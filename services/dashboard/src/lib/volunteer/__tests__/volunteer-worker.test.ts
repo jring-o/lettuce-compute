@@ -2,7 +2,6 @@
 // The worker runs in a DedicatedWorkerGlobalScope, so we mock self.postMessage,
 // WebAssembly.compileStreaming, etc.
 
-import { BrowserWASI, WASIExitError } from "../wasi-shim";
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,

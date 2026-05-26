@@ -1,6 +1,6 @@
 // Pool Manager tests — mocks Worker and VolunteerClient.
 
-import type { WorkerToMainMessage, MainToWorkerMessage } from "../types";
+import type { WorkerToMainMessage } from "../types";
 
 // Mock the client module before importing pool-manager.
 const mockRegister = jest.fn();

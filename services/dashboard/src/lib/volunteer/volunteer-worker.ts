@@ -181,10 +181,8 @@ async function executeWorkUnit(
           outputSize: gpuInput.length,
         });
         // Write GPU output back to in-memory FS for WASM to read.
-        // Since we can't re-run WASM easily, store it as the output.
-        const outputPath = "/work/gpu_output.bin";
-        // Store directly — the WASM module already ran.
-        // gpu_output.bin becomes part of the output.
+        // Store directly at /work/gpu_output.bin — the WASM module already ran;
+        // gpu_output.bin simply becomes part of the output.
         preopens["/work"]["gpu_output.bin"] = gpuOutput;
       } catch (err) {
         post({

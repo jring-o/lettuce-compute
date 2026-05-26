@@ -26,7 +26,6 @@ interface ProjectActionsProps {
 export function ProjectActions({
   leafId,
   leafState,
-  leafSlug,
   hasCompletedWorkUnits,
 }: ProjectActionsProps) {
   const router = useRouter();

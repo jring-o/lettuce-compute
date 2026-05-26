@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { LeafSelector } from "@/components/contribute/leaf-selector";
 
 // Polyfill PointerEvent for jsdom (required by @base-ui/react Switch)
