@@ -33,7 +33,7 @@ export function StatusPanel({ stats, workerCount, running }: StatusPanelProps) {
       return () => clearInterval(timer);
     } else {
       startRef.current = null;
-      // eslint-disable-next-line react-compiler/react-compiler -- intentional reset; component renders null when !running, no cascade risk
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional reset; component renders null when !running, no cascade risk
       setElapsed(0);
     }
   }, [running]);

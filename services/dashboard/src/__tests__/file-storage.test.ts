@@ -59,8 +59,8 @@ jest.mock("@/lib/db/schema", () => ({
 
 // Mock crypto.randomUUID to return a predictable value
 const mockUUID = "test-uuid-1234";
-// eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.spyOn(
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   require("crypto") as { randomUUID: () => string },
   "randomUUID",
 ).mockReturnValue(mockUUID);
