@@ -1,0 +1,1992 @@
+package daemon
+
+import (
+	"context"
+	"crypto/ed25519"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
+	"github.com/lettuce-compute/volunteer-cli/internal/client"
+	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/resource"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+)
+
+// WorkClient defines the gRPC operations the daemon needs from the server.
+type WorkClient interface {
+	RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error)
+	SubmitResult(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error)
+	Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error)
+	SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error)
+	GetCheckpoint(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
+	GetHeadInfo(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
+	AbandonWorkUnit(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error)
+	Close() error
+}
+
+// Daemon manages the volunteer compute loop using concurrent execution slots
+// and a pre-fetch queue.
+type Daemon struct {
+	cfg             *config.Config
+	pubKey          ed25519.PublicKey
+	privKey         ed25519.PrivateKey
+	multiClient     *MultiServerClient
+	runtimeRegistry *RuntimeRegistry
+	logger          *slog.Logger
+
+	// Resource management
+	limiter   resource.Limiter
+	scheduler *resource.Scheduler
+
+	// Thermal monitoring
+	thermalMonitor *runtime.ThermalMonitor
+	thermalPauseCh chan bool
+
+	// Backoff configuration (overridable for tests)
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+
+	// Cached hardware capabilities (detected once at startup)
+	cachedHW *lettucev1.HardwareCapabilities
+
+	// Podman machine lifecycle (Windows/macOS).
+	machineManager   *runtime.PodmanMachineManager
+	machineStartedBy bool // true if this daemon started the machine
+
+	// Leaf discovery and weighted scheduling.
+	leafCache        *LeafCache
+	weightedSelector *WeightedSelector
+
+	// Concurrent execution (replaces serial currentWU/pipelining).
+	slotManager   *SlotManager
+	prefetchQueue *PreFetchQueue
+	fetcher       *Fetcher
+
+	// State
+	mu       sync.Mutex
+	stopping bool
+	running  bool
+	paused   bool
+
+	// User-initiated pause (separate from resource/thermal auto-pause).
+	userPaused  bool
+	pauseReason string // "user", "thermal", "scheduled", ""
+	userPauseCh chan bool
+
+	// Daemon start time for uptime calculation.
+	startedAt time.Time
+
+	// Process group: ensures child processes are killed when daemon exits.
+	// Windows: Job Object with KILL_ON_JOB_CLOSE. Unix: setpgid + tracked pgids.
+	processGroup ProcessGroup
+	runCancel    context.CancelFunc // cancels all slot contexts on Stop()
+
+	// CPU benchmark score for runtime estimation.
+	benchmarkFPOPS float64
+	dcfTracker     *DCFTracker
+
+	// Image-presence gate (item 5): caches whether an enabled leaf's image is
+	// already pulled, so shouldFetch requires only workspace headroom for a
+	// cached-image rerun instead of the full max_disk_gb allowance.
+	imgCacheMu      sync.Mutex
+	imgCacheChecked time.Time
+	imgCacheResult  bool
+}
+
+// DaemonConfig holds all dependencies for creating a Daemon.
+type DaemonConfig struct {
+	Config  *config.Config
+	PubKey  ed25519.PublicKey
+	PrivKey ed25519.PrivateKey
+
+	// Multi-server: preferred way to configure servers.
+	Servers []*ServerConnection
+
+	// Legacy single-server fields (used if Servers is empty).
+	Client      WorkClient
+	VolunteerID string
+
+	Runtime         runtime.Runtime               // Legacy: wraps in single-entry registry if RuntimeRegistry is nil
+	RuntimeRegistry *RuntimeRegistry              // Preferred: explicit registry with multiple runtimes
+	MachineManager  *runtime.PodmanMachineManager // optional: Podman machine lifecycle
+	Logger          *slog.Logger
+	Limiter         resource.Limiter    // optional, auto-detected if nil
+	Scheduler       *resource.Scheduler // optional, created from config if nil
+}
+
+// NewDaemon creates a new daemon with the provided configuration.
+func NewDaemon(cfg DaemonConfig) *Daemon {
+	limiter := cfg.Limiter
+	if limiter == nil {
+		limiter = resource.NewLimiter(cfg.Logger)
+	}
+
+	scheduler := cfg.Scheduler
+	if scheduler == nil {
+		scheduler = resource.NewScheduler(&cfg.Config.Scheduling, cfg.Logger)
+	}
+
+	// Build runtime registry.
+	registry := cfg.RuntimeRegistry
+	if registry == nil {
+		registry = NewRuntimeRegistry()
+		if cfg.Runtime != nil {
+			registry.Register(cfg.Runtime)
+		}
+	}
+
+	// Create process group for child process lifecycle management.
+	// On Windows: Job Object with KILL_ON_JOB_CLOSE ensures children die with daemon.
+	// On Unix: setpgid + tracked pgids for explicit cleanup.
+	pg, pgErr := NewProcessGroup(cfg.Logger)
+	if pgErr != nil {
+		cfg.Logger.Warn("failed to create process group, child processes may outlive daemon", "error", pgErr)
+	}
+
+	// Wire resource limiter and process group hooks into any NativeRuntime.
+	limits := &cfg.Config.ResourceLimits
+	for _, rt := range registry.runtimes {
+		if nr, ok := rt.(*runtime.NativeRuntime); ok {
+			nr.SetCommandModifier(func(cmd *exec.Cmd) error {
+				if pg != nil {
+					pg.ConfigureCommand(cmd)
+				}
+				return limiter.Apply(cmd, limits)
+			})
+			nr.SetProcessNotifier(func(pid int) (func(), error) {
+				if pg != nil {
+					if err := pg.Add(pid); err != nil {
+						cfg.Logger.Warn("failed to add process to group", "pid", pid, "error", err)
+					}
+				}
+				return limiter.Enforce(pid, limits)
+			})
+		}
+	}
+
+	// Create thermal monitor.
+	thermalPauseCh := make(chan bool, 1)
+	thermalCfg := runtime.ThermalConfig{
+		Enabled:             cfg.Config.Thermal.Enabled,
+		CPUPauseThresholdC:  cfg.Config.Thermal.CPUPauseThresholdC,
+		CPUResumeThresholdC: cfg.Config.Thermal.CPUResumeThresholdC,
+		GPUPauseThresholdC:  cfg.Config.Thermal.GPUPauseThresholdC,
+		GPUResumeThresholdC: cfg.Config.Thermal.GPUResumeThresholdC,
+		PollIntervalSeconds: cfg.Config.Thermal.PollIntervalSeconds,
+	}
+	thermalMonitor := runtime.NewThermalMonitor(thermalCfg, thermalPauseCh, cfg.Logger)
+
+	// Build multi-server client. Support both new Servers field and legacy
+	// Client/VolunteerID for backward compatibility with existing tests.
+	servers := cfg.Servers
+	if len(servers) == 0 && cfg.Client != nil {
+		servers = []*ServerConnection{{
+			Client:      cfg.Client,
+			VolunteerID: cfg.VolunteerID,
+			Name:        "default",
+			Available:   true,
+		}}
+	}
+	multiClient := NewMultiServerClient(servers, cfg.Logger)
+
+	// Detect hardware once at startup (avoid repeated exec calls that
+	// trigger DiskPart/UAC popups on Windows).
+	hw := client.DetectHardware(cfg.Config)
+
+	// Run or load CPU benchmark for runtime estimation.
+	var benchFPOPS float64
+	cpuModel := ""
+	if hw != nil {
+		cpuModel = hw.CpuModel
+	}
+	benchFPOPS, benchErr := EnsureBenchmark(cfg.Config.DataDir, cpuModel)
+	if benchErr != nil {
+		cfg.Logger.Warn("failed to save benchmark result", "error", benchErr)
+	}
+	if benchFPOPS > 0 && hw != nil {
+		hw.BenchmarkFpops = benchFPOPS
+	}
+
+	// Load duration correction factors.
+	dcfTracker := LoadDCFTracker(cfg.Config.DataDir)
+
+	// Create leaf cache (5 min refresh) and weighted selector.
+	leafCache := NewLeafCache(5*time.Minute, cfg.Logger)
+	ws := NewWeightedSelector()
+
+	// Initialize head weights from config.
+	headWeights := make(map[string]int, len(cfg.Config.Servers))
+	for _, srv := range cfg.Config.Servers {
+		w := srv.Weight
+		if w <= 0 {
+			w = 100
+		}
+		headWeights[srv.DisplayName()] = w
+	}
+	ws.SetHeadWeights(headWeights)
+
+	return &Daemon{
+		cfg:              cfg.Config,
+		pubKey:           cfg.PubKey,
+		privKey:          cfg.PrivKey,
+		multiClient:      multiClient,
+		runtimeRegistry:  registry,
+		machineManager:   cfg.MachineManager,
+		logger:           cfg.Logger,
+		limiter:          limiter,
+		scheduler:        scheduler,
+		thermalMonitor:   thermalMonitor,
+		thermalPauseCh:   thermalPauseCh,
+		initialBackoff:   1 * time.Second,
+		maxBackoff:       30 * time.Second,
+		cachedHW:         hw,
+		leafCache:        leafCache,
+		weightedSelector: ws,
+		userPauseCh:      make(chan bool, 1),
+		processGroup:     pg,
+		benchmarkFPOPS:   benchFPOPS,
+		dcfTracker:       dcfTracker,
+	}
+}
+
+// Run starts the coordinator loop. It blocks until ctx is cancelled or Stop() is called.
+// On context cancellation, it waits for all active slots to finish before returning.
+func (d *Daemon) Run(ctx context.Context) error {
+	// Wrap context so Stop() can cancel all slot execution.
+	ctx, runCancel := context.WithCancel(ctx)
+	d.mu.Lock()
+	d.running = true
+	d.startedAt = time.Now()
+	d.runCancel = runCancel
+	d.mu.Unlock()
+	defer func() {
+		runCancel()
+		d.mu.Lock()
+		d.running = false
+		d.runCancel = nil
+		d.mu.Unlock()
+	}()
+
+	maxSlots := d.cfg.MaxConcurrentTasks
+	if maxSlots <= 0 {
+		maxSlots = 1
+	}
+
+	serverNames := make([]string, len(d.multiClient.Servers()))
+	for i, s := range d.multiClient.Servers() {
+		serverNames[i] = s.Name
+	}
+	d.logger.Info("daemon started",
+		"servers", serverNames,
+		"server_count", len(serverNames),
+		"max_concurrent_tasks", maxSlots,
+		"runtimes", d.runtimeRegistry.AvailableRuntimes(),
+		"scheduling_mode", d.cfg.Scheduling.Mode,
+	)
+
+	// Initialize leaf cache from all servers.
+	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())
+	d.initializeWeights()
+
+	// Write PID file.
+	if err := WritePID(d.cfg.DataDir); err != nil {
+		d.logger.Warn("failed to write PID file", "error", err)
+	}
+	defer RemovePID(d.cfg.DataDir)
+
+	// Initialize slot manager and pre-fetch queue.
+	d.slotManager = NewSlotManager(maxSlots, d.logger)
+	queueDepth := d.cfg.WorkBufferSize
+	if queueDepth <= 0 {
+		queueDepth = maxSlots + 2
+	}
+	d.prefetchQueue = NewPreFetchQueue(queueDepth, d.logger)
+
+	// Start resource monitor goroutine.
+	pauseCh := make(chan bool, 1)
+	monitorCtx, monitorCancel := context.WithCancel(ctx)
+	defer monitorCancel()
+	monitor := resource.NewMonitor(d.limiter, d.scheduler, &d.cfg.ResourceLimits, d.cfg.DataDir, d.logger)
+	go monitor.Run(monitorCtx, pauseCh)
+
+	// Start thermal monitor.
+	if d.thermalMonitor != nil {
+		d.thermalMonitor.Start(monitorCtx)
+		defer d.thermalMonitor.Stop()
+	}
+
+	// Resume any tasks preserved from the previous daemon session.
+	d.resumePersistedTasks(ctx)
+
+	// Start the pending-result retry worker. It sweeps once now (recovering any
+	// results stranded by a previous run's submission failure) then periodically.
+	go d.runPendingResultRetry(ctx)
+
+	// Start fetcher goroutine. We track the cancel func in a variable
+	// so it can be replaced when the fetcher is restarted after pause.
+	var fetcherCancel context.CancelFunc
+	startFetcher := func() {
+		var fetcherCtx context.Context
+		fetcherCtx, fetcherCancel = context.WithCancel(ctx)
+		d.fetcher = NewFetcher(d, d.prefetchQueue, d.weightedSelector, d.leafCache)
+		go d.fetcher.Run(fetcherCtx)
+	}
+	startFetcher()
+
+	// Coordinator cleanup on exit.
+	defer func() {
+		if fetcherCancel != nil {
+			fetcherCancel()
+		}
+
+		// Signal shutdown so slots preserve work directories instead of cleaning up.
+		d.slotManager.SetShuttingDown()
+
+		// Wait for all active slots to finish.
+		d.slotManager.StopAll()
+
+		// Collect preserved tasks (work dirs kept for resumption).
+		preserved := d.slotManager.GetPreservedTasks()
+
+		// Drain any remaining results and submit them.
+		// Use Background context since the original ctx may be cancelled.
+		submitCtx := context.Background()
+		for {
+			result, ok := d.slotManager.TryGetResult()
+			if !ok {
+				break
+			}
+			d.handleSlotResult(submitCtx, result)
+		}
+
+		// Return remaining queued (un-run) units to the head so they aren't
+		// orphaned as ASSIGNED, then clean up. abandonItem uses a detached
+		// context since the run context is already cancelled. See item 4.
+		for _, item := range d.prefetchQueue.Clear() {
+			item.stopHeartbeat()
+			d.abandonItem(item, "volunteer shutdown")
+			if item.Runtime != nil && item.Prep != nil {
+				item.Runtime.Cleanup(item.Prep)
+			}
+		}
+
+		// Save preserved tasks to disk for next startup.
+		if len(preserved) > 0 {
+			if err := SaveActiveState(d.cfg.DataDir, preserved); err != nil {
+				d.logger.Error("failed to save active tasks for resume", "error", err)
+			} else {
+				d.logger.Info("saved active tasks for resume", "count", len(preserved))
+			}
+		} else {
+			ClearActiveState(d.cfg.DataDir)
+		}
+
+		// Kill any remaining child processes via the process group.
+		if d.processGroup != nil {
+			d.processGroup.Terminate()
+		}
+
+		d.slotManager = nil
+		d.prefetchQueue = nil
+		d.fetcher = nil
+	}()
+
+	// Coordinator tick for queue maintenance.
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		// Check if we should stop.
+		d.mu.Lock()
+		stopping := d.stopping
+		d.mu.Unlock()
+		if stopping {
+			d.logger.Info("daemon stopping (stop requested)")
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			d.logger.Info("daemon stopping (context cancelled)")
+			return nil
+		default:
+		}
+
+		// Check for pause/resume signals from resource, thermal, and user.
+		d.checkPauseSignals(pauseCh)
+
+		// If paused, stop execution but keep fetcher running for user pause.
+		d.mu.Lock()
+		systemPaused := d.paused
+		userPaused := d.userPaused
+		d.mu.Unlock()
+		if systemPaused || userPaused {
+			if systemPaused {
+				// Thermal/resource pause: stop everything including fetcher.
+				fetcherCancel()
+			}
+
+			// Suspend all running processes (freeze in place).
+			d.slotManager.SuspendAll()
+			d.logger.Info("suspended all active processes",
+				"reason", d.pauseReason,
+				"active_slots", d.slotManager.ActiveCount(),
+			)
+
+			// Wait for resume.
+			if !d.waitForResume(ctx, pauseCh) {
+				// Shutting down — resume processes so they can be cleaned up.
+				d.slotManager.ResumeAll()
+				return nil // context cancelled
+			}
+
+			// Resume all suspended processes.
+			d.slotManager.ResumeAll()
+			d.logger.Info("resumed all active processes")
+
+			// Restart fetcher if it was stopped (system pause).
+			if systemPaused {
+				startFetcher()
+			}
+			continue
+		}
+
+		// Check scheduler before filling slots.
+		if !d.scheduler.ShouldRun() {
+			d.logger.Debug("scheduler says not active, waiting")
+			if err := d.scheduler.WaitUntilActive(ctx); err != nil {
+				return nil
+			}
+		}
+
+		// Process completed slots.
+		for {
+			result, ok := d.slotManager.TryGetResult()
+			if !ok {
+				break
+			}
+			d.logger.Info("daemon: slot completed", "work_unit_id", result.WU.ID, "success", result.Err == nil)
+			d.handleSlotResult(ctx, result)
+			d.persistActiveTasks()
+		}
+
+		// Fill available slots from the pre-fetch queue.
+		d.logger.Debug("daemon: filling slots", "active_slots", d.slotManager.ActiveCount(), "queue_len", d.prefetchQueue.Len())
+		d.fillSlots(ctx)
+
+		// Wait for next event: slot completion, queue item, pause signal, or tick.
+		select {
+		case <-ctx.Done():
+			d.logger.Info("daemon stopping (context cancelled)")
+			return nil
+		case result := <-d.slotManager.results:
+			d.logger.Info("daemon: slot result received", "work_unit_id", result.WU.ID)
+			d.handleSlotResult(ctx, result)
+			d.persistActiveTasks()
+			// Immediately try to fill the freed slot.
+			d.fillSlots(ctx)
+		case <-d.prefetchQueue.Notify():
+			d.logger.Debug("daemon: prefetch queue notification, filling slots")
+			// New item in queue — try to fill slots.
+			d.fillSlots(ctx)
+		case shouldPause := <-pauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "scheduled"
+			}
+			d.mu.Unlock()
+		case shouldPause := <-d.thermalPauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "thermal"
+			}
+			d.mu.Unlock()
+		case shouldPause := <-d.userPauseCh:
+			d.mu.Lock()
+			d.userPaused = shouldPause
+			d.mu.Unlock()
+		case <-ticker.C:
+			// Periodic maintenance — drop expiring items, refresh weights.
+		}
+	}
+}
+
+// handleSlotResult submits the result from a completed slot to the server.
+func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
+	wu := result.WU
+	conn := result.Conn
+
+	if result.Err != nil {
+		d.logger.Error("slot execution failed",
+			"work_unit_id", wu.ID,
+			"slot", result.SlotID,
+			"error", result.Err,
+		)
+		return
+	}
+
+	if result.Result == nil {
+		d.logger.Error("slot returned nil result", "work_unit_id", wu.ID, "slot", result.SlotID)
+		return
+	}
+
+	if result.Result.ExitCode != 0 {
+		d.logger.Error("slot execution non-zero exit",
+			"work_unit_id", wu.ID,
+			"slot", result.SlotID,
+			"exit_code", result.Result.ExitCode,
+		)
+		return
+	}
+
+	// Persist result JSON for replay if the leaf has a viz bundle.
+	if result.VizBundlePath != "" && len(result.Result.OutputData) > 0 {
+		leafName, leafSlug := d.resolveLeafInfo(wu.LeafID)
+		maxBytes := int64(d.cfg.ResultCacheMaxMB) * 1024 * 1024
+		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, result.VizBundlePath, maxBytes); err != nil {
+			d.logger.Warn("failed to persist result for replay",
+				"work_unit_id", wu.ID,
+				"error", err,
+			)
+		}
+	}
+
+	// Submit result to the server.
+	submitReq := d.buildSubmitRequest(wu, result.Result, conn)
+	submitResp, err := conn.Client.SubmitResult(ctx, submitReq)
+	if err != nil {
+		// Don't drop a finished result on a network blip — persist it and let the
+		// retry worker resubmit (now and on future daemon starts). See item 6.
+		d.logger.Error("submit result failed; persisting for retry",
+			"work_unit_id", wu.ID,
+			"slot", result.SlotID,
+			"error", err,
+		)
+		d.persistPendingResult(wu, result, conn, submitReq)
+		return
+	}
+
+	d.logger.Info("result submitted",
+		"work_unit_id", wu.ID,
+		"result_id", submitResp.ResultId,
+		"accepted", submitResp.Accepted,
+		"server", conn.Name,
+		"slot", result.SlotID,
+	)
+
+	// Update duration correction factor from actual vs estimated time.
+	if d.dcfTracker != nil && wu.RscFpopsEst > 0 && d.benchmarkFPOPS > 0 {
+		estimatedSec := wu.RscFpopsEst / d.benchmarkFPOPS
+		actualSec := float64(result.Result.Metrics.WallClockSeconds)
+		if actualSec > 0 {
+			d.dcfTracker.Update(wu.LeafID, estimatedSec, actualSec)
+		}
+	}
+
+	wallClock := result.Result.Metrics.WallClockSeconds
+	cpuSeconds := wallClock - int64(result.TotalPausedDur.Seconds())
+	if cpuSeconds < 0 {
+		cpuSeconds = 0
+	}
+	d.recordHistory(wu, wallClock, cpuSeconds, submitResp.Accepted, conn.Name)
+}
+
+// persistActiveTasks writes the current active tasks to disk so they survive
+// a crash or force-kill. Called after every task start and completion — the file
+// is always up to date, no graceful shutdown needed.
+func (d *Daemon) persistActiveTasks() {
+	if d.slotManager == nil {
+		return
+	}
+	tasks := d.slotManager.GetActivePersistableTasks()
+	if len(tasks) > 0 {
+		if err := SaveActiveState(d.cfg.DataDir, tasks); err != nil {
+			d.logger.Warn("failed to persist active tasks", "error", err)
+		}
+	} else {
+		ClearActiveState(d.cfg.DataDir)
+	}
+}
+
+// fillSlots fills available execution slots from the pre-fetch queue.
+func (d *Daemon) fillSlots(ctx context.Context) {
+	for {
+		slotID := d.slotManager.AvailableSlotID()
+		if slotID < 0 {
+			d.logger.Debug("fillSlots: no available slots", "active", d.slotManager.ActiveCount())
+			return // no available slots
+		}
+
+		item := d.prefetchQueue.Pop()
+		if item == nil {
+			// No items in queue — return slot.
+			d.logger.Debug("fillSlots: queue empty, returning slot", "slot", slotID, "queue_len", d.prefetchQueue.Len())
+			d.slotManager.ReturnSlotID(slotID)
+			return
+		}
+
+		// Check resource availability.
+		if !d.canAccommodateWU(item.WU) {
+			// Can't accommodate — push item back and return slot.
+			d.logger.Debug("fillSlots: can't accommodate WU, pushing back", "work_unit_id", item.WU.ID)
+			d.prefetchQueue.PushBack(item)
+			d.slotManager.ReturnSlotID(slotID)
+			return
+		}
+
+		d.logger.Info("starting work unit in slot",
+			"work_unit_id", item.WU.ID,
+			"leaf_id", item.WU.LeafID,
+			"slot", slotID,
+			"server", item.Conn.Name,
+		)
+
+		if err := d.slotManager.StartSlot(ctx, slotID, item, d); err != nil {
+			d.logger.Error("failed to start slot", "slot", slotID, "error", err)
+			d.slotManager.ReturnSlotID(slotID)
+			// Return the un-run unit to the head instead of orphaning it.
+			item.stopHeartbeat()
+			d.abandonItem(item, "slot start failed")
+			if item.Runtime != nil && item.Prep != nil {
+				item.Runtime.Cleanup(item.Prep)
+			}
+		} else {
+			d.persistActiveTasks()
+		}
+	}
+}
+
+// canAccommodateWU checks whether there are enough resources to run the WU
+// before admitting it to a slot. It applies three guards (only run
+// what the machine can actually fit):
+//
+//  1. Configured budget — the sum of declared per-WU memory across active slots
+//     plus this WU must stay within the volunteer's max_memory_mb. Uses declared
+//     maxes, so it is robust to container memory ramping up over time.
+//  2. Real free system RAM — the machine must currently have enough available
+//     memory for this WU (plus a small headroom), regardless of the configured
+//     budget. Skipped on platforms where free memory can't be read.
+//  3. GPU exclusivity — at most one GPU work unit per physical GPU, so concurrent
+//     units never oversubscribe VRAM (the per-WU VRAM requirement isn't
+//     transmitted, so admission gates on device count).
+func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
+	if d.slotManager == nil {
+		return true
+	}
+
+	wuMemoryMB := int(wu.ExecutionSpec.MaxMemoryMB)
+	if wuMemoryMB <= 0 {
+		wuMemoryMB = defaultWUMemoryMB
+	}
+
+	// 1. Configured memory budget.
+	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
+		activeMemoryMB := d.slotManager.TotalActiveMemoryMB()
+		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
+			d.logger.Debug("canAccommodateWU: exceeds configured memory budget",
+				"work_unit_id", wu.ID, "active_mb", activeMemoryMB, "wu_mb", wuMemoryMB, "max_mb", maxMemoryMB)
+			return false
+		}
+	}
+
+	// 2. Real free system RAM (already reflects memory used by active containers).
+	if freeMB, ok := freeSystemMemoryMB(); ok {
+		if freeMB < wuMemoryMB+freeMemoryHeadroomMB {
+			d.logger.Debug("canAccommodateWU: insufficient free system RAM",
+				"work_unit_id", wu.ID, "free_mb", freeMB, "wu_mb", wuMemoryMB, "headroom_mb", freeMemoryHeadroomMB)
+			return false
+		}
+	}
+
+	// 3. GPU exclusivity: one GPU work unit per physical GPU.
+	if wu.ExecutionSpec.GPURequired {
+		gpuCount := 0
+		if d.cachedHW != nil {
+			gpuCount = len(d.cachedHW.GetGpus())
+		}
+		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
+			d.logger.Debug("canAccommodateWU: all GPUs busy",
+				"work_unit_id", wu.ID, "gpu_count", gpuCount, "active_gpu_units", d.slotManager.ActiveGPUCount())
+			return false
+		}
+	}
+
+	return true
+}
+
+// cachedImageWorkspaceHeadroomMB is the disk headroom required on the data-dir
+// volume to start a unit whose image is already pulled. A rerun only writes a
+// small workspace — the image itself is already on disk (or in the container
+// backend's VM disk) — so the full max_disk_gb allowance isn't needed.
+const cachedImageWorkspaceHeadroomMB = 10 * 1024 // 10 GB
+
+// imageCacheCheckTTL bounds how often shouldFetch probes the container backend
+// for image presence, so a disk-gated daemon doesn't spawn an "image exists"
+// call on every loop iteration.
+const imageCacheCheckTTL = 30 * time.Second
+
+// shouldFetch checks whether the fetcher should request work.
+// Returns false if disk space is insufficient or the scheduler says not active.
+func (d *Daemon) shouldFetch() bool {
+	// Check scheduler.
+	if d.scheduler != nil && !d.scheduler.ShouldRun() {
+		d.logger.Debug("shouldFetch: scheduler says don't run")
+		return false
+	}
+
+	if d.limiter == nil {
+		return true
+	}
+
+	// Full allowance: enough headroom on the data-dir volume to pull a fresh
+	// image and run a unit.
+	fullRequiredMB := d.cfg.ResourceLimits.MaxDiskGB * 1024
+	if fullRequiredMB <= 0 {
+		fullRequiredMB = 1024
+	}
+	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, fullRequiredMB); err == nil {
+		return true
+	}
+
+	// Below the full allowance. A repeat run on an already-cached image needs
+	// only workspace headroom, not room to pull the image again. The leaf's
+	// min_disk_mb (which sizes max_disk_gb) bundles the image, so demanding the
+	// whole allowance free forever would block every cached-image rerun.
+	if d.hasCachedRunnableImage() {
+		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedImageWorkspaceHeadroomMB); err != nil {
+			d.logger.Debug("shouldFetch: below workspace headroom even with cached image",
+				"required_mb", cachedImageWorkspaceHeadroomMB, "error", err)
+			return false
+		}
+		d.logger.Debug("shouldFetch: cached image present, requiring workspace headroom only",
+			"required_mb", cachedImageWorkspaceHeadroomMB)
+		return true
+	}
+
+	d.logger.Debug("shouldFetch: disk space check failed", "required_mb", fullRequiredMB)
+	return false
+}
+
+// hasCachedRunnableImage reports whether at least one enabled leaf's container
+// image is already present locally. The result is cached for imageCacheCheckTTL
+// to avoid repeated backend calls while disk-gated. Returns false when no
+// container runtime is registered (native-only volunteers, or tests using mock
+// runtimes — which keeps the disk gate from ever shelling out under test).
+func (d *Daemon) hasCachedRunnableImage() bool {
+	d.imgCacheMu.Lock()
+	if !d.imgCacheChecked.IsZero() && time.Since(d.imgCacheChecked) < imageCacheCheckTTL {
+		r := d.imgCacheResult
+		d.imgCacheMu.Unlock()
+		return r
+	}
+	d.imgCacheMu.Unlock()
+
+	result := d.checkCachedRunnableImage()
+
+	d.imgCacheMu.Lock()
+	d.imgCacheChecked = time.Now()
+	d.imgCacheResult = result
+	d.imgCacheMu.Unlock()
+	return result
+}
+
+func (d *Daemon) checkCachedRunnableImage() bool {
+	if d.runtimeRegistry == nil || d.multiClient == nil {
+		return false
+	}
+	cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime)
+	if !ok || cr == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	seen := make(map[string]bool)
+	for _, srv := range d.multiClient.Servers() {
+		for _, lf := range d.enabledLeafs(srv.Name) {
+			if lf.ExecutionSpec == nil || lf.ExecutionSpec.Image == "" {
+				continue
+			}
+			img := lf.ExecutionSpec.Image
+			if seen[img] {
+				continue
+			}
+			seen[img] = true
+			if exists, err := cr.Client().ImageExists(ctx, img); err == nil && exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// abandonItem returns an un-run prefetched unit to the head so it isn't orphaned
+// as ASSIGNED. Uses a detached context with a short timeout so it still reaches
+// the head during shutdown, when the run context is already cancelled. See item 4.
+func (d *Daemon) abandonItem(item *PreFetchItem, reason string) {
+	if item == nil || item.Conn == nil || item.Conn.Client == nil || item.WU == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := item.Conn.Client.AbandonWorkUnit(ctx, &lettucev1.AbandonWorkUnitRequest{
+		WorkUnitId:  item.WU.ID,
+		VolunteerId: item.Conn.VolunteerID,
+		PublicKey:   d.pubKey,
+		Reason:      reason,
+	}); err != nil {
+		d.logger.Warn("failed to abandon un-run work unit", "work_unit_id", item.WU.ID, "error", err)
+		return
+	}
+	d.logger.Info("abandoned un-run work unit back to head", "work_unit_id", item.WU.ID, "reason", reason)
+}
+
+// restoreCheckpoint downloads and extracts a checkpoint for a work unit.
+func (d *Daemon) restoreCheckpoint(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult, conn *ServerConnection) {
+	resp, getErr := conn.Client.GetCheckpoint(ctx, &lettucev1.GetCheckpointRequest{
+		WorkUnitId: wu.ID,
+	})
+	if getErr != nil {
+		d.logger.Warn("failed to download checkpoint, starting fresh",
+			"work_unit_id", wu.ID,
+			"error", getErr,
+		)
+		return
+	}
+	if !resp.HasCheckpoint {
+		return
+	}
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
+	if mkErr := os.MkdirAll(checkpointDir, 0755); mkErr != nil {
+		d.logger.Warn("failed to create checkpoint dir", "error", mkErr)
+		return
+	}
+	if exErr := extractTar(resp.CheckpointData, checkpointDir); exErr != nil {
+		d.logger.Warn("failed to extract checkpoint", "error", exErr)
+		return
+	}
+	d.logger.Info("restored checkpoint",
+		"work_unit_id", wu.ID,
+		"sequence", resp.CheckpointSequence,
+	)
+}
+
+// runSlotHeartbeat sends periodic heartbeats for a slot's work unit.
+// Takes the checkpoint manager directly, making it safe for concurrent slots.
+func (d *Daemon) runSlotHeartbeat(ctx context.Context, wu *runtime.WorkUnit, workDir string, intervalSeconds int32, cancelExec context.CancelFunc, conn *ServerConnection, cm *CheckpointManager) {
+	interval := time.Duration(intervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 300 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// send issues one heartbeat. Returns false if the server asked us to abort.
+	send := func() bool {
+		hbStatus := "RUNNING"
+		if cm != nil && cm.LastSaveSuccess() {
+			hbStatus = "CHECKPOINT_SAVED"
+		}
+
+		resp, err := conn.Client.Heartbeat(ctx, &lettucev1.HeartbeatRequest{
+			WorkUnitId:  wu.ID,
+			VolunteerId: conn.VolunteerID,
+			Status:      hbStatus,
+			ProgressPct: ReadProgressFile(workDir),
+		})
+		if err != nil {
+			d.logger.Warn("heartbeat failed", "work_unit_id", wu.ID, "server", conn.Name, "error", err)
+			return true
+		}
+		if !resp.ContinueExecution {
+			d.logger.Info("server requested execution abort",
+				"work_unit_id", wu.ID,
+				"server", conn.Name,
+				"message", resp.Message,
+			)
+			cancelExec()
+			return false
+		}
+		return true
+	}
+
+	// Send immediately so the unit transitions ASSIGNED -> RUNNING right at slot
+	// handoff (the PREPARING heartbeat that kept it fresh has just been stopped),
+	// rather than waiting a full interval for the first RUNNING heartbeat.
+	if !send() {
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
+			}
+		}
+	}
+}
+
+// checkPauseSignals drains pause/resume signals from all sources.
+func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
+	for {
+		select {
+		case shouldPause := <-pauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "scheduled"
+				d.logger.Info("daemon paused by resource monitor")
+			}
+			d.mu.Unlock()
+		case shouldPause := <-d.thermalPauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "thermal"
+				d.logger.Info("daemon paused due to thermal throttle")
+			} else {
+				d.logger.Info("daemon resumed from thermal throttle")
+			}
+			d.mu.Unlock()
+		case shouldPause := <-d.userPauseCh:
+			d.mu.Lock()
+			d.userPaused = shouldPause
+			d.mu.Unlock()
+			if shouldPause {
+				d.logger.Info("daemon paused by user")
+			} else {
+				d.logger.Info("daemon resumed by user")
+			}
+		default:
+			return
+		}
+	}
+}
+
+// waitForResume blocks until the daemon is unpaused or ctx is cancelled.
+// Returns false if ctx was cancelled.
+func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
+	for {
+		d.mu.Lock()
+		paused := d.paused || d.userPaused
+		d.mu.Unlock()
+		if !paused {
+			return true
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case shouldPause := <-pauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "scheduled"
+			}
+			d.mu.Unlock()
+			if !shouldPause {
+				d.logger.Info("daemon resumed by resource monitor")
+			}
+		case shouldPause := <-d.thermalPauseCh:
+			d.mu.Lock()
+			d.paused = shouldPause
+			if shouldPause {
+				d.pauseReason = "thermal"
+			}
+			d.mu.Unlock()
+			if !shouldPause {
+				d.logger.Info("daemon resumed from thermal throttle")
+			}
+		case shouldPause := <-d.userPauseCh:
+			d.mu.Lock()
+			d.userPaused = shouldPause
+			d.mu.Unlock()
+			if !shouldPause {
+				d.logger.Info("daemon resumed by user")
+			}
+		}
+	}
+}
+
+// Stop signals the daemon to stop. Active work units are cancelled so the
+// daemon can shut down promptly. Work directories are preserved for resumption.
+func (d *Daemon) Stop() {
+	d.mu.Lock()
+	d.stopping = true
+	cancel := d.runCancel
+	d.mu.Unlock()
+	// Cancel the run context to interrupt all active slot execution.
+	// The slot cleanup will preserve work directories (shuttingDown flag).
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// osExitFunc is the function called to exit the process. Defaults to os.Exit.
+// Tests override this via SetOsExitFunc to prevent actual process termination.
+var osExitFunc = os.Exit
+
+// SetOsExitFunc overrides the os.Exit function used by SuspendAndQuit.
+// Returns a restore function. Intended for testing only.
+func SetOsExitFunc(fn func(int)) func() {
+	prev := osExitFunc
+	osExitFunc = fn
+	return func() { osExitFunc = prev }
+}
+
+// SuspendAndQuit suspends all compute processes, saves their PIDs to disk,
+// releases children from the process group (so they survive as frozen orphans),
+// and exits the daemon process immediately. The next daemon launch will find
+// the orphans by PID and resume them — zero work lost.
+//
+// We use os.Exit instead of d.Stop because Stop() cancels the run context,
+// which causes exec.CommandContext to kill the suspended processes — defeating
+// the entire purpose. os.Exit bypasses all defers, keeping orphans alive.
+func (d *Daemon) SuspendAndQuit() {
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Unlock()
+
+	// Suspend all running processes (NtSuspendProcess / SIGSTOP).
+	if d.slotManager != nil {
+		d.slotManager.SuspendAll()
+		d.logger.Info("suspended all processes for quit",
+			"active_slots", d.slotManager.ActiveCount())
+
+		// Persist active tasks with PIDs so next launch can resume them.
+		d.persistActiveTasks()
+	}
+
+	// Release children from process group so they survive daemon exit.
+	// On Windows: removes KILL_ON_JOB_CLOSE from the Job Object.
+	// On Unix: clears tracked pgids so Terminate() won't kill them.
+	if d.processGroup != nil {
+		d.processGroup.ReleaseChildren()
+	}
+
+	d.logger.Info("exiting daemon, orphan processes will survive frozen")
+
+	// Exit immediately. Do NOT call d.Stop() — it cancels the run context,
+	// which triggers exec.CommandContext to kill the suspended processes.
+	// os.Exit skips all defers, which is intentional: the cleanup defer in
+	// Run() would call processGroup.Terminate() and kill everything.
+	osExitFunc(0)
+}
+
+// IsRunning returns true if the daemon loop is active.
+func (d *Daemon) IsRunning() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.running
+}
+
+// Pause pauses the daemon from fetching new work units. Does not cancel
+// the current work unit in progress.
+func (d *Daemon) Pause() error {
+	d.mu.Lock()
+	if d.userPaused {
+		d.mu.Unlock()
+		return fmt.Errorf("already paused")
+	}
+	d.userPaused = true
+	d.pauseReason = "user"
+	d.mu.Unlock()
+	// Signal the daemon loop (non-blocking).
+	select {
+	case d.userPauseCh <- true:
+	default:
+	}
+	return nil
+}
+
+// Resume resumes the daemon after a user-initiated pause.
+func (d *Daemon) Resume() error {
+	d.mu.Lock()
+	if !d.userPaused {
+		d.mu.Unlock()
+		return fmt.Errorf("not paused")
+	}
+	d.userPaused = false
+	d.mu.Unlock()
+	select {
+	case d.userPauseCh <- false:
+	default:
+	}
+	return nil
+}
+
+// IsPaused returns true if the daemon is paused by any source.
+func (d *Daemon) IsPaused() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.paused || d.userPaused
+}
+
+// PauseReason returns the reason the daemon is paused, or empty string if not paused.
+func (d *Daemon) PauseReason() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.userPaused {
+		return "user"
+	}
+	if d.paused {
+		return d.pauseReason
+	}
+	return ""
+}
+
+// CurrentTask holds info about an in-progress work unit.
+type CurrentTask struct {
+	WorkUnitID            string
+	LeafID                string
+	StartedAt             time.Time
+	WorkDir               string
+	VizBundlePath         string
+	CheckpointSequence    int32
+	LastCheckpointAt      time.Time
+	ResumedFromCheckpoint bool
+	EstimatedSeconds      float64 // benchmark-based estimate (0 = unknown)
+	Suspended             bool
+	TotalPausedSeconds    int
+	DeadlineSeconds       int32
+	RuntimeType           string // "native", "container", or "wasm"
+	ContainerImage        string
+	ServerName            string
+	ProcessID             int
+	FetchedAt             time.Time
+}
+
+// GetCurrentTasks returns info about all in-progress work units across all slots.
+func (d *Daemon) GetCurrentTasks() []CurrentTask {
+	if d.slotManager == nil {
+		return nil
+	}
+	var dcfFunc func(string) float64
+	if d.dcfTracker != nil {
+		dcfFunc = d.dcfTracker.Get
+	}
+	return d.slotManager.GetCurrentTasks(d.benchmarkFPOPS, dcfFunc)
+}
+
+// SuspendTask suspends a single task by work unit ID.
+func (d *Daemon) SuspendTask(workUnitID string) error {
+	if d.slotManager == nil {
+		return ErrTaskNotFound
+	}
+	return d.slotManager.SuspendSlot(workUnitID)
+}
+
+// ResumeTask resumes a single suspended task by work unit ID.
+// Returns ErrDaemonPaused if the daemon is paused (resume blocked at daemon level).
+func (d *Daemon) ResumeTask(workUnitID string) error {
+	if d.slotManager == nil {
+		return ErrTaskNotFound
+	}
+	if d.IsPaused() {
+		return ErrDaemonPaused
+	}
+	return d.slotManager.ResumeSlot(workUnitID)
+}
+
+// AbortTask cancels a single task by work unit ID, killing its process.
+func (d *Daemon) AbortTask(workUnitID string) error {
+	if d.slotManager == nil {
+		return ErrTaskNotFound
+	}
+	return d.slotManager.AbortSlot(workUnitID)
+}
+
+// GetQueuedCount returns the number of work units in the prefetch queue.
+func (d *Daemon) GetQueuedCount() int {
+	if d.prefetchQueue == nil {
+		return 0
+	}
+	return d.prefetchQueue.Len()
+}
+
+// QueuedTask describes a work unit waiting in the prefetch queue.
+type QueuedTask struct {
+	WorkUnitID      string
+	LeafID          string
+	DeadlineSeconds int32
+	FetchedAt       time.Time
+	ServerName      string
+}
+
+// GetQueuedTasks returns details of all work units in the prefetch queue.
+func (d *Daemon) GetQueuedTasks() []QueuedTask {
+	if d.prefetchQueue == nil {
+		return nil
+	}
+	items := d.prefetchQueue.Items()
+	tasks := make([]QueuedTask, 0, len(items))
+	for _, item := range items {
+		serverName := ""
+		if item.Conn != nil {
+			serverName = item.Conn.Config.DisplayName()
+		}
+		tasks = append(tasks, QueuedTask{
+			WorkUnitID:      item.WU.ID,
+			LeafID:          item.WU.LeafID,
+			DeadlineSeconds: item.WU.DeadlineSeconds,
+			FetchedAt:       item.FetchedAt,
+			ServerName:      serverName,
+		})
+	}
+	return tasks
+}
+
+// GetStartedAt returns when the daemon started running.
+func (d *Daemon) GetStartedAt() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.startedAt
+}
+
+// GetConfig returns the current daemon configuration.
+func (d *Daemon) GetConfig() *config.Config {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cfg
+}
+
+// GetMultiClient returns the multi-server client.
+func (d *Daemon) GetMultiClient() *MultiServerClient {
+	return d.multiClient
+}
+
+// ApplyConfig applies new configuration to the running daemon without restart.
+// Changing max_concurrent_tasks requires a restart — slot count is fixed at init.
+func (d *Daemon) ApplyConfig(newCfg *config.Config) {
+	d.mu.Lock()
+	oldMax := d.cfg.MaxConcurrentTasks
+	d.cfg = newCfg
+	d.mu.Unlock()
+
+	if newCfg.MaxConcurrentTasks != oldMax && oldMax > 0 {
+		d.logger.Warn("max_concurrent_tasks changed — restart daemon to apply",
+			"old", oldMax,
+			"new", newCfg.MaxConcurrentTasks,
+		)
+	}
+
+	// Reinitialize weights from new config.
+	d.initializeWeights()
+}
+
+// SetBackoff overrides backoff durations (for testing).
+func (d *Daemon) SetBackoff(initial, max time.Duration) {
+	d.initialBackoff = initial
+	d.maxBackoff = max
+}
+
+// leafPreferences returns the leaf ID filter and block list from config.
+func (d *Daemon) leafPreferences() (leafIDs, blockedIDs []string) {
+	switch d.cfg.Leafs.Mode {
+	case "SPECIFIC":
+		leafIDs = d.cfg.Leafs.LeafIDs
+	case "BLOCKLIST":
+		blockedIDs = d.cfg.Leafs.BlockedIDs
+	}
+	return
+}
+
+// GetLeafCache returns the daemon's leaf cache (for management API access).
+func (d *Daemon) GetLeafCache() *LeafCache {
+	return d.leafCache
+}
+
+// GetWeightedSelector returns the daemon's weighted selector (for management API access).
+func (d *Daemon) GetWeightedSelector() *WeightedSelector {
+	return d.weightedSelector
+}
+
+// GetMachineManager returns the Podman machine manager, or nil if not configured.
+func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
+	return d.machineManager
+}
+
+// SetMachineStartedByDaemon marks that the daemon started the Podman machine,
+// so it can be stopped on daemon shutdown.
+func (d *Daemon) SetMachineStartedByDaemon(started bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.machineStartedBy = started
+}
+
+// MachineStartedByDaemon returns whether the daemon started the Podman machine.
+func (d *Daemon) MachineStartedByDaemon() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.machineStartedBy
+}
+
+// SetSlotManagerForTest injects a SlotManager into the daemon for testing.
+// This allows external test packages (e.g., management) to exercise task
+// visibility and per-task control endpoints without running the full daemon loop.
+func (d *Daemon) SetSlotManagerForTest(sm *SlotManager) {
+	d.slotManager = sm
+}
+
+// SetMultiClientForTest injects a MultiServerClient into the daemon for testing.
+// This allows external test packages (e.g., management) to test GetHeads()
+// volunteer ID population without running the full daemon loop.
+func (d *Daemon) SetMultiClientForTest(mc *MultiServerClient) {
+	d.multiClient = mc
+}
+
+// initializeWeights computes effective leaf weights from cache + config preferences.
+func (d *Daemon) initializeWeights() {
+	headWeights := make(map[string]int)
+	for _, srv := range d.cfg.Servers {
+		name := srv.DisplayName()
+		w := srv.Weight
+		if w <= 0 {
+			w = 100
+		}
+		headWeights[name] = w
+
+		// Compute effective leaf weights for this server.
+		defaults := d.leafCache.GetDefaultWeights(name)
+		lp := srv.LeafPreferences
+		mode := lp.Mode
+		if mode == "" {
+			mode = "ALL"
+		}
+
+		effective := make(map[string]int)
+		switch mode {
+		case "ALL":
+			// Start with researcher defaults.
+			for slug, dw := range defaults {
+				effective[slug] = dw
+			}
+			// Overlay any custom weights.
+			for slug, cw := range lp.Weights {
+				effective[slug] = cw
+			}
+		case "SPECIFIC":
+			enabledSet := make(map[string]bool, len(lp.Enabled))
+			for _, slug := range lp.Enabled {
+				enabledSet[slug] = true
+			}
+			for slug := range enabledSet {
+				if cw, ok := lp.Weights[slug]; ok {
+					effective[slug] = cw
+				} else if dw, ok := defaults[slug]; ok {
+					effective[slug] = dw
+				} else {
+					effective[slug] = 100
+				}
+			}
+		case "BLOCKLIST":
+			disabledSet := make(map[string]bool, len(lp.Disabled))
+			for _, slug := range lp.Disabled {
+				disabledSet[slug] = true
+			}
+			for slug, dw := range defaults {
+				if disabledSet[slug] {
+					continue
+				}
+				if cw, ok := lp.Weights[slug]; ok {
+					effective[slug] = cw
+				} else {
+					effective[slug] = dw
+				}
+			}
+			// Also include leafs from cache that aren't in defaults but exist.
+			leafs := d.leafCache.GetLeafs(name)
+			for _, leaf := range leafs {
+				if disabledSet[leaf.Slug] {
+					continue
+				}
+				if _, ok := effective[leaf.Slug]; !ok {
+					if cw, ok := lp.Weights[leaf.Slug]; ok {
+						effective[leaf.Slug] = cw
+					} else {
+						effective[leaf.Slug] = 100
+					}
+				}
+			}
+		}
+
+		d.weightedSelector.SetLeafWeights(name, effective)
+	}
+	d.weightedSelector.SetHeadWeights(headWeights)
+}
+
+// availableServers returns servers not currently in backoff.
+func (d *Daemon) availableServers() []*ServerConnection {
+	var available []*ServerConnection
+	for _, srv := range d.multiClient.Servers() {
+		if srv.Available || time.Since(srv.LastError) >= srv.Backoff {
+			available = append(available, srv)
+		}
+	}
+	return available
+}
+
+// enabledLeafs returns cached leafs filtered by the server's leaf preferences.
+func (d *Daemon) enabledLeafs(serverName string) []CachedLeafInfo {
+	leafs := d.leafCache.GetLeafs(serverName)
+	if leafs == nil {
+		return nil
+	}
+
+	// Find the server config.
+	var lp config.LeafPreferences
+	for _, srv := range d.cfg.Servers {
+		if srv.DisplayName() == serverName {
+			lp = srv.LeafPreferences
+			break
+		}
+	}
+
+	mode := lp.Mode
+	if mode == "" {
+		mode = "ALL"
+	}
+
+	switch mode {
+	case "ALL":
+		return leafs
+	case "SPECIFIC":
+		enabledSet := make(map[string]bool, len(lp.Enabled))
+		for _, slug := range lp.Enabled {
+			enabledSet[slug] = true
+		}
+		var result []CachedLeafInfo
+		for _, leaf := range leafs {
+			if enabledSet[leaf.Slug] {
+				result = append(result, leaf)
+			}
+		}
+		return result
+	case "BLOCKLIST":
+		disabledSet := make(map[string]bool, len(lp.Disabled))
+		for _, slug := range lp.Disabled {
+			disabledSet[slug] = true
+		}
+		var result []CachedLeafInfo
+		for _, leaf := range leafs {
+			if !disabledSet[leaf.Slug] {
+				result = append(result, leaf)
+			}
+		}
+		return result
+	default:
+		return leafs
+	}
+}
+
+// requestWorkWeighted uses the weighted selector to request work.
+// Falls back to the legacy round-robin path if the leaf cache is empty.
+func (d *Daemon) requestWorkWeighted(ctx context.Context) (*lettucev1.RequestWorkUnitResponse, *ServerConnection, error) {
+	// Check if any server has cached leafs. If no server has leafs,
+	// fall back to the legacy round-robin + leaf preferences path.
+	hasLeafs := false
+	for _, srv := range d.multiClient.Servers() {
+		if leafs := d.leafCache.GetLeafs(srv.Name); len(leafs) > 0 {
+			hasLeafs = true
+			break
+		}
+	}
+
+	if !hasLeafs {
+		d.logger.Debug("no leafs in cache, falling back to legacy work request path")
+		leafIDs, blockedIDs := d.leafPreferences()
+		return d.multiClient.RequestWork(ctx, d.pubKey, leafIDs, blockedIDs, d.cachedHW)
+	}
+
+	available := d.availableServers()
+	if len(available) == 0 {
+		return nil, nil, status.Error(codes.NotFound, "no servers available")
+	}
+
+	// Try heads in deficit order.
+	tried := make(map[string]bool)
+	for len(tried) < len(available) {
+		head := d.weightedSelector.SelectHead(filterOut(available, tried))
+		if head == nil {
+			break
+		}
+		tried[head.Name] = true
+
+		enabled := d.enabledLeafs(head.Name)
+		if len(enabled) == 0 {
+			continue
+		}
+
+		// Try leafs in deficit order on this head.
+		orderedLeafs := d.weightedSelector.SelectLeafByDeficitOrder(head.Name, enabled)
+		for _, leaf := range orderedLeafs {
+			resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
+				VolunteerId:      head.VolunteerID,
+				PublicKey:        d.pubKey,
+				LeafIds:          []string{leaf.ID},
+				CurrentAvailable: d.cachedHW,
+			})
+			if err != nil {
+				st, ok := status.FromError(err)
+				if ok && st.Code() == codes.NotFound {
+					// No work for this leaf, try next.
+					head.Available = true
+					head.Backoff = 0
+					continue
+				}
+				// Connection error — apply backoff and try next head.
+				head.Available = false
+				head.LastError = time.Now()
+				if head.Backoff == 0 {
+					head.Backoff = d.initialBackoff
+				} else {
+					head.Backoff = time.Duration(float64(head.Backoff) * 2)
+					if head.Backoff > d.maxBackoff {
+						head.Backoff = d.maxBackoff
+					}
+				}
+				break
+			}
+
+			// Success.
+			head.Available = true
+			head.Backoff = 0
+			d.weightedSelector.RecordAssignment(head.Name, leaf.Slug)
+			return resp, head, nil
+		}
+	}
+
+	return nil, nil, status.Error(codes.NotFound, "no work available from any server")
+}
+
+// filterOut returns servers not in the excluded set.
+func filterOut(servers []*ServerConnection, excluded map[string]bool) []*ServerConnection {
+	var result []*ServerConnection
+	for _, srv := range servers {
+		if !excluded[srv.Name] {
+			result = append(result, srv)
+		}
+	}
+	return result
+}
+
+// buildSubmitRequest creates a SubmitResultRequest from a work unit, execution result, and server connection.
+func (d *Daemon) buildSubmitRequest(wu *runtime.WorkUnit, result *runtime.ExecutionResult, conn *ServerConnection) *lettucev1.SubmitResultRequest {
+	return &lettucev1.SubmitResultRequest{
+		WorkUnitId:           wu.ID,
+		VolunteerId:          conn.VolunteerID,
+		PublicKey:            d.pubKey,
+		OutputData:           result.OutputData,
+		OutputChecksumSha256: result.OutputChecksum,
+		Metadata:             runtime.MetricsToProto(&result.Metrics),
+	}
+}
+
+// pendingResultRetryInterval is how often the retry worker resweeps persisted
+// results that failed to submit.
+const pendingResultRetryInterval = 60 * time.Second
+
+// persistPendingResult marshals a completed result's submit request to disk so it
+// can be retried after a submission failure. See item 6.
+func (d *Daemon) persistPendingResult(wu *runtime.WorkUnit, result SlotResult, conn *ServerConnection, req *lettucev1.SubmitResultRequest) {
+	blob, err := proto.Marshal(req)
+	if err != nil {
+		d.logger.Error("failed to marshal pending result", "work_unit_id", wu.ID, "error", err)
+		return
+	}
+	wallClock := result.Result.Metrics.WallClockSeconds
+	cpuSeconds := wallClock - int64(result.TotalPausedDur.Seconds())
+	if cpuSeconds < 0 {
+		cpuSeconds = 0
+	}
+	if err := SavePendingResult(d.cfg.DataDir, PendingResult{
+		WorkUnitID:       wu.ID,
+		LeafID:           wu.LeafID,
+		ServerName:       conn.Name,
+		RequestProto:     blob,
+		WallClockSeconds: wallClock,
+		CPUSeconds:       cpuSeconds,
+		CreatedAt:        time.Now().UTC(),
+	}); err != nil {
+		d.logger.Error("failed to persist pending result", "work_unit_id", wu.ID, "error", err)
+		return
+	}
+	d.logger.Info("persisted result for retry", "work_unit_id", wu.ID, "server", conn.Name)
+}
+
+// runPendingResultRetry resubmits persisted results until the head accepts them.
+// It sweeps once on start (recovering results stranded by a previous run) and
+// then every pendingResultRetryInterval until ctx is cancelled.
+func (d *Daemon) runPendingResultRetry(ctx context.Context) {
+	d.retryPendingResults(ctx)
+	ticker := time.NewTicker(pendingResultRetryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.retryPendingResults(ctx)
+		}
+	}
+}
+
+// retryPendingResults attempts one resubmission of each persisted result. A
+// result is deleted once it reaches the head (accepted or rejected — either way
+// retrying won't change the verdict); only transport failures keep it for the
+// next sweep.
+func (d *Daemon) retryPendingResults(ctx context.Context) {
+	pending, err := ListPendingResults(d.cfg.DataDir)
+	if err != nil {
+		d.logger.Warn("failed to list pending results", "error", err)
+		return
+	}
+	for _, pr := range pending {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		conn := d.serverByName(pr.ServerName)
+		if conn == nil {
+			d.logger.Debug("pending result: no connection for server, will retry later",
+				"server", pr.ServerName, "work_unit_id", pr.WorkUnitID)
+			continue
+		}
+
+		var req lettucev1.SubmitResultRequest
+		if err := proto.Unmarshal(pr.RequestProto, &req); err != nil {
+			d.logger.Error("pending result: corrupt request, dropping",
+				"work_unit_id", pr.WorkUnitID, "error", err)
+			_ = DeletePendingResult(d.cfg.DataDir, pr.WorkUnitID)
+			continue
+		}
+
+		submitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		resp, err := conn.Client.SubmitResult(submitCtx, &req)
+		cancel()
+		if err != nil {
+			d.logger.Warn("pending result: resubmit failed, will retry later",
+				"work_unit_id", pr.WorkUnitID, "server", pr.ServerName, "error", err)
+			continue
+		}
+
+		// Reached the head — stop retrying regardless of accept/reject.
+		if err := DeletePendingResult(d.cfg.DataDir, pr.WorkUnitID); err != nil {
+			d.logger.Warn("pending result: failed to delete after resubmit",
+				"work_unit_id", pr.WorkUnitID, "error", err)
+		}
+		d.logger.Info("pending result resubmitted",
+			"work_unit_id", pr.WorkUnitID, "accepted", resp.Accepted, "server", pr.ServerName)
+		d.recordHistory(&runtime.WorkUnit{ID: pr.WorkUnitID, LeafID: pr.LeafID},
+			pr.WallClockSeconds, pr.CPUSeconds, resp.Accepted, pr.ServerName)
+	}
+}
+
+// serverByName returns the active server connection with the given name, or nil.
+func (d *Daemon) serverByName(name string) *ServerConnection {
+	if d.multiClient == nil {
+		return nil
+	}
+	for _, srv := range d.multiClient.Servers() {
+		if srv.Name == name {
+			return srv
+		}
+	}
+	return nil
+}
+
+// recordHistory appends a history entry and logs a warning on failure.
+func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpuSeconds int64, accepted bool, serverName string) {
+	if histErr := AppendHistory(d.cfg.DataDir, HistoryEntry{
+		WorkUnitID:       wu.ID,
+		LeafID:           wu.LeafID,
+		ServerName:       serverName,
+		CompletedAt:      time.Now().UTC(),
+		WallClockSeconds: wallClockSeconds,
+		CPUSeconds:       cpuSeconds,
+		ResultAccepted:   accepted,
+	}); histErr != nil {
+		d.logger.Warn("failed to write history entry", "error", histErr)
+	}
+}
+
+// resolveLeafInfo looks up the display name and slug for a leaf ID from the cache.
+func (d *Daemon) resolveLeafInfo(leafID string) (name, slug string) {
+	if d.leafCache != nil {
+		for _, leafs := range d.leafCache.AllLeafs() {
+			for _, l := range leafs {
+				if l.ID == leafID {
+					return l.Name, l.Slug
+				}
+			}
+		}
+	}
+	return leafID, leafID
+}
+
+// --- PID file management ---
+
+// WritePID writes the current process PID to {dataDir}/daemon.pid.
+func WritePID(dataDir string) error {
+	pidPath := filepath.Join(dataDir, "daemon.pid")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return fmt.Errorf("creating data directory: %w", err)
+	}
+	return os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644)
+}
+
+// RemovePID removes the PID file.
+func RemovePID(dataDir string) {
+	os.Remove(filepath.Join(dataDir, "daemon.pid"))
+}
+
+// ReadPID reads the PID from {dataDir}/daemon.pid.
+func ReadPID(dataDir string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(dataDir, "daemon.pid"))
+	if err != nil {
+		return 0, fmt.Errorf("reading PID file: %w", err)
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil {
+		return 0, fmt.Errorf("parsing PID: %w", err)
+	}
+	return pid, nil
+}
+
+// resumePersistedTasks loads tasks saved from a previous session and resumes
+// them. Work directories were preserved on shutdown; execution restarts from
+// any checkpoint files found in the work dir.
+func (d *Daemon) resumePersistedTasks(ctx context.Context) {
+	state, err := LoadActiveState(d.cfg.DataDir)
+	if err != nil {
+		d.logger.Warn("failed to load persisted tasks", "error", err)
+		ClearActiveState(d.cfg.DataDir)
+		return
+	}
+	if state == nil || len(state.Tasks) == 0 {
+		return
+	}
+
+	d.logger.Info("found persisted tasks from previous session",
+		"count", len(state.Tasks),
+		"saved_at", state.SavedAt,
+	)
+
+	// Build a server lookup by gRPC address.
+	serverByAddr := make(map[string]*ServerConnection)
+	if mc := d.multiClient; mc != nil {
+		for _, srv := range mc.Servers() {
+			serverByAddr[srv.Config.GRPCAddress] = srv
+		}
+	}
+
+	resumed := 0
+	for _, pt := range state.Tasks {
+		// Try to resume a suspended orphan process by PID first.
+		// This handles the "tray quit" case: processes are frozen in memory,
+		// daemon exited, now we're back. Just wake them up.
+		if pt.PID > 0 && isProcessAliveFunc(pt.PID) {
+			slotID := d.slotManager.AvailableSlotID()
+			if slotID < 0 {
+				d.logger.Warn("no slots available for PID resume", "pid", pt.PID)
+				break
+			}
+
+			// Resume the frozen process.
+			handle := NewNativeProcessHandle(pt.PID)
+			if err := handle.Resume(); err != nil {
+				d.logger.Warn("failed to resume orphan process, will re-execute",
+					"pid", pt.PID, "error", err)
+				d.slotManager.ReturnSlotID(slotID)
+				// Fall through to normal re-execution below.
+			} else {
+				// Re-attach to process group so it's tracked.
+				if d.processGroup != nil {
+					_ = d.processGroup.Add(pt.PID)
+				}
+
+				// Wire up a slot to monitor this resumed process.
+				conn := serverByAddr[pt.ServerGRPCAddress]
+				if conn == nil {
+					d.logger.Warn("server gone for resumed orphan, killing",
+						"pid", pt.PID, "server", pt.ServerGRPCAddress)
+					_ = handle.Suspend() // re-freeze, let it die naturally or kill
+					d.slotManager.ReturnSlotID(slotID)
+					continue
+				}
+
+				rt := d.runtimeRegistry.GetRuntime(pt.RuntimeName)
+				if rt == nil {
+					rt = d.runtimeRegistry.GetRuntime("native")
+				}
+
+				wu := &runtime.WorkUnit{
+					ID:                        pt.WorkUnitID,
+					LeafID:                    pt.LeafID,
+					Runtime:                   pt.RuntimeName,
+					CodeArtifactURL:           pt.CodeArtifactURL,
+					ParametersJSON:            pt.ParametersJSON,
+					DeadlineSeconds:           pt.DeadlineSeconds,
+					EnvVars:                   pt.EnvVars,
+					ExecutionSpec:             pt.ExecutionSpec,
+					RscFpopsEst:               pt.RscFpopsEst,
+					CheckpointSequence:        pt.CheckpointSequence,
+					CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+				}
+
+				prep := &runtime.PrepareResult{
+					WorkDir:           pt.WorkDir,
+					BinaryPath:        pt.BinaryPath,
+					InputPath:         pt.InputPath,
+					VizBundlePath:     pt.VizBundlePath,
+					OrphanPID:         pt.PID, // Tell the slot to poll instead of executing
+					OriginalStartedAt: pt.StartedAt,
+				}
+
+				item := &PreFetchItem{
+					WU:      wu,
+					Prep:    prep,
+					Runtime: rt,
+					Conn:    conn,
+					WUResp: &lettucev1.RequestWorkUnitResponse{
+						HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
+					},
+					FetchedAt: time.Now(),
+				}
+
+				if startErr := d.slotManager.StartSlot(ctx, slotID, item, d); startErr != nil {
+					d.logger.Warn("failed to start slot for resumed orphan",
+						"pid", pt.PID, "error", startErr)
+					d.slotManager.ReturnSlotID(slotID)
+					continue
+				}
+
+				// Set the process handle on the slot so suspend/resume works.
+				d.slotManager.SetProcessHandle(slotID, handle)
+
+				resumed++
+				d.logger.Info("resumed orphan process by PID",
+					"pid", pt.PID, "work_unit_id", pt.WorkUnitID)
+				continue
+			}
+		}
+
+		// Verify work directory still exists on disk.
+		if _, statErr := os.Stat(pt.WorkDir); statErr != nil {
+			d.logger.Warn("work directory missing, skipping persisted task",
+				"work_unit_id", pt.WorkUnitID, "work_dir", pt.WorkDir)
+			continue
+		}
+
+		// Find the matching server connection.
+		conn := serverByAddr[pt.ServerGRPCAddress]
+		if conn == nil {
+			d.logger.Warn("server no longer configured, skipping persisted task",
+				"work_unit_id", pt.WorkUnitID, "server", pt.ServerGRPCAddress)
+			// Clean up orphaned work dir.
+			os.RemoveAll(pt.WorkDir)
+			continue
+		}
+
+		// Find the runtime.
+		rtName := pt.RuntimeName
+		if rtName == "" {
+			rtName = "native"
+		}
+		rt := d.runtimeRegistry.GetRuntime(rtName)
+		if rt == nil {
+			d.logger.Warn("runtime not available, skipping persisted task",
+				"work_unit_id", pt.WorkUnitID, "runtime", rtName)
+			os.RemoveAll(pt.WorkDir)
+			continue
+		}
+
+		// Reconstruct the work unit. InputData is nil — the input file is
+		// already on disk in the work directory.
+		wu := &runtime.WorkUnit{
+			ID:                        pt.WorkUnitID,
+			LeafID:                    pt.LeafID,
+			Runtime:                   pt.RuntimeName,
+			CodeArtifactURL:           pt.CodeArtifactURL,
+			ParametersJSON:            pt.ParametersJSON,
+			DeadlineSeconds:           pt.DeadlineSeconds,
+			EnvVars:                   pt.EnvVars,
+			ExecutionSpec:             pt.ExecutionSpec,
+			RscFpopsEst:               pt.RscFpopsEst,
+			CheckpointSequence:        pt.CheckpointSequence,
+			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+			// Don't set HasCheckpoint — we already have checkpoint files locally
+			// in the work dir. The binary will find them via LETTUCE_CHECKPOINT_DIR.
+		}
+
+		prep := &runtime.PrepareResult{
+			WorkDir:           pt.WorkDir,
+			BinaryPath:        pt.BinaryPath,
+			InputPath:         pt.InputPath,
+			VizBundlePath:     pt.VizBundlePath,
+			OriginalStartedAt: pt.StartedAt,
+		}
+
+		// Get a slot.
+		slotID := d.slotManager.AvailableSlotID()
+		if slotID < 0 {
+			d.logger.Warn("no slots available, cannot resume remaining tasks",
+				"resumed_so_far", resumed)
+			break
+		}
+
+		// Build a synthetic PreFetchItem for StartSlot.
+		item := &PreFetchItem{
+			WU:      wu,
+			Prep:    prep,
+			Runtime: rt,
+			Conn:    conn,
+			WUResp: &lettucev1.RequestWorkUnitResponse{
+				HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
+			},
+			FetchedAt: time.Now(),
+		}
+
+		if startErr := d.slotManager.StartSlot(ctx, slotID, item, d); startErr != nil {
+			d.logger.Warn("failed to resume persisted task",
+				"work_unit_id", pt.WorkUnitID, "error", startErr)
+			d.slotManager.ReturnSlotID(slotID)
+			continue
+		}
+
+		resumed++
+		d.logger.Info("resumed persisted task",
+			"work_unit_id", pt.WorkUnitID,
+			"leaf_id", pt.LeafID,
+			"work_dir", pt.WorkDir,
+			"checkpoint_seq", pt.CheckpointSequence,
+		)
+	}
+
+	// Clear the state file now that we've processed it.
+	ClearActiveState(d.cfg.DataDir)
+
+	if resumed > 0 {
+		d.logger.Info("task resumption complete", "resumed", resumed, "total", len(state.Tasks))
+	}
+}

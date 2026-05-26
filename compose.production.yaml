@@ -1,0 +1,130 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: lettuce
+      POSTGRES_USER: lettuce
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lettuce -d lettuce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  infrastructure:
+    build:
+      context: ./services/infrastructure
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LETTUCE_DB_HOST: postgres
+      LETTUCE_DB_PORT: "5432"
+      LETTUCE_DB_DATABASE: lettuce
+      LETTUCE_DB_USER: lettuce
+      LETTUCE_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      LETTUCE_DB_SSL_MODE: disable
+      LETTUCE_SERVER_HTTP_ADDR: ":8080"
+      LETTUCE_SERVER_GRPC_ADDR: ":9090"
+      LETTUCE_LOG_LEVEL: info
+      LETTUCE_LOG_FORMAT: json
+      LETTUCE_SIGNING_PRIVATE_KEY_PATH: /keys/signing.key
+      LETTUCE_ADMIN_API_KEY: ${LETTUCE_ADMIN_API_KEY}
+      LETTUCE_ADMIN_EMAIL: ${LETTUCE_ADMIN_EMAIL:-}
+      LETTUCE_ADMIN_PASSWORD: ${LETTUCE_ADMIN_PASSWORD:-}
+      DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-}
+      LETTUCE_HEAD_NAME: ${LETTUCE_HEAD_NAME}
+      LETTUCE_HEAD_DESCRIPTION: ${LETTUCE_HEAD_DESCRIPTION:-}
+      LETTUCE_HEAD_URL: ${PLATFORM_URL}
+      LETTUCE_CORS_ORIGINS: ${LETTUCE_CORS_ORIGINS:-}
+      # Trust the X-Forwarded-For / X-Real-IP headers that Caddy adds, so the
+      # infrastructure server can rate-limit and audit-log by the REAL client IP
+      # instead of Caddy's container IP. Infra publishes no host ports — only
+      # Caddy (on this private Docker network) can reach it — so trusting the
+      # Docker/RFC1918 bridge ranges is safe and lets per-client limiting work.
+      # If you override this, set it to the CIDR your reverse proxy connects from.
+      LETTUCE_TRUSTED_PROXIES: ${LETTUCE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+    volumes:
+      - ./keys:/keys:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+      target: production
+    init: true
+    restart: unless-stopped
+    depends_on:
+      infrastructure:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: lettuce
+      DB_USER: lettuce
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      INFRASTRUCTURE_API_URL: http://infrastructure:8080
+      # Dashboard service API key — create via Settings > API Keys, then set here.
+      DASHBOARD_API_KEY: ${DASHBOARD_API_KEY}
+      PLATFORM_URL: ${PLATFORM_URL}
+      NEXTAUTH_URL: ${PLATFORM_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      AUTH_TRUST_HOST: "true"
+      VIZ_ORIGIN: ${VIZ_ORIGIN:-}
+      NODE_ENV: production
+      # Docker auto-sets HOSTNAME to the container id, which makes the Next.js
+      # standalone server bind to that hostname instead of all interfaces.
+      # Force 0.0.0.0 so the loopback healthcheck below can reach it.
+      HOSTNAME: "0.0.0.0"
+    volumes:
+      - dashboard_data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  registry:
+    image: registry:2
+    restart: unless-stopped
+    volumes:
+      - registry_data:/var/lib/registry
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+      - infrastructure
+      - registry
+    environment:
+      REGISTRY_USER: ${REGISTRY_USER:-lettuce}
+      REGISTRY_PASS_HASH: ${REGISTRY_PASS_HASH}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./binaries:/srv/binaries:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  dashboard_data:
+  registry_data:
+  caddy_data:
+  caddy_config:

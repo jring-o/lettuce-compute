@@ -1,0 +1,57 @@
+# Lettuce Infrastructure Server Configuration
+#
+# All values shown are defaults unless noted otherwise.
+# Environment variables with the LETTUCE_ prefix override these values.
+
+server:
+  # HTTP API listen address
+  http_addr: ":8080"      # env: LETTUCE_SERVER_HTTP_ADDR
+
+  # gRPC listen address (volunteer connections)
+  grpc_addr: ":9090"      # env: LETTUCE_SERVER_GRPC_ADDR
+
+database:
+  host: "localhost"        # env: LETTUCE_DB_HOST
+  port: 5432               # env: LETTUCE_DB_PORT
+  database: "lettuce"      # env: LETTUCE_DB_DATABASE
+  user: "lettuce"          # env: LETTUCE_DB_USER
+  password: ""             # env: LETTUCE_DB_PASSWORD (required — set via env var)
+  ssl_mode: "prefer"       # env: LETTUCE_DB_SSL_MODE
+                           # Values: disable, allow, prefer, require, verify-ca, verify-full
+
+  # Connection pool settings
+  max_conns: 25            # env: LETTUCE_DB_MAX_CONNS
+  min_conns: 5             # env: LETTUCE_DB_MIN_CONNS
+  max_conn_lifetime: "1h"  # env: LETTUCE_DB_MAX_CONN_LIFETIME (Go duration)
+  max_conn_idle_time: "30m" # env: LETTUCE_DB_MAX_CONN_IDLE_TIME (Go duration)
+
+log:
+  # Log level: debug, info, warn, error
+  level: "info"            # env: LETTUCE_LOG_LEVEL
+
+  # Output format: json, text
+  format: "json"           # env: LETTUCE_LOG_FORMAT
+
+tls:
+  # TLS certificate and key paths. Both must be set, or both empty.
+  cert_file: ""            # env: LETTUCE_TLS_CERT_FILE
+  key_file: ""             # env: LETTUCE_TLS_KEY_FILE
+
+  # CA certificate for mutual TLS (optional)
+  ca_file: ""              # env: LETTUCE_TLS_CA_FILE
+
+head:
+  # Head identity — required. This is the name of this Lettuce server (head).
+  name: "My Lettuce Server"  # env: LETTUCE_HEAD_NAME
+
+  # Optional description and URL.
+  description: ""            # env: LETTUCE_HEAD_DESCRIPTION
+  url: ""                    # env: LETTUCE_HEAD_URL
+
+  # Default leaf weights — map of leaf slug to relative weight (integer > 0).
+  # Empty = equal weight among all active leafs. Higher weight = more work assigned.
+  # Example:
+  #   default_leaf_weights:
+  #     globular-cluster-n-body: 10
+  #     prime-gap-study: 5
+  default_leaf_weights: {}

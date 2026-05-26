@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lettuce
+      POSTGRES_USER: lettuce
+      POSTGRES_PASSWORD: lettuce_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lettuce -d lettuce"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  infrastructure:
+    build:
+      context: ./services/infrastructure
+      dockerfile: Dockerfile
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LETTUCE_DB_HOST: postgres
+      LETTUCE_DB_PORT: "5432"
+      LETTUCE_DB_DATABASE: lettuce
+      LETTUCE_DB_USER: lettuce
+      LETTUCE_DB_PASSWORD: lettuce_dev
+      LETTUCE_DB_SSL_MODE: disable
+      LETTUCE_SERVER_HTTP_ADDR: ":8080"
+      LETTUCE_SERVER_GRPC_ADDR: ":9090"
+      LETTUCE_LOG_LEVEL: debug
+      LETTUCE_LOG_FORMAT: json
+      LETTUCE_ADMIN_API_KEY: dev-admin-key-not-for-production
+      # The signing key fails closed (fatal) when missing in production. The dev
+      # stack mounts no pre-generated key, so explicitly opt into auto-generating
+      # an ephemeral key on first boot. NEVER set this in production — a missing
+      # key there should be a hard error, not a silently new signing identity.
+      LETTUCE_SIGNING_KEY_AUTOGEN: "true"
+      # Dashboard (:3000) and infrastructure (:8080) are different origins, and the
+      # browser volunteer in the dashboard calls this REST API cross-origin in dev.
+      # CORS now fails closed when unset, so dev must allowlist the dashboard origin.
+      LETTUCE_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+      dockerfile: Dockerfile
+      target: dev
+    depends_on:
+      infrastructure:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lettuce:lettuce_dev@postgres:5432/lettuce?sslmode=disable
+      INFRASTRUCTURE_API_URL: http://infrastructure:8080
+      DASHBOARD_API_KEY: dev-dashboard-key-not-for-production
+      NEXTAUTH_SECRET: dev-secret-not-for-production
+      NEXTAUTH_URL: http://localhost:3000
+      AUTH_TRUST_HOST: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./services/dashboard/src:/app/src
+      - ./services/dashboard/public:/app/public
+
+volumes:
+  postgres-data:

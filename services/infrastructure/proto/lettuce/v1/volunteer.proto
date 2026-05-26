@@ -1,0 +1,260 @@
+syntax = "proto3";
+
+package lettuce.volunteer.v1;
+
+option go_package = "github.com/lettuce-compute/infrastructure/proto/lettuce/v1;lettucev1";
+
+service VolunteerService {
+  // Returns server status and version information.
+  rpc GetServerStatus(GetServerStatusRequest) returns (GetServerStatusResponse);
+
+  // Register or update volunteer capabilities.
+  // Called on first connection and when hardware config changes.
+  // Upserts by public_key: new key = register, existing key = update.
+  rpc RegisterVolunteer(RegisterVolunteerRequest) returns (RegisterVolunteerResponse);
+
+  // Request a work unit matching volunteer capabilities.
+  // Returns NOT_FOUND status if no matching work available.
+  // Volunteer should poll with exponential backoff (1s, 2s, 4s, max 30s).
+  rpc RequestWorkUnit(RequestWorkUnitRequest) returns (RequestWorkUnitResponse);
+
+  // Submit result for a completed work unit.
+  // Includes output data and execution metadata.
+  rpc SubmitResult(SubmitResultRequest) returns (SubmitResultResponse);
+
+  // Send heartbeat during work unit execution.
+  // Must be called at leaf's configured interval (default: 5 min).
+  // Missing heartbeats trigger work unit abandonment.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Query status of a specific work unit.
+  rpc GetWorkUnitStatus(GetWorkUnitStatusRequest) returns (GetWorkUnitStatusResponse);
+
+  // Get head identity and active leaf discovery info.
+  rpc GetHeadInfo(GetHeadInfoRequest) returns (GetHeadInfoResponse);
+
+  // Save a checkpoint for a running work unit.
+  rpc SaveCheckpoint(SaveCheckpointRequest) returns (SaveCheckpointResponse);
+
+  // Get the latest checkpoint for a work unit.
+  rpc GetCheckpoint(GetCheckpointRequest) returns (GetCheckpointResponse);
+
+  // Abandon a work unit that the volunteer cannot execute (e.g., prepare failed).
+  // Server marks the assignment as ABANDONED and requeues the work unit.
+  rpc AbandonWorkUnit(AbandonWorkUnitRequest) returns (AbandonWorkUnitResponse);
+}
+
+// --- Existing v0.1 messages (unchanged) ---
+
+message GetServerStatusRequest {}
+
+message GetServerStatusResponse {
+  string status = 1;
+  string version = 2;
+  int64 uptime_seconds = 3;
+  string database_status = 4;
+}
+
+// --- v0.3 messages ---
+
+message RegisterVolunteerRequest {
+  bytes public_key = 1;              // Ed25519 public key (32 bytes)
+  string display_name = 2;           // optional
+  HardwareCapabilities hardware = 3;
+  repeated string available_runtimes = 4; // ["NATIVE", "CONTAINER"]
+  string scheduling_mode = 5;        // ALWAYS, WHEN_IDLE, SCHEDULED
+}
+
+message RegisterVolunteerResponse {
+  string volunteer_id = 1;           // assigned UUID
+  bool registered = 2;               // true if new registration, false if updated existing
+}
+
+message RequestWorkUnitRequest {
+  string volunteer_id = 1;
+  bytes public_key = 2;              // for auth verification
+  repeated string project_ids = 3;   // DEPRECATED: use leaf_ids
+  repeated string blocked_project_ids = 4; // DEPRECATED: use blocked_leaf_ids
+  HardwareCapabilities current_available = 5; // current free resources
+  repeated string leaf_ids = 6;      // empty = any matching leaf
+  repeated string blocked_leaf_ids = 7;
+}
+
+message RequestWorkUnitResponse {
+  string work_unit_id = 1;
+  string project_id = 2;            // DEPRECATED: use leaf_id
+  string runtime = 3;               // native, container, etc.
+  bytes input_data = 4;             // inline data (< 1 MB)
+  string input_data_url = 5;        // URL for external data
+  string code_artifact_url = 6;     // URL to download code/binary
+  string parameters_json = 7;       // parameter set as JSON string
+  int32 deadline_seconds = 8;
+  int32 heartbeat_interval_seconds = 9;
+  map<string, string> env_vars = 10;
+  ExecutionSpec execution_spec = 11;
+  bool has_checkpoint = 15;                   // true if a checkpoint exists for this reassigned WU
+  int32 checkpoint_sequence = 16;             // sequence number of the latest checkpoint
+  int32 checkpoint_interval_seconds = 17;     // from leaf's fault_tolerance_config
+  string leaf_id = 18;
+  double rsc_fpops_est = 19;                  // estimated FP ops for this work unit (for time estimates)
+}
+
+message SubmitResultRequest {
+  string work_unit_id = 1;
+  string volunteer_id = 2;
+  bytes public_key = 3;
+  bytes output_data = 4;            // inline result (< 100 MB)
+  string output_data_url = 5;       // URL if uploaded externally
+  string output_checksum_sha256 = 6;
+  ExecutionMetadata metadata = 7;
+}
+
+message SubmitResultResponse {
+  string result_id = 1;
+  bool accepted = 2;                // false if duplicate or invalid
+  string message = 3;
+}
+
+message HeartbeatRequest {
+  string work_unit_id = 1;
+  string volunteer_id = 2;
+  string status = 3;                // RUNNING, CHECKPOINT_SAVED
+  double progress_pct = 4;          // 0.0-1.0, optional estimate
+  ExecutionMetadata current_metrics = 5;
+}
+
+message HeartbeatResponse {
+  bool continue_execution = 1;      // false = abort (leaf paused/cancelled)
+  string message = 2;
+}
+
+message GetWorkUnitStatusRequest {
+  string work_unit_id = 1;
+  string volunteer_id = 2;
+}
+
+message GetWorkUnitStatusResponse {
+  string work_unit_id = 1;
+  string state = 2;                 // ASSIGNED, RUNNING, COMPLETED, etc.
+  string message = 3;
+}
+
+// --- v0.9 Checkpointing messages ---
+
+message SaveCheckpointRequest {
+  string work_unit_id = 1;
+  string volunteer_id = 2;
+  string public_key = 3;
+  bytes checkpoint_data = 4;        // opaque blob, max size configurable (default 100 MB)
+  int32 checkpoint_sequence = 5;    // must be > current sequence for this work unit
+}
+
+message SaveCheckpointResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message GetCheckpointRequest {
+  string work_unit_id = 1;
+}
+
+message GetCheckpointResponse {
+  bool has_checkpoint = 1;
+  bytes checkpoint_data = 2;
+  int32 checkpoint_sequence = 3;
+  string created_by_volunteer_id = 4;
+  string created_at = 5;            // RFC 3339
+}
+
+// --- Shared sub-messages ---
+
+message HardwareCapabilities {
+  int32 cpu_cores = 1;
+  string cpu_model = 2;
+  int32 max_cpu_cores = 3;
+  int32 memory_total_mb = 4;
+  int32 max_memory_mb = 5;
+  int64 disk_available_mb = 6;
+  int64 max_disk_mb = 7;
+  int32 max_bandwidth_mbps = 8;
+  repeated GpuInfo gpus = 9;
+  double benchmark_fpops = 10;       // CPU benchmark: floating-point ops per second
+}
+
+message GpuInfo {
+  string model = 1;
+  string vendor = 2;          // nvidia, amd
+  int32 vram_mb = 3;
+  int32 max_vram_pct = 4;
+  string compute_capability = 5;
+}
+
+message ExecutionMetadata {
+  int64 wall_clock_seconds = 1;
+  double cpu_seconds_user = 2;
+  double cpu_seconds_system = 3;
+  int32 cpu_cores_used = 4;
+  double gpu_seconds = 5;
+  string gpu_model = 6;
+  int32 gpu_vram_used_mb = 7;
+  int32 peak_memory_mb = 8;
+  int64 disk_read_mb = 9;
+  int64 disk_write_mb = 10;
+  int64 network_rx_mb = 11;
+  int64 network_tx_mb = 12;
+}
+
+message ExecutionSpec {
+  map<string, string> binaries = 1;  // platform -> URL (native)
+  string image = 2;                   // OCI image ref (container)
+  bool gpu_required = 3;
+  string gpu_type = 4;
+  int32 max_memory_mb = 5;
+  int32 max_disk_mb = 6;
+  bool network_access = 7;
+  // binary_checksums maps each platform key in `binaries` to the lowercase hex
+  // SHA-256 of the artifact at that URL. Volunteers verify the downloaded bytes
+  // against this digest before execution (integrity / anti-tamper). For NATIVE
+  // runtime leafs a checksum is REQUIRED for every binaries entry; for
+  // wasm/viz/container it is optional but verified when present.
+  map<string, string> binary_checksums = 8;
+}
+
+// --- v0.9.0.1 Head & Leaf discovery ---
+
+message GetHeadInfoRequest {}
+
+message GetHeadInfoResponse {
+  string name = 1;
+  string description = 2;
+  string url = 3;
+  repeated LeafInfo leafs = 4;
+  map<string, int32> default_leaf_weights = 5;
+}
+
+message LeafInfo {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string description = 4;
+  repeated string research_area = 5;
+  string task_pattern = 6;
+  string state = 7;
+  int32 queued_work_units = 8;
+  int32 active_volunteers = 9;
+  ExecutionSpec execution_spec = 10;  // runtime badges for desktop/browser clients
+}
+
+// --- AbandonWorkUnit ---
+
+message AbandonWorkUnitRequest {
+  string work_unit_id = 1;
+  string volunteer_id = 2;
+  bytes public_key = 3;
+  string reason = 4;              // e.g., "prepare failed: no binary for platform"
+}
+
+message AbandonWorkUnitResponse {
+  bool requeued = 1;              // true if work unit was put back in the queue
+  string message = 2;
+}

@@ -1,0 +1,80 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+bin/
+dist/
+target/
+.next/
+out/
+*.exe
+
+# Compiled binaries & release artifacts (rebuildable — excluded from the reset repo)
+release-*/
+*.msi
+*.msi.sha256
+/lettuce-volunteer
+/lettuce-volunteer-linux-amd64
+/lettuce-volunteer-windows-amd64
+/lettuce-volunteer-darwin-amd64
+/lettuce-volunteer-darwin-arm64
+
+# Windows reserved-name junk file (breaks git checkout on Windows)
+NUL
+
+# Compiled Go/WASM example & service binaries (build outputs — source is kept)
+*.wasm
+*-linux
+*-linux-amd64
+*-linux-arm64
+*-darwin-amd64
+*-darwin-arm64
+*-windows-amd64
+/services/infrastructure/lettuce-head
+/services/infrastructure/lettuce-server
+
+# Environment and secrets
+.env
+.env.local
+.env*.local
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# Runtime secret/artifact dirs (bind-mounted by compose.production.yaml) — keep dir, drop contents
+keys/*
+!keys/.gitkeep
+binaries/*
+!binaries/.gitkeep
+
+# Test and coverage
+coverage/
+coverage.out
+*.test
+
+# Python (container examples)
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Bundled third-party installers (download during build)
+apps/volunteer-desktop/src-tauri/resources/*.msi
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Security review tracker (internal, not for the public repo)
+/SECURITY.md
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts

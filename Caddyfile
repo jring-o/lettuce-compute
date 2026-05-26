@@ -1,0 +1,52 @@
+your-domain.com {
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+
+	# gRPC — detect via content-type, proxy to infrastructure over h2c
+	@grpc header Content-Type application/grpc*
+	handle @grpc {
+		reverse_proxy infrastructure:9090 {
+			transport http {
+				versions h2c
+			}
+		}
+	}
+
+	# Docker registry — anonymous pull, authenticated push/delete
+	handle /v2/* {
+		@registry_write method PUT PATCH POST DELETE
+		basicauth @registry_write {
+			{$REGISTRY_USER} {$REGISTRY_PASS_HASH}
+		}
+		reverse_proxy registry:5000
+	}
+
+	handle /binaries/* {
+		root * /srv
+		file_server
+	}
+
+	# REST API — plain HTTP to infrastructure (Caddy terminates TLS)
+	handle /api/v1/* {
+		reverse_proxy infrastructure:8080
+	}
+
+	handle {
+		reverse_proxy dashboard:3000
+	}
+}
+
+# Viz bundle subdomain — serves viz content in a separate origin for iframe isolation
+viz.your-domain.com {
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	header Content-Security-Policy "frame-ancestors https://your-domain.com"
+	reverse_proxy dashboard:3000
+}
+
+# HTTP to HTTPS redirect
+http://your-domain.com {
+	redir https://{host}{uri} permanent
+}
+
+http://viz.your-domain.com {
+	redir https://{host}{uri} permanent
+}

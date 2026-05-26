@@ -1,0 +1,396 @@
+package workunit
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"strconv"
+
+	"github.com/lettuce-compute/infrastructure/internal/apierror"
+	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/logging"
+	"github.com/lettuce-compute/infrastructure/internal/types"
+)
+
+// GenerateFunc is the signature for pattern-specific work unit generators.
+// It breaks the import cycle between workunit and generator packages.
+type GenerateFunc func(
+	ctx context.Context,
+	proj *leaf.Leaf,
+	parameterSpace map[string]interface{},
+	batchSize int,
+	wuRepo WorkUnitRepository,
+	batchRepo BatchRepository,
+) (*GenerateResult, error)
+
+// GenerateResult is returned after successfully generating work units.
+type GenerateResult struct {
+	BatchIDs         []types.ID `json:"batch_ids"`
+	WorkUnitsCreated int        `json:"work_units_created"`
+	Status           string     `json:"status"`
+}
+
+// WorkUnitHandler handles HTTP requests for work unit operations.
+type WorkUnitHandler struct {
+	wuRepo     WorkUnitRepository
+	batchRepo  BatchRepository
+	leafRepo   leaf.Repository
+	assignRepo assignment.Repository // optional; enables closing assignment outcomes on requeue
+	generate   GenerateFunc
+	logger     *slog.Logger
+}
+
+// SetAssignmentRepo wires the assignment-history repository so operator requeue
+// can close the active assignment row (mirrors the fault monitor). Without it,
+// a requeued unit's open assignment-history row keeps the prior volunteer
+// permanently excluded from reassignment (see FindNextAssignable's outcome
+// IS NULL exclusion). Optional so existing constructor call sites are unchanged.
+func (h *WorkUnitHandler) SetAssignmentRepo(r assignment.Repository) {
+	h.assignRepo = r
+}
+
+// NewWorkUnitHandler creates a new WorkUnitHandler.
+func NewWorkUnitHandler(
+	wuRepo WorkUnitRepository,
+	batchRepo BatchRepository,
+	leafRepo leaf.Repository,
+	generate GenerateFunc,
+	logger *slog.Logger,
+) *WorkUnitHandler {
+	return &WorkUnitHandler{
+		wuRepo:    wuRepo,
+		batchRepo: batchRepo,
+		leafRepo:  leafRepo,
+		generate:  generate,
+		logger:    logger,
+	}
+}
+
+// RegisterRoutes is a no-op; all work unit routes require auth and are
+// registered in the router with middleware wrappers.
+func (h *WorkUnitHandler) RegisterRoutes(mux *http.ServeMux) {}
+
+// HandleList handles GET /api/v1/projects/{leaf_id}/work-units (exported for auth wrapping).
+func (h *WorkUnitHandler) HandleList(w http.ResponseWriter, r *http.Request) {
+	h.handleList(w, r)
+}
+
+// HandleGet handles GET /api/v1/projects/{leaf_id}/work-units/{work_unit_id} (exported for auth wrapping).
+func (h *WorkUnitHandler) HandleGet(w http.ResponseWriter, r *http.Request) {
+	h.handleGet(w, r)
+}
+
+// HandleGenerate handles POST /api/v1/projects/{leaf_id}/work-units/generate (exported for auth wrapping).
+func (h *WorkUnitHandler) HandleGenerate(w http.ResponseWriter, r *http.Request) {
+	h.handleGenerate(w, r)
+}
+
+// HandleRequeue handles POST /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/requeue (exported for auth wrapping).
+func (h *WorkUnitHandler) HandleRequeue(w http.ResponseWriter, r *http.Request) {
+	h.handleRequeue(w, r)
+}
+
+// handleList handles GET /api/v1/projects/{leaf_id}/work-units.
+func (h *WorkUnitHandler) handleList(w http.ResponseWriter, r *http.Request) {
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
+
+	// Verify leaf exists.
+	if _, err := h.leafRepo.GetByID(r.Context(), leafID); err != nil {
+		l.Error("failed to get leaf for work unit list", "error", err, "leaf_id", leafID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	q := r.URL.Query()
+	filters := WorkUnitListFilters{
+		LeafID: &leafID,
+	}
+
+	// Parse state filter.
+	if v := q.Get("state"); v != "" {
+		state := WorkUnitState(v)
+		filters.State = &state
+	}
+
+	// Parse batch_id filter.
+	if v := q.Get("batch_id"); v != "" {
+		batchID, err := types.ParseID(v)
+		if err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid batch_id: must be a valid UUID", nil))
+			return
+		}
+		filters.BatchID = &batchID
+	}
+
+	// Parse priority filter.
+	if v := q.Get("priority"); v != "" {
+		priority := WorkUnitPriority(v)
+		filters.Priority = &priority
+	}
+
+	// Parse flagged_for_review filter.
+	if v := q.Get("flagged_for_review"); v != "" {
+		flagged, err := strconv.ParseBool(v)
+		if err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid flagged_for_review: must be true or false", nil))
+			return
+		}
+		filters.FlaggedForReview = &flagged
+	}
+
+	// Parse pagination.
+	page := types.PaginationRequest{
+		Cursor: q.Get("cursor"),
+	}
+	if v := q.Get("limit"); v != "" {
+		limit, err := strconv.Atoi(v)
+		if err != nil || limit < 1 || limit > types.MaxPageSize {
+			apierror.WriteError(w, apierror.ValidationError(
+				"invalid limit: must be an integer between 1 and 200", nil))
+			return
+		}
+		page.PageSize = limit
+	}
+
+	workUnits, pagination, err := h.wuRepo.List(r.Context(), filters, page)
+	if err != nil {
+		l.Error("failed to list work units", "error", err, "leaf_id", leafID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	summaries := make([]WorkUnitSummary, len(workUnits))
+	for i, wu := range workUnits {
+		summaries[i] = ToWorkUnitSummary(wu)
+	}
+
+	resp := types.NewListResponse(summaries, pagination)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleGet handles GET /api/v1/projects/{leaf_id}/work-units/{work_unit_id}.
+func (h *WorkUnitHandler) handleGet(w http.ResponseWriter, r *http.Request) {
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
+
+	workUnitID, err := types.ParseID(r.PathValue("work_unit_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid work_unit_id: must be a valid UUID", nil))
+		return
+	}
+
+	wu, err := h.wuRepo.GetByID(r.Context(), workUnitID)
+	if err != nil {
+		l.Error("failed to get work unit", "error", err, "work_unit_id", workUnitID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	// Verify work unit belongs to the specified leaf.
+	if wu.LeafID != leafID {
+		apierror.WriteError(w, apierror.NotFound("work_unit", workUnitID.String()))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, wu)
+}
+
+// handleRequeue resets a stuck work unit back to QUEUED so it can be reassigned.
+// Operator-authed (the router wraps it with requireAuth + requireLeafOwnership).
+// It exists for units stranded in ASSIGNED/RUNNING — e.g. a volunteer that
+// vanished mid-pull or mid-run — which for no_deadline leaves are never
+// auto-expired and would otherwise be orphaned with no way to reset them.
+// It reuses the same transition path as volunteer abandonment
+// (TransitionToExpired → Reassign).
+func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) {
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
+
+	workUnitID, err := types.ParseID(r.PathValue("work_unit_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid work_unit_id: must be a valid UUID", nil))
+		return
+	}
+
+	wu, err := h.wuRepo.GetByID(r.Context(), workUnitID)
+	if err != nil {
+		l.Error("requeue: failed to get work unit", "error", err, "work_unit_id", workUnitID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	// Scope to the leaf in the path (mirrors handleGet).
+	if wu.LeafID != leafID {
+		apierror.WriteError(w, apierror.NotFound("work_unit", workUnitID.String()))
+		return
+	}
+
+	switch wu.State {
+	case WorkUnitStateAssigned, WorkUnitStateRunning:
+		// Move to EXPIRED first so Reassign (EXPIRED|REJECTED → QUEUED) applies.
+		if _, err := h.wuRepo.TransitionToExpired(r.Context(), workUnitID); err != nil {
+			l.Error("requeue: failed to expire work unit", "error", err, "work_unit_id", workUnitID)
+			apierror.WriteError(w, apierror.FromError(err))
+			return
+		}
+		// Close the prior volunteer's open assignment-history row. Without this,
+		// FindNextAssignable permanently excludes that volunteer (outcome IS NULL)
+		// and the requeue is a no-op for them. Mirrors fault-monitor on expiry.
+		h.closeActiveAssignment(r.Context(), l, wu, assignment.OutcomeExpired)
+	case WorkUnitStateExpired, WorkUnitStateRejected:
+		// Already in a requeue-able state.
+	default:
+		apierror.WriteError(w, apierror.Conflict(
+			"work unit cannot be requeued from its current state",
+			map[string]string{"code": "INVALID_REQUEUE_STATE", "current_state": string(wu.State)},
+		))
+		return
+	}
+
+	updated, requeued, err := h.wuRepo.Reassign(r.Context(), workUnitID)
+	if err != nil {
+		l.Error("requeue: failed to reassign work unit", "error", err, "work_unit_id", workUnitID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	l.Info("work unit requeued by operator",
+		"work_unit_id", workUnitID, "leaf_id", leafID, "requeued", requeued, "state", updated.State)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"work_unit_id": workUnitID.String(),
+		"requeued":     requeued,
+		"state":        string(updated.State),
+	})
+}
+
+// closeActiveAssignment sets the outcome on the prior volunteer's open
+// assignment-history row so FindNextAssignable no longer excludes them.
+// Best-effort: the work unit is already requeued regardless. No-op when the
+// assignment repo isn't wired or the unit had no assigned volunteer.
+func (h *WorkUnitHandler) closeActiveAssignment(ctx context.Context, l *slog.Logger, wu *WorkUnit, outcome assignment.AssignmentOutcome) {
+	if h.assignRepo == nil || wu.AssignedVolunteerID == nil {
+		return
+	}
+	active, err := h.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, wu.ID, *wu.AssignedVolunteerID)
+	if err != nil {
+		l.Error("requeue: failed to find active assignment to close",
+			"work_unit_id", wu.ID, "volunteer_id", wu.AssignedVolunteerID, "error", err)
+		return
+	}
+	if err := h.assignRepo.UpdateOutcome(ctx, active.ID, outcome, nil); err != nil {
+		l.Error("requeue: failed to close assignment outcome",
+			"assignment_id", active.ID, "outcome", outcome, "error", err)
+	}
+}
+
+// handleGenerate handles POST /api/v1/projects/{leaf_id}/work-units/generate.
+func (h *WorkUnitHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
+
+	// Verify leaf exists.
+	proj, err := h.leafRepo.GetByID(r.Context(), leafID)
+	if err != nil {
+		l.Error("failed to get leaf for generation", "error", err, "leaf_id", leafID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	// Check leaf state — must be CONFIGURING or ACTIVE.
+	if proj.State != leaf.StateConfiguring && proj.State != leaf.StateActive {
+		apierror.WriteError(w, apierror.Conflict(
+			"leaf must be in CONFIGURING or ACTIVE state to generate work units",
+			map[string]string{
+				"code":          "INVALID_STATE_TRANSITION",
+				"current_state": string(proj.State),
+			},
+		))
+		return
+	}
+
+	var req GenerateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+		return
+	}
+
+	// Build parameter space for the generator. For map-reduce, input_data and
+	// input_data_ref are passed through parameterSpace since GenerateFunc uses
+	// a single map for all pattern-specific inputs.
+	parameterSpace := req.ParameterSpace
+	if parameterSpace == nil {
+		parameterSpace = make(map[string]interface{})
+	}
+
+	// Pass input_data / input_data_ref through parameterSpace for map-reduce.
+	if req.InputData != nil {
+		parameterSpace["input_data"] = req.InputData
+	}
+	if req.InputDataRef != nil {
+		parameterSpace["input_data_ref"] = *req.InputDataRef
+	}
+
+	// For parameter_sweep, fall back to leaf splitting_config if no parameter_space provided.
+	if len(parameterSpace) == 0 {
+		if proj.DataConfig.SplittingConfig != nil {
+			parameterSpace = proj.DataConfig.SplittingConfig
+		}
+	}
+	if len(parameterSpace) == 0 {
+		apierror.WriteError(w, apierror.ValidationError(
+			"parameter_space is required: not provided in request and leaf has no splitting_config", nil))
+		return
+	}
+
+	result, err := h.generate(r.Context(), proj, parameterSpace, req.BatchSize, h.wuRepo, h.batchRepo)
+	if err != nil {
+		l.Error("failed to generate work units", "error", err, "leaf_id", leafID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	if len(result.BatchIDs) == 0 {
+		l.Error("generate returned no batches", "leaf_id", leafID)
+		apierror.WriteError(w, apierror.Internal("generation produced no batches", nil))
+		return
+	}
+
+	resp := GenerateResponse{
+		BatchIDs:         result.BatchIDs,
+		WorkUnitsCreated: result.WorkUnitsCreated,
+		Status:           result.Status,
+	}
+
+	writeJSON(w, http.StatusAccepted, resp)
+}
+
+// writeJSON encodes v as JSON and writes it with the given status code.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
