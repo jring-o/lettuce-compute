@@ -37,9 +37,20 @@ examples are in `guides/examples/` (`monte-carlo-pi` native, `nbody-gravity` con
 4. **Verify before proceeding.** After each step, run its check. Fix failures from the real
    output; never move forward on a broken step.
 5. **Make user steps trivial.** Exact instructions, then ask for paste-back or a screenshot.
-6. **Confirm before generating a large sweep** (it can create thousands of work units) or
+6. **Always offer an "I don't know" choice.** Whenever you ask the user to pick between
+   options — native vs. container, validation mode, research area, parameter values,
+   anything — include an explicit **"Not sure / help me choose"** option. If they take it,
+   explain the trade-offs in plain language and recommend one for their situation, then
+   proceed with that recommendation unless they push back.
+7. **Confirm before generating a large sweep** (it can create thousands of work units) or
    anything hard to undo.
-7. **Never print secrets into the chat** (see *Secret handling*).
+8. **Never print secrets into the chat** (see *Secret handling*).
+9. **When the user must save a secret, make it impossible to lose.** Don't just say "save
+   it." Give explicit storage instructions (password manager: Bitwarden free, 1Password,
+   or KeePass) with the exact label to use, then call **`AskUserQuestion`** to confirm
+   they've saved it before continuing. For this skill, the main one is the **registry
+   push password** they saved during head setup — if they can't find it, help them rotate
+   it on the server before attempting a container push, rather than guessing.
 
 ## Who does what
 
@@ -65,6 +76,38 @@ ssh root@<IP> 'set -a; . ~/lettuce-compute/.env; set +a; \
   *Before you start* on the server.
 
 ## The flow
+
+### 0 — Orient
+
+**First, before any chat: sever the local clone's upstream (if it's still connected).**
+This skill is normally invoked from inside a local clone of `lettuce-compute`, and during
+leaf creation you'll be adapting code, writing scratch files, and possibly handling the
+registry password in this folder. An accidental `git push` from here must not be able to
+reach the public upstream:
+
+```bash
+git remote -v                # see what's connected (run in the current working directory)
+git remote remove origin     # if origin still points to jring-o/lettuce-compute (or a fork)
+git remote -v                # verify — should print nothing
+```
+
+- If there are already no remotes, you're good — say "already disconnected" and move on.
+  (The user likely ran the `deploy-lettuce-head` skill earlier, which sets this up.)
+- If `origin` points somewhere other than `jring-o/lettuce-compute` (e.g. their own fork
+  they actively work in), **ask before removing it** — offer *Remove it* / *Keep it (I
+  know what I'm doing)* / *Help me decide*.
+- This only affects the **local** working copy. The clone on the head's server keeps its
+  `origin` so the user can `git pull` updates in the future.
+
+Then tell the user plainly what's coming: "Now that your head is running, I'll help you
+turn a computation into a **leaf** that volunteers can run. I'll do the technical work —
+you just tell me what you want to compute and approve a few choices along the way."
+
+Then give them the escape hatch, in their own words: *"If at any point I say something you
+don't understand — a command, an acronym, a button name, anything — copy what I said,
+paste it back to me, and tell me 'I don't know what this means'. I'll explain it in plain
+language and help you decide. There are no dumb questions, and this offer stands for the
+whole session."* Say this once, up front, so they know it's always available.
 
 ### A — What are we computing?
 Ask, in plain terms, what they want to compute. Three cases:

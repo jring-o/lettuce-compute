@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  infrastructure:
+    name: Infrastructure (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/infrastructure
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/infrastructure/go.mod
+          cache-dependency-path: services/infrastructure/go.sum
+      - run: go vet ./...
+      - run: go test ./...
+
+  volunteer-cli:
+    name: Volunteer CLI (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/volunteer-cli
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/volunteer-cli/go.mod
+          cache-dependency-path: services/volunteer-cli/go.sum
+      - run: go vet ./...
+      - run: go test ./...
+
+  dashboard:
+    name: Dashboard (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: services/dashboard/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

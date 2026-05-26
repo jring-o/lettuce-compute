@@ -38,10 +38,24 @@ var names, and checks. This skill tells you *how to run it for the user*; the gu
    the real output and fix it. Never move forward on a broken step.
 5. **When you need the user, make it trivial.** Tell them exactly where to click or what to
    type. Then ask them to paste the output back, or share a screenshot. Wait for it.
-6. **Confirm before anything that costs money or is hard to undo** (creating a paid server,
+6. **Always offer an "I don't know" choice.** Whenever you ask the user to pick between
+   options — provider, registrar, password manager, anything — include an explicit
+   **"Not sure / help me choose"** option. If they take it, explain the trade-offs in plain
+   language and recommend one for their situation, then proceed with that recommendation
+   unless they push back.
+7. **Confirm before anything that costs money or is hard to undo** (creating a paid server,
    deleting data).
-7. **Never print secrets into the chat.** Generate them on the server and write them straight
+8. **Never print secrets into the chat.** Generate them on the server and write them straight
    into `.env`. (See *Secret handling*.)
+9. **When the user must save a secret, make it impossible to lose.** Don't just say "save
+   it." Give them explicit storage instructions: a **password manager** (Bitwarden — free;
+   1Password; or KeePass — free, offline) and the **exact label** to file it under (e.g.
+   *Lettuce admin — https://your-domain.com*). Then call **`AskUserQuestion`** to confirm
+   they've actually saved it, with options like *Yes — saved* / *Not yet, wait while I
+   save it* / *Help me pick a password manager*. Do not proceed past a save step until
+   they confirm. Never drop sensitive files into a user-project-looking folder (e.g.
+   `Documents/<name>/`) by default — use a temp directory and have them move it into a
+   vault, then delete the temp copy.
 
 ## Who does what
 
@@ -59,10 +73,41 @@ Do these in order. For each: who acts, the action, and the **check** that must p
 you continue. Use the exact commands from `guides/head-setup.md`.
 
 ### 0 — Orient
-Tell the user what's coming, plainly: "We'll get you a server, point your domain at it, and
-I'll install and configure everything. About 20 minutes. I'll handle the technical parts and
-only ask you for a few things I can't do for you." Then ask two questions: **Do you already
-have (a) a server, and (b) a domain name?** Branch on their answers.
+
+**First, before any chat: sever the local clone's upstream.** This skill is normally
+invoked from inside a local clone of `lettuce-compute` (the user opened it in their
+editor and ran the prompt from `README.md`). Anything that ends up in this folder during
+setup — a scratch note, a temp file, even a misplaced secret — is a leak risk if
+`git push` ever runs from here. The fix is to detach this *local* working copy from the
+public upstream **immediately**:
+
+```bash
+git remote -v                # see what's connected (run in the current working directory)
+git remote remove origin     # if origin points to jring-o/lettuce-compute (or a fork of it)
+git remote -v                # verify — should print nothing
+```
+
+- If there are already no remotes, say so and move on (idempotent — fine to re-run).
+- If `origin` points somewhere *other* than `jring-o/lettuce-compute` (e.g. the user's own
+  fork they actively work in), **ask before removing it** — offer *Remove it* /
+  *Keep it (I know what I'm doing)* / *Help me decide*.
+- This only affects the **local** working copy. The clone you'll later make on the
+  **server** (Step 4) keeps its `origin` so the user can `git pull` updates in the future.
+
+Then tell the user what's coming, plainly: "We'll get you a server, point your domain at
+it, and I'll install and configure everything. About 20 minutes. I'll handle the technical
+parts and only ask you for a few things I can't do for you. (I just disconnected this
+local folder from the public Lettuce repo as a safety precaution — that way nothing we
+do here can accidentally get pushed back.)"
+
+Then give them the escape hatch, in their own words: *"If at any point I say something you
+don't understand — a command, an acronym, a button name, anything — copy what I said,
+paste it back to me, and tell me 'I don't know what this means'. I'll explain it in plain
+language and help you decide. There are no dumb questions, and this offer stands for the
+whole session."* Say this once, up front, so they know it's always available.
+
+Then ask two questions: **Do you already have (a) a server, and (b) a domain name?** Branch
+on their answers.
 
 ### 1 — [user] Get a server
 If they don't have one, walk them through it click-by-click (default to **DigitalOcean**
@@ -87,14 +132,35 @@ Over SSH, run head-setup.md Steps 3–4.
 `ssh root@<IP> 'git clone https://github.com/jring-o/lettuce-compute.git'` (head-setup.md
 Step 5). **Check:** `~/lettuce-compute/compose.production.yaml` exists.
 
+Leave the **server** clone's `origin` connected — the user will want it to `git pull`
+future updates. The leak risk lived in the *local* clone (already detached in Step 0);
+the server clone is a fresh checkout that should never contain anything the user is
+authoring or committing in the first place. `.env` and `keys/signing.key` live alongside
+the code but are protected by `chmod 600` and the absence of any `git add` step.
+
 ### 5 — [you] Secrets + `.env`
 Ask the user **only** for the human-meaningful values: their **admin email**, an **admin
-password** they'll remember (dashboard login), and a **head name** (what volunteers see).
+password** (dashboard login — they'll use it every sign-in), and a **head name** (what
+volunteers see).
+
+**Before they finalize the admin password, give explicit storage instructions:** "Save
+this in a password manager — Bitwarden (free), 1Password, or KeePass (free, offline). The
+entry should be labeled **Lettuce admin — https://your-domain.com**, with your email as
+the username." Then call **`AskUserQuestion`** with options like *Yes — saved* / *Not
+yet, wait while I save it* / *Help me pick a password manager*. Do not continue until
+they confirm.
+
 You already know the domain. Generate everything else (`POSTGRES_PASSWORD`,
 `NEXTAUTH_SECRET`, `LETTUCE_ADMIN_API_KEY`, `DASHBOARD_API_KEY`) with `openssl rand -base64 32`
 **on the server**, and the registry password + its hash (head-setup.md Step 6). Write `.env`
-directly on the server and `chmod 600` it. Show the user the **registry password once** and
-tell them to save it (needed later to push container images).
+directly on the server and `chmod 600` it.
+
+Show the user the **registry password once** with the same kind of storage instructions:
+"Save this in your password manager. Label it **Lettuce registry — <domain>**, username
+`lettuce`. You'll need it later when you push container images for computations." Then
+call **`AskUserQuestion`** again — same three options — to confirm they've saved it
+before moving on. (If they ever lose it, it can be rotated; saving it now avoids that
+hassle.)
 
 **Domain-substituted values to set in `.env`** (not random — derived from the user's domain):
 
@@ -127,9 +193,27 @@ if `keys/signing.key` is missing — it no longer silently auto-generates in pro
 Run `openssl genpkey -algorithm ed25519 -out keys/signing.key` in the repo root on the
 server (so the file ends up at `./keys/signing.key`, which `compose.production.yaml`
 mounts read-only at `/keys/signing.key`).
-**Check:** `ls -l keys/signing.key` shows the file exists and is non-empty. Tell the user
-to back it up privately (losing it changes the head's signing identity and breaks
-verification of every prior attestation).
+**Check:** `ls -l keys/signing.key` shows the file exists and is non-empty.
+
+Now **back it up off-server, safely**. The user must own a copy: if the server dies and
+the key is gone, the head's signing identity is lost and no prior attestation can ever
+be verified against this head again.
+
+1. `scp` it down to a **temp directory** on the user's machine — never into their
+   Documents tree or anything that could be (or become) a git repo:
+   - Windows: `scp root@<IP>:~/lettuce-compute/keys/signing.key "$env:TEMP\<head-name>-signing.key"`
+   - macOS/Linux: `scp root@<IP>:~/lettuce-compute/keys/signing.key /tmp/<head-name>-signing.key`
+2. Give explicit storage instructions: "This is a tiny (119-byte) private key. Save it as
+   a **secure file attachment** on your *Lettuce admin* password-manager entry, **or**
+   into an encrypted vault (e.g. a VeraCrypt container, or an encrypted disk image on
+   macOS). **Do not** leave it loose in Documents, Desktop, Downloads, or any project
+   folder, and **never** commit it to git."
+3. Call **`AskUserQuestion`**: *Yes — backed up into my vault* / *Not yet — wait* /
+   *Help me back it up (recommend Bitwarden file attachment)*. Do not continue until
+   they confirm.
+4. **Delete the temp copy** once they've confirmed the backup is in their vault:
+   - Windows: `Remove-Item "$env:TEMP\<head-name>-signing.key"`
+   - macOS/Linux: `rm /tmp/<head-name>-signing.key`
 
 ### 8 — [you] Start the stack
 head-setup.md Step 9. **If the server has ≤ 1 GB RAM, build images one at a time** to avoid
@@ -150,11 +234,21 @@ walk you through it." → hand off to the **`create-lettuce-leaf`** skill.
 
 ## Secret handling
 
-- Generate secrets on the server; write them straight into `.env`. **Never echo a full secret
-  value into the chat.** The one exception is the registry push password (the user needs it
-  later) — show it once and tell them to store it in a password manager.
-- `chmod 600 .env`; never `git add` it. `keys/signing.key` stays on the server — the user
-  backs it up privately.
+- Generate machine secrets on the server; write them straight into `.env`. **Never echo a
+  full secret value into the chat.**
+- Three things the **user** must save themselves — for each, give explicit storage
+  instructions (password manager + exact label) and verify with **`AskUserQuestion`**
+  before continuing (see rule #9 in *How to behave*):
+  1. The **admin password** they chose (dashboard sign-in).
+  2. The **registry push password** (shown once on the server; needed later for image pushes).
+  3. The **signing-key backup** (`keys/signing.key`, scp'd to a temp dir, then moved into
+     their vault, then the temp copy deleted).
+- `chmod 600 .env`; never `git add` it. The **local** clone (the working folder the user
+  opened in their editor) has its `origin` remote removed in Step 0 so that an accidental
+  `git push` from their editor cannot leak any setup artifact — scratch files, temp
+  copies, anything — to the public upstream. The **server** clone keeps its `origin` so
+  the user can `git pull` updates later; it should never contain anything they're
+  authoring or committing, so the upstream connection is safe there.
 - Prefer SSH keys over having the user paste a root password into chat.
 
 ## If a step fails

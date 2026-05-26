@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build CLI and create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/volunteer-cli/go.mod
+          cache-dependency-path: services/volunteer-cli/go.sum
+
+      - name: Set version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Cross-compile lettuce-volunteer (5 platforms)
+        working-directory: services/volunteer-cli
+        env:
+          GOWORK: "off"
+          CGO_ENABLED: "0"
+        run: |
+          LDFLAGS="-X github.com/lettuce-compute/volunteer-cli/internal/cli.version=${VERSION}"
+          mkdir -p ../../dist
+
+          build() {
+            local goos=$1 goarch=$2 ext=$3
+            local out="lettuce-volunteer-${goos}-${goarch}${ext}"
+            echo "Building ${out}..."
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath \
+              -ldflags "${LDFLAGS}" \
+              -o "../../dist/${out}" \
+              ./cmd/lettuce-volunteer/
+          }
+
+          build linux   amd64 ""
+          build linux   arm64 ""
+          build windows amd64 ".exe"
+          build darwin  amd64 ""
+          build darwin  arm64 ""
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          for f in *; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
