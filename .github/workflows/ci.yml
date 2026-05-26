@@ -24,8 +24,8 @@ jobs:
     env:
       GOWORK: "off"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: services/infrastructure/go.mod
           cache-dependency-path: services/infrastructure/go.sum
@@ -41,8 +41,8 @@ jobs:
     env:
       GOWORK: "off"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: services/volunteer-cli/go.mod
           cache-dependency-path: services/volunteer-cli/go.sum
@@ -56,7 +56,7 @@ jobs:
       run:
         working-directory: services/dashboard
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: 20
