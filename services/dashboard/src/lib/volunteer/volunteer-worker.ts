@@ -36,7 +36,7 @@ async function getOrCompileModule(url: string): Promise<WebAssembly.Module> {
   if (cached) return cached;
 
   const response = fetch(url);
-  const module = await WebAssembly.compileStreaming(response);
+  const wasmModule = await WebAssembly.compileStreaming(response);
 
   // Evict oldest entry if cache is full (Map iteration order = insertion order).
   if (moduleCache.size >= MAX_MODULE_CACHE_SIZE) {
@@ -46,8 +46,8 @@ async function getOrCompileModule(url: string): Promise<WebAssembly.Module> {
     }
   }
 
-  moduleCache.set(url, module);
-  return module;
+  moduleCache.set(url, wasmModule);
+  return wasmModule;
 }
 
 async function executeWorkUnit(
@@ -101,9 +101,9 @@ async function executeWorkUnit(
     return;
   }
 
-  let module: WebAssembly.Module;
+  let wasmModule: WebAssembly.Module;
   try {
-    module = await getOrCompileModule(wasmUrl);
+    wasmModule = await getOrCompileModule(wasmUrl);
   } catch (err) {
     post({
       type: "error",
@@ -122,7 +122,7 @@ async function executeWorkUnit(
   const imports = wasi.getImports();
   let instance: WebAssembly.Instance;
   try {
-    instance = await WebAssembly.instantiate(module, imports);
+    instance = await WebAssembly.instantiate(wasmModule, imports);
   } catch (err) {
     post({
       type: "error",

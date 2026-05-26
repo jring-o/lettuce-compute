@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Copy, Check, Terminal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -71,12 +72,12 @@ export function ContributeSection({ serverHost }: ContributeSectionProps) {
         </ol>
         <p className="text-xs text-muted-foreground">
           Your contributions will be automatically tracked and credited.{" "}
-          <a
+          <Link
             href="/"
             className="underline hover:text-foreground"
           >
             Learn more about volunteering
-          </a>
+          </Link>
         </p>
       </CardContent>
     </Card>

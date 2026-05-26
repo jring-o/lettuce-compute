@@ -100,6 +100,7 @@ export function WorkUnitTable({ leafId }: WorkUnitTableProps) {
 
   useEffect(() => {
     let cancelled = false;
+    // eslint-disable-next-line react-compiler/react-compiler -- intentional loading toggle when filters change; deps stable so no cascade
     setLoading(true);
     fetchWorkUnits().then((result) => {
       if (cancelled) return;

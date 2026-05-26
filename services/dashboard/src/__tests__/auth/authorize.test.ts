@@ -57,7 +57,9 @@ jest.mock("next-auth/providers/credentials", () => {
   };
 });
 
-// Import triggers NextAuth() which captures authorize
+// Import triggers NextAuth() which captures authorize.
+// require() (not import) so this runs AFTER the jest.mock setups above.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 require("@/lib/auth");
 
 function setupDbReturn(user: Record<string, unknown> | undefined) {

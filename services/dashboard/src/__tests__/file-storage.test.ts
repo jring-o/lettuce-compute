@@ -1,5 +1,3 @@
-import { randomUUID } from "crypto";
-
 // --- Mocks ---
 
 const mockMkdir = jest.fn().mockResolvedValue(undefined);
@@ -61,6 +59,7 @@ jest.mock("@/lib/db/schema", () => ({
 
 // Mock crypto.randomUUID to return a predictable value
 const mockUUID = "test-uuid-1234";
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.spyOn(
   require("crypto") as { randomUUID: () => string },
   "randomUUID",
