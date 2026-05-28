@@ -109,7 +109,36 @@ paste it back to me, and tell me 'I don't know what this means'. I'll explain it
 language and help you decide. There are no dumb questions, and this offer stands for the
 whole session."* Say this once, up front, so they know it's always available.
 
-### A — What are we computing?
+### A — What slug? Read the spec.
+
+**First ask:** *"What's the slug of the leaf you want to build?"* (One
+word, kebab-case, the directory name under `leafs/`.)
+
+Then check whether the design has already been done:
+
+```bash
+ls lettuce-compute/leafs/<slug>/leaf-spec.md 2>/dev/null
+```
+
+- **If the spec exists:** read it. It answers what's being computed,
+  the parameter sweep, the output schema, the validation strategy, the
+  runtime, the cost shape, and the aggregation. Don't re-ask any of
+  those questions; confirm the spec with the user in one sentence
+  (*"I see a spec for ising-model — Metropolis MC sweep over
+  lattice_size × temperature × seed, WASM runtime, redundancy 1, EXACT
+  comparison. Sound right?"*) and proceed to Step B already knowing
+  most of the answers.
+- **If the spec doesn't exist:** offer to run `design-lettuce-leaf`
+  first. It's the conversation that produces `leaf-spec.md`. If the
+  user wants to skip the design step entirely, proceed below — but
+  flag that you'll be improvising decisions the spec would have
+  pinned down.
+
+Everything you write — the entrypoint, Dockerfile, build script,
+sample params, READMEs — goes into `lettuce-compute/leafs/<slug>/`.
+Don't scatter files across the repo.
+
+### A.1 — What are we computing? (fallback if no spec)
 Ask, in plain terms, what they want to compute. Three cases:
 1. **They have code** → you adapt it to the contract (Step C).
 2. **They have a method but no code** → you write it with them, honoring the contract.
@@ -192,6 +221,33 @@ The first-leaf.md examples use `10485760` (10 MiB) which is a sane default for m
 
 **Check:** GET the leaf → `state` is `ACTIVE`.
 
+### F.5 — Persist the leaf's identity
+
+Once the head has accepted the leaf and returned an `id` and `slug`,
+write `lettuce-compute/leafs/<slug>/.lettuce.json` with:
+
+```json
+{
+  "leaf_id": "<uuid the head assigned>",
+  "slug": "<slug the head assigned>",
+  "name": "<name as set on the head>",
+  "head_url": "<INFRASTRUCTURE_BASE_URL>",
+  "state": "ACTIVE",
+  "created_at": "<ISO timestamp>"
+}
+```
+
+This is the **handoff artifact** for any downstream skill. Platform
+operators (e.g. SciOS Compute) will run `register-leaf-on-scios` next,
+which reads `.lettuce.json` to find the leaf without re-asking. Even
+for non-platform deployments, this file is the durable record of
+"which leaf this directory represents."
+
+If the head's slug differs from the user's chosen directory name
+(slug normalization), write both — `slug` is the head's canonical
+slug; the directory name is a local convenience. Don't rename the
+directory.
+
 ### G — Generate work units
 Translate the user's "I'd like to run these values" into a `parameter_space`. **Start small**
 (a handful of units) and confirm the pipeline works before scaling. For `PARAMETER_SWEEP`
@@ -222,6 +278,23 @@ output, interpret it, continue with the same steps and checks. Same procedure �
 types it changes.
 
 ## When done
-The leaf is live and computing. Remind the user how to **add more work units later**,
-**pause/resume**, and **collect results** — all in `guides/first-leaf.md` ("Operating your
-leaf").
+The leaf is live and computing. The directory
+`lettuce-compute/leafs/<slug>/` now holds everything that defines it:
+the wrapper code, the spec, sample params, and `.lettuce.json` (the
+durable record of the head's `leaf_id` and `slug`).
+
+**Hand off cleanly:**
+
+- For **platform operators** (SciOS Compute or similar) — tell the
+  user to `cd` into the platform repo and run the platform's
+  registration skill (e.g. `register-leaf-on-scios`), passing the
+  same slug. That skill reads `.lettuce.json` and inserts the
+  platform-side ownership row.
+- For **standalone heads with no platform layer** — the leaf is
+  already discoverable on the head's own listing. No further step
+  needed; the user can manage it via the head's REST API or
+  dashboard.
+
+Remind the user how to **add more work units later**, **pause/resume**,
+and **collect results** — all in `guides/first-leaf.md` ("Operating
+your leaf").
