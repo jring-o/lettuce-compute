@@ -6,7 +6,7 @@ A distributed volunteer compute platform. Researchers run a server (a **head**) 
 
 ## How it works
 
-Someone runs a Lettuce server — a **head** — and creates one or more **leafs** (computations). **Volunteers** run the CLI, attach to one or more heads, and crunch work units. Results are validated and credit is tracked automatically.
+Someone runs a Lettuce server — a **head** — and creates one or more **leafs** (computational projects). **Volunteers** run the CLI/GUI, attach to one or more heads, and crunch work units. Results are validated and credit is tracked automatically.
 
 ```
 Head operator                        Volunteers

@@ -75,6 +75,9 @@ Thumbs.db
 # Security review tracker (internal, not for the public repo)
 /SECURITY.md
 
+# Operator notes (cross-project blockers/follow-ups, not for the public repo)
+/TODO.md
+
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
