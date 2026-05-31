@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"text/tabwriter"
 
@@ -26,9 +25,8 @@ func runProjects(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseSlogLevel(cfg.LogLevel),
-	}))
+	logger, closeLogger := newLogger(cfg)
+	defer closeLogger()
 	mgr := project.NewManager(cfg, cfgPath, logger)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)

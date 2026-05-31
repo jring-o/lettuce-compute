@@ -41,6 +41,16 @@ type Config struct {
 	WorkBufferSize     int    `yaml:"work_buffer_size"`
 	LogLevel           string `yaml:"log_level"`
 	ResultCacheMaxMB   int    `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
+
+	// Logging output. By default logs are written to both stderr and a
+	// size-rotated JSON file under <DataDir>/logs/ so problems remain
+	// debuggable after the fact with no manual stderr redirection.
+	LogFile       string `yaml:"log_file,omitempty"` // log file path; empty = <DataDir>/logs/volunteer.log
+	LogToFile     bool   `yaml:"log_to_file"`        // write logs to the rotating file (default true)
+	LogToStderr   bool   `yaml:"log_to_stderr"`      // write logs to stderr (default true)
+	LogMaxSizeMB  int    `yaml:"log_max_size_mb"`    // rotate after the file reaches this size (default 10)
+	LogMaxBackups int    `yaml:"log_max_backups"`    // number of rotated files to retain (default 5)
+	LogMaxAgeDays int    `yaml:"log_max_age_days"`   // max age of rotated files in days (default 0 = no limit)
 }
 
 // ThermalConfig controls thermal monitoring thresholds.
@@ -186,8 +196,22 @@ func Defaults() *Config {
 		},
 		MaxConcurrentTasks: 1,
 		LogLevel:           "info",
+		LogToFile:          true,
+		LogToStderr:        true,
+		LogMaxSizeMB:       10,
+		LogMaxBackups:      5,
+		LogMaxAgeDays:      0,
 		ResultCacheMaxMB:   500,
 	}
+}
+
+// LogFilePath returns the resolved log file path: the explicit LogFile when
+// set, otherwise <DataDir>/logs/volunteer.log.
+func (c *Config) LogFilePath() string {
+	if c.LogFile != "" {
+		return c.LogFile
+	}
+	return filepath.Join(c.DataDir, "logs", "volunteer.log")
 }
 
 // Load reads and parses a YAML config file. Returns defaults if the file doesn't exist.
@@ -305,6 +329,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("log_level must be debug, info, warn, or error, got %q", c.LogLevel)
 	}
 
+	if c.LogMaxSizeMB < 0 {
+		return fmt.Errorf("log_max_size_mb must be >= 0, got %d", c.LogMaxSizeMB)
+	}
+	if c.LogMaxBackups < 0 {
+		return fmt.Errorf("log_max_backups must be >= 0, got %d", c.LogMaxBackups)
+	}
+	if c.LogMaxAgeDays < 0 {
+		return fmt.Errorf("log_max_age_days must be >= 0, got %d", c.LogMaxAgeDays)
+	}
+
 	// Container backend validation.
 	validBackends := map[string]bool{"": true, "podman": true, "docker": true}
 	if !validBackends[c.ContainerBackend] {
@@ -355,6 +389,38 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 		c.VolunteerID = value
 	case "log_level":
 		c.LogLevel = value
+	case "log_file":
+		c.LogFile = value
+	case "log_to_file":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid boolean for %s: %w", dotPath, err)
+		}
+		c.LogToFile = v
+	case "log_to_stderr":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid boolean for %s: %w", dotPath, err)
+		}
+		c.LogToStderr = v
+	case "log_max_size_mb":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.LogMaxSizeMB = v
+	case "log_max_backups":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.LogMaxBackups = v
+	case "log_max_age_days":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.LogMaxAgeDays = v
 	case "max_concurrent_tasks":
 		v, err := strconv.Atoi(value)
 		if err != nil {
@@ -430,6 +496,18 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return c.VolunteerID, nil
 	case "log_level":
 		return c.LogLevel, nil
+	case "log_file":
+		return c.LogFile, nil
+	case "log_to_file":
+		return strconv.FormatBool(c.LogToFile), nil
+	case "log_to_stderr":
+		return strconv.FormatBool(c.LogToStderr), nil
+	case "log_max_size_mb":
+		return strconv.Itoa(c.LogMaxSizeMB), nil
+	case "log_max_backups":
+		return strconv.Itoa(c.LogMaxBackups), nil
+	case "log_max_age_days":
+		return strconv.Itoa(c.LogMaxAgeDays), nil
 	case "max_concurrent_tasks":
 		return strconv.Itoa(c.MaxConcurrentTasks), nil
 	case "work_buffer_size":

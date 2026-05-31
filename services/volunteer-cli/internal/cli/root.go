@@ -15,6 +15,7 @@ var version = "dev"
 var (
 	cfgPath  string
 	logLevel string
+	logFile  string
 	dataDir  string
 	cfg      *config.Config
 )
@@ -44,6 +45,9 @@ func newRootCmd() *cobra.Command {
 			if cmd.Flags().Changed("data-dir") {
 				cfg.DataDir = dataDir
 			}
+			if cmd.Flags().Changed("log-file") {
+				cfg.LogFile = logFile
+			}
 			return nil
 		},
 		SilenceUsage: true,
@@ -59,6 +63,7 @@ func newRootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&cfgPath, "config", defaultCfgPath, "path to config file")
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	root.PersistentFlags().StringVar(&dataDir, "data-dir", defaultDataDir, "path to data directory")
+	root.PersistentFlags().StringVar(&logFile, "log-file", "", "log file path (default <data-dir>/logs/volunteer.log; logs also go to stderr)")
 
 	root.AddCommand(
 		newInitCmd(),
@@ -73,6 +78,7 @@ func newRootCmd() *cobra.Command {
 		newHistoryCmd(),
 		newUpdateCmd(),
 		newProveIdentityCmd(),
+		newDoctorCmd(),
 	)
 
 	return root

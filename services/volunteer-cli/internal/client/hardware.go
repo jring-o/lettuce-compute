@@ -25,6 +25,15 @@ var (
 	detectDiskAvailableMB = defaultDetectDiskAvailableMB
 )
 
+// DiskAvailableMB returns the disk space (in MB) available to the current user
+// on the filesystem that contains path, or 0 if it can't be determined. It
+// reuses the same platform detection as hardware registration, so callers (the
+// daemon's disk gate, the startup readiness banner) can report real free space
+// without duplicating the per-OS syscalls.
+func DiskAvailableMB(path string) int64 {
+	return detectDiskAvailableMB(path)
+}
+
 // DetectHardware detects system hardware and builds a HardwareCapabilities proto.
 // Config-specified limits override detected hardware maximums.
 // Platform-specific detection is in hardware_{linux,darwin,windows}.go.

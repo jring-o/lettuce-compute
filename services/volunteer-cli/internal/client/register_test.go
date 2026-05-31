@@ -54,6 +54,41 @@ func TestBuildRegistrationRequest(t *testing.T) {
 	}
 }
 
+// Explicit runtimes (what the volunteer can actually run) override the config
+// list — a box that lists CONTAINER but has no Docker/Podman advertises only
+// what's real, so the head never assigns it container work it must abandon.
+func TestBuildRegistrationRequest_ExplicitRuntimesOverrideConfig(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	cfg := config.Defaults()
+	cfg.AvailableRuntimes = []string{"NATIVE", "CONTAINER"} // config claims CONTAINER...
+
+	req := BuildRegistrationRequest(pub, nil, cfg, "NATIVE", "WASM") // ...but advertise reality
+
+	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
+		t.Errorf("AvailableRuntimes = %v, want [NATIVE WASM] (explicit override wins over config)", req.AvailableRuntimes)
+	}
+}
+
+// With no explicit runtimes the request falls back to the config list, so
+// existing callers and tests keep their behavior.
+func TestBuildRegistrationRequest_EmptyRuntimesFallsBackToConfig(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	cfg := config.Defaults()
+	cfg.AvailableRuntimes = []string{"NATIVE", "WASM"}
+
+	req := BuildRegistrationRequest(pub, nil, cfg) // no explicit runtimes
+
+	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
+		t.Errorf("AvailableRuntimes = %v, want config fallback [NATIVE WASM]", req.AvailableRuntimes)
+	}
+}
+
 func TestRegisterNewVolunteer(t *testing.T) {
 	withMockHardware(t)
 	mock := &mockVolunteerService{

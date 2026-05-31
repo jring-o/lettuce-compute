@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"log/slog"
 	"os"
 	"text/tabwriter"
 
@@ -27,9 +26,8 @@ func newHistoryCmd() *cobra.Command {
 }
 
 func runHistory(cmd *cobra.Command, limit int) error {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseSlogLevel(cfg.LogLevel),
-	}))
+	logger, closeLogger := newLogger(cfg)
+	defer closeLogger()
 	mgr := project.NewManager(cfg, cfgPath, logger)
 
 	entries, err := mgr.GetHistory(cmd.Context(), limit)

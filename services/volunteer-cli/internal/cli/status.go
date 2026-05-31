@@ -2,8 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"log/slog"
-	"os"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/project"
@@ -19,9 +17,8 @@ func newStatusCmd() *cobra.Command {
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseSlogLevel(cfg.LogLevel),
-	}))
+	logger, closeLogger := newLogger(cfg)
+	defer closeLogger()
 	mgr := project.NewManager(cfg, cfgPath, logger)
 
 	st, err := mgr.GetStatus(cmd.Context())

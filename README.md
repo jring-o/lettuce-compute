@@ -37,6 +37,46 @@ Head operator                        Volunteers
 
 You can attach to multiple heads run by different operators. The CLI distributes work across all of them.
 
+Not getting work, or setting up a container runtime? Run `./lettuce-volunteer doctor`
+for a pass/fail diagnosis, and see the [volunteer setup guide](guides/volunteer-setup.md)
+(per-OS container setup + a "why am I getting no work?" troubleshooting table).
+
+### Logs
+
+Every command writes JSON logs to both stderr **and** a rotating file at
+`~/.lettuce/logs/volunteer.log` (under your `--data-dir`) — no shell redirection
+needed. If something goes wrong, just attach that file. The file rotates at
+10 MB and keeps 5 backups, so it stays bounded even at `--log-level debug`.
+
+Tune it in `config.yaml` (or via `lettuce-volunteer config set <key> <value>`):
+
+| key | default | meaning |
+| --- | --- | --- |
+| `log_to_file` | `true` | write logs to the rotating file |
+| `log_to_stderr` | `true` | write logs to stderr |
+| `log_file` | `<data-dir>/logs/volunteer.log` | log file path (also `--log-file`) |
+| `log_max_size_mb` | `10` | rotate after this size |
+| `log_max_backups` | `5` | rotated files to keep |
+| `log_max_age_days` | `0` | max age of rotated files (`0` = no limit) |
+| `log_level` | `info` | `debug`, `info`, `warn`, `error` (also `--log-level`) |
+
+#### "Connected but getting no work?"
+
+On startup `lettuce-volunteer start` logs a readiness line — the runtimes it can
+actually run, free disk vs your `max_disk_gb`, and how many of the attached
+leafs you're eligible for — and raises a `WARN` for the common silent stalls:
+
+- **No matching runtime** — e.g. every attached leaf needs a container runtime
+  but you have no Docker/Podman. The volunteer now advertises only the runtimes
+  it can actually run, so it won't be handed work it can't do; install a
+  container runtime or attach a head with native leafs.
+- **Disk gate** — free space is below `max_disk_gb`, so no work is fetched. Free
+  space, lower `resource_limits.max_disk_gb`, or point `--data-dir` at a roomier
+  volume.
+
+These show up in `volunteer.log`, so attaching that file is usually enough to
+diagnose a quiet volunteer.
+
 Update to the latest version:
 ```bash
 ./lettuce-volunteer update

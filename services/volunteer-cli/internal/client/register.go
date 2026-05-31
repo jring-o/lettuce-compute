@@ -12,22 +12,35 @@ import (
 
 // BuildRegistrationRequest assembles a RegisterVolunteerRequest from identity,
 // hardware capabilities, and config.
-func BuildRegistrationRequest(pub ed25519.PublicKey, hw *lettucev1.HardwareCapabilities, cfg *config.Config) *lettucev1.RegisterVolunteerRequest {
+//
+// availableRuntimes, when non-empty, overrides cfg.AvailableRuntimes for what we
+// advertise to the head. Callers pass the runtimes the volunteer can ACTUALLY
+// run (e.g. derived from the live runtime registry) so a box that lists
+// CONTAINER in config but has no working Docker/Podman doesn't get assigned
+// container work it can only abandon. When empty, falls back to config.
+func BuildRegistrationRequest(pub ed25519.PublicKey, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
+	runtimes := availableRuntimes
+	if len(runtimes) == 0 {
+		runtimes = cfg.AvailableRuntimes
+	}
 	hostname, _ := os.Hostname()
 	return &lettucev1.RegisterVolunteerRequest{
 		PublicKey:         pub,
 		DisplayName:       hostname,
 		Hardware:          hw,
-		AvailableRuntimes: cfg.AvailableRuntimes,
+		AvailableRuntimes: runtimes,
 		SchedulingMode:    cfg.Scheduling.Mode,
 	}
 }
 
 // Register performs the full registration flow: detect hardware, build request,
 // call RegisterVolunteer RPC, persist the returned volunteer ID to config.
-func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, cfg *config.Config, configPath string) (string, bool, error) {
+//
+// availableRuntimes (optional) advertises the runtimes actually available rather
+// than cfg.AvailableRuntimes — see BuildRegistrationRequest.
+func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, cfg *config.Config, configPath string, availableRuntimes ...string) (string, bool, error) {
 	hw := DetectHardware(cfg)
-	req := BuildRegistrationRequest(pub, hw, cfg)
+	req := BuildRegistrationRequest(pub, hw, cfg, availableRuntimes...)
 
 	resp, err := client.RegisterVolunteer(ctx, req)
 	if err != nil {

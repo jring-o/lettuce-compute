@@ -6,10 +6,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
+	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	"github.com/lettuce-compute/volunteer-cli/internal/management"
@@ -43,9 +46,42 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no servers configured. Run `lettuce-volunteer attach --server <host>` first")
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: parseSlogLevel(cfg.LogLevel),
-	}))
+	// File-backed logger for the whole daemon lifetime: JSON to both stderr and
+	// a size-rotated file under <DataDir>/logs/. Deferred first so it closes the
+	// log file last, after all other shutdown logging has flushed.
+	logger, closeLogger := newLogger(cfg)
+	defer closeLogger()
+
+	logger.Info("logging to file", "path", cfg.LogFilePath(), "enabled", cfg.LogToFile)
+
+	// Ensure WASM is in AvailableRuntimes (handles existing configs that predate
+	// WASM support); the WASM runtime is always available.
+	if !containsRuntime(cfg.AvailableRuntimes, "WASM") {
+		cfg.AvailableRuntimes = append(cfg.AvailableRuntimes, "WASM")
+	}
+
+	// Build the runtime registry up front — before registering with any head — so
+	// we advertise the runtimes this box can ACTUALLY run, not whatever config
+	// lists. A machine that lists CONTAINER but has no working Docker/Podman then
+	// never gets container work it can only abandon (which would churn units to
+	// FAILED on the head). native/wasm are always registered; container only when
+	// a backend is detected and initializes.
+	registry, machineManager, machineSetupOK := buildRuntimeRegistry(cfg, logger)
+	advertised := advertisedRuntimes(registry)
+	logger.Info("runtimes available", "advertised", advertised)
+
+	// If we started a Podman machine, stop it on exit. Registered here (right
+	// after setup, before the connect loop) so it also fires on the early
+	// "could not connect to any server" return below — otherwise a failed
+	// startup would leak the running VM.
+	if machineManager != nil && machineSetupOK {
+		defer func() {
+			logger.Info("stopping podman machine on daemon shutdown")
+			if err := machineManager.Stop(); err != nil {
+				logger.Warn("failed to stop podman machine", "error", err)
+			}
+		}()
+	}
 
 	// Connect to all configured servers.
 	var connections []*daemon.ServerConnection
@@ -79,7 +115,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, cfg, cfgPath)
+		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, cfg, cfgPath, advertised...)
 		if err != nil {
 			logger.Warn("failed to register with server, skipping",
 				"server", name, "error", err)
@@ -123,6 +159,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	for _, conn := range connections {
 		fmt.Printf("  - %s (volunteer ID: %s)\n", conn.Name, conn.VolunteerID)
 	}
+	if cfg.LogToFile {
+		fmt.Printf("Logs: %s (rotating; also on stderr)\n", cfg.LogFilePath())
+	}
 
 	// Persist daemon state so the status command can read it.
 	if err := daemon.WriteDaemonState(cfg.DataDir, &daemon.DaemonState{
@@ -139,12 +178,54 @@ func runStart(cmd *cobra.Command, args []string) error {
 		daemon.RemoveDaemonState(cfg.DataDir)
 	}()
 
-	// Ensure WASM is in AvailableRuntimes (handles existing configs that predate WASM support).
-	if !containsRuntime(cfg.AvailableRuntimes, "WASM") {
-		cfg.AvailableRuntimes = append(cfg.AvailableRuntimes, "WASM")
+	// Create daemon with runtime registry.
+	d := daemon.NewDaemon(daemon.DaemonConfig{
+		Config:          cfg,
+		PubKey:          pub,
+		PrivKey:         priv,
+		Servers:         connections,
+		RuntimeRegistry: registry,
+		MachineManager:  machineManager,
+		Logger:          logger,
+	})
+
+	// Start management API server.
+	mgmtServer := management.NewServer(cfg.DataDir, logger)
+	bridge := management.NewDaemonBridge(d, cfgPath)
+	if err := mgmtServer.Start(bridge); err != nil {
+		logger.Warn("failed to start management API", "error", err)
+	} else {
+		fmt.Printf("Management API listening on http://127.0.0.1:%d\n", mgmtServer.Port())
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer shutdownCancel()
+			mgmtServer.Shutdown(shutdownCtx)
+		}()
 	}
 
-	// Create runtime registry.
+	// Set up signal handling.
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		logger.Info("received signal, shutting down gracefully", "signal", sig)
+		fmt.Fprintf(os.Stderr, "\nReceived %s. Finishing current work unit before exiting...\n", sig)
+		cancel()
+	}()
+
+	// Run daemon loop — blocks until shutdown.
+	return d.Run(ctx)
+}
+
+// buildRuntimeRegistry constructs the runtime registry. native and wasm are
+// always registered; the container runtime is added only when CONTAINER is
+// configured AND a working backend (Docker/Podman, setting up a Podman machine
+// if needed) is detected and initializes. Returning the machine manager and the
+// setup flag lets the caller stop a daemon-started Podman machine on shutdown.
+func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager, bool) {
 	registry := daemon.NewRuntimeRegistry()
 
 	// Always register native runtime.
@@ -212,59 +293,22 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Create daemon with runtime registry.
-	d := daemon.NewDaemon(daemon.DaemonConfig{
-		Config:          cfg,
-		PubKey:          pub,
-		PrivKey:         priv,
-		Servers:         connections,
-		RuntimeRegistry: registry,
-		MachineManager:  machineManager,
-		Logger:          logger,
-	})
-	if machineManager != nil && machineSetupOK {
-		d.SetMachineStartedByDaemon(true)
+	return registry, machineManager, machineSetupOK
+}
+
+// advertisedRuntimes returns the UPPERCASE runtime enum names the volunteer can
+// actually run, derived from what's actually registered (registry Name()s are
+// lowercase: native/wasm/container). This is what we send the head at
+// registration instead of cfg.AvailableRuntimes, so the advertised capabilities
+// reflect reality and a backend-less box never gets container work.
+func advertisedRuntimes(registry *daemon.RuntimeRegistry) []string {
+	names := registry.AvailableRuntimes()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, strings.ToUpper(n))
 	}
-
-	// Stop Podman machine on daemon shutdown if we started it.
-	defer func() {
-		if machineManager != nil && d.MachineStartedByDaemon() {
-			logger.Info("stopping podman machine on daemon shutdown")
-			if err := machineManager.Stop(); err != nil {
-				logger.Warn("failed to stop podman machine", "error", err)
-			}
-		}
-	}()
-
-	// Start management API server.
-	mgmtServer := management.NewServer(cfg.DataDir, logger)
-	bridge := management.NewDaemonBridge(d, cfgPath)
-	if err := mgmtServer.Start(bridge); err != nil {
-		logger.Warn("failed to start management API", "error", err)
-	} else {
-		fmt.Printf("Management API listening on http://127.0.0.1:%d\n", mgmtServer.Port())
-		defer func() {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer shutdownCancel()
-			mgmtServer.Shutdown(shutdownCtx)
-		}()
-	}
-
-	// Set up signal handling.
-	ctx, cancel := context.WithCancel(cmd.Context())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		sig := <-sigCh
-		logger.Info("received signal, shutting down gracefully", "signal", sig)
-		fmt.Fprintf(os.Stderr, "\nReceived %s. Finishing current work unit before exiting...\n", sig)
-		cancel()
-	}()
-
-	// Run daemon loop — blocks until shutdown.
-	return d.Run(ctx)
+	sort.Strings(out)
+	return out
 }
 
 func containsRuntime(runtimes []string, name string) bool {

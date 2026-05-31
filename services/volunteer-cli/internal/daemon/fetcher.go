@@ -59,10 +59,22 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 	}
 }
 
+// noWorkWarnThreshold is how many consecutive empty polls (no work returned)
+// trigger the one-time "connected but getting no work" diagnostic WARN. With
+// exponential backoff this is roughly half a minute of genuine idleness, long
+// enough to skip a momentarily-empty queue but short enough to be useful.
+const noWorkWarnThreshold = 5
+
 // Run is the fetcher's main loop. It fills the queue until ctx is cancelled.
 func (f *Fetcher) Run(ctx context.Context) {
 	currentBackoff := f.backoff
 	f.logger.Info("fetcher: started", "initial_backoff", f.backoff, "max_backoff", f.maxBackoff)
+
+	// Track a run of empty polls so we can surface "connected but no work — here's
+	// why" exactly once, instead of leaving the operator staring at a silent,
+	// idle daemon.
+	emptyPolls := 0
+	warnedNoWork := false
 
 	for {
 		select {
@@ -123,6 +135,11 @@ func (f *Fetcher) Run(ctx context.Context) {
 
 		if item == nil {
 			f.logger.Debug("fetcher: fetchOne returned nil (no work available)", "backoff", currentBackoff)
+			emptyPolls++
+			if emptyPolls >= noWorkWarnThreshold && !warnedNoWork {
+				f.warnNoWork()
+				warnedNoWork = true
+			}
 			// No work available — back off.
 			select {
 			case <-ctx.Done():
@@ -136,6 +153,11 @@ func (f *Fetcher) Run(ctx context.Context) {
 			f.logger.Debug("fetcher: backoff increased", "new_backoff", currentBackoff)
 			continue
 		}
+
+		// Got work — clear the no-work streak so the diagnostic can fire again if
+		// the volunteer later goes idle for a new reason.
+		emptyPolls = 0
+		warnedNoWork = false
 
 		f.logger.Info("fetcher: got work unit", "work_unit_id", item.WU.ID, "leaf_id", item.WU.LeafID, "server", item.Conn.Name)
 
@@ -157,6 +179,40 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// Reset backoff on success.
 		currentBackoff = f.backoff
 	}
+}
+
+// warnNoWork emits the one-time "connected but getting no work" diagnostic. It
+// compares the leafs the volunteer is attached to against the runtimes it can
+// actually run: if every attached leaf needs a container runtime this box lacks,
+// that's the (fixable) reason and it says so; otherwise the queue is most likely
+// just empty, which it reports without crying wolf.
+func (f *Fetcher) warnNoWork() {
+	hasContainer := f.registry != nil && f.registry.GetRuntime("container") != nil
+	var runtimes []string
+	if f.registry != nil {
+		runtimes = f.registry.AvailableRuntimes()
+	}
+
+	var totalLeafs, containerBlocked int
+	if f.enabledLeafsFunc != nil && f.multiClient != nil {
+		for _, srv := range f.multiClient.Servers() {
+			for _, lf := range f.enabledLeafsFunc(srv.Name) {
+				totalLeafs++
+				if lf.ExecutionSpec != nil && lf.ExecutionSpec.Image != "" && !hasContainer {
+					containerBlocked++
+				}
+			}
+		}
+	}
+
+	if totalLeafs > 0 && containerBlocked == totalLeafs {
+		f.logger.Warn("connected but getting no work: every attached leaf needs a container runtime this volunteer doesn't have — install Docker or Podman (see the volunteer setup docs), or attach a head with native leafs",
+			"runtimes", runtimes, "leafs", totalLeafs)
+		return
+	}
+	f.logger.Warn("connected but getting no work after repeated polls — the head has no matching units for this volunteer right now",
+		"runtimes", runtimes, "attached_leafs", totalLeafs,
+		"hint", "normal if the queue is just empty; if it persists, check that your runtimes match the leafs and that disk/scheduling aren't pausing fetches")
 }
 
 // fetchOne attempts to fetch and prepare a single work unit.

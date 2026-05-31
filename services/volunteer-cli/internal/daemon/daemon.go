@@ -101,6 +101,12 @@ type Daemon struct {
 	imgCacheMu      sync.Mutex
 	imgCacheChecked time.Time
 	imgCacheResult  bool
+
+	// Disk-gate warning state: surfaces the otherwise-silent "no free disk, so
+	// not fetching" stall as a one-time WARN, reset once the gate clears, so a
+	// volunteer that's idle on disk space says so instead of only at Debug.
+	diskGateMu     sync.Mutex
+	diskGateWarned bool
 }
 
 // DaemonConfig holds all dependencies for creating a Daemon.
@@ -297,6 +303,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Initialize leaf cache from all servers.
 	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())
 	d.initializeWeights()
+
+	// Readiness banner: now that runtimes are registered and the leaf list is
+	// fetched, report what this volunteer can actually run and warn loudly about
+	// the silent "connected but will never get work" cases (no matching runtime,
+	// disk already below the allowance).
+	d.logReadiness()
 
 	// Write PID file.
 	if err := WritePID(d.cfg.DataDir); err != nil {
@@ -757,6 +769,7 @@ func (d *Daemon) shouldFetch() bool {
 		fullRequiredMB = 1024
 	}
 	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, fullRequiredMB); err == nil {
+		d.clearDiskGateWarning()
 		return true
 	}
 
@@ -766,17 +779,102 @@ func (d *Daemon) shouldFetch() bool {
 	// whole allowance free forever would block every cached-image rerun.
 	if d.hasCachedRunnableImage() {
 		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedImageWorkspaceHeadroomMB); err != nil {
-			d.logger.Debug("shouldFetch: below workspace headroom even with cached image",
-				"required_mb", cachedImageWorkspaceHeadroomMB, "error", err)
+			d.warnDiskGateOnce(cachedImageWorkspaceHeadroomMB)
 			return false
 		}
+		d.clearDiskGateWarning()
 		d.logger.Debug("shouldFetch: cached image present, requiring workspace headroom only",
 			"required_mb", cachedImageWorkspaceHeadroomMB)
 		return true
 	}
 
-	d.logger.Debug("shouldFetch: disk space check failed", "required_mb", fullRequiredMB)
+	d.warnDiskGateOnce(fullRequiredMB)
 	return false
+}
+
+// warnDiskGateOnce surfaces the disk-space stall. The first time the gate blocks
+// fetching it logs a single actionable WARN (naming the path, the required and
+// available space, and the remedies); subsequent blocked polls stay at Debug so
+// the log isn't spammed. clearDiskGateWarning resets it so a later recovery and
+// re-stall warns again.
+func (d *Daemon) warnDiskGateOnce(requiredMB int) {
+	d.diskGateMu.Lock()
+	already := d.diskGateWarned
+	d.diskGateWarned = true
+	d.diskGateMu.Unlock()
+
+	if already {
+		d.logger.Debug("shouldFetch: still disk-gated", "required_mb", requiredMB)
+		return
+	}
+
+	availableMB := client.DiskAvailableMB(d.cfg.DataDir)
+	d.logger.Warn("not fetching work: not enough free disk space — this volunteer stays idle until it clears",
+		"data_dir", d.cfg.DataDir,
+		"required_mb", requiredMB,
+		"available_mb", availableMB,
+		"remedy", "free disk space, lower resource_limits.max_disk_gb, or restart with --data-dir on a roomier volume")
+}
+
+// clearDiskGateWarning re-arms the disk-gate WARN after the gate clears.
+func (d *Daemon) clearDiskGateWarning() {
+	d.diskGateMu.Lock()
+	wasWarned := d.diskGateWarned
+	d.diskGateWarned = false
+	d.diskGateMu.Unlock()
+	if wasWarned {
+		d.logger.Info("disk space recovered: resuming work fetching", "data_dir", d.cfg.DataDir)
+	}
+}
+
+// logReadiness logs a one-shot startup banner: the runtimes this volunteer can
+// actually run, free disk vs the configured allowance, and how many of the
+// attached leafs it is eligible for. When nothing is runnable (e.g. every leaf
+// needs a container runtime that isn't installed) it escalates to WARN with the
+// reason and remedy, so a misconfigured volunteer learns why in seconds instead
+// of sitting silently idle. A leaf with a container image requires the container
+// runtime; everything else runs on the always-present native/wasm runtimes.
+func (d *Daemon) logReadiness() {
+	if d.runtimeRegistry == nil || d.multiClient == nil {
+		return
+	}
+	runtimes := d.runtimeRegistry.AvailableRuntimes()
+	hasContainer := d.runtimeRegistry.GetRuntime("container") != nil
+
+	availableMB := client.DiskAvailableMB(d.cfg.DataDir)
+	allowanceMB := d.cfg.ResourceLimits.MaxDiskGB * 1024
+
+	var totalLeafs, eligibleLeafs, containerBlocked int
+	for _, srv := range d.multiClient.Servers() {
+		for _, lf := range d.enabledLeafs(srv.Name) {
+			totalLeafs++
+			if lf.ExecutionSpec != nil && lf.ExecutionSpec.Image != "" && !hasContainer {
+				containerBlocked++
+				continue
+			}
+			eligibleLeafs++
+		}
+	}
+
+	d.logger.Info("volunteer ready",
+		"runtimes", runtimes,
+		"data_dir", d.cfg.DataDir,
+		"disk_free_mb", availableMB,
+		"disk_allowance_mb", allowanceMB,
+		"eligible_leafs", eligibleLeafs,
+		"total_leafs", totalLeafs,
+	)
+
+	// "Connected, but you will get no work" — the actionable case worth a WARN.
+	if totalLeafs > 0 && eligibleLeafs == 0 {
+		if containerBlocked == totalLeafs && !hasContainer {
+			d.logger.Warn("no runnable leafs: every attached leaf needs a container runtime, but none is available here — install Docker or Podman (see the volunteer setup docs), or attach a head that has native leafs",
+				"runtimes", runtimes, "container_leafs", containerBlocked)
+		} else {
+			d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
+				"runtimes", runtimes, "total_leafs", totalLeafs)
+		}
+	}
 }
 
 // hasCachedRunnableImage reports whether at least one enabled leaf's container

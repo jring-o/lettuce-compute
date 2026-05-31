@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/project"
@@ -33,9 +32,8 @@ Examples:
   lettuce-volunteer attach --server localhost --insecure`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-				Level: parseSlogLevel(cfg.LogLevel),
-			}))
+			logger, closeLogger := newLogger(cfg)
+			defer closeLogger()
 			mgr := project.NewManager(cfg, cfgPath, logger)
 
 			// Case 1: attach --server <host>
