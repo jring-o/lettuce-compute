@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1005,6 +1006,21 @@ func (d *Daemon) runSlotHeartbeat(ctx context.Context, wu *runtime.WorkUnit, wor
 			ProgressPct: ReadProgressFile(workDir),
 		})
 		if err != nil {
+			// A PermissionDenied "not assigned" verdict means the head no longer
+			// has this volunteer assigned to this work unit (e.g. the assignment
+			// expired and was reassigned while we were resuming or computing). The
+			// result we'd eventually submit is already doomed, so stop computing
+			// now: cancel execution and end the heartbeat. Mirrors the abort branch
+			// below. Any other error (transport, Unavailable, etc.) is transient —
+			// keep heartbeating.
+			if st, ok := status.FromError(err); ok &&
+				st.Code() == codes.PermissionDenied &&
+				strings.Contains(st.Message(), "not assigned") {
+				d.logger.Warn("heartbeat rejected: volunteer no longer assigned to this work unit, dropping task",
+					"work_unit_id", wu.ID, "server", conn.Name, "error", err)
+				cancelExec()
+				return false
+			}
 			d.logger.Warn("heartbeat failed", "work_unit_id", wu.ID, "server", conn.Name, "error", err)
 			return true
 		}
@@ -1783,6 +1799,22 @@ func (d *Daemon) retryPendingResults(ctx context.Context) {
 		resp, err := conn.Client.SubmitResult(submitCtx, &req)
 		cancel()
 		if err != nil {
+			// Classify the failure. A definitive (terminal) gRPC rejection means
+			// the result reached the head and was rejected on its content/identity;
+			// resending the identical bytes can never succeed, so drop the file to
+			// stop the unbounded disk+RPC retry leak. Anything else (transport
+			// failure, non-status error, or a transient/unclassified code) is kept
+			// for the next sweep.
+			if st, ok := status.FromError(err); ok && isTerminalSubmitCode(st.Code()) {
+				d.logger.Warn("pending result: rejected by head, dropping",
+					"work_unit_id", pr.WorkUnitID, "server", pr.ServerName,
+					"code", st.Code(), "message", st.Message())
+				if delErr := DeletePendingResult(d.cfg.DataDir, pr.WorkUnitID); delErr != nil {
+					d.logger.Warn("pending result: failed to delete after rejection",
+						"work_unit_id", pr.WorkUnitID, "error", delErr)
+				}
+				continue
+			}
 			d.logger.Warn("pending result: resubmit failed, will retry later",
 				"work_unit_id", pr.WorkUnitID, "server", pr.ServerName, "error", err)
 			continue
@@ -1797,6 +1829,29 @@ func (d *Daemon) retryPendingResults(ctx context.Context) {
 			"work_unit_id", pr.WorkUnitID, "accepted", resp.Accepted, "server", pr.ServerName)
 		d.recordHistory(&runtime.WorkUnit{ID: pr.WorkUnitID, LeafID: pr.LeafID},
 			pr.WallClockSeconds, pr.CPUSeconds, resp.Accepted, pr.ServerName)
+	}
+}
+
+// isTerminalSubmitCode reports whether a gRPC status code from SubmitResult is a
+// definitive, resend-invariant rejection of the result. For these codes the head
+// reached a verdict on the request's fixed content or identity (parse/validation
+// failure, checksum mismatch, missing entity, key mismatch, closed assignment, or
+// an existing record), so resending the identical persisted bytes can never
+// succeed and the file should be dropped. Every other code — transport/availability
+// failures (Unavailable, DeadlineExceeded, Canceled), server-side faults (Internal,
+// ResourceExhausted), and the catch-all codes.Unknown (which also covers non-status
+// errors, since status.FromError yields Unknown for them) — is transient: the result
+// may still land on a later sweep, so it is kept and retried.
+func isTerminalSubmitCode(code codes.Code) bool {
+	switch code {
+	case codes.InvalidArgument,
+		codes.NotFound,
+		codes.PermissionDenied,
+		codes.FailedPrecondition,
+		codes.AlreadyExists:
+		return true
+	default:
+		return false
 	}
 }
 

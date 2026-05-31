@@ -12,6 +12,8 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -221,6 +223,163 @@ func TestRetryPendingResults_DropsUnknownServerLater(t *testing.T) {
 	remaining, _ := ListPendingResults(d.cfg.DataDir)
 	if len(remaining) != 1 {
 		t.Errorf("pending = %d, want 1 (kept until server reconnects)", len(remaining))
+	}
+}
+
+// --- TODO #20: terminal vs. transient classification of resubmit errors ---
+
+// A definitive gRPC rejection (here FailedPrecondition "no active assignment")
+// means the head adjudicated the result and rejected it; resending the identical
+// bytes can never succeed, so the persisted file must be dropped rather than
+// retried forever.
+func TestRetryPendingResults_DeletesOnTerminalRejection(t *testing.T) {
+	mc := &mockClient{}
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, &testLimiter{}, scheduler)
+	d.cfg.DataDir = t.TempDir()
+
+	if err := SavePendingResult(d.cfg.DataDir, PendingResult{
+		WorkUnitID:   "dc5ff9da-f084-4dd7-86b8-e829669814f8",
+		ServerName:   "default",
+		RequestProto: newPendingRequest(t, "dc5ff9da-f084-4dd7-86b8-e829669814f8"),
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mc.submitResultFn = func(_ context.Context, _ *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
+		return nil, status.Error(codes.FailedPrecondition, "no active assignment for this volunteer and work unit")
+	}
+
+	d.retryPendingResults(context.Background())
+
+	if mc.getSubmitCalls() != 1 {
+		t.Errorf("SubmitResult calls = %d, want 1", mc.getSubmitCalls())
+	}
+	remaining, _ := ListPendingResults(d.cfg.DataDir)
+	if len(remaining) != 0 {
+		t.Errorf("pending after terminal rejection = %d, want 0 (should be dropped)", len(remaining))
+	}
+}
+
+// A transient gRPC status (Unavailable) is a transport/availability failure: the
+// result may still land on a later sweep, so the persisted file must be kept.
+func TestRetryPendingResults_KeepsOnTransientStatus(t *testing.T) {
+	mc := &mockClient{}
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, &testLimiter{}, scheduler)
+	d.cfg.DataDir = t.TempDir()
+
+	if err := SavePendingResult(d.cfg.DataDir, PendingResult{
+		WorkUnitID:   "dc5ff9da-f084-4dd7-86b8-e829669814f8",
+		ServerName:   "default",
+		RequestProto: newPendingRequest(t, "dc5ff9da-f084-4dd7-86b8-e829669814f8"),
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mc.submitResultFn = func(_ context.Context, _ *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
+		return nil, status.Error(codes.Unavailable, "head is restarting")
+	}
+
+	d.retryPendingResults(context.Background())
+
+	if mc.getSubmitCalls() != 1 {
+		t.Errorf("SubmitResult calls = %d, want 1", mc.getSubmitCalls())
+	}
+	remaining, _ := ListPendingResults(d.cfg.DataDir)
+	if len(remaining) != 1 {
+		t.Errorf("pending after transient status = %d, want 1 (kept for retry)", len(remaining))
+	}
+}
+
+// When a slot's heartbeat returns PermissionDenied "not assigned", the volunteer
+// has lost its assignment for this work unit. The slot must stop computing
+// (cancelExec) and the heartbeat must exit (send returns false) so we don't run a
+// doomed task to completion and submit a result that can never be credited.
+func TestRunSlotHeartbeat_DropsOnAssignmentLost(t *testing.T) {
+	mc := &mockClient{}
+	mc.heartbeatFn = func(_ context.Context, _ *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+		return nil, status.Error(codes.PermissionDenied, "volunteer is not assigned to this work unit")
+	}
+	d := newSlotTestDaemon()
+
+	execCtx, cancelExec := context.WithCancel(context.Background())
+	defer cancelExec()
+
+	conn := &ServerConnection{Name: "t", VolunteerID: "v", Client: mc}
+	wu := &runtime.WorkUnit{ID: "dc5ff9da-f084-4dd7-86b8-e829669814f8", LeafID: "leaf-1"}
+
+	done := make(chan struct{})
+	go func() {
+		// 1s interval; the terminal error fires on the very first (immediate) send,
+		// so this returns well before the ticker would ever tick.
+		d.runSlotHeartbeat(context.Background(), wu, t.TempDir(), 1, cancelExec, conn, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runSlotHeartbeat did not exit after assignment-lost rejection")
+	}
+
+	if execCtx.Err() != context.Canceled {
+		t.Errorf("execCtx.Err() = %v, want context.Canceled (cancelExec should have run)", execCtx.Err())
+	}
+	if c := mc.getHeartbeatCalls(); c != 1 {
+		t.Errorf("heartbeat calls = %d, want 1 (should stop after terminal rejection)", c)
+	}
+}
+
+// Regression guard: a transient heartbeat error (Unavailable) must NOT drop the
+// task. Execution stays alive (execCtx not cancelled) and the heartbeat keeps
+// firing on the ticker.
+func TestRunSlotHeartbeat_KeepsRunningOnTransientError(t *testing.T) {
+	mc := &mockClient{}
+	mc.heartbeatFn = func(_ context.Context, _ *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+		return nil, status.Error(codes.Unavailable, "connection refused")
+	}
+	d := newSlotTestDaemon()
+
+	execCtx, cancelExec := context.WithCancel(context.Background())
+	defer cancelExec()
+
+	conn := &ServerConnection{Name: "t", VolunteerID: "v", Client: mc}
+	wu := &runtime.WorkUnit{ID: "dc5ff9da-f084-4dd7-86b8-e829669814f8", LeafID: "leaf-1"}
+
+	// heartbeatCtx drives the loop; we cancel it to stop the goroutine once we've
+	// observed it kept running across at least two sends.
+	heartbeatCtx, heartbeatCancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		d.runSlotHeartbeat(heartbeatCtx, wu, t.TempDir(), 1, cancelExec, conn, nil)
+		close(done)
+	}()
+
+	// Wait for the ticker to fire at least once more after the immediate send.
+	deadline := time.After(4 * time.Second)
+	for mc.getHeartbeatCalls() < 2 {
+		select {
+		case <-deadline:
+			heartbeatCancel()
+			t.Fatalf("heartbeat calls = %d, want >= 2 (transient error should keep heartbeating)", mc.getHeartbeatCalls())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	if execCtx.Err() != nil {
+		heartbeatCancel()
+		t.Fatalf("execCtx.Err() = %v, want nil (transient error must not cancel execution)", execCtx.Err())
+	}
+
+	// Stop the heartbeat goroutine and confirm it exits cleanly.
+	heartbeatCancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runSlotHeartbeat did not exit after ctx cancel")
 	}
 }
 
