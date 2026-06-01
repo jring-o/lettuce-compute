@@ -77,6 +77,7 @@ func TestFetcher_WarnsOnceWhenNoWork(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 5 * time.Millisecond
 	fetcher.maxBackoff = 10 * time.Millisecond
+	fetcher.minInterval = 0 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

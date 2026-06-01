@@ -1,4 +1,4 @@
-﻿package daemon
+package daemon
 
 import (
 	"context"
@@ -301,6 +301,7 @@ func TestMultiServerSingleServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -359,6 +360,7 @@ func TestMultiServerSubmitToCorrectServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -421,6 +423,7 @@ func TestMultiServerHistoryTracksServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -491,6 +494,7 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

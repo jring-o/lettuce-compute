@@ -733,7 +733,10 @@ func testSigningClientInterceptor(priv ed25519.PrivateKey, pub ed25519.PublicKey
 			return err
 		}
 		unixTs := timeNow().Unix()
-		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes)
+		// In-process test signer keeps emitting the legacy (no-nonce) canonical form;
+		// the server verifies it via the empty-nonce branch. Passing "" matches the
+		// updated canonicalGRPCAuthMessage signature without changing behavior.
+		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes, "")
 		sig := ed25519.Sign(priv, []byte(signed))
 		ctx = metadata.AppendToOutgoingContext(ctx,
 			grpcAuthPubKeyMeta, string(pub),

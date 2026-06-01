@@ -57,6 +57,12 @@ type Daemon struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 
+	// fetcherMinInterval is the minimum interval between the fetcher's
+	// RequestWorkUnit poll cycles (#18 fix 2 throttle). Zero (the production
+	// zero value) means "use the default 2s floor"; a negative value disables
+	// the gate (used by tests so loops stay fast). See resolveMinInterval.
+	fetcherMinInterval time.Duration
+
 	// Cached hardware capabilities (detected once at startup)
 	cachedHW *lettucev1.HardwareCapabilities
 

@@ -1,4 +1,4 @@
-﻿package daemon
+package daemon
 
 import (
 	"context"
@@ -234,6 +234,9 @@ func newTestDaemon(mc *mockClient, mr *mockRuntime) *Daemon {
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
+	// Disable the fetcher's inter-request throttle so short-window tests aren't
+	// paced by the 2s production floor. Negative = gate off (see resolveMinInterval).
+	d.fetcherMinInterval = -1
 	return d
 }
 
@@ -922,6 +925,8 @@ func newTestDaemonWithResources(mc *mockClient, mr *mockRuntime, limiter resourc
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
+	// Disable the fetcher inter-request throttle for fast tests (see resolveMinInterval).
+	d.fetcherMinInterval = -1
 	return d
 }
 
@@ -1037,6 +1042,7 @@ func TestDaemonLeafPreferences_Specific(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1080,6 +1086,7 @@ func TestDaemonLeafPreferences_Blocklist(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()

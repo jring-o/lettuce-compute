@@ -5,6 +5,8 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"log/slog"
+	"math/rand"
+	"strings"
 	"time"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
@@ -38,7 +40,58 @@ type Fetcher struct {
 	// shouldFetchFunc checks whether fetching is allowed (disk space, scheduler, etc.).
 	// Returns true if fetching should proceed, false to wait.
 	shouldFetchFunc func() bool
+
+	// --- THROTTLE (#18 fix 2): minimum inter-request interval ---
+	// minInterval is the floor on how often RequestWorkUnit may be issued across
+	// the poll cycle. It composes with the per-head backoff and the no-work
+	// backoff: it bounds the FAST path (zero-delay success, or a sub-second
+	// backoff that resets to f.backoff on each success), which those backoffs do
+	// not. Injectable so tests can set it to 0 to disable the gate.
+	minInterval time.Duration
+	// lastRequest is when the most recent RequestWorkUnit poll cycle began. Only
+	// touched from the single Run goroutine, so no lock is required.
+	lastRequest time.Time
+	// rateLimitBackoff is the dedicated (larger) per-head backoff floor applied
+	// when a head answers codes.ResourceExhausted, so we ease pressure on the
+	// shared head rate bucket rather than hammering it.
+	rateLimitBackoff time.Duration
+
+	// --- ESCALATION (#15 fix 4): per-runtime consecutive-abandon breaker ---
+	// runtimeAbandons counts consecutive capability-driven abandons (missing or
+	// incapable runtime, or a failed Prepare), keyed on the normalized runtime
+	// name. pausedRuntimes records when a runtime tripped the breaker so its
+	// leafs are skipped until the cooldown elapses. Both are owned by the single
+	// Run goroutine — no lock needed.
+	runtimeAbandons map[string]int
+	pausedRuntimes  map[string]time.Time
+
+	// now is the clock seam (defaults to time.Now). Tests advance it to exercise
+	// the pause cooldown without real sleeps.
+	now func() time.Time
 }
+
+// Throttle / escalation defaults. minIntervalFloor is the hard floor a
+// configured non-zero interval is clamped to (an explicit 0 disables the gate,
+// used by tests). The head's shared rate bucket sustains ~1 req/sec across all
+// volunteers behind one proxy IP; a 2s floor caps each volunteer at ~0.5
+// req/sec so a small pool stays within the shared budget.
+const (
+	defaultMinInterval      = 2 * time.Second
+	minIntervalFloor        = 1 * time.Second
+	defaultRateLimitBackoff = 5 * time.Second
+)
+
+// runtimeAbandonPauseThreshold is how many consecutive capability-driven
+// abandons for one runtime trip the circuit breaker. It matches the head's
+// max_reassignments default (3): after a volunteer has caused a unit to exhaust
+// its reassignments once, it stops contributing.
+const runtimeAbandonPauseThreshold = 3
+
+// runtimeAbandonCooldown is how long a tripped runtime stays paused before it
+// is re-probed once. Container backends recover (Docker/Podman restart) and
+// leaf ExecutionSpecs change on head edits, so the pause is time-bounded rather
+// than permanent-until-restart; this lines up with the 5-min leaf-cache refresh.
+const runtimeAbandonCooldown = 10 * time.Minute
 
 // NewFetcher creates a new fetcher that fills the pre-fetch queue.
 func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, leafCache *LeafCache) *Fetcher {
@@ -56,6 +109,30 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		enabledLeafsFunc: d.enabledLeafs,
 		leafPrefsFunc:    d.leafPreferences,
 		shouldFetchFunc:  d.shouldFetch,
+		minInterval:      resolveMinInterval(d.fetcherMinInterval),
+		rateLimitBackoff: defaultRateLimitBackoff,
+		runtimeAbandons:  make(map[string]int),
+		pausedRuntimes:   make(map[string]time.Time),
+		now:              time.Now,
+	}
+}
+
+// resolveMinInterval maps the Daemon's fetcherMinInterval knob to the gate's
+// effective interval:
+//   - 0 (the production zero value): use defaultMinInterval (2s).
+//   - negative: gate disabled (used by tests so loops stay fast).
+//   - positive: use it, but clamp up to the hard floor so the gate can never be
+//     configured tighter than minIntervalFloor.
+func resolveMinInterval(configured time.Duration) time.Duration {
+	switch {
+	case configured < 0:
+		return 0
+	case configured == 0:
+		return defaultMinInterval
+	case configured < minIntervalFloor:
+		return minIntervalFloor
+	default:
+		return configured
 	}
 }
 
@@ -108,6 +185,24 @@ func (f *Fetcher) Run(ctx context.Context) {
 			}
 			continue
 		}
+
+		// THROTTLE (#18 fix 2): enforce a minimum interval between RequestWorkUnit
+		// poll cycles. This sits on the poll CYCLE (the same head+leaf only recurs
+		// across cycles, never within a single fetchOne's distinct-leaf inner loop)
+		// and is independent of which branch (success / NotFound / error) the prior
+		// cycle took, so it bounds both the zero-delay success path and any
+		// sub-second backoff reset. It composes with the existing per-head and
+		// no-work backoffs rather than replacing them.
+		if f.minInterval > 0 {
+			if wait := f.minInterval - time.Since(f.lastRequest); wait > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+		}
+		f.lastRequest = time.Now()
 
 		f.logger.Debug("fetcher: attempting fetchOne", "queue_len", f.queue.Len())
 
@@ -218,6 +313,11 @@ func (f *Fetcher) warnNoWork() {
 // fetchOne attempts to fetch and prepare a single work unit.
 // Returns nil, nil when no work is available.
 func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
+	// ESCALATION (#15 fix 4): expire any paused runtimes whose cooldown has
+	// elapsed so they are re-probed once. Done here (not only inside runtimePaused)
+	// so a runtime no longer referenced by any leaf still clears eventually.
+	f.expirePausedRuntimes()
+
 	// Refresh leaf cache for servers that need it.
 	for _, srv := range f.multiClient.Servers() {
 		if f.leafCache.NeedsRefresh(srv.Name) {
@@ -269,6 +369,14 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 
 		orderedLeafs := f.selector.SelectLeafByDeficitOrder(head.Name, enabled)
 		for _, leaf := range orderedLeafs {
+			// ESCALATION (#15 fix 4): if this leaf needs a runtime we've paused
+			// after repeated abandons, skip it BEFORE issuing RequestWorkUnit.
+			// This pre-request skip is the load-bearing stop for the
+			// grab->abandon churn and the head-side reassignment burn.
+			if reqRt := requiredRuntimeForLeaf(leaf); f.runtimePaused(reqRt) {
+				f.logger.Debug("fetcher: skipping leaf for paused runtime", "server", head.Name, "leaf_slug", leaf.Slug, "runtime", reqRt)
+				continue
+			}
 			f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug)
 			resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 				VolunteerId:      head.VolunteerID,
@@ -283,6 +391,15 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 					head.Available = true
 					head.Backoff = 0
 					continue
+				}
+				if ok && st.Code() == codes.ResourceExhausted {
+					// RATE LIMITED (#18 fix 2): the head throttled us. Treat it as a
+					// calm, dedicated, larger backoff rather than a hard connection
+					// error so we stop adding pressure to the shared head bucket. It
+					// is logged at Info (not Warn) since it is a normal flow-control
+					// signal, not a fault.
+					f.applyRateLimitBackoff(head, leaf.Slug, err)
+					break
 				}
 				// Connection error.
 				f.logger.Warn("fetcher: gRPC error requesting work", "server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
@@ -320,6 +437,9 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 			rt, selErr := f.registry.SelectRuntime(wu)
 			if selErr != nil {
 				f.logger.Warn("fetcher: no runtime for work unit", "work_unit_id", wu.ID, "runtime", wu.Runtime, "error", selErr)
+				// ESCALATION (#15 fix 4): capability category A — no registered or
+				// capable runtime for this unit's required runtime.
+				f.recordRuntimeAbandon(runtimeKeyForWU(wu), selErr)
 				f.abandonWorkUnit(ctx, head, wu, selErr.Error())
 				continue
 			}
@@ -329,10 +449,19 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 			prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, head, wu, resp.HeartbeatIntervalSeconds, rt)
 			if prepErr != nil {
 				f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
+				// ESCALATION (#15 fix 4): capability category B — Prepare failed for
+				// this runtime (image pull / binary download / setup). Keyed on the
+				// runtime that was actually selected.
+				f.recordRuntimeAbandon(strings.ToLower(rt.Name()), prepErr)
 				f.abandonWorkUnit(ctx, head, wu, prepErr.Error())
 				continue
 			}
 			f.logger.Info("fetcher: prepare succeeded", "work_unit_id", wu.ID, "work_dir", prep.WorkDir)
+
+			// ESCALATION (#15 fix 4): a successful Prepare clears the runtime's
+			// abandon streak (and any pause). Reset on prepare-success, not
+			// select-success: select can pass while Prepare keeps failing.
+			f.resetRuntimeAbandon(strings.ToLower(rt.Name()))
 
 			f.selector.RecordAssignment(head.Name, leaf.Slug)
 
@@ -363,6 +492,16 @@ func (f *Fetcher) fetchOneLegacy(ctx context.Context, available []*ServerConnect
 
 	resp, conn, err := f.multiClient.RequestWork(ctx, f.pubKey, leafIDs, blockedIDs, f.cachedHW)
 	if err != nil {
+		// RATE LIMITED (#18 fix 2, legacy mirror): if the head throttled us, park
+		// every available head with the dedicated rate-limit backoff floor so we
+		// stop hammering the shared bucket. The legacy multi-client API doesn't
+		// surface which head answered, so apply the floor to all available heads.
+		if st, ok := status.FromError(err); ok && st.Code() == codes.ResourceExhausted {
+			for _, srv := range f.availableServers() {
+				f.applyRateLimitBackoff(srv, "", err)
+			}
+			return nil, nil
+		}
 		f.logger.Debug("fetcher: legacy request failed", "error", err)
 		return nil, nil // no work available
 	}
@@ -381,6 +520,8 @@ func (f *Fetcher) fetchOneLegacy(ctx context.Context, available []*ServerConnect
 	rt, selErr := f.registry.SelectRuntime(wu)
 	if selErr != nil {
 		f.logger.Warn("fetcher: no runtime for work unit (legacy)", "work_unit_id", wu.ID, "error", selErr)
+		// ESCALATION (#15 fix 4, legacy mirror): capability category A.
+		f.recordRuntimeAbandon(runtimeKeyForWU(wu), selErr)
 		f.abandonWorkUnit(ctx, conn, wu, selErr.Error())
 		return nil, nil
 	}
@@ -388,9 +529,14 @@ func (f *Fetcher) fetchOneLegacy(ctx context.Context, available []*ServerConnect
 	prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, conn, wu, resp.HeartbeatIntervalSeconds, rt)
 	if prepErr != nil {
 		f.logger.Warn("fetcher: prepare failed (legacy)", "work_unit_id", wu.ID, "error", prepErr)
+		// ESCALATION (#15 fix 4, legacy mirror): capability category B.
+		f.recordRuntimeAbandon(strings.ToLower(rt.Name()), prepErr)
 		f.abandonWorkUnit(ctx, conn, wu, prepErr.Error())
 		return nil, nil
 	}
+
+	// ESCALATION (#15 fix 4, legacy mirror): clear the streak on prepare-success.
+	f.resetRuntimeAbandon(strings.ToLower(rt.Name()))
 
 	return &PreFetchItem{
 		WU:        wu,
@@ -488,6 +634,139 @@ func (f *Fetcher) availableServers() []*ServerConnection {
 		}
 	}
 	return available
+}
+
+// applyRateLimitBackoff parks a head that answered codes.ResourceExhausted with
+// the dedicated, larger rate-limit backoff floor (then exponential, jittered,
+// capped growth on repeat). availableServers() honors Backoff via
+// time.Since(LastError) >= Backoff, so the rate-limited head is skipped for the
+// longer floor. This is deliberately calmer (Info, not Warn) than the generic
+// connection-error path because rate limiting is normal flow control. See #18.
+func (f *Fetcher) applyRateLimitBackoff(head *ServerConnection, leafSlug string, err error) {
+	f.logger.Info("fetcher: head rate-limited request, backing off",
+		"server", head.Name, "leaf_slug", leafSlug, "error", err, "floor", f.rateLimitBackoff)
+	head.Available = false
+	head.LastError = time.Now()
+	if head.Backoff < f.rateLimitBackoff {
+		head.Backoff = f.rateLimitBackoff
+	} else {
+		// +/-20% jitter on the doubling de-synchronizes the fleet so volunteers
+		// don't all retry on the same tick (gRPC retry etiquette).
+		head.Backoff = withBackoffJitter(head.Backoff * 2)
+		if head.Backoff > f.maxBackoff {
+			head.Backoff = f.maxBackoff
+		}
+	}
+}
+
+// withBackoffJitter applies +/-20% jitter to a backoff duration.
+func withBackoffJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	jittered := float64(d) * (1 + (rand.Float64()*2-1)*0.2)
+	if jittered < 0 {
+		jittered = 0
+	}
+	return time.Duration(jittered)
+}
+
+// runtimeKeyForWU normalizes a work unit's runtime hint for the abandon counter,
+// mirroring RuntimeRegistry.SelectRuntime (empty -> "native").
+func runtimeKeyForWU(wu *runtime.WorkUnit) string {
+	name := strings.ToLower(wu.Runtime)
+	if name == "" {
+		return "native"
+	}
+	return name
+}
+
+// requiredRuntimeForLeaf derives the runtime a leaf needs, mirroring the
+// SelectRuntime/CanHandle precedence: container if an image is set; else wasm if
+// a wasm binary is present and no image; else native. Used to decide whether a
+// leaf must be skipped because its runtime is paused.
+func requiredRuntimeForLeaf(leaf CachedLeafInfo) string {
+	spec := leaf.ExecutionSpec
+	if spec == nil {
+		return "native"
+	}
+	if spec.Image != "" {
+		return "container"
+	}
+	if _, ok := spec.Binaries["wasm"]; ok {
+		return "wasm"
+	}
+	return "native"
+}
+
+// recordRuntimeAbandon increments the consecutive-abandon counter for a
+// capability-driven abandon (missing/incapable runtime, or a failed Prepare).
+// When the count first reaches the threshold (and the runtime is not already
+// paused) it emits exactly one loud WARN naming the runtime, the count, the last
+// error and a runtime-specific remedy, then pauses the runtime.
+func (f *Fetcher) recordRuntimeAbandon(name string, err error) {
+	f.runtimeAbandons[name]++
+	count := f.runtimeAbandons[name]
+	if count != runtimeAbandonPauseThreshold {
+		return
+	}
+	if _, already := f.pausedRuntimes[name]; already {
+		return
+	}
+	f.pausedRuntimes[name] = f.now()
+	f.logger.Warn("fetcher: runtime repeatedly failing — pausing leaf requests that need it",
+		"runtime", name,
+		"consecutive_abandons", count,
+		"last_error", err,
+		"remedy", remedyForRuntime(name),
+		"cooldown", runtimeAbandonCooldown)
+}
+
+// resetRuntimeAbandon clears the abandon counter and any pause for a runtime
+// after a successful Prepare for it.
+func (f *Fetcher) resetRuntimeAbandon(name string) {
+	delete(f.runtimeAbandons, name)
+	delete(f.pausedRuntimes, name)
+}
+
+// runtimePaused reports whether the named runtime is currently paused, clearing
+// the pause (and zeroing its count) if the cooldown has elapsed so it is
+// re-probed once.
+func (f *Fetcher) runtimePaused(name string) bool {
+	pausedAt, ok := f.pausedRuntimes[name]
+	if !ok {
+		return false
+	}
+	if f.now().Sub(pausedAt) >= runtimeAbandonCooldown {
+		delete(f.pausedRuntimes, name)
+		delete(f.runtimeAbandons, name)
+		return false
+	}
+	return true
+}
+
+// expirePausedRuntimes sweeps all paused runtimes and clears any whose cooldown
+// has elapsed, so a runtime no longer referenced by any leaf is still re-probed.
+func (f *Fetcher) expirePausedRuntimes() {
+	now := f.now()
+	for name, pausedAt := range f.pausedRuntimes {
+		if now.Sub(pausedAt) >= runtimeAbandonCooldown {
+			delete(f.pausedRuntimes, name)
+			delete(f.runtimeAbandons, name)
+		}
+	}
+}
+
+// remedyForRuntime returns a runtime-specific operator hint for the loud WARN.
+func remedyForRuntime(name string) string {
+	switch name {
+	case "container":
+		return "install or repair the container backend (Docker/Podman) and make sure it is running"
+	case "wasm":
+		return "verify the wasm runtime is available and the wasm binary URL/checksum is correct"
+	default:
+		return "check this leaf's native binary URLs/checksums and that this host can run the work unit"
+	}
 }
 
 // serverNames extracts names from server connections for logging.

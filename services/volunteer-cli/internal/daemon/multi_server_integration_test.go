@@ -1,4 +1,4 @@
-﻿package daemon
+package daemon
 
 import (
 	"context"
@@ -127,6 +127,7 @@ func testMultiServerFullJourney(t *testing.T) {
 	})
 	d.initialBackoff = 5 * time.Millisecond
 	d.maxBackoff = 50 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	// Run long enough for all 3 work units to execute (~3.6s + overhead).
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -377,6 +378,7 @@ func testMultiServerPartialFailure(t *testing.T) {
 	})
 	d.initialBackoff = 5 * time.Millisecond
 	d.maxBackoff = 50 * time.Millisecond
+	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 	d.multiClient.SetBackoff(5*time.Millisecond, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

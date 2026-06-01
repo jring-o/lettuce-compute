@@ -24,6 +24,18 @@ const (
 	grpcAuthPubKeyMeta    = "x-lettuce-pubkey-bin"
 	grpcAuthTimestampMeta = "x-lettuce-timestamp"
 	grpcAuthSignatureMeta = "x-lettuce-signature-bin"
+	// grpcAuthNonceMeta carries an OPTIONAL fresh per-request nonce. It is a plain
+	// (NOT "-bin") key because the value is lowercase-hex ASCII the client folded
+	// verbatim into the signed bytes; a "-bin" key would be base64-decoded by gRPC
+	// on read and would no longer match. When present, the canonical message is
+	// reconstructed WITH the nonce; when absent (legacy/old volunteers), the
+	// pre-nonce <ts>:<method>:<hash> form is used, preserving backward compat.
+	grpcAuthNonceMeta = "x-lettuce-nonce"
+
+	// grpcAuthMaxNonceLen bounds the nonce length accepted from metadata before it
+	// is folded into the signed string. A well-behaved client sends 32 hex chars;
+	// this caps the signed-string size against a hostile over-long metadata value.
+	grpcAuthMaxNonceLen = 256
 )
 
 // grpcReplayDetectionEnabled gates the anti-replay cache. It is true in production
@@ -55,15 +67,24 @@ var grpcPublicMethods = map[string]bool{
 }
 
 // canonicalGRPCAuthMessage builds the message that the client signs and the server
-// verifies. It MUST match the client interceptor exactly:
+// verifies. It MUST match the client interceptor exactly. There are two forms,
+// selected by whether a nonce is present:
 //
-//	<unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>
+//	with nonce:    <unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>:<nonce-hex>
+//	without nonce: <unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>
 //
-// requestBytes uses deterministic protobuf marshaling, which is stable across the
-// shared protobuf-go version in this workspace, so both sides hash identical bytes.
-func canonicalGRPCAuthMessage(unixTs int64, fullMethod string, requestBytes []byte) string {
+// The empty-nonce branch reproduces the pre-nonce protocol BYTE-FOR-BYTE so that
+// old volunteers (which send no x-lettuce-nonce) still verify. New volunteers send
+// the nonce both in the signed bytes and in metadata, so the server reconstructs
+// the with-nonce form identically. requestBytes uses deterministic protobuf
+// marshaling, which is stable across the shared protobuf-go version in this
+// workspace, so both sides hash identical bytes.
+func canonicalGRPCAuthMessage(unixTs int64, fullMethod string, requestBytes []byte, nonce string) string {
 	sum := sha256.Sum256(requestBytes)
-	return fmt.Sprintf("%d:%s:%s", unixTs, fullMethod, hex.EncodeToString(sum[:]))
+	if nonce == "" {
+		return fmt.Sprintf("%d:%s:%s", unixTs, fullMethod, hex.EncodeToString(sum[:]))
+	}
+	return fmt.Sprintf("%d:%s:%s:%s", unixTs, fullMethod, hex.EncodeToString(sum[:]), nonce)
 }
 
 // replayCache is a small, bounded, mutex-guarded set of recently-seen signatures
@@ -186,6 +207,19 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *repl
 		return nil, status.Errorf(codes.Unauthenticated, "invalid timestamp: %v", err)
 	}
 
+	// Nonce is OPTIONAL: old volunteers send none and verify against the legacy
+	// (empty-nonce) canonical form. When present, it is folded into the signed
+	// bytes so it is bound by ed25519.Verify (a tampered metadata nonce yields a
+	// different reconstructed message and fails verification). Cap the length to
+	// bound the signed-string size from a hostile metadata value.
+	var nonce string
+	if nonceVals := md.Get(grpcAuthNonceMeta); len(nonceVals) > 0 {
+		nonce = nonceVals[0]
+		if len(nonce) > grpcAuthMaxNonceLen {
+			return nil, status.Error(codes.Unauthenticated, "invalid nonce: too long")
+		}
+	}
+
 	now := timeNow()
 	reqTime := time.Unix(ts, 0)
 	skew := now.Sub(reqTime)
@@ -204,7 +238,7 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *repl
 		return nil, status.Errorf(codes.Internal, "failed to marshal request for verification: %v", err)
 	}
 
-	message := canonicalGRPCAuthMessage(ts, fullMethod, requestBytes)
+	message := canonicalGRPCAuthMessage(ts, fullMethod, requestBytes, nonce)
 
 	pubKey := ed25519.PublicKey(pubKeyBytes)
 	if !ed25519.Verify(pubKey, []byte(message), sigBytes) {
