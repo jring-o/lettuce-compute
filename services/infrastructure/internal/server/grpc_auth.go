@@ -24,12 +24,13 @@ const (
 	grpcAuthPubKeyMeta    = "x-lettuce-pubkey-bin"
 	grpcAuthTimestampMeta = "x-lettuce-timestamp"
 	grpcAuthSignatureMeta = "x-lettuce-signature-bin"
-	// grpcAuthNonceMeta carries an OPTIONAL fresh per-request nonce. It is a plain
+	// grpcAuthNonceMeta carries a REQUIRED fresh per-request nonce. It is a plain
 	// (NOT "-bin") key because the value is lowercase-hex ASCII the client folded
 	// verbatim into the signed bytes; a "-bin" key would be base64-decoded by gRPC
-	// on read and would no longer match. When present, the canonical message is
-	// reconstructed WITH the nonce; when absent (legacy/old volunteers), the
-	// pre-nonce <ts>:<method>:<hash> form is used, preserving backward compat.
+	// on read and would no longer match. The canonical message is always
+	// reconstructed WITH the nonce; a request with no nonce metadata is rejected
+	// Unauthenticated (there is no legacy non-nonce form — greenfield, head and
+	// volunteers ship together).
 	grpcAuthNonceMeta = "x-lettuce-nonce"
 
 	// grpcAuthMaxNonceLen bounds the nonce length accepted from metadata before it
@@ -67,23 +68,16 @@ var grpcPublicMethods = map[string]bool{
 }
 
 // canonicalGRPCAuthMessage builds the message that the client signs and the server
-// verifies. It MUST match the client interceptor exactly. There are two forms,
-// selected by whether a nonce is present:
+// verifies. It MUST match the client interceptor exactly. There is a single form:
 //
-//	with nonce:    <unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>:<nonce-hex>
-//	without nonce: <unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>
+//	<unix-ts>:<full-method>:<hex(sha256(deterministic-marshal(req)))>:<nonce-hex>
 //
-// The empty-nonce branch reproduces the pre-nonce protocol BYTE-FOR-BYTE so that
-// old volunteers (which send no x-lettuce-nonce) still verify. New volunteers send
-// the nonce both in the signed bytes and in metadata, so the server reconstructs
-// the with-nonce form identically. requestBytes uses deterministic protobuf
+// The nonce is always present (the client always sends a fresh one and the server
+// rejects a request without it). requestBytes uses deterministic protobuf
 // marshaling, which is stable across the shared protobuf-go version in this
 // workspace, so both sides hash identical bytes.
 func canonicalGRPCAuthMessage(unixTs int64, fullMethod string, requestBytes []byte, nonce string) string {
 	sum := sha256.Sum256(requestBytes)
-	if nonce == "" {
-		return fmt.Sprintf("%d:%s:%s", unixTs, fullMethod, hex.EncodeToString(sum[:]))
-	}
 	return fmt.Sprintf("%d:%s:%s:%s", unixTs, fullMethod, hex.EncodeToString(sum[:]), nonce)
 }
 
@@ -207,17 +201,19 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *repl
 		return nil, status.Errorf(codes.Unauthenticated, "invalid timestamp: %v", err)
 	}
 
-	// Nonce is OPTIONAL: old volunteers send none and verify against the legacy
-	// (empty-nonce) canonical form. When present, it is folded into the signed
-	// bytes so it is bound by ed25519.Verify (a tampered metadata nonce yields a
-	// different reconstructed message and fails verification). Cap the length to
-	// bound the signed-string size from a hostile metadata value.
-	var nonce string
-	if nonceVals := md.Get(grpcAuthNonceMeta); len(nonceVals) > 0 {
-		nonce = nonceVals[0]
-		if len(nonce) > grpcAuthMaxNonceLen {
-			return nil, status.Error(codes.Unauthenticated, "invalid nonce: too long")
-		}
+	// Nonce is REQUIRED: a request with no (or empty) x-lettuce-nonce metadata is
+	// rejected Unauthenticated — there is no legacy non-nonce form. The nonce is
+	// folded into the signed bytes so it is bound by ed25519.Verify (a tampered
+	// metadata nonce yields a different reconstructed message and fails
+	// verification). Cap the length to bound the signed-string size from a hostile
+	// metadata value.
+	nonceVals := md.Get(grpcAuthNonceMeta)
+	if len(nonceVals) == 0 || nonceVals[0] == "" {
+		return nil, status.Error(codes.Unauthenticated, "missing nonce")
+	}
+	nonce := nonceVals[0]
+	if len(nonce) > grpcAuthMaxNonceLen {
+		return nil, status.Error(codes.Unauthenticated, "invalid nonce: too long")
 	}
 
 	now := timeNow()

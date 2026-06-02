@@ -73,7 +73,7 @@ func setupHeartbeatServer(t *testing.T) (
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	startTime := time.Now()
 
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerRepo := volunteer.NewPgxRepository(pool)
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)

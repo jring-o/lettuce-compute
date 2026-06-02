@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"runtime/debug"
 	"time"
 
@@ -28,22 +29,37 @@ const grpcMaxMsgSize = 128 * 1024 * 1024 // 128 MB
 
 // NewGRPCServer creates a configured gRPC server with interceptors.
 //
-// Rate limiting (H3): a per-IP token-bucket limiter is installed BEFORE the C1
-// Ed25519 auth interceptor so that unauthenticated abuse is throttled, while
-// logging/recovery remain outermost so every request is still logged and panics
-// recovered. The limiter keys on the gRPC peer IP.
+// Per-client rate limiting: two token-bucket limiters bracket the Ed25519 auth
+// interceptor.
 //
-// Known limitation: behind a reverse proxy that terminates gRPC (e.g. Caddy),
-// the gRPC peer IP seen here is the proxy's address, so this limiter becomes an
-// effectively GLOBAL ceiling rather than per-client. It still protects
-// direct-access deployments and provides a global rate ceiling; for true
-// per-client gRPC limiting behind a proxy, configure rate limiting at the proxy.
-func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger) (*grpc.Server, func()) {
-	// Per-IP rate limiter. Uses the same rateLimitStore/tokenBucket pattern as the
-	// HTTP limiter, with its own store and cleanup goroutine.
-	rlStore := newRateLimitStore()
-	rlStop := make(chan struct{})
-	go rlStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, rlStop)
+//   - The PRE-auth per-IP limiter (grpcRateLimitInterceptor) is the global /
+//     unauthenticated ceiling. It runs before auth so unauthenticated abuse —
+//     and the Ed25519-verify cost it would otherwise incur — is shed. It is now
+//     trust-aware: with trustedProxies configured (mirroring the HTTP limiter and
+//     LETTUCE_TRUSTED_PROXIES), volunteers behind a reverse proxy (e.g. Caddy)
+//     are bucketed per real client IP from x-forwarded-for / x-real-ip instead of
+//     sharing one bucket keyed on the proxy address. With no trusted proxies, the
+//     direct gRPC peer IP is used (the secure default).
+//   - The POST-auth per-pubkey limiter (grpcPerPubkeyRateLimitInterceptor) is the
+//     per-authenticated-volunteer budget, keyed on the verified Ed25519 key. It
+//     MUST be last in the chain (the pubkey is only trustworthy after auth) and
+//     sheds DB/handler cost only, not crypto cost.
+//
+// logging/recovery remain outermost so every request is still logged and panics
+// recovered even when rate-limiting or authentication rejects the call.
+func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*net.IPNet) (*grpc.Server, func()) {
+	// Pre-auth per-IP rate limiter. Uses the same rateLimitStore/tokenBucket
+	// pattern as the HTTP limiter, with its own store and cleanup goroutine.
+	ipStore := newRateLimitStore()
+	ipStop := make(chan struct{})
+	go ipStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, ipStop)
+
+	// Post-auth per-pubkey rate limiter. A SECOND store so pubkey buckets are
+	// reaped independently; worst-case live buckets ≈ active fleet size × one
+	// small struct, bounded by the 10-min stale-bucket reaper.
+	pubkeyStore := newRateLimitStore()
+	pubkeyStop := make(chan struct{})
+	go pubkeyStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, pubkeyStop)
 
 	// Ed25519 request authentication. The interceptor verifies a per-request
 	// signature carried in gRPC metadata and binds the proven public key into the
@@ -68,8 +84,9 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger) (*grpc.Server, func(
 		grpc.ChainUnaryInterceptor(
 			loggingInterceptor(logger),
 			recoveryInterceptor(logger),
-			grpcRateLimitInterceptor(rlStore),
+			grpcRateLimitInterceptor(ipStore, trustedProxies),
 			authIntercept,
+			grpcPerPubkeyRateLimitInterceptor(pubkeyStore),
 		),
 	}
 
@@ -78,7 +95,8 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger) (*grpc.Server, func(
 	}
 
 	cleanup := func() {
-		close(rlStop)
+		close(ipStop)
+		close(pubkeyStop)
 		authCleanup()
 	}
 	return grpc.NewServer(opts...), cleanup

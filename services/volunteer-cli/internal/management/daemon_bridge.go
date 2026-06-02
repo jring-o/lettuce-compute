@@ -712,8 +712,8 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 			applyLeafFilter(&newCfg.Leafs, p)
 		}
 	}
-	if v, ok := partial["work_buffer_size"]; ok {
-		newCfg.WorkBufferSize = toInt(v)
+	if v, ok := partial["work_buffer_hours"]; ok {
+		newCfg.WorkBufferHours = toFloat(v)
 	}
 	if v, ok := partial["servers"]; ok {
 		if serverList, ok := v.([]any); ok {
@@ -1276,6 +1276,20 @@ func toInt(v any) int {
 	case json.Number:
 		i, _ := n.Int64()
 		return int(i)
+	default:
+		return 0
+	}
+}
+
+func toFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
 	default:
 		return 0
 	}

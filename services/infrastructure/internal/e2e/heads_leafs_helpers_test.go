@@ -37,9 +37,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 // headsLeafsEnv holds all server handles for Heads & Leafs E2E tests.
@@ -175,10 +173,10 @@ func setupHeadsLeafsServer(t *testing.T) (*headsLeafsEnv, func()) {
 	httpURL := "http://" + httpLis.Addr().String()
 
 	// gRPC server with checkpoint support.
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0.1-heads-leafs", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
-	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10)
+	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10, server.HeadDispatchConfig{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -319,17 +317,14 @@ func getHeadInfo(t *testing.T, env *headsLeafsEnv) leaf.HeadInfoResponse {
 	return headInfo
 }
 
-// effectiveLeafID returns LeafId if populated, falling back to ProjectId.
-// Needed because LeafId (proto field 18) doesn't serialize without proto regeneration.
-func effectiveLeafID(resp *lettucev1.RequestWorkUnitResponse) string {
-	if resp.LeafId != "" {
-		return resp.LeafId
-	}
-	return resp.ProjectId
+// effectiveLeafID returns the assignment's LeafId.
+func effectiveLeafID(a *lettucev1.WorkUnitAssignment) string {
+	return a.LeafId
 }
 
-// requestWUFromLeafs requests a work unit with leaf_ids filter via gRPC.
-func requestWUFromLeafs(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID string, pubKey []byte, leafIDs []string) *lettucev1.RequestWorkUnitResponse {
+// requestWUFromLeafs requests a work unit with leaf_ids filter via gRPC and
+// returns the single assignment the head dispatched.
+func requestWUFromLeafs(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID string, pubKey []byte, leafIDs []string) *lettucev1.WorkUnitAssignment {
 	t.Helper()
 	wuResp, err := env.grpc.RequestWorkUnit(signFor(t, ctx, pubKey), &lettucev1.RequestWorkUnitRequest{
 		VolunteerId: volID,
@@ -339,29 +334,42 @@ func requestWUFromLeafs(t *testing.T, env *headsLeafsEnv, ctx context.Context, v
 	if err != nil {
 		t.Fatalf("request work unit: %v", err)
 	}
-	return wuResp
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	return wuResp.Assignments[0]
 }
 
-// requestWUExpectNone requests work and asserts the server reports no matching work
-// (a NotFound gRPC status), used by exclusion tests where a volunteer is not eligible.
+// requestWUExpectNone requests work and asserts the server reports no matching
+// work. No-work is now an OK response carrying an empty assignments list (the
+// codes.NotFound sentinel was removed); used by exclusion tests where a
+// volunteer is not eligible.
 func requestWUExpectNone(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID string, pubKey []byte, leafIDs []string) {
 	t.Helper()
-	_, err := env.grpc.RequestWorkUnit(signFor(t, ctx, pubKey), &lettucev1.RequestWorkUnitRequest{
+	resp, err := env.grpc.RequestWorkUnit(signFor(t, ctx, pubKey), &lettucev1.RequestWorkUnitRequest{
 		VolunteerId: volID,
 		PublicKey:   pubKey,
 		LeafIds:     leafIDs,
 	})
-	if err == nil {
-		t.Fatal("expected no work available (NotFound), but a work unit was assigned")
+	if err != nil {
+		t.Fatalf("request work unit: %v", err)
 	}
-	if status.Code(err) != codes.NotFound {
-		t.Fatalf("expected NotFound for no available work, got: %v", err)
+	if len(resp.Assignments) != 0 {
+		t.Fatalf("expected no work available (empty assignments), but got %d", len(resp.Assignments))
 	}
 }
 
 // submitWUResult submits a result for a work unit via gRPC.
 func submitWUResult(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID string, pubKey []byte, wuID string, outputData []byte) {
 	t.Helper()
+	// Ensure the submitting volunteer has an active assignment_history row. A
+	// buffered unit is leased via reservation columns (no history row) until
+	// run-start, so the reserving volunteer must run-start (RUNNING heartbeat →
+	// Assign) before submitting. A redundant volunteer that was placed on the unit
+	// via a direct history-row insert already has its row and never reserved it, so
+	// this is a no-op for that volunteer (the run-start guard only fires for a
+	// QUEUED unit reserved to this caller).
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuID)
 	checksum := sha256Hex(outputData)
 	_, err := env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
 		WorkUnitId:           wuID,
@@ -378,6 +386,34 @@ func submitWUResult(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID
 	})
 	if err != nil {
 		t.Fatalf("submit result for WU %s: %v", wuID, err)
+	}
+}
+
+// ensureRunStart sends a RUNNING heartbeat (run-start) for wuID ONLY when the unit
+// is still QUEUED and reserved to this volunteer — i.e. the volunteer that actually
+// reserved the unit via RequestWorkUnit. This flips it to ASSIGNED/RUNNING and
+// creates the active assignment_history row SubmitResult needs. It is a deliberate
+// no-op for a redundant volunteer (placed on the unit via a direct history-row
+// insert, never reserved) and for an already-running unit, so it can be called
+// generically from the submit helpers without breaking redundant-volunteer flows.
+func ensureRunStart(t *testing.T, pool *pgxpool.Pool, grpc lettucev1.VolunteerServiceClient, ctx context.Context, volID string, pubKey []byte, wuID string) {
+	t.Helper()
+	var state string
+	var reservedVol *string
+	if err := pool.QueryRow(ctx,
+		"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).
+		Scan(&state, &reservedVol); err != nil {
+		t.Fatalf("ensureRunStart: query work unit %s: %v", wuID, err)
+	}
+	if state != "QUEUED" || reservedVol == nil || *reservedVol != volID {
+		return
+	}
+	if _, err := grpc.Heartbeat(signFor(t, ctx, pubKey), &lettucev1.HeartbeatRequest{
+		WorkUnitId:  wuID,
+		VolunteerId: volID,
+		Status:      "RUNNING",
+	}); err != nil {
+		t.Fatalf("ensureRunStart: run-start heartbeat for WU %s: %v", wuID, err)
 	}
 }
 

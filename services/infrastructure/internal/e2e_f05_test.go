@@ -101,7 +101,7 @@ func setupF05Server(t *testing.T) (
 	httpURL := "http://" + httpLis.Addr().String()
 
 	// gRPC server for volunteer service.
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerRepo := volunteer.NewPgxRepository(pool)
 	assignRepo := assignment.NewPgxRepository(pool)
@@ -315,23 +315,39 @@ func TestE2EF05Lifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 7: RequestWorkUnit: %v", err)
 	}
-	if wuResp.WorkUnitId == "" {
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("step 7: expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	wu := wuResp.Assignments[0]
+	if wu.WorkUnitId == "" {
 		t.Fatal("step 7: expected non-empty work_unit_id")
 	}
-	if wuResp.ProjectId != proj.ID.String() {
-		t.Errorf("step 7: leaf_id = %q, want %q", wuResp.ProjectId, proj.ID.String())
+	if wu.LeafId != proj.ID.String() {
+		t.Errorf("step 7: leaf_id = %q, want %q", wu.LeafId, proj.ID.String())
 	}
-	if wuResp.Runtime != "NATIVE" {
-		t.Errorf("step 7: runtime = %q, want NATIVE", wuResp.Runtime)
+	if wu.Runtime != "NATIVE" {
+		t.Errorf("step 7: runtime = %q, want NATIVE", wu.Runtime)
 	}
 
 	// --- Step 8: Submit result for volunteer 1 ---
+	// Run-start: a RUNNING heartbeat flips the reserved (QUEUED) unit to
+	// ASSIGNED/RUNNING and creates the active assignment_history row SubmitResult
+	// requires (buffered units are leased via reservation columns, no history row,
+	// until run-start).
+	if _, hbErr := grpcClient.Heartbeat(key1.sign(ctx), &lettucev1.HeartbeatRequest{
+		WorkUnitId:  wu.WorkUnitId,
+		VolunteerId: vol1ID,
+		Status:      "RUNNING",
+	}); hbErr != nil {
+		t.Fatalf("step 8: run-start heartbeat: %v", hbErr)
+	}
+
 	outputData := []byte(`{"result": "computation_complete", "value": 3.14159}`)
 	hash := sha256.Sum256(outputData)
 	checksum := hex.EncodeToString(hash[:])
 
 	submitResp, err := grpcClient.SubmitResult(key1.sign(ctx), &lettucev1.SubmitResultRequest{
-		WorkUnitId:          wuResp.WorkUnitId,
+		WorkUnitId:          wu.WorkUnitId,
 		VolunteerId:         vol1ID,
 		PublicKey:           pubKey1,
 		OutputData:          outputData,
@@ -359,7 +375,7 @@ func TestE2EF05Lifecycle(t *testing.T) {
 	}
 
 	// --- Step 9: Work unit is NOT yet complete (redundancy_factor=2 needs two results) ---
-	wuID, _ := types.ParseID(wuResp.WorkUnitId)
+	wuID, _ := types.ParseID(wu.WorkUnitId)
 	var wuState string
 	if err := pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", wuID).Scan(&wuState); err != nil {
 		t.Fatalf("step 9: query work unit: %v", err)
@@ -402,11 +418,11 @@ func TestE2EF05Lifecycle(t *testing.T) {
 	// --- Step 12: Assign the SAME work unit to volunteer 2 (redundancy_factor=2) ---
 	// The scheduler does not hand the same unit to a second volunteer via RequestWorkUnit,
 	// so the redundant assignment is created directly (mirrors the maintained e2e suite).
-	createRedundantAssignment(t, pool, ctx, wuResp.WorkUnitId, types.MustParseID(vol2ID))
+	createRedundantAssignment(t, pool, ctx, wu.WorkUnitId, types.MustParseID(vol2ID))
 
 	// --- Step 13: Volunteer 2 submits a CORROBORATING (identical) result ---
 	submitResp2, err := grpcClient.SubmitResult(key2.sign(ctx), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wu.WorkUnitId,
 		VolunteerId:          vol2ID,
 		PublicKey:            pubKey2,
 		OutputData:           outputData,
@@ -474,7 +490,7 @@ func TestE2EF05Lifecycle(t *testing.T) {
 		t.Fatalf("step 17: RegisterVolunteer 3: %v", err)
 	}
 	_, err = grpcClient.SubmitResult(key3.sign(ctx), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wu.WorkUnitId,
 		VolunteerId:          regResp3.VolunteerId,
 		PublicKey:            pubKey3,
 		OutputData:           outputData,
@@ -494,7 +510,7 @@ func TestE2EF05Lifecycle(t *testing.T) {
 
 	// --- Step 18: Checksum mismatch is rejected ---
 	_, err = grpcClient.SubmitResult(key1.sign(ctx), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wu.WorkUnitId,
 		VolunteerId:          vol1ID,
 		PublicKey:            pubKey1,
 		OutputData:           outputData,

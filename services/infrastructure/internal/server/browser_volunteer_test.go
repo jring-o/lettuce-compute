@@ -109,6 +109,18 @@ func (m *bvMockWURepo) FindNextAssignable(context.Context, workunit.AssignmentOp
 	}
 	return m.wus[0], nil
 }
+func (m *bvMockWURepo) ReserveNextAssignable(context.Context, workunit.AssignmentOptions, time.Duration) (*workunit.WorkUnit, error) {
+	if len(m.wus) == 0 {
+		return nil, nil
+	}
+	return m.wus[0], nil
+}
+func (m *bvMockWURepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *bvMockWURepo) Assign(_ context.Context, wuID types.ID, volID types.ID) (*workunit.WorkUnit, error) {
 	for _, wu := range m.wus {
 		if wu.ID == wuID {

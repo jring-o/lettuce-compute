@@ -209,7 +209,10 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol A request work: %v", err)
 		}
-		wuID1 := wuRespA.WorkUnitId
+		if len(wuRespA.Assignments) != 1 {
+			t.Fatalf("vol A expected 1 assignment, got %d", len(wuRespA.Assignments))
+		}
+		wuID1 := wuRespA.Assignments[0].WorkUnitId
 
 		// Volunteer A sends heartbeat → ASSIGNED → RUNNING.
 		hbResp, err := grpcClient.Heartbeat(keyA.sign(ctx), &lettucev1.HeartbeatRequest{
@@ -336,7 +339,18 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol A request work: %v", err)
 		}
-		wuID2 := wuRespA.WorkUnitId
+		if len(wuRespA.Assignments) != 1 {
+			t.Fatalf("vol A expected 1 assignment, got %d", len(wuRespA.Assignments))
+		}
+		wuID2 := wuRespA.Assignments[0].WorkUnitId
+
+		// Vol A run-starts (RUNNING heartbeat) so its reserved unit flips to
+		// ASSIGNED/RUNNING and gets the active history row SubmitResult needs.
+		if _, hbErr := grpcClient.Heartbeat(keyA.sign(ctx), &lettucev1.HeartbeatRequest{
+			WorkUnitId: wuID2, VolunteerId: volAID, Status: "RUNNING",
+		}); hbErr != nil {
+			t.Fatalf("vol A run-start heartbeat: %v", hbErr)
+		}
 
 		// Create redundant assignment for vol B.
 		createRedundantAssignment(t, wuID2, volBIDParsed)
@@ -446,8 +460,18 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol C request reassigned work: %v", err)
 		}
-		if wuRespC.WorkUnitId != wuID2 {
-			t.Errorf("vol C got %s, want %s (reassigned)", wuRespC.WorkUnitId, wuID2)
+		if len(wuRespC.Assignments) != 1 {
+			t.Fatalf("vol C expected 1 assignment, got %d", len(wuRespC.Assignments))
+		}
+		if wuRespC.Assignments[0].WorkUnitId != wuID2 {
+			t.Errorf("vol C got %s, want %s (reassigned)", wuRespC.Assignments[0].WorkUnitId, wuID2)
+		}
+
+		// Vol C run-starts the reassigned unit so it gets its active history row.
+		if _, hbErr := grpcClient.Heartbeat(keyC.sign(ctx), &lettucev1.HeartbeatRequest{
+			WorkUnitId: wuID2, VolunteerId: volCID, Status: "RUNNING",
+		}); hbErr != nil {
+			t.Fatalf("vol C run-start heartbeat: %v", hbErr)
 		}
 
 		// Create redundant assignment for vol D.
@@ -504,7 +528,10 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol A request work: %v", err)
 		}
-		wuID3 := wuRespA.WorkUnitId
+		if len(wuRespA.Assignments) != 1 {
+			t.Fatalf("vol A expected 1 assignment, got %d", len(wuRespA.Assignments))
+		}
+		wuID3 := wuRespA.Assignments[0].WorkUnitId
 
 		// Vol A sends heartbeat (ASSIGNED → RUNNING).
 		_, err = grpcClient.Heartbeat(keyA.sign(ctx), &lettucev1.HeartbeatRequest{
@@ -571,8 +598,19 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol B request after timeout: %v", err)
 		}
-		if wuRespB.WorkUnitId != wuID3 {
-			t.Errorf("vol B got %s, want %s", wuRespB.WorkUnitId, wuID3)
+		if len(wuRespB.Assignments) != 1 {
+			t.Fatalf("vol B expected 1 assignment, got %d", len(wuRespB.Assignments))
+		}
+		if wuRespB.Assignments[0].WorkUnitId != wuID3 {
+			t.Errorf("vol B got %s, want %s", wuRespB.Assignments[0].WorkUnitId, wuID3)
+		}
+
+		// Vol B run-starts (RUNNING heartbeat) so its reserved unit flips to
+		// ASSIGNED/RUNNING and gets the active history row SubmitResult needs.
+		if _, hbErr := grpcClient.Heartbeat(keyB.sign(ctx), &lettucev1.HeartbeatRequest{
+			WorkUnitId: wuID3, VolunteerId: volBID, Status: "RUNNING",
+		}); hbErr != nil {
+			t.Fatalf("vol B run-start heartbeat: %v", hbErr)
 		}
 
 		// Create redundant assignment for vol A.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -47,6 +48,15 @@ func (r *mockWorkUnitRepo) BulkTransitionByBatch(_ context.Context, _ types.ID, 
 	return 0, nil
 }
 func (r *mockWorkUnitRepo) FindNextAssignable(_ context.Context, _ workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (r *mockWorkUnitRepo) Assign(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {

@@ -1,4 +1,4 @@
-package daemon
+﻿package daemon
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -20,264 +19,21 @@ import (
 
 // --- MultiServerClient tests ---
 
-func TestMultiServerRoundRobin(t *testing.T) {
-	// 3 servers, each has work â†’ work comes from servers in rotation.
-	serverA := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "aaaa0000-0000-4000-8000-00000000000a", ProjectId: "proj-a", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-	serverB := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "bbbb0000-0000-4000-8000-00000000000b", ProjectId: "proj-b", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-	serverC := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "cccc0000-0000-4000-8000-00000000000c", ProjectId: "proj-c", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-
-	connections := []*ServerConnection{
-		{Client: serverA, VolunteerID: "vol-a", Name: "server-a", Available: true},
-		{Client: serverB, VolunteerID: "vol-b", Name: "server-b", Available: true},
-		{Client: serverC, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-
-	ctx := context.Background()
-
-	// First request should come from server A (index 0).
-	resp, conn, err := mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 1: %v", err)
-	}
-	if resp.WorkUnitId != "aaaa0000-0000-4000-8000-00000000000a" {
-		t.Errorf("request 1: got %s, want wu-a", resp.WorkUnitId)
-	}
-	if conn.Name != "server-a" {
-		t.Errorf("request 1: conn = %s, want server-a", conn.Name)
-	}
-
-	// Second request should come from server B.
-	resp, conn, err = mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 2: %v", err)
-	}
-	if resp.WorkUnitId != "bbbb0000-0000-4000-8000-00000000000b" {
-		t.Errorf("request 2: got %s, want wu-b", resp.WorkUnitId)
-	}
-	if conn.Name != "server-b" {
-		t.Errorf("request 2: conn = %s, want server-b", conn.Name)
-	}
-
-	// Third request should come from server C.
-	resp, conn, err = mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 3: %v", err)
-	}
-	if resp.WorkUnitId != "cccc0000-0000-4000-8000-00000000000c" {
-		t.Errorf("request 3: got %s, want wu-c", resp.WorkUnitId)
-	}
-	if conn.Name != "server-c" {
-		t.Errorf("request 3: conn = %s, want server-c", conn.Name)
-	}
-
-	// Fourth request wraps around to server A.
-	resp, _, err = mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 4: %v", err)
-	}
-	if resp.WorkUnitId != "aaaa0000-0000-4000-8000-00000000000a" {
-		t.Errorf("request 4: got %s, want wu-a", resp.WorkUnitId)
-	}
-}
-
-func TestMultiServerSkipEmpty(t *testing.T) {
-	// Server A has no work, server B has work â†’ returns B's work, next starts at C.
-	serverA := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.NotFound, "no work")
-		},
-	}
-	serverB := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "bbbb0000-0000-4000-8000-00000000000b", ProjectId: "proj-b", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-	serverC := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "cccc0000-0000-4000-8000-00000000000c", ProjectId: "proj-c", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-
-	connections := []*ServerConnection{
-		{Client: serverA, VolunteerID: "vol-a", Name: "server-a", Available: true},
-		{Client: serverB, VolunteerID: "vol-b", Name: "server-b", Available: true},
-		{Client: serverC, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-
-	ctx := context.Background()
-
-	// First request: A has no work â†’ skipped â†’ B has work.
-	resp, conn, err := mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 1: %v", err)
-	}
-	if resp.WorkUnitId != "bbbb0000-0000-4000-8000-00000000000b" {
-		t.Errorf("request 1: got %s, want wu-b", resp.WorkUnitId)
-	}
-	if conn.Name != "server-b" {
-		t.Errorf("request 1: conn = %s, want server-b", conn.Name)
-	}
-
-	// Next request should start at C (round-robin advances past B).
-	resp, conn, err = mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 2: %v", err)
-	}
-	if resp.WorkUnitId != "cccc0000-0000-4000-8000-00000000000c" {
-		t.Errorf("request 2: got %s, want wu-c", resp.WorkUnitId)
-	}
-	if conn.Name != "server-c" {
-		t.Errorf("request 2: conn = %s, want server-c", conn.Name)
-	}
-}
-
-func TestMultiServerAllEmpty(t *testing.T) {
-	// All 3 servers return NotFound â†’ returns NotFound.
-	noWork := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.NotFound, "no work")
-		},
-	}
-
-	connections := []*ServerConnection{
-		{Client: noWork, VolunteerID: "vol-a", Name: "server-a", Available: true},
-		{Client: noWork, VolunteerID: "vol-b", Name: "server-b", Available: true},
-		{Client: noWork, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-
-	_, _, err := mc.RequestWork(context.Background(), nil, nil, nil, nil)
-	if err == nil {
-		t.Fatal("expected error when all servers empty")
-	}
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.NotFound {
-		t.Errorf("expected NotFound, got %v", err)
-	}
-}
-
-func TestMultiServerUnavailable(t *testing.T) {
-	// Server B has a connection error â†’ skipped with backoff, retried after backoff.
-	serverA := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.NotFound, "no work")
-		},
-	}
-	serverB := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.Unavailable, "connection refused")
-		},
-	}
-	serverC := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "cccc0000-0000-4000-8000-00000000000c", ProjectId: "proj-c", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-
-	connections := []*ServerConnection{
-		{Client: serverA, VolunteerID: "vol-a", Name: "server-a", Available: true},
-		{Client: serverB, VolunteerID: "vol-b", Name: "server-b", Available: true},
-		{Client: serverC, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-	mc.initialBackoff = 100 * time.Millisecond
-
-	ctx := context.Background()
-
-	// First round: A empty, B error (gets backoff), C has work.
-	resp, conn, err := mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 1: %v", err)
-	}
-	if resp.WorkUnitId != "cccc0000-0000-4000-8000-00000000000c" {
-		t.Errorf("request 1: got %s, want wu-c", resp.WorkUnitId)
-	}
-	if conn.Name != "server-c" {
-		t.Errorf("request 1: conn = %s, want server-c", conn.Name)
-	}
-
-	// Server B should be marked unavailable.
-	if connections[1].Available {
-		t.Error("server B should be unavailable")
-	}
-	if connections[1].Backoff == 0 {
-		t.Error("server B should have backoff set")
-	}
-
-	// Second request immediately: B should be skipped (still in backoff).
-	// A is empty, C has work.
-	resp, _, err = mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("request 2: %v", err)
-	}
-	if resp.WorkUnitId != "cccc0000-0000-4000-8000-00000000000c" {
-		t.Errorf("request 2: got %s, want wu-c", resp.WorkUnitId)
-	}
-
-	// B was skipped â€” verify it wasn't contacted again.
-	if serverB.getRequestCalls() != 1 {
-		t.Errorf("server B request calls = %d, want 1 (should be skipped in backoff)", serverB.getRequestCalls())
-	}
-
-	// Wait for backoff to expire, then B should be retried.
-	time.Sleep(150 * time.Millisecond)
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if serverB.getRequestCalls() < 2 {
-		t.Errorf("server B request calls = %d, want >= 2 (should retry after backoff)", serverB.getRequestCalls())
-	}
-}
-
 func TestMultiServerSingleServer(t *testing.T) {
-	// 1 server configured â†’ behaves identically to current (no regression).
+	// 1 server configured Ã¢â€ â€™ behaves identically to current (no regression).
 	workCount := 0
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			workCount++
 			if workCount <= 2 {
 				return &lettucev1.RequestWorkUnitResponse{
-					WorkUnitId: fmt.Sprintf("00000000-0000-4000-8000-%012d", workCount), ProjectId: "proj-1",
-					Runtime: "native", InputData: []byte("input"),
-					HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+					Assignments: []*lettucev1.WorkUnitAssignment{
+						{
+							WorkUnitId: fmt.Sprintf("00000000-0000-4000-8000-%012d", workCount), LeafId: "proj-1",
+							Runtime: "native", InputData: []byte("input"),
+							HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+						},
+					},
 				}, nil
 			}
 			return nil, status.Error(codes.NotFound, "no work")
@@ -301,7 +57,6 @@ func TestMultiServerSingleServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -326,9 +81,13 @@ func TestMultiServerSubmitToCorrectServer(t *testing.T) {
 	serverB := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "bbbb0000-0000-4000-8000-0000000f0b0b", ProjectId: "proj-b",
-				Runtime: "native", InputData: []byte("input"),
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId: "bbbb0000-0000-4000-8000-0000000f0b0b", LeafId: "proj-b",
+						Runtime: "native", InputData: []byte("input"),
+						HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -360,7 +119,6 @@ func TestMultiServerSubmitToCorrectServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -399,9 +157,13 @@ func TestMultiServerHistoryTracksServer(t *testing.T) {
 			}
 			workServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "11110000-0000-4000-8000-000000001515", ProjectId: "proj-1",
-				Runtime: "native", InputData: []byte("input"),
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId: "11110000-0000-4000-8000-000000001515", LeafId: "proj-1",
+						Runtime: "native", InputData: []byte("input"),
+						HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -423,7 +185,6 @@ func TestMultiServerHistoryTracksServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -452,10 +213,14 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 	serverB := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "bbbb0000-0000-4000-8000-00000000b00b", ProjectId: "proj-b",
-				Runtime: "native", InputData: []byte("input"),
-				HeartbeatIntervalSeconds: 1, // 1 second for test
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId: "bbbb0000-0000-4000-8000-00000000b00b", LeafId: "proj-b",
+						Runtime: "native", InputData: []byte("input"),
+						HeartbeatIntervalSeconds: 1, // 1 second for test
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -494,7 +259,6 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -513,224 +277,6 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 }
 
 // --- MultiServerClient edge-case tests ---
-
-func TestMultiServerBackoffExponentialDoubling(t *testing.T) {
-	// Verify backoff doubles on repeated failures and caps at maxBackoff.
-	failing := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.Unavailable, "connection refused")
-		},
-	}
-
-	conn := &ServerConnection{Client: failing, VolunteerID: "vol-a", Name: "server-a", Available: true}
-	connections := []*ServerConnection{conn}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-	mc.initialBackoff = 10 * time.Millisecond
-	mc.maxBackoff = 50 * time.Millisecond
-
-	ctx := context.Background()
-
-	// First failure: backoff should be initialBackoff (10ms).
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 10*time.Millisecond {
-		t.Errorf("backoff after 1st failure = %v, want 10ms", conn.Backoff)
-	}
-
-	// Reset availability and re-trigger (simulate backoff expiry).
-	conn.LastError = time.Now().Add(-100 * time.Millisecond)
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 20*time.Millisecond {
-		t.Errorf("backoff after 2nd failure = %v, want 20ms", conn.Backoff)
-	}
-
-	// Third failure: 40ms.
-	conn.LastError = time.Now().Add(-100 * time.Millisecond)
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 40*time.Millisecond {
-		t.Errorf("backoff after 3rd failure = %v, want 40ms", conn.Backoff)
-	}
-
-	// Fourth failure: should cap at maxBackoff (50ms), not 80ms.
-	conn.LastError = time.Now().Add(-100 * time.Millisecond)
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 50*time.Millisecond {
-		t.Errorf("backoff after 4th failure = %v, want 50ms (max cap)", conn.Backoff)
-	}
-}
-
-func TestMultiServerBackoffResetOnSuccess(t *testing.T) {
-	// After a server recovers, its backoff should reset to 0.
-	callCount := 0
-	recovering := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			callCount++
-			if callCount <= 2 {
-				return nil, status.Error(codes.Unavailable, "connection refused")
-			}
-			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId: "11110000-0000-4000-8000-000000005ec0", ProjectId: "proj-1", Runtime: "native",
-				HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-			}, nil
-		},
-	}
-
-	conn := &ServerConnection{Client: recovering, VolunteerID: "vol-a", Name: "server-a", Available: true}
-	connections := []*ServerConnection{conn}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-	mc.initialBackoff = 10 * time.Millisecond
-	mc.maxBackoff = 100 * time.Millisecond
-
-	ctx := context.Background()
-
-	// First two calls fail, building up backoff.
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 10*time.Millisecond {
-		t.Fatalf("backoff after 1st failure = %v, want 10ms", conn.Backoff)
-	}
-
-	conn.LastError = time.Now().Add(-100 * time.Millisecond) // expire backoff
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	if conn.Backoff != 20*time.Millisecond {
-		t.Fatalf("backoff after 2nd failure = %v, want 20ms", conn.Backoff)
-	}
-
-	// Third call succeeds.
-	conn.LastError = time.Now().Add(-100 * time.Millisecond) // expire backoff
-	resp, _, err := mc.RequestWork(ctx, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("expected success on 3rd call: %v", err)
-	}
-	if resp.WorkUnitId != "11110000-0000-4000-8000-000000005ec0" {
-		t.Errorf("work unit = %q, want 11110000-0000-4000-8000-000000005ec0", resp.WorkUnitId)
-	}
-	if !conn.Available {
-		t.Error("server should be marked available after success")
-	}
-	if conn.Backoff != 0 {
-		t.Errorf("backoff should be 0 after success, got %v", conn.Backoff)
-	}
-}
-
-func TestMultiServerAllUnavailable(t *testing.T) {
-	// All servers return connection errors (not NotFound) â€” result is NotFound
-	// (no work from any server), and all servers get backoff set.
-	failing := func() *mockClient {
-		return &mockClient{
-			requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-				return nil, status.Error(codes.Unavailable, "connection refused")
-			},
-		}
-	}
-
-	connections := []*ServerConnection{
-		{Client: failing(), VolunteerID: "vol-a", Name: "server-a", Available: true},
-		{Client: failing(), VolunteerID: "vol-b", Name: "server-b", Available: true},
-		{Client: failing(), VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-	mc.initialBackoff = 10 * time.Millisecond
-
-	_, _, err := mc.RequestWork(context.Background(), nil, nil, nil, nil)
-	if err == nil {
-		t.Fatal("expected error when all servers are unavailable")
-	}
-	st, ok := status.FromError(err)
-	if !ok || st.Code() != codes.NotFound {
-		t.Errorf("expected NotFound code, got %v", err)
-	}
-
-	// All servers should be marked unavailable with backoff.
-	for _, conn := range connections {
-		if conn.Available {
-			t.Errorf("server %s should be unavailable", conn.Name)
-		}
-		if conn.Backoff == 0 {
-			t.Errorf("server %s should have backoff set", conn.Name)
-		}
-	}
-}
-
-func TestMultiServerVolunteerIDPassedInRequest(t *testing.T) {
-	// Verify that each server's VolunteerID is used in the RequestWorkUnit call.
-	var receivedIDs []string
-	var mu sync.Mutex
-
-	makeClient := func() *mockClient {
-		return &mockClient{
-			requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-				mu.Lock()
-				receivedIDs = append(receivedIDs, req.VolunteerId)
-				mu.Unlock()
-				return &lettucev1.RequestWorkUnitResponse{
-					WorkUnitId: "dc5ff9da-f084-4dd7-86b8-e829669814f8", ProjectId: "proj-1", Runtime: "native",
-					HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
-				}, nil
-			},
-		}
-	}
-
-	connections := []*ServerConnection{
-		{Client: makeClient(), VolunteerID: "vol-alpha", Name: "server-a", Available: true},
-		{Client: makeClient(), VolunteerID: "vol-beta", Name: "server-b", Available: true},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-
-	ctx := context.Background()
-
-	// Request from server A.
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-	// Request from server B.
-	mc.RequestWork(ctx, nil, nil, nil, nil)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(receivedIDs) != 2 {
-		t.Fatalf("received %d IDs, want 2", len(receivedIDs))
-	}
-	if receivedIDs[0] != "vol-alpha" {
-		t.Errorf("first request volunteer_id = %q, want vol-alpha", receivedIDs[0])
-	}
-	if receivedIDs[1] != "vol-beta" {
-		t.Errorf("second request volunteer_id = %q, want vol-beta", receivedIDs[1])
-	}
-}
-
-func TestMultiServerAllInBackoff(t *testing.T) {
-	// When all servers are in backoff, they should all be skipped and return NotFound.
-	failing := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.Unavailable, "connection refused")
-		},
-	}
-
-	connections := []*ServerConnection{
-		{Client: failing, VolunteerID: "vol-a", Name: "server-a", Available: false, LastError: time.Now(), Backoff: 1 * time.Hour},
-		{Client: failing, VolunteerID: "vol-b", Name: "server-b", Available: false, LastError: time.Now(), Backoff: 1 * time.Hour},
-	}
-
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mc := NewMultiServerClient(connections, logger)
-
-	callsBefore := failing.getRequestCalls()
-	_, _, err := mc.RequestWork(context.Background(), nil, nil, nil, nil)
-	callsAfter := failing.getRequestCalls()
-
-	if err == nil {
-		t.Fatal("expected error when all servers in backoff")
-	}
-	// No actual requests should have been made (all skipped).
-	if callsAfter != callsBefore {
-		t.Errorf("request calls = %d, want %d (servers in backoff should be skipped)", callsAfter, callsBefore)
-	}
-}
 
 func TestNewDaemonLegacyClientCompat(t *testing.T) {
 	// Verify that using the legacy Client/VolunteerID fields creates a

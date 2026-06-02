@@ -96,10 +96,10 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 		t.Fatalf("request work unit: %v", err)
 	}
 
-	if wuResp.InputDataUrl == "" {
+	if wuResp.Assignments[0].InputDataUrl == "" {
 		t.Error("expected input_data_url to be set for external reference leaf")
 	}
-	t.Logf("work unit input_data_url = %s", wuResp.InputDataUrl)
+	t.Logf("work unit input_data_url = %s", wuResp.Assignments[0].InputDataUrl)
 
 	// Submit result with output_data_url (simulating volunteer uploading to external storage).
 	outputData := []byte(`{"result": "computed from external data"}`)
@@ -107,11 +107,12 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 	checksum := hex.EncodeToString(hash[:])
 
 	// Submit with output_data_url instead of inline output_data.
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 	submitResp, err := env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
-		OutputDataUrl:        "https://storage.example.com/results/wu-" + wuResp.WorkUnitId + ".json",
+		OutputDataUrl:        "https://storage.example.com/results/wu-" + wuResp.Assignments[0].WorkUnitId + ".json",
 		OutputChecksumSha256: checksum,
 		Metadata:             &lettucev1.ExecutionMetadata{WallClockSeconds: 15, CpuSecondsUser: 10, CpuCoresUsed: 2},
 	})
@@ -142,7 +143,7 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 	var storedRef *string
 	err = env.pool.QueryRow(ctx,
 		"SELECT input_data_ref FROM work_units WHERE id = $1",
-		wuResp.WorkUnitId,
+		wuResp.Assignments[0].WorkUnitId,
 	).Scan(&storedRef)
 	if err != nil {
 		t.Fatalf("query work unit input_data_ref: %v", err)
@@ -281,8 +282,8 @@ func TestF20_InlineSubmitStillWorks(t *testing.T) {
 	}
 
 	// Verify inline data path: input_data_url should be empty for inline leafs.
-	if wuResp.InputDataUrl != "" {
-		t.Logf("note: input_data_url = %s (may be empty for inline)", wuResp.InputDataUrl)
+	if wuResp.Assignments[0].InputDataUrl != "" {
+		t.Logf("note: input_data_url = %s (may be empty for inline)", wuResp.Assignments[0].InputDataUrl)
 	}
 
 	// Submit inline result.
@@ -290,8 +291,9 @@ func TestF20_InlineSubmitStillWorks(t *testing.T) {
 	hash := sha256.Sum256(outputData)
 	checksum := hex.EncodeToString(hash[:])
 
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 	submitResp, err := env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
 		OutputData:           outputData,

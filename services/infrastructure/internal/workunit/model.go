@@ -58,6 +58,12 @@ type WorkUnit struct {
 	SpotCheck                bool             `json:"spot_check"`
 	LastCheckpointAt         *time.Time       `json:"last_checkpoint_at,omitempty"`
 	LastCheckpointSequence   int              `json:"last_checkpoint_sequence"`
+	// ReservedUntil / ReservedVolunteerID model a lightweight lease on a buffered
+	// (still-QUEUED) work unit: while reserved_until > NOW() the unit is hidden
+	// from other volunteers by FindNextAssignable's reservation guard, without the
+	// reclaim monitors treating it as assigned. Nil when not reserved.
+	ReservedUntil            *time.Time       `json:"reserved_until,omitempty"`
+	ReservedVolunteerID      *types.ID        `json:"reserved_volunteer_id,omitempty"`
 	CreatedAt                time.Time        `json:"created_at"`
 	UpdatedAt                time.Time        `json:"updated_at"`
 }

@@ -185,7 +185,10 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RequestWorkUnit: %v", err)
 		}
-		wu := volruntime.WorkUnitFromProto(wuResp)
+		if len(wuResp.Assignments) != 1 {
+			t.Fatalf("expected 1 assignment, got %d", len(wuResp.Assignments))
+		}
+		wu := volruntime.WorkUnitFromProto(wuResp.Assignments[0])
 		t.Logf("Received WU: %s (leaf: %s)", wu.ID, wu.LeafID)
 
 		prep, err := nativeRT.Prepare(ctx, wu)
@@ -242,7 +245,11 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 			t.Log("No remaining work units (all consumed)")
 			return
 		}
-		wu := volruntime.WorkUnitFromProto(wuResp)
+		if len(wuResp.Assignments) == 0 {
+			t.Log("No remaining work units (all consumed)")
+			return
+		}
+		wu := volruntime.WorkUnitFromProto(wuResp.Assignments[0])
 		t.Logf("Self-hosted WU: %s (leaf: %s)", wu.ID, wu.LeafID)
 
 		prep, err := nativeRT.Prepare(ctx, wu)

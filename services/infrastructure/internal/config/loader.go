@@ -173,6 +173,55 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("LETTUCE_HEAD_URL"); v != "" {
 		cfg.Head.URL = v
 	}
+	if v := os.Getenv("LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER must be an integer: %w", err)
+		}
+		cfg.Head.MaxInflightPerVolunteer = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_MAX_BATCH_PER_REQUEST"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAX_BATCH_PER_REQUEST must be an integer: %w", err)
+		}
+		cfg.Head.MaxBatchPerRequest = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.MinRetryDelaySeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.MaxRetryDelaySeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT must be a float: %w", err)
+		}
+		cfg.Head.RetryDelayJitterPct = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC must be a float: %w", err)
+		}
+		cfg.Head.TargetRequestRatePerSec = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_LEASE_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_LEASE_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.LeaseSeconds = n
+	}
 	return nil
 }
 

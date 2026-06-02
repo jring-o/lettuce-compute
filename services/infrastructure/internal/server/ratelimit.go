@@ -190,8 +190,29 @@ func clientIP(r *http.Request) string {
 //     If no such entry exists, fall back to X-Real-IP (only because the peer is
 //     trusted); failing that, the direct peer IP.
 func clientIPFromRequest(r *http.Request, trustedProxies []*net.IPNet) string {
-	peerIP := remoteIP(r.RemoteAddr)
+	return clientIPFromForwarded(
+		remoteIP(r.RemoteAddr),
+		r.Header.Get("X-Forwarded-For"),
+		r.Header.Get("X-Real-IP"),
+		trustedProxies,
+	)
+}
 
+// clientIPFromForwarded is the transport-neutral core of trust-aware client-IP
+// extraction shared by the HTTP limiter (clientIPFromRequest) and the gRPC
+// limiter (grpcClientIP). It takes the already-extracted direct-peer IP plus the
+// raw X-Forwarded-For and X-Real-IP header/metadata values and applies the same
+// algorithm documented on clientIPFromRequest:
+//
+//  1. If peerIP is NOT within trustedProxies, return peerIP and IGNORE xff/xRealIP
+//     (the secure default; also the path when trustedProxies is empty).
+//  2. Otherwise walk xff RIGHT-to-LEFT, skipping entries that are themselves
+//     trusted proxies, and return the first non-trusted, valid IP (the real
+//     client). Failing that, fall back to xRealIP (trusted because the peer is),
+//     then the direct peer IP.
+//
+// xff may contain multiple comma-separated entries; xRealIP is a single IP.
+func clientIPFromForwarded(peerIP, xff, xRealIP string, trustedProxies []*net.IPNet) string {
 	// If we cannot trust the peer (untrusted peer or no trusted proxies at all),
 	// never honor forwarding headers — return the direct peer.
 	if !ipInNets(net.ParseIP(peerIP), trustedProxies) {
@@ -200,7 +221,7 @@ func clientIPFromRequest(r *http.Request, trustedProxies []*net.IPNet) string {
 
 	// Peer is a trusted proxy: walk X-Forwarded-For right-to-left for the
 	// first non-trusted, valid IP (the real client).
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+	if xff != "" {
 		parts := strings.Split(xff, ",")
 		for i := len(parts) - 1; i >= 0; i-- {
 			candidate := strings.TrimSpace(parts[i])
@@ -217,7 +238,7 @@ func clientIPFromRequest(r *http.Request, trustedProxies []*net.IPNet) string {
 	}
 
 	// No usable XFF entry. Fall back to X-Real-IP (trusted because the peer is).
-	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+	if xri := strings.TrimSpace(xRealIP); xri != "" {
 		if net.ParseIP(xri) != nil {
 			return xri
 		}

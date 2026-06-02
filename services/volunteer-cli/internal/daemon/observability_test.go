@@ -1,4 +1,4 @@
-package daemon
+﻿package daemon
 
 import (
 	"bytes"
@@ -11,8 +11,6 @@ import (
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // The disk gate must surface its otherwise-silent stall as a single WARN (not a
@@ -22,7 +20,7 @@ func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 	lim := &thresholdLimiter{availMB: 50 * 1024}
 	d := newTestDaemonWithResources(&mockClient{}, &mockRuntime{canHandle: true}, lim, scheduler)
 	d.cfg.DataDir = t.TempDir()
-	d.cfg.ResourceLimits.MaxDiskGB = 100 // needs 100*1024 MB free; only 50*1024 available → gated
+	d.cfg.ResourceLimits.MaxDiskGB = 100 // needs 100*1024 MB free; only 50*1024 available â†’ gated
 
 	var buf bytes.Buffer
 	d.logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,7 +34,7 @@ func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 		t.Fatalf("disk-gate WARN count across repeated polls = %d, want exactly 1", got)
 	}
 
-	// Disk recovers → fetching resumes and the gate re-arms.
+	// Disk recovers â†’ fetching resumes and the gate re-arms.
 	lim.availMB = 1 << 30
 	if !d.shouldFetch() {
 		t.Fatal("shouldFetch = false, want true after disk recovered")
@@ -45,7 +43,7 @@ func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 		t.Error("expected a 'disk space recovered' message when the gate cleared")
 	}
 
-	// Re-stall → it warns again, proving the one-time flag re-armed.
+	// Re-stall â†’ it warns again, proving the one-time flag re-armed.
 	lim.availMB = 50 * 1024
 	d.shouldFetch()
 	if got := strings.Count(buf.String(), "not fetching work"); got != 2 {
@@ -58,7 +56,8 @@ func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 func TestFetcher_WarnsOnceWhenNoWork(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(_ context.Context, _ *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.NotFound, "no work")
+			// No-work is an OK reply with empty assignments (no NotFound sentinel).
+			return &lettucev1.RequestWorkUnitResponse{Assignments: nil}, nil
 		},
 		getHeadInfoFn: func(_ context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
 			return &lettucev1.GetHeadInfoResponse{
@@ -77,7 +76,6 @@ func TestFetcher_WarnsOnceWhenNoWork(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 5 * time.Millisecond
 	fetcher.maxBackoff = 10 * time.Millisecond
-	fetcher.minInterval = 0 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -89,7 +87,7 @@ func TestFetcher_WarnsOnceWhenNoWork(t *testing.T) {
 }
 
 // The startup readiness banner must escalate to a WARN when nothing is runnable
-// — e.g. every attached leaf needs a container runtime this box doesn't have —
+// â€” e.g. every attached leaf needs a container runtime this box doesn't have â€”
 // so a misconfigured volunteer learns why instead of sitting silently idle.
 func TestLogReadiness_WarnsWhenOnlyContainerLeafsAndNoRuntime(t *testing.T) {
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())

@@ -510,6 +510,65 @@ func TestHeadConfigValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "valid layer-1 dispatch knobs",
+			cfg: HeadConfig{
+				Name:                    "L1 Head",
+				MaxBatchPerRequest:      8,
+				MinRetryDelaySeconds:    30,
+				MaxRetryDelaySeconds:    900,
+				RetryDelayJitterPct:     0.20,
+				TargetRequestRatePerSec: 500,
+				LeaseSeconds:            900,
+			},
+			wantErr: false,
+		},
+		{
+			name: "max_retry_delay at stale threshold rejected",
+			cfg: HeadConfig{
+				Name:                 "Stale Delay Head",
+				MaxRetryDelaySeconds: 1800,
+			},
+			wantErr: true,
+			errMsg:  "max_retry_delay_seconds must be < 1800",
+		},
+		{
+			name: "lease at stale threshold rejected",
+			cfg: HeadConfig{
+				Name:         "Stale Lease Head",
+				LeaseSeconds: 1800,
+			},
+			wantErr: true,
+			errMsg:  "lease_seconds must be < 1800",
+		},
+		{
+			name: "min greater than max retry delay rejected",
+			cfg: HeadConfig{
+				Name:                 "Inverted Delay Head",
+				MinRetryDelaySeconds: 600,
+				MaxRetryDelaySeconds: 300,
+			},
+			wantErr: true,
+			errMsg:  "min_retry_delay_seconds",
+		},
+		{
+			name: "jitter pct >= 1 rejected",
+			cfg: HeadConfig{
+				Name:                "Bad Jitter Head",
+				RetryDelayJitterPct: 1.0,
+			},
+			wantErr: true,
+			errMsg:  "retry_delay_jitter_pct must be in [0, 1)",
+		},
+		{
+			name: "negative max batch rejected",
+			cfg: HeadConfig{
+				Name:               "Neg Batch Head",
+				MaxBatchPerRequest: -1,
+			},
+			wantErr: true,
+			errMsg:  "max_batch_per_request must be >= 0",
+		},
 	}
 
 	for _, tt := range tests {
@@ -528,6 +587,82 @@ func TestHeadConfigValidate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHeadEffectiveDispatchDefaults(t *testing.T) {
+	// Zero-valued HeadConfig yields the documented Layer-1 defaults.
+	var h HeadConfig
+	if got := h.EffectiveMaxBatch(); got != 8 {
+		t.Errorf("EffectiveMaxBatch() = %d, want 8", got)
+	}
+	if got := h.EffectiveMinRetryDelaySeconds(); got != 30 {
+		t.Errorf("EffectiveMinRetryDelaySeconds() = %d, want 30", got)
+	}
+	if got := h.EffectiveMaxRetryDelaySeconds(); got != 900 {
+		t.Errorf("EffectiveMaxRetryDelaySeconds() = %d, want 900", got)
+	}
+	if got := h.EffectiveRetryDelayJitterPct(); got != 0.20 {
+		t.Errorf("EffectiveRetryDelayJitterPct() = %v, want 0.20", got)
+	}
+	if got := h.EffectiveTargetRequestRatePerSec(); got != 500 {
+		t.Errorf("EffectiveTargetRequestRatePerSec() = %v, want 500", got)
+	}
+	if got := h.EffectiveLeaseSeconds(); got != 900 {
+		t.Errorf("EffectiveLeaseSeconds() = %d, want 900", got)
+	}
+
+	// Non-zero values are returned verbatim.
+	h2 := HeadConfig{
+		MaxBatchPerRequest:      4,
+		MinRetryDelaySeconds:    10,
+		MaxRetryDelaySeconds:    600,
+		RetryDelayJitterPct:     0.1,
+		TargetRequestRatePerSec: 250,
+		LeaseSeconds:            300,
+	}
+	if got := h2.EffectiveMaxBatch(); got != 4 {
+		t.Errorf("EffectiveMaxBatch() = %d, want 4", got)
+	}
+	if got := h2.EffectiveLeaseSeconds(); got != 300 {
+		t.Errorf("EffectiveLeaseSeconds() = %d, want 300", got)
+	}
+	if got := h2.EffectiveTargetRequestRatePerSec(); got != 250 {
+		t.Errorf("EffectiveTargetRequestRatePerSec() = %v, want 250", got)
+	}
+}
+
+func TestHeadDispatchEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_MAX_BATCH_PER_REQUEST", "5")
+	t.Setenv("LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS", "15")
+	t.Setenv("LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS", "600")
+	t.Setenv("LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT", "0.1")
+	t.Setenv("LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC", "250")
+	t.Setenv("LETTUCE_HEAD_LEASE_SECONDS", "450")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Head.MaxBatchPerRequest != 5 {
+		t.Errorf("MaxBatchPerRequest = %d, want 5", cfg.Head.MaxBatchPerRequest)
+	}
+	if cfg.Head.MinRetryDelaySeconds != 15 {
+		t.Errorf("MinRetryDelaySeconds = %d, want 15", cfg.Head.MinRetryDelaySeconds)
+	}
+	if cfg.Head.MaxRetryDelaySeconds != 600 {
+		t.Errorf("MaxRetryDelaySeconds = %d, want 600", cfg.Head.MaxRetryDelaySeconds)
+	}
+	if cfg.Head.RetryDelayJitterPct != 0.1 {
+		t.Errorf("RetryDelayJitterPct = %v, want 0.1", cfg.Head.RetryDelayJitterPct)
+	}
+	if cfg.Head.TargetRequestRatePerSec != 250 {
+		t.Errorf("TargetRequestRatePerSec = %v, want 250", cfg.Head.TargetRequestRatePerSec)
+	}
+	if cfg.Head.LeaseSeconds != 450 {
+		t.Errorf("LeaseSeconds = %d, want 450", cfg.Head.LeaseSeconds)
 	}
 }
 

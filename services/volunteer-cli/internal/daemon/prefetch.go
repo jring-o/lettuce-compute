@@ -14,7 +14,7 @@ import (
 // PreFetchItem is a fetched+prepared WU waiting for an open slot.
 type PreFetchItem struct {
 	WU      *runtime.WorkUnit
-	WUResp  *lettucev1.RequestWorkUnitResponse
+	WUResp  *lettucev1.WorkUnitAssignment
 	Prep    *runtime.PrepareResult
 	Runtime runtime.Runtime
 	Conn    *ServerConnection
@@ -158,6 +158,50 @@ func (q *PreFetchQueue) DropExpiring(threshold float64) {
 		if item.Runtime != nil && item.Prep != nil {
 			if err := item.Runtime.Cleanup(item.Prep); err != nil {
 				q.logger.Warn("cleanup failed for dropped item", "work_unit_id", item.WU.ID, "error", err)
+			}
+		}
+	}
+}
+
+// DropLapsedReservations removes buffered items whose head-side reservation lease
+// (reserved_until_unix) has lapsed or is within `margin` of lapsing.
+//
+// The lease is kept alive by the volunteer's PREPARING heartbeats (the head bumps
+// reserved_until on each), so a held unit's lease should never lapse while the
+// volunteer is live. This is a belt-and-suspenders guard for the case where
+// renewal stalled (head briefly unreachable, heartbeat errors): rather than later
+// pop a lease-lapsed unit — which the head may have re-dispatched to a SECOND
+// volunteer, so its run-start Assign would fail with ASSIGNMENT_CONFLICT after a
+// wasted prepare — we drop it from the buffer now. Items with no lease
+// (ReservedUntilUnix == 0) are left untouched. now is injected for tests.
+func (q *PreFetchQueue) DropLapsedReservations(margin time.Duration, now time.Time) {
+	q.mu.Lock()
+	var kept []*PreFetchItem
+	var dropped []*PreFetchItem
+	cutoff := now.Add(margin).Unix()
+	for _, item := range q.items {
+		if item.WU == nil || item.WU.ReservedUntilUnix == 0 {
+			kept = append(kept, item)
+			continue
+		}
+		if item.WU.ReservedUntilUnix <= cutoff {
+			dropped = append(dropped, item)
+		} else {
+			kept = append(kept, item)
+		}
+	}
+	q.items = kept
+	q.mu.Unlock()
+
+	for _, item := range dropped {
+		q.logger.Warn("dropping buffered item with lapsed reservation lease",
+			"work_unit_id", item.WU.ID,
+			"reserved_until_unix", item.WU.ReservedUntilUnix,
+		)
+		item.stopHeartbeat()
+		if item.Runtime != nil && item.Prep != nil {
+			if err := item.Runtime.Cleanup(item.Prep); err != nil {
+				q.logger.Warn("cleanup failed for lapsed-lease item", "work_unit_id", item.WU.ID, "error", err)
 			}
 		}
 	}

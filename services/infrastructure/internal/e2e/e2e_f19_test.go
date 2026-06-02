@@ -101,8 +101,9 @@ func TestF19_ParameterSweepE2E(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId:           wuResp.WorkUnitId,
+			WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 			VolunteerId:          volID,
 			PublicKey:            pubKey,
 			OutputData:           outputData,
@@ -254,8 +255,9 @@ func TestF19_MapReduceE2E(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 5, CpuSecondsUser: 3, CpuCoresUsed: 1},
 		})
@@ -388,8 +390,8 @@ func TestF19_MonteCarloE2E(t *testing.T) {
 		var params struct {
 			Seed int64 `json:"seed"`
 		}
-		if wuResp.ParametersJson != "" {
-			json.Unmarshal([]byte(wuResp.ParametersJson), &params)
+		if wuResp.Assignments[0].ParametersJson != "" {
+			json.Unmarshal([]byte(wuResp.Assignments[0].ParametersJson), &params)
 		}
 
 		result := float64(params.Seed) * 0.1
@@ -398,8 +400,9 @@ func TestF19_MonteCarloE2E(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 1, CpuSecondsUser: 1, CpuCoresUsed: 1},
 		})
@@ -570,8 +573,9 @@ func TestF19_CustomE2E(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 2, CpuSecondsUser: 1, CpuCoresUsed: 1},
 		})

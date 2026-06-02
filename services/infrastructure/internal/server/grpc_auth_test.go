@@ -23,17 +23,22 @@ import (
 const testAuthMethod = "/lettuce.volunteer.v1.VolunteerService/SubmitResult"
 
 // signedCtx builds an incoming-metadata context with a valid signature over req for
-// the given method/timestamp using priv, signing the legacy (no-nonce) canonical
-// form. Callers can then tamper with individual pieces to exercise failure paths.
+// the given method/timestamp using priv, signing the canonical form with a fresh
+// random nonce (the nonce is required — there is no legacy no-nonce form). Callers
+// can then tamper with individual pieces to exercise failure paths.
 func signedCtx(t *testing.T, priv ed25519.PrivateKey, pub ed25519.PublicKey, method string, ts int64, req proto.Message) context.Context {
 	t.Helper()
-	return signedCtxNonce(t, priv, pub, method, ts, req, "")
+	var nonceBytes [16]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		t.Fatalf("nonce: %v", err)
+	}
+	return signedCtxNonce(t, priv, pub, method, ts, req, hex.EncodeToString(nonceBytes[:]))
 }
 
-// signedCtxNonce is like signedCtx but signs the WITH-nonce canonical form (when
-// nonce != "") and attaches the nonce as x-lettuce-nonce metadata, exactly as the
-// real client does. nonce == "" reproduces the legacy no-nonce request (no nonce
-// metadata attached, legacy canonical form signed).
+// signedCtxNonce signs the canonical form with the given nonce and attaches it as
+// x-lettuce-nonce metadata, exactly as the real client does. An empty nonce
+// reproduces a request with NO nonce metadata (used to exercise the
+// missing-nonce rejection path).
 func signedCtxNonce(t *testing.T, priv ed25519.PrivateKey, pub ed25519.PublicKey, method string, ts int64, req proto.Message, nonce string) context.Context {
 	t.Helper()
 	requestBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
@@ -224,28 +229,30 @@ func TestGRPCAuth_WithNonceVerifies(t *testing.T) {
 	}
 }
 
-// TestGRPCAuth_NoNonceBackwardCompat proves an old volunteer that sends NO nonce
-// (and signs the legacy <ts>:<method>:<hash> form) still verifies unchanged. This
-// is the load-bearing backward-compatibility guarantee.
-func TestGRPCAuth_NoNonceBackwardCompat(t *testing.T) {
+// TestGRPCAuth_MissingNonceRejected proves a request that sends NO nonce metadata
+// (the removed legacy form) is rejected Unauthenticated. The legacy non-nonce
+// signing path is gone: every authenticated RPC MUST carry a fresh nonce.
+func TestGRPCAuth_MissingNonceRejected(t *testing.T) {
 	interceptor, cleanup := authInterceptor()
 	defer cleanup()
 
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	req := sampleReq()
+	// signedCtxNonce("") signs the empty-nonce canonical form and attaches NO
+	// x-lettuce-nonce metadata — exactly a legacy client. The server must reject it.
 	ctx := signedCtxNonce(t, priv, pub, testAuthMethod, time.Now().Unix(), req, "")
 
 	handler := func(context.Context, any) (any, error) { return "ok", nil }
-	if _, err := interceptor(ctx, req, &grpc.UnaryServerInfo{FullMethod: testAuthMethod}, handler); err != nil {
-		t.Fatalf("expected success for legacy no-nonce request, got %v", err)
+	_, err := interceptor(ctx, req, &grpc.UnaryServerInfo{FullMethod: testAuthMethod}, handler)
+	if codeOf(err) != codes.Unauthenticated {
+		t.Fatalf("expected Unauthenticated for missing-nonce request, got %v", err)
 	}
 }
 
-// TestGRPCAuth_LegacyCanonicalFormIsByteStable asserts the empty-nonce branch
-// reproduces the pre-nonce string BYTE-FOR-BYTE. If this ever drifts, every old
-// volunteer breaks. The expected string is computed independently here, not via
-// canonicalGRPCAuthMessage, so the test is a true oracle.
-func TestGRPCAuth_LegacyCanonicalFormIsByteStable(t *testing.T) {
+// TestGRPCAuth_CanonicalFormIsByteStable asserts the (sole, with-nonce) canonical
+// form is byte-stable. The expected string is computed independently here, not via
+// canonicalGRPCAuthMessage, so the test is a true oracle against silent drift.
+func TestGRPCAuth_CanonicalFormIsByteStable(t *testing.T) {
 	req := sampleReq()
 	requestBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
 	if err != nil {
@@ -253,17 +260,11 @@ func TestGRPCAuth_LegacyCanonicalFormIsByteStable(t *testing.T) {
 	}
 	sum := sha256.Sum256(requestBytes)
 	const ts int64 = 1700000000
-	want := fmt.Sprintf("%d:%s:%s", ts, testAuthMethod, hex.EncodeToString(sum[:]))
-	got := canonicalGRPCAuthMessage(ts, testAuthMethod, requestBytes, "")
-	if got != want {
-		t.Fatalf("legacy canonical form drifted:\n got=%q\nwant=%q", got, want)
-	}
-	// And the with-nonce form must be want + ":" + nonce.
 	const nonce = "deadbeefdeadbeefdeadbeefdeadbeef"
-	gotN := canonicalGRPCAuthMessage(ts, testAuthMethod, requestBytes, nonce)
-	wantN := want + ":" + nonce
-	if gotN != wantN {
-		t.Fatalf("with-nonce canonical form wrong:\n got=%q\nwant=%q", gotN, wantN)
+	want := fmt.Sprintf("%d:%s:%s:%s", ts, testAuthMethod, hex.EncodeToString(sum[:]), nonce)
+	got := canonicalGRPCAuthMessage(ts, testAuthMethod, requestBytes, nonce)
+	if got != want {
+		t.Fatalf("canonical form drifted:\n got=%q\nwant=%q", got, want)
 	}
 }
 

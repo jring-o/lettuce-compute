@@ -41,19 +41,22 @@ type Fetcher struct {
 	// Returns true if fetching should proceed, false to wait.
 	shouldFetchFunc func() bool
 
-	// --- THROTTLE (#18 fix 2): minimum inter-request interval ---
-	// minInterval is the floor on how often RequestWorkUnit may be issued across
-	// the poll cycle. It composes with the per-head backoff and the no-work
-	// backoff: it bounds the FAST path (zero-delay success, or a sub-second
-	// backoff that resets to f.backoff on each success), which those backoffs do
-	// not. Injectable so tests can set it to 0 to disable the gate.
-	minInterval time.Duration
-	// lastRequest is when the most recent RequestWorkUnit poll cycle began. Only
-	// touched from the single Run goroutine, so no lock is required.
-	lastRequest time.Time
-	// rateLimitBackoff is the dedicated (larger) per-head backoff floor applied
-	// when a head answers codes.ResourceExhausted, so we ease pressure on the
-	// shared head rate bucket rather than hammering it.
+	// --- CLIENT WORK BUFFER (Layer 1) ---
+	// workBufferFullFn reports whether the hours-based client work buffer is full.
+	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
+	workBufferFullFn func() bool
+	// batchSizeFn returns how many assignments to request for a leaf given an
+	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest].
+	batchSizeFn func(estSecondsPerUnit float64) int32
+	// estSecondsFn estimates wall-clock seconds for one unit of the given leaf
+	// (0 = unknown). Used to size the per-leaf batch request.
+	estSecondsFn func(leafID string, rscFpopsEst float64) float64
+
+	// rateLimitBackoff is the fixed local backoff floor applied when a head
+	// answers codes.ResourceExhausted. ResourceExhausted carries NO
+	// server-directed value (the head is shedding load and wants the caller gone
+	// now), so this is a pure jittered LOCAL backoff, distinct from the
+	// authoritative server-directed retry delay carried in the response body.
 	rateLimitBackoff time.Duration
 
 	// --- ESCALATION (#15 fix 4): per-runtime consecutive-abandon breaker ---
@@ -70,16 +73,26 @@ type Fetcher struct {
 	now func() time.Time
 }
 
-// Throttle / escalation defaults. minIntervalFloor is the hard floor a
-// configured non-zero interval is clamped to (an explicit 0 disables the gate,
-// used by tests). The head's shared rate bucket sustains ~1 req/sec across all
-// volunteers behind one proxy IP; a 2s floor caps each volunteer at ~0.5
-// req/sec so a small pool stays within the shared budget.
+// Cadence defaults.
+//
+// The single authoritative cadence is the head-provided server-directed retry
+// delay (RequestWorkUnitResponse.RetryAfterSeconds), obeyed verbatim via
+// ServerConnection.NextContactAt. There is no client-side minimum-interval
+// throttle anymore: the head decides when each volunteer checks back.
+//
+// defaultRateLimitBackoff is the fixed LOCAL backoff applied on
+// codes.ResourceExhausted (which carries no server-directed value). It is
+// jittered ±20% and capped at maxResourceExhaustedBackoff.
 const (
-	defaultMinInterval      = 2 * time.Second
-	minIntervalFloor        = 1 * time.Second
-	defaultRateLimitBackoff = 5 * time.Second
+	defaultRateLimitBackoff    = 30 * time.Second
+	maxResourceExhaustedBackoff = 900 * time.Second
 )
+
+// maxBatchPerRequest bounds how many assignments the volunteer requests in one
+// RequestWorkUnit (the head independently caps this server-side). Mirrors the
+// head's max_batch_per_request default so a volunteer never asks for more than
+// the head will hand out in a batch.
+const maxBatchPerRequest = 8
 
 // runtimeAbandonPauseThreshold is how many consecutive capability-driven
 // abandons for one runtime trip the circuit breaker. It matches the head's
@@ -109,30 +122,13 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		enabledLeafsFunc: d.enabledLeafs,
 		leafPrefsFunc:    d.leafPreferences,
 		shouldFetchFunc:  d.shouldFetch,
-		minInterval:      resolveMinInterval(d.fetcherMinInterval),
+		workBufferFullFn: d.workBufferFull,
+		batchSizeFn:      d.requestBatchSize,
+		estSecondsFn:     d.estSecondsForUnit,
 		rateLimitBackoff: defaultRateLimitBackoff,
 		runtimeAbandons:  make(map[string]int),
 		pausedRuntimes:   make(map[string]time.Time),
 		now:              time.Now,
-	}
-}
-
-// resolveMinInterval maps the Daemon's fetcherMinInterval knob to the gate's
-// effective interval:
-//   - 0 (the production zero value): use defaultMinInterval (2s).
-//   - negative: gate disabled (used by tests so loops stay fast).
-//   - positive: use it, but clamp up to the hard floor so the gate can never be
-//     configured tighter than minIntervalFloor.
-func resolveMinInterval(configured time.Duration) time.Duration {
-	switch {
-	case configured < 0:
-		return 0
-	case configured == 0:
-		return defaultMinInterval
-	case configured < minIntervalFloor:
-		return minIntervalFloor
-	default:
-		return configured
 	}
 }
 
@@ -142,10 +138,18 @@ func resolveMinInterval(configured time.Duration) time.Duration {
 // enough to skip a momentarily-empty queue but short enough to be useful.
 const noWorkWarnThreshold = 5
 
-// Run is the fetcher's main loop. It fills the queue until ctx is cancelled.
+// idleWait is how long the fetcher sleeps when there is nothing to do right now
+// (buffer full, every head waiting out its server-directed delay with no
+// computable wake time, or no work served). The cadence between actual
+// RequestWorkUnit calls is governed by the head's retry delay, not this value;
+// this is only the loop's poll granularity.
+const idleWait = 5 * time.Second
+
+// Run is the fetcher's main loop. It fills the client work buffer until ctx is
+// cancelled. Cadence is entirely server-directed: each head stamps a
+// retry_after_seconds the volunteer obeys via ServerConnection.NextContactAt.
 func (f *Fetcher) Run(ctx context.Context) {
-	currentBackoff := f.backoff
-	f.logger.Info("fetcher: started", "initial_backoff", f.backoff, "max_backoff", f.maxBackoff)
+	f.logger.Info("fetcher: started", "max_batch_per_request", maxBatchPerRequest)
 
 	// Track a run of empty polls so we can surface "connected but no work — here's
 	// why" exactly once, instead of leaving the operator staring at a silent,
@@ -164,88 +168,79 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// Check if fetching is allowed (disk space, scheduler, etc.).
 		if f.shouldFetchFunc != nil && !f.shouldFetchFunc() {
 			f.logger.Debug("fetcher: shouldFetch returned false, waiting 1s")
-			select {
-			case <-ctx.Done():
+			if !f.sleep(ctx, 1*time.Second) {
 				return
-			case <-time.After(1 * time.Second):
 			}
 			continue
 		}
 
-		// Drop expiring items.
+		// Drop expiring items (deadline safety).
 		f.queue.DropExpiring(0.1)
 
-		// If queue is full, wait before checking again.
-		if f.queue.IsFull() {
-			f.logger.Debug("fetcher: queue is full, waiting 5s", "queue_len", f.queue.Len())
-			select {
-			case <-ctx.Done():
+		// Drop buffered items whose head-side reservation lease has (nearly) lapsed.
+		// The lease is kept alive by PREPARING heartbeats (the head renews
+		// reserved_until on each), so this should not normally fire; it is a
+		// belt-and-suspenders guard so a holder that missed renewals never pops a
+		// lease-lapsed unit (which the head may have re-dispatched) and wastes a
+		// run-start. The margin matches one prepare-heartbeat interval so we drop
+		// before the lease actually lapses.
+		f.queue.DropLapsedReservations(prepareHeartbeatInterval, f.now())
+
+		// CLIENT WORK BUFFER (DoD #2): when the hours-based buffer is full, issue
+		// ZERO RequestWorkUnit calls. Re-check on a short cadence (f.backoff, not
+		// the longer idleWait) so the fetcher refills promptly the moment a running
+		// slot completes and frees buffer capacity, without polling the head.
+		if f.workBufferFullFn != nil && f.workBufferFullFn() {
+			f.logger.Debug("fetcher: work buffer full, not requesting", "queue_len", f.queue.Len())
+			recheck := f.backoff
+			if recheck <= 0 {
+				recheck = time.Millisecond
+			}
+			if !f.sleep(ctx, recheck) {
 				return
-			case <-time.After(5 * time.Second):
 			}
 			continue
 		}
 
-		// THROTTLE (#18 fix 2): enforce a minimum interval between RequestWorkUnit
-		// poll cycles. This sits on the poll CYCLE (the same head+leaf only recurs
-		// across cycles, never within a single fetchOne's distinct-leaf inner loop)
-		// and is independent of which branch (success / NotFound / error) the prior
-		// cycle took, so it bounds both the zero-delay success path and any
-		// sub-second backoff reset. It composes with the existing per-head and
-		// no-work backoffs rather than replacing them.
-		if f.minInterval > 0 {
-			if wait := f.minInterval - time.Since(f.lastRequest); wait > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
+		// SERVER-DIRECTED DELAY (DoD #1): if every available head is still waiting
+		// out its retry delay, sleep until the earliest NextContactAt (or a poll
+		// tick), issuing no requests in the meantime.
+		if wait, ok := f.waitUntilHeadEligible(); ok {
+			f.logger.Debug("fetcher: all heads waiting out retry delay", "wait", wait)
+			if !f.sleep(ctx, wait) {
+				return
 			}
+			continue
 		}
-		f.lastRequest = time.Now()
 
 		f.logger.Debug("fetcher: attempting fetchOne", "queue_len", f.queue.Len())
 
-		// Try to fetch a work unit.
-		item, err := f.fetchOne(ctx)
+		// Try to fetch a batch of work units.
+		got, err := f.fetchOne(ctx)
 		if err != nil {
-			f.logger.Warn("fetcher: fetchOne returned error", "error", err, "backoff", currentBackoff)
-			select {
-			case <-ctx.Done():
+			f.logger.Warn("fetcher: fetchOne returned error", "error", err)
+			if !f.sleep(ctx, idleWait) {
 				return
-			default:
-			}
-			// Back off on failure.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(currentBackoff):
-			}
-			currentBackoff = time.Duration(float64(currentBackoff) * 2)
-			if currentBackoff > f.maxBackoff {
-				currentBackoff = f.maxBackoff
 			}
 			continue
 		}
 
-		if item == nil {
-			f.logger.Debug("fetcher: fetchOne returned nil (no work available)", "backoff", currentBackoff)
+		if got == 0 {
+			f.logger.Debug("fetcher: fetchOne buffered no work")
 			emptyPolls++
 			if emptyPolls >= noWorkWarnThreshold && !warnedNoWork {
 				f.warnNoWork()
 				warnedNoWork = true
 			}
-			// No work available — back off.
-			select {
-			case <-ctx.Done():
+			// No work was buffered this cycle (no assignments, or every assignment
+			// was abandoned as unusable). The authoritative cadence is the head's
+			// retry delay, obeyed via NextContactAt by the head-eligibility gate at
+			// the top of the loop. This small no-work floor (f.backoff) only prevents
+			// a busy-spin when a head answers with a zero delay and no work; it does
+			// NOT grow (cadence is server-directed, not client exponential backoff).
+			if !f.sleep(ctx, f.backoff) {
 				return
-			case <-time.After(currentBackoff):
 			}
-			currentBackoff = time.Duration(float64(currentBackoff) * 2)
-			if currentBackoff > f.maxBackoff {
-				currentBackoff = f.maxBackoff
-			}
-			f.logger.Debug("fetcher: backoff increased", "new_backoff", currentBackoff)
 			continue
 		}
 
@@ -253,27 +248,52 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// the volunteer later goes idle for a new reason.
 		emptyPolls = 0
 		warnedNoWork = false
-
-		f.logger.Info("fetcher: got work unit", "work_unit_id", item.WU.ID, "leaf_id", item.WU.LeafID, "server", item.Conn.Name)
-
-		// Push to queue.
-		if err := f.queue.Push(item); err != nil {
-			f.logger.Warn("fetcher: queue push failed (full between check and push)", "error", err)
-			// Queue became full between check and push — return the un-run unit to
-			// the head and clean up rather than orphaning it as ASSIGNED.
-			item.stopHeartbeat()
-			f.abandonWorkUnit(ctx, item.Conn, item.WU, "queue full")
-			if item.Runtime != nil && item.Prep != nil {
-				item.Runtime.Cleanup(item.Prep)
-			}
-			continue
-		}
-
-		f.logger.Debug("fetcher: pushed to queue", "queue_len", f.queue.Len())
-
-		// Reset backoff on success.
-		currentBackoff = f.backoff
 	}
+}
+
+// sleep waits for d or until ctx is cancelled. Returns false if ctx was
+// cancelled (the caller should return).
+func (f *Fetcher) sleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// waitUntilHeadEligible reports whether EVERY available head is still waiting out
+// its server-directed retry delay. If so it returns the duration until the
+// earliest head becomes eligible (capped at idleWait so a far-future delay still
+// re-checks periodically) and true. If at least one head is contactable now, it
+// returns (0, false).
+func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
+	now := f.now()
+	var earliest time.Time
+	any := false
+	for _, srv := range f.availableServers() {
+		if !now.Before(srv.NextContactAt) {
+			// Contactable now.
+			return 0, false
+		}
+		any = true
+		if earliest.IsZero() || srv.NextContactAt.Before(earliest) {
+			earliest = srv.NextContactAt
+		}
+	}
+	if !any {
+		// No available heads at all (all in connection backoff) — let the caller
+		// fall through to fetchOne, which returns no work and sleeps.
+		return 0, false
+	}
+	wait := earliest.Sub(now)
+	if wait > idleWait {
+		wait = idleWait
+	}
+	return wait, true
 }
 
 // warnNoWork emits the one-time "connected but getting no work" diagnostic. It
@@ -310,9 +330,13 @@ func (f *Fetcher) warnNoWork() {
 		"hint", "normal if the queue is just empty; if it persists, check that your runtimes match the leafs and that disk/scheduling aren't pausing fetches")
 }
 
-// fetchOne attempts to fetch and prepare a single work unit.
-// Returns nil, nil when no work is available.
-func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
+// fetchOne issues at most one RequestWorkUnit (to the first eligible head/leaf
+// in deficit order whose retry delay has elapsed), then prepares and buffers
+// every assignment in the returned batch. It returns the number of units pushed
+// into the client work buffer (0 = no work served). Cadence is server-directed:
+// on every reply it stamps head.NextContactAt from the head's authoritative
+// retry_after_seconds.
+func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 	// ESCALATION (#15 fix 4): expire any paused runtimes whose cooldown has
 	// elapsed so they are re-probed once. Done here (not only inside runtimePaused)
 	// so a runtime no longer referenced by any leaf still clears eventually.
@@ -331,26 +355,12 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 	available := f.availableServers()
 	if len(available) == 0 {
 		f.logger.Debug("fetcher: no available servers")
-		return nil, nil
+		return 0, nil
 	}
 	f.logger.Debug("fetcher: available servers", "count", len(available), "servers", serverNames(available))
 
-	// Check if any server has cached leafs. If not, fall back to the
-	// legacy round-robin path (needed for servers that don't support GetHeadInfo).
-	hasLeafs := false
-	for _, srv := range available {
-		if leafs := f.leafCache.GetLeafs(srv.Name); len(leafs) > 0 {
-			hasLeafs = true
-			break
-		}
-	}
-
-	if !hasLeafs {
-		f.logger.Debug("fetcher: no cached leafs, falling back to legacy path")
-		return f.fetchOneLegacy(ctx, available)
-	}
-
-	// Try heads in deficit order.
+	// Try heads in deficit order, skipping any still waiting out their
+	// server-directed retry delay.
 	tried := make(map[string]bool)
 	for len(tried) < len(available) {
 		head := f.selector.SelectHead(filterOut(available, tried))
@@ -360,9 +370,27 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 		}
 		tried[head.Name] = true
 
+		// Obey the head's server-directed retry delay.
+		if f.now().Before(head.NextContactAt) {
+			f.logger.Debug("fetcher: head waiting out retry delay", "server", head.Name, "next_contact_at", head.NextContactAt)
+			continue
+		}
+
 		enabled := f.enabledLeafsFunc(head.Name)
 		if len(enabled) == 0 {
-			f.logger.Debug("fetcher: no enabled leafs for server", "server", head.Name)
+			// No cached/enabled leafs for this head (e.g. a head that doesn't
+			// surface GetHeadInfo). Fall back to a single any-leaf request through
+			// the SAME batched path: the head picks any matching leaf for us,
+			// honoring the volunteer's config-level leaf filters.
+			var leafIDs, blockedIDs []string
+			if f.leafPrefsFunc != nil {
+				leafIDs, blockedIDs = f.leafPrefsFunc()
+			}
+			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
+			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs)
+			if pushed > 0 {
+				return pushed, nil
+			}
 			continue
 		}
 		f.logger.Debug("fetcher: trying server", "server", head.Name, "enabled_leafs", len(enabled), "leaf_slugs", leafSlugs(enabled))
@@ -377,176 +405,177 @@ func (f *Fetcher) fetchOne(ctx context.Context) (*PreFetchItem, error) {
 				f.logger.Debug("fetcher: skipping leaf for paused runtime", "server", head.Name, "leaf_slug", leaf.Slug, "runtime", reqRt)
 				continue
 			}
-			f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug)
-			resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
-				VolunteerId:      head.VolunteerID,
-				PublicKey:        f.pubKey,
-				LeafIds:          []string{leaf.ID},
-				CurrentAvailable: f.cachedHW,
-			})
-			if err != nil {
-				st, ok := status.FromError(err)
-				if ok && st.Code() == codes.NotFound {
-					f.logger.Debug("fetcher: no work for leaf (NotFound)", "server", head.Name, "leaf_slug", leaf.Slug)
-					head.Available = true
-					head.Backoff = 0
-					continue
-				}
-				if ok && st.Code() == codes.ResourceExhausted {
-					// RATE LIMITED (#18 fix 2): the head throttled us. Treat it as a
-					// calm, dedicated, larger backoff rather than a hard connection
-					// error so we stop adding pressure to the shared head bucket. It
-					// is logged at Info (not Warn) since it is a normal flow-control
-					// signal, not a fault.
-					f.applyRateLimitBackoff(head, leaf.Slug, err)
-					break
-				}
-				// Connection error.
-				f.logger.Warn("fetcher: gRPC error requesting work", "server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
-				head.Available = false
-				head.LastError = time.Now()
-				if head.Backoff == 0 {
-					head.Backoff = f.backoff
-				} else {
-					head.Backoff = time.Duration(float64(head.Backoff) * 2)
-					if head.Backoff > f.maxBackoff {
-						head.Backoff = f.maxBackoff
-					}
-				}
+
+			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil)
+			if pushed > 0 {
+				return pushed, nil
+			}
+			if stop {
+				// Transport error or rate-limit on this head: stop trying its leafs.
 				break
 			}
-
-			// Got work. Prepare it.
-			head.Available = true
-			head.Backoff = 0
-
-			wu := runtime.WorkUnitFromProto(resp)
-			f.logger.Info("fetcher: received work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime)
-
-			// SECURITY (H2): the head supplies the work unit ID, which becomes the
-			// trailing component of on-disk paths (and container bind-mount sources).
-			// Reject anything that is not a canonical UUID before it reaches a
-			// runtime, so a malicious head can't use path traversal to write outside
-			// the data dir. Treat it like any other unusable unit: abandon and skip.
-			if idErr := runtime.ValidateWorkUnitID(wu.ID); idErr != nil {
-				f.logger.Warn("fetcher: rejecting work unit with invalid ID", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "error", idErr)
-				f.abandonWorkUnit(ctx, head, wu, idErr.Error())
-				continue
-			}
-
-			rt, selErr := f.registry.SelectRuntime(wu)
-			if selErr != nil {
-				f.logger.Warn("fetcher: no runtime for work unit", "work_unit_id", wu.ID, "runtime", wu.Runtime, "error", selErr)
-				// ESCALATION (#15 fix 4): capability category A — no registered or
-				// capable runtime for this unit's required runtime.
-				f.recordRuntimeAbandon(runtimeKeyForWU(wu), selErr)
-				f.abandonWorkUnit(ctx, head, wu, selErr.Error())
-				continue
-			}
-			f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_name", fmt.Sprintf("%T", rt))
-
-			f.logger.Debug("fetcher: preparing work unit", "work_unit_id", wu.ID)
-			prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, head, wu, resp.HeartbeatIntervalSeconds, rt)
-			if prepErr != nil {
-				f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
-				// ESCALATION (#15 fix 4): capability category B — Prepare failed for
-				// this runtime (image pull / binary download / setup). Keyed on the
-				// runtime that was actually selected.
-				f.recordRuntimeAbandon(strings.ToLower(rt.Name()), prepErr)
-				f.abandonWorkUnit(ctx, head, wu, prepErr.Error())
-				continue
-			}
-			f.logger.Info("fetcher: prepare succeeded", "work_unit_id", wu.ID, "work_dir", prep.WorkDir)
-
-			// ESCALATION (#15 fix 4): a successful Prepare clears the runtime's
-			// abandon streak (and any pause). Reset on prepare-success, not
-			// select-success: select can pass while Prepare keeps failing.
-			f.resetRuntimeAbandon(strings.ToLower(rt.Name()))
-
-			f.selector.RecordAssignment(head.Name, leaf.Slug)
-
-			return &PreFetchItem{
-				WU:        wu,
-				WUResp:    resp,
-				Prep:      prep,
-				Runtime:   rt,
-				Conn:      head,
-				FetchedAt: time.Now(),
-				hbCancel:  hbCancel,
-			}, nil
+			// No work / all-abandoned for this leaf: try the next leaf.
 		}
 	}
 
-	f.logger.Debug("fetcher: exhausted all servers and leafs, no work found")
-	return nil, nil
+	f.logger.Debug("fetcher: exhausted all eligible servers and leafs, no work buffered")
+	return 0, nil
 }
 
-// fetchOneLegacy falls back to round-robin work requests when no leafs are cached.
-// This supports servers that don't implement GetHeadInfo.
-func (f *Fetcher) fetchOneLegacy(ctx context.Context, available []*ServerConnection) (*PreFetchItem, error) {
-	var leafIDs, blockedIDs []string
-	if f.leafPrefsFunc != nil {
-		leafIDs, blockedIDs = f.leafPrefsFunc()
-	}
-	f.logger.Debug("fetcher: legacy request", "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
+// anyLeafInfo is the placeholder leaf descriptor used for the no-cached-leafs
+// any-leaf request path. Its slug labels the assignment-recording bucket.
+var anyLeafInfo = CachedLeafInfo{ID: "", Slug: "any"}
 
-	resp, conn, err := f.multiClient.RequestWork(ctx, f.pubKey, leafIDs, blockedIDs, f.cachedHW)
+// requestAndBuffer issues one RequestWorkUnit to head for the given leaf filter,
+// stamps the server-directed retry delay, and buffers every assignment in the
+// reply. It returns the number of units buffered and whether the caller should
+// stop trying further leafs on this head (true on transport error or rate-limit).
+func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string) (pushed int, stop bool) {
+	// Size the batch request from the remaining hours deficit.
+	var estSec float64
+	if f.estSecondsFn != nil {
+		estSec = f.estSecondsFn(leaf.ID, leafFpopsEst(leaf))
+	}
+	maxAssignments := int32(1)
+	if f.batchSizeFn != nil {
+		maxAssignments = f.batchSizeFn(estSec)
+	}
+
+	f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug, "max_assignments", maxAssignments)
+	resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
+		VolunteerId:      head.VolunteerID,
+		PublicKey:        f.pubKey,
+		LeafIds:          leafIDs,
+		BlockedLeafIds:   blockedIDs,
+		MaxAssignments:   maxAssignments,
+		CurrentAvailable: f.cachedHW,
+	})
 	if err != nil {
-		// RATE LIMITED (#18 fix 2, legacy mirror): if the head throttled us, park
-		// every available head with the dedicated rate-limit backoff floor so we
-		// stop hammering the shared bucket. The legacy multi-client API doesn't
-		// surface which head answered, so apply the floor to all available heads.
-		if st, ok := status.FromError(err); ok && st.Code() == codes.ResourceExhausted {
-			for _, srv := range f.availableServers() {
-				f.applyRateLimitBackoff(srv, "", err)
-			}
-			return nil, nil
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.ResourceExhausted {
+			// RATE LIMITED: the head is shedding load. ResourceExhausted carries NO
+			// server-directed value (blocker #2 resolution), so we apply a fixed
+			// jittered LOCAL backoff to this head's NextContactAt. Logged at Info
+			// (not Warn) since it is normal flow control.
+			f.applyResourceExhaustedBackoff(head, leaf.Slug, err)
+			return 0, true
 		}
-		f.logger.Debug("fetcher: legacy request failed", "error", err)
-		return nil, nil // no work available
+		if ok && st.Code() == codes.NotFound {
+			// DEFENSIVE: the no-work NotFound sentinel was removed from the protocol
+			// (no-work is now an OK reply with empty assignments). A current head
+			// never returns NotFound here, but if one does we treat it as no-work —
+			// the head is healthy and just empty — rather than a transport fault, so
+			// it stays available and is not parked in reconnect backoff.
+			f.logger.Debug("fetcher: head returned NotFound (treated as no-work)", "server", head.Name, "leaf_slug", leaf.Slug)
+			head.Available = true
+			head.Backoff = 0
+			return 0, false
+		}
+		// Connection error (Unavailable/Internal/etc.): no delay to obey, so fall
+		// back to the per-head exponential reconnect backoff.
+		f.logger.Warn("fetcher: gRPC error requesting work", "server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+		head.Available = false
+		head.LastError = f.now()
+		if head.Backoff == 0 {
+			head.Backoff = f.backoff
+		} else {
+			head.Backoff = time.Duration(float64(head.Backoff) * 2)
+			if head.Backoff > f.maxBackoff {
+				head.Backoff = f.maxBackoff
+			}
+		}
+		return 0, true
 	}
 
-	wu := runtime.WorkUnitFromProto(resp)
-	f.logger.Info("fetcher: legacy got work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID)
+	// Success: obey the server-directed retry delay on EVERY reply, including the
+	// no-work path.
+	head.Available = true
+	head.Backoff = 0
+	f.applyServerRetryDelay(head, resp.RetryAfterSeconds)
 
-	// SECURITY (H2): validate the head-supplied work unit ID before it reaches a
-	// runtime (see fetchOne). On a bad ID, abandon and report no work available.
-	if idErr := runtime.ValidateWorkUnitID(wu.ID); idErr != nil {
-		f.logger.Warn("fetcher: rejecting work unit with invalid ID (legacy)", "work_unit_id", wu.ID, "error", idErr)
-		f.abandonWorkUnit(ctx, conn, wu, idErr.Error())
-		return nil, nil
+	// No-work is an OK response carrying an empty assignments list (the
+	// codes.NotFound sentinel was removed from the protocol).
+	if len(resp.Assignments) == 0 {
+		f.logger.Debug("fetcher: no work for leaf (empty assignments)", "server", head.Name, "leaf_slug", leaf.Slug, "retry_after_s", resp.RetryAfterSeconds)
+		return 0, false
 	}
 
-	rt, selErr := f.registry.SelectRuntime(wu)
-	if selErr != nil {
-		f.logger.Warn("fetcher: no runtime for work unit (legacy)", "work_unit_id", wu.ID, "error", selErr)
-		// ESCALATION (#15 fix 4, legacy mirror): capability category A.
-		f.recordRuntimeAbandon(runtimeKeyForWU(wu), selErr)
-		f.abandonWorkUnit(ctx, conn, wu, selErr.Error())
-		return nil, nil
+	// Prepare and buffer every assignment in the batch.
+	return f.bufferBatch(ctx, head, leaf, resp.Assignments), false
+}
+
+// bufferBatch prepares each assignment in a batch and pushes it into the client
+// work buffer, recording the assignment with the selector once per buffered
+// unit. Unusable units (bad ID, no runtime, prepare failure) are abandoned back
+// to the head. Returns the count actually buffered.
+func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, assignments []*lettucev1.WorkUnitAssignment) int {
+	pushed := 0
+	for _, asg := range assignments {
+		wu := runtime.WorkUnitFromProto(asg)
+		f.logger.Info("fetcher: received work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime)
+
+		// SECURITY (H2): the head supplies the work unit ID, which becomes the
+		// trailing component of on-disk paths (and container bind-mount sources).
+		// Reject anything that is not a canonical UUID before it reaches a runtime.
+		if idErr := runtime.ValidateWorkUnitID(wu.ID); idErr != nil {
+			f.logger.Warn("fetcher: rejecting work unit with invalid ID", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "error", idErr)
+			f.abandonWorkUnit(ctx, head, wu, idErr.Error())
+			continue
+		}
+
+		rt, selErr := f.registry.SelectRuntime(wu)
+		if selErr != nil {
+			f.logger.Warn("fetcher: no runtime for work unit", "work_unit_id", wu.ID, "runtime", wu.Runtime, "error", selErr)
+			// ESCALATION (#15 fix 4): capability category A — no registered or
+			// capable runtime for this unit's required runtime.
+			f.recordRuntimeAbandon(runtimeKeyForWU(wu), selErr)
+			f.abandonWorkUnit(ctx, head, wu, selErr.Error())
+			continue
+		}
+		f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_name", fmt.Sprintf("%T", rt))
+
+		f.logger.Debug("fetcher: preparing work unit", "work_unit_id", wu.ID)
+		prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, head, wu, asg.HeartbeatIntervalSeconds, rt)
+		if prepErr != nil {
+			f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
+			// ESCALATION (#15 fix 4): capability category B — Prepare failed for
+			// this runtime (image pull / binary download / setup).
+			f.recordRuntimeAbandon(strings.ToLower(rt.Name()), prepErr)
+			f.abandonWorkUnit(ctx, head, wu, prepErr.Error())
+			continue
+		}
+		f.logger.Info("fetcher: prepare succeeded", "work_unit_id", wu.ID, "work_dir", prep.WorkDir)
+
+		// ESCALATION (#15 fix 4): a successful Prepare clears the runtime's
+		// abandon streak (and any pause).
+		f.resetRuntimeAbandon(strings.ToLower(rt.Name()))
+
+		item := &PreFetchItem{
+			WU:        wu,
+			WUResp:    asg,
+			Prep:      prep,
+			Runtime:   rt,
+			Conn:      head,
+			FetchedAt: f.now(),
+			hbCancel:  hbCancel,
+		}
+		if err := f.queue.Push(item); err != nil {
+			// Buffer filled between the fullness check and now — return the un-run
+			// unit to the head and clean up rather than orphaning it as ASSIGNED.
+			f.logger.Warn("fetcher: queue push failed (full between check and push)", "error", err)
+			item.stopHeartbeat()
+			f.abandonWorkUnit(ctx, head, wu, "buffer full")
+			if rt != nil && prep != nil {
+				rt.Cleanup(prep)
+			}
+			break
+		}
+
+		// RecordAssignment is called once per buffered unit.
+		f.selector.RecordAssignment(head.Name, leaf.Slug)
+		pushed++
 	}
-
-	prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, conn, wu, resp.HeartbeatIntervalSeconds, rt)
-	if prepErr != nil {
-		f.logger.Warn("fetcher: prepare failed (legacy)", "work_unit_id", wu.ID, "error", prepErr)
-		// ESCALATION (#15 fix 4, legacy mirror): capability category B.
-		f.recordRuntimeAbandon(strings.ToLower(rt.Name()), prepErr)
-		f.abandonWorkUnit(ctx, conn, wu, prepErr.Error())
-		return nil, nil
-	}
-
-	// ESCALATION (#15 fix 4, legacy mirror): clear the streak on prepare-success.
-	f.resetRuntimeAbandon(strings.ToLower(rt.Name()))
-
-	return &PreFetchItem{
-		WU:        wu,
-		WUResp:    resp,
-		Prep:      prep,
-		Runtime:   rt,
-		Conn:      conn,
-		FetchedAt: time.Now(),
-		hbCancel:  hbCancel,
-	}, nil
+	return pushed
 }
 
 // abandonWorkUnit tells the server to release a work unit the volunteer can't execute.
@@ -636,27 +665,36 @@ func (f *Fetcher) availableServers() []*ServerConnection {
 	return available
 }
 
-// applyRateLimitBackoff parks a head that answered codes.ResourceExhausted with
-// the dedicated, larger rate-limit backoff floor (then exponential, jittered,
-// capped growth on repeat). availableServers() honors Backoff via
-// time.Since(LastError) >= Backoff, so the rate-limited head is skipped for the
-// longer floor. This is deliberately calmer (Info, not Warn) than the generic
-// connection-error path because rate limiting is normal flow control. See #18.
-func (f *Fetcher) applyRateLimitBackoff(head *ServerConnection, leafSlug string, err error) {
-	f.logger.Info("fetcher: head rate-limited request, backing off",
-		"server", head.Name, "leaf_slug", leafSlug, "error", err, "floor", f.rateLimitBackoff)
-	head.Available = false
-	head.LastError = time.Now()
-	if head.Backoff < f.rateLimitBackoff {
-		head.Backoff = f.rateLimitBackoff
-	} else {
-		// +/-20% jitter on the doubling de-synchronizes the fleet so volunteers
-		// don't all retry on the same tick (gRPC retry etiquette).
-		head.Backoff = withBackoffJitter(head.Backoff * 2)
-		if head.Backoff > f.maxBackoff {
-			head.Backoff = f.maxBackoff
-		}
+// applyServerRetryDelay obeys the head's authoritative server-directed retry
+// delay: it stamps head.NextContactAt so the fetcher will not contact this head
+// again until at least retryAfterSeconds have elapsed. The head already applied
+// its own jitter, so the volunteer obeys the value verbatim. A zero/negative
+// value means "no enforced delay" (contact again as soon as other gates allow).
+func (f *Fetcher) applyServerRetryDelay(head *ServerConnection, retryAfterSeconds int32) {
+	if retryAfterSeconds <= 0 {
+		head.NextContactAt = time.Time{}
+		return
 	}
+	head.NextContactAt = f.now().Add(time.Duration(retryAfterSeconds) * time.Second)
+	f.logger.Debug("fetcher: obeying server-directed retry delay",
+		"server", head.Name, "retry_after_s", retryAfterSeconds, "next_contact_at", head.NextContactAt)
+}
+
+// applyResourceExhaustedBackoff applies a fixed, jittered LOCAL backoff to a head
+// that answered codes.ResourceExhausted. Unlike the server-directed retry delay,
+// ResourceExhausted carries no authoritative value (the head returned no body and
+// just wants the caller gone), so the volunteer chooses the delay locally:
+// rateLimitBackoff (default 30s) ±20%, capped at maxResourceExhaustedBackoff
+// (900s). It is parked via NextContactAt, the same per-head gate as the
+// server-directed delay, so the two mechanisms compose cleanly.
+func (f *Fetcher) applyResourceExhaustedBackoff(head *ServerConnection, leafSlug string, err error) {
+	backoff := withBackoffJitter(f.rateLimitBackoff)
+	if backoff > maxResourceExhaustedBackoff {
+		backoff = maxResourceExhaustedBackoff
+	}
+	head.NextContactAt = f.now().Add(backoff)
+	f.logger.Info("fetcher: head shed load (ResourceExhausted), backing off locally",
+		"server", head.Name, "leaf_slug", leafSlug, "error", err, "backoff", backoff)
 }
 
 // withBackoffJitter applies +/-20% jitter to a backoff duration.
@@ -669,6 +707,16 @@ func withBackoffJitter(d time.Duration) time.Duration {
 		jittered = 0
 	}
 	return time.Duration(jittered)
+}
+
+// leafFpopsEst returns the cached per-unit FP-ops estimate for a leaf. The leaf
+// cache does not currently carry rsc_fpops_est (it is a per-work-unit field on
+// the assignment, not on the leaf descriptor), so this returns 0 today and the
+// batch sizer falls back to averaging already-buffered units. Kept as a seam so
+// a future leaf-level estimate can feed pre-request batch sizing directly.
+func leafFpopsEst(leaf CachedLeafInfo) float64 {
+	_ = leaf
+	return 0
 }
 
 // runtimeKeyForWU normalizes a work unit's runtime hint for the abandon counter,

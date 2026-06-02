@@ -67,7 +67,7 @@ func TestCanAccommodateWU_GPUExclusivity(t *testing.T) {
 			ID: "gpu-active", LeafID: "p",
 			ExecutionSpec: runtime.ExecutionSpec{GPURequired: true},
 		},
-		WUResp: &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/gpu-active"},
 		Runtime: &mockRuntime{canHandle: true, executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
 			<-blockCh

@@ -105,7 +105,25 @@ func (r *PgxRepository) Create(ctx context.Context, p *Leaf) error {
 
 // GetByID retrieves a leaf by its UUID.
 func (r *PgxRepository) GetByID(ctx context.Context, id types.ID) (*Leaf, error) {
-	row := r.pool.QueryRow(ctx,
+	return GetByIDTx(ctx, r.pool, id)
+}
+
+// rowQuerier is the minimal read surface (QueryRow) shared by *pgxpool.Pool and
+// pgx.Tx, so a leaf can be read on a caller-supplied transaction connection
+// instead of acquiring a second pool connection.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// GetByIDTx retrieves a leaf by its UUID using the supplied querier, which may be
+// a *pgxpool.Pool or an open pgx.Tx. Reading the leaf on an already-held tx
+// connection (rather than via the pool-backed Repository) lets a handler that is
+// mid-transaction avoid acquiring a SECOND pool connection — the cause of the
+// pool starvation / self-deadlock under concurrent batched RequestWorkUnit calls,
+// where each handler held its reserve-loop tx connection while blocking on a
+// fresh getLeaf connection that never freed.
+func GetByIDTx(ctx context.Context, db rowQuerier, id types.ID) (*Leaf, error) {
+	row := db.QueryRow(ctx,
 		"SELECT "+leafColumns+" FROM leafs WHERE id = $1", id)
 
 	p, err := scanLeaf(row)

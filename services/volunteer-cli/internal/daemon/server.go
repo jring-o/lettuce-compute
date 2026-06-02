@@ -19,6 +19,14 @@ type ServerConnection struct {
 	Available   bool          // false if last request failed
 	LastError   time.Time     // when the last error occurred
 	Backoff     time.Duration // current backoff for this server
+
+	// NextContactAt is the earliest wall-clock time the fetcher may issue the
+	// next RequestWorkUnit to this head. It is set from the head's authoritative
+	// server-directed retry delay (RequestWorkUnitResponse.RetryAfterSeconds) on
+	// every reply, and from a fixed jittered local backoff on ResourceExhausted.
+	// It lives on the per-head connection (not the Fetcher) so it survives the
+	// fetcher being recreated on pause/resume. Zero means "contact immediately".
+	NextContactAt time.Time
 }
 
 // DaemonState is persisted to disk so the status command can show per-server info.

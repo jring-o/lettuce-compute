@@ -357,6 +357,21 @@ func (sm *SlotManager) ActiveCount() int {
 	return count
 }
 
+// ActiveWorkUnits returns the work units of all currently active slots. Used by
+// the client work buffer to account for in-flight (running) work toward the
+// hours-based buffer target.
+func (sm *SlotManager) ActiveWorkUnits() []*runtime.WorkUnit {
+	var wus []*runtime.WorkUnit
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil {
+			wus = append(wus, slot.wu)
+		}
+		slot.mu.Unlock()
+	}
+	return wus
+}
+
 // GetCurrentTasks returns info about all active slots' work units.
 // benchmarkFPOPS is the volunteer's CPU benchmark score for time estimation.
 // dcfFunc returns the duration correction factor for a given leaf ID.

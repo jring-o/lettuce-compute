@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -52,6 +53,15 @@ func (m *mockWURepo) UpdateState(_ context.Context, _ types.ID, _, _ workunit.Wo
 	return nil, nil
 }
 func (m *mockWURepo) FindNextAssignable(context.Context, workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ReserveNextAssignable(context.Context, workunit.AssignmentOptions, time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) Assign(_ context.Context, _ types.ID, _ types.ID) (*workunit.WorkUnit, error) {

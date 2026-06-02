@@ -223,7 +223,7 @@ func TestHeadsLeafsE2E_ConcurrentExecution(t *testing.T) {
 		{leafY.ID.String()},
 		{leafZ.ID.String()},
 	}
-	wuResps := make([]*lettucev1.RequestWorkUnitResponse, 3)
+	wuResps := make([]*lettucev1.WorkUnitAssignment, 3)
 	leafsHit := map[string]bool{}
 
 	for i := 0; i < 3; i++ {
@@ -290,7 +290,7 @@ func TestHeadsLeafsE2E_PreFetchDeadline(t *testing.T) {
 	leafIDs := []string{lf.ID.String()}
 
 	// Request 4 WUs without submitting (simulating pre-fetch).
-	wuResps := make([]*lettucev1.RequestWorkUnitResponse, 4)
+	wuResps := make([]*lettucev1.WorkUnitAssignment, 4)
 	for i := 0; i < 4; i++ {
 		wuResps[i] = requestWUFromLeafs(t, env, ctx, volID, volPubKey, leafIDs)
 		if wuResps[i].DeadlineSeconds <= 0 {
@@ -310,18 +310,28 @@ func TestHeadsLeafsE2E_PreFetchDeadline(t *testing.T) {
 		t.Errorf("unique WU IDs = %d, want 4", len(wuIDs))
 	}
 
-	// Verify server-side state is ASSIGNED for all 4.
+	// Under Layer 1, a dispatched (batched) work unit is LEASED, not assigned:
+	// it stays QUEUED with a live reservation held by this volunteer (the
+	// deadline/heartbeat clock starts only at run-start). Verify the reservation,
+	// and that each assignment carries the lease expiry.
 	for _, resp := range wuResps {
 		var state string
+		var reservedVol *string
 		err := env.pool.QueryRow(ctx,
-			"SELECT state FROM work_units WHERE id = $1",
+			"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1",
 			types.MustParseID(resp.WorkUnitId),
-		).Scan(&state)
+		).Scan(&state, &reservedVol)
 		if err != nil {
 			t.Fatalf("query WU state: %v", err)
 		}
-		if state != "ASSIGNED" && state != "RUNNING" {
-			t.Errorf("WU %s state = %q, want ASSIGNED or RUNNING", resp.WorkUnitId, state)
+		if state != "QUEUED" {
+			t.Errorf("WU %s state = %q, want QUEUED (reserved)", resp.WorkUnitId, state)
+		}
+		if reservedVol == nil || *reservedVol != volID {
+			t.Errorf("WU %s reserved_volunteer_id = %v, want %s", resp.WorkUnitId, reservedVol, volID)
+		}
+		if resp.ReservedUntilUnix <= 0 {
+			t.Errorf("WU %s reserved_until_unix = %d, want > 0", resp.WorkUnitId, resp.ReservedUntilUnix)
 		}
 	}
 

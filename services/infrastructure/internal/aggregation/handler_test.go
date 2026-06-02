@@ -111,6 +111,15 @@ func (m *mockWURepo) BulkTransitionByBatch(_ context.Context, _ types.ID, _, _ w
 func (m *mockWURepo) FindNextAssignable(_ context.Context, _ workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWURepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *mockWURepo) Assign(_ context.Context, _ types.ID, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

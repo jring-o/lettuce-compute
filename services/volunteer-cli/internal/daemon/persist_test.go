@@ -267,7 +267,7 @@ func TestGetActivePersistableTasks_IncludesPID(t *testing.T) {
 			Runtime:     "native",
 			RscFpopsEst: 2.5e11,
 		},
-		WUResp:  &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+		WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 		Prep:    &runtime.PrepareResult{WorkDir: "/tmp/wu-pid-test"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -320,7 +320,7 @@ func TestGetActivePersistableTasks_NilProcessHandle(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-no-handle", LeafID: "leaf-1"},
-		WUResp: &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-no-handle"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -515,7 +515,7 @@ func TestSuspendAll_ResumeAll(t *testing.T) {
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
 			WU:     &runtime.WorkUnit{ID: id, LeafID: "leaf-1"},
-			WUResp: &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+			WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -626,7 +626,7 @@ func TestSuspendAndQuit_SuspendsAndPersists(t *testing.T) {
 			Runtime:     "native",
 			RscFpopsEst: 1e10,
 		},
-		WUResp:  &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+		WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 		Prep:    &runtime.PrepareResult{WorkDir: t.TempDir()},
 		Runtime: &mockRuntime{
 			canHandle: true,

@@ -1,4 +1,4 @@
-package daemon
+﻿package daemon
 
 import (
 	"context"
@@ -24,12 +24,12 @@ import (
 // --- Mock client (satisfies WorkClient interface) ---
 
 type mockClient struct {
-	requestWorkUnitFn  func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error)
-	submitResultFn     func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error)
-	heartbeatFn        func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error)
-	saveCheckpointFn   func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error)
-	getCheckpointFn    func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
-	getHeadInfoFn      func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
+	requestWorkUnitFn func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error)
+	submitResultFn    func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error)
+	heartbeatFn       func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error)
+	saveCheckpointFn  func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error)
+	getCheckpointFn   func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
+	getHeadInfoFn     func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
 
 	abandonFn func(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error)
 
@@ -134,11 +134,11 @@ func (m *mockClient) getHeartbeatCalls() int {
 // --- Mock runtime ---
 
 type mockRuntime struct {
-	prepareFn  func(ctx context.Context, wu *runtime.WorkUnit) (*runtime.PrepareResult, error)
-	executeFn  func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error)
-	cleanupFn  func(prep *runtime.PrepareResult) error
-	canHandle  bool
-	name       string
+	prepareFn func(ctx context.Context, wu *runtime.WorkUnit) (*runtime.PrepareResult, error)
+	executeFn func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error)
+	cleanupFn func(prep *runtime.PrepareResult) error
+	canHandle bool
+	name      string
 
 	mu           sync.Mutex
 	prepareCalls int
@@ -236,7 +236,6 @@ func newTestDaemon(mc *mockClient, mr *mockRuntime) *Daemon {
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
 	// Disable the fetcher's inter-request throttle so short-window tests aren't
 	// paced by the 2s production floor. Negative = gate off (see resolveMinInterval).
-	d.fetcherMinInterval = -1
 	return d
 }
 
@@ -251,12 +250,16 @@ func TestDaemonExecuteCycle(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -320,12 +323,16 @@ func TestDaemonGracefulShutdown(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -378,12 +385,16 @@ func TestDaemonHeartbeatAbort(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 1, // 1 second â€” short enough for test
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 1, // 1 second Ã¢â‚¬â€ short enough for test
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 		heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
@@ -425,11 +436,15 @@ func TestDaemonCanHandleSkip(t *testing.T) {
 				return nil, status.Error(codes.NotFound, "no work")
 			}
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:    fmt.Sprintf("00000000-0000-4000-8000-%012d", callCount),
-				ProjectId:     "proj-1",
-				Runtime:       "container",
-				InputData:     []byte("input"),
-				ExecutionSpec: &lettucev1.ExecutionSpec{Image: "ubuntu:latest"},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:    fmt.Sprintf("00000000-0000-4000-8000-%012d", callCount),
+						LeafId:        "proj-1",
+						Runtime:       "container",
+						InputData:     []byte("input"),
+						ExecutionSpec: &lettucev1.ExecutionSpec{Image: "ubuntu:latest"},
+					},
+				},
 			}, nil
 		},
 	}
@@ -595,12 +610,16 @@ func TestDaemonNonZeroExitCode(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "b3d35f5a-68fa-4003-85b0-f8aef5448fca", // was wu-fail
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "b3d35f5a-68fa-4003-85b0-f8aef5448fca", // was wu-fail
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -643,12 +662,16 @@ func TestDaemonPrepareFails(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "37d3687a-7192-41a8-87da-8721acd0bc76", // was wu-prep-fail
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "37d3687a-7192-41a8-87da-8721acd0bc76", // was wu-prep-fail
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -707,12 +730,16 @@ func TestDaemonMultipleWorkUnits(t *testing.T) {
 			callCount++
 			if callCount <= 3 {
 				return &lettucev1.RequestWorkUnitResponse{
-					WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", callCount),
-					ProjectId:                "proj-1",
-					Runtime:                  "native",
-					InputData:                []byte(fmt.Sprintf("input-%d", callCount)),
-					HeartbeatIntervalSeconds: 300,
-					ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					Assignments: []*lettucev1.WorkUnitAssignment{
+						{
+							WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", callCount),
+							LeafId:                   "proj-1",
+							Runtime:                  "native",
+							InputData:                []byte(fmt.Sprintf("input-%d", callCount)),
+							HeartbeatIntervalSeconds: 300,
+							ExecutionSpec:            &lettucev1.ExecutionSpec{},
+						},
+					},
 				}, nil
 			}
 			return nil, status.Error(codes.NotFound, "no more work")
@@ -780,12 +807,16 @@ func TestDaemonCleanupAlwaysCalledOnExecFailure(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "eb494575-e87d-4acc-8346-5e0fcb10ce87", // was wu-exec-fail
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "eb494575-e87d-4acc-8346-5e0fcb10ce87", // was wu-exec-fail
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -835,12 +866,16 @@ func TestDaemonSubmitFails(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "2fab6bd1-67d8-40ab-80b3-1e6cd67f46cc", // was wu-submit-fail
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "2fab6bd1-67d8-40ab-80b3-1e6cd67f46cc", // was wu-submit-fail
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 		submitResultFn: func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
@@ -926,7 +961,6 @@ func newTestDaemonWithResources(mc *mockClient, mr *mockRuntime, limiter resourc
 	d.maxBackoff = 16 * time.Millisecond
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
 	// Disable the fetcher inter-request throttle for fast tests (see resolveMinInterval).
-	d.fetcherMinInterval = -1
 	return d
 }
 
@@ -1013,11 +1047,11 @@ func TestDaemonLeafPreferences_Specific(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			// Verify leaf IDs are passed through.
-			if len(req.ProjectIds) != 2 || req.ProjectIds[0] != "proj-a" || req.ProjectIds[1] != "proj-b" {
-				t.Errorf("ProjectIds = %v, want [proj-a, proj-b]", req.ProjectIds)
+			if len(req.LeafIds) != 2 || req.LeafIds[0] != "proj-a" || req.LeafIds[1] != "proj-b" {
+				t.Errorf("LeafIds = %v, want [proj-a, proj-b]", req.LeafIds)
 			}
-			if len(req.BlockedProjectIds) != 0 {
-				t.Errorf("BlockedProjectIds = %v, want empty", req.BlockedProjectIds)
+			if len(req.BlockedLeafIds) != 0 {
+				t.Errorf("BlockedLeafIds = %v, want empty", req.BlockedLeafIds)
 			}
 			return nil, status.Error(codes.NotFound, "no work")
 		},
@@ -1042,7 +1076,6 @@ func TestDaemonLeafPreferences_Specific(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1057,11 +1090,11 @@ func TestDaemonLeafPreferences_Specific(t *testing.T) {
 func TestDaemonLeafPreferences_Blocklist(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			if len(req.BlockedProjectIds) != 1 || req.BlockedProjectIds[0] != "proj-blocked" {
-				t.Errorf("BlockedProjectIds = %v, want [proj-blocked]", req.BlockedProjectIds)
+			if len(req.BlockedLeafIds) != 1 || req.BlockedLeafIds[0] != "proj-blocked" {
+				t.Errorf("BlockedLeafIds = %v, want [proj-blocked]", req.BlockedLeafIds)
 			}
-			if len(req.ProjectIds) != 0 {
-				t.Errorf("ProjectIds = %v, want empty", req.ProjectIds)
+			if len(req.LeafIds) != 0 {
+				t.Errorf("LeafIds = %v, want empty", req.LeafIds)
 			}
 			return nil, status.Error(codes.NotFound, "no work")
 		},
@@ -1086,7 +1119,6 @@ func TestDaemonLeafPreferences_Blocklist(t *testing.T) {
 	})
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1131,12 +1163,16 @@ func TestDaemonWritesHistory(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "30ee01ce-b932-4e58-8d58-5bcce572681b", // was wu-hist-1
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "30ee01ce-b932-4e58-8d58-5bcce572681b", // was wu-hist-1
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 	}
@@ -1199,7 +1235,7 @@ func TestHistoryFileOperations(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		if err := AppendHistory(dir, HistoryEntry{
 			WorkUnitID:       fmt.Sprintf("wu-%d", i),
-			LeafID:        "proj-1",
+			LeafID:           "proj-1",
 			CompletedAt:      time.Now().UTC(),
 			WallClockSeconds: int64(i + 1),
 			ResultAccepted:   i%2 == 0,
@@ -1237,7 +1273,7 @@ func TestReadHistoryDefaultLimit(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		if err := AppendHistory(dir, HistoryEntry{
 			WorkUnitID:       fmt.Sprintf("wu-%d", i),
-			LeafID:        "proj-1",
+			LeafID:           "proj-1",
 			CompletedAt:      time.Now().UTC(),
 			WallClockSeconds: int64(i + 1),
 			ResultAccepted:   true,
@@ -1246,7 +1282,7 @@ func TestReadHistoryDefaultLimit(t *testing.T) {
 		}
 	}
 
-	// Pass 0 as limit â€” should use default (50) and return all entries.
+	// Pass 0 as limit Ã¢â‚¬â€ should use default (50) and return all entries.
 	entries, err := ReadHistory(dir, 0)
 	if err != nil {
 		t.Fatalf("ReadHistory: %v", err)
@@ -1299,7 +1335,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 	d := newTestDaemon(&mockClient{}, &mockRuntime{canHandle: true})
 	d.slotManager = NewSlotManager(4, d.logger)
 
-	// No memory limit configured â€” always allow.
+	// No memory limit configured Ã¢â‚¬â€ always allow.
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	wu := &runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 4096}}
 	if !d.canAccommodateWU(wu) {
@@ -1309,7 +1345,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 	// Set memory limit to 8GB.
 	d.cfg.ResourceLimits.MaxMemoryMB = 8192
 
-	// WU with 4GB â€” should fit (0 active + 4096 <= 8192).
+	// WU with 4GB Ã¢â‚¬â€ should fit (0 active + 4096 <= 8192).
 	if !d.canAccommodateWU(wu) {
 		t.Error("should accommodate 4GB WU with 8GB limit and 0 active")
 	}
@@ -1324,8 +1360,8 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 			ID: "wu-active", LeafID: "proj-1",
 			ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 6144},
 		},
-		WUResp:  &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
-		Prep:    &runtime.PrepareResult{WorkDir: "/tmp/active"},
+		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/active"},
 		Runtime: &mockRuntime{canHandle: true, executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
 			<-blockCh
 			return &runtime.ExecutionResult{ExitCode: 0, OutputData: []byte("ok")}, nil
@@ -1336,7 +1372,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// 6GB active + 4GB WU = 10GB > 8GB limit â€” should NOT accommodate.
+	// 6GB active + 4GB WU = 10GB > 8GB limit Ã¢â‚¬â€ should NOT accommodate.
 	if d.canAccommodateWU(wu) {
 		t.Error("should NOT accommodate 4GB WU when 6GB active and 8GB limit")
 	}

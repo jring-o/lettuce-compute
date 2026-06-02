@@ -152,7 +152,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	httpURL := "http://" + httpLis.Addr().String()
 
 	// gRPC server.
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(pool, "0.6.0-alpha", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
@@ -283,13 +283,21 @@ func TestAlphaE2E_Scenario1_FullPipeline(t *testing.T) {
 		if reqErr != nil {
 			t.Fatalf("WU %d: vol A request: %v", i+1, reqErr)
 		}
+		if len(wuResp.Assignments) != 1 {
+			t.Fatalf("WU %d: vol A expected 1 assignment, got %d", i+1, len(wuResp.Assignments))
+		}
+		wuID := wuResp.Assignments[0].WorkUnitId
+
+		// Vol A run-starts (RUNNING heartbeat) so its reserved unit flips to
+		// ASSIGNED and gets the active history row SubmitResult needs.
+		runStartWU(t, env, ctx, wuID, volAID, volAPubKey)
 
 		// Create redundant assignment for vol B.
-		createRedundantAssignment(t, env.pool, ctx, wuResp.WorkUnitId, volBIDParsed)
+		createRedundantAssignment(t, env.pool, ctx, wuID, volBIDParsed)
 
 		// Vol A submits.
 		_, subErr := env.grpc.SubmitResult(signFor(t, ctx, volAPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId:           wuResp.WorkUnitId,
+			WorkUnitId:           wuID,
 			VolunteerId:          volAID,
 			PublicKey:            volAPubKey,
 			OutputData:           outputData,
@@ -307,7 +315,7 @@ func TestAlphaE2E_Scenario1_FullPipeline(t *testing.T) {
 
 		// Vol B submits matching result → triggers validation.
 		_, subErr = env.grpc.SubmitResult(signFor(t, ctx, volBPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId:           wuResp.WorkUnitId,
+			WorkUnitId:           wuID,
 			VolunteerId:          volBID,
 			PublicKey:            volBPubKey,
 			OutputData:           outputData,
@@ -491,16 +499,23 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vol A request: %v", err)
 	}
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("vol A expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	wuID := wuResp.Assignments[0].WorkUnitId
+
+	// Vol A run-starts so its reserved unit flips to ASSIGNED with an active row.
+	runStartWU(t, env, ctx, wuID, volAID, volAPubKey)
 
 	// Create redundant assignment for vol B.
-	createRedundantAssignment(t, env.pool, ctx, wuResp.WorkUnitId, volBIDParsed)
+	createRedundantAssignment(t, env.pool, ctx, wuID, volBIDParsed)
 
 	// Submit DIFFERENT results → disagreement.
 	outputA := []byte(`{"answer": "alpha"}`)
 	outputB := []byte(`{"answer": "bravo"}`)
 
 	_, err = env.grpc.SubmitResult(signFor(t, ctx, volAPubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuID,
 		VolunteerId:          volAID,
 		PublicKey:            volAPubKey,
 		OutputData:           outputA,
@@ -512,7 +527,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	}
 
 	_, err = env.grpc.SubmitResult(signFor(t, ctx, volBPubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuID,
 		VolunteerId:          volBID,
 		PublicKey:            volBPubKey,
 		OutputData:           outputB,
@@ -527,7 +542,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	var disagreedAttCount int
 	err = env.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM credit_attestations WHERE work_unit_id = $1 AND validation_outcome = 'DISAGREED' AND credit_amount = 0",
-		types.MustParseID(wuResp.WorkUnitId)).Scan(&disagreedAttCount)
+		types.MustParseID(wuID)).Scan(&disagreedAttCount)
 	if err != nil {
 		t.Fatalf("query disagreed attestations: %v", err)
 	}
@@ -539,7 +554,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	var wuState, priority string
 	err = env.pool.QueryRow(ctx,
 		"SELECT state, priority FROM work_units WHERE id = $1",
-		types.MustParseID(wuResp.WorkUnitId)).Scan(&wuState, &priority)
+		types.MustParseID(wuID)).Scan(&wuState, &priority)
 	if err != nil {
 		t.Fatalf("query WU state: %v", err)
 	}
@@ -565,19 +580,25 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vol C request: %v", err)
 	}
-	if wuRespC.WorkUnitId != wuResp.WorkUnitId {
-		t.Errorf("vol C got WU %s, want %s (reassigned)", wuRespC.WorkUnitId, wuResp.WorkUnitId)
+	if len(wuRespC.Assignments) != 1 {
+		t.Fatalf("vol C expected 1 assignment, got %d", len(wuRespC.Assignments))
+	}
+	if wuRespC.Assignments[0].WorkUnitId != wuID {
+		t.Errorf("vol C got WU %s, want %s (reassigned)", wuRespC.Assignments[0].WorkUnitId, wuID)
 	}
 
+	// Vol C run-starts the reassigned unit so it gets its active history row.
+	runStartWU(t, env, ctx, wuID, volCID, volCPubKey)
+
 	// Create redundant assignment for vol D.
-	createRedundantAssignment(t, env.pool, ctx, wuResp.WorkUnitId, volDIDParsed)
+	createRedundantAssignment(t, env.pool, ctx, wuID, volDIDParsed)
 
 	// Both submit matching results.
 	outputGood := []byte(`{"answer": "correct"}`)
 	checksumGood := sha256Hex(outputGood)
 
 	_, err = env.grpc.SubmitResult(signFor(t, ctx, volCPubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuID,
 		VolunteerId:          volCID,
 		PublicKey:            volCPubKey,
 		OutputData:           outputGood,
@@ -589,7 +610,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	}
 
 	_, err = env.grpc.SubmitResult(signFor(t, ctx, volDPubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuID,
 		VolunteerId:          volDID,
 		PublicKey:            volDPubKey,
 		OutputData:           outputGood,
@@ -603,7 +624,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	// Verify: WU now VALIDATED.
 	err = env.pool.QueryRow(ctx,
 		"SELECT state FROM work_units WHERE id = $1",
-		types.MustParseID(wuResp.WorkUnitId)).Scan(&wuState)
+		types.MustParseID(wuID)).Scan(&wuState)
 	if err != nil {
 		t.Fatalf("query final state: %v", err)
 	}
@@ -615,7 +636,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	var creditForAB int
 	err = env.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM credit_ledger WHERE work_unit_id = $1 AND volunteer_id IN ($2, $3)",
-		types.MustParseID(wuResp.WorkUnitId), types.MustParseID(volAID), types.MustParseID(volBID),
+		types.MustParseID(wuID), types.MustParseID(volAID), types.MustParseID(volBID),
 	).Scan(&creditForAB)
 	if err != nil {
 		t.Fatalf("query A/B credit: %v", err)
@@ -627,7 +648,7 @@ func TestAlphaE2E_Scenario2_Disagreement(t *testing.T) {
 	var creditForCD int
 	err = env.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM credit_ledger WHERE work_unit_id = $1 AND volunteer_id IN ($2, $3)",
-		types.MustParseID(wuResp.WorkUnitId), types.MustParseID(volCID), types.MustParseID(volDID),
+		types.MustParseID(wuID), types.MustParseID(volCID), types.MustParseID(volDID),
 	).Scan(&creditForCD)
 	if err != nil {
 		t.Fatalf("query C/D credit: %v", err)
@@ -765,6 +786,18 @@ func createRedundantAssignment(t *testing.T, pool *pgxpool.Pool, ctx context.Con
 	if err != nil {
 		t.Fatalf("create redundant assignment: %v", err)
 	}
+}
+
+// runStartWU performs the reserving volunteer's run-start (RUNNING heartbeat),
+// flipping its reserved QUEUED unit to ASSIGNED/RUNNING and creating the active
+// assignment_history row SubmitResult requires. Buffered units are leased via
+// reservation columns (no history row) until run-start, so a real volunteer always
+// heartbeats RUNNING before submitting; these lifecycle tests mirror that. It
+// delegates to ensureRunStart, which is a safe no-op for a non-reserving (redundant
+// or already-assigned) volunteer.
+func runStartWU(t *testing.T, env *testEnv, ctx context.Context, wuID, volID string, pubKey []byte) {
+	t.Helper()
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuID)
 }
 
 func sha256Hex(data []byte) string {

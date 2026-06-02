@@ -34,50 +34,55 @@ import (
 // (Re-baseline both files together whenever protobuf-go is intentionally
 // upgraded in both modules.)
 
-const expectedDeterministicHash = "3ae9066f001d06e363fc711c397cf7af1bf84025cabd401df7a0fae0194ebf8a"
+const expectedDeterministicHash = "c499a96a52959df62f99b442a67fb7071cf6e639f2108e411da3760c64a9c5de"
 
 // fixedRequestWorkUnitResponse is the canonical fixture mirrored from the
 // infrastructure test. Field values are deliberately identical — including
 // the out-of-order map insertions, which deterministic marshal MUST sort.
 func fixedRequestWorkUnitResponse() *lettucev1.RequestWorkUnitResponse {
 	return &lettucev1.RequestWorkUnitResponse{
-		WorkUnitId:               "wu-f3-fixture",
-		ProjectId:                "proj-legacy",
-		Runtime:                  "container",
-		InputData:                []byte{0x00, 0x01, 0x02, 0x03, 0xff},
-		InputDataUrl:             "https://example.invalid/in",
-		CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
-		ParametersJson:           `{"k":"v"}`,
-		DeadlineSeconds:          3600,
-		HeartbeatIntervalSeconds: 300,
-		EnvVars: map[string]string{
-			"ZETA":  "z",
-			"alpha": "a",
-			"MIKE":  "m",
-		},
-		ExecutionSpec: &lettucev1.ExecutionSpec{
-			Binaries: map[string]string{
-				"linux-amd64":   "https://example.invalid/linux.bin",
-				"darwin-arm64":  "https://example.invalid/darwin.bin",
-				"windows-amd64": "https://example.invalid/windows.exe",
+		Assignments: []*lettucev1.WorkUnitAssignment{
+			{
+				WorkUnitId:               "wu-f3-fixture",
+				LeafId:                   "leaf-fixture",
+				Runtime:                  "container",
+				InputData:                []byte{0x00, 0x01, 0x02, 0x03, 0xff},
+				InputDataUrl:             "https://example.invalid/in",
+				CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
+				ParametersJson:           `{"k":"v"}`,
+				DeadlineSeconds:          3600,
+				HeartbeatIntervalSeconds: 300,
+				EnvVars: map[string]string{
+					"ZETA":  "z",
+					"alpha": "a",
+					"MIKE":  "m",
+				},
+				ExecutionSpec: &lettucev1.ExecutionSpec{
+					Binaries: map[string]string{
+						"linux-amd64":   "https://example.invalid/linux.bin",
+						"darwin-arm64":  "https://example.invalid/darwin.bin",
+						"windows-amd64": "https://example.invalid/windows.exe",
+					},
+					Image:         "ghcr.io/example/img:tag",
+					GpuRequired:   false,
+					GpuType:       "",
+					MaxMemoryMb:   2048,
+					MaxDiskMb:     4096,
+					NetworkAccess: true,
+					BinaryChecksums: map[string]string{
+						"linux-amd64":   "aaaa",
+						"darwin-arm64":  "bbbb",
+						"windows-amd64": "cccc",
+					},
+				},
+				HasCheckpoint:             true,
+				CheckpointSequence:        7,
+				CheckpointIntervalSeconds: 600,
+				RscFpopsEst:               1.25e9,
+				ReservedUntilUnix:         1893456000,
 			},
-			Image:         "ghcr.io/example/img:tag",
-			GpuRequired:   false,
-			GpuType:       "",
-			MaxMemoryMb:   2048,
-			MaxDiskMb:     4096,
-			NetworkAccess: true,
-			BinaryChecksums: map[string]string{
-				"linux-amd64":   "aaaa",
-				"darwin-arm64":  "bbbb",
-				"windows-amd64": "cccc",
-			},
 		},
-		HasCheckpoint:             true,
-		CheckpointSequence:        7,
-		CheckpointIntervalSeconds: 600,
-		LeafId:                    "leaf-fixture",
-		RscFpopsEst:               1.25e9,
+		RetryAfterSeconds: 42,
 	}
 }
 

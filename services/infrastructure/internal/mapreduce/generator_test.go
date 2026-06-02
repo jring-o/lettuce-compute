@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
@@ -43,6 +44,15 @@ func (m *mockWorkUnitRepo) BulkTransitionByBatch(ctx context.Context, batchID ty
 	return 0, nil
 }
 func (m *mockWorkUnitRepo) FindNextAssignable(context.Context, workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) ReserveNextAssignable(context.Context, workunit.AssignmentOptions, time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) StampReservation(context.Context, types.ID, types.ID, time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) ClearReservation(context.Context, types.ID, types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWorkUnitRepo) Assign(context.Context, types.ID, types.ID) (*workunit.WorkUnit, error) {

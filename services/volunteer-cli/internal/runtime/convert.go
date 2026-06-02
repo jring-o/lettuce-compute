@@ -4,29 +4,32 @@ import (
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
-// WorkUnitFromProto converts a RequestWorkUnitResponse into an internal WorkUnit.
-func WorkUnitFromProto(resp *lettucev1.RequestWorkUnitResponse) *WorkUnit {
-	if resp == nil {
+// WorkUnitFromProto converts a single WorkUnitAssignment (one element of a
+// RequestWorkUnitResponse's batch) into an internal WorkUnit.
+func WorkUnitFromProto(a *lettucev1.WorkUnitAssignment) *WorkUnit {
+	if a == nil {
 		return nil
 	}
 
 	wu := &WorkUnit{
-		ID:                        resp.GetWorkUnitId(),
-		LeafID:                    resp.GetProjectId(),
-		Runtime:                   resp.GetRuntime(),
-		InputData:                 resp.GetInputData(),
-		InputDataURL:              resp.GetInputDataUrl(),
-		CodeArtifactURL:           resp.GetCodeArtifactUrl(),
-		ParametersJSON:            resp.GetParametersJson(),
-		DeadlineSeconds:           resp.GetDeadlineSeconds(),
-		EnvVars:                   resp.GetEnvVars(),
-		RscFpopsEst:               resp.GetRscFpopsEst(),
-		HasCheckpoint:             resp.GetHasCheckpoint(),
-		CheckpointSequence:        resp.GetCheckpointSequence(),
-		CheckpointIntervalSeconds: resp.GetCheckpointIntervalSeconds(),
+		ID:                        a.GetWorkUnitId(),
+		LeafID:                    a.GetLeafId(),
+		Runtime:                   a.GetRuntime(),
+		InputData:                 a.GetInputData(),
+		InputDataURL:              a.GetInputDataUrl(),
+		CodeArtifactURL:           a.GetCodeArtifactUrl(),
+		ParametersJSON:            a.GetParametersJson(),
+		DeadlineSeconds:           a.GetDeadlineSeconds(),
+		HeartbeatIntervalSeconds:  a.GetHeartbeatIntervalSeconds(),
+		EnvVars:                   a.GetEnvVars(),
+		RscFpopsEst:               a.GetRscFpopsEst(),
+		ReservedUntilUnix:         a.GetReservedUntilUnix(),
+		HasCheckpoint:             a.GetHasCheckpoint(),
+		CheckpointSequence:        a.GetCheckpointSequence(),
+		CheckpointIntervalSeconds: a.GetCheckpointIntervalSeconds(),
 	}
 
-	if spec := resp.GetExecutionSpec(); spec != nil {
+	if spec := a.GetExecutionSpec(); spec != nil {
 		wu.ExecutionSpec = ExecutionSpec{
 			Binaries:        spec.GetBinaries(),
 			BinaryChecksums: spec.GetBinaryChecksums(),

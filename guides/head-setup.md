@@ -246,6 +246,8 @@ REGISTRY_PASS_HASH=<the hash printed by caddy hash-password>
 | `LETTUCE_ADMIN_EMAIL` / `LETTUCE_ADMIN_PASSWORD` | Dashboard admin account, created automatically on first boot. The password is bcrypt-hashed for you. |
 | `LETTUCE_HEAD_NAME` / `LETTUCE_HEAD_DESCRIPTION` | What volunteers see for this head. |
 | `LETTUCE_CORS_ORIGINS` | Allowed browser origins (your domain). |
+| `LETTUCE_GRPC_PER_IP_RATE_LIMIT` | *(optional)* Per-source-IP gRPC request budget, **requests per minute** (default 60). Raise this when a whole fleet legitimately shares one source IP — e.g. many volunteers behind a single NAT, or a load test from one host — so the shared per-IP bucket does not throttle the fleet to ~1 req/s. Combine with `LETTUCE_TRUSTED_PROXIES` so volunteers behind your reverse proxy are still bucketed per real client IP. |
+| `LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT` | *(optional)* Per-authenticated-volunteer gRPC request budget, **requests per minute** (default 120), keyed on the volunteer's verified Ed25519 key. This limiter sits *after* auth, so it sheds database/handler load but not signature-verification cost (the per-IP limiter is the only pre-auth, crypto-shedding ceiling). |
 | `VIZ_ORIGIN` | The `viz.` subdomain, for visualization isolation. **Required in production** — it binds the viz-bundle route to this origin so author bundle code only runs in the sandboxed viz origin, never on your main app origin. |
 | `VIZ_BUNDLE_ALLOWED_ORIGINS` | *(optional)* Comma-separated `scheme://host[:port]` origins the viz-bundle route may fetch tarballs from. Defaults to the `PLATFORM_URL` origin (where `/binaries/` is served), so you normally don't set it. Set it only if you host viz tarballs on additional origins (e.g. a CDN). |
 | `REGISTRY_USER` / `REGISTRY_PASS_HASH` | Credentials for pushing container images. The proxy needs the hash to start. |
@@ -370,7 +372,42 @@ docker compose -f compose.production.yaml build dashboard
 docker compose -f compose.production.yaml up -d
 ```
 
-Migrations run automatically on startup.
+Migrations run automatically on startup. This release adds a migration
+(`00002_work_unit_reservations`) that adds nullable `reserved_until` /
+`reserved_volunteer_id` columns to `work_units`; it applies automatically and
+needs no data migration. A reserved (buffered) unit stays `QUEUED` with
+`reserved_until > now()` and is invisible to deadline/abandonment reclaim until
+the volunteer actually starts running it.
+
+> **Breaking release — head and all volunteers update together.** This release
+> redesigns the volunteer⇄head work protocol (server-directed retry delay, work
+> batching, leased buffered work). **A volunteer older than this release cannot
+> talk to the new head.** Redeploy the head first, then update every volunteer
+> binary (and the desktop-app sidecar). See the volunteer setup guide for the
+> volunteer-side note.
+
+### Work dispatch tuning
+
+The head paces volunteers and hands out work in batches so a large fleet creates
+far less request noise. These are tuned with `head.*` keys in `lettuce.yaml`
+(or the matching `LETTUCE_HEAD_*` env vars). Defaults are sane for a small head;
+the only one you should actively calibrate is `target_request_rate_per_sec`.
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `max_batch_per_request` (`LETTUCE_HEAD_MAX_BATCH_PER_REQUEST`) | `8` | Max work units one work request may return (the server-side batch cap). |
+| `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max units (running + buffered/reserved) one volunteer may hold. Also caps how deep a volunteer's hours-based work buffer can fill. |
+| `min_retry_delay_seconds` (`LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS`) | `30` | Server-directed retry delay handed out when quiet. Stamped on **every** reply (including no-work); volunteers must obey it. |
+| `max_retry_delay_seconds` (`LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS`) | `900` | Retry delay under full load. Must stay below the 1800s stale-volunteer threshold (validated at startup). |
+| `retry_delay_jitter_pct` (`LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT`) | `0.20` | Server-side ± jitter on the stamped delay so a fleet does not re-contact in lockstep. |
+| `target_request_rate_per_sec` (`LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC`) | `500` | Per-head work-request rate the load estimator treats as "fully loaded". **Not calibrated** — measure your single-head dispatch ceiling with `swarm-sim` (see `CONTRIBUTING.md`) and set this to it. The 2026-06-01 reference run measured ~240 assignments/sec on a single head, well below the default. |
+| `lease_seconds` (`LETTUCE_HEAD_LEASE_SECONDS`) | `900` | How long a buffered/reserved unit is held for a volunteer before the head may reclaim it. Must stay below 1800s. |
+
+`LETTUCE_TRUSTED_PROXIES` also governs **per-client rate limiting** on the gRPC
+port: with it set, volunteers behind your reverse proxy are bucketed per real
+client IP (and per authenticated key) rather than sharing one proxy-IP bucket.
+The per-pubkey limiter sits *after* auth, so it does not shed
+signature-verification cost — the per-IP ceiling is the only pre-auth layer.
 
 ### Back up
 

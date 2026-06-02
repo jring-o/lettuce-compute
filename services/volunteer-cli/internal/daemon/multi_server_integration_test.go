@@ -1,4 +1,4 @@
-package daemon
+﻿package daemon
 
 import (
 	"context"
@@ -34,11 +34,11 @@ func TestMultiServerIntegration(t *testing.T) {
 func testMultiServerFullJourney(t *testing.T) {
 	// --- Per-server work unit tracking ---
 	type serverTracker struct {
-		mu               sync.Mutex
-		workServed       bool
-		submitRequests   []*lettucev1.SubmitResultRequest
-		heartbeatWUIDs   []string // work unit IDs seen in heartbeats
-		requestVolIDs    []string // volunteer IDs seen in requests
+		mu             sync.Mutex
+		workServed     bool
+		submitRequests []*lettucev1.SubmitResultRequest
+		heartbeatWUIDs []string // work unit IDs seen in heartbeats
+		requestVolIDs  []string // volunteer IDs seen in requests
 	}
 
 	trackerA := &serverTracker{}
@@ -58,12 +58,16 @@ func testMultiServerFullJourney(t *testing.T) {
 					return nil, status.Error(codes.NotFound, "no more work")
 				}
 				return &lettucev1.RequestWorkUnitResponse{
-					WorkUnitId:               wuID,
-					ProjectId:                projID,
-					Runtime:                  "native",
-					InputData:                []byte(fmt.Sprintf("input-%s", name)),
-					HeartbeatIntervalSeconds: 1, // 1s so we get heartbeats during execution
-					ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					Assignments: []*lettucev1.WorkUnitAssignment{
+						{
+							WorkUnitId:               wuID,
+							LeafId:                   projID,
+							Runtime:                  "native",
+							InputData:                []byte(fmt.Sprintf("input-%s", name)),
+							HeartbeatIntervalSeconds: 1, // 1s so we get heartbeats during execution
+							ExecutionSpec:            &lettucev1.ExecutionSpec{},
+						},
+					},
 				}, nil
 			},
 			submitResultFn: func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
@@ -127,7 +131,6 @@ func testMultiServerFullJourney(t *testing.T) {
 	})
 	d.initialBackoff = 5 * time.Millisecond
 	d.maxBackoff = 50 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 
 	// Run long enough for all 3 work units to execute (~3.6s + overhead).
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -254,7 +257,7 @@ func testMultiServerFullJourney(t *testing.T) {
 
 	expectedHistory := map[string]string{
 		"a1a1a1a1-0000-4000-8000-000000000001": "server-alpha",
-		"b2b2b2b2-0000-4000-8000-000000000002":  "server-beta",
+		"b2b2b2b2-0000-4000-8000-000000000002": "server-beta",
 		"c3c3c3c3-0000-4000-8000-000000000003": "server-gamma",
 	}
 	for wuID, expectedServer := range expectedHistory {
@@ -300,12 +303,16 @@ func testMultiServerPartialFailure(t *testing.T) {
 			}
 			aWorkServed.Store(true)
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "573709bf-0916-4f1f-8973-60b2ebfd50fc", // was wu-a-partial
-				ProjectId:                "proj-a",
-				Runtime:                  "native",
-				InputData:                []byte("input-a"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "573709bf-0916-4f1f-8973-60b2ebfd50fc", // was wu-a-partial
+						LeafId:                   "proj-a",
+						Runtime:                  "native",
+						InputData:                []byte("input-a"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 		submitResultFn: func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
@@ -340,12 +347,16 @@ func testMultiServerPartialFailure(t *testing.T) {
 			}
 			cWorkServed.Store(true)
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "92a0b88e-5700-4da1-828b-a79e1995e82a", // was wu-c-partial
-				ProjectId:                "proj-c",
-				Runtime:                  "native",
-				InputData:                []byte("input-c"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "92a0b88e-5700-4da1-828b-a79e1995e82a", // was wu-c-partial
+						LeafId:                   "proj-c",
+						Runtime:                  "native",
+						InputData:                []byte("input-c"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 		submitResultFn: func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
@@ -378,7 +389,6 @@ func testMultiServerPartialFailure(t *testing.T) {
 	})
 	d.initialBackoff = 5 * time.Millisecond
 	d.maxBackoff = 50 * time.Millisecond
-	d.fetcherMinInterval = -1 // disable the inter-request throttle for fast tests
 	d.multiClient.SetBackoff(5*time.Millisecond, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

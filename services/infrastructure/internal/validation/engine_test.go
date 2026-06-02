@@ -141,6 +141,15 @@ func (m *mockWorkUnitRepo) BulkTransitionByBatch(_ context.Context, _ types.ID, 
 func (m *mockWorkUnitRepo) FindNextAssignable(_ context.Context, _ workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWorkUnitRepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *mockWorkUnitRepo) Assign(_ context.Context, _ types.ID, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

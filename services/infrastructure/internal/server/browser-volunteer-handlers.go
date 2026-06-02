@@ -636,12 +636,23 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 
 		if existingCount+1 >= effectiveRedundancy {
+			// Mirror the gRPC SubmitResult completion predicate: also complete a
+			// buffered (QUEUED + reserved) unit whose redundancy is met by results
+			// submitted before a RUNNING heartbeat flipped it to ASSIGNED — e.g. a
+			// gRPC volunteer reserved the unit and a browser volunteer corroborates
+			// it. Clear the reservation columns on completion.
 			_, err := tx.Exec(r.Context(), `
 				UPDATE work_units SET
 					state = 'COMPLETED',
 					started_at = COALESCE(started_at, NOW()),
-					completed_at = NOW()
-				WHERE id = $1 AND (state IN ('ASSIGNED', 'RUNNING') OR (state = 'QUEUED' AND spot_check = true))`,
+					completed_at = NOW(),
+					reserved_until = NULL,
+					reserved_volunteer_id = NULL
+				WHERE id = $1 AND (
+					state IN ('ASSIGNED', 'RUNNING')
+					OR (state = 'QUEUED' AND spot_check = true)
+					OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
+				)`,
 				workUnitID,
 			)
 			if err != nil {

@@ -1,4 +1,4 @@
-﻿package daemon
+package daemon
 
 import (
 	"context"
@@ -51,14 +51,18 @@ func TestF16_ContainerWorkUnitExecution(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "1ecc156d-5771-45c6-8e41-718829bd7b45", // was wu-container-1
-				ProjectId:                "proj-1",
-				Runtime:                  "container",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec: &lettucev1.ExecutionSpec{
-					Image:      "test-image:latest",
-					GpuRequired: false,
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "1ecc156d-5771-45c6-8e41-718829bd7b45", // was wu-container-1
+						LeafId:                   "proj-1",
+						Runtime:                  "container",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec: &lettucev1.ExecutionSpec{
+							Image:       "test-image:latest",
+							GpuRequired: false,
+						},
+					},
 				},
 			}, nil
 		},
@@ -120,14 +124,18 @@ func TestF16_GPUContainerWorkUnit(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "9a9f659e-6b8b-4c91-8f0f-cc53cb72aa26", // was wu-gpu-1
-				ProjectId:                "proj-1",
-				Runtime:                  "container",
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec: &lettucev1.ExecutionSpec{
-					Image:       "gpu-image:latest",
-					GpuRequired: true,
-					GpuType:     "nvidia",
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "9a9f659e-6b8b-4c91-8f0f-cc53cb72aa26", // was wu-gpu-1
+						LeafId:                   "proj-1",
+						Runtime:                  "container",
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec: &lettucev1.ExecutionSpec{
+							Image:       "gpu-image:latest",
+							GpuRequired: true,
+							GpuType:     "nvidia",
+						},
+					},
 				},
 			}, nil
 		},
@@ -203,12 +211,16 @@ func TestF16_RuntimeMismatch(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "bad94ec5-4093-4f4d-8d9d-eb38e1d438a4", // was wu-mismatch
-				ProjectId:                "proj-1",
-				Runtime:                  "container", // requests container runtime
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec: &lettucev1.ExecutionSpec{
-					Image: "some-image:latest",
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "bad94ec5-4093-4f4d-8d9d-eb38e1d438a4", // was wu-mismatch
+						LeafId:                   "proj-1",
+						Runtime:                  "container", // requests container runtime
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec: &lettucev1.ExecutionSpec{
+							Image: "some-image:latest",
+						},
+					},
 				},
 			}, nil
 		},
@@ -325,13 +337,17 @@ func TestF16_NativeWorkUnitRegression(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               "1932032b-5d60-438f-8b64-1244ba787ff9", // was wu-native-1
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec: &lettucev1.ExecutionSpec{
-					Binaries: map[string]string{"linux_amd64": "http://example.com/bin"},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               "1932032b-5d60-438f-8b64-1244ba787ff9", // was wu-native-1
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec: &lettucev1.ExecutionSpec{
+							Binaries: map[string]string{"linux_amd64": "http://example.com/bin"},
+						},
+					},
 				},
 			}, nil
 		},

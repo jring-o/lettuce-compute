@@ -41,9 +41,11 @@ type VolunteerServiceClient interface {
 	// Called on first connection and when hardware config changes.
 	// Upserts by public_key: new key = register, existing key = update.
 	RegisterVolunteer(ctx context.Context, in *RegisterVolunteerRequest, opts ...grpc.CallOption) (*RegisterVolunteerResponse, error)
-	// Request a work unit matching volunteer capabilities.
-	// Returns NOT_FOUND status if no matching work available.
-	// Volunteer should poll with exponential backoff (1s, 2s, 4s, max 30s).
+	// Request work units matching volunteer capabilities.
+	// Returns 0..N assignments and a server-directed `retry_after_seconds` the
+	// caller MUST obey before its next call (present on all replies, including
+	// no-work). Each assignment carries `reserved_until_unix`, the lease window
+	// during which the head will not reclaim the unit.
 	RequestWorkUnit(ctx context.Context, in *RequestWorkUnitRequest, opts ...grpc.CallOption) (*RequestWorkUnitResponse, error)
 	// Submit result for a completed work unit.
 	// Includes output data and execution metadata.
@@ -183,9 +185,11 @@ type VolunteerServiceServer interface {
 	// Called on first connection and when hardware config changes.
 	// Upserts by public_key: new key = register, existing key = update.
 	RegisterVolunteer(context.Context, *RegisterVolunteerRequest) (*RegisterVolunteerResponse, error)
-	// Request a work unit matching volunteer capabilities.
-	// Returns NOT_FOUND status if no matching work available.
-	// Volunteer should poll with exponential backoff (1s, 2s, 4s, max 30s).
+	// Request work units matching volunteer capabilities.
+	// Returns 0..N assignments and a server-directed `retry_after_seconds` the
+	// caller MUST obey before its next call (present on all replies, including
+	// no-work). Each assignment carries `reserved_until_unix`, the lease window
+	// during which the head will not reclaim the unit.
 	RequestWorkUnit(context.Context, *RequestWorkUnitRequest) (*RequestWorkUnitResponse, error)
 	// Submit result for a completed work unit.
 	// Includes output data and execution metadata.

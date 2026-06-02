@@ -5,6 +5,8 @@ package server
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"strconv"
 
 	"google.golang.org/grpc"
@@ -39,12 +41,16 @@ func ContextWithTestSigner(ctx context.Context, pub ed25519.PublicKey, priv ed25
 //     reject. Disabled here so the auth signature itself is still verified.
 //   - per-IP gRPC rate limit: raised far above the 60/min production budget so a
 //     burst of test RPCs from 127.0.0.1 is not throttled.
+//   - per-pubkey gRPC rate limit: raised far above the 120/min production budget
+//     so a burst of multi-RPC integration calls signed by one volunteer key is
+//     not throttled by the post-auth per-volunteer limiter.
 //
 // This is integration-build-only (see the //go:build integration tag) and is never
 // linked into the production server.
 func SetGRPCSecurityForIntegrationTests() {
 	grpcReplayDetectionEnabled = false
 	grpcRateLimit = 1_000_000
+	grpcPerPubkeyRateLimit = 1_000_000
 }
 
 // TestSigningInterceptor returns a UnaryClientInterceptor that signs outgoing
@@ -66,15 +72,24 @@ func TestSigningInterceptor() grpc.UnaryClientInterceptor {
 			return err
 		}
 		unixTs := timeNow().Unix()
-		// Integration signer keeps emitting the legacy (no-nonce) canonical form;
-		// the server verifies it via the empty-nonce branch. Passing "" matches the
-		// updated canonicalGRPCAuthMessage signature without changing behavior.
-		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes, "")
+		// The nonce is REQUIRED on every signed RPC (the legacy no-nonce form was
+		// removed). Emit a fresh 128-bit nonce per call exactly as the real client
+		// does, signing the with-nonce canonical form and attaching the same hex
+		// string as x-lettuce-nonce metadata so the server reconstructs identical
+		// bytes. (Anti-replay is disabled for integration tests, so the fresh nonce
+		// does not interfere with the harness's intentional byte-identical replays.)
+		var nonceBytes [16]byte
+		if _, err := rand.Read(nonceBytes[:]); err != nil {
+			return err
+		}
+		nonce := hex.EncodeToString(nonceBytes[:])
+		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes, nonce)
 		sig := ed25519.Sign(keys.Priv, []byte(signed))
 		ctx = metadata.AppendToOutgoingContext(ctx,
 			grpcAuthPubKeyMeta, string(keys.Pub),
 			grpcAuthTimestampMeta, strconv.FormatInt(unixTs, 10),
 			grpcAuthSignatureMeta, string(sig),
+			grpcAuthNonceMeta, nonce,
 		)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}

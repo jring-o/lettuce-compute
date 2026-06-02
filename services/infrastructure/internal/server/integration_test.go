@@ -47,7 +47,7 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 	}()
 
 	// Wire up gRPC server.
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(nil, version, startTime, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)

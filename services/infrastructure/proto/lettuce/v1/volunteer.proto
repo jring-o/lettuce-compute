@@ -13,9 +13,11 @@ service VolunteerService {
   // Upserts by public_key: new key = register, existing key = update.
   rpc RegisterVolunteer(RegisterVolunteerRequest) returns (RegisterVolunteerResponse);
 
-  // Request a work unit matching volunteer capabilities.
-  // Returns NOT_FOUND status if no matching work available.
-  // Volunteer should poll with exponential backoff (1s, 2s, 4s, max 30s).
+  // Request work units matching volunteer capabilities.
+  // Returns 0..N assignments and a server-directed `retry_after_seconds` the
+  // caller MUST obey before its next call (present on all replies, including
+  // no-work). Each assignment carries `reserved_until_unix`, the lease window
+  // during which the head will not reclaim the unit.
   rpc RequestWorkUnit(RequestWorkUnitRequest) returns (RequestWorkUnitResponse);
 
   // Submit result for a completed work unit.
@@ -72,31 +74,37 @@ message RegisterVolunteerResponse {
 
 message RequestWorkUnitRequest {
   string volunteer_id = 1;
-  bytes public_key = 2;              // for auth verification
-  repeated string project_ids = 3;   // DEPRECATED: use leaf_ids
-  repeated string blocked_project_ids = 4; // DEPRECATED: use blocked_leaf_ids
-  HardwareCapabilities current_available = 5; // current free resources
-  repeated string leaf_ids = 6;      // empty = any matching leaf
-  repeated string blocked_leaf_ids = 7;
+  bytes public_key = 2;                       // 32-byte Ed25519, for auth verification
+  HardwareCapabilities current_available = 3; // current free resources
+  repeated string leaf_ids = 4;               // empty = any matching leaf
+  repeated string blocked_leaf_ids = 5;
+  int32 max_assignments = 6;                  // client's requested batch size (server-capped)
 }
 
 message RequestWorkUnitResponse {
+  repeated WorkUnitAssignment assignments = 1; // 0..N units; empty = no work right now
+  int32 retry_after_seconds = 2;               // server-directed retry delay (authoritative)
+}
+
+// WorkUnitAssignment is a single work unit dispatched to a volunteer. A
+// RequestWorkUnitResponse carries 0..N of these (work batching).
+message WorkUnitAssignment {
   string work_unit_id = 1;
-  string project_id = 2;            // DEPRECATED: use leaf_id
-  string runtime = 3;               // native, container, etc.
-  bytes input_data = 4;             // inline data (< 1 MB)
-  string input_data_url = 5;        // URL for external data
-  string code_artifact_url = 6;     // URL to download code/binary
-  string parameters_json = 7;       // parameter set as JSON string
+  string leaf_id = 2;
+  string runtime = 3;                         // native, container, etc.
+  bytes input_data = 4;                       // inline data (< 1 MB)
+  string input_data_url = 5;                  // URL for external data
+  string code_artifact_url = 6;               // URL to download code/binary
+  string parameters_json = 7;                 // parameter set as JSON string
   int32 deadline_seconds = 8;
   int32 heartbeat_interval_seconds = 9;
   map<string, string> env_vars = 10;
   ExecutionSpec execution_spec = 11;
-  bool has_checkpoint = 15;                   // true if a checkpoint exists for this reassigned WU
-  int32 checkpoint_sequence = 16;             // sequence number of the latest checkpoint
-  int32 checkpoint_interval_seconds = 17;     // from leaf's fault_tolerance_config
-  string leaf_id = 18;
-  double rsc_fpops_est = 19;                  // estimated FP ops for this work unit (for time estimates)
+  bool has_checkpoint = 12;                    // true if a checkpoint exists for this reassigned WU
+  int32 checkpoint_sequence = 13;             // sequence number of the latest checkpoint
+  int32 checkpoint_interval_seconds = 14;     // from leaf's fault_tolerance_config
+  double rsc_fpops_est = 15;                   // estimated FP ops for this work unit (hours-based buffer sizing)
+  int64 reserved_until_unix = 16;             // head-set lease expiry for this buffered unit
 }
 
 message SubmitResultRequest {

@@ -55,3 +55,40 @@ head:
   #     globular-cluster-n-body: 10
   #     prime-gap-study: 5
   default_leaf_weights: {}
+
+  # --- Work dispatch (server-directed retry delay, work batching, buffer lease) ---
+  # These govern how the head paces volunteers and hands out work in batches so a
+  # large fleet creates far less request noise. Defaults are sane for a small head;
+  # tune target_request_rate_per_sec with the swarm-sim load test (see CONTRIBUTING.md).
+
+  # Max work units one RequestWorkUnit may return (the server-side batch cap).
+  max_batch_per_request: 8           # env: LETTUCE_HEAD_MAX_BATCH_PER_REQUEST
+
+  # Max work units (running + buffered/reserved) one volunteer may hold at once.
+  # Reserved-but-not-yet-running units count against this, so it also caps how
+  # deep a volunteer can fill its hours-based client work buffer.
+  max_inflight_per_volunteer: 10     # env: LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER
+
+  # Server-directed retry delay (seconds) the head stamps on EVERY work reply
+  # (including no-work). Volunteers MUST wait this long before contacting again.
+  # The head stretches from min (quiet) toward max (loaded) as a function of load.
+  min_retry_delay_seconds: 30        # env: LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS
+  max_retry_delay_seconds: 900       # env: LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS
+                                     # Must stay < 1800 (the stale-volunteer threshold).
+
+  # Server-side ± jitter applied to the stamped delay so a fleet does not
+  # re-contact in lockstep. 0.20 = ±20%. Range [0, 1).
+  retry_delay_jitter_pct: 0.20       # env: LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT
+
+  # The per-head RequestWorkUnit rate (req/sec) that the load estimator treats as
+  # "fully loaded" (load saturates and the retry delay reaches its max here).
+  # NOTE: this default is NOT calibrated — measure your single-head dispatch
+  # ceiling with swarm-sim and set this to it. On the reference 2026-06-01 load
+  # test the measured ceiling was ~240 assignments/sec, well below this default.
+  target_request_rate_per_sec: 500   # env: LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC
+
+  # How long (seconds) a buffered/reserved unit is held for a volunteer before the
+  # head may reclaim it. A buffered unit stays QUEUED with reserved_until > now and
+  # is invisible to deadline/abandonment reclaim until run start. Must stay < 1800.
+  # Adds reservation columns to work_units (migration 00002, auto-applied on boot).
+  lease_seconds: 900                 # env: LETTUCE_HEAD_LEASE_SECONDS

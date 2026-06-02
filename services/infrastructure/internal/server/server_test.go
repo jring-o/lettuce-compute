@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"log/slog"
@@ -267,7 +268,7 @@ func TestGRPCGetServerStatus(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	startTime := time.Now()
 
-	grpcServer, grpcCleanup := NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := NewVolunteerService(nil, "0.1.0-test", startTime, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
@@ -555,7 +556,7 @@ func TestLoadTLSConfig_MalformedCA(t *testing.T) {
 func TestGRPCRecoveryInterceptor(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 
-	grpcServer, grpcCleanup := NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 
 	// Register a service that panics
@@ -733,15 +734,22 @@ func testSigningClientInterceptor(priv ed25519.PrivateKey, pub ed25519.PublicKey
 			return err
 		}
 		unixTs := timeNow().Unix()
-		// In-process test signer keeps emitting the legacy (no-nonce) canonical form;
-		// the server verifies it via the empty-nonce branch. Passing "" matches the
-		// updated canonicalGRPCAuthMessage signature without changing behavior.
-		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes, "")
+		// The nonce is REQUIRED on every signed RPC (the legacy no-nonce form was
+		// removed). Emit a fresh 128-bit nonce per call, sign the with-nonce
+		// canonical form, and attach the same hex string as x-lettuce-nonce metadata,
+		// exactly as the real client does.
+		var nonceBytes [16]byte
+		if _, err := rand.Read(nonceBytes[:]); err != nil {
+			return err
+		}
+		nonce := hex.EncodeToString(nonceBytes[:])
+		signed := canonicalGRPCAuthMessage(unixTs, method, requestBytes, nonce)
 		sig := ed25519.Sign(priv, []byte(signed))
 		ctx = metadata.AppendToOutgoingContext(ctx,
 			grpcAuthPubKeyMeta, string(pub),
 			grpcAuthTimestampMeta, strconv.FormatInt(unixTs, 10),
 			grpcAuthSignatureMeta, string(sig),
+			grpcAuthNonceMeta, nonce,
 		)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
@@ -756,7 +764,7 @@ func setupRegisterTestServer(t *testing.T, repo volunteer.Repository) (lettucev1
 	testRegisterPubKey = pub
 
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
-	grpcServer, grpcCleanup := NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	svc := NewVolunteerService(nil, "0.1.0-test", time.Now(), repo, nil, nil, nil, nil, nil, nil, nil, nil)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, svc)
@@ -1051,7 +1059,7 @@ func TestGracefulShutdown_ContextCancel(t *testing.T) {
 	}()
 
 	// Create real gRPC server.
-	grpcSrv, grpcCleanup := NewGRPCServer(nil, logger)
+	grpcSrv, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -148,6 +148,28 @@ PostgreSQL (:5432)                    — leafs, work units, results, volunteers
 - **Dashboard** is optional — the REST API works without it
 - **Volunteer CLI** connects directly to infrastructure via gRPC
 
+### How work is dispatched
+
+The head, not the volunteer, owns the conversation rate, so a single cheap
+server scales to large fleets:
+
+- **Server-directed retry delay** — every work reply (including "no work right
+  now") tells the volunteer how long to wait before contacting again. A quiet
+  head asks volunteers back quickly; a busy head stretches the delay out, so the
+  fleet's request load self-throttles instead of hammering the server.
+- **Work batching + a client work buffer** — volunteers request work in batches
+  and keep a buffer measured in hours. While the buffer is full they make zero
+  work requests; they just run what they hold.
+- **Leased buffered work** — buffered units are *leased* (reserved), not yet
+  started, so the head won't hand the same unit to anyone else, and the
+  deadline/heartbeat clock only starts when the unit actually runs. Buffered work
+  is downloaded and prepared lazily, right before it runs.
+- **Per-client rate limiting** — the gRPC port is rate-limited per real client IP
+  (trust-aware behind a reverse proxy) and per authenticated volunteer key.
+
+Heads and volunteers ship together as a breaking release: a volunteer older than
+the head's protocol version cannot attach. Update the head first, then volunteers.
+
 ## Credit system
 
 - Ed25519 cryptographic identity for every volunteer

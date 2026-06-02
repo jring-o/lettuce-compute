@@ -184,6 +184,18 @@ func (w *WeightedSelector) RecordAssignment(serverName, leafSlug string) {
 	w.leafCounts[serverName][leafSlug]++
 }
 
+// AssignedCount returns the cumulative number of assignments recorded for a
+// given head+leaf via RecordAssignment. Used to verify per-unit recording when a
+// batched RequestWorkUnit returns multiple assignments.
+func (w *WeightedSelector) AssignedCount(serverName, leafSlug string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if m := w.leafCounts[serverName]; m != nil {
+		return m[leafSlug]
+	}
+	return 0
+}
+
 // Reset zeroes all cumulative counts.
 func (w *WeightedSelector) Reset() {
 	w.mu.Lock()

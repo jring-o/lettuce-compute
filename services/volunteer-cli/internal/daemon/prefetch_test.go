@@ -24,7 +24,7 @@ func newMockPreFetchItem(id string, deadlineSeconds int32, fetchedAt time.Time) 
 			LeafID:          "proj-1",
 			DeadlineSeconds: deadlineSeconds,
 		},
-		WUResp:  &lettucev1.RequestWorkUnitResponse{HeartbeatIntervalSeconds: 300},
+		WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
 		Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 		Runtime: mr,
 		Conn:    &ServerConnection{Name: "test-server", VolunteerID: "vol-1"},

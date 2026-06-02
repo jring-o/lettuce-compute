@@ -1,4 +1,4 @@
-﻿package daemon
+package daemon
 
 import (
 	"context"
@@ -34,13 +34,17 @@ func TestDaemonCheckpointRestore(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "2c7d1dae-749f-49cc-8adf-2b0f5cc9c7c8", // was wu-ckp-1
-				ProjectId:                 "proj-1",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  300,
-				HasCheckpoint:             true,
-				CheckpointSequence:        3,
-				CheckpointIntervalSeconds: 60,
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "2c7d1dae-749f-49cc-8adf-2b0f5cc9c7c8", // was wu-ckp-1
+						LeafId:                    "proj-1",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  300,
+						HasCheckpoint:             true,
+						CheckpointSequence:        3,
+						CheckpointIntervalSeconds: 60,
+					},
+				},
 			}, nil
 		},
 		getCheckpointFn: func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error) {
@@ -108,11 +112,15 @@ func TestDaemonCheckpointGoroutineStarts(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "1ddc58f0-695e-42e0-82cb-b9ab1342077f", // was wu-ckp-2
-				ProjectId:                 "proj-1",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  300,
-				CheckpointIntervalSeconds: 1, // 1 second â€” fast for test
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "1ddc58f0-695e-42e0-82cb-b9ab1342077f", // was wu-ckp-2
+						LeafId:                    "proj-1",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  300,
+						CheckpointIntervalSeconds: 1, // 1 second â€” fast for test
+					},
+				},
 			}, nil
 		},
 		saveCheckpointFn: func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
@@ -180,11 +188,15 @@ func TestDaemonCheckpointNotStartedWhenDisabled(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "b924d1be-435a-4d13-8641-f85ba261c54c", // was wu-no-ckp
-				ProjectId:                 "proj-1",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  300,
-				CheckpointIntervalSeconds: 0, // disabled
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "b924d1be-435a-4d13-8641-f85ba261c54c", // was wu-no-ckp
+						LeafId:                    "proj-1",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  300,
+						CheckpointIntervalSeconds: 0, // disabled
+					},
+				},
 			}, nil
 		},
 		saveCheckpointFn: func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
@@ -225,11 +237,15 @@ func TestDaemonHeartbeatCheckpointStatus(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "821673a2-01aa-47ce-810b-d313b9492389", // was wu-hb-1
-				ProjectId:                 "proj-1",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  1,
-				CheckpointIntervalSeconds: 1,
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "821673a2-01aa-47ce-810b-d313b9492389", // was wu-hb-1
+						LeafId:                    "proj-1",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  1,
+						CheckpointIntervalSeconds: 1,
+					},
+				},
 			}, nil
 		},
 		heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
@@ -309,13 +325,17 @@ func TestDaemonCheckpointRestoreFailure_StartsFresh(t *testing.T) {
 			}
 			workUnitServed = true
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "5e84956d-05df-4c7c-8ade-cd9355c03da8", // was wu-ckp-fail
-				ProjectId:                 "proj-1",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  300,
-				HasCheckpoint:             true,
-				CheckpointSequence:        2,
-				CheckpointIntervalSeconds: 60,
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "5e84956d-05df-4c7c-8ade-cd9355c03da8", // was wu-ckp-fail
+						LeafId:                    "proj-1",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  300,
+						HasCheckpoint:             true,
+						CheckpointSequence:        2,
+						CheckpointIntervalSeconds: 60,
+					},
+				},
 			}, nil
 		},
 		getCheckpointFn: func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error) {
@@ -374,13 +394,17 @@ func TestDaemonGetCurrentTasks_WithCheckpoint(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:                "6d237510-ab4e-4073-86fa-30da90429d51", // was wu-current-1
-				ProjectId:                 "proj-current",
-				Runtime:                   "native",
-				HeartbeatIntervalSeconds:  300,
-				HasCheckpoint:             true,
-				CheckpointSequence:        3,
-				CheckpointIntervalSeconds: 1,
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:                "6d237510-ab4e-4073-86fa-30da90429d51", // was wu-current-1
+						LeafId:                    "proj-current",
+						Runtime:                   "native",
+						HeartbeatIntervalSeconds:  300,
+						HasCheckpoint:             true,
+						CheckpointSequence:        3,
+						CheckpointIntervalSeconds: 1,
+					},
+				},
 			}, nil
 		},
 		getCheckpointFn: func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error) {

@@ -30,6 +30,7 @@ const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 	reassignment_count, max_reassignments, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
+	reserved_until, reserved_volunteer_id,
 	created_at, updated_at`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
@@ -61,6 +62,8 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.SpotCheck,
 		&wu.LastCheckpointAt,
 		&wu.LastCheckpointSequence,
+		&wu.ReservedUntil,
+		&wu.ReservedVolunteerID,
 		&wu.CreatedAt,
 		&wu.UpdatedAt,
 	)
@@ -415,6 +418,7 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.assigned_volunteer_id, wu.assigned_at, wu.started_at, wu.completed_at, wu.validated_at,
 	wu.reassignment_count, wu.max_reassignments, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
+	wu.reserved_until, wu.reserved_volunteer_id,
 	wu.created_at, wu.updated_at`
 
 // FindNextAssignable finds the highest-priority QUEUED work unit from active projects
@@ -452,22 +456,74 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    OR (l.resource_requirements->>'gpu_compute_capability') IS NULL
 		    OR (l.resource_requirements->>'gpu_compute_capability') = ANY($11::text[])
 		  )
+		  -- Redundancy: a NORMAL buffered (reserved) unit is leased purely via the
+		  -- reservation columns and writes NO assignment_history row (so a crashed
+		  -- holder leaves no stale active row to leak — a lapsed lease is re-reservable
+		  -- with zero cleanup). The active-redundancy count is therefore the active
+		  -- history rows PLUS one for a live NORMAL reservation held by any OTHER
+		  -- volunteer. Spot-check units are excluded from the reservation term: they
+		  -- DO write a history row alongside their reservation, so they are already
+		  -- counted by the history-row subquery (adding the reservation too would
+		  -- double-count and wrongly block the second corroborating volunteer). A live
+		  -- reservation by THIS volunteer is excluded by the self-exclusion guard
+		  -- below; once a unit flips to ASSIGNED at run-start, Assign clears the
+		  -- reservation columns, so there is no overlap between the two terms.
 		  AND (
-		    SELECT COUNT(*) FROM work_unit_assignment_history wuah
-		    WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
+		    (
+		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
+		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
+		    )
+		    + CASE
+		        WHEN NOT wu.spot_check
+		             AND wu.reserved_until IS NOT NULL AND wu.reserved_until > NOW()
+		             AND wu.reserved_volunteer_id IS DISTINCT FROM $9
+		        THEN 1 ELSE 0
+		      END
 		  ) < CASE WHEN wu.spot_check THEN 2
 		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 		      END
+		  -- Reservation guard: a live reservation held by ANOTHER volunteer hides the
+		  -- unit; a lapsed lease (reserved_until < NOW()) or this volunteer's own
+		  -- reservation does not (the latter is then handled by the self-exclusion
+		  -- guard below so the holder is never handed its own held unit twice).
+		  -- Spot-check units are exempt: they must stay visible to a SECOND volunteer
+		  -- for corroboration despite the first volunteer's reservation — their
+		  -- dedup/redundancy is enforced by the history-row subqueries (the
+		  -- "not already assigned" guard excludes the first volunteer; the
+		  -- redundancy < 2 admits exactly one more).
+		  AND (
+		    wu.spot_check
+		    OR wu.reserved_until IS NULL
+		    OR wu.reserved_until < NOW()
+		    OR wu.reserved_volunteer_id = $9
+		  )
+		  -- Self-exclusion: never hand this volunteer a unit it already holds — either
+		  -- via an active history row (assigned, or a spot-checked unit it touched) or
+		  -- via a live reservation of its own.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history wuah2
 		    WHERE wuah2.work_unit_id = wu.id
 		      AND wuah2.volunteer_id = $9
 		      AND (wuah2.outcome IS NULL OR wu.spot_check)
 		  )
+		  AND NOT (
+		    wu.reserved_volunteer_id = $9
+		    AND wu.reserved_until IS NOT NULL
+		    AND wu.reserved_until > NOW()
+		  )
+		  -- Per-volunteer inflight cap counts BOTH active assignments (active history
+		  -- rows) AND this volunteer's live reservations, so one volunteer cannot
+		  -- reserve the whole queue. The two terms never overlap: a reserved QUEUED
+		  -- unit has no history row, and Assign clears the reservation when it writes
+		  -- the history row at run-start.
 		  AND (
 		    $12::int <= 0
-		    OR (SELECT COUNT(*) FROM work_unit_assignment_history wuah3
-		        WHERE wuah3.volunteer_id = $9 AND wuah3.outcome IS NULL) < $12
+		    OR (
+		      (SELECT COUNT(*) FROM work_unit_assignment_history wuah3
+		       WHERE wuah3.volunteer_id = $9 AND wuah3.outcome IS NULL)
+		      + (SELECT COUNT(*) FROM work_units wur
+		         WHERE wur.reserved_volunteer_id = $9 AND wur.reserved_until > NOW())
+		    ) < $12
 		  )
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT 1
@@ -496,6 +552,52 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 	return wu, nil
 }
 
+// ReserveNextAssignable is the batch-fill counterpart to FindNextAssignable: it
+// finds the next assignable QUEUED unit for the volunteer (honoring every
+// capability/redundancy/reservation/inflight predicate) and, instead of
+// transitioning it to ASSIGNED, stamps a lease (reserved_until = NOW() + lease,
+// reserved_volunteer_id = vol) while keeping state='QUEUED'. The row is held by
+// the FOR UPDATE lock taken in FindNextAssignable for the life of the enclosing
+// transaction, so the follow-up UPDATE cannot race another reserver. Returns
+// (nil, nil) when no work is available.
+//
+// Because the reservation is written within the caller's transaction, a
+// subsequent ReserveNextAssignable in the same tx sees the bumped live
+// reservation count and the reservation guard, so the same unit is never
+// reserved twice and the per-volunteer inflight cap is respected across the
+// whole batch.
+func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts AssignmentOptions, lease time.Duration) (*WorkUnit, error) {
+	wu, err := r.FindNextAssignable(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if wu == nil {
+		return nil, nil
+	}
+
+	reservedUntil := time.Now().UTC().Add(lease)
+	row := r.db.QueryRow(ctx, `
+		UPDATE work_units SET
+			reserved_until = $2,
+			reserved_volunteer_id = $3
+		WHERE id = $1 AND state = 'QUEUED'
+		RETURNING `+workUnitColumns,
+		wu.ID, reservedUntil, opts.VolunteerID,
+	)
+
+	reserved, err := scanWorkUnit(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.Conflict(
+				"work unit is no longer in QUEUED state",
+				map[string]string{"code": "RESERVATION_CONFLICT"},
+			)
+		}
+		return nil, apierror.Internal("failed to reserve work unit", err)
+	}
+	return reserved, nil
+}
+
 // Assign transitions a work unit from QUEUED to ASSIGNED and sets assignment metadata.
 // Uses optimistic concurrency: the update succeeds only if the work unit is currently QUEUED.
 func (r *PgxWorkUnitRepository) Assign(ctx context.Context, workUnitID types.ID, volunteerID types.ID) (*WorkUnit, error) {
@@ -505,7 +607,9 @@ func (r *PgxWorkUnitRepository) Assign(ctx context.Context, workUnitID types.ID,
 			state = 'ASSIGNED',
 			assigned_volunteer_id = $2,
 			assigned_at = $3,
-			last_heartbeat_at = $3
+			last_heartbeat_at = $3,
+			reserved_until = NULL,
+			reserved_volunteer_id = NULL
 		WHERE id = $1 AND state = 'QUEUED'
 		RETURNING `+workUnitColumns,
 		workUnitID, volunteerID, now,
@@ -688,6 +792,66 @@ func (r *PgxWorkUnitRepository) MarkSpotCheck(ctx context.Context, id types.ID) 
 		return apierror.NotFound("work_unit", id.String())
 	}
 	return nil
+}
+
+// StampReservation sets reserved_until / reserved_volunteer_id on a still-QUEUED
+// work unit without re-running the assignment predicate. Used in the batch
+// spot-check branch (belt-and-suspenders): the "not already assigned" subquery
+// already excludes a spot-checked volunteer on the next loop iteration, and the
+// reservation guard reinforces it. Returns the updated WorkUnit (so the response
+// can echo reserved_until_unix).
+func (r *PgxWorkUnitRepository) StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*WorkUnit, error) {
+	reservedUntil := time.Now().UTC().Add(lease)
+	row := r.db.QueryRow(ctx, `
+		UPDATE work_units SET
+			reserved_until = $2,
+			reserved_volunteer_id = $3
+		WHERE id = $1 AND state = 'QUEUED'
+		RETURNING `+workUnitColumns,
+		id, reservedUntil, volunteerID,
+	)
+	wu, err := scanWorkUnit(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.Conflict(
+				"work unit is no longer in QUEUED state",
+				map[string]string{"code": "RESERVATION_CONFLICT"},
+			)
+		}
+		return nil, apierror.Internal("failed to stamp reservation", err)
+	}
+	return wu, nil
+}
+
+// ClearReservation drops the reservation columns (reserved_until /
+// reserved_volunteer_id) on a still-QUEUED unit currently reserved to
+// volunteerID, leaving it QUEUED so it is immediately re-reservable by any
+// volunteer. Used when a volunteer abandons a buffered (reserved, un-started)
+// unit — e.g. a prepare failure or queue-full drop before the unit ever ran. It
+// is a no-op-safe guard: it only matches a unit still reserved to this
+// volunteer, so a unit that has since flipped to ASSIGNED (different volunteer,
+// or run-started) is not touched. Returns the updated WorkUnit, or
+// apierror.Conflict if no matching reserved QUEUED unit exists.
+func (r *PgxWorkUnitRepository) ClearReservation(ctx context.Context, id, volunteerID types.ID) (*WorkUnit, error) {
+	row := r.db.QueryRow(ctx, `
+		UPDATE work_units SET
+			reserved_until = NULL,
+			reserved_volunteer_id = NULL
+		WHERE id = $1 AND state = 'QUEUED' AND reserved_volunteer_id = $2
+		RETURNING `+workUnitColumns,
+		id, volunteerID,
+	)
+	wu, err := scanWorkUnit(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.Conflict(
+				"work unit is not reserved to this volunteer in QUEUED state",
+				map[string]string{"code": "RESERVATION_CONFLICT"},
+			)
+		}
+		return nil, apierror.Internal("failed to clear reservation", err)
+	}
+	return wu, nil
 }
 
 // ClearSpotCheck sets spot_check = false for a work unit, allowing it to complete

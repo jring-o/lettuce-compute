@@ -47,8 +47,8 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 |---|---|---|
 | `not fetching work: not enough free disk space …` | Free space is below your `max_disk_gb` allowance, so the daemon won't fetch. | Free space, lower `resource_limits.max_disk_gb`, or `--data-dir` on a roomier volume. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
-| `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. If persistent, check `doctor` and your leaf preferences. |
-| `no work for leaf (NotFound)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
+| `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
 | `docker is not available … Is the docker daemon running?` | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
 | `permission denied … /run/user/1000/podman/podman.sock` | Socket owned by a different user, or you ran under `sudo`. | Run lettuce as your **normal user**, not sudo; the socket owner must match. |
@@ -132,6 +132,44 @@ the container runtime's store:
   ownership) is fiddlier.
 
 ---
+
+## How the volunteer paces its work
+
+Your volunteer does **not** poll on a fixed schedule. Instead:
+
+- **The head decides when you check back (server-directed retry delay).** Every
+  work request comes back with a delay your volunteer obeys before its next
+  request to that head — even when there's no work right now. A quiet head asks
+  you back quickly; a busy head stretches the delay out so a large fleet creates
+  far less request noise. You don't configure this; the head does, and your
+  volunteer follows it.
+- **It keeps a client work buffer measured in hours, not units.** Rather than
+  fetching one unit at a time, the volunteer requests work in batches and holds
+  roughly `work_buffer_hours` of work per concurrent task. While that buffer is
+  full it makes **zero** work requests — it just runs what it has. Buffered work
+  is leased by the head (not yet started), so it is cheap to hand back if you
+  stop, and it is only downloaded/prepared right before it runs. The volunteer
+  keeps each buffered unit's lease alive while it holds it, so the head won't
+  hand the same unit to another volunteer — no duplicated work, even when a unit
+  sits in your buffer for a while.
+
+### Tuning the buffer
+
+| Config key | Default | What it does |
+|---|---|---|
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task. Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this. |
+
+```bash
+./lettuce-volunteer config set work_buffer_hours 4
+```
+
+> **Replaces `work_buffer_size`.** Earlier releases sized the buffer as a unit
+> count via `work_buffer_size`. That key is gone; use `work_buffer_hours`.
+
+> **Breaking release — update required.** This release changes the
+> volunteer⇄head work protocol. **A volunteer older than this release cannot talk
+> to the new head.** Run `lettuce-volunteer update`, then restart the daemon.
 
 ## Updating
 

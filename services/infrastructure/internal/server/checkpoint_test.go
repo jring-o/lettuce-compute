@@ -78,7 +78,7 @@ func setupCheckpointServer(t *testing.T) (
 	startTime := time.Now()
 	storageDir := t.TempDir()
 
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerRepo := volunteer.NewPgxRepository(pool)
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
@@ -670,13 +670,17 @@ func TestRequestWorkUnit_IncludesCheckpointInfo(t *testing.T) {
 		t.Fatalf("RequestWorkUnit: %v", err)
 	}
 
-	if !wuResp.HasCheckpoint {
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	wu := wuResp.Assignments[0]
+	if !wu.HasCheckpoint {
 		t.Error("expected has_checkpoint = true")
 	}
-	if wuResp.CheckpointSequence != 7 {
-		t.Errorf("checkpoint_sequence = %d, want 7", wuResp.CheckpointSequence)
+	if wu.CheckpointSequence != 7 {
+		t.Errorf("checkpoint_sequence = %d, want 7", wu.CheckpointSequence)
 	}
-	if wuResp.CheckpointIntervalSeconds != 60 {
-		t.Errorf("checkpoint_interval_seconds = %d, want 60", wuResp.CheckpointIntervalSeconds)
+	if wu.CheckpointIntervalSeconds != 60 {
+		t.Errorf("checkpoint_interval_seconds = %d, want 60", wu.CheckpointIntervalSeconds)
 	}
 }

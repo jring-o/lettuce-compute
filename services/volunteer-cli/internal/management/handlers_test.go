@@ -1567,7 +1567,7 @@ func setupTestEnvWithActiveTask(t *testing.T) (env *testEnv, workUnitID string, 
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.RequestWorkUnitResponse{
+		WUResp: &lettucev1.WorkUnitAssignment{
 			HeartbeatIntervalSeconds: 300,
 		},
 		Prep: &runtime.PrepareResult{

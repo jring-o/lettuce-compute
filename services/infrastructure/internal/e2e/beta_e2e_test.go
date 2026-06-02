@@ -80,11 +80,13 @@ func TestBetaE2E_MultiPatternNative(t *testing.T) {
 			if err != nil {
 				t.Fatalf("vol A request WU %d: %v", i, err)
 			}
+			wu := firstAssignment(t, wuResp)
 
-			createRedundantAssignment(t, env.pool, ctx, wuResp.WorkUnitId, volBIDParsed)
+			ensureRunStart(t, env.pool, env.grpc, ctx, volAID, volAPubKey, wu.WorkUnitId)
+			createRedundantAssignment(t, env.pool, ctx, wu.WorkUnitId, volBIDParsed)
 
 			_, err = env.grpc.SubmitResult(signFor(t, ctx, volAPubKey), &lettucev1.SubmitResultRequest{
-				WorkUnitId: wuResp.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
+				WorkUnitId: wu.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
 				OutputData: outputData, OutputChecksumSha256: checksum,
 				Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 10, CpuSecondsUser: 8, CpuCoresUsed: 2},
 			})
@@ -92,7 +94,7 @@ func TestBetaE2E_MultiPatternNative(t *testing.T) {
 				t.Fatalf("vol A submit WU %d: %v", i, err)
 			}
 			_, err = env.grpc.SubmitResult(signFor(t, ctx, volBPubKey), &lettucev1.SubmitResultRequest{
-				WorkUnitId: wuResp.WorkUnitId, VolunteerId: volBID, PublicKey: volBPubKey,
+				WorkUnitId: wu.WorkUnitId, VolunteerId: volBID, PublicKey: volBPubKey,
 				OutputData: outputData, OutputChecksumSha256: checksum,
 				Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 12, CpuSecondsUser: 10, CpuCoresUsed: 2},
 			})
@@ -227,18 +229,20 @@ func TestBetaE2E_MultiPatternNative(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request WU %d: %v", i, err)
 			}
+			wu := firstAssignment(t, wuResp)
 			var params struct {
 				Seed int64 `json:"seed"`
 			}
-			if wuResp.ParametersJson != "" {
-				json.Unmarshal([]byte(wuResp.ParametersJson), &params)
+			if wu.ParametersJson != "" {
+				json.Unmarshal([]byte(wu.ParametersJson), &params)
 			}
 			result := float64(params.Seed) * 0.1
 			values = append(values, result)
 			outputData := []byte(fmt.Sprintf(`{"result": %.1f}`, result))
 			checksum := sha256Hex(outputData)
+			ensureRunStart(t, env.pool, env.grpc, ctx, volAID, volAPubKey, wu.WorkUnitId)
 			_, err = env.grpc.SubmitResult(signFor(t, ctx, volAPubKey), &lettucev1.SubmitResultRequest{
-				WorkUnitId: wuResp.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
+				WorkUnitId: wu.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
 				OutputData: outputData, OutputChecksumSha256: checksum,
 				Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 1, CpuSecondsUser: 1, CpuCoresUsed: 1},
 			})
@@ -401,11 +405,16 @@ func TestBetaE2E_ContainerGPU(t *testing.T) {
 	cpuPubKey := genVolunteerKey(t)
 	cpuVolID := registerBetaVolunteer(t, env, ctx, cpuPubKey, "CPU Only Vol", nil)
 
-	_, err := env.grpc.RequestWorkUnit(signFor(t, ctx, cpuPubKey), &lettucev1.RequestWorkUnitRequest{
+	// No-work is now an OK response with empty assignments (the codes.NotFound
+	// sentinel was removed); a CPU-only volunteer simply matches no GPU work.
+	cpuResp, err := env.grpc.RequestWorkUnit(signFor(t, ctx, cpuPubKey), &lettucev1.RequestWorkUnitRequest{
 		VolunteerId: cpuVolID, PublicKey: cpuPubKey,
 	})
-	if err == nil {
-		t.Error("CPU-only volunteer should NOT receive GPU work unit")
+	if err != nil {
+		t.Fatalf("CPU-only volunteer request: unexpected error %v", err)
+	}
+	if len(cpuResp.Assignments) != 0 {
+		t.Errorf("CPU-only volunteer should NOT receive GPU work unit, got %d assignments", len(cpuResp.Assignments))
 	}
 
 	// Register GPU volunteer A.
@@ -441,11 +450,13 @@ func TestBetaE2E_ContainerGPU(t *testing.T) {
 		if reqErr != nil {
 			t.Fatalf("GPU vol A request WU %d: %v", i, reqErr)
 		}
+		wu := firstAssignment(t, wuResp)
 
-		createRedundantAssignment(t, env.pool, ctx, wuResp.WorkUnitId, gpuBIDParsed)
+		ensureRunStart(t, env.pool, env.grpc, ctx, gpuAVolID, gpuAPubKey, wu.WorkUnitId)
+		createRedundantAssignment(t, env.pool, ctx, wu.WorkUnitId, gpuBIDParsed)
 
 		_, subErr := env.grpc.SubmitResult(signFor(t, ctx, gpuAPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: gpuAVolID, PublicKey: gpuAPubKey,
+			WorkUnitId: wu.WorkUnitId, VolunteerId: gpuAVolID, PublicKey: gpuAPubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum, Metadata: gpuMeta,
 		})
 		if subErr != nil {
@@ -457,7 +468,7 @@ func TestBetaE2E_ContainerGPU(t *testing.T) {
 			GpuSeconds: 24, GpuModel: "RTX 3090", GpuVramUsedMb: 4096, PeakMemoryMb: 2048,
 		}
 		_, subErr = env.grpc.SubmitResult(signFor(t, ctx, gpuBPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: gpuBVolID, PublicKey: gpuBPubKey,
+			WorkUnitId: wu.WorkUnitId, VolunteerId: gpuBVolID, PublicKey: gpuBPubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum, Metadata: gpuMetaB,
 		})
 		if subErr != nil {
@@ -549,11 +560,12 @@ func TestBetaE2E_Checkpointing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vol A request work unit: %v", err)
 	}
-	wuID := wuResp.WorkUnitId
+	wu := firstAssignment(t, wuResp)
+	wuID := wu.WorkUnitId
 
 	// Verify checkpoint info in response.
-	if wuResp.CheckpointIntervalSeconds != int32(cpInterval) {
-		t.Errorf("checkpoint_interval_seconds = %d, want %d", wuResp.CheckpointIntervalSeconds, cpInterval)
+	if wu.CheckpointIntervalSeconds != int32(cpInterval) {
+		t.Errorf("checkpoint_interval_seconds = %d, want %d", wu.CheckpointIntervalSeconds, cpInterval)
 	}
 
 	// Vol A sends heartbeat (transitions ASSIGNED → RUNNING).
@@ -641,15 +653,21 @@ func TestBetaE2E_Checkpointing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vol B request work unit: %v", err)
 	}
-	if wuResp2.WorkUnitId != wuID {
-		t.Errorf("vol B got different WU: %s, want %s", wuResp2.WorkUnitId, wuID)
+	wu2 := firstAssignment(t, wuResp2)
+	if wu2.WorkUnitId != wuID {
+		t.Errorf("vol B got different WU: %s, want %s", wu2.WorkUnitId, wuID)
 	}
-	if !wuResp2.HasCheckpoint {
+	if !wu2.HasCheckpoint {
 		t.Error("vol B should see has_checkpoint = true")
 	}
-	if wuResp2.CheckpointSequence != 1 {
-		t.Errorf("vol B checkpoint_sequence = %d, want 1", wuResp2.CheckpointSequence)
+	if wu2.CheckpointSequence != 1 {
+		t.Errorf("vol B checkpoint_sequence = %d, want 1", wu2.CheckpointSequence)
 	}
+
+	// Vol B run-starts the reassigned unit (RUNNING heartbeat → Assign) so it has an
+	// active assignment_history row before retrieving the checkpoint and submitting.
+	// Run-start preserves the checkpoint fields carried on the unit.
+	ensureRunStart(t, env.pool, env.grpc, ctx, volBID, volBPubKey, wuID)
 
 	// Vol B retrieves checkpoint data.
 	getResp2, err := env.grpc.GetCheckpoint(signFor(t, ctx, volBPubKey), &lettucev1.GetCheckpointRequest{
@@ -763,12 +781,16 @@ func TestBetaE2E_SpotCheck(t *testing.T) {
 		if err != nil {
 			t.Fatalf("vol A request WU %d: %v", i, err)
 		}
+		asg := firstAssignment(t, wuResp)
 
 		goodOutput := []byte(fmt.Sprintf(`{"result": "correct_%d"}`, i+1))
-		wus = append(wus, wuInfo{id: wuResp.WorkUnitId, goodData: goodOutput})
+		wus = append(wus, wuInfo{id: asg.WorkUnitId, goodData: goodOutput})
 
+		// Normal units: run-start (a no-op for the spot-check ones, which keep the
+		// history-row model and submit while QUEUED).
+		ensureRunStart(t, env.pool, env.grpc, ctx, volAID, volAPubKey, asg.WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, volAPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
+			WorkUnitId: asg.WorkUnitId, VolunteerId: volAID, PublicKey: volAPubKey,
 			OutputData: goodOutput, OutputChecksumSha256: sha256Hex(goodOutput),
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 5, CpuSecondsUser: 4, CpuCoresUsed: 1},
 		})
@@ -797,8 +819,12 @@ func TestBetaE2E_SpotCheck(t *testing.T) {
 			VolunteerId: volBID, PublicKey: volBPubKey,
 		})
 		if err != nil {
-			break // No more work available
+			break // request failed
 		}
+		if len(wuResp.Assignments) == 0 {
+			break // No more work available (no-work is now an OK response with empty assignments)
+		}
+		asg := wuResp.Assignments[0]
 
 		var outputData []byte
 		if submittedByB == 0 {
@@ -808,7 +834,7 @@ func TestBetaE2E_SpotCheck(t *testing.T) {
 		} else {
 			// Remaining: match Vol A's output.
 			for _, wu := range wus {
-				if wu.id == wuResp.WorkUnitId {
+				if wu.id == asg.WorkUnitId {
 					outputData = wu.goodData
 					break
 				}
@@ -819,7 +845,7 @@ func TestBetaE2E_SpotCheck(t *testing.T) {
 		}
 
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, volBPubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volBID, PublicKey: volBPubKey,
+			WorkUnitId: asg.WorkUnitId, VolunteerId: volBID, PublicKey: volBPubKey,
 			OutputData: outputData, OutputChecksumSha256: sha256Hex(outputData),
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 5, CpuSecondsUser: 4, CpuCoresUsed: 1},
 		})

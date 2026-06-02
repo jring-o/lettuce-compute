@@ -46,6 +46,13 @@ type volunteerService struct {
 	headURL                 string
 	defaultWeights          map[string]int32
 	maxInflightPerVolunteer int
+
+	// Layer 1: work batching + buffer lease.
+	maxBatchPerRequest int
+	leaseSeconds       int
+
+	// Layer 1: load measurement → server-directed retry delay.
+	loadEstimator *loadEstimator
 }
 
 // NewVolunteerService creates a new VolunteerService gRPC implementation.
@@ -63,7 +70,7 @@ func NewVolunteerService(
 	validationEngine *validation.Engine,
 	logger *slog.Logger,
 ) lettucev1.VolunteerServiceServer {
-	return &volunteerService{
+	s := &volunteerService{
 		pool:             pool,
 		version:          version,
 		startTime:        startTime,
@@ -76,18 +83,66 @@ func NewVolunteerService(
 		checkpointRepo:   checkpointRepo,
 		validationEngine: validationEngine,
 		logger:           logger,
+		maxBatchPerRequest: defaultMaxBatchPerRequest,
+		leaseSeconds:       defaultLeaseSeconds,
 	}
+	// Default load estimator until SetHeadConfig overrides the tunables. The pool
+	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
+	// gRPC-plumbing unit tests).
+	s.loadEstimator = newLoadEstimator(defaultLoadEstimatorConfig(), poolSaturation(pool))
+	return s
 }
 
-// SetHeadConfig sets the head identity for GetHeadInfo gRPC responses.
-func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url string, weights map[string]int32, maxInflight int) {
+// HeadDispatchConfig carries the Layer-1 dispatch tunables (work batching,
+// buffer lease, server-directed retry delay) into the gRPC volunteer service.
+// It is a plain struct (no config-package dependency) so SetHeadConfig stays
+// decoupled from internal/config; main.go fills it from HeadConfig.Effective*.
+type HeadDispatchConfig struct {
+	MaxBatchPerRequest      int
+	LeaseSeconds            int
+	MinRetryDelaySeconds    int
+	MaxRetryDelaySeconds    int
+	RetryDelayJitterPct     float64
+	TargetRequestRatePerSec float64
+}
+
+// SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
+// Layer-1 dispatch tunables (batching/lease/retry-delay). dispatch may be the
+// zero value, in which case per-field defaults apply.
+func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url string, weights map[string]int32, maxInflight int, dispatch HeadDispatchConfig) {
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.headName = name
 		vs.headDescription = description
 		vs.headURL = url
 		vs.defaultWeights = weights
 		vs.maxInflightPerVolunteer = maxInflight
+
+		vs.maxBatchPerRequest = defaultInt(dispatch.MaxBatchPerRequest, defaultMaxBatchPerRequest)
+		vs.leaseSeconds = defaultInt(dispatch.LeaseSeconds, defaultLeaseSeconds)
+
+		cfg := loadEstimatorConfig{
+			targetRequestRatePerSec: defaultFloat(dispatch.TargetRequestRatePerSec, defaultTargetRequestRatePerSec),
+			targetAssignLatency:     defaultTargetAssignLatency,
+			minDelaySeconds:         defaultInt(dispatch.MinRetryDelaySeconds, defaultMinRetryDelaySeconds),
+			maxDelaySeconds:         defaultInt(dispatch.MaxRetryDelaySeconds, defaultMaxRetryDelaySeconds),
+			jitterPct:               defaultFloat(dispatch.RetryDelayJitterPct, defaultRetryDelayJitterPct),
+		}
+		vs.loadEstimator = newLoadEstimator(cfg, poolSaturation(vs.pool))
 	}
+}
+
+func defaultInt(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+func defaultFloat(v, def float64) float64 {
+	if v <= 0 {
+		return def
+	}
+	return v
 }
 
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
@@ -302,6 +357,10 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 }
 
 func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
+	// Feed the load estimator: every call counts toward the request-rate signal
+	// that drives the server-directed retry delay, regardless of outcome.
+	s.loadEstimator.recordRequest()
+
 	// Validate volunteer_id.
 	volunteerID, err := types.ParseID(req.VolunteerId)
 	if err != nil {
@@ -339,20 +398,12 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		hw = volunteer.HardwareCapabilitiesFromProto(req.CurrentAvailable)
 	}
 
-	// Parse leaf_ids (new) with fallback to project_ids (deprecated).
-	leafIDStrings := req.GetLeafIds()
-	if len(leafIDStrings) == 0 {
-		leafIDStrings = req.GetProjectIds() // deprecated fallback
-	}
-	leafIDs, err := parseIDSlice(leafIDStrings)
+	// Parse leaf preferences (empty = any matching leaf).
+	leafIDs, err := parseIDSlice(req.GetLeafIds())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid leaf_id: %v", err)
 	}
-	blockedStrings := req.GetBlockedLeafIds()
-	if len(blockedStrings) == 0 {
-		blockedStrings = req.GetBlockedProjectIds() // deprecated fallback
-	}
-	blockedIDs, err := parseIDSlice(blockedStrings)
+	blockedIDs, err := parseIDSlice(req.GetBlockedLeafIds())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid blocked_leaf_id: %v", err)
 	}
@@ -389,7 +440,29 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		MaxInflightPerVolunteer: s.maxInflightPerVolunteer,
 	}
 
-	// Begin transaction for atomic find-assign-record.
+	// Server-directed retry delay: computed once from the current load and
+	// stamped on EVERY reply (work and no-work). Measure load before the
+	// (possibly empty) batch fill so the delay reflects pressure at arrival.
+	load := s.loadEstimator.currentLoad()
+	retryAfter := s.loadEstimator.computeRetryDelaySeconds(load)
+
+	// Batch size: client's requested max, clamped to ≥1 and the server batch cap.
+	// The per-volunteer inflight budget (active assignments + live reservations)
+	// is enforced inside ReserveNextAssignable's query, which returns nil once the
+	// cap is hit, ending the loop early.
+	n := int(req.GetMaxAssignments())
+	if n < 1 {
+		n = 1
+	}
+	if n > s.maxBatchPerRequest {
+		n = s.maxBatchPerRequest
+	}
+
+	lease := time.Duration(s.leaseSeconds) * time.Second
+
+	// Begin ONE transaction for the whole batch: amortizes the transaction +
+	// round-trip cost across N units. SKIP LOCKED keeps concurrent multi-row
+	// claims safe.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.logger.Error("failed to begin transaction", "method", "RequestWorkUnit", "error", err)
@@ -400,80 +473,134 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 	txWURepo := workunit.NewPgxWorkUnitRepository(tx)
 	txAssignRepo := assignment.NewPgxRepository(tx)
 
-	// Find next assignable work unit.
-	wu, err := txWURepo.FindNextAssignable(ctx, opts)
-	if err != nil {
-		s.logger.Error("failed to find assignable work unit", "method", "RequestWorkUnit", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	if wu == nil {
-		return nil, status.Errorf(codes.NotFound, "no matching work units available")
-	}
-
-	// Check if this should be a spot-check first assignment.
-	isSpotCheckFirst := false
-	if !wu.SpotCheck {
-		scLeaf, scErr := s.leafRepo.GetByID(ctx, wu.LeafID)
-		if scErr != nil {
-			s.logger.Warn("failed to check spot-check config, proceeding with normal assignment",
-				"leaf_id", wu.LeafID, "error", scErr)
-		} else if scLeaf.ValidationConfig.SpotCheckEnabled &&
-			scLeaf.ValidationConfig.RedundancyFactor == 1 &&
-			workunit.ShouldSpotCheck(scLeaf.ValidationConfig.SpotCheckPercentage) {
-			isSpotCheckFirst = true
+	// leafCache collapses repeated GetByID lookups so N units from one leaf cost
+	// one lookup (the spot-check check and the response build share it). The leaf
+	// is read on THIS handler's tx connection (leaf.GetByIDTx), NOT via the
+	// pool-backed s.leafRepo: acquiring a second pool connection while already
+	// holding the reserve-loop tx connection is what starved/self-deadlocked the
+	// pool under concurrent batched RequestWorkUnit calls (handlers holding a tx
+	// connection blocked ~29s on a getLeaf connection that never freed). One
+	// handler now holds exactly one pool connection for the whole batch.
+	leafCache := make(map[types.ID]*leaf.Leaf)
+	getLeaf := func(id types.ID) (*leaf.Leaf, error) {
+		if lf, ok := leafCache[id]; ok {
+			return lf, nil
 		}
+		lf, lerr := leaf.GetByIDTx(ctx, tx, id)
+		if lerr != nil {
+			return nil, lerr
+		}
+		leafCache[id] = lf
+		return lf, nil
 	}
 
-	now := time.Now().UTC()
-	if isSpotCheckFirst {
-		// Spot-check first assignment: mark spot_check=true, keep state QUEUED.
-		// The WU remains findable so a second volunteer can be assigned.
-		if err := txWURepo.MarkSpotCheck(ctx, wu.ID); err != nil {
-			s.logger.Error("failed to mark spot-check", "method", "RequestWorkUnit", "error", err)
+	type reservedUnit struct {
+		wu   *workunit.WorkUnit
+		leaf *leaf.Leaf
+	}
+	var reserved []reservedUnit
+
+	assignStart := time.Now()
+	for i := 0; i < n; i++ {
+		wu, ferr := txWURepo.ReserveNextAssignable(ctx, opts, lease)
+		if ferr != nil {
+			s.logger.Error("failed to reserve assignable work unit", "method", "RequestWorkUnit", "error", ferr)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
-		wu.SpotCheck = true
-	} else {
-		// Normal assignment: QUEUED → ASSIGNED.
-		wu, err = txWURepo.Assign(ctx, wu.ID, volunteerID)
-		if err != nil {
-			s.logger.Error("failed to assign work unit", "method", "RequestWorkUnit", "error", err)
+		if wu == nil {
+			break // no more assignable work for this volunteer right now
+		}
+
+		lf, lerr := getLeaf(wu.LeafID)
+		if lerr != nil {
+			s.logger.Error("failed to get leaf for assignment", "method", "RequestWorkUnit", "leaf_id", wu.LeafID, "error", lerr)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
-	}
 
-	// Record assignment history.
-	historyEntry := &assignment.AssignmentHistoryEntry{
-		WorkUnitID:  wu.ID,
-		VolunteerID: volunteerID,
-		AssignedAt:  now,
-	}
-	if err := txAssignRepo.Create(ctx, historyEntry); err != nil {
-		s.logger.Error("failed to record assignment history", "method", "RequestWorkUnit", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
+		// Spot-check first assignment: keep the unit QUEUED (so a second volunteer
+		// can also be assigned) but mark it spot_check and stamp the reservation (to
+		// hide it from THIS volunteer's later loop iterations).
+		if !wu.SpotCheck &&
+			lf.ValidationConfig.SpotCheckEnabled &&
+			lf.ValidationConfig.RedundancyFactor == 1 &&
+			workunit.ShouldSpotCheck(lf.ValidationConfig.SpotCheckPercentage) {
+			if serr := txWURepo.MarkSpotCheck(ctx, wu.ID); serr != nil {
+				s.logger.Error("failed to mark spot-check", "method", "RequestWorkUnit", "error", serr)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+			stamped, serr := txWURepo.StampReservation(ctx, wu.ID, volunteerID, lease)
+			if serr != nil {
+				s.logger.Error("failed to stamp spot-check reservation", "method", "RequestWorkUnit", "error", serr)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+			stamped.SpotCheck = true
+			wu = stamped
+		}
 
-	// Commit transaction.
+		if wu.SpotCheck {
+			// Spot-check units are the ONE case that keeps the history-row model:
+			// they never flip to ASSIGNED (they stay QUEUED for corroboration), so
+			// EVERY volunteer placed on a spot-check unit — the marking volunteer AND
+			// any later corroborating volunteer — submits directly against an active
+			// history row written here (there is no run-start to create it). The
+			// 1-hour QUEUED-spot-check sweep in FindExpiredWorkUnits reclaims a
+			// never-corroborated spot-check, so these rows do not leak the way a
+			// normal reservation's would.
+			if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
+				WorkUnitID:  wu.ID,
+				VolunteerID: volunteerID,
+				AssignedAt:  time.Now().UTC(),
+			}); cerr != nil {
+				s.logger.Error("failed to record spot-check assignment history", "method", "RequestWorkUnit", "error", cerr)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+		}
+		// For a NORMAL (non-spot-check) reservation, NO assignment_history row is
+		// written: the buffered unit is leased purely via the reservation columns
+		// (reserved_until / reserved_volunteer_id) and stays QUEUED. This prevents
+		// the orphaned-buffered-work leak — a crashed holder leaves no stale active
+		// history row; its lapsed lease (reserved_until < NOW()) makes the unit
+		// re-reservable with no manual transition. The active history row is written
+		// by Assign at run-start, when the deadline/heartbeat clock starts.
+		reserved = append(reserved, reservedUnit{wu: wu, leaf: lf})
+	}
+	// Fold the batch's assignment-query cost into the latency signal (per call,
+	// not per unit, so an empty no-work probe still reports its find cost).
+	s.loadEstimator.recordAssignLatency(time.Since(assignStart))
+
 	if err := tx.Commit(ctx); err != nil {
 		s.logger.Error("failed to commit assignment", "method", "RequestWorkUnit", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Update volunteer last_seen (best effort, outside transaction).
+	// Update volunteer last_seen (best effort, outside transaction, once per call).
 	_ = s.volunteerRepo.UpdateLastSeen(ctx, volunteerID)
 	_ = s.volunteerRepo.SetActive(ctx, volunteerID, true)
 
-	// Get leaf for response building.
-	lf, err := s.leafRepo.GetByID(ctx, wu.LeafID)
-	if err != nil {
-		s.logger.Error("failed to get leaf for response", "method", "RequestWorkUnit", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
+	// No work right now: OK response carrying only the server-directed delay.
+	if len(reserved) == 0 {
+		return &lettucev1.RequestWorkUnitResponse{
+			Assignments:       nil,
+			RetryAfterSeconds: retryAfter,
+		}, nil
 	}
 
-	// Build response (populate both leaf_id and deprecated project_id).
-	resp := &lettucev1.RequestWorkUnitResponse{
+	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(reserved))
+	for _, ru := range reserved {
+		assignments = append(assignments, buildWorkUnitAssignment(ru.wu, ru.leaf))
+	}
+
+	return &lettucev1.RequestWorkUnitResponse{
+		Assignments:       assignments,
+		RetryAfterSeconds: retryAfter,
+	}, nil
+}
+
+// buildWorkUnitAssignment renders a reserved work unit + its leaf into the proto
+// assignment, including the lease expiry (reserved_until_unix).
+func buildWorkUnitAssignment(wu *workunit.WorkUnit, lf *leaf.Leaf) *lettucev1.WorkUnitAssignment {
+	a := &lettucev1.WorkUnitAssignment{
 		WorkUnitId:               wu.ID.String(),
-		ProjectId:                wu.LeafID.String(), // deprecated
 		LeafId:                   wu.LeafID.String(),
 		Runtime:                  lf.ExecutionConfig.Runtime,
 		InputData:                wu.InputData,
@@ -495,17 +622,17 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 			NetworkAccess:   lf.ExecutionConfig.NetworkAccess,
 		},
 	}
-
-	// Include checkpoint info for reassigned work units with checkpoints.
+	if wu.ReservedUntil != nil {
+		a.ReservedUntilUnix = wu.ReservedUntil.Unix()
+	}
 	if wu.LastCheckpointSequence > 0 {
-		resp.HasCheckpoint = true
-		resp.CheckpointSequence = int32(wu.LastCheckpointSequence)
+		a.HasCheckpoint = true
+		a.CheckpointSequence = int32(wu.LastCheckpointSequence)
 	}
 	if lf.FaultToleranceConfig.CheckpointingEnabled && lf.FaultToleranceConfig.CheckpointIntervalSeconds != nil {
-		resp.CheckpointIntervalSeconds = int32(*lf.FaultToleranceConfig.CheckpointIntervalSeconds)
+		a.CheckpointIntervalSeconds = int32(*lf.FaultToleranceConfig.CheckpointIntervalSeconds)
 	}
-
-	return resp, nil
+	return a
 }
 
 // parseIDSlice parses a slice of UUID strings into a slice of types.ID.
@@ -715,12 +842,25 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	}
 
 	if existingCount+1 >= effectiveRedundancy {
+		// The QUEUED + reserved branch handles a buffered (reserved) unit whose
+		// redundancy is met by results submitted before any RUNNING heartbeat
+		// flipped it to ASSIGNED: a submitted result implies the work ran, so
+		// complete the unit and clear its reservation columns. reserved_volunteer_id
+		// IS NOT NULL (rather than = the submitter) because with redundancy > 1 the
+		// volunteer whose submit MEETS the redundancy need not be the lease holder.
+		// The QUEUED + spot_check branch is the existing spot-check completion path.
 		_, err := tx.Exec(ctx, `
 			UPDATE work_units SET
 				state = 'COMPLETED',
 				started_at = COALESCE(started_at, NOW()),
-				completed_at = NOW()
-			WHERE id = $1 AND (state IN ('ASSIGNED', 'RUNNING') OR (state = 'QUEUED' AND spot_check = true))`,
+				completed_at = NOW(),
+				reserved_until = NULL,
+				reserved_volunteer_id = NULL
+			WHERE id = $1 AND (
+				state IN ('ASSIGNED', 'RUNNING')
+				OR (state = 'QUEUED' AND spot_check = true)
+				OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
+			)`,
 			workUnitID,
 		)
 		if err != nil {
@@ -818,6 +958,97 @@ func (s *volunteerService) Heartbeat(ctx context.Context, req *lettucev1.Heartbe
 		}
 		s.logger.Error("failed to load work unit", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
+	// Lazy run-start for a buffered (reserved) unit: the volunteer pulled a
+	// reserved descriptor out of its work buffer and is now actually running it.
+	// Its FIRST RUNNING heartbeat flips the still-QUEUED unit to ASSIGNED via the
+	// normal Assign (which sets assigned_at/last_heartbeat_at = now and clears the
+	// reservation columns), starting the deadline/heartbeat clock at run time —
+	// not at buffer-fill. PREPARING heartbeats do NOT flip it (buffered units rely
+	// on the lease, not heartbeats). Spot-check units stay QUEUED for a second
+	// volunteer and are excluded here.
+	if !wu.SpotCheck &&
+		wu.State == workunit.WorkUnitStateQueued &&
+		wu.ReservedVolunteerID != nil && *wu.ReservedVolunteerID == volunteerID &&
+		hbStatus != "PREPARING" {
+		// Flip the reserved unit to ASSIGNED and create its active assignment_history
+		// row in ONE transaction. The history row is written HERE (at run-start), not
+		// at reservation time — a buffered unit is leased purely via the reservation
+		// columns, so a crashed holder leaves no stale active row to leak. From this
+		// point the active history row is what SubmitResult / AbandonWorkUnit / the
+		// fault monitor key off, and what the redundancy/inflight counts in
+		// FindNextAssignable count for a now-ASSIGNED unit.
+		startTx, terr := s.pool.Begin(ctx)
+		if terr != nil {
+			s.logger.Error("failed to begin run-start transaction", "error", terr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		txWURepo := workunit.NewPgxWorkUnitRepository(startTx)
+		txAssignRepo := assignment.NewPgxRepository(startTx)
+		assigned, aerr := txWURepo.Assign(ctx, workUnitID, volunteerID)
+		if aerr != nil {
+			// A concurrent reclaim (lapsed lease taken by another volunteer) or a
+			// state change lost the race: treat as no-longer-active.
+			_ = startTx.Rollback(ctx)
+			s.logger.Warn("run-start Assign failed for reserved unit", "work_unit_id", workUnitID, "error", aerr)
+			return &lettucev1.HeartbeatResponse{
+				ContinueExecution: false,
+				Message:           "work unit no longer active",
+			}, nil
+		}
+		if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
+			WorkUnitID:  workUnitID,
+			VolunteerID: volunteerID,
+			AssignedAt:  time.Now().UTC(),
+		}); cerr != nil {
+			_ = startTx.Rollback(ctx)
+			s.logger.Error("failed to record assignment history at run-start", "work_unit_id", workUnitID, "error", cerr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		if cerr := startTx.Commit(ctx); cerr != nil {
+			s.logger.Error("failed to commit run-start", "work_unit_id", workUnitID, "error", cerr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		wu = assigned
+	}
+
+	// PREPARING heartbeat for a still-buffered (reserved, un-started) unit: renew
+	// its lease. A buffered unit stays QUEUED and is kept alive ONLY by its
+	// reservation lease (reserved_until), NOT by last_heartbeat_at (which the
+	// abandonment monitor ignores for QUEUED units). Without this, a unit held in
+	// the volunteer's work buffer longer than lease_seconds has its lease lapse,
+	// and FindNextAssignable's reservation guard re-exposes the still-QUEUED unit
+	// to a SECOND volunteer (double-dispatch) while the original holder still
+	// intends to run it. The volunteer sends PREPARING heartbeats for every
+	// buffered unit, so bumping reserved_until here keeps a live holder's lease
+	// from lapsing. This path handles the unit BEFORE the "Verify assignment"
+	// block below, which would otherwise reject a QUEUED (never-ASSIGNED) unit
+	// with PermissionDenied. Spot-check units are excluded: they must stay
+	// reservable by a SECOND volunteer and are governed by FindExpiredWorkUnits.
+	if !wu.SpotCheck &&
+		wu.State == workunit.WorkUnitStateQueued &&
+		wu.ReservedVolunteerID != nil && *wu.ReservedVolunteerID == volunteerID {
+		lease := time.Duration(s.leaseSeconds) * time.Second
+		if _, rerr := s.wuRepo.StampReservation(ctx, workUnitID, volunteerID, lease); rerr != nil {
+			// Conflict means the unit is no longer QUEUED (it flipped to ASSIGNED via
+			// a concurrent run-start, or its lapsed lease was re-taken). Treat as
+			// no-longer-buffered: tell the volunteer to drop it from its buffer.
+			if apiErr, ok := rerr.(*apierror.APIError); ok && apiErr.HTTPStatus == 409 {
+				return &lettucev1.HeartbeatResponse{
+					ContinueExecution: false,
+					Message:           "reservation lapsed, work unit no longer held",
+				}, nil
+			}
+			s.logger.Error("failed to renew reservation on PREPARING heartbeat", "work_unit_id", workUnitID, "error", rerr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		// Best-effort liveness bookkeeping, consistent with the running-heartbeat path.
+		if _, uerr := s.pool.Exec(ctx,
+			"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", volunteerID); uerr != nil {
+			s.logger.Warn("failed to update volunteer liveness on PREPARING heartbeat", "volunteer_id", volunteerID, "error", uerr)
+		}
+		return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
 	}
 
 	// Verify assignment.
@@ -1103,11 +1334,35 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	// Find the active assignment for this volunteer + work unit.
 	activeAssignment, err := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
 	if err != nil {
+		// No active assignment means the unit may be a buffered (reserved,
+		// un-started) unit: the volunteer abandons it on prepare failure,
+		// queue-full, or a slot-start failure before it ever flips to ASSIGNED. A
+		// reservation writes no assignment_history row, so there is nothing to mark
+		// ABANDONED — just drop the lease, leaving the unit QUEUED and immediately
+		// re-reservable by any volunteer.
+		if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPStatus == 404 {
+			if _, cerr := s.wuRepo.ClearReservation(ctx, workUnitID, volunteerID); cerr != nil {
+				// Conflict: the unit is no longer reserved to this volunteer in QUEUED
+				// state (e.g. its lease already lapsed and it was re-taken, or it
+				// already ran). Treat as a stale abandon — nothing to do.
+				if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
+					return nil, status.Errorf(codes.FailedPrecondition, "no active assignment or live reservation found for this volunteer and work unit")
+				}
+				s.logger.Error("abandon: failed to clear reservation", "work_unit_id", req.WorkUnitId, "error", cerr)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+			s.logger.Info("buffered work unit abandoned by volunteer (reservation dropped)",
+				"work_unit_id", req.WorkUnitId,
+				"volunteer_id", req.VolunteerId,
+				"reason", req.Reason,
+			)
+			return &lettucev1.AbandonWorkUnitResponse{
+				Requeued: true,
+				Message:  "reservation dropped, work unit requeued",
+			}, nil
+		}
 		s.logger.Error("abandon: failed to find active assignment", "work_unit_id", req.WorkUnitId, "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	if activeAssignment == nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "no active assignment found for this volunteer and work unit")
 	}
 
 	// Mark assignment as ABANDONED.

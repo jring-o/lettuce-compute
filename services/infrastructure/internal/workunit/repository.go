@@ -2,6 +2,7 @@ package workunit
 
 import (
 	"context"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
@@ -39,6 +40,14 @@ type WorkUnitRepository interface {
 	// the leaf's redundancy_factor. Returns nil, nil if no work available.
 	FindNextAssignable(ctx context.Context, opts AssignmentOptions) (*WorkUnit, error)
 
+	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
+	// predicates as FindNextAssignable, including the per-volunteer inflight cap
+	// counting live reservations) and stamps a lease on it (reserved_until,
+	// reserved_volunteer_id), keeping state='QUEUED'. Used by the batch-fill path
+	// to lease buffered work without starting the deadline/heartbeat clock.
+	// Returns nil, nil if no work available.
+	ReserveNextAssignable(ctx context.Context, opts AssignmentOptions, lease time.Duration) (*WorkUnit, error)
+
 	// Assign transitions a work unit from QUEUED to ASSIGNED and sets assignment metadata.
 	// Returns the updated work unit. Fails if work unit is not in QUEUED state.
 	Assign(ctx context.Context, workUnitID types.ID, volunteerID types.ID) (*WorkUnit, error)
@@ -69,6 +78,18 @@ type WorkUnitRepository interface {
 
 	// MarkSpotCheck sets spot_check = true for a work unit.
 	MarkSpotCheck(ctx context.Context, id types.ID) error
+
+	// StampReservation sets reserved_until / reserved_volunteer_id on a still-QUEUED
+	// work unit (used by the batch spot-check branch to hide the unit from the same
+	// volunteer's subsequent iterations). Returns the updated WorkUnit.
+	StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*WorkUnit, error)
+
+	// ClearReservation drops the reservation columns on a still-QUEUED unit
+	// reserved to volunteerID, leaving it QUEUED so it is immediately
+	// re-reservable. Used when a volunteer abandons a buffered (reserved,
+	// un-started) unit. Returns the updated WorkUnit, or apierror.Conflict if no
+	// matching reserved QUEUED unit exists.
+	ClearReservation(ctx context.Context, id, volunteerID types.ID) (*WorkUnit, error)
 
 	// ClearSpotCheck sets spot_check = false, allowing single-result validation.
 	ClearSpotCheck(ctx context.Context, id types.ID) error

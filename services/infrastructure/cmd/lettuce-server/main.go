@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
@@ -176,8 +177,24 @@ func main() {
 	defer rateLimitCleanup()
 	httpServer := server.NewHTTPServer(cfg.Server.HTTPAddr, router, tlsCfg)
 
+	// Optional operator override for the gRPC rate-limit budgets (requests per
+	// minute). Useful when a large fleet legitimately shares one source IP (a
+	// single NAT, or a loopback load test). Unset/non-positive leaves defaults.
+	if v := os.Getenv("LETTUCE_GRPC_PER_IP_RATE_LIMIT"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil {
+			server.SetGRPCRateLimits(n, 0)
+			slog.Info("per-IP gRPC rate limit overridden", "per_min", n)
+		}
+	}
+	if v := os.Getenv("LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil {
+			server.SetGRPCRateLimits(0, n)
+			slog.Info("per-pubkey gRPC rate limit overridden", "per_min", n)
+		}
+	}
+
 	// Create gRPC server and register VolunteerService.
-	grpcServer, grpcRateLimitCleanup := server.NewGRPCServer(tlsCfg, logger)
+	grpcServer, grpcRateLimitCleanup := server.NewGRPCServer(tlsCfg, logger, trustedProxies)
 	defer grpcRateLimitCleanup()
 
 	volunteerSvc := server.NewVolunteerService(pool, version, startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
@@ -185,7 +202,15 @@ func main() {
 	for k, v := range cfg.Head.DefaultLeafWeights {
 		weights[k] = int32(v)
 	}
-	server.SetHeadConfig(volunteerSvc, cfg.Head.Name, cfg.Head.Description, cfg.Head.URL, weights, cfg.Head.EffectiveMaxInflight())
+	server.SetHeadConfig(volunteerSvc, cfg.Head.Name, cfg.Head.Description, cfg.Head.URL, weights, cfg.Head.EffectiveMaxInflight(),
+		server.HeadDispatchConfig{
+			MaxBatchPerRequest:      cfg.Head.EffectiveMaxBatch(),
+			LeaseSeconds:            cfg.Head.EffectiveLeaseSeconds(),
+			MinRetryDelaySeconds:    cfg.Head.EffectiveMinRetryDelaySeconds(),
+			MaxRetryDelaySeconds:    cfg.Head.EffectiveMaxRetryDelaySeconds(),
+			RetryDelayJitterPct:     cfg.Head.EffectiveRetryDelayJitterPct(),
+			TargetRequestRatePerSec: cfg.Head.EffectiveTargetRequestRatePerSec(),
+		})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	// Start HTTP server.

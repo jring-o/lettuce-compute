@@ -57,12 +57,6 @@ type Daemon struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 
-	// fetcherMinInterval is the minimum interval between the fetcher's
-	// RequestWorkUnit poll cycles (#18 fix 2 throttle). Zero (the production
-	// zero value) means "use the default 2s floor"; a negative value disables
-	// the gate (used by tests so loops stay fast). See resolveMinInterval.
-	fetcherMinInterval time.Duration
-
 	// Cached hardware capabilities (detected once at startup)
 	cachedHW *lettucev1.HardwareCapabilities
 
@@ -323,13 +317,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer RemovePID(d.cfg.DataDir)
 
-	// Initialize slot manager and pre-fetch queue.
+	// Initialize slot manager and the client work buffer. The buffer's "fullness"
+	// is governed by work_buffer_hours (see workBufferFull); the queue's hard
+	// maxDepth is only a safety ceiling on descriptor count, so it is set well
+	// above the hours target to avoid being the binding constraint.
 	d.slotManager = NewSlotManager(maxSlots, d.logger)
-	queueDepth := d.cfg.WorkBufferSize
-	if queueDepth <= 0 {
-		queueDepth = maxSlots + 2
-	}
-	d.prefetchQueue = NewPreFetchQueue(queueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 
 	// Start resource monitor goroutine.
 	pauseCh := make(chan bool, 1)
@@ -797,6 +790,175 @@ func (d *Daemon) shouldFetch() bool {
 
 	d.warnDiskGateOnce(fullRequiredMB)
 	return false
+}
+
+// workBufferQueueDepth is the hard ceiling on the number of un-run descriptors
+// the client work buffer may hold. The buffer's real "full" gate is hours-based
+// (workBufferFull); this is only a safety cap so a misbehaving head or a leaf
+// with tiny units cannot make the buffer grow without bound. Set generously high
+// so it is not normally the binding constraint.
+const workBufferQueueDepth = 256
+
+// fallbackBufferUnitsPerSlot bounds the buffer when no per-unit time estimate is
+// available (benchmark unknown, or leafs report rsc_fpops_est=0). Without a time
+// estimate the hours-based target can't be computed, so we fall back to a small
+// unit-count buffer (this many descriptors per slot) so the volunteer still
+// pre-fetches a little without unboundedly hoarding reservations.
+const fallbackBufferUnitsPerSlot = 2
+
+// maxSlots returns the configured concurrent-task count (>= 1).
+func (d *Daemon) maxSlots() int {
+	n := d.cfg.MaxConcurrentTasks
+	if n <= 0 {
+		n = 1
+	}
+	return n
+}
+
+// estSecondsForUnit estimates wall-clock seconds for a unit from its FP-ops
+// estimate and this host's benchmark, applying the leaf's learned duration
+// correction factor when available. Returns 0 when no estimate is possible.
+func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
+	if rscFpopsEst <= 0 || d.benchmarkFPOPS <= 0 {
+		return 0
+	}
+	sec := rscFpopsEst / d.benchmarkFPOPS
+	if d.dcfTracker != nil {
+		if dcf := d.dcfTracker.Get(leafID); dcf > 0 {
+			sec *= dcf
+		}
+	}
+	return sec
+}
+
+// bufferTargetSeconds is the total seconds of work the client work buffer aims
+// to hold: work_buffer_hours hours per execution slot. Sizing in hours (rather
+// than a unit count) keeps the buffer meaningful across leafs whose units span
+// seconds to hours. Returns 0 when buffering is disabled by config (hours == 0).
+func (d *Daemon) bufferTargetSeconds() float64 {
+	hours := d.cfg.WorkBufferHours
+	if hours < 0 {
+		hours = 0
+	}
+	if hours == 0 {
+		return 0
+	}
+	return hours * 3600 * float64(d.maxSlots())
+}
+
+// bufferedSeconds sums the estimated seconds of work currently buffered (queued,
+// un-run descriptors) and running (active slots). This is the "fill" measured
+// against bufferTargetSeconds.
+func (d *Daemon) bufferedSeconds() float64 {
+	var total float64
+	if d.prefetchQueue != nil {
+		for _, item := range d.prefetchQueue.Items() {
+			if item.WU == nil {
+				continue
+			}
+			total += d.estSecondsForUnit(item.WU.LeafID, item.WU.RscFpopsEst)
+		}
+	}
+	if d.slotManager != nil {
+		for _, wu := range d.slotManager.ActiveWorkUnits() {
+			if wu == nil {
+				continue
+			}
+			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		}
+	}
+	return total
+}
+
+// workBufferFull reports whether the client work buffer holds enough work that
+// the fetcher must issue ZERO RequestWorkUnit calls (Layer-1 DoD #2).
+//
+// When a per-unit time estimate is available it uses the hours-based target;
+// otherwise it falls back to a small per-slot unit count so the buffer can't
+// grow without bound when estimates are missing.
+func (d *Daemon) workBufferFull() bool {
+	target := d.bufferTargetSeconds()
+	if target <= 0 {
+		// Hours target unusable (buffering disabled) — fall back to a unit count.
+		return d.bufferedUnitCount() >= d.fallbackBufferUnits()
+	}
+	// If we have buffered units but can't estimate ANY of their durations, the
+	// hours math is meaningless; bound by the unit-count fallback instead.
+	if d.bufferedSeconds() <= 0 && d.bufferedUnitCount() >= d.fallbackBufferUnits() {
+		return true
+	}
+	return d.bufferedSeconds() >= target
+}
+
+// fallbackBufferUnits is the unit-count cap used when an hours estimate is
+// unavailable: a small multiple of the slot count.
+func (d *Daemon) fallbackBufferUnits() int {
+	return fallbackBufferUnitsPerSlot * d.maxSlots()
+}
+
+// bufferedUnitCount counts queued + running units (the unit-count fallback view).
+func (d *Daemon) bufferedUnitCount() int {
+	n := 0
+	if d.prefetchQueue != nil {
+		n += d.prefetchQueue.Len()
+	}
+	if d.slotManager != nil {
+		n += d.slotManager.ActiveCount()
+	}
+	return n
+}
+
+// requestBatchSize returns how many assignments the fetcher should ask a head
+// for on the next RequestWorkUnit, given the remaining hours deficit and an
+// estimate of seconds-per-unit for the leaf it is about to request. It is
+// clamped to [1, maxBatchPerRequest].
+//
+// When a per-unit time estimate IS available, the count is the hours-deficit
+// divided by that estimate (so a leaf with long units is requested fewer at a
+// time than one with short units). When no estimate is available — common before
+// the first unit of a leaf has been seen, since the leaf cache carries no
+// rsc_fpops_est — it falls back to averaging the seconds-per-unit of work already
+// buffered; failing that, it requests a full batch whenever the buffer is below
+// its hours target so batching still happens, and 1 otherwise.
+func (d *Daemon) requestBatchSize(estSecondsPerUnit float64) int32 {
+	target := d.bufferTargetSeconds()
+	if target <= 0 {
+		// Buffering disabled (hours == 0): unit-count fallback, one at a time.
+		return 1
+	}
+	deficit := target - d.bufferedSeconds()
+	if deficit <= 0 {
+		return 1
+	}
+
+	per := estSecondsPerUnit
+	if per <= 0 {
+		per = d.avgBufferedSecondsPerUnit()
+	}
+	if per <= 0 {
+		// No estimate at all: request a full batch to refill the deficit quickly.
+		return maxBatchPerRequest
+	}
+
+	n := int32(deficit / per)
+	if n < 1 {
+		n = 1
+	}
+	if n > maxBatchPerRequest {
+		n = maxBatchPerRequest
+	}
+	return n
+}
+
+// avgBufferedSecondsPerUnit returns the mean estimated seconds per buffered or
+// running unit, or 0 if nothing is buffered or no estimate is available.
+func (d *Daemon) avgBufferedSecondsPerUnit() float64 {
+	total := d.bufferedSeconds()
+	n := d.bufferedUnitCount()
+	if total <= 0 || n <= 0 {
+		return 0
+	}
+	return total / float64(n)
 }
 
 // warnDiskGateOnce surfaces the disk-space stall. The first time the gate blocks
@@ -1617,86 +1779,6 @@ func (d *Daemon) enabledLeafs(serverName string) []CachedLeafInfo {
 	}
 }
 
-// requestWorkWeighted uses the weighted selector to request work.
-// Falls back to the legacy round-robin path if the leaf cache is empty.
-func (d *Daemon) requestWorkWeighted(ctx context.Context) (*lettucev1.RequestWorkUnitResponse, *ServerConnection, error) {
-	// Check if any server has cached leafs. If no server has leafs,
-	// fall back to the legacy round-robin + leaf preferences path.
-	hasLeafs := false
-	for _, srv := range d.multiClient.Servers() {
-		if leafs := d.leafCache.GetLeafs(srv.Name); len(leafs) > 0 {
-			hasLeafs = true
-			break
-		}
-	}
-
-	if !hasLeafs {
-		d.logger.Debug("no leafs in cache, falling back to legacy work request path")
-		leafIDs, blockedIDs := d.leafPreferences()
-		return d.multiClient.RequestWork(ctx, d.pubKey, leafIDs, blockedIDs, d.cachedHW)
-	}
-
-	available := d.availableServers()
-	if len(available) == 0 {
-		return nil, nil, status.Error(codes.NotFound, "no servers available")
-	}
-
-	// Try heads in deficit order.
-	tried := make(map[string]bool)
-	for len(tried) < len(available) {
-		head := d.weightedSelector.SelectHead(filterOut(available, tried))
-		if head == nil {
-			break
-		}
-		tried[head.Name] = true
-
-		enabled := d.enabledLeafs(head.Name)
-		if len(enabled) == 0 {
-			continue
-		}
-
-		// Try leafs in deficit order on this head.
-		orderedLeafs := d.weightedSelector.SelectLeafByDeficitOrder(head.Name, enabled)
-		for _, leaf := range orderedLeafs {
-			resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
-				VolunteerId:      head.VolunteerID,
-				PublicKey:        d.pubKey,
-				LeafIds:          []string{leaf.ID},
-				CurrentAvailable: d.cachedHW,
-			})
-			if err != nil {
-				st, ok := status.FromError(err)
-				if ok && st.Code() == codes.NotFound {
-					// No work for this leaf, try next.
-					head.Available = true
-					head.Backoff = 0
-					continue
-				}
-				// Connection error — apply backoff and try next head.
-				head.Available = false
-				head.LastError = time.Now()
-				if head.Backoff == 0 {
-					head.Backoff = d.initialBackoff
-				} else {
-					head.Backoff = time.Duration(float64(head.Backoff) * 2)
-					if head.Backoff > d.maxBackoff {
-						head.Backoff = d.maxBackoff
-					}
-				}
-				break
-			}
-
-			// Success.
-			head.Available = true
-			head.Backoff = 0
-			d.weightedSelector.RecordAssignment(head.Name, leaf.Slug)
-			return resp, head, nil
-		}
-	}
-
-	return nil, nil, status.Error(codes.NotFound, "no work available from any server")
-}
-
 // filterOut returns servers not in the excluded set.
 func filterOut(servers []*ServerConnection, excluded map[string]bool) []*ServerConnection {
 	var result []*ServerConnection
@@ -2027,7 +2109,7 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 					Prep:    prep,
 					Runtime: rt,
 					Conn:    conn,
-					WUResp: &lettucev1.RequestWorkUnitResponse{
+					WUResp: &lettucev1.WorkUnitAssignment{
 						HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
 					},
 					FetchedAt: time.Now(),
@@ -2120,7 +2202,7 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			Prep:    prep,
 			Runtime: rt,
 			Conn:    conn,
-			WUResp: &lettucev1.RequestWorkUnitResponse{
+			WUResp: &lettucev1.WorkUnitAssignment{
 				HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
 			},
 			FetchedAt: time.Now(),

@@ -26,7 +26,45 @@ type HeadConfig struct {
 	URL                     string         `yaml:"url"`
 	DefaultLeafWeights      map[string]int `yaml:"default_leaf_weights"`
 	MaxInflightPerVolunteer int            `yaml:"max_inflight_per_volunteer"`
+
+	// --- Layer 1: work batching, server-directed retry delay, buffer lease ---
+
+	// MaxBatchPerRequest caps how many assignments a single RequestWorkUnit may
+	// return (the client may request fewer via max_assignments). Default 8.
+	MaxBatchPerRequest int `yaml:"max_batch_per_request"`
+	// MinRetryDelaySeconds is the server-directed retry delay handed out when the
+	// head is quiet. Default 30.
+	MinRetryDelaySeconds int `yaml:"min_retry_delay_seconds"`
+	// MaxRetryDelaySeconds is the retry delay under full load. Must stay strictly
+	// below the 30-min StaleVolunteerMonitor threshold. Default 900 (15 min).
+	MaxRetryDelaySeconds int `yaml:"max_retry_delay_seconds"`
+	// RetryDelayJitterPct is the ±fraction of uniform jitter applied server-side
+	// to the computed delay so a fleet does not re-contact in lockstep. Default 0.20.
+	RetryDelayJitterPct float64 `yaml:"retry_delay_jitter_pct"`
+	// TargetRequestRatePerSec is the per-head RequestWorkUnit rate that maps to
+	// load=1 for the rate signal. SIMULATOR-CALIBRATED, not a trusted default.
+	// Default 500.
+	TargetRequestRatePerSec float64 `yaml:"target_request_rate_per_sec"`
+	// LeaseSeconds is how long a buffered (reserved) unit is held for a volunteer
+	// before the lease lapses and the unit becomes re-reservable. Must stay below
+	// the 30-min stale threshold. Default 900 (15 min).
+	LeaseSeconds int `yaml:"lease_seconds"`
 }
+
+// Layer-1 defaults and the stale-volunteer threshold both delays and the lease
+// must stay strictly below.
+const (
+	defaultMaxBatchPerRequest      = 8
+	defaultMinRetryDelaySeconds    = 30
+	defaultMaxRetryDelaySeconds    = 900
+	defaultRetryDelayJitterPct     = 0.20
+	defaultTargetRequestRatePerSec = 500.0
+	defaultLeaseSeconds            = 900
+	// staleVolunteerThresholdSeconds mirrors StaleVolunteerMonitor's 30-min
+	// inactivity threshold; retry delay and lease must stay strictly below it so a
+	// throttled-but-healthy volunteer is never marked inactive.
+	staleVolunteerThresholdSeconds = 1800
+)
 
 // Validate checks HeadConfig for required fields and valid values.
 func (h HeadConfig) Validate() error {
@@ -50,6 +88,36 @@ func (h HeadConfig) Validate() error {
 	if h.MaxInflightPerVolunteer < 0 {
 		return fmt.Errorf("head.max_inflight_per_volunteer must be >= 0, got %d", h.MaxInflightPerVolunteer)
 	}
+	if h.MaxBatchPerRequest < 0 {
+		return fmt.Errorf("head.max_batch_per_request must be >= 0, got %d", h.MaxBatchPerRequest)
+	}
+	if h.MinRetryDelaySeconds < 0 {
+		return fmt.Errorf("head.min_retry_delay_seconds must be >= 0, got %d", h.MinRetryDelaySeconds)
+	}
+	if h.MaxRetryDelaySeconds < 0 {
+		return fmt.Errorf("head.max_retry_delay_seconds must be >= 0, got %d", h.MaxRetryDelaySeconds)
+	}
+	if h.MaxRetryDelaySeconds >= staleVolunteerThresholdSeconds {
+		return fmt.Errorf("head.max_retry_delay_seconds must be < %d (the stale-volunteer threshold), got %d",
+			staleVolunteerThresholdSeconds, h.MaxRetryDelaySeconds)
+	}
+	if h.MinRetryDelaySeconds > 0 && h.MaxRetryDelaySeconds > 0 && h.MinRetryDelaySeconds > h.MaxRetryDelaySeconds {
+		return fmt.Errorf("head.min_retry_delay_seconds (%d) must be <= max_retry_delay_seconds (%d)",
+			h.MinRetryDelaySeconds, h.MaxRetryDelaySeconds)
+	}
+	if h.RetryDelayJitterPct < 0 || h.RetryDelayJitterPct >= 1 {
+		return fmt.Errorf("head.retry_delay_jitter_pct must be in [0, 1), got %v", h.RetryDelayJitterPct)
+	}
+	if h.TargetRequestRatePerSec < 0 {
+		return fmt.Errorf("head.target_request_rate_per_sec must be >= 0, got %v", h.TargetRequestRatePerSec)
+	}
+	if h.LeaseSeconds < 0 {
+		return fmt.Errorf("head.lease_seconds must be >= 0, got %d", h.LeaseSeconds)
+	}
+	if h.LeaseSeconds >= staleVolunteerThresholdSeconds {
+		return fmt.Errorf("head.lease_seconds must be < %d (the stale-volunteer threshold), got %d",
+			staleVolunteerThresholdSeconds, h.LeaseSeconds)
+	}
 	return nil
 }
 
@@ -60,6 +128,56 @@ func (h HeadConfig) EffectiveMaxInflight() int {
 		return 10
 	}
 	return h.MaxInflightPerVolunteer
+}
+
+// EffectiveMaxBatch returns the per-request batch cap, defaulting to 8 if unset.
+func (h HeadConfig) EffectiveMaxBatch() int {
+	if h.MaxBatchPerRequest <= 0 {
+		return defaultMaxBatchPerRequest
+	}
+	return h.MaxBatchPerRequest
+}
+
+// EffectiveMinRetryDelaySeconds returns the quiet-load retry delay, default 30.
+func (h HeadConfig) EffectiveMinRetryDelaySeconds() int {
+	if h.MinRetryDelaySeconds <= 0 {
+		return defaultMinRetryDelaySeconds
+	}
+	return h.MinRetryDelaySeconds
+}
+
+// EffectiveMaxRetryDelaySeconds returns the full-load retry delay, default 900.
+func (h HeadConfig) EffectiveMaxRetryDelaySeconds() int {
+	if h.MaxRetryDelaySeconds <= 0 {
+		return defaultMaxRetryDelaySeconds
+	}
+	return h.MaxRetryDelaySeconds
+}
+
+// EffectiveRetryDelayJitterPct returns the jitter fraction, default 0.20.
+// A configured 0 is treated as "use the default"; disable jitter is not a
+// supported mode (the anti-synchronization property is load-bearing).
+func (h HeadConfig) EffectiveRetryDelayJitterPct() float64 {
+	if h.RetryDelayJitterPct <= 0 {
+		return defaultRetryDelayJitterPct
+	}
+	return h.RetryDelayJitterPct
+}
+
+// EffectiveTargetRequestRatePerSec returns the rate-signal target, default 500.
+func (h HeadConfig) EffectiveTargetRequestRatePerSec() float64 {
+	if h.TargetRequestRatePerSec <= 0 {
+		return defaultTargetRequestRatePerSec
+	}
+	return h.TargetRequestRatePerSec
+}
+
+// EffectiveLeaseSeconds returns the buffer-lease window, default 900.
+func (h HeadConfig) EffectiveLeaseSeconds() int {
+	if h.LeaseSeconds <= 0 {
+		return defaultLeaseSeconds
+	}
+	return h.LeaseSeconds
 }
 
 // StorageConfig defines local filesystem storage settings.

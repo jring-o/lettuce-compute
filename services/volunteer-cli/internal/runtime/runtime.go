@@ -15,9 +15,11 @@ type WorkUnit struct {
 	CodeArtifactURL string            // URL to download code/binary
 	ParametersJSON  string            // parameter set as JSON
 	DeadlineSeconds int32             // max wall-clock time
+	HeartbeatIntervalSeconds int32    // heartbeat cadence while RUNNING (from the assignment)
 	EnvVars         map[string]string // environment variables
 	ExecutionSpec   ExecutionSpec     // runtime-specific config
 	RscFpopsEst     float64           // estimated FP ops (0 = unknown)
+	ReservedUntilUnix int64           // head-set lease expiry for this buffered unit (0 = unset)
 
 	// Checkpoint fields (from RequestWorkUnitResponse)
 	HasCheckpoint             bool  // true if a checkpoint exists for this reassigned WU

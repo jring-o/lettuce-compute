@@ -1,4 +1,4 @@
-package daemon
+﻿package daemon
 
 import (
 	"bytes"
@@ -48,9 +48,6 @@ func newFetcherTestDaemon(servers []*ServerConnection) *Daemon {
 		leafCache:        leafCache,
 		weightedSelector: ws,
 		userPauseCh:      make(chan bool, 1),
-		// Disable the fetcher inter-request throttle by default; individual tests
-		// set fetcher.minInterval explicitly where they need a specific value.
-		fetcherMinInterval: -1,
 	}
 
 	// Set up leaf cache so weighted selection works.
@@ -79,12 +76,16 @@ func TestFetcher_FillsQueue(t *testing.T) {
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			wuCount++
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", wuCount),
-				ProjectId:                "proj-1",
-				Runtime:                  "native",
-				InputData:                []byte("input"),
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", wuCount),
+						LeafId:                   "proj-1",
+						Runtime:                  "native",
+						InputData:                []byte("input"),
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					},
+				},
 			}, nil
 		},
 		getHeadInfoFn: func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
@@ -107,7 +108,9 @@ func TestFetcher_FillsQueue(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 10 * time.Millisecond
 	fetcher.maxBackoff = 50 * time.Millisecond
-	fetcher.minInterval = 0 // disable the inter-request throttle for fast tests
+	// Drive "full" off the queue's hard depth so this test exercises queue
+	// filling rather than the hours-based buffer target.
+	fetcher.workBufferFullFn = queue.IsFull
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -139,7 +142,9 @@ func TestFetcher_BacksOffWhenNoWork(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			callCount++
-			return nil, status.Error(codes.NotFound, "no work")
+			// No-work is an OK reply with empty assignments and a zero retry delay,
+			// so the fetcher keeps polling (paced by the small no-work floor).
+			return &lettucev1.RequestWorkUnitResponse{Assignments: nil, RetryAfterSeconds: 0}, nil
 		},
 		getHeadInfoFn: func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
 			return &lettucev1.GetHeadInfoResponse{
@@ -161,7 +166,6 @@ func TestFetcher_BacksOffWhenNoWork(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 10 * time.Millisecond
 	fetcher.maxBackoff = 50 * time.Millisecond
-	fetcher.minInterval = 0 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -202,7 +206,6 @@ func TestFetcher_StopsWhenContextCancelled(t *testing.T) {
 	queue := NewPreFetchQueue(2, d.logger)
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 10 * time.Millisecond
-	fetcher.minInterval = 0 // disable the inter-request throttle for fast tests
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately.
@@ -215,7 +218,7 @@ func TestFetcher_StopsWhenContextCancelled(t *testing.T) {
 
 	select {
 	case <-done:
-		// OK — fetcher exited.
+		// OK â€” fetcher exited.
 	case <-time.After(1 * time.Second):
 		t.Fatal("fetcher did not stop within 1 second")
 	}
@@ -268,54 +271,71 @@ func nativeWURespFn(count *int) func(context.Context, *lettucev1.RequestWorkUnit
 	return func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 		*count++
 		return &lettucev1.RequestWorkUnitResponse{
-			WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", *count),
-			ProjectId:                "proj-1",
-			Runtime:                  "native",
-			InputData:                []byte("input"),
-			HeartbeatIntervalSeconds: 300,
-			ExecutionSpec:            &lettucev1.ExecutionSpec{},
+			Assignments: []*lettucev1.WorkUnitAssignment{
+				{
+					WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", *count),
+					LeafId:                   "proj-1",
+					Runtime:                  "native",
+					InputData:                []byte("input"),
+					HeartbeatIntervalSeconds: 300,
+					ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				},
+			},
 		}, nil
 	}
 }
 
-// TestFetcher_ThrottlesRequestRate verifies the inter-request gate caps how
-// often RequestWorkUnit is issued. With a 50ms floor over a ~250ms window the
-// fetcher must issue far fewer requests than an ungated busy loop would.
-func TestFetcher_ThrottlesRequestRate(t *testing.T) {
+// TestFetcher_ObeysServerRetryDelay (DoD #1): when a head returns a large
+// retry_after_seconds, the fetcher issues exactly one RequestWorkUnit and then
+// makes no further calls until the clock advances past the delay. The fetcher's
+// `now` clock seam drives time so the test does not sleep for the real delay.
+func TestFetcher_ObeysServerRetryDelay(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			return nil, status.Error(codes.NotFound, "no work")
+			// No work, but a 600s server-directed delay on the (OK) reply.
+			return &lettucev1.RequestWorkUnitResponse{
+				Assignments:       nil,
+				RetryAfterSeconds: 600,
+			}, nil
 		},
 	}
 	servers := nativeLeafServer(mc)
 
 	d := newFetcherTestDaemon(servers)
-	queue := NewPreFetchQueue(2, d.logger)
+	queue := NewPreFetchQueue(4, d.logger)
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
-	// Make the per-empty backoff negligible so the inter-request floor is the
-	// only thing pacing the loop, then assert the floor actually paces it.
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 1 * time.Millisecond
-	fetcher.minInterval = 50 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
+	base := time.Now()
+	fetcher.now = func() time.Time { return base }
+
+	// Run a short window; the head answers once then must be parked for 600s.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	fetcher.Run(ctx)
+	cancel()
 
-	calls := mc.getRequestCalls()
-	if calls == 0 {
-		t.Fatalf("expected some requests, got 0")
+	if calls := mc.getRequestCalls(); calls != 1 {
+		t.Fatalf("with a 600s server-directed delay the fetcher made %d requests, want exactly 1", calls)
 	}
-	// 250ms / 50ms = 5 cycles; allow generous scheduling slack but it must be
-	// well below the hundreds a 1ms-backoff loop would produce without the gate.
-	if calls > 12 {
-		t.Errorf("throttle not honored: %d requests in ~250ms with a 50ms floor (want <= 12)", calls)
+	srv := servers[0]
+	if !srv.NextContactAt.Equal(base.Add(600 * time.Second)) {
+		t.Errorf("NextContactAt = %v, want base+600s", srv.NextContactAt)
+	}
+
+	// Advancing past the delay re-enables contact: another window yields more calls.
+	fetcher.now = func() time.Time { return base.Add(601 * time.Second) }
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	fetcher.Run(ctx2)
+	cancel2()
+	if calls := mc.getRequestCalls(); calls <= 1 {
+		t.Errorf("after the delay elapsed the fetcher made %d total requests, want > 1", calls)
 	}
 }
 
 // TestFetcher_BacksOffOnResourceExhausted verifies a ResourceExhausted reply is
-// treated as a rate-limit backoff (dedicated floor, head parked) rather than a
-// NotFound (no backoff) or a tight loop.
+// treated as a fixed jittered LOCAL backoff (parking the head via NextContactAt),
+// not a tight loop and not a server-directed value.
 func TestFetcher_BacksOffOnResourceExhausted(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
@@ -329,36 +349,38 @@ func TestFetcher_BacksOffOnResourceExhausted(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 200 * time.Millisecond
-	fetcher.minInterval = 0 // isolate the per-head rate-limit backoff
 	fetcher.rateLimitBackoff = 100 * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	base := time.Now()
+	fetcher.now = func() time.Time { return base }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	fetcher.Run(ctx)
 
-	// The head is parked with the 100ms rate-limit floor each time it answers,
-	// so over ~250ms we expect only a couple of requests, not a tight loop.
+	// The head is parked via NextContactAt for ~the rate-limit floor (jittered),
+	// so over a fixed clock it is contacted exactly once.
 	calls := mc.getRequestCalls()
 	if calls == 0 {
 		t.Fatalf("expected at least one request, got 0")
 	}
-	if calls > 6 {
-		t.Errorf("ResourceExhausted did not back off: %d requests in ~250ms with a 100ms floor (want <= 6)", calls)
+	if calls != 1 {
+		t.Errorf("ResourceExhausted did not park the head: %d requests with a fixed clock (want 1)", calls)
 	}
 
-	// And the head must be parked with at least the rate-limit floor (proving it
-	// was not mistaken for NotFound, which zeroes Backoff).
+	// NextContactAt must be pushed out by roughly the rate-limit floor (±20%
+	// jitter), proving a fixed LOCAL backoff was applied rather than nothing.
 	srv := servers[0]
-	if srv.Available {
-		t.Errorf("head should be marked unavailable after ResourceExhausted")
-	}
-	if srv.Backoff < fetcher.rateLimitBackoff {
-		t.Errorf("head backoff = %v, want >= rateLimitBackoff %v", srv.Backoff, fetcher.rateLimitBackoff)
+	gotDelay := srv.NextContactAt.Sub(base)
+	lo := time.Duration(float64(fetcher.rateLimitBackoff) * 0.8)
+	hi := time.Duration(float64(fetcher.rateLimitBackoff) * 1.2)
+	if gotDelay < lo || gotDelay > hi {
+		t.Errorf("ResourceExhausted local backoff = %v, want within ±20%% of %v", gotDelay, fetcher.rateLimitBackoff)
 	}
 }
 
 // TestFetcher_EscalatesAfterRepeatedPrepareFailures (Test A): when Prepare keeps
-// failing for a runtime, the breaker trips at exactly the threshold — the
+// failing for a runtime, the breaker trips at exactly the threshold â€” the
 // volunteer grabs and abandons exactly `threshold` units, then stops requesting
 // that runtime's leafs and emits the loud WARN exactly once.
 func TestFetcher_EscalatesAfterRepeatedPrepareFailures(t *testing.T) {
@@ -385,7 +407,6 @@ func TestFetcher_EscalatesAfterRepeatedPrepareFailures(t *testing.T) {
 	fetcher.logger = logger
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 2 * time.Millisecond
-	fetcher.minInterval = 0
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -438,7 +459,6 @@ func TestFetcher_EscalationResetsOnSuccess(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 2 * time.Millisecond
-	fetcher.minInterval = 0
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -475,7 +495,6 @@ func TestFetcher_EscalationCooldownReprobe(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 2 * time.Millisecond
-	fetcher.minInterval = 0
 
 	base := time.Now()
 	fetcher.now = func() time.Time { return base }
@@ -525,22 +544,30 @@ func TestFetcher_SkipsPausedRuntimeLeafOnly(t *testing.T) {
 			if leaf == "leaf-native" {
 				nativeReqs++
 				return &lettucev1.RequestWorkUnitResponse{
-					WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", nativeReqs),
-					ProjectId:                "proj-1",
-					Runtime:                  "native",
-					HeartbeatIntervalSeconds: 300,
-					ExecutionSpec:            &lettucev1.ExecutionSpec{},
+					Assignments: []*lettucev1.WorkUnitAssignment{
+						{
+							WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", nativeReqs),
+							LeafId:                   "proj-1",
+							Runtime:                  "native",
+							HeartbeatIntervalSeconds: 300,
+							ExecutionSpec:            &lettucev1.ExecutionSpec{},
+						},
+					},
 				}, nil
 			}
 			// container leaf: serve a container WU so SelectRuntime fails (no
 			// container runtime registered) -> abandon -> escalate.
 			containerReqs++
 			return &lettucev1.RequestWorkUnitResponse{
-				WorkUnitId:               fmt.Sprintf("00000000-0000-4000-9000-%012d", containerReqs),
-				ProjectId:                "proj-1",
-				Runtime:                  "container",
-				HeartbeatIntervalSeconds: 300,
-				ExecutionSpec:            &lettucev1.ExecutionSpec{Image: "ghcr.io/example/img:tag"},
+				Assignments: []*lettucev1.WorkUnitAssignment{
+					{
+						WorkUnitId:               fmt.Sprintf("00000000-0000-4000-9000-%012d", containerReqs),
+						LeafId:                   "proj-1",
+						Runtime:                  "container",
+						HeartbeatIntervalSeconds: 300,
+						ExecutionSpec:            &lettucev1.ExecutionSpec{Image: "ghcr.io/example/img:tag"},
+					},
+				},
 			}, nil
 		},
 		getHeadInfoFn: func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
@@ -579,7 +606,6 @@ func TestFetcher_SkipsPausedRuntimeLeafOnly(t *testing.T) {
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 2 * time.Millisecond
-	fetcher.minInterval = 0
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -601,5 +627,158 @@ func TestFetcher_SkipsPausedRuntimeLeafOnly(t *testing.T) {
 	}
 	if nativeReqs <= runtimeAbandonPauseThreshold {
 		t.Errorf("native requests = %d, want > %d (native keeps fetching while container is paused)", nativeReqs, runtimeAbandonPauseThreshold)
+	}
+}
+
+// --- CLIENT WORK BUFFER tests (Layer 1) ---
+
+// TestFetcher_ZeroRequestsWhenBufferFull (DoD #2): when the client work buffer
+// reports full, the fetcher issues ZERO RequestWorkUnit calls for the whole
+// window.
+func TestFetcher_ZeroRequestsWhenBufferFull(t *testing.T) {
+	mc := &mockClient{
+		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
+			t.Error("RequestWorkUnit must not be called while the buffer is full")
+			return &lettucev1.RequestWorkUnitResponse{}, nil
+		},
+	}
+	servers := nativeLeafServer(mc)
+
+	d := newFetcherTestDaemon(servers)
+	queue := NewPreFetchQueue(8, d.logger)
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+	fetcher.backoff = 1 * time.Millisecond
+	fetcher.maxBackoff = 2 * time.Millisecond
+	// Force the buffer to report full for the whole window.
+	fetcher.workBufferFullFn = func() bool { return true }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	fetcher.Run(ctx)
+
+	if calls := mc.getRequestCalls(); calls != 0 {
+		t.Errorf("RequestWorkUnit calls while buffer full = %d, want 0", calls)
+	}
+}
+
+// TestFetcher_BatchPushesAllAndRecordsEach: a single RequestWorkUnit that returns
+// N assignments must push N descriptors into the buffer and record N assignments
+// with the selector (RecordAssignment once per unit).
+func TestFetcher_BatchPushesAllAndRecordsEach(t *testing.T) {
+	const batch = 3
+	served := false
+	mc := &mockClient{
+		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
+			if served {
+				return &lettucev1.RequestWorkUnitResponse{Assignments: nil}, nil
+			}
+			served = true
+			asgs := make([]*lettucev1.WorkUnitAssignment, batch)
+			for i := 0; i < batch; i++ {
+				asgs[i] = &lettucev1.WorkUnitAssignment{
+					WorkUnitId:               fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1),
+					LeafId:                   "proj-1",
+					Runtime:                  "native",
+					HeartbeatIntervalSeconds: 300,
+					ExecutionSpec:            &lettucev1.ExecutionSpec{},
+				}
+			}
+			return &lettucev1.RequestWorkUnitResponse{Assignments: asgs, RetryAfterSeconds: 600}, nil
+		},
+	}
+	servers := nativeLeafServer(mc)
+
+	d := newFetcherTestDaemon(servers)
+	queue := NewPreFetchQueue(16, d.logger)
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+	fetcher.backoff = 1 * time.Millisecond
+	fetcher.maxBackoff = 2 * time.Millisecond
+	// Never "full" so the single batch is fully buffered.
+	fetcher.workBufferFullFn = func() bool { return false }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	fetcher.Run(ctx)
+
+	if got := queue.Len(); got != batch {
+		t.Errorf("queue length = %d, want %d (every assignment in the batch buffered)", got, batch)
+	}
+	// RecordAssignment increments the selector's assigned count per unit.
+	if got := d.weightedSelector.AssignedCount("server-a", "leaf-1"); got != batch {
+		t.Errorf("RecordAssignment count = %d, want %d (once per buffered unit)", got, batch)
+	}
+}
+
+// TestFetcher_RequestsMaxAssignments: the fetcher asks for more than one
+// assignment when the hours buffer is below target and a per-unit estimate is
+// available, and obeys the maxBatchPerRequest cap.
+func TestFetcher_RequestsMaxAssignments(t *testing.T) {
+	var gotMax int32 = -1
+	mc := &mockClient{
+		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
+			if gotMax < 0 {
+				gotMax = req.MaxAssignments
+			}
+			return &lettucev1.RequestWorkUnitResponse{Assignments: nil, RetryAfterSeconds: 600}, nil
+		},
+	}
+	servers := nativeLeafServer(mc)
+
+	d := newFetcherTestDaemon(servers)
+	// No benchmark and no buffered work → no per-unit estimate → batch sizer
+	// requests a full batch to refill the empty buffer quickly.
+	queue := NewPreFetchQueue(16, d.logger)
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+	fetcher.backoff = 1 * time.Millisecond
+	fetcher.maxBackoff = 2 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	fetcher.Run(ctx)
+
+	if gotMax != maxBatchPerRequest {
+		t.Errorf("MaxAssignments requested = %d, want %d (full batch when buffer empty and no estimate)", gotMax, maxBatchPerRequest)
+	}
+}
+
+// TestFetcher_NextContactAtSurvivesRecreate: NextContactAt lives on the
+// ServerConnection, so a fetcher recreated (pause/resume) still honors a
+// previously stamped server-directed retry delay.
+func TestFetcher_NextContactAtSurvivesRecreate(t *testing.T) {
+	mc := &mockClient{
+		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
+			return &lettucev1.RequestWorkUnitResponse{Assignments: nil, RetryAfterSeconds: 600}, nil
+		},
+	}
+	servers := nativeLeafServer(mc)
+
+	d := newFetcherTestDaemon(servers)
+	queue := NewPreFetchQueue(4, d.logger)
+
+	base := time.Now()
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+	fetcher.backoff = 1 * time.Millisecond
+	fetcher.now = func() time.Time { return base }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	fetcher.Run(ctx)
+	cancel()
+
+	if mc.getRequestCalls() != 1 {
+		t.Fatalf("first fetcher requests = %d, want 1", mc.getRequestCalls())
+	}
+
+	// Recreate the fetcher (as on resume). The per-head NextContactAt persists on
+	// the ServerConnection, so the recreated fetcher must still wait it out.
+	fetcher2 := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+	fetcher2.backoff = 1 * time.Millisecond
+	fetcher2.now = func() time.Time { return base.Add(1 * time.Second) } // still < 600s
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	fetcher2.Run(ctx2)
+	cancel2()
+
+	if mc.getRequestCalls() != 1 {
+		t.Errorf("after recreate, total requests = %d, want 1 (recreated fetcher still obeys the prior delay)", mc.getRequestCalls())
 	}
 }

@@ -37,9 +37,9 @@ type Config struct {
 
 	Servers []ServerConfig `yaml:"servers,omitempty"`
 
-	MaxConcurrentTasks int    `yaml:"max_concurrent_tasks"`
-	WorkBufferSize     int    `yaml:"work_buffer_size"`
-	LogLevel           string `yaml:"log_level"`
+	MaxConcurrentTasks int     `yaml:"max_concurrent_tasks"`
+	WorkBufferHours    float64 `yaml:"work_buffer_hours"` // hours of work to keep buffered per slot (default 2.0; 0 = a small unit-count fallback)
+	LogLevel           string  `yaml:"log_level"`
 	ResultCacheMaxMB   int    `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
 
 	// Logging output. By default logs are written to both stderr and a
@@ -195,6 +195,7 @@ func Defaults() *Config {
 			PollIntervalSeconds: 10,
 		},
 		MaxConcurrentTasks: 1,
+		WorkBufferHours:    2.0,
 		LogLevel:           "info",
 		LogToFile:          true,
 		LogToStderr:        true,
@@ -320,8 +321,8 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrentTasks < 1 {
 		return fmt.Errorf("max_concurrent_tasks must be >= 1, got %d", c.MaxConcurrentTasks)
 	}
-	if c.WorkBufferSize < 0 {
-		return fmt.Errorf("work_buffer_size must be >= 0 (0 = auto), got %d", c.WorkBufferSize)
+	if c.WorkBufferHours < 0 {
+		return fmt.Errorf("work_buffer_hours must be >= 0 (0 = small unit-count fallback), got %g", c.WorkBufferHours)
 	}
 
 	validLogLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
@@ -427,12 +428,12 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
 		c.MaxConcurrentTasks = v
-	case "work_buffer_size":
-		v, err := strconv.Atoi(value)
+	case "work_buffer_hours":
+		v, err := strconv.ParseFloat(value, 64)
 		if err != nil {
-			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+			return fmt.Errorf("invalid number for %s: %w", dotPath, err)
 		}
-		c.WorkBufferSize = v
+		c.WorkBufferHours = v
 	case "resource_limits.max_cpu_cores":
 		v, err := strconv.Atoi(value)
 		if err != nil {
@@ -510,8 +511,8 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return strconv.Itoa(c.LogMaxAgeDays), nil
 	case "max_concurrent_tasks":
 		return strconv.Itoa(c.MaxConcurrentTasks), nil
-	case "work_buffer_size":
-		return strconv.Itoa(c.WorkBufferSize), nil
+	case "work_buffer_hours":
+		return strconv.FormatFloat(c.WorkBufferHours, 'g', -1, 64), nil
 	case "resource_limits.max_cpu_cores":
 		return strconv.Itoa(c.ResourceLimits.MaxCPUCores), nil
 	case "resource_limits.max_memory_mb":

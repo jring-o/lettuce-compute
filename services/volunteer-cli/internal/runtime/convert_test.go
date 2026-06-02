@@ -7,9 +7,9 @@ import (
 )
 
 func TestWorkUnitFromProto(t *testing.T) {
-	resp := &lettucev1.RequestWorkUnitResponse{
+	resp := &lettucev1.WorkUnitAssignment{
 		WorkUnitId:      "wu-123",
-		ProjectId:       "proj-456",
+		LeafId:          "proj-456",
 		Runtime:         "native",
 		InputData:       []byte("test input"),
 		InputDataUrl:    "https://example.com/input.dat",
@@ -88,7 +88,7 @@ func TestWorkUnitFromProto_Nil(t *testing.T) {
 }
 
 func TestWorkUnitFromProto_NilSpec(t *testing.T) {
-	resp := &lettucev1.RequestWorkUnitResponse{
+	resp := &lettucev1.WorkUnitAssignment{
 		WorkUnitId: "wu-1",
 		Runtime:    "native",
 	}
@@ -102,9 +102,9 @@ func TestWorkUnitFromProto_NilSpec(t *testing.T) {
 }
 
 func TestWorkUnitFromProto_CheckpointFields(t *testing.T) {
-	resp := &lettucev1.RequestWorkUnitResponse{
+	resp := &lettucev1.WorkUnitAssignment{
 		WorkUnitId:                "wu-ckp",
-		ProjectId:                 "proj-1",
+		LeafId:                    "proj-1",
 		Runtime:                   "native",
 		HasCheckpoint:             true,
 		CheckpointSequence:        5,
@@ -126,7 +126,7 @@ func TestWorkUnitFromProto_CheckpointFields(t *testing.T) {
 
 func TestWorkUnitFromProto_CheckpointFieldsDefault(t *testing.T) {
 	// When checkpoint fields are not set, they should be zero-valued.
-	resp := &lettucev1.RequestWorkUnitResponse{
+	resp := &lettucev1.WorkUnitAssignment{
 		WorkUnitId: "wu-no-ckp",
 		Runtime:    "native",
 	}

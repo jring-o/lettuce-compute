@@ -43,10 +43,12 @@ import (
 //
 // The expected hash is NOT a secret. It's a stable test fixture. The chosen
 // message exercises:
-//   - scalar string / int / bytes fields,
-//   - a nested message (ExecutionSpec) which itself contains map<string,string>
-//     fields (binaries, binary_checksums),
-//   - a top-level map<string,string> field (env_vars),
+//   - a repeated nested message (assignments) carrying the per-unit fields,
+//   - scalar string / int / bytes fields on the assignment,
+//   - a doubly-nested message (ExecutionSpec) which itself contains
+//     map<string,string> fields (binaries, binary_checksums),
+//   - a map<string,string> field on the assignment (env_vars),
+//   - a top-level scalar on the response (retry_after_seconds),
 //   - and a deterministic *set* of map entries — deterministic marshal sorts
 //     map keys, which is exactly the surface most likely to drift.
 //
@@ -57,7 +59,7 @@ import (
 //      services/volunteer-cli/internal/client/proto_determinism_test.go.
 //   3. Re-run both packages' tests; both should pass.
 
-const expectedDeterministicHash = "3ae9066f001d06e363fc711c397cf7af1bf84025cabd401df7a0fae0194ebf8a"
+const expectedDeterministicHash = "c499a96a52959df62f99b442a67fb7071cf6e639f2108e411da3760c64a9c5de"
 
 // fixedRequestWorkUnitResponse builds the canonical fixture for the marshal
 // hash test. The exact field values are arbitrary; what matters is that this
@@ -65,46 +67,51 @@ const expectedDeterministicHash = "3ae9066f001d06e363fc711c397cf7af1bf84025cabd4
 // volunteer-cli mirror test.
 func fixedRequestWorkUnitResponse() *lettucev1.RequestWorkUnitResponse {
 	return &lettucev1.RequestWorkUnitResponse{
-		WorkUnitId:               "wu-f3-fixture",
-		ProjectId:                "proj-legacy",
-		Runtime:                  "container",
-		InputData:                []byte{0x00, 0x01, 0x02, 0x03, 0xff},
-		InputDataUrl:             "https://example.invalid/in",
-		CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
-		ParametersJson:           `{"k":"v"}`,
-		DeadlineSeconds:          3600,
-		HeartbeatIntervalSeconds: 300,
-		EnvVars: map[string]string{
-			// Intentionally inserted out of sorted order — deterministic marshal
-			// MUST emit them in sorted key order. If protobuf-go ever changes
-			// that, the hash diverges.
-			"ZETA":  "z",
-			"alpha": "a",
-			"MIKE":  "m",
-		},
-		ExecutionSpec: &lettucev1.ExecutionSpec{
-			Binaries: map[string]string{
-				"linux-amd64":   "https://example.invalid/linux.bin",
-				"darwin-arm64":  "https://example.invalid/darwin.bin",
-				"windows-amd64": "https://example.invalid/windows.exe",
+		Assignments: []*lettucev1.WorkUnitAssignment{
+			{
+				WorkUnitId:               "wu-f3-fixture",
+				LeafId:                   "leaf-fixture",
+				Runtime:                  "container",
+				InputData:                []byte{0x00, 0x01, 0x02, 0x03, 0xff},
+				InputDataUrl:             "https://example.invalid/in",
+				CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
+				ParametersJson:           `{"k":"v"}`,
+				DeadlineSeconds:          3600,
+				HeartbeatIntervalSeconds: 300,
+				EnvVars: map[string]string{
+					// Intentionally inserted out of sorted order — deterministic marshal
+					// MUST emit them in sorted key order. If protobuf-go ever changes
+					// that, the hash diverges.
+					"ZETA":  "z",
+					"alpha": "a",
+					"MIKE":  "m",
+				},
+				ExecutionSpec: &lettucev1.ExecutionSpec{
+					Binaries: map[string]string{
+						"linux-amd64":   "https://example.invalid/linux.bin",
+						"darwin-arm64":  "https://example.invalid/darwin.bin",
+						"windows-amd64": "https://example.invalid/windows.exe",
+					},
+					Image:         "ghcr.io/example/img:tag",
+					GpuRequired:   false,
+					GpuType:       "",
+					MaxMemoryMb:   2048,
+					MaxDiskMb:     4096,
+					NetworkAccess: true,
+					BinaryChecksums: map[string]string{
+						"linux-amd64":   "aaaa",
+						"darwin-arm64":  "bbbb",
+						"windows-amd64": "cccc",
+					},
+				},
+				HasCheckpoint:             true,
+				CheckpointSequence:        7,
+				CheckpointIntervalSeconds: 600,
+				RscFpopsEst:               1.25e9,
+				ReservedUntilUnix:         1893456000,
 			},
-			Image:         "ghcr.io/example/img:tag",
-			GpuRequired:   false,
-			GpuType:       "",
-			MaxMemoryMb:   2048,
-			MaxDiskMb:     4096,
-			NetworkAccess: true,
-			BinaryChecksums: map[string]string{
-				"linux-amd64":   "aaaa",
-				"darwin-arm64":  "bbbb",
-				"windows-amd64": "cccc",
-			},
 		},
-		HasCheckpoint:             true,
-		CheckpointSequence:        7,
-		CheckpointIntervalSeconds: 600,
-		LeafId:                    "leaf-fixture",
-		RscFpopsEst:               1.25e9,
+		RetryAfterSeconds: 42,
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/generate"
@@ -453,6 +454,18 @@ func (m *mockWorkUnitRepo) BulkTransitionByBatch(ctx context.Context, batchID ty
 }
 
 func (m *mockWorkUnitRepo) FindNextAssignable(ctx context.Context, opts workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+
+func (m *mockWorkUnitRepo) ReserveNextAssignable(ctx context.Context, opts workunit.AssignmentOptions, lease time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+
+func (m *mockWorkUnitRepo) StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+
+func (m *mockWorkUnitRepo) ClearReservation(ctx context.Context, id, volunteerID types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 

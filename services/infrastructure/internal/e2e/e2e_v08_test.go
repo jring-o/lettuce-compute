@@ -127,8 +127,9 @@ func TestV08_Scenario1_MapReduceFullLifecycle(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 5, CpuSecondsUser: 3, CpuCoresUsed: 1},
 		})
@@ -259,8 +260,8 @@ func TestV08_Scenario2_MonteCarloStatistics(t *testing.T) {
 		var params struct {
 			Seed int64 `json:"seed"`
 		}
-		if wuResp.ParametersJson != "" {
-			json.Unmarshal([]byte(wuResp.ParametersJson), &params)
+		if wuResp.Assignments[0].ParametersJson != "" {
+			json.Unmarshal([]byte(wuResp.Assignments[0].ParametersJson), &params)
 		}
 
 		result := float64(params.Seed) * 0.1
@@ -269,8 +270,9 @@ func TestV08_Scenario2_MonteCarloStatistics(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 1, CpuSecondsUser: 1, CpuCoresUsed: 1},
 		})
@@ -451,8 +453,9 @@ func TestV08_Scenario3_CustomBulkUpload(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 2, CpuSecondsUser: 1, CpuCoresUsed: 1},
 		})
@@ -557,7 +560,7 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request work unit: %v", err)
 	}
-	if wuResp.InputDataUrl == "" {
+	if wuResp.Assignments[0].InputDataUrl == "" {
 		t.Error("expected input_data_url for external reference leaf")
 	}
 
@@ -566,11 +569,12 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 	hash := sha256.Sum256(outputData)
 	checksum := hex.EncodeToString(hash[:])
 
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 	submitResp, err := env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
-		OutputDataUrl:        "https://storage.example.com/results/v08-wu-" + wuResp.WorkUnitId + ".json",
+		OutputDataUrl:        "https://storage.example.com/results/v08-wu-" + wuResp.Assignments[0].WorkUnitId + ".json",
 		OutputChecksumSha256: checksum,
 		Metadata:             &lettucev1.ExecutionMetadata{WallClockSeconds: 10, CpuSecondsUser: 5, CpuCoresUsed: 2},
 	})
@@ -690,8 +694,9 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 		hash := sha256.Sum256(outputData)
 		checksum := hex.EncodeToString(hash[:])
 
+		ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 		_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-			WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+			WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 			OutputData: outputData, OutputChecksumSha256: checksum,
 			Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 1, CpuSecondsUser: 1, CpuCoresUsed: 1},
 		})
@@ -928,8 +933,9 @@ func TestV08_Scenario6_AllPatternsRegression(t *testing.T) {
 				hash := sha256.Sum256(outputData)
 				checksum := hex.EncodeToString(hash[:])
 
+				ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 				_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-					WorkUnitId: wuResp.WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
+					WorkUnitId: wuResp.Assignments[0].WorkUnitId, VolunteerId: volID, PublicKey: pubKey,
 					OutputData: outputData, OutputChecksumSha256: checksum,
 					Metadata: &lettucev1.ExecutionMetadata{WallClockSeconds: 1, CpuSecondsUser: 1, CpuCoresUsed: 1},
 				})

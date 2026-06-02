@@ -16,8 +16,6 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // TestE2EF07VolunteerProtocol tests the full volunteer protocol flow from the
@@ -162,25 +160,29 @@ func TestE2EF07VolunteerProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 5: RequestWorkUnit: %v", err)
 	}
-	if wuResp.WorkUnitId == "" {
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("step 5: expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	wu := wuResp.Assignments[0]
+	if wu.WorkUnitId == "" {
 		t.Fatal("step 5: expected non-empty work_unit_id")
 	}
-	if wuResp.ProjectId != proj.ID.String() {
-		t.Errorf("step 5: leaf_id = %q, want %q", wuResp.ProjectId, proj.ID.String())
+	if wu.LeafId != proj.ID.String() {
+		t.Errorf("step 5: leaf_id = %q, want %q", wu.LeafId, proj.ID.String())
 	}
-	if wuResp.Runtime != "NATIVE" {
-		t.Errorf("step 5: runtime = %q, want NATIVE", wuResp.Runtime)
+	if wu.Runtime != "NATIVE" {
+		t.Errorf("step 5: runtime = %q, want NATIVE", wu.Runtime)
 	}
-	if wuResp.HeartbeatIntervalSeconds <= 0 {
-		t.Errorf("step 5: heartbeat_interval_seconds = %d, want > 0", wuResp.HeartbeatIntervalSeconds)
+	if wu.HeartbeatIntervalSeconds <= 0 {
+		t.Errorf("step 5: heartbeat_interval_seconds = %d, want > 0", wu.HeartbeatIntervalSeconds)
 	}
-	if len(wuResp.InputData) == 0 && wuResp.InputDataUrl == "" && wuResp.ParametersJson == "" {
+	if len(wu.InputData) == 0 && wu.InputDataUrl == "" && wu.ParametersJson == "" {
 		t.Error("step 5: expected input_data, input_data_url, or parameters_json")
 	}
 
 	// --- Step 6: Send heartbeat ---
 	hbResp, err := grpcClient.Heartbeat(volKey.sign(ctx), &lettucev1.HeartbeatRequest{
-		WorkUnitId:  wuResp.WorkUnitId,
+		WorkUnitId:  wu.WorkUnitId,
 		VolunteerId: volID,
 		Status:      "RUNNING",
 		ProgressPct: 0.0,
@@ -198,7 +200,7 @@ func TestE2EF07VolunteerProtocol(t *testing.T) {
 	checksum := hex.EncodeToString(hash[:])
 
 	submitResp, err := grpcClient.SubmitResult(volKey.sign(ctx), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wu.WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
 		OutputData:           outputData,
@@ -224,7 +226,7 @@ func TestE2EF07VolunteerProtocol(t *testing.T) {
 	}
 
 	// --- Step 8: Verify work unit state ---
-	wuID, _ := types.ParseID(wuResp.WorkUnitId)
+	wuID, _ := types.ParseID(wu.WorkUnitId)
 	var wuState string
 	err = pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", wuID).Scan(&wuState)
 	if err != nil {
@@ -235,19 +237,20 @@ func TestE2EF07VolunteerProtocol(t *testing.T) {
 	}
 
 	// --- Step 9: Verify no more work available ---
-	_, err = grpcClient.RequestWorkUnit(volKey.sign(ctx), &lettucev1.RequestWorkUnitRequest{
+	// The no-work path is now an OK response with empty assignments and a
+	// server-directed retry delay (the codes.NotFound sentinel was removed).
+	noWorkResp, err := grpcClient.RequestWorkUnit(volKey.sign(ctx), &lettucev1.RequestWorkUnitRequest{
 		VolunteerId: volID,
 		PublicKey:   pubKey,
 	})
-	if err == nil {
-		t.Fatal("step 9: expected error for no work available")
+	if err != nil {
+		t.Fatalf("step 9: expected OK no-work response, got error: %v", err)
 	}
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("step 9: expected gRPC status error, got: %v", err)
+	if len(noWorkResp.Assignments) != 0 {
+		t.Errorf("step 9: expected 0 assignments for no-work, got %d", len(noWorkResp.Assignments))
 	}
-	if st.Code() != codes.NotFound {
-		t.Errorf("step 9: expected NotFound, got %s: %s", st.Code(), st.Message())
+	if noWorkResp.RetryAfterSeconds < 1 {
+		t.Errorf("step 9: expected retry_after_seconds >= 1 on no-work reply, got %d", noWorkResp.RetryAfterSeconds)
 	}
 
 	// --- Step 10: Verify volunteer ID stability ---

@@ -127,6 +127,115 @@ that one test fails, suspect the environment before your change.
 
 ---
 
+## Load-testing with swarm-sim
+
+`swarm-sim` is a volunteer-swarm simulator used to load-test a head and
+calibrate its dispatch tuning. It lives at
+`services/volunteer-cli/cmd/swarm-sim` (in the volunteer-cli module, the only
+place that can import the real signing client, so each simulated volunteer
+speaks the genuine per-request-signed protocol). It spins up a fleet of
+simulated volunteers, optionally seeds a leaf with work units over the head's
+HTTP admin API, runs for a fixed duration, and prints a metrics report.
+
+### Profiles
+
+- **`naive`** — loops `RequestWorkUnit` with `MaxAssignments=1` at a fixed
+  interval and **ignores** the head's *server-directed retry delay*. It
+  approximates a pre-batching client and produces the maximum request noise.
+- **`buffered`** — the full client model: it requests work in batches
+  (*work batching*), maintains an in-memory *client work buffer* sized in hours,
+  **obeys** the *server-directed retry delay*, makes **zero** `RequestWorkUnit`
+  calls while its buffer is full, and treats *per-client rate limiting*
+  (`ResourceExhausted`) as a fixed local backoff. The report shows the
+  `RenewReservations` rate on its own line so lease-renewal traffic stays
+  visible and separate from `RequestWorkUnit` noise.
+
+### Seeding
+
+By default the simulator seeds an active leaf with work units over the HTTP
+admin API (create → configure → update → activate → `work-units/generate`),
+idempotent on the `--seed-leaf` name. Leaf creation needs a `creator_id` that
+references a real user row, so pass `--creator-id` (or `SWARM_SIM_CREATOR_ID`)
+the id of an existing user. Pass `--no-seed` to target a pre-existing leaf by
+name without seeding.
+
+### In-process vs standalone head
+
+There is no in-process head harness for the simulator: it lives in a different
+module from the head and cannot import the head's internal packages. Run the
+simulator against a **standalone head process**:
+
+1. Start a throwaway Postgres (a non-default host port; do **not** touch a local
+   Postgres 17 service):
+
+   ```bash
+   podman run -d --name lettuce-sim-pg \
+     -e POSTGRES_USER=lettuce -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=lettuce \
+     -p 5434:5432 docker.io/library/postgres:16-alpine
+   ```
+
+2. Run the head with TLS off on `127.0.0.1:9090` (gRPC) / `:8080` (HTTP),
+   pointing at that Postgres. The head applies migrations on boot. Set
+   `LETTUCE_ADMIN_API_KEY` (required) and, to provision an owner user for
+   seeding, `LETTUCE_ADMIN_EMAIL` + `LETTUCE_ADMIN_PASSWORD`. On Windows +
+   podman, the published port is reachable via the podman VM's `eth0` IP, not
+   `127.0.0.1`, so set `LETTUCE_DB_HOST` to that VM IP.
+
+3. Read the bootstrapped admin user's id from the DB (`SELECT id FROM users
+   WHERE role='ADMIN'`) and pass it as `--creator-id`.
+
+4. Run a profile:
+
+   ```bash
+   go run ./cmd/swarm-sim \
+     --head-grpc=127.0.0.1:9090 --head-http=http://127.0.0.1:8080 \
+     --admin-key=$LETTUCE_ADMIN_API_KEY --creator-id=<admin-user-id> \
+     --volunteers=25 --profile=buffered --duration=60s \
+     --seed-leaf=swarm-test --seed-units=100000 \
+     --buffer-hours=2 --max-assignments=8 --report=text
+   ```
+
+   Run it once per profile (`--profile=naive`, then `--profile=buffered`) to
+   compare fleet `RequestWorkUnit` rate at equal dispatch throughput.
+
+### Per-client rate limiting note
+
+The head's *per-client rate limiting* buckets gRPC callers per source IP. A
+swarm run entirely from one host shares a single source IP, so a large fleet
+will be throttled (`ResourceExhausted`) — this is itself a valid Layer-0
+measurement, but it means request-rate numbers from a single-host swarm are
+bounded by the per-IP limit. The simulator retries **registration** through the
+limiter so the fleet still comes up; steady-state `RequestWorkUnit` numbers
+reflect whatever the limiter allows.
+
+### Integration smoke test
+
+`cmd/swarm-sim/smoke_test.go` (`//go:build integration`) runs 20 volunteers ×
+5s for **both** profiles against a head you stand up out of process, and
+asserts the buffered profile makes strictly fewer `RequestWorkUnit` calls than
+the naive profile. It is env-gated and skips unless these are set:
+
+```bash
+export SWARM_SMOKE_GRPC=127.0.0.1:9090
+export SWARM_SMOKE_HTTP=http://127.0.0.1:8080
+export SWARM_SMOKE_ADMIN=$LETTUCE_ADMIN_API_KEY
+export SWARM_SIM_CREATOR_ID=<admin-user-id>
+go test -tags=integration -run TestSwarmSimSmoke ./cmd/swarm-sim/
+```
+
+### Calibrating `target_request_rate_per_sec`
+
+The head's `target_request_rate_per_sec` (env
+`LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC`, default 500) is **not** a trusted
+default — it must be calibrated against the real single-head assignment ceiling
+on the target hardware before the head's *server-directed retry delay* behaves
+meaningfully under load. Use the simulator's reported dispatch throughput
+(assignments/sec) at saturation as the measured ceiling, then set the head knob
+to that value and re-run. Until calibrated, the delay curve (which keys off the
+ratio of observed request rate to this target) over- or under-shoots.
+
+---
+
 ## Developer Certificate of Origin (DCO)
 
 Every commit must be signed off. The sign-off certifies that you wrote the code

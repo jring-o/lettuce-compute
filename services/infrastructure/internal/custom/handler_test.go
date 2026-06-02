@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
@@ -74,6 +75,15 @@ func (m *mockWURepo) BulkTransitionByBatch(ctx context.Context, batchID types.ID
 	return m.transitionRows, nil
 }
 func (m *mockWURepo) FindNextAssignable(ctx context.Context, opts workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ReserveNextAssignable(ctx context.Context, opts workunit.AssignmentOptions, lease time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ClearReservation(ctx context.Context, id, volunteerID types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) Assign(ctx context.Context, workUnitID, volunteerID types.ID) (*workunit.WorkUnit, error) {

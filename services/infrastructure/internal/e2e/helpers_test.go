@@ -155,7 +155,7 @@ func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	httpURL := "http://" + httpLis.Addr().String()
 
 	// gRPC server with checkpoint support.
-	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger)
+	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-beta", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
@@ -297,6 +297,17 @@ func registerBetaVolunteer(t *testing.T, env *betaEnv, ctx context.Context, pubK
 	return regResp.VolunteerId
 }
 
+// firstAssignment returns the single work unit assignment from a
+// RequestWorkUnitResponse, failing the test if the batch is not exactly one
+// unit. Most e2e flows request work one unit at a time.
+func firstAssignment(t *testing.T, resp *lettucev1.RequestWorkUnitResponse) *lettucev1.WorkUnitAssignment {
+	t.Helper()
+	if len(resp.Assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(resp.Assignments))
+	}
+	return resp.Assignments[0]
+}
+
 // requestSubmitResult requests a work unit and submits a result. Returns the work unit ID.
 func requestSubmitResult(t *testing.T, env *betaEnv, ctx context.Context, volID string, pubKey, outputData []byte) string {
 	t.Helper()
@@ -307,10 +318,20 @@ func requestSubmitResult(t *testing.T, env *betaEnv, ctx context.Context, volID 
 	if err != nil {
 		t.Fatalf("request work unit: %v", err)
 	}
+	if len(wuResp.Assignments) != 1 {
+		t.Fatalf("expected 1 assignment, got %d", len(wuResp.Assignments))
+	}
+	wuID := wuResp.Assignments[0].WorkUnitId
+
+	// Run-start: a RUNNING heartbeat flips the reserved (QUEUED) unit to
+	// ASSIGNED/RUNNING and creates the active assignment_history row SubmitResult
+	// requires. Buffered units are leased via reservation columns (no history row)
+	// until run-start, so the realistic flow heartbeats RUNNING before submitting.
+	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuID)
 
 	checksum := sha256Hex(outputData)
 	_, err = env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
-		WorkUnitId:           wuResp.WorkUnitId,
+		WorkUnitId:           wuID,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
 		OutputData:           outputData,
@@ -323,9 +344,9 @@ func requestSubmitResult(t *testing.T, env *betaEnv, ctx context.Context, volID 
 		},
 	})
 	if err != nil {
-		t.Fatalf("submit result for WU %s: %v", wuResp.WorkUnitId, err)
+		t.Fatalf("submit result for WU %s: %v", wuID, err)
 	}
-	return wuResp.WorkUnitId
+	return wuID
 }
 
 // assertCreditExists verifies that credit ledger entries exist for a volunteer on a leaf.
