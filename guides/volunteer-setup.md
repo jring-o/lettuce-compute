@@ -127,9 +127,69 @@ the container runtime's store:
 - Separate raw volumes for rootfs vs data vs the image store is the normal "data
   separate from OS" pattern — just remember the disk gate checks the data-dir
   volume, and Docker 29 puts images under `/var/lib/containerd`.
-- In LXC, the most reliable path reported so far is **Docker-in-LXC with your
-  user in the `docker` group**; rootless Podman in LXC (userns/nesting/socket
-  ownership) is fiddlier.
+- **Easiest path in LXC: Docker with your user in the `docker` group.** Rootless
+  Podman in LXC works but is fiddlier (user-namespace mapping, nesting, and
+  socket ownership all have to line up). Pick Docker unless you specifically want
+  rootless.
+- A full container runtime needs to be **VM-only** on some setups: in an
+  unprivileged LXC guest, rootless engines must write user-namespace id-maps
+  through the container → guest → host, which not every host permits. If LXC
+  fights you, run the volunteer in a VM instead.
+
+#### Rootless Podman in an unprivileged LXC guest (Proxmox)
+
+Validated on Proxmox VE 9.1 with an Arch Linux guest by a community tester; the
+shape is the same for most LXC/distro combinations. Do the basic setup first and
+confirm `podman run --rm hello-world` works **before** starting the volunteer —
+then add one fix at a time.
+
+On the **Proxmox host**:
+
+```bash
+# 1. Give the host enough sub-uids/gids to map into.
+#    /etc/subuid and /etc/subgid:   root:100000:200000
+
+# 2. Create the LXC, then enable the features it needs (Options > Features):
+#    keyctl=1,nesting=1
+
+# 3. Map the guest's uid/gid range to host ids, and allow the tun device
+#    (needed by the rootless network helpers). In /etc/pve/lxc/<VMID>.conf:
+lxc.idmap: u 0 100000 165536
+lxc.idmap: g 0 100000 165536
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net dev/net none bind,create=dir
+```
+
+Inside the **LXC guest**:
+
+```bash
+# Confirm the id-map took effect (expect: 0 100000 165536):
+cat /proc/self/uid_map
+
+# Install podman, create a dedicated user, and give it sub-uids/gids
+# (/etc/subuid and /etc/subgid):   <lettuce-user>:100000:65536
+
+# Reboot, then log in AS the user (su - from root does NOT set up the session
+# correctly). As the user, verify the rootless plumbing:
+ls -la /run/user/$UID          # the runtime dir must exist
+env | grep XDG_RUNTIME_DIR     # must be set (see fix below if empty)
+podman run --rm hello-world    # must succeed before going further
+```
+
+Common fixes if a check above fails:
+
+- **`/run/user/<uid>` missing after login:** `sudo loginctl enable-linger
+  <lettuce-user>`, then reboot.
+- **`newuidmap`/`newgidmap` errors mentioning `id_map`:**
+  `sudo setcap cap_setuid+ep /usr/bin/newuidmap` and
+  `sudo setcap cap_setgid+ep /usr/bin/newgidmap`.
+- **`XDG_RUNTIME_DIR` unset / the volunteer can't reach the socket:** the
+  volunteer manages Podman over its API socket, so the socket service must be
+  running and `XDG_RUNTIME_DIR` must point at it. Add
+  `export XDG_RUNTIME_DIR=/run/user/$UID` to your shell profile, `source` it,
+  then `systemctl --user enable --now podman.socket`. (`podman run` works
+  without the socket, but the volunteer does not — see
+  ["Setting up a container runtime"](#setting-up-a-container-runtime).)
 
 ---
 

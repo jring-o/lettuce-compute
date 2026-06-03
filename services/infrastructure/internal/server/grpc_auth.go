@@ -207,9 +207,16 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *repl
 	// metadata nonce yields a different reconstructed message and fails
 	// verification). Cap the length to bound the signed-string size from a hostile
 	// metadata value.
+	//
+	// A client that sent well-formed pubkey/signature/timestamp metadata (checked
+	// above) but no nonce is a pre-nonce volunteer — i.e. older than this head's
+	// protocol. Name that explicitly so the operator sees "update your volunteer"
+	// instead of a cryptic auth failure; this is the single clearest old-client
+	// tell at the auth layer.
 	nonceVals := md.Get(grpcAuthNonceMeta)
 	if len(nonceVals) == 0 || nonceVals[0] == "" {
-		return nil, status.Error(codes.Unauthenticated, "missing nonce")
+		return nil, status.Error(codes.Unauthenticated,
+			"volunteer too old for this head: update to a build that signs per-request nonces (head and volunteers must be on the same release)")
 	}
 	nonce := nonceVals[0]
 	if len(nonce) > grpcAuthMaxNonceLen {

@@ -247,6 +247,12 @@ func TestGRPCAuth_MissingNonceRejected(t *testing.T) {
 	if codeOf(err) != codes.Unauthenticated {
 		t.Fatalf("expected Unauthenticated for missing-nonce request, got %v", err)
 	}
+	// The message must name the cause (an out-of-date volunteer) so an operator
+	// seeing it in head logs knows to update the volunteer, not chase a phantom
+	// signing bug.
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, "too old") {
+		t.Fatalf("missing-nonce rejection should explain the volunteer is too old, got %q", msg)
+	}
 }
 
 // TestGRPCAuth_CanonicalFormIsByteStable asserts the (sole, with-nonce) canonical
