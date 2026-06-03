@@ -18,6 +18,12 @@ services:
     build:
       context: ./services/infrastructure
       dockerfile: Dockerfile
+      args:
+        # Stamp the binary's version. Supply at build time from the checked-out
+        # tag, e.g. `LETTUCE_VERSION=$(git describe --tags) docker compose build
+        # infrastructure`. Falls back to "dev" if unset (.git is outside the
+        # build context, so git can't run inside the container).
+        VERSION: ${LETTUCE_VERSION:-dev}
     init: true
     restart: unless-stopped
     depends_on:

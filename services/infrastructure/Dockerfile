@@ -1,6 +1,12 @@
 # ---- Build stage ----
 FROM golang:1.25-alpine AS build
 
+# Version stamped into the binary via -ldflags (see Makefile). Passed in as a
+# build arg because .git is outside the build context, so `git describe` can't
+# run in here; the caller computes it (e.g. from `git describe --tags`) and
+# hands it in. Defaults to "dev" so a plain build still works.
+ARG VERSION=dev
+
 RUN apk add --no-cache make git protobuf
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
     go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
@@ -16,7 +22,7 @@ COPY . .
 
 # Generate protobuf code and build static binary
 RUN make proto
-RUN CGO_ENABLED=0 make build
+RUN CGO_ENABLED=0 make build VERSION=$VERSION
 
 # ---- Runtime stage ----
 FROM alpine:3.19
