@@ -173,8 +173,19 @@ hassle.)
   code can never execute as script on the main app origin.
 - `LETTUCE_TRUSTED_PROXIES` — **leave unset in `.env`**. `compose.production.yaml`
   already defaults it to the Docker/RFC1918 bridge ranges so per-client rate
-  limiting works behind Caddy. Only override it if the user has a non-standard
-  proxy network.
+  limiting works behind Caddy. As of v0.2.0 this governs per-client limiting on
+  **both** the HTTP and the gRPC (volunteer) port, so the default matters more —
+  but it's still correct out of the box. Only override it if the user has a
+  non-standard proxy network.
+- **Dispatch tuning (`LETTUCE_HEAD_*`) — leave unset for a fresh head.** v0.2.0
+  added server-directed dispatch knobs (work batching, retry delays, the buffer
+  lease). `compose.production.yaml` forwards them all from `.env`, but the
+  built-in defaults are fine to launch with. The one to revisit **later**, once
+  the head carries real volunteer load, is
+  `LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC`: measure the single-head dispatch
+  ceiling with `swarm-sim` and set it (the `500` default is intentionally high —
+  the 2026-06 reference run measured ~240/sec). Full table: `guides/head-setup.md`
+  → "Work dispatch tuning".
 - `VIZ_BUNDLE_ALLOWED_ORIGINS` — **leave unset** unless the user hosts viz tarballs
   on additional origins. The default (`PLATFORM_URL` origin, where `/binaries/`
   lives) covers the documented setup.
@@ -223,9 +234,18 @@ postgres, infrastructure, dashboard, registry, caddy all up.
 ### 9 — [you] Verify
 head-setup.md Step 10:
 - `curl https://your-domain.com/api/v1/health` → `"status":"healthy"`, `"database":"connected"`.
+- Startup logs show the schema migrations applied (`migrations applied successfully`,
+  through `00002_work_unit_reservations` — the v0.2.0 reservation columns) and a
+  `trusted proxies configured` line. No panics or restart loop.
 - Bootstrap log shows `admin user created via bootstrap` and `dashboard API key created via bootstrap`.
 - Ask the user to open `https://your-domain.com/sign-in`, log in with their email + password,
   and **share a screenshot** of the dashboard so you both confirm it works.
+
+**Note (v0.2.0):** this is a server-directed-dispatch head. Volunteers attaching
+to it must be on a **v0.2.0+** build. An older volunteer is rejected at
+registration with `volunteer too old for this head: update to a build that signs
+per-request nonces` — that's expected, not a deploy fault. Point contributors at
+the v0.2.0 release binaries.
 
 ### 10 — Done → offer the leaf
 Tell them their head is live and where: `https://your-domain.com` (dashboard), admin console

@@ -56,6 +56,21 @@ services:
       # Docker/RFC1918 bridge ranges is safe and lets per-client limiting work.
       # If you override this, set it to the CIDR your reverse proxy connects from.
       LETTUCE_TRUSTED_PROXIES: ${LETTUCE_TRUSTED_PROXIES:-172.16.0.0/12,10.0.0.0/8,192.168.0.0/16}
+      # --- Layer 1 dispatch tuning (v0.2.0) ---
+      # All OPTIONAL: leave the matching variable unset in .env and the head uses
+      # its built-in default (the loader ignores empty values). Forwarded here so
+      # they are settable from .env without editing this file. Full table +
+      # defaults: guides/head-setup.md. The one worth calibrating is
+      # TARGET_REQUEST_RATE_PER_SEC — measure your single-head ceiling with
+      # swarm-sim (the 2026-06 reference run measured ~240/sec) and set it; the
+      # built-in 500 default is intentionally high.
+      LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC: ${LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC:-}
+      LETTUCE_HEAD_MAX_BATCH_PER_REQUEST: ${LETTUCE_HEAD_MAX_BATCH_PER_REQUEST:-}
+      LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS: ${LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS:-}
+      LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS: ${LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS:-}
+      LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT: ${LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT:-}
+      LETTUCE_HEAD_LEASE_SECONDS: ${LETTUCE_HEAD_LEASE_SECONDS:-}
+      LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER:-}
     volumes:
       - ./keys:/keys:ro
     healthcheck:
