@@ -18,6 +18,12 @@
 //     the simulator measures the single-head dispatch ceiling (peak dispatch/sec)
 //     and proves the head sheds gracefully (ResourceExhausted) instead of
 //     collapsing the DB pool (DeadlineExceeded / Unavailable).
+//   - request-only: a supplementary HandOut-isolation probe — overload's hot
+//     RequestWorkUnit loop with NO StartWork/SubmitResult, so it measures the pure
+//     server-side HandOut path (the dispatch cache lock/scan ceiling and head-side
+//     RequestWorkUnit p50/p99 vs concurrency) with zero write-path noise. It must
+//     be run against a generously primed ready pool and a short duration, since it
+//     reserves units without recycling them.
 //
 // It can seed a test leaf with work units over the head's HTTP admin API, runs
 // the fleet for a fixed duration, and reports dispatch throughput (whole-run and
@@ -82,7 +88,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.adminKey, "admin-key", os.Getenv("LETTUCE_ADMIN_API_KEY"), "admin API key for seeding (defaults to $LETTUCE_ADMIN_API_KEY)")
 
 	fs.IntVar(&o.volunteers, "volunteers", 100, "number of simulated volunteers")
-	fs.StringVar(&o.profile, "profile", "buffered", "client profile: naive | buffered | overload")
+	fs.StringVar(&o.profile, "profile", "buffered", "client profile: naive | buffered | overload | request-only")
 	fs.DurationVar(&o.duration, "duration", 60*time.Second, "how long to run the fleet")
 
 	fs.StringVar(&o.seedLeaf, "seed-leaf", "swarm-test", "name/slug of the leaf to seed and target")
@@ -103,8 +109,9 @@ func parseFlags(args []string) (*options, error) {
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	if o.profile != string(profileNaive) && o.profile != string(profileBuffered) && o.profile != string(profileOverload) {
-		return nil, fmt.Errorf("invalid --profile %q: must be naive, buffered, or overload", o.profile)
+	if o.profile != string(profileNaive) && o.profile != string(profileBuffered) &&
+		o.profile != string(profileOverload) && o.profile != string(profileRequestOnly) {
+		return nil, fmt.Errorf("invalid --profile %q: must be naive, buffered, overload, or request-only", o.profile)
 	}
 	if o.volunteers < 1 {
 		return nil, fmt.Errorf("--volunteers must be >= 1")
@@ -286,10 +293,10 @@ func writeReport(w io.Writer, rep report, format string) error {
 		collapse = fmt.Sprintf("YES (%d RequestWorkUnit calls hit DeadlineExceeded/Unavailable)", rep.CollapseCount)
 	}
 	fmt.Fprintf(w, "DB-pool collapse:      %s\n", collapse)
-	fmt.Fprintf(w, "\n%-18s %8s %8s %8s %8s %8s %9s %9s %9s %9s\n", "rpc", "calls", "ok", "errors", "throttl", "collaps", "p50ms", "p90ms", "p99ms", "maxms")
+	fmt.Fprintf(w, "\n%-18s %8s %8s %8s %8s %8s %8s %9s %9s %9s %9s\n", "rpc", "calls", "ok", "errors", "throttl", "collaps", "cancel", "p50ms", "p90ms", "p99ms", "maxms")
 	for _, r := range rep.RPCs {
-		fmt.Fprintf(w, "%-18s %8d %8d %8d %8d %8d %9.2f %9.2f %9.2f %9.2f\n",
-			r.RPC, r.Calls, r.OK, r.Errors, r.Throttled, r.Collapse,
+		fmt.Fprintf(w, "%-18s %8d %8d %8d %8d %8d %8d %9.2f %9.2f %9.2f %9.2f\n",
+			r.RPC, r.Calls, r.OK, r.Errors, r.Throttled, r.Collapse, r.Canceled,
 			r.Latency.P50, r.Latency.P90, r.Latency.P99, r.Latency.Max)
 	}
 	fmt.Fprintln(w)

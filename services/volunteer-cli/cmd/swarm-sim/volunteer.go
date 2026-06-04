@@ -33,6 +33,18 @@ const (
 	// collapsing the DB pool. Unlike naive (a pre-Layer-1 client at a fixed
 	// interval), overload never sleeps between RequestWorkUnit calls.
 	profileOverload profileKind = "overload"
+	// profileRequestOnly is a supplementary HandOut-isolation probe: a hot
+	// RequestWorkUnit loop IDENTICAL to overload's request pacing but with NO
+	// StartWork / SubmitResult (no pretend-compute), so it measures the pure
+	// server-side HandOut path — the dispatch cache lock/scan ceiling and the
+	// head-side RequestWorkUnit p50/p99 vs concurrency — in isolation from the
+	// write path. It is how the FIX-1 lock-cliff removal is read with no write-path
+	// noise. CAVEAT: because units are reserved but never run/submitted, this
+	// profile does not recycle the ready pool, so it MUST be run against a
+	// generously primed pool (large head ready_pool_size + refill_batch_size and a
+	// high --seed-units) and a SHORT --duration, or it measures the
+	// readyLen==0+admissionSaturated shed branch rather than the HandOut win.
+	profileRequestOnly profileKind = "request-only"
 )
 
 // simConfig is the resolved, immutable configuration shared by every simulated
@@ -135,7 +147,7 @@ func (v *simVolunteer) register(ctx context.Context, name string) error {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		start := time.Now()
 		resp, err := v.cl.RegisterVolunteer(ctx, req)
-		v.m.record(rpcRegister, time.Since(start), outcomeFor(err))
+		v.m.record(rpcRegister, time.Since(start), outcomeForCtx(ctx, err))
 		if err == nil {
 			v.id = resp.GetVolunteerId()
 			return nil
@@ -171,8 +183,50 @@ func (v *simVolunteer) run(ctx context.Context) {
 		v.runBuffered(ctx)
 	case profileOverload:
 		v.runOverload(ctx)
+	case profileRequestOnly:
+		v.runRequestOnly(ctx)
 	default:
 		v.runNaive(ctx)
+	}
+}
+
+// runRequestOnly is the supplementary HandOut-isolation probe (see
+// profileRequestOnly). It is a runOverload clone that ONLY loops
+// RequestWorkUnit(MaxAssignments=1) — it never calls StartWork or SubmitResult and
+// never pretend-computes — so the measured load is the pure server-side HandOut
+// path (the dispatch cache lock/scan ceiling) with zero write-path noise. This is
+// how the FIX-1 lock-cliff removal is read in isolation: head-side RequestWorkUnit
+// p50/p99 vs concurrency, and peak dispatch/sec, uncontaminated by
+// StartWork/SubmitResult.
+//
+// It honors the same --honor-shed gate as runOverload: by default (honorShed=false)
+// it ignores a shed and immediately re-requests (maximal HandOut pressure); with
+// --honor-shed it backs off on ResourceExhausted like a real client.
+//
+// CAVEAT (also documented on the const): this profile reserves units but never
+// runs/submits them, so it does NOT recycle the ready pool. Run it only against a
+// generously primed pool and a short --duration, or once the seeded pool drains it
+// measures the readyLen==0+admissionSaturated shed branch instead of the HandOut
+// ceiling.
+func (v *simVolunteer) runRequestOnly(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		_, _, ok := v.requestWork(ctx, 1)
+		if ok {
+			// Got work (or an empty OK response): immediately ask again with no delay
+			// to hold the HandOut path at saturation. We deliberately do NOT
+			// StartWork/Submit — the reservation is left to lapse server-side.
+			continue
+		}
+		// A shed/error. By default keep hammering with no delay; --honor-shed backs
+		// off like a real client.
+		if v.cfg.honorShed {
+			if !v.sleepUntil(ctx, time.Now().Add(time.Duration(v.resourceExhaustedBackoff())*time.Second)) {
+				return
+			}
+		}
 	}
 }
 
@@ -326,9 +380,11 @@ func (v *simVolunteer) requestWork(ctx context.Context, maxAssign int32) ([]*let
 	dur := time.Since(start)
 	if err != nil {
 		// Classify the failure: ResourceExhausted is the graceful shed (record it
-		// and surface a fixed local backoff); DeadlineExceeded/Unavailable is the
-		// pool-collapse signal Layer 2 must avoid; anything else is a plain error.
-		outcome := outcomeFor(err)
+		// and surface a fixed local backoff); a head-side DeadlineExceeded /
+		// Unavailable while the run is live is the pool-collapse signal Layer 2 must
+		// avoid; a run-end cancel/deadline is a benign artifact (outcomeCanceled),
+		// NOT a collapse; anything else is a plain error.
+		outcome := outcomeForCtx(ctx, err)
 		v.m.record(rpcRequestWorkUnit, dur, outcome)
 		if outcome == outcomeThrottled {
 			return nil, v.resourceExhaustedBackoff(), false
@@ -384,7 +440,7 @@ func (v *simVolunteer) startRun(ctx context.Context, wuID string) bool {
 		WorkUnitId:  wuID,
 		VolunteerId: v.id,
 	})
-	v.m.record(rpcStartWork, time.Since(start), outcomeFor(err))
+	v.m.record(rpcStartWork, time.Since(start), outcomeForCtx(ctx, err))
 	if err != nil {
 		return false
 	}
@@ -409,7 +465,7 @@ func (v *simVolunteer) submitResult(ctx context.Context, wuID string) {
 			PeakMemoryMb:     128,
 		},
 	})
-	v.m.record(rpcSubmitResult, time.Since(start), outcomeFor(err))
+	v.m.record(rpcSubmitResult, time.Since(start), outcomeForCtx(ctx, err))
 	if err == nil {
 		v.m.resultsSubmitted.Add(1)
 	}
@@ -530,7 +586,21 @@ func (v *simVolunteer) sleepUntil(ctx context.Context, t time.Time) bool {
 	}
 }
 
-func outcomeFor(err error) rpcOutcome {
+// outcomeForCtx classifies an RPC result, distinguishing a TRUE head-side
+// DB-pool collapse from the known FALSE-POSITIVE: a client-side gRPC deadline or
+// cancellation that is really a run-end artifact (the simulation's own
+// duration-bounded context expiring under in-flight calls) or mere head
+// lock-slowness rather than the head's DB pool collapsing.
+//
+// The discriminator is the simulation's OWN context: if simCtx is already done
+// when a Canceled/DeadlineExceeded surfaces, that error is the run shutting down
+// (or the per-call timeout tripping while the caller's ctx was already on its way
+// out), NOT a head collapse, so it is recorded as outcomeCanceled and excluded
+// from the collapse flag. A DeadlineExceeded while the simulation is still live
+// is a genuine head-side deadline ("context deadline exceeded" inside the head's
+// per-request DB touch) and counts as collapse; Unavailable always counts as
+// collapse (the transport/head went away under load).
+func outcomeForCtx(simCtx context.Context, err error) rpcOutcome {
 	if err == nil {
 		return outcomeOK
 	}
@@ -539,14 +609,37 @@ func outcomeFor(err error) rpcOutcome {
 		// Graceful shed: the Layer 2 admission cap or the Layer 0 per-client rate
 		// limiter. The DESIRED overload behavior.
 		return outcomeThrottled
-	case codes.DeadlineExceeded, codes.Unavailable:
-		// DB-pool congestion collapse: the head's per-request DB touch timed out
-		// ("context deadline exceeded") or the head became unavailable under load.
+	case codes.Canceled:
+		// gRPC cancellation is essentially always the simulation's own context
+		// being cancelled at run shutdown; never a head DB collapse.
+		return outcomeCanceled
+	case codes.DeadlineExceeded:
+		// A client-side deadline that fired because the run is ending (or because
+		// the per-call timeout tripped while HandOut was merely slow under lock
+		// contention, with the run already winding down) is a benign artifact, not
+		// a pool collapse. We can tell because the simulation's own context is
+		// already done. Only a DeadlineExceeded observed while the run is still
+		// live reflects the head's per-request DB touch timing out.
+		if simCtx != nil && simCtx.Err() != nil {
+			return outcomeCanceled
+		}
+		return outcomeCollapse
+	case codes.Unavailable:
+		// The head became unavailable under load (transport reset / pool collapse).
 		// Layer 2 must keep this at zero under overload by shedding first.
 		return outcomeCollapse
 	default:
 		return outcomeError
 	}
+}
+
+// outcomeFor classifies an RPC result without a simulation context. It treats a
+// DeadlineExceeded as a true collapse (the conservative reading) and is retained
+// for the metric unit tests and for call sites that have no live-run context to
+// consult. Hot-path call sites use outcomeForCtx so a run-end cancellation is not
+// miscounted as a head collapse.
+func outcomeFor(err error) rpcOutcome {
+	return outcomeForCtx(nil, err)
 }
 
 // errNotRegistered is returned when a volunteer fails to register.

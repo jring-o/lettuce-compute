@@ -109,6 +109,7 @@ type dispatchCacheConfig struct {
 	lowWatermark            int
 	refillBatchSize         int
 	admissionCap            int
+	maintenanceAdmissionCap int
 	flushInterval           time.Duration
 	flushBatchSize          int
 	leaseSeconds            int
@@ -187,8 +188,24 @@ type dispatchCache struct {
 	identityMu    sync.Mutex
 	identityCache map[types.ID]*volunteerIdentity
 
-	// admission bounds concurrent dispatch-cache DB operations.
+	// admission bounds concurrent CLIENT write-path dispatch-cache DB operations
+	// (StartWork / SubmitResult / AbandonWorkUnit gates, the RequestWorkUnit
+	// cold-miss identity read, getLeaf, resolveIdentity). See maintenanceAdmission
+	// for the SEPARATE background-restock budget.
 	admission chan struct{}
+	// maintenanceAdmission is a SEPARATE, reserved admission budget for background
+	// restock/landing ops (the refiller's fetchAndStage, the ticker flusher's
+	// reservation-flush, and the spot-check flush) so a client write storm holding
+	// the client `admission` budget cannot starve cache restock (FIX 4). It is a
+	// brand-new channel pulled ONLY by the refiller + flusher goroutines, which
+	// never simultaneously hold the client `admission` slot — and the held-slot path
+	// (flushAllPendingHeld, called while StartWork holds a client slot) does NOT
+	// touch it — so it cannot reintroduce the cap-1 self-deadlock.
+	maintenanceAdmission chan struct{}
+	// scanCount is a TEST-ONLY counter incremented once per ready-pool candidate
+	// VISITED by HandOut, used to assert the FIX-1 early-exit stops scanning the pool
+	// once n reservations are taken. It carries no production behavior.
+	scanCount int
 	// refillSignal nudges the refiller when a hand-out drains the pool.
 	refillSignal chan struct{}
 	// leafRefillSignal nudges the refiller to do an ON-DEMAND, LEAF-SCOPED refill
@@ -225,19 +242,28 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 	if cfg.flushBatchSize <= 0 {
 		cfg.flushBatchSize = 200
 	}
+	if cfg.maintenanceAdmissionCap <= 0 {
+		// Default a reserved background budget of a quarter of the client budget so
+		// client writers cannot starve restock; always >= 1.
+		cfg.maintenanceAdmissionCap = cfg.admissionCap / 4
+		if cfg.maintenanceAdmissionCap < 1 {
+			cfg.maintenanceAdmissionCap = 1
+		}
+	}
 	return &dispatchCache{
-		cfg:                cfg,
-		deps:               deps,
-		logger:             logger,
-		now:                time.Now,
-		reservedInMem:      make(map[types.ID]map[types.ID]time.Time),
-		inflight:           make(map[types.ID]int),
-		leafCache:          make(map[types.ID]*leaf.Leaf),
-		identityCache:      make(map[types.ID]*volunteerIdentity),
-		admission:          make(chan struct{}, cfg.admissionCap),
-		refillSignal:       make(chan struct{}, 1),
-		leafRefillSignal:   make(chan struct{}, 1),
-		pendingLeafRefills: make(map[types.ID]struct{}),
+		cfg:                  cfg,
+		deps:                 deps,
+		logger:               logger,
+		now:                  time.Now,
+		reservedInMem:        make(map[types.ID]map[types.ID]time.Time),
+		inflight:             make(map[types.ID]int),
+		leafCache:            make(map[types.ID]*leaf.Leaf),
+		identityCache:        make(map[types.ID]*volunteerIdentity),
+		admission:            make(chan struct{}, cfg.admissionCap),
+		maintenanceAdmission: make(chan struct{}, cfg.maintenanceAdmissionCap),
+		refillSignal:         make(chan struct{}, 1),
+		leafRefillSignal:     make(chan struct{}, 1),
+		pendingLeafRefills:   make(map[types.ID]struct{}),
 	}
 }
 
@@ -270,6 +296,36 @@ func (c *dispatchCache) acquire(ctx context.Context) (func(), bool) {
 	select {
 	case c.admission <- struct{}{}:
 		return func() { <-c.admission }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+// maintenanceAdmissionSaturated reports whether the maintenance admission budget is
+// currently full (FIX 4).
+func (c *dispatchCache) maintenanceAdmissionSaturated() bool {
+	return len(c.maintenanceAdmission) >= cap(c.maintenanceAdmission)
+}
+
+// tryAcquireMaintenance attempts to take a maintenance admission slot without
+// blocking. Returns a release func and true on success (FIX 4).
+func (c *dispatchCache) tryAcquireMaintenance() (func(), bool) {
+	select {
+	case c.maintenanceAdmission <- struct{}{}:
+		return func() { <-c.maintenanceAdmission }, true
+	default:
+		return nil, false
+	}
+}
+
+// acquireMaintenance blocks (until ctx is done) for a maintenance admission slot.
+// Used by background restock/landing ops (refiller fetchAndStage, ticker
+// reservation-flush, spot-check flush) so a client write storm holding the client
+// `admission` budget cannot starve them (FIX 4).
+func (c *dispatchCache) acquireMaintenance(ctx context.Context) (func(), bool) {
+	select {
+	case c.maintenanceAdmission <- struct{}{}:
+		return func() { <-c.maintenanceAdmission }, true
 	case <-ctx.Done():
 		return nil, false
 	}
@@ -340,12 +396,22 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	c.mu.Lock()
 	kept := c.ready[:0]
 	taken := 0
-	for i := range c.ready {
+	// FIX 1: scan front-to-back, but STOP scanning once n reservations are taken and
+	// splice the unscanned tail back in one append (below), instead of copying every
+	// trailing element tail-into-kept under the global lock (the O(pool) latency
+	// cliff). `kept` aliases c.ready's backing array; an element is DROPPED only when
+	// accepted-and-exhausted, never inserted ahead of the read cursor, so len(kept)
+	// <= i always and the tail-splice is a safe forward-overlapping copy with no
+	// realloc (len(kept)+len(tail) <= len(c.ready) <= cap). A fully-ineligible or
+	// tightly leaf-filtered request that never reaches n legitimately scans to the
+	// end (i == len(c.ready)); that O(pool) corner is accepted/rare per the directive.
+	i := 0
+	for ; i < len(c.ready); i++ {
 		cand := c.ready[i]
 		if taken >= n {
-			kept = append(kept, cand)
-			continue
+			break
 		}
+		c.scanCount++ // TEST-ONLY: count candidates actually visited (FIX-1 early-exit probe).
 		if !c.eligibleLocked(volunteerID, opts, cand) {
 			kept = append(kept, cand)
 			continue
@@ -413,7 +479,11 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			kept = append(kept, cand)
 		}
 	}
-	c.ready = kept
+	// Splice the unscanned tail [i:] back. When the loop ran to completion (n never
+	// reached) i == len(c.ready) and the tail is empty, degenerating to the old
+	// full-compaction result. kept aliases c.ready's backing array and len(kept) <= i,
+	// so this forward-overlapping append never reallocates and Go's copy handles it.
+	c.ready = append(kept, c.ready[i:]...)
 	readyNonEmpty := len(c.ready) > 0
 	drained = len(c.ready) < c.cfg.lowWatermark
 	c.mu.Unlock()
@@ -529,6 +599,48 @@ func (c *dispatchCache) releaseInMemLocked(unitID, volunteerID types.ID) {
 		if c.inflight[volunteerID] == 0 {
 			delete(c.inflight, volunteerID)
 		}
+	}
+	// MINOR: when an in-memory hold is VOIDED (flush conflict, un-buildable leaf, or
+	// a buffered-abandon's ClearReservation), purge any STILL-QUEUED pending
+	// reservation / spot-check write for this (unit, volunteer) so a late flush
+	// cannot re-stamp a reservation onto a unit whose hold was just dropped (and, for
+	// abandon, already requeued). Done under the same mu as the hold drop so there is
+	// no window where the hold is gone but the queued write survives.
+	c.purgePendingForLocked(unitID, volunteerID)
+}
+
+// purgePendingForLocked drops any queued reservation / spot-check write for
+// (unitID, volunteerID) so a late flush cannot re-stamp a reservation onto a unit
+// whose in-memory hold was just voided. Caller holds mu. (Forward-overlapping
+// in-place compaction, the same safe pattern as FIX 1's tail-splice: the write
+// cursor never overtakes the read cursor.)
+//
+// This closes the re-stamp window only for entries STILL QUEUED here; an entry
+// already snapshotted into an in-flight flushBatch (copied under mu, written outside
+// the lock) cannot be recalled. For the buffered-abandon path that residual window
+// is backstopped by the prior ClearReservation in PG (cleared BEFORE releaseInMem),
+// so a late landed reservation on the already-cleared/requeued unit is a no-op
+// conflict (not returned by FlushReservations), never a double-reserve.
+func (c *dispatchCache) purgePendingForLocked(unitID, volunteerID types.ID) {
+	if len(c.pendingWrites) > 0 {
+		w := c.pendingWrites[:0]
+		for _, r := range c.pendingWrites {
+			if r.WorkUnitID == unitID && r.VolunteerID == volunteerID {
+				continue
+			}
+			w = append(w, r)
+		}
+		c.pendingWrites = w
+	}
+	if len(c.pendingSpotChecks) > 0 {
+		s := c.pendingSpotChecks[:0]
+		for _, r := range c.pendingSpotChecks {
+			if r.workUnitID == unitID && r.volunteerID == volunteerID {
+				continue
+			}
+			s = append(s, r)
+		}
+		c.pendingSpotChecks = s
 	}
 }
 
@@ -745,6 +857,12 @@ func (c *dispatchCache) runRefiller(ctx context.Context, tick time.Duration) {
 	defer ticker.Stop()
 	// Prime the pool immediately on start.
 	c.refillOnce(ctx)
+	// FIX 4 observability: count consecutive ticks where the ready pool sits below the
+	// low watermark and emit a rate-limited warning. This is the refill-starvation
+	// probe the operator currently lacks (the refiller logs nothing after "starting")
+	// and doubles as the FIX-4 acceptance signal.
+	const lowTickLogEvery = 8 // ~2s at the default 250ms tick
+	consecutiveLowTicks := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -755,6 +873,19 @@ func (c *dispatchCache) runRefiller(ctx context.Context, tick time.Duration) {
 			// Service any pending leaf-scoped requests on the tick too, so a starved
 			// leaf is unblocked even if its signal was coalesced away.
 			c.leafRefillOnce(ctx)
+			if c.readyLen() < c.cfg.lowWatermark {
+				consecutiveLowTicks++
+				if consecutiveLowTicks%lowTickLogEvery == 1 {
+					c.logger.Warn("dispatch cache: ready pool below low watermark",
+						"ready_len", c.readyLen(),
+						"low_watermark", c.cfg.lowWatermark,
+						"client_admission_inflight", len(c.admission),
+						"maintenance_admission_inflight", len(c.maintenanceAdmission),
+						"consecutive_low_ticks", consecutiveLowTicks)
+				}
+			} else {
+				consecutiveLowTicks = 0
+			}
 		case <-c.refillSignal:
 			c.refillOnce(ctx)
 		case <-c.leafRefillSignal:
@@ -826,7 +957,9 @@ func (c *dispatchCache) leafRefillOnce(ctx context.Context) {
 func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, leafIDs []types.ID) {
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 	defer cancel()
-	release, ok := c.acquire(dbCtx)
+	// FIX 4: restock pulls from the SEPARATE maintenance budget so a client write
+	// storm holding the client `admission` slots cannot starve cache refill.
+	release, ok := c.acquireMaintenance(dbCtx)
 	if !ok {
 		return // admission/ctx timeout: shed the refill, retry next tick
 	}
@@ -976,7 +1109,12 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 	defer cancel()
 	if acquireAdmission {
-		release, ok := c.acquire(dbCtx)
+		// FIX 4: the ticker flusher's reservation-flush pulls from the SEPARATE
+		// maintenance budget so a client write storm cannot starve reservation
+		// landing. The held-slot path (flushAllPendingHeld, acquireAdmission=false,
+		// called while StartWork holds a CLIENT slot) acquires nothing here, so the
+		// cap-1 anti-deadlock is untouched.
+		release, ok := c.acquireMaintenance(dbCtx)
 		if !ok {
 			// Could not get an admission slot: requeue the batch so it is not dropped.
 			c.requeueWrites(batch)
@@ -1052,7 +1190,12 @@ func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 
 	for _, sc := range batch {
 		dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
-		release, ok := c.acquire(dbCtx)
+		// FIX 4: the spot-check landing (MarkSpotCheck + StampReservation + history
+		// row) is part of the flusher goroutine and is correctness-bearing for
+		// spot-check deferral, so it pulls from the SEPARATE maintenance budget. After
+		// FIX 3, Submit/Abandon hold heavier client slots; leaving this on the client
+		// budget would let a write storm starve spot-check landing MORE than at HEAD.
+		release, ok := c.acquireMaintenance(dbCtx)
 		if !ok {
 			cancel()
 			c.requeueSpotChecks([]spotCheckWrite{sc})

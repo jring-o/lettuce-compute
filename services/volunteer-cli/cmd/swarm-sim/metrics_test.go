@@ -23,6 +23,7 @@ func TestOutcomeForClassifiesOverloadSignals(t *testing.T) {
 		{"resource exhausted is graceful shed", status.Error(codes.ResourceExhausted, "shed"), outcomeThrottled},
 		{"deadline exceeded is collapse", status.Error(codes.DeadlineExceeded, "context deadline exceeded"), outcomeCollapse},
 		{"unavailable is collapse", status.Error(codes.Unavailable, "connection refused"), outcomeCollapse},
+		{"canceled is run-end artifact", status.Error(codes.Canceled, "context canceled"), outcomeCanceled},
 		{"internal is plain error", status.Error(codes.Internal, "boom"), outcomeError},
 		{"failed precondition is plain error", status.Error(codes.FailedPrecondition, "no active assignment"), outcomeError},
 	}
@@ -30,6 +31,41 @@ func TestOutcomeForClassifiesOverloadSignals(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := outcomeFor(tt.err); got != tt.want {
 				t.Fatalf("outcomeFor(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestOutcomeForCtxExcludesRunEndFalsePositive pins the collapse-flag
+// false-positive guard: a client-side Canceled/DeadlineExceeded observed while
+// the simulation's OWN context is already done is a benign run-end artifact
+// (outcomeCanceled), NOT a head DB-pool collapse. The same code while the run is
+// still live IS a collapse. This is what stops a run-end deadline burst (or a
+// per-call timeout firing from mere head lock-slowness as the run winds down)
+// from falsely tripping the DoD collapse flag.
+func TestOutcomeForCtxExcludesRunEndFalsePositive(t *testing.T) {
+	liveCtx := context.Background()
+	doneCtx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the run ending
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want rpcOutcome
+	}{
+		{"deadline while run live is collapse", liveCtx, status.Error(codes.DeadlineExceeded, "context deadline exceeded"), outcomeCollapse},
+		{"deadline at run end is benign cancel", doneCtx, status.Error(codes.DeadlineExceeded, "context deadline exceeded"), outcomeCanceled},
+		{"canceled while run live is still cancel", liveCtx, status.Error(codes.Canceled, "context canceled"), outcomeCanceled},
+		{"canceled at run end is benign cancel", doneCtx, status.Error(codes.Canceled, "context canceled"), outcomeCanceled},
+		{"unavailable while run live is collapse", liveCtx, status.Error(codes.Unavailable, "connection refused"), outcomeCollapse},
+		{"unavailable at run end is still collapse", doneCtx, status.Error(codes.Unavailable, "connection refused"), outcomeCollapse},
+		{"resource exhausted at run end is still shed", doneCtx, status.Error(codes.ResourceExhausted, "shed"), outcomeThrottled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := outcomeForCtx(tt.ctx, tt.err); got != tt.want {
+				t.Fatalf("outcomeForCtx(ctxErr=%v, %v) = %v, want %v", tt.ctx.Err(), tt.err, got, tt.want)
 			}
 		})
 	}
@@ -73,6 +109,39 @@ func TestBuildReportOverloadSignals(t *testing.T) {
 		}
 		if rep.CollapseCount != 2 {
 			t.Fatalf("CollapseCount = %d, want 2", rep.CollapseCount)
+		}
+	})
+
+	t.Run("run-end cancel on RequestWorkUnit does not flag collapse", func(t *testing.T) {
+		// The known false-positive: in-flight RequestWorkUnit calls cancelled at run
+		// shutdown (or client-side deadlines from mere head lock-slowness) must NOT
+		// trip the collapse flag. They are recorded as Canceled, separate from the
+		// true head-side collapse signal.
+		m := newMetrics()
+		m.record(rpcRequestWorkUnit, time.Millisecond, outcomeOK)
+		for i := 0; i < 5; i++ {
+			m.record(rpcRequestWorkUnit, time.Millisecond, outcomeCanceled)
+		}
+		rep := m.buildReport("request-only", 10, 10*time.Second)
+
+		if rep.Collapsed {
+			t.Fatalf("Collapsed = true, want false (cancellations are a benign run-end artifact)")
+		}
+		if rep.CollapseCount != 0 {
+			t.Fatalf("CollapseCount = %d, want 0", rep.CollapseCount)
+		}
+		// The cancellations are surfaced on the RequestWorkUnit row, not as errors.
+		var rwu rpcReport
+		for _, r := range rep.RPCs {
+			if r.RPC == rpcRequestWorkUnit.String() {
+				rwu = r
+			}
+		}
+		if rwu.Canceled != 5 {
+			t.Fatalf("RequestWorkUnit Canceled = %d, want 5", rwu.Canceled)
+		}
+		if rwu.Errors != 0 {
+			t.Fatalf("RequestWorkUnit Errors = %d, want 0 (cancellations are not errors)", rwu.Errors)
 		}
 	})
 

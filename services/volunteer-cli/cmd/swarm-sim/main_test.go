@@ -2,9 +2,10 @@ package main
 
 import "testing"
 
-// TestParseFlagsProfiles asserts the three supported profiles parse and that an
-// unknown profile is rejected. The overload profile is the Layer 2 saturation
-// driver; it must be accepted alongside naive and buffered.
+// TestParseFlagsProfiles asserts the supported profiles parse and that an unknown
+// profile is rejected. The overload profile is the Layer 2 saturation driver and
+// request-only is its HandOut-isolation probe; both must be accepted alongside
+// naive and buffered.
 func TestParseFlagsProfiles(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -14,6 +15,7 @@ func TestParseFlagsProfiles(t *testing.T) {
 		{"naive ok", []string{"--profile", "naive"}, false},
 		{"buffered ok", []string{"--profile", "buffered"}, false},
 		{"overload ok", []string{"--profile", "overload"}, false},
+		{"request-only ok", []string{"--profile", "request-only"}, false},
 		{"unknown rejected", []string{"--profile", "bogus"}, true},
 	}
 	for _, tt := range tests {

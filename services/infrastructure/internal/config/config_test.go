@@ -668,6 +668,42 @@ func TestHeadDispatchEnvOverrides(t *testing.T) {
 	}
 }
 
+// TestHeadMaintenanceAdmissionCap exercises the FIX-4 maintenance-admission knob:
+// the Effective accessor returns 0 to derive (default and negative), a positive
+// value verbatim; the env override threads through Load; Validate rejects negative.
+func TestHeadMaintenanceAdmissionCap(t *testing.T) {
+	var zero HeadConfig
+	if got := zero.EffectiveMaintenanceAdmissionCap(); got != 0 {
+		t.Errorf("zero MaintenanceAdmissionCap should derive (return 0), got %d", got)
+	}
+	neg := HeadConfig{MaintenanceAdmissionCap: -1}
+	if got := neg.EffectiveMaintenanceAdmissionCap(); got != 0 {
+		t.Errorf("negative MaintenanceAdmissionCap should return 0 to derive, got %d", got)
+	}
+	pos := HeadConfig{MaintenanceAdmissionCap: 7}
+	if got := pos.EffectiveMaintenanceAdmissionCap(); got != 7 {
+		t.Errorf("explicit MaintenanceAdmissionCap should be returned verbatim, got %d", got)
+	}
+
+	// Validate rejects a negative value.
+	bad := HeadConfig{Name: "x", MaintenanceAdmissionCap: -5}
+	if err := bad.Validate(); err == nil {
+		t.Errorf("Validate should reject negative maintenance_admission_cap")
+	}
+
+	// Env override threads through Load.
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_MAINTENANCE_ADMISSION_CAP", "9")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Head.MaintenanceAdmissionCap != 9 {
+		t.Errorf("MaintenanceAdmissionCap = %d, want 9", cfg.Head.MaintenanceAdmissionCap)
+	}
+}
+
 func TestHeadEnvOverrides(t *testing.T) {
 	clearLettuceEnv(t)
 	path := writeTestConfig(t, `head: { name: "from-yaml" }`)

@@ -64,10 +64,18 @@ type HeadConfig struct {
 	// RefillBatchSize is how many units one bulk refill (LIMIT N) pulls from
 	// Postgres. Default 500.
 	RefillBatchSize int `yaml:"refill_batch_size"`
-	// DispatchAdmissionCap bounds concurrent dispatch-cache DB operations (refill,
-	// flush, spot-check mark, StartWork, SubmitResult) so the pool cannot saturate.
-	// Default max(1, MaxConns/2); 0 = derive from the pool.
+	// DispatchAdmissionCap bounds concurrent CLIENT write-path dispatch-cache DB
+	// operations — StartWork / SubmitResult / AbandonWorkUnit gates, the
+	// RequestWorkUnit cold-miss identity read, getLeaf, resolveIdentity — so the pool
+	// cannot saturate. The background refiller, ticker reservation-flush, and
+	// spot-check landing run on the SEPARATE MaintenanceAdmissionCap budget so client
+	// writers cannot starve cache restock. Default max(1, MaxConns/2); 0 = derive
+	// from the pool.
 	DispatchAdmissionCap int `yaml:"dispatch_admission_cap"`
+	// MaintenanceAdmissionCap is the reserved admission budget for background restock
+	// + landing (refiller, ticker reservation-flush, spot-check flush) so client
+	// writes cannot starve them. Default max(1, dispatch_admission_cap/4); 0 = derive.
+	MaintenanceAdmissionCap int `yaml:"maintenance_admission_cap"`
 	// FlushIntervalMs is the async reservation-flush cadence (milliseconds).
 	// Default 100.
 	FlushIntervalMs int `yaml:"flush_interval_ms"`
@@ -168,6 +176,9 @@ func (h HeadConfig) Validate() error {
 	if h.DispatchAdmissionCap < 0 {
 		return fmt.Errorf("head.dispatch_admission_cap must be >= 0, got %d", h.DispatchAdmissionCap)
 	}
+	if h.MaintenanceAdmissionCap < 0 {
+		return fmt.Errorf("head.maintenance_admission_cap must be >= 0, got %d", h.MaintenanceAdmissionCap)
+	}
 	if h.FlushIntervalMs < 0 {
 		return fmt.Errorf("head.flush_interval_ms must be >= 0, got %d", h.FlushIntervalMs)
 	}
@@ -264,6 +275,15 @@ func (h HeadConfig) EffectiveDispatchAdmissionCap() int {
 		return 0
 	}
 	return h.DispatchAdmissionCap
+}
+
+// EffectiveMaintenanceAdmissionCap returns the configured reserved maintenance
+// admission budget, or 0 to let the caller derive it (max(1, admissionCap/4)).
+func (h HeadConfig) EffectiveMaintenanceAdmissionCap() int {
+	if h.MaintenanceAdmissionCap < 0 {
+		return 0
+	}
+	return h.MaintenanceAdmissionCap
 }
 
 // EffectiveFlushIntervalMs returns the async flush cadence in ms, default 100.

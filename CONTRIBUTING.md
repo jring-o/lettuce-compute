@@ -159,11 +159,31 @@ HTTP admin API, runs for a fixed duration, and prints a metrics report.
   `RequestWorkUnit`). By default the profile ignores sheds and re-requests
   immediately (maximal pressure); pass `--honor-shed` to back off like a real
   client.
+- **`request-only`** — a supplementary **HandOut-isolation probe**: `overload`'s
+  hot `RequestWorkUnit` loop with **no** `StartWork`/`SubmitResult` (no
+  pretend-compute), so it measures the pure server-side *dispatch cache* HandOut
+  path — the lock/scan ceiling and head-side `RequestWorkUnit` p50/p99 vs
+  concurrency — with zero write-path noise. It is how the FIX-1 lock-cliff
+  removal is read in isolation. **It reserves units without recycling them, so it
+  MUST be run against a generously primed ready pool and a short `--duration`**
+  (large head `ready_pool_size` + `refill_batch_size` and a high `--seed-units`),
+  or once the pool drains it just measures the `readyLen==0`+admission-saturated
+  shed branch instead of the HandOut win. The **headline** FIX-1 number still
+  comes from the `overload` before/after comparison (where units recycle via
+  `StartWork` and keep the pool primed); `request-only` is a supplementary probe.
 
 Run-start is the explicit `StartWork` RPC (one call per unit actually executed,
 **not** per request); there is no per-task heartbeat, so liveness is
-deadline-based. The report's per-RPC table shows `StartWork` and a `collaps`
-column alongside `throttl`.
+deadline-based. The report's per-RPC table shows `StartWork`, a `throttl`
+(`ResourceExhausted` graceful shed) column, a `collaps` column (**true** head-side
+DB-pool collapse: a head-side `DeadlineExceeded`/`Unavailable` while the run is
+live), and a `cancel` column. **`cancel` is the known false-positive guard:** an
+in-flight RPC cancelled at run shutdown — or a client-side `DeadlineExceeded` from
+mere head lock-slowness as the run winds down — is recorded as `cancel`, **not**
+`collaps`, so it does not falsely trip the DoD collapse flag. Read write-path
+shedding (FIX 2/3) from the `StartWork`/`SubmitResult` rows' `throttl`>0 with
+`collaps`==0 — **not** from the RWU-only `collapsed` headline flag / `shed_ratio`,
+which are keyed only on `RequestWorkUnit` by design.
 
 ### Seeding
 
@@ -257,6 +277,39 @@ Two head-side knobs are required for a meaningful ceiling run:
 Run the overload profile **before** and **after** the Layer 2 changes to compare
 `peak_dispatch_per_sec` against the ~240/s baseline and to confirm `collapsed`
 flips from `true` (pre-Layer-2 pool collapse) to `false` (graceful shedding).
+
+For the perf-hardening pass, run `--profile=overload` at **20/100/200/500/1000**
+volunteers before vs after, comparing the per-RPC `RequestWorkUnit` p50/p99 and
+`peak_dispatch_per_sec`: the headline FIX-1 result is that the head-side
+`RequestWorkUnit` latency cliff under a concurrent storm (the old
+sub-ms@20 → hundreds-of-ms@500 climb) is materially reduced, with `RequestWorkUnit`
+still off Postgres (`collapsed`=`false`). Write-path shedding (FIX 2/3) is read
+from the `StartWork`/`SubmitResult` rows' `throttl`>0, `collaps`==0 — confirm the
+head returns `ResourceExhausted` instead of logging `context deadline exceeded`.
+
+#### HandOut-isolation run (FIX-1 lock cliff, write path excluded)
+
+To isolate the pure HandOut path from the write path, run the `request-only`
+probe against a **generously primed** ready pool and a **short** duration so the
+numbers are the contended HandOut, not the drained-pool shed branch:
+
+```bash
+# Head launched with a large primed pool, e.g.:
+#   LETTUCE_HEAD_READY_POOL_SIZE=20000 LETTUCE_HEAD_REFILL_BATCH_SIZE=5000 \
+#   LETTUCE_GRPC_PER_IP_RATE_LIMIT=100000000 LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT=100000000 \
+#   LETTUCE_DB_MAX_CONNS=60 ...other env... lettuce-server --config ...
+go run ./cmd/swarm-sim \
+  --head-grpc=127.0.0.1:9090 --head-http=http://127.0.0.1:8080 \
+  --admin-key=$LETTUCE_ADMIN_API_KEY --creator-id=<admin-user-id> \
+  --volunteers=500 --profile=request-only --duration=15s \
+  --seed-leaf=swarm-handout --seed-units=300000 --report=json
+```
+
+Read the `RequestWorkUnit` row's p50/p99 vs volunteer count (sweep 20/100/200/500)
+as the pure HandOut latency curve. If the run reports a high `shed_ratio` or many
+`RequestWorkUnit` sheds, the pool drained — raise `--seed-units` /
+`ready_pool_size` / `refill_batch_size` or shorten `--duration` and re-run, since
+a drained pool measures the shed branch, not the HandOut win.
 
 ### Per-client rate limiting note
 

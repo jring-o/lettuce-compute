@@ -243,6 +243,13 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.DispatchAdmissionCap = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_MAINTENANCE_ADMISSION_CAP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAINTENANCE_ADMISSION_CAP must be an integer: %w", err)
+		}
+		cfg.Head.MaintenanceAdmissionCap = n
+	}
 	if v := os.Getenv("LETTUCE_HEAD_FLUSH_INTERVAL_MS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

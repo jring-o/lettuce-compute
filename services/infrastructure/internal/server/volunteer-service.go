@@ -134,11 +134,12 @@ type HeadDispatchConfig struct {
 	TargetRequestRatePerSec float64
 
 	// --- Layer 2: dispatch-cache knobs ---
-	ReadyPoolSize        int
-	RefillBatchSize      int
-	DispatchAdmissionCap int // 0 = derive max(1, MaxConns/2) from the pool
-	FlushIntervalMs      int
-	FlushBatchSize       int
+	ReadyPoolSize           int
+	RefillBatchSize         int
+	DispatchAdmissionCap    int // 0 = derive max(1, MaxConns/2) from the pool
+	MaintenanceAdmissionCap int // 0 = derive max(1, admissionCap/4)
+	FlushIntervalMs         int
+	FlushBatchSize          int
 }
 
 // SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
@@ -215,10 +216,22 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	}
 	flushInterval := time.Duration(defaultInt(s.dispatchCfg.FlushIntervalMs, 100)) * time.Millisecond
 
+	// FIX 4: derive the reserved maintenance budget (refiller + ticker
+	// reservation-flush + spot-check landing) as max(1, admissionCap/4) when not set,
+	// so client writers cannot starve cache restock.
+	maintCap := s.dispatchCfg.MaintenanceAdmissionCap
+	if maintCap <= 0 {
+		maintCap = admissionCap / 4
+		if maintCap < 1 {
+			maintCap = 1
+		}
+	}
+
 	cfg := dispatchCacheConfig{
 		readyPoolSize:           s.dispatchCfg.ReadyPoolSize,
 		refillBatchSize:         s.dispatchCfg.RefillBatchSize,
 		admissionCap:            admissionCap,
+		maintenanceAdmissionCap: maintCap,
 		flushInterval:           flushInterval,
 		flushBatchSize:          s.dispatchCfg.FlushBatchSize,
 		leaseSeconds:            s.leaseSeconds,
@@ -235,7 +248,10 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	go cache.runRefiller(ctx, defaultRefillTickInterval)
 	go cache.runFlusher(ctx)
 	go cache.runReconciler(ctx, defaultReconcileInterval)
-	s.logger.Info("dispatch cache started", "admission_cap", admissionCap, "single_replica", true)
+	s.logger.Info("dispatch cache started",
+		"admission_cap", admissionCap,
+		"maintenance_admission_cap", maintCap,
+		"single_replica", true)
 }
 
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
@@ -866,24 +882,13 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.InvalidArgument, "public_key must be exactly 32 bytes, got %d", len(req.PublicKey))
 	}
 
-	// Authenticated identity (cryptographically proven by the request signature).
-	authedKey, ok := GRPCAuthPublicKeyFromContext(ctx)
-	if !ok {
-		return nil, status.Errorf(codes.Unauthenticated, "request is not authenticated")
-	}
-
-	// Verify volunteer exists and bind the proven identity to it.
-	vol, err := s.volunteerRepo.GetByID(ctx, volunteerID)
-	if err != nil {
-		apiErr, ok := err.(*apierror.APIError)
-		if ok && apiErr.HTTPStatus == 404 {
-			return nil, status.Errorf(codes.NotFound, "volunteer not found")
-		}
-		s.logger.Error("failed to look up volunteer", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	if !bytes.Equal(vol.PublicKey, authedKey) {
-		return nil, status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
+	// FIX 2: bind the cryptographically proven identity to the volunteer via the
+	// admission-bounded identity snapshot (warm = no pool touch), replacing the
+	// inline UNBOUNDED s.volunteerRepo.GetByID that collapsed the pool under a submit
+	// storm. Runs BEFORE the FIX-3 shed gate so resolveIdentity's own cold-miss
+	// acquire never overlaps the handler's held slot.
+	if err := s.resolveAuthedVolunteer(ctx, volunteerID, "SubmitResult"); err != nil {
+		return nil, err
 	}
 
 	// Validate output data: at least one of output_data or output_data_url required.
@@ -911,6 +916,25 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	}
 	if req.Metadata.WallClockSeconds <= 0 {
 		return nil, status.Errorf(codes.InvalidArgument, "metadata.wall_clock_seconds must be > 0")
+	}
+
+	// FIX 3 — GRACEFUL SHEDDING: bound SubmitResult's DB work by the dispatch
+	// admission semaphore + a short shed ctx so a submit storm fails fast
+	// (ResourceExhausted) instead of collapsing the pool. Placed after the cheap,
+	// pool-free validation and AFTER the bounded auth (FIX 2) — immediately before the
+	// first pool touch. ctx is reassigned so every subsequent DB call (size-check
+	// GetByID, pool.Begin, FindActive..., the COMPLETED tx, onUnitDone) runs on the
+	// bounded shedCtx. The !ok return happens BEFORE any pool.Begin/GetByID, so a shed
+	// never opens a tx or grabs a connection. Mirrors StartWork.
+	if s.dispatchCache != nil {
+		shedCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+		defer cancel()
+		release, ok := s.dispatchCache.acquire(shedCtx)
+		if !ok {
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry SubmitResult")
+		}
+		defer release()
+		ctx = shedCtx
 	}
 
 	// M3: enforce the leaf's researcher-configured per-result output cap on the
@@ -1460,9 +1484,27 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		return nil, status.Errorf(codes.InvalidArgument, "invalid volunteer_id: %v", err)
 	}
 
-	// Bind the authenticated identity to the volunteer being acted on.
+	// Bind the authenticated identity to the volunteer being acted on (FIX 2: bounded).
 	if err := s.requireAuthedVolunteer(ctx, volunteerID, "AbandonWorkUnit"); err != nil {
 		return nil, err
+	}
+
+	// FIX 3 — GRACEFUL SHEDDING: bound AbandonWorkUnit's DB work by the dispatch
+	// admission semaphore + a short shed ctx so an abandon storm fails fast
+	// (ResourceExhausted) instead of collapsing the pool. Placed after bounded auth,
+	// immediately before the first pool touch (FindActiveByWorkUnitAndVolunteer). ctx
+	// is reassigned so both the buffered branch (ClearReservation + releaseInMem) and
+	// the active branch (UpdateOutcome, TransitionToExpired, Reassign, onUnitDone) run
+	// on the bounded shedCtx. The !ok return happens BEFORE any pool touch.
+	if s.dispatchCache != nil {
+		shedCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+		defer cancel()
+		release, ok := s.dispatchCache.acquire(shedCtx)
+		if !ok {
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry AbandonWorkUnit")
+		}
+		defer release()
+		ctx = shedCtx
 	}
 
 	// Find the active assignment for this volunteer + work unit.
@@ -1547,28 +1589,67 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	}, nil
 }
 
-// requireAuthedVolunteer verifies that the request was authenticated and that the
+// resolveAuthedVolunteer verifies that the request was authenticated and that the
 // cryptographically proven public key (set by the gRPC auth interceptor) matches the
 // public key on record for the volunteer identified by volunteerID. This binds the
-// proven identity to the volunteer being acted on. method is used only for logging.
-func (s *volunteerService) requireAuthedVolunteer(ctx context.Context, volunteerID types.ID, method string) error {
+// proven identity to the volunteer being acted on.
+//
+// FIX 2: it resolves the volunteer pubkey from the admission-bounded, shed-aware
+// identity snapshot (dispatchCache.resolveIdentity) instead of an UNBOUNDED
+// s.volunteerRepo.GetByID on the request ctx. In steady state (RegisterVolunteer
+// pre-warms the snapshot) this touches ZERO DB; only a cold miss reads Postgres, and
+// that read is bounded by the admission semaphore + a short shed timeout, so under a
+// write storm the write path SHEDS (ResourceExhausted) instead of saturating the DB
+// pool with "context deadline exceeded".
+//
+// Codes: Unauthenticated (no proven key), PermissionDenied (key mismatch), NotFound
+// (unknown volunteer) are preserved. NEW on a cold miss, intentionally matching the
+// RequestWorkUnit precedent: admission saturation OR a transient (non-404) DB error
+// both return ResourceExhausted (the transient case was previously Internal). This is
+// the whole point — the client backs off and the collapse vector is removed; do NOT
+// "fix" the transient case back to Internal.
+//
+// This resolution must run BEFORE / OUTSIDE any per-handler shed gate (resolveIdentity
+// acquires its OWN admission slot internally on a cold miss; a handler already holding
+// a slot could otherwise double-acquire and self-deadlock at a small admissionCap).
+// method is used only for logging.
+func (s *volunteerService) resolveAuthedVolunteer(ctx context.Context, volunteerID types.ID, method string) error {
 	authedKey, ok := GRPCAuthPublicKeyFromContext(ctx)
 	if !ok {
 		return status.Errorf(codes.Unauthenticated, "request is not authenticated")
 	}
-	vol, err := s.volunteerRepo.GetByID(ctx, volunteerID)
-	if err != nil {
-		apiErr, ok := err.(*apierror.APIError)
-		if ok && apiErr.HTTPStatus == 404 {
+	var pub []byte
+	if s.dispatchCache != nil {
+		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
+		if shed {
+			return status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
+		}
+		if notFound {
 			return status.Errorf(codes.NotFound, "volunteer not found")
 		}
-		s.logger.Error("failed to look up volunteer", "method", method, "error", err)
-		return status.Errorf(codes.Internal, "internal error")
+		pub = ident.publicKey
+	} else {
+		vol, err := s.volunteerRepo.GetByID(ctx, volunteerID)
+		if err != nil {
+			apiErr, ok := err.(*apierror.APIError)
+			if ok && apiErr.HTTPStatus == 404 {
+				return status.Errorf(codes.NotFound, "volunteer not found")
+			}
+			s.logger.Error("failed to look up volunteer", "method", method, "error", err)
+			return status.Errorf(codes.Internal, "internal error")
+		}
+		pub = vol.PublicKey
 	}
-	if !bytes.Equal(vol.PublicKey, authedKey) {
+	if !bytes.Equal(pub, authedKey) {
 		return status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
 	}
 	return nil
+}
+
+// requireAuthedVolunteer is a thin alias for resolveAuthedVolunteer (FIX 2), kept so
+// the StartWork / SaveCheckpoint / AbandonWorkUnit call sites are unchanged.
+func (s *volunteerService) requireAuthedVolunteer(ctx context.Context, volunteerID types.ID, method string) error {
+	return s.resolveAuthedVolunteer(ctx, volunteerID, method)
 }
 
 // derefString returns the dereferenced string or empty string if nil.

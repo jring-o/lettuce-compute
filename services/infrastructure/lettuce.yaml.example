@@ -111,9 +111,16 @@ head:
   # How many units one bulk refill pulls from Postgres.
   refill_batch_size: 500             # env: LETTUCE_HEAD_REFILL_BATCH_SIZE
 
-  # Bounds concurrent dispatch-cache database operations (refill, flush, run-start) so
-  # they cannot saturate the connection pool. 0 = derive max(1, db pool size / 2).
+  # Bounds concurrent CLIENT write-path dispatch-cache database operations (StartWork,
+  # SubmitResult, AbandonWorkUnit, the request cold-miss identity read) so they cannot
+  # saturate the connection pool. Background restock + landing use a SEPARATE budget,
+  # maintenance_admission_cap below. 0 = derive max(1, db pool size / 2).
   dispatch_admission_cap: 0          # env: LETTUCE_HEAD_DISPATCH_ADMISSION_CAP
+
+  # Reserved admission budget for background restock + landing (refiller,
+  # reservation-flush, spot-check landing) so a client write storm cannot starve cache
+  # restock. 0 = derive max(1, dispatch_admission_cap / 4).
+  maintenance_admission_cap: 0       # env: LETTUCE_HEAD_MAINTENANCE_ADMISSION_CAP
 
   # Async reservation-flush cadence (ms) and early-flush threshold (pending writes).
   flush_interval_ms: 100             # env: LETTUCE_HEAD_FLUSH_INTERVAL_MS

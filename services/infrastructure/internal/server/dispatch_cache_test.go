@@ -1031,3 +1031,323 @@ func TestFlushAllPendingHeldDoesNotAcquireAdmission(t *testing.T) {
 		t.Fatalf("pending queue should be drained, got %d", c.pendingWriteCount())
 	}
 }
+
+// --- FIX 1: HandOut early-exit / tail-splice ----------------------------------
+
+// TestHandOutEarlyExitStopsScanning stages a large all-eligible ready pool and asks
+// for n=1. The early-exit must stop scanning right after the single accepted
+// candidate (it visits the accepted unit, then breaks at the top of the next
+// iteration), leaving the rest of the pool intact and in FIFO order. This is the
+// FIX-1 latency-cliff guard: a hand-out is no longer O(pool).
+func TestHandOutEarlyExitStopsScanning(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+	c.cfg.readyPoolSize = 4000
+	c.cfg.lowWatermark = 1
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	const poolSize = 2000
+	frontID := types.NewID()
+	c.stageUnit(frontID, leafID, 1, 0) // FIFO front
+	for i := 1; i < poolSize; i++ {
+		c.stageUnit(types.NewID(), leafID, 1, 0)
+	}
+
+	vol := types.NewID()
+	results, _ := c.HandOut(vol, capableOpts(vol, 0), 1)
+	if len(results) != 1 {
+		t.Fatalf("expected exactly 1 hand-out, got %d", len(results))
+	}
+	// FIFO: the front (first-staged) unit is handed out.
+	if results[0].unit.ID != frontID {
+		t.Fatalf("FIFO priority broken: expected front unit handed out")
+	}
+	// Early-exit: only ONE candidate was visited (the accepted front unit); the loop
+	// broke at the top of the next iteration without scanning the rest.
+	if c.scanCount != 1 {
+		t.Fatalf("FIX-1 early-exit: expected scanCount==1 (n=1), got %d", c.scanCount)
+	}
+	// The unscanned tail is spliced back intact: pool drops by exactly the 1 taken.
+	if got := c.readyLen(); got != poolSize-1 {
+		t.Fatalf("expected ready pool %d after handing out 1, got %d", poolSize-1, got)
+	}
+}
+
+// TestHandOutLeafFilteredScansFully documents the accepted O(pool) corner: a request
+// tightly filtered to a leaf absent from the pool finds <n eligible candidates and
+// scans the WHOLE pool. Per the operator directive this is acceptable/rare; we do
+// NOT index by leaf.
+func TestHandOutLeafFilteredScansFully(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+
+	leafA := types.NewID()
+	leafB := types.NewID()
+	c.warm(nativeLeaf(leafA, 1, false, 0), leafRepo)
+	c.warm(nativeLeaf(leafB, 1, false, 0), leafRepo)
+	const poolSize = 50
+	for i := 0; i < poolSize; i++ {
+		c.stageUnit(types.NewID(), leafA, 1, 0)
+	}
+
+	vol := types.NewID()
+	opts := capableOpts(vol, 0)
+	opts.LeafIDs = []types.ID{leafB} // none of the pool matches
+	results, _ := c.HandOut(vol, opts, 1)
+	if len(results) != 0 {
+		t.Fatalf("leaf-B request should get nothing from a leaf-A pool, got %d", len(results))
+	}
+	// Found <n, so the loop ran to the end: the whole pool was visited.
+	if c.scanCount != poolSize {
+		t.Fatalf("a no-match leaf-filtered request should scan the whole pool, scanCount=%d want %d", c.scanCount, poolSize)
+	}
+	if c.readyLen() != poolSize {
+		t.Fatalf("no unit handed out: pool must be intact, got %d", c.readyLen())
+	}
+}
+
+// TestHandOutEarlyExitMultiTake asserts the splice is correct for n>1: it hands out
+// exactly n, visits n candidates (all eligible front-to-back), and the tail of
+// untouched candidates is spliced back so the pool count is exact.
+func TestHandOutEarlyExitMultiTake(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	const poolSize = 100
+	staged := make([]types.ID, 0, poolSize)
+	for i := 0; i < poolSize; i++ {
+		id := types.NewID()
+		staged = append(staged, id)
+		c.stageUnit(id, leafID, 1, 0)
+	}
+
+	vol := types.NewID()
+	const n = 5
+	results, _ := c.HandOut(vol, capableOpts(vol, 0), n)
+	if len(results) != n {
+		t.Fatalf("expected %d hand-outs, got %d", n, len(results))
+	}
+	// The first n (FIFO) units were handed out.
+	for i := 0; i < n; i++ {
+		if results[i].unit.ID != staged[i] {
+			t.Fatalf("FIFO broken at %d", i)
+		}
+	}
+	if c.scanCount != n {
+		t.Fatalf("expected to visit exactly n=%d candidates, got %d", n, c.scanCount)
+	}
+	if got := c.readyLen(); got != poolSize-n {
+		t.Fatalf("expected pool %d after handing out %d, got %d", poolSize-n, n, got)
+	}
+}
+
+// BenchmarkHandOutN1 measures the cost of HandOut(n=1) as the ready-pool size grows.
+// FIX-1 stops SCANNING (running eligibleLocked / the accept branch) after the single
+// accepted candidate, and splices the unscanned tail back in ONE bulk copy instead of
+// the old per-element append-the-tail loop. A FIFO front hand-out still shifts the
+// tail by `taken` positions (a single memmove — unavoidable without a ring-buffer
+// redesign, which the directive forbids), so per-op cost is not perfectly flat; the
+// win is the much lower constant factor of one memmove vs N per-element appends under
+// the global lock, which is what reduces the concurrency latency cliff. Run:
+// go test -bench BenchmarkHandOutN1 -benchmem.
+func BenchmarkHandOutN1(b *testing.B) {
+	for _, poolSize := range []int{100, 1000, 4000} {
+		poolSize := poolSize
+		b.Run("pool="+itoa(poolSize), func(b *testing.B) {
+			wuRepo := &fakeWURepo{}
+			leafRepo := &fakeLeafRepo{}
+			assignRepo := &fakeAssignRepo{}
+			c := newTestCache(wuRepo, leafRepo, assignRepo)
+			c.cfg.readyPoolSize = poolSize * 2
+			c.cfg.lowWatermark = 1
+			leafID := types.NewID()
+			c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				// Re-stage to a full pool each iteration so every op pays the scan cost
+				// against a pool of `poolSize` (HandOut removes the unit it takes).
+				c.mu.Lock()
+				c.ready = c.ready[:0]
+				for j := 0; j < poolSize; j++ {
+					c.ready = append(c.ready, candidate{
+						unit:                &workunit.WorkUnit{ID: types.NewID(), LeafID: leafID, State: workunit.WorkUnitStateQueued},
+						effectiveRedundancy: 1,
+					})
+				}
+				c.mu.Unlock()
+				vol := types.NewID()
+				b.StartTimer()
+				c.HandOut(vol, capableOpts(vol, 0), 1)
+			}
+		})
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+// --- FIX 4: maintenance admission budget --------------------------------------
+
+// TestMaintenanceBudgetNotStarvedByClient asserts that a FULLY saturated CLIENT
+// admission budget does NOT block the refiller's fetchAndStage: it acquires a
+// maintenance slot and stages units (the ready pool grows). This is the FIX-4
+// structural guarantee.
+func TestMaintenanceBudgetNotStarvedByClient(t *testing.T) {
+	leafID := types.NewID()
+	stagedID := types.NewID()
+	wuRepo := &fakeWURepo{
+		dispatchFn: func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
+			return []workunit.DispatchCandidate{{
+				WorkUnit:          &workunit.WorkUnit{ID: stagedID, LeafID: leafID, State: workunit.WorkUnitStateQueued},
+				LeafID:            leafID,
+				RedundancyFactor:  1,
+				ActiveAssignments: 0,
+			}}, nil
+		},
+	}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+
+	// Saturate the CLIENT admission budget entirely (a write storm holding all slots).
+	for i := 0; i < cap(c.admission); i++ {
+		c.admission <- struct{}{}
+	}
+	if !c.admissionSaturated() {
+		t.Fatalf("client admission should be saturated")
+	}
+
+	// Refill must still succeed via the SEPARATE maintenance budget.
+	c.refillOnce(context.Background())
+	if !c.readyContainsLockedTest(stagedID) {
+		t.Fatalf("FIX 4: refill must stage units even when the client admission budget is fully held")
+	}
+}
+
+// TestSpotCheckFlushUsesMaintenanceBudget asserts a fully-saturated CLIENT admission
+// budget does NOT block a spot-check flush from landing (MarkSpotCheck +
+// StampReservation + history row) — it runs on the maintenance budget (FIX 4). This
+// guards against the spot-check-deferral regression FIX 3 would otherwise introduce.
+func TestSpotCheckFlushUsesMaintenanceBudget(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, true, 100), leafRepo) // 100% spot-check
+	unitID := types.NewID()
+	c.stageUnit(unitID, leafID, 1, 0)
+
+	vol := types.NewID()
+	if r, _ := c.HandOut(vol, capableOpts(vol, 0), 1); len(r) != 1 {
+		t.Fatalf("spot-check hand-out failed")
+	}
+	c.mu.Lock()
+	nSpot := len(c.pendingSpotChecks)
+	c.mu.Unlock()
+	if nSpot != 1 {
+		t.Fatalf("expected 1 deferred spot-check, got %d", nSpot)
+	}
+
+	// Saturate the CLIENT admission budget; the spot-check flush must still land.
+	for i := 0; i < cap(c.admission); i++ {
+		c.admission <- struct{}{}
+	}
+	c.flushSpotChecksOnce(context.Background())
+	if assignRepo.createdCount() == 0 {
+		t.Fatalf("FIX 4: spot-check flush must land via the maintenance budget even with client admission full")
+	}
+}
+
+// TestMaintenanceCapDefaultDerives asserts newDispatchCache derives the maintenance
+// budget as max(1, admissionCap/4) when not explicitly set, and is always >= 1.
+func TestMaintenanceCapDefaultDerives(t *testing.T) {
+	c := newDispatchCache(dispatchCacheConfig{admissionCap: 12}, dispatchDeps{}, testLogger())
+	if got := cap(c.maintenanceAdmission); got != 3 {
+		t.Fatalf("admissionCap 12 should derive maintenance cap 3, got %d", got)
+	}
+	c2 := newDispatchCache(dispatchCacheConfig{admissionCap: 1}, dispatchDeps{}, testLogger())
+	if got := cap(c2.maintenanceAdmission); got != 1 {
+		t.Fatalf("admissionCap 1 should derive maintenance cap 1 (floor), got %d", got)
+	}
+	c3 := newDispatchCache(dispatchCacheConfig{admissionCap: 12, maintenanceAdmissionCap: 5}, dispatchDeps{}, testLogger())
+	if got := cap(c3.maintenanceAdmission); got != 5 {
+		t.Fatalf("explicit maintenance cap 5 should be honored, got %d", got)
+	}
+}
+
+// --- MINOR: purge pending writes on in-memory void ----------------------------
+
+// TestReleaseInMemPurgesPending asserts that voiding an in-memory hold also purges a
+// still-queued pendingWrite / pendingSpotCheck for that (unit, volunteer) — so a late
+// flush cannot re-stamp a reservation onto a unit whose hold was just dropped.
+func TestReleaseInMemPurgesPending(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	unitID := types.NewID()
+	c.stageUnit(unitID, leafID, 1, 0)
+
+	vol := types.NewID()
+	if r, _ := c.HandOut(vol, capableOpts(vol, 0), 1); len(r) != 1 {
+		t.Fatalf("hand-out failed")
+	}
+	if c.pendingWriteCount() != 1 {
+		t.Fatalf("expected a queued reservation write, got %d", c.pendingWriteCount())
+	}
+
+	// Void the hold (e.g. the buffered-abandon path): the queued write must be purged.
+	c.releaseInMem(unitID, vol)
+	if c.pendingWriteCount() != 0 {
+		t.Fatalf("MINOR: voiding the hold must purge the queued reservation write, got %d", c.pendingWriteCount())
+	}
+	c.mu.Lock()
+	nSpot := len(c.pendingSpotChecks)
+	c.mu.Unlock()
+	if nSpot != 0 {
+		t.Fatalf("no spot-check entry should survive for the voided pair, got %d", nSpot)
+	}
+
+	// A second still-queued entry for a DIFFERENT volunteer must NOT be purged.
+	otherVol := types.NewID()
+	until := c.now().UTC().Add(time.Hour)
+	c.mu.Lock()
+	c.pendingWrites = append(c.pendingWrites,
+		workunit.FlushReservation{WorkUnitID: unitID, VolunteerID: otherVol, ReservedUntil: until},
+		workunit.FlushReservation{WorkUnitID: types.NewID(), VolunteerID: vol, ReservedUntil: until},
+	)
+	c.reservedInMem[unitID] = map[types.ID]time.Time{otherVol: until}
+	c.inflight[otherVol] = 1
+	c.mu.Unlock()
+	c.releaseInMem(unitID, otherVol) // purges only (unitID, otherVol)
+	if c.pendingWriteCount() != 1 {
+		t.Fatalf("purge must drop ONLY the matching pair, leaving the unrelated write, got %d", c.pendingWriteCount())
+	}
+}

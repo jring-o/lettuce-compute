@@ -45,9 +45,10 @@ func (k rpcKind) String() string {
 type rpcStat struct {
 	calls     atomic.Int64 // total attempts
 	ok        atomic.Int64 // status OK
-	errs      atomic.Int64 // non-OK (excludes ResourceExhausted and collapse)
+	errs      atomic.Int64 // non-OK (excludes ResourceExhausted, collapse, and run-end cancel)
 	throttled atomic.Int64 // codes.ResourceExhausted (graceful shed: admission cap / rate limit)
-	collapse  atomic.Int64 // codes.DeadlineExceeded / Unavailable (DB-pool collapse signal)
+	collapse  atomic.Int64 // TRUE DB-pool collapse: a head-side deadline/Unavailable while the run is live
+	canceled  atomic.Int64 // run-end client-side cancel/deadline (benign; NOT a head collapse)
 
 	mu        sync.Mutex
 	latencies []time.Duration // reservoir of sampled latencies (capped)
@@ -66,6 +67,8 @@ func (s *rpcStat) record(d time.Duration, outcome rpcOutcome) {
 		s.throttled.Add(1)
 	case outcomeCollapse:
 		s.collapse.Add(1)
+	case outcomeCanceled:
+		s.canceled.Add(1)
 	default:
 		s.errs.Add(1)
 	}
@@ -96,12 +99,22 @@ const (
 	// (Layer 2 admission cap or Layer 0 per-client rate limiting). The volunteer
 	// treats it as a fixed local backoff; it is the DESIRED overload behavior.
 	outcomeThrottled
-	// outcomeCollapse is codes.DeadlineExceeded / Unavailable: the DB-pool
-	// CONGESTION-COLLAPSE signal Layer 2 must eliminate. If the head shed
-	// gracefully under overload this stays zero; a non-zero collapse count on
-	// RequestWorkUnit means the pool saturated ("context deadline exceeded")
-	// instead of the head returning ResourceExhausted.
+	// outcomeCollapse is the TRUE DB-pool CONGESTION-COLLAPSE signal Layer 2 must
+	// eliminate: a head-side deadline (the head's per-request DB touch timed out
+	// with "context deadline exceeded") or codes.Unavailable, observed while the
+	// simulation is still live. If the head shed gracefully under overload this
+	// stays zero; a non-zero collapse count on RequestWorkUnit means the pool
+	// saturated instead of the head returning ResourceExhausted.
 	outcomeCollapse
+	// outcomeCanceled is a BENIGN run-end artifact, NOT a head collapse: an
+	// in-flight RPC that failed with codes.Canceled / codes.DeadlineExceeded
+	// because the simulation's own (duration-bounded) context expired or was
+	// cancelled out from under it at run shutdown. It is tracked separately so it
+	// does NOT inflate the collapse flag. This is the known FALSE-POSITIVE the
+	// collapse signal must exclude: a client-side gRPC deadline (run-end, or the
+	// per-call timeout firing because HandOut was merely slow under lock
+	// contention) is NOT evidence the head's DB pool collapsed.
+	outcomeCanceled
 )
 
 // latencyPercentiles returns p50/p90/p99/max in milliseconds (sorted copy).
@@ -226,6 +239,7 @@ type rpcReport struct {
 	Errors      int64          `json:"errors"`
 	Throttled   int64          `json:"throttled"`
 	Collapse    int64          `json:"collapse"`
+	Canceled    int64          `json:"canceled"` // benign run-end client cancel/deadline (NOT a collapse)
 	CallsPerSec float64        `json:"calls_per_sec"`
 	Latency     latencySummary `json:"latency"`
 }
@@ -250,11 +264,16 @@ type report struct {
 	// the DESIRED behavior.
 	ShedRatio float64 `json:"shed_ratio"`
 	// CollapseCount is the number of RequestWorkUnit calls that failed with the
-	// DB-pool congestion-collapse signal (DeadlineExceeded / Unavailable). Layer 2
-	// must keep this at ZERO under naive overload.
+	// TRUE DB-pool congestion-collapse signal (a head-side deadline / Unavailable
+	// observed while the run was live). It EXCLUDES benign run-end client
+	// cancellations and client-side deadlines from mere lock-slowness (those are
+	// counted as Canceled on the per-RPC rows). Layer 2 must keep this at ZERO
+	// under overload.
 	CollapseCount int64 `json:"collapse_count"`
 	// Collapsed is the DoD pass/fail flag: true iff any RequestWorkUnit call hit
-	// the pool-collapse signal. The Layer 2 overload run asserts this is false.
+	// the TRUE pool-collapse signal (run-end cancellations and client-side
+	// deadlines from lock-slowness do not trip it). The Layer 2 overload run
+	// asserts this is false.
 	Collapsed bool `json:"collapsed"`
 
 	RPCs []rpcReport `json:"rpcs"`
@@ -276,6 +295,7 @@ func (m *metrics) buildReport(profile string, volunteers int, elapsed time.Durat
 			Errors:      st.errs.Load(),
 			Throttled:   st.throttled.Load(),
 			Collapse:    st.collapse.Load(),
+			Canceled:    st.canceled.Load(),
 			CallsPerSec: float64(calls) / secs,
 			Latency:     st.summary(),
 		})

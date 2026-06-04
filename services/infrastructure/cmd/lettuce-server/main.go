@@ -217,11 +217,12 @@ func main() {
 			RetryDelayJitterPct:     cfg.Head.EffectiveRetryDelayJitterPct(),
 			TargetRequestRatePerSec: cfg.Head.EffectiveTargetRequestRatePerSec(),
 			// Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY).
-			ReadyPoolSize:        cfg.Head.EffectiveReadyPoolSize(),
-			RefillBatchSize:      cfg.Head.EffectiveRefillBatchSize(),
-			DispatchAdmissionCap: cfg.Head.EffectiveDispatchAdmissionCap(),
-			FlushIntervalMs:      cfg.Head.EffectiveFlushIntervalMs(),
-			FlushBatchSize:       cfg.Head.EffectiveFlushBatchSize(),
+			ReadyPoolSize:           cfg.Head.EffectiveReadyPoolSize(),
+			RefillBatchSize:         cfg.Head.EffectiveRefillBatchSize(),
+			DispatchAdmissionCap:    cfg.Head.EffectiveDispatchAdmissionCap(),
+			MaintenanceAdmissionCap: cfg.Head.EffectiveMaintenanceAdmissionCap(),
+			FlushIntervalMs:         cfg.Head.EffectiveFlushIntervalMs(),
+			FlushBatchSize:          cfg.Head.EffectiveFlushBatchSize(),
 		})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
