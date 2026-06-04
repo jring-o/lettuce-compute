@@ -124,12 +124,15 @@ type FaultToleranceConfig struct {
 	HeartbeatIntervalSeconds  int     `json:"heartbeat_interval_seconds"`
 	MissedHeartbeatsThreshold int     `json:"missed_heartbeats_threshold"`
 	DeadlineMultiplier        float64 `json:"deadline_multiplier"`
-	// NoDeadline disables the hard wall-clock deadline for this leaf's work
-	// units: ResolveDeadlineSeconds returns 0, which the volunteer runtime reads
-	// as "no timeout" and FindExpiredWorkUnits skips (the deadline_seconds > 0
-	// guard). Liveness is then governed solely by heartbeats, so a work unit may
-	// run indefinitely as long as it keeps heartbeating. Defaults to false
-	// (deadline enforced via DeadlineMultiplier).
+	// NoDeadline disables the hard wall-clock deadline for this leaf's work units
+	// at the execution level: ResolveDeadlineSeconds stamps a large synthetic
+	// reclaim ceiling (NoDeadlineCeilingSeconds, default 6h, operator-tunable via
+	// head.no_deadline_ceiling_seconds) which the runtime treats as effectively no
+	// timeout. With per-task heartbeats removed, liveness is purely deadline-based,
+	// so the ceiling (rather than a literal 0) guarantees the head always reclaims a
+	// unit whose volunteer vanished — FindExpiredWorkUnits covers it because
+	// deadline_seconds > 0. Defaults to false (deadline enforced via
+	// DeadlineMultiplier).
 	NoDeadline                bool  `json:"no_deadline"`
 	MaxReassignments          int   `json:"max_reassignments"`
 	CheckpointingEnabled      bool  `json:"checkpointing_enabled"`

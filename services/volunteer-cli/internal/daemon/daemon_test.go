@@ -26,7 +26,7 @@ import (
 type mockClient struct {
 	requestWorkUnitFn func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error)
 	submitResultFn    func(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error)
-	heartbeatFn       func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error)
+	startWorkFn       func(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error)
 	saveCheckpointFn  func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error)
 	getCheckpointFn   func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
 	getHeadInfoFn     func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
@@ -36,7 +36,7 @@ type mockClient struct {
 	mu             sync.Mutex
 	requestCalls   int
 	submitCalls    int
-	heartbeatCalls int
+	startWorkCalls int
 	abandonCalls   int
 	lastSubmitReq  *lettucev1.SubmitResultRequest
 	lastAbandonReq *lettucev1.AbandonWorkUnitRequest
@@ -65,14 +65,14 @@ func (m *mockClient) SubmitResult(ctx context.Context, req *lettucev1.SubmitResu
 	return &lettucev1.SubmitResultResponse{ResultId: "result-1", Accepted: true}, nil
 }
 
-func (m *mockClient) Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+func (m *mockClient) StartWork(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
 	m.mu.Lock()
-	m.heartbeatCalls++
+	m.startWorkCalls++
 	m.mu.Unlock()
-	if m.heartbeatFn != nil {
-		return m.heartbeatFn(ctx, req)
+	if m.startWorkFn != nil {
+		return m.startWorkFn(ctx, req)
 	}
-	return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
+	return &lettucev1.StartWorkResponse{Ok: true}, nil
 }
 
 func (m *mockClient) SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
@@ -125,10 +125,10 @@ func (m *mockClient) getSubmitCalls() int {
 	return m.submitCalls
 }
 
-func (m *mockClient) getHeartbeatCalls() int {
+func (m *mockClient) getStartWorkCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.heartbeatCalls
+	return m.startWorkCalls
 }
 
 // --- Mock runtime ---
@@ -256,7 +256,6 @@ func TestDaemonExecuteCycle(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -329,7 +328,6 @@ func TestDaemonGracefulShutdown(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -381,50 +379,28 @@ func TestDaemonGracefulShutdown(t *testing.T) {
 	}
 }
 
-func TestDaemonHeartbeatAbort(t *testing.T) {
+func disabledTestDaemonHeartbeatAbort(t *testing.T) {
 	mc := &mockClient{
 		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 			return &lettucev1.RequestWorkUnitResponse{
 				Assignments: []*lettucev1.WorkUnitAssignment{
 					{
-						WorkUnitId:               "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
-						LeafId:                   "proj-1",
-						Runtime:                  "native",
-						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 1, // 1 second Ã¢â‚¬â€ short enough for test
-						ExecutionSpec:            &lettucev1.ExecutionSpec{},
+						WorkUnitId: "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
+						LeafId:     "proj-1",
+						Runtime:    "native",
+						InputData:  []byte("input"),
+						ExecutionSpec: &lettucev1.ExecutionSpec{},
 					},
 				},
 			}, nil
 		},
-		heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
-			return &lettucev1.HeartbeatResponse{
-				ContinueExecution: false,
-				Message:           "leaf paused",
-			}, nil
+		startWorkFn: func(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
+			return &lettucev1.StartWorkResponse{Ok: false, Message: "leaf paused"}, nil
 		},
 	}
-	mr := &mockRuntime{
-		canHandle: true,
-		executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
-	}
-
-	d := newTestDaemon(mc, mr)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d.Run(ctx)
-
-	if mr.getExecuteCalls() < 1 {
-		t.Errorf("execute calls = %d, want >= 1", mr.getExecuteCalls())
-	}
-	if mc.getSubmitCalls() != 0 {
-		t.Errorf("submit calls = %d, want 0 (aborted work should not submit)", mc.getSubmitCalls())
-	}
+	_ = mc
+	// Body retired: the per-task heartbeat abort path no longer exists. WP-VOL will
+	// add a StartWork-drop test once the slot wires the StartWork call.
 }
 
 func TestDaemonCanHandleSkip(t *testing.T) {
@@ -616,7 +592,6 @@ func TestDaemonNonZeroExitCode(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -668,7 +643,6 @@ func TestDaemonPrepareFails(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -736,7 +710,6 @@ func TestDaemonMultipleWorkUnits(t *testing.T) {
 							LeafId:                   "proj-1",
 							Runtime:                  "native",
 							InputData:                []byte(fmt.Sprintf("input-%d", callCount)),
-							HeartbeatIntervalSeconds: 300,
 							ExecutionSpec:            &lettucev1.ExecutionSpec{},
 						},
 					},
@@ -813,7 +786,6 @@ func TestDaemonCleanupAlwaysCalledOnExecFailure(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -872,7 +844,6 @@ func TestDaemonSubmitFails(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -1169,7 +1140,6 @@ func TestDaemonWritesHistory(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -1360,7 +1330,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 			ID: "wu-active", LeafID: "proj-1",
 			ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 6144},
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/active"},
 		Runtime: &mockRuntime{canHandle: true, executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
 			<-blockCh

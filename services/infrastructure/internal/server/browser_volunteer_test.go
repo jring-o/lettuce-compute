@@ -138,7 +138,16 @@ func (m *bvMockWURepo) CountByLeafAndState(context.Context, types.ID, workunit.W
 func (m *bvMockWURepo) FindExpiredWorkUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *bvMockWURepo) FindAbandonedWorkUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
+func (m *bvMockWURepo) FindLapsedReservations(context.Context, int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) FindDispatchableBatch(context.Context, int, []types.ID, []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation) ([]types.ID, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) CountActiveByVolunteer(context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) TransitionToExpired(context.Context, types.ID) (*workunit.WorkUnit, error) {
@@ -508,77 +517,8 @@ func TestBrowserSubmitResult_VolunteerNotRegistered(t *testing.T) {
 	}
 }
 
-// --- Heartbeat pre-transaction tests ---
-
-func TestBrowserHeartbeat_MissingAuth(t *testing.T) {
-	deps, _, _, _, _, _ := testBrowserDeps()
-	handler := handleBrowserHeartbeat(deps)
-
-	body := `{"work_unit_id":"00000000-0000-0000-0000-000000000001"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/volunteers/heartbeat", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d", rec.Code)
-	}
-}
-
-func TestBrowserHeartbeat_VolunteerNotRegistered(t *testing.T) {
-	deps, _, wuRepo, _, _, _ := testBrowserDeps()
-	handler := handleBrowserHeartbeat(deps)
-
-	pubKey, _, _ := ed25519.GenerateKey(rand.Reader)
-	wuID := types.NewID()
-	wuRepo.wus = append(wuRepo.wus, &workunit.WorkUnit{
-		ID:              wuID,
-		State:           workunit.WorkUnitStateAssigned,
-		DeadlineSeconds: 3600,
-	})
-
-	body := `{"work_unit_id":"` + wuID.String() + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/volunteers/heartbeat", strings.NewReader(body))
-	ctx := ContextWithEd25519PubKey(req.Context(), pubKey)
-	req = req.WithContext(ctx)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for unregistered volunteer, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestBrowserHeartbeat_WUNotFound(t *testing.T) {
-	deps, volRepo, _, _, _, _ := testBrowserDeps()
-	handler := handleBrowserHeartbeat(deps)
-
-	pubKey, _, _ := ed25519.GenerateKey(rand.Reader)
-	vol := &volunteer.Volunteer{
-		PublicKey:         pubKey,
-		AvailableRuntimes: []string{"WASM"},
-		IsActive:          true,
-		SchedulingMode:    volunteer.ScheduleAlways,
-		HardwareCapabilities: volunteer.HardwareCapabilities{
-			CPUCores: 4, MaxCPUCores: 4, MemoryTotalMB: 8192, MaxMemoryMB: 8192,
-		},
-	}
-	volRepo.Create(context.Background(), vol)
-
-	fakeWUID := types.NewID()
-	body := `{"work_unit_id":"` + fakeWUID.String() + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/volunteers/heartbeat", strings.NewReader(body))
-	ctx := ContextWithEd25519PubKey(req.Context(), pubKey)
-	req = req.WithContext(ctx)
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("expected 404 for unknown WU, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
+// Browser REST heartbeat tests removed: the browser heartbeat endpoint is gone
+// (browser/WASM units run-start at assignment time; liveness is deadline-based).
 
 // --- CORS middleware tests ---
 

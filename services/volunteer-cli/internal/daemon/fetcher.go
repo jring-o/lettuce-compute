@@ -48,9 +48,13 @@ type Fetcher struct {
 	// batchSizeFn returns how many assignments to request for a leaf given an
 	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest].
 	batchSizeFn func(estSecondsPerUnit float64) int32
-	// estSecondsFn estimates wall-clock seconds for one unit of the given leaf
-	// (0 = unknown). Used to size the per-leaf batch request.
-	estSecondsFn func(leafID string, rscFpopsEst float64) float64
+	// leafEstSecondsFn estimates wall-clock seconds for ONE unit of the given leaf
+	// (0 = unknown), used to size the per-leaf batch request BEFORE any of that
+	// leaf's units have been buffered (#29). It prefers the leaf-level,
+	// benchmark-independent estimate carried in CachedLeafInfo
+	// (EstimatedDurationSeconds), so it stays non-zero even on a host with no CPU
+	// benchmark — the exact case the old FP-ops-only path tripped to 0.
+	leafEstSecondsFn func(leaf CachedLeafInfo) float64
 
 	// rateLimitBackoff is the fixed local backoff floor applied when a head
 	// answers codes.ResourceExhausted. ResourceExhausted carries NO
@@ -88,17 +92,31 @@ const (
 	maxResourceExhaustedBackoff = 900 * time.Second
 )
 
-// maxBatchPerRequest bounds how many assignments the volunteer requests in one
-// RequestWorkUnit (the head independently caps this server-side). Mirrors the
-// head's max_batch_per_request default so a volunteer never asks for more than
-// the head will hand out in a batch.
-const maxBatchPerRequest = 8
+// maxBatchPerRequest is the SAFETY CEILING on how many assignments the volunteer
+// requests in one RequestWorkUnit — not the primary limiter (#29). The primary
+// limiter is the hours-deficit / per-unit-seconds math in requestBatchSize; this
+// ceiling only stops a pathologically short-unit leaf from asking for an
+// unbounded batch. Raised from 8 to 64 so short-unit leafs can actually fill
+// work_buffer_hours in one request instead of idling between polls. Mirrors the
+// head's max_batch_per_request default (also 64) so a volunteer never asks for
+// more than the head will hand out in a batch.
+const maxBatchPerRequest = 64
 
 // runtimeAbandonPauseThreshold is how many consecutive capability-driven
 // abandons for one runtime trip the circuit breaker. It matches the head's
 // max_reassignments default (3): after a volunteer has caused a unit to exhaust
 // its reassignments once, it stops contributing.
 const runtimeAbandonPauseThreshold = 3
+
+// reservationDropMargin is the safety window before a buffered unit's reservation
+// window (reserved_until, sized once at hand-out and never renewed) lapses, at
+// which point the fetcher drops it from the work buffer rather than wasting a
+// run-start (StartWork) on a unit the head may have already re-staged via its
+// lapsed-reservation sweep. It is the deadline-based-leasing analogue of the old
+// prepare-heartbeat renewal interval: large enough to absorb a slow image pull
+// before the unit reaches a slot, small enough that we don't race the head's
+// reclaim. See PreFetchQueue.DropLapsedReservations.
+const reservationDropMargin = 60 * time.Second
 
 // runtimeAbandonCooldown is how long a tripped runtime stays paused before it
 // is re-probed once. Container backends recover (Docker/Podman restart) and
@@ -124,7 +142,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		shouldFetchFunc:  d.shouldFetch,
 		workBufferFullFn: d.workBufferFull,
 		batchSizeFn:      d.requestBatchSize,
-		estSecondsFn:     d.estSecondsForUnit,
+		leafEstSecondsFn: d.leafEstSeconds,
 		rateLimitBackoff: defaultRateLimitBackoff,
 		runtimeAbandons:  make(map[string]int),
 		pausedRuntimes:   make(map[string]time.Time),
@@ -177,14 +195,13 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// Drop expiring items (deadline safety).
 		f.queue.DropExpiring(0.1)
 
-		// Drop buffered items whose head-side reservation lease has (nearly) lapsed.
-		// The lease is kept alive by PREPARING heartbeats (the head renews
-		// reserved_until on each), so this should not normally fire; it is a
-		// belt-and-suspenders guard so a holder that missed renewals never pops a
-		// lease-lapsed unit (which the head may have re-dispatched) and wastes a
-		// run-start. The margin matches one prepare-heartbeat interval so we drop
-		// before the lease actually lapses.
-		f.queue.DropLapsedReservations(prepareHeartbeatInterval, f.now())
+		// Drop buffered items whose head-side reservation window has (nearly) lapsed.
+		// With per-task heartbeats removed, the reservation window (reserved_until) is
+		// sized ONCE at hand-out and is NOT renewed, so a unit held in the buffer past
+		// its window is re-staged by the head's lapsed-reservation sweep. This guard
+		// drops such a unit `reservationDropMargin` ahead of lapse, before we waste a
+		// run-start (StartWork) on a unit the head no longer believes is ours.
+		f.queue.DropLapsedReservations(reservationDropMargin, f.now())
 
 		// CLIENT WORK BUFFER (DoD #2): when the hours-based buffer is full, issue
 		// ZERO RequestWorkUnit calls. Re-check on a short cadence (f.backoff, not
@@ -431,10 +448,14 @@ var anyLeafInfo = CachedLeafInfo{ID: "", Slug: "any"}
 // reply. It returns the number of units buffered and whether the caller should
 // stop trying further leafs on this head (true on transport error or rate-limit).
 func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string) (pushed int, stop bool) {
-	// Size the batch request from the remaining hours deficit.
+	// Size the batch request from the remaining hours deficit. The per-unit
+	// seconds estimate comes from the leaf-level, benchmark-independent estimate
+	// (#29) so short-unit leafs fill work_buffer_hours on the FIRST request rather
+	// than idling at the flat ceiling. The hours-deficit math in batchSizeFn binds;
+	// maxBatchPerRequest is only a safety ceiling.
 	var estSec float64
-	if f.estSecondsFn != nil {
-		estSec = f.estSecondsFn(leaf.ID, leafFpopsEst(leaf))
+	if f.leafEstSecondsFn != nil {
+		estSec = f.leafEstSecondsFn(leaf)
 	}
 	maxAssignments := int32(1)
 	if f.batchSizeFn != nil {
@@ -535,7 +556,10 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_name", fmt.Sprintf("%T", rt))
 
 		f.logger.Debug("fetcher: preparing work unit", "work_unit_id", wu.ID)
-		prep, hbCancel, prepErr := f.prepareWithHeartbeat(ctx, head, wu, asg.HeartbeatIntervalSeconds, rt)
+		// A buffered (reserved) unit is leased purely via its reservation window
+		// (reserved_until), not a per-task heartbeat, so a long image pull no longer
+		// needs a keep-alive to look alive. Prepare directly.
+		prep, prepErr := rt.Prepare(ctx, wu)
 		if prepErr != nil {
 			f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
 			// ESCALATION (#15 fix 4): capability category B — Prepare failed for
@@ -557,13 +581,11 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			Runtime:   rt,
 			Conn:      head,
 			FetchedAt: f.now(),
-			hbCancel:  hbCancel,
 		}
 		if err := f.queue.Push(item); err != nil {
 			// Buffer filled between the fullness check and now — return the un-run
-			// unit to the head and clean up rather than orphaning it as ASSIGNED.
+			// unit to the head and clean up rather than orphaning it as reserved.
 			f.logger.Warn("fetcher: queue push failed (full between check and push)", "error", err)
-			item.stopHeartbeat()
 			f.abandonWorkUnit(ctx, head, wu, "buffer full")
 			if rt != nil && prep != nil {
 				rt.Cleanup(prep)
@@ -597,60 +619,10 @@ func (f *Fetcher) abandonWorkUnit(ctx context.Context, conn *ServerConnection, w
 	f.logger.Info("fetcher: abandoned work unit", "work_unit_id", wu.ID, "requeued", resp.Requeued)
 }
 
-// prepareHeartbeatInterval caps how often a PREPARING heartbeat is sent while a
-// unit is pulling its image or waiting in the prefetch queue. Kept small so
-// last_heartbeat_at stays well within the head's abandonment window.
-const prepareHeartbeatInterval = 60 * time.Second
-
-// prepareWithHeartbeat runs rt.Prepare while sending PREPARING heartbeats so a
-// long image pull doesn't look like a dead volunteer. On success it returns the
-// prep result plus the still-running heartbeat's cancel func (the caller stores
-// it on the PreFetchItem and cancels it at slot handoff or disposal). On failure
-// it stops the heartbeat and returns the error.
-func (f *Fetcher) prepareWithHeartbeat(ctx context.Context, conn *ServerConnection, wu *runtime.WorkUnit, intervalSeconds int32, rt runtime.Runtime) (*runtime.PrepareResult, context.CancelFunc, error) {
-	hbCtx, hbCancel := context.WithCancel(context.Background())
-	go f.runPrepareHeartbeat(hbCtx, conn, wu, intervalSeconds)
-
-	prep, err := rt.Prepare(ctx, wu)
-	if err != nil {
-		hbCancel()
-		return nil, nil, err
-	}
-	return prep, hbCancel, nil
-}
-
-// runPrepareHeartbeat sends PREPARING heartbeats until ctx is cancelled. The head
-// refreshes last_heartbeat_at without transitioning the unit to RUNNING.
-func (f *Fetcher) runPrepareHeartbeat(ctx context.Context, conn *ServerConnection, wu *runtime.WorkUnit, intervalSeconds int32) {
-	interval := time.Duration(intervalSeconds) * time.Second
-	if interval <= 0 || interval > prepareHeartbeatInterval {
-		interval = prepareHeartbeatInterval
-	}
-
-	send := func() {
-		hbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if _, err := conn.Client.Heartbeat(hbCtx, &lettucev1.HeartbeatRequest{
-			WorkUnitId:  wu.ID,
-			VolunteerId: conn.VolunteerID,
-			Status:      "PREPARING",
-		}); err != nil {
-			f.logger.Debug("fetcher: prepare heartbeat failed", "work_unit_id", wu.ID, "server", conn.Name, "error", err)
-		}
-	}
-
-	send() // immediate, so a long pull is covered from assignment onward
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			send()
-		}
-	}
-}
+// The PREPARING-heartbeat helpers (prepareWithHeartbeat / runPrepareHeartbeat) are
+// removed: per-task heartbeats no longer exist. A buffered unit is leased via its
+// reservation window (reserved_until) and reclaimed by the head's lapsed-reservation
+// sweep if never run-started, so rt.Prepare runs without a keep-alive heartbeat.
 
 // availableServers returns servers not in backoff.
 func (f *Fetcher) availableServers() []*ServerConnection {
@@ -707,16 +679,6 @@ func withBackoffJitter(d time.Duration) time.Duration {
 		jittered = 0
 	}
 	return time.Duration(jittered)
-}
-
-// leafFpopsEst returns the cached per-unit FP-ops estimate for a leaf. The leaf
-// cache does not currently carry rsc_fpops_est (it is a per-work-unit field on
-// the assignment, not on the leaf descriptor), so this returns 0 today and the
-// batch sizer falls back to averaging already-buffered units. Kept as a seam so
-// a future leaf-level estimate can feed pre-request batch sizing directly.
-func leafFpopsEst(leaf CachedLeafInfo) float64 {
-	_ = leaf
-	return 0
 }
 
 // runtimeKeyForWU normalizes a work unit's runtime hint for the abandon counter,

@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -19,20 +18,6 @@ type PreFetchItem struct {
 	Runtime runtime.Runtime
 	Conn    *ServerConnection
 	FetchedAt time.Time
-
-	// hbCancel stops the PREPARING heartbeat that keeps this unit's last_heartbeat_at
-	// fresh on the head from assignment through the image pull and while it waits
-	// in the queue. Cancelled at slot handoff (the RUNNING heartbeat takes over)
-	// or on disposal (drop/abandon/cleanup). See item 2.
-	hbCancel context.CancelFunc
-}
-
-// stopHeartbeat cancels the item's PREPARING heartbeat if one is running.
-func (item *PreFetchItem) stopHeartbeat() {
-	if item != nil && item.hbCancel != nil {
-		item.hbCancel()
-		item.hbCancel = nil
-	}
 }
 
 // PreFetchQueue is a thread-safe queue of pre-fetched work units.
@@ -152,9 +137,8 @@ func (q *PreFetchQueue) DropExpiring(threshold float64) {
 			"deadline_seconds", item.WU.DeadlineSeconds,
 			"fetched_at", item.FetchedAt,
 		)
-		// Stop heartbeating a unit we're giving up on; the head reclaims it via
-		// its deadline (these items always have DeadlineSeconds > 0).
-		item.stopHeartbeat()
+		// The head reclaims this unit via its deadline (these items always have
+		// DeadlineSeconds > 0); we just clean up the local work dir.
 		if item.Runtime != nil && item.Prep != nil {
 			if err := item.Runtime.Cleanup(item.Prep); err != nil {
 				q.logger.Warn("cleanup failed for dropped item", "work_unit_id", item.WU.ID, "error", err)
@@ -163,17 +147,19 @@ func (q *PreFetchQueue) DropExpiring(threshold float64) {
 	}
 }
 
-// DropLapsedReservations removes buffered items whose head-side reservation lease
-// (reserved_until_unix) has lapsed or is within `margin` of lapsing.
+// DropLapsedReservations removes buffered items whose head-side reservation
+// window (reserved_until_unix) has lapsed or is within `margin` of lapsing.
 //
-// The lease is kept alive by the volunteer's PREPARING heartbeats (the head bumps
-// reserved_until on each), so a held unit's lease should never lapse while the
-// volunteer is live. This is a belt-and-suspenders guard for the case where
-// renewal stalled (head briefly unreachable, heartbeat errors): rather than later
-// pop a lease-lapsed unit — which the head may have re-dispatched to a SECOND
-// volunteer, so its run-start Assign would fail with ASSIGNMENT_CONFLICT after a
-// wasted prepare — we drop it from the buffer now. Items with no lease
-// (ReservedUntilUnix == 0) are left untouched. now is injected for tests.
+// With per-task heartbeats removed, the reservation window is sized ONCE at
+// hand-out and is NEVER renewed: it is the deadline-based lease for a buffered
+// (not-yet-run-started) unit. A unit therefore approaches lapse simply by sitting
+// in the buffer, and once reserved_until passes, the head's lapsed-reservation
+// sweep re-stages the unit for re-dispatch. If we later pop such a unit, its
+// run-start StartWork would return Ok=false (no longer reserved for us) after a
+// wasted prepare — possibly racing a SECOND volunteer the head already handed it
+// to — so we drop it from the buffer `margin` ahead of lapse instead. Items with
+// no reservation window (ReservedUntilUnix == 0) are left untouched. now is
+// injected for tests.
 func (q *PreFetchQueue) DropLapsedReservations(margin time.Duration, now time.Time) {
 	q.mu.Lock()
 	var kept []*PreFetchItem
@@ -194,14 +180,13 @@ func (q *PreFetchQueue) DropLapsedReservations(margin time.Duration, now time.Ti
 	q.mu.Unlock()
 
 	for _, item := range dropped {
-		q.logger.Warn("dropping buffered item with lapsed reservation lease",
+		q.logger.Warn("dropping buffered item with lapsed reservation window",
 			"work_unit_id", item.WU.ID,
 			"reserved_until_unix", item.WU.ReservedUntilUnix,
 		)
-		item.stopHeartbeat()
 		if item.Runtime != nil && item.Prep != nil {
 			if err := item.Runtime.Cleanup(item.Prep); err != nil {
-				q.logger.Warn("cleanup failed for lapsed-lease item", "work_unit_id", item.WU.ID, "error", err)
+				q.logger.Warn("cleanup failed for lapsed-reservation item", "work_unit_id", item.WU.ID, "error", err)
 			}
 		}
 	}

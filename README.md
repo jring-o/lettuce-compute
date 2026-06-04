@@ -150,8 +150,8 @@ PostgreSQL (:5432)                    — leafs, work units, results, volunteers
 
 ### How work is dispatched
 
-The head, not the volunteer, owns the conversation rate, so a single cheap
-server scales to large fleets:
+The head, not the volunteer, owns the conversation rate, so one head keeps up
+with a large fleet:
 
 - **Server-directed retry delay** — every work reply (including "no work right
   now") tells the volunteer how long to wait before contacting again. A quiet
@@ -160,12 +160,24 @@ server scales to large fleets:
 - **Work batching + a client work buffer** — volunteers request work in batches
   and keep a buffer measured in hours. While the buffer is full they make zero
   work requests; they just run what they hold.
-- **Leased buffered work** — buffered units are *leased* (reserved), not yet
-  started, so the head won't hand the same unit to anyone else, and the
-  deadline/heartbeat clock only starts when the unit actually runs. Buffered work
-  is downloaded and prepared lazily, right before it runs.
+- **In-process dispatch cache** — work requests are served from an in-memory pool
+  of queued units (no database round-trip on the hot path); reservations are
+  written back to Postgres asynchronously in batches.
+- **Graceful shedding** — under sustained overload the head serves from the cache
+  until it empties, then returns a fast "back off" instead of letting database
+  connections pile up.
+- **Leased buffered work + deadline-based reassignment** — buffered units are
+  *leased* (reserved), not yet started, so the head won't hand the same unit to
+  anyone else; the deadline clock starts only when the unit actually runs (via an
+  explicit `StartWork` step), and a unit not submitted by its deadline is
+  reassigned. There are no per-task heartbeats. Buffered work is downloaded and
+  prepared lazily, right before it runs.
 - **Per-client rate limiting** — the gRPC port is rate-limited per real client IP
   (trust-aware behind a reverse proxy) and per authenticated volunteer key.
+
+> **Run exactly one head replica.** Dispatch is owned by an in-process cache;
+> running two head processes against one database would hand the same work unit to
+> two volunteers. Horizontal scale-out across replicas is a planned later layer.
 
 Heads and volunteers ship together as a breaking release: a volunteer older than
 the head's protocol version cannot attach. Update the head first, then volunteers.

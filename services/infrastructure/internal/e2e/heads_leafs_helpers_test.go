@@ -47,10 +47,34 @@ type headsLeafsEnv struct {
 	httpURL    string
 	signingPub ed25519.PublicKey
 	storageDir string
+	// svc is the concrete volunteer service (for tests that need to drive the
+	// Layer-2 dispatch cache directly). Non-nil only when the cache is started.
+	svc lettucev1.VolunteerServiceServer
 }
 
-// setupHeadsLeafsServer creates HTTP and gRPC servers with head config for E2E tests.
+// setupHeadsLeafsServer creates HTTP and gRPC servers with head config for E2E tests
+// using the requestWorkUnitFromDB fallback path (the dispatch cache is NOT started).
 func setupHeadsLeafsServer(t *testing.T) (*headsLeafsEnv, func()) {
+	return setupHeadsLeafsServerOpts(t, false, server.HeadDispatchConfig{})
+}
+
+// setupHeadsLeafsServerWithCache is setupHeadsLeafsServer but with the Layer-2
+// in-process dispatch cache started, so RequestWorkUnit serves reservations from the
+// cache (hot path off Postgres) and the async flusher/refiller/reconciler run. Used
+// by the dispatch-cache integration test to exercise the cache against real Postgres.
+func setupHeadsLeafsServerWithCache(t *testing.T) (*headsLeafsEnv, func()) {
+	return setupHeadsLeafsServerOpts(t, true, server.HeadDispatchConfig{})
+}
+
+// setupHeadsLeafsServerWithCacheCfg starts the dispatch cache with the given dispatch
+// config (e.g. a long flush interval to widen the flush window for a flush-race test).
+func setupHeadsLeafsServerWithCacheCfg(t *testing.T, cfg server.HeadDispatchConfig) (*headsLeafsEnv, func()) {
+	return setupHeadsLeafsServerOpts(t, true, cfg)
+}
+
+// setupHeadsLeafsServerOpts creates HTTP and gRPC servers with head config for E2E
+// tests. When withCache is true the Layer-2 dispatch cache is started with dispatchCfg.
+func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.HeadDispatchConfig) (*headsLeafsEnv, func()) {
 	t.Helper()
 
 	dbURL := os.Getenv("LETTUCE_TEST_DB_URL")
@@ -176,7 +200,16 @@ func setupHeadsLeafsServer(t *testing.T) (*headsLeafsEnv, func()) {
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0.1-heads-leafs", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
-	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10, server.HeadDispatchConfig{})
+	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10, dispatchCfg)
+
+	// Optionally start the Layer-2 in-process dispatch cache so RequestWorkUnit serves
+	// reservations from memory (hot path off Postgres) and the async flusher/refiller/
+	// reconciler run against real Postgres. cacheCtx is cancelled on cleanup.
+	cacheCtx, cacheCancel := context.WithCancel(context.Background())
+	if withCache {
+		server.StartDispatchCache(volunteerSvc, cacheCtx)
+	}
+
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -200,9 +233,11 @@ func setupHeadsLeafsServer(t *testing.T) (*headsLeafsEnv, func()) {
 		httpURL:    httpURL,
 		signingPub: signer.PublicKey(),
 		storageDir: storageDir,
+		svc:        volunteerSvc,
 	}
 
 	cleanup := func() {
+		cacheCancel() // stop the dispatch-cache goroutines (no-op if never started)
 		conn.Close()
 		grpcServer.Stop()
 		httpServer.Close()
@@ -408,12 +443,13 @@ func ensureRunStart(t *testing.T, pool *pgxpool.Pool, grpc lettucev1.VolunteerSe
 	if state != "QUEUED" || reservedVol == nil || *reservedVol != volID {
 		return
 	}
-	if _, err := grpc.Heartbeat(signFor(t, ctx, pubKey), &lettucev1.HeartbeatRequest{
+	// Run-start the reserved unit via StartWork (the relocated QUEUED->ASSIGNED
+	// transition that the first RUNNING heartbeat used to perform).
+	if _, err := grpc.StartWork(signFor(t, ctx, pubKey), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: volID,
-		Status:      "RUNNING",
 	}); err != nil {
-		t.Fatalf("ensureRunStart: run-start heartbeat for WU %s: %v", wuID, err)
+		t.Fatalf("ensureRunStart: StartWork for WU %s: %v", wuID, err)
 	}
 }
 

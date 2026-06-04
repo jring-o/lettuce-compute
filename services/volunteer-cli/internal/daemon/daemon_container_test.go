@@ -57,7 +57,6 @@ func TestF16_ContainerWorkUnitExecution(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "container",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec: &lettucev1.ExecutionSpec{
 							Image:       "test-image:latest",
 							GpuRequired: false,
@@ -129,7 +128,6 @@ func TestF16_GPUContainerWorkUnit(t *testing.T) {
 						WorkUnitId:               "9a9f659e-6b8b-4c91-8f0f-cc53cb72aa26", // was wu-gpu-1
 						LeafId:                   "proj-1",
 						Runtime:                  "container",
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec: &lettucev1.ExecutionSpec{
 							Image:       "gpu-image:latest",
 							GpuRequired: true,
@@ -216,7 +214,6 @@ func TestF16_RuntimeMismatch(t *testing.T) {
 						WorkUnitId:               "bad94ec5-4093-4f4d-8d9d-eb38e1d438a4", // was wu-mismatch
 						LeafId:                   "proj-1",
 						Runtime:                  "container", // requests container runtime
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec: &lettucev1.ExecutionSpec{
 							Image: "some-image:latest",
 						},
@@ -343,7 +340,6 @@ func TestF16_NativeWorkUnitRegression(t *testing.T) {
 						LeafId:                   "proj-1",
 						Runtime:                  "native",
 						InputData:                []byte("input"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec: &lettucev1.ExecutionSpec{
 							Binaries: map[string]string{"linux_amd64": "http://example.com/bin"},
 						},

@@ -222,6 +222,48 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.LeaseSeconds = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_READY_POOL_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_READY_POOL_SIZE must be an integer: %w", err)
+		}
+		cfg.Head.ReadyPoolSize = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_REFILL_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REFILL_BATCH_SIZE must be an integer: %w", err)
+		}
+		cfg.Head.RefillBatchSize = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DISPATCH_ADMISSION_CAP"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DISPATCH_ADMISSION_CAP must be an integer: %w", err)
+		}
+		cfg.Head.DispatchAdmissionCap = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_FLUSH_INTERVAL_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_FLUSH_INTERVAL_MS must be an integer: %w", err)
+		}
+		cfg.Head.FlushIntervalMs = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_FLUSH_BATCH_SIZE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_FLUSH_BATCH_SIZE must be an integer: %w", err)
+		}
+		cfg.Head.FlushBatchSize = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.NoDeadlineCeilingSeconds = n
+	}
 	return nil
 }
 

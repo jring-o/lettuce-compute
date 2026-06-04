@@ -401,7 +401,6 @@ type WorkUnitAssignment struct {
 	CodeArtifactUrl           string                 `protobuf:"bytes,6,opt,name=code_artifact_url,json=codeArtifactUrl,proto3" json:"code_artifact_url,omitempty"` // URL to download code/binary
 	ParametersJson            string                 `protobuf:"bytes,7,opt,name=parameters_json,json=parametersJson,proto3" json:"parameters_json,omitempty"`      // parameter set as JSON string
 	DeadlineSeconds           int32                  `protobuf:"varint,8,opt,name=deadline_seconds,json=deadlineSeconds,proto3" json:"deadline_seconds,omitempty"`
-	HeartbeatIntervalSeconds  int32                  `protobuf:"varint,9,opt,name=heartbeat_interval_seconds,json=heartbeatIntervalSeconds,proto3" json:"heartbeat_interval_seconds,omitempty"`
 	EnvVars                   map[string]string      `protobuf:"bytes,10,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	ExecutionSpec             *ExecutionSpec         `protobuf:"bytes,11,opt,name=execution_spec,json=executionSpec,proto3" json:"execution_spec,omitempty"`
 	HasCheckpoint             bool                   `protobuf:"varint,12,opt,name=has_checkpoint,json=hasCheckpoint,proto3" json:"has_checkpoint,omitempty"`                                       // true if a checkpoint exists for this reassigned WU
@@ -495,13 +494,6 @@ func (x *WorkUnitAssignment) GetParametersJson() string {
 func (x *WorkUnitAssignment) GetDeadlineSeconds() int32 {
 	if x != nil {
 		return x.DeadlineSeconds
-	}
-	return 0
-}
-
-func (x *WorkUnitAssignment) GetHeartbeatIntervalSeconds() int32 {
-	if x != nil {
-		return x.HeartbeatIntervalSeconds
 	}
 	return 0
 }
@@ -707,31 +699,32 @@ func (x *SubmitResultResponse) GetMessage() string {
 	return ""
 }
 
-type HeartbeatRequest struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	WorkUnitId     string                 `protobuf:"bytes,1,opt,name=work_unit_id,json=workUnitId,proto3" json:"work_unit_id,omitempty"`
-	VolunteerId    string                 `protobuf:"bytes,2,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"`
-	Status         string                 `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`                                // RUNNING, CHECKPOINT_SAVED
-	ProgressPct    float64                `protobuf:"fixed64,4,opt,name=progress_pct,json=progressPct,proto3" json:"progress_pct,omitempty"` // 0.0-1.0, optional estimate
-	CurrentMetrics *ExecutionMetadata     `protobuf:"bytes,5,opt,name=current_metrics,json=currentMetrics,proto3" json:"current_metrics,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+// StartWork marks a buffered (reserved) work unit as run-started: the volunteer
+// slot is now executing it. The head performs the QUEUED -> ASSIGNED transition,
+// clears the reservation column, writes the active assignment history row, and
+// starts the deadline clock (assigned_at = now).
+type StartWorkRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkUnitId    string                 `protobuf:"bytes,1,opt,name=work_unit_id,json=workUnitId,proto3" json:"work_unit_id,omitempty"`
+	VolunteerId   string                 `protobuf:"bytes,2,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *HeartbeatRequest) Reset() {
-	*x = HeartbeatRequest{}
+func (x *StartWorkRequest) Reset() {
+	*x = StartWorkRequest{}
 	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *HeartbeatRequest) String() string {
+func (x *StartWorkRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*HeartbeatRequest) ProtoMessage() {}
+func (*StartWorkRequest) ProtoMessage() {}
 
-func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+func (x *StartWorkRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -743,68 +736,47 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
-func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use StartWorkRequest.ProtoReflect.Descriptor instead.
+func (*StartWorkRequest) Descriptor() ([]byte, []int) {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{9}
 }
 
-func (x *HeartbeatRequest) GetWorkUnitId() string {
+func (x *StartWorkRequest) GetWorkUnitId() string {
 	if x != nil {
 		return x.WorkUnitId
 	}
 	return ""
 }
 
-func (x *HeartbeatRequest) GetVolunteerId() string {
+func (x *StartWorkRequest) GetVolunteerId() string {
 	if x != nil {
 		return x.VolunteerId
 	}
 	return ""
 }
 
-func (x *HeartbeatRequest) GetStatus() string {
-	if x != nil {
-		return x.Status
-	}
-	return ""
+type StartWorkResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`          // true if the unit was run-started for this volunteer
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"` // diagnostic; on !ok the volunteer should drop the unit
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *HeartbeatRequest) GetProgressPct() float64 {
-	if x != nil {
-		return x.ProgressPct
-	}
-	return 0
-}
-
-func (x *HeartbeatRequest) GetCurrentMetrics() *ExecutionMetadata {
-	if x != nil {
-		return x.CurrentMetrics
-	}
-	return nil
-}
-
-type HeartbeatResponse struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	ContinueExecution bool                   `protobuf:"varint,1,opt,name=continue_execution,json=continueExecution,proto3" json:"continue_execution,omitempty"` // false = abort (leaf paused/cancelled)
-	Message           string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
-}
-
-func (x *HeartbeatResponse) Reset() {
-	*x = HeartbeatResponse{}
+func (x *StartWorkResponse) Reset() {
+	*x = StartWorkResponse{}
 	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *HeartbeatResponse) String() string {
+func (x *StartWorkResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*HeartbeatResponse) ProtoMessage() {}
+func (*StartWorkResponse) ProtoMessage() {}
 
-func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+func (x *StartWorkResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -816,19 +788,19 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
-func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use StartWorkResponse.ProtoReflect.Descriptor instead.
+func (*StartWorkResponse) Descriptor() ([]byte, []int) {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{10}
 }
 
-func (x *HeartbeatResponse) GetContinueExecution() bool {
+func (x *StartWorkResponse) GetOk() bool {
 	if x != nil {
-		return x.ContinueExecution
+		return x.Ok
 	}
 	return false
 }
 
-func (x *HeartbeatResponse) GetMessage() string {
+func (x *StartWorkResponse) GetMessage() string {
 	if x != nil {
 		return x.Message
 	}
@@ -1748,8 +1720,12 @@ type LeafInfo struct {
 	QueuedWorkUnits  int32                  `protobuf:"varint,8,opt,name=queued_work_units,json=queuedWorkUnits,proto3" json:"queued_work_units,omitempty"`
 	ActiveVolunteers int32                  `protobuf:"varint,9,opt,name=active_volunteers,json=activeVolunteers,proto3" json:"active_volunteers,omitempty"`
 	ExecutionSpec    *ExecutionSpec         `protobuf:"bytes,10,opt,name=execution_spec,json=executionSpec,proto3" json:"execution_spec,omitempty"` // runtime badges for desktop/browser clients
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Benchmark-independent per-leaf duration estimate (seconds) used by the
+	// volunteer for duration-aware work batching: it sizes the first batch request
+	// to fill work_buffer_hours instead of idling at the flat per-request ceiling.
+	EstimatedDurationSeconds float64 `protobuf:"fixed64,11,opt,name=estimated_duration_seconds,json=estimatedDurationSeconds,proto3" json:"estimated_duration_seconds,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *LeafInfo) Reset() {
@@ -1850,6 +1826,13 @@ func (x *LeafInfo) GetExecutionSpec() *ExecutionSpec {
 		return x.ExecutionSpec
 	}
 	return nil
+}
+
+func (x *LeafInfo) GetEstimatedDurationSeconds() float64 {
+	if x != nil {
+		return x.EstimatedDurationSeconds
+	}
+	return 0
 }
 
 type AbandonWorkUnitRequest struct {
@@ -2005,7 +1988,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0fmax_assignments\x18\x06 \x01(\x05R\x0emaxAssignments\"\x95\x01\n" +
 	"\x17RequestWorkUnitResponse\x12J\n" +
 	"\vassignments\x18\x01 \x03(\v2(.lettuce.volunteer.v1.WorkUnitAssignmentR\vassignments\x12.\n" +
-	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\"\xb2\x06\n" +
+	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\"\xfa\x05\n" +
 	"\x12WorkUnitAssignment\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12\x17\n" +
@@ -2016,8 +1999,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0einput_data_url\x18\x05 \x01(\tR\finputDataUrl\x12*\n" +
 	"\x11code_artifact_url\x18\x06 \x01(\tR\x0fcodeArtifactUrl\x12'\n" +
 	"\x0fparameters_json\x18\a \x01(\tR\x0eparametersJson\x12)\n" +
-	"\x10deadline_seconds\x18\b \x01(\x05R\x0fdeadlineSeconds\x12<\n" +
-	"\x1aheartbeat_interval_seconds\x18\t \x01(\x05R\x18heartbeatIntervalSeconds\x12P\n" +
+	"\x10deadline_seconds\x18\b \x01(\x05R\x0fdeadlineSeconds\x12P\n" +
 	"\benv_vars\x18\n" +
 	" \x03(\v25.lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntryR\aenvVars\x12J\n" +
 	"\x0eexecution_spec\x18\v \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\x12%\n" +
@@ -2028,7 +2010,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x13reserved_until_unix\x18\x10 \x01(\x03R\x11reservedUntilUnix\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbd\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +
+	"\"\xbd\x02\n" +
 	"\x13SubmitResultRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +
@@ -2043,16 +2026,13 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x14SubmitResultResponse\x12\x1b\n" +
 	"\tresult_id\x18\x01 \x01(\tR\bresultId\x12\x1a\n" +
 	"\baccepted\x18\x02 \x01(\bR\baccepted\x12\x18\n" +
-	"\amessage\x18\x03 \x01(\tR\amessage\"\xe4\x01\n" +
-	"\x10HeartbeatRequest\x12 \n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"W\n" +
+	"\x10StartWorkRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +
-	"\fvolunteer_id\x18\x02 \x01(\tR\vvolunteerId\x12\x16\n" +
-	"\x06status\x18\x03 \x01(\tR\x06status\x12!\n" +
-	"\fprogress_pct\x18\x04 \x01(\x01R\vprogressPct\x12P\n" +
-	"\x0fcurrent_metrics\x18\x05 \x01(\v2'.lettuce.volunteer.v1.ExecutionMetadataR\x0ecurrentMetrics\"\\\n" +
-	"\x11HeartbeatResponse\x12-\n" +
-	"\x12continue_execution\x18\x01 \x01(\bR\x11continueExecution\x12\x18\n" +
+	"\fvolunteer_id\x18\x02 \x01(\tR\vvolunteerId\"=\n" +
+	"\x11StartWorkResponse\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"_\n" +
 	"\x18GetWorkUnitStatusRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
@@ -2143,7 +2123,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x14default_leaf_weights\x18\x05 \x03(\v2A.lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntryR\x12defaultLeafWeights\x1aE\n" +
 	"\x17DefaultLeafWeightsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xe7\x02\n" +
+	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xa5\x03\n" +
 	"\bLeafInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04slug\x18\x02 \x01(\tR\x04slug\x12\x12\n" +
@@ -2155,7 +2135,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x11queued_work_units\x18\b \x01(\x05R\x0fqueuedWorkUnits\x12+\n" +
 	"\x11active_volunteers\x18\t \x01(\x05R\x10activeVolunteers\x12J\n" +
 	"\x0eexecution_spec\x18\n" +
-	" \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\"\x94\x01\n" +
+	" \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\x12<\n" +
+	"\x1aestimated_duration_seconds\x18\v \x01(\x01R\x18estimatedDurationSeconds\"\x94\x01\n" +
 	"\x16AbandonWorkUnitRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +
@@ -2171,7 +2152,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x11RegisterVolunteer\x12..lettuce.volunteer.v1.RegisterVolunteerRequest\x1a/.lettuce.volunteer.v1.RegisterVolunteerResponse\x12n\n" +
 	"\x0fRequestWorkUnit\x12,.lettuce.volunteer.v1.RequestWorkUnitRequest\x1a-.lettuce.volunteer.v1.RequestWorkUnitResponse\x12e\n" +
 	"\fSubmitResult\x12).lettuce.volunteer.v1.SubmitResultRequest\x1a*.lettuce.volunteer.v1.SubmitResultResponse\x12\\\n" +
-	"\tHeartbeat\x12&.lettuce.volunteer.v1.HeartbeatRequest\x1a'.lettuce.volunteer.v1.HeartbeatResponse\x12t\n" +
+	"\tStartWork\x12&.lettuce.volunteer.v1.StartWorkRequest\x1a'.lettuce.volunteer.v1.StartWorkResponse\x12t\n" +
 	"\x11GetWorkUnitStatus\x12..lettuce.volunteer.v1.GetWorkUnitStatusRequest\x1a/.lettuce.volunteer.v1.GetWorkUnitStatusResponse\x12b\n" +
 	"\vGetHeadInfo\x12(.lettuce.volunteer.v1.GetHeadInfoRequest\x1a).lettuce.volunteer.v1.GetHeadInfoResponse\x12k\n" +
 	"\x0eSaveCheckpoint\x12+.lettuce.volunteer.v1.SaveCheckpointRequest\x1a,.lettuce.volunteer.v1.SaveCheckpointResponse\x12h\n" +
@@ -2201,8 +2182,8 @@ var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*WorkUnitAssignment)(nil),        // 6: lettuce.volunteer.v1.WorkUnitAssignment
 	(*SubmitResultRequest)(nil),       // 7: lettuce.volunteer.v1.SubmitResultRequest
 	(*SubmitResultResponse)(nil),      // 8: lettuce.volunteer.v1.SubmitResultResponse
-	(*HeartbeatRequest)(nil),          // 9: lettuce.volunteer.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),         // 10: lettuce.volunteer.v1.HeartbeatResponse
+	(*StartWorkRequest)(nil),          // 9: lettuce.volunteer.v1.StartWorkRequest
+	(*StartWorkResponse)(nil),         // 10: lettuce.volunteer.v1.StartWorkResponse
 	(*GetWorkUnitStatusRequest)(nil),  // 11: lettuce.volunteer.v1.GetWorkUnitStatusRequest
 	(*GetWorkUnitStatusResponse)(nil), // 12: lettuce.volunteer.v1.GetWorkUnitStatusResponse
 	(*SaveCheckpointRequest)(nil),     // 13: lettuce.volunteer.v1.SaveCheckpointRequest
@@ -2230,38 +2211,37 @@ var file_proto_lettuce_v1_volunteer_proto_depIdxs = []int32{
 	26, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
 	20, // 4: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
 	19, // 5: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
-	19, // 6: lettuce.volunteer.v1.HeartbeatRequest.current_metrics:type_name -> lettuce.volunteer.v1.ExecutionMetadata
-	18, // 7: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
-	27, // 8: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	28, // 9: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	23, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
-	29, // 11: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
-	20, // 12: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
-	0,  // 13: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
-	2,  // 14: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
-	4,  // 15: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
-	7,  // 16: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
-	9,  // 17: lettuce.volunteer.v1.VolunteerService.Heartbeat:input_type -> lettuce.volunteer.v1.HeartbeatRequest
-	11, // 18: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
-	21, // 19: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
-	13, // 20: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
-	15, // 21: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
-	24, // 22: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
-	1,  // 23: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
-	3,  // 24: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
-	5,  // 25: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
-	8,  // 26: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
-	10, // 27: lettuce.volunteer.v1.VolunteerService.Heartbeat:output_type -> lettuce.volunteer.v1.HeartbeatResponse
-	12, // 28: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
-	22, // 29: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
-	14, // 30: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
-	16, // 31: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
-	25, // 32: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
-	23, // [23:33] is the sub-list for method output_type
-	13, // [13:23] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	18, // 6: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
+	27, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	28, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	23, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
+	29, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	20, // 11: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
+	0,  // 12: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
+	2,  // 13: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
+	4,  // 14: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
+	7,  // 15: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
+	9,  // 16: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
+	11, // 17: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
+	21, // 18: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
+	13, // 19: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
+	15, // 20: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
+	24, // 21: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
+	1,  // 22: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
+	3,  // 23: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
+	5,  // 24: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
+	8,  // 25: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
+	10, // 26: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
+	12, // 27: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
+	22, // 28: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
+	14, // 29: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
+	16, // 30: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
+	25, // 31: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
+	22, // [22:32] is the sub-list for method output_type
+	12, // [12:22] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_lettuce_v1_volunteer_proto_init() }

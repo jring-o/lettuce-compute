@@ -398,8 +398,10 @@ func TestResolveDeadlineSeconds_NoDeadline(t *testing.T) {
 		},
 	}
 	deadline := generate.ResolveDeadlineSeconds(proj)
-	if deadline != 0 { // 0 = unlimited; liveness via heartbeats only
-		t.Errorf("expected 0 (no deadline), got %d", deadline)
+	// Post-heartbeat-removal: NoDeadline stamps a synthetic reclaim ceiling (not 0)
+	// so a unit on a vanished volunteer is always reclaimed by FindExpiredWorkUnits.
+	if deadline != generate.NoDeadlineCeilingSeconds {
+		t.Errorf("expected synthetic ceiling %d, got %d", generate.NoDeadlineCeilingSeconds, deadline)
 	}
 }
 
@@ -476,7 +478,16 @@ func (m *mockWorkUnitRepo) UpdateHeartbeat(_ context.Context, _ types.ID) error 
 func (m *mockWorkUnitRepo) FindExpiredWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWorkUnitRepo) FindAbandonedWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
+func (m *mockWorkUnitRepo) FindLapsedReservations(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) FindDispatchableBatch(_ context.Context, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation) ([]types.ID, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *mockWorkUnitRepo) TransitionToExpired(_ context.Context, _ types.ID) (*workunit.WorkUnit, error) {

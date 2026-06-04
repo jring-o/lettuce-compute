@@ -11,7 +11,7 @@ import (
 func TestProtoImportCompiles(t *testing.T) {
 	// Verify we can reference proto types from the infrastructure module.
 	_ = &pb.RegisterVolunteerRequest{}
-	_ = &pb.HeartbeatRequest{}
+	_ = &pb.StartWorkRequest{}
 	_ = &pb.RequestWorkUnitRequest{}
 	_ = &pb.SubmitResultRequest{}
 }

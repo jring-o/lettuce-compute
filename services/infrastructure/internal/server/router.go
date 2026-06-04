@@ -230,8 +230,8 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		ed25519AuthRequired(handleBrowserRequestWork(bvDeps)))
 	mux.HandleFunc("POST /api/v1/volunteers/submit-result",
 		ed25519AuthRequired(handleBrowserSubmitResult(bvDeps)))
-	mux.HandleFunc("POST /api/v1/volunteers/heartbeat",
-		ed25519AuthRequired(handleBrowserHeartbeat(bvDeps)))
+	// Browser REST heartbeat removed: browser/WASM units run-start at assignment
+	// time and liveness is deadline-based (see browser-volunteer-handlers.go).
 
 	// --- Middleware chain ---
 	// Execution order (outermost to innermost):

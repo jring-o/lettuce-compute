@@ -59,7 +59,7 @@ import (
 //      services/volunteer-cli/internal/client/proto_determinism_test.go.
 //   3. Re-run both packages' tests; both should pass.
 
-const expectedDeterministicHash = "c499a96a52959df62f99b442a67fb7071cf6e639f2108e411da3760c64a9c5de"
+const expectedDeterministicHash = "c05bf60927406e51936da9d1c37c187d0cef9cdc4bc75af28a393c8f7dbc9316"
 
 // fixedRequestWorkUnitResponse builds the canonical fixture for the marshal
 // hash test. The exact field values are arbitrary; what matters is that this
@@ -77,7 +77,6 @@ func fixedRequestWorkUnitResponse() *lettucev1.RequestWorkUnitResponse {
 				CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
 				ParametersJson:           `{"k":"v"}`,
 				DeadlineSeconds:          3600,
-				HeartbeatIntervalSeconds: 300,
 				EnvVars: map[string]string{
 					// Intentionally inserted out of sorted order — deterministic marshal
 					// MUST emit them in sorted key order. If protobuf-go ever changes

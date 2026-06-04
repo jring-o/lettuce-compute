@@ -60,9 +60,16 @@ head:
   # These govern how the head paces volunteers and hands out work in batches so a
   # large fleet creates far less request noise. Defaults are sane for a small head;
   # tune target_request_rate_per_sec with the swarm-sim load test (see CONTRIBUTING.md).
+  #
+  # SINGLE-REPLICA ONLY: dispatch is served from an in-process cache (below). Do NOT
+  # run multiple heads against one database in Layer 2 — two replicas would each
+  # refill independently and hand the same work unit to two volunteers. Horizontal
+  # scale-out is a planned later layer.
 
-  # Max work units one RequestWorkUnit may return (the server-side batch cap).
-  max_batch_per_request: 8           # env: LETTUCE_HEAD_MAX_BATCH_PER_REQUEST
+  # SAFETY CEILING on how many work units one RequestWorkUnit may return. This is a
+  # cap, not the limiter: the actual batch is sized by each volunteer's work-buffer
+  # deficit and per-unit duration estimate, then clamped to this.
+  max_batch_per_request: 64          # env: LETTUCE_HEAD_MAX_BATCH_PER_REQUEST
 
   # Max work units (running + buffered/reserved) one volunteer may hold at once.
   # Reserved-but-not-yet-running units count against this, so it also caps how
@@ -92,3 +99,31 @@ head:
   # is invisible to deadline/abandonment reclaim until run start. Must stay < 1800.
   # Adds reservation columns to work_units (migration 00002, auto-applied on boot).
   lease_seconds: 900                 # env: LETTUCE_HEAD_LEASE_SECONDS
+
+  # --- Dispatch cache (Layer 2, SINGLE-REPLICA ONLY) ---
+  # The head serves work requests from an in-memory pool of queued units (no database
+  # round-trip on the hot path) and flushes the resulting reservations to Postgres
+  # asynchronously. Defaults are sane; you rarely need to change these.
+
+  # Max pre-fetched queued units held in memory for hand-out.
+  ready_pool_size: 2000              # env: LETTUCE_HEAD_READY_POOL_SIZE
+
+  # How many units one bulk refill pulls from Postgres.
+  refill_batch_size: 500             # env: LETTUCE_HEAD_REFILL_BATCH_SIZE
+
+  # Bounds concurrent dispatch-cache database operations (refill, flush, run-start) so
+  # they cannot saturate the connection pool. 0 = derive max(1, db pool size / 2).
+  dispatch_admission_cap: 0          # env: LETTUCE_HEAD_DISPATCH_ADMISSION_CAP
+
+  # Async reservation-flush cadence (ms) and early-flush threshold (pending writes).
+  flush_interval_ms: 100             # env: LETTUCE_HEAD_FLUSH_INTERVAL_MS
+  flush_batch_size: 200              # env: LETTUCE_HEAD_FLUSH_BATCH_SIZE
+
+  # Reclaim ceiling (seconds) for no-deadline leafs: with per-task heartbeats removed,
+  # a unit on a vanished volunteer is reclaimed at the latest after this. This is a
+  # DEADLINE, not a lease, so it is intentionally NOT bound by the 1800s threshold.
+  # It is stamped into each no-deadline unit's deadline_seconds at generation time,
+  # so lowering it tightens reclaim for newly generated units (already-generated
+  # units keep the value stamped when they were created). Lower it for tighter
+  # reclaim of no-deadline work, or set a real deadline instead.
+  no_deadline_ceiling_seconds: 21600 # env: LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS

@@ -552,6 +552,251 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 	return wu, nil
 }
 
+// DispatchCandidate is one stageable QUEUED unit returned by
+// FindDispatchableBatch, carrying everything the in-memory dispatch cache needs
+// to hand it out and build the proto assignment without any further DB read.
+type DispatchCandidate struct {
+	WorkUnit *WorkUnit
+	// LeafID is wu.LeafID, duplicated for the cache's per-leaf metadata lookup.
+	LeafID types.ID
+	// RedundancyFactor is the leaf's effective redundancy (validation_config), the
+	// cap the cache enforces on in-memory hand-outs of this unit.
+	RedundancyFactor int
+	// ActiveAssignments is the unit's CURRENT active-history-row count (outcome IS
+	// NULL) at refill time. The cache seeds its per-unit redundancy headroom from
+	// this authoritative DB count so a unit already partially dispatched (e.g. a
+	// redundancy>1 unit with one running holder) is staged with the correct
+	// remaining headroom.
+	ActiveAssignments int
+	// Runtime is the leaf's execution_config.runtime (used to assert the WASM
+	// partition and for capability matching at hand-out).
+	Runtime string
+}
+
+// FindDispatchableBatch bulk-selects up to `limit` QUEUED, dispatch-eligible work
+// units for the in-memory dispatch cache to refill from. It is the LIMIT-N,
+// volunteer-AGNOSTIC counterpart of FindNextAssignable: the global no-double-hand
+// and redundancy/reservation guards are kept in SQL, but the per-requester
+// predicates (capability fit, blocked-leaf, self-exclusion, the per-volunteer
+// inflight cap) are dropped — those are re-checked in memory at hand-out against
+// each requester.
+//
+// Differences from FindNextAssignable, all deliberate:
+//   - LIMIT $1 (the refill batch), not LIMIT 1.
+//   - No specific requester: the redundancy term counts active history rows + any
+//     live NORMAL reservation (held by anyone); the reservation guard hides any
+//     live-reserved NORMAL unit. A redundancy>1 unit with one live reservation but
+//     unmet redundancy is still staged (its remaining headroom is carried out in
+//     DispatchCandidate.ActiveAssignments + the cache's reservation accounting).
+//   - excludeIDs (the cache's in-memory-reserved id set) are excluded via
+//     NOT wu.id = ANY($2): a DB-level backstop so two refill ticks cannot re-stage
+//     a unit the cache already handed out but has not yet flushed.
+//   - WASM-runtime leafs are excluded: those are dispatched by the separate
+//     immediate-assign browser path, partitioned from the cache by runtime so there
+//     is exactly one writer per unit.
+//   - FOR UPDATE OF wu SKIP LOCKED is KEPT (short-lived for a bulk read), the proven
+//     no-double-hand primitive; the refill writes nothing, so the lock is released
+//     at the end of this SELECT's transaction.
+func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]DispatchCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT `+prefixedWorkUnitColumns+`,
+			CASE WHEN wu.spot_check THEN 2
+			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
+			END AS effective_redundancy,
+			(SELECT COUNT(*) FROM work_unit_assignment_history wuah
+			 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL) AS active_assignments,
+			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime
+		FROM work_units wu
+		JOIN leafs l ON wu.leaf_id = l.id
+		WHERE wu.state = 'QUEUED'
+		  AND l.state = 'ACTIVE'
+		  -- WASM is dispatched by the immediate-assign browser path, not the cache.
+		  AND COALESCE(l.execution_config->>'runtime', 'NATIVE') <> 'WASM'
+		  -- DB-level backstop: never re-stage a unit the cache already holds in memory.
+		  -- Guard the NULL/empty exclude set explicitly: id = ANY(NULL::uuid[]) is NULL
+		  -- (not FALSE), so a bare NOT (id = ANY($2)) would filter out EVERY row whenever
+		  -- excludeIDs is nil (e.g. a cold-cache refill) — the array-length guard makes an
+		  -- empty/absent exclude set a no-op instead.
+		  AND (array_length($2::uuid[], 1) IS NULL OR NOT (wu.id = ANY($2::uuid[])))
+		  -- Optional leaf scope (the on-demand leaf-scoped refill): when $3 is empty the
+		  -- select spans all ACTIVE non-WASM leafs; otherwise it is confined to those
+		  -- leafs so a leaf-filtered requester can be served even when the ready pool is
+		  -- monopolized by a higher-priority/older leaf.
+		  AND (array_length($3::uuid[], 1) IS NULL OR wu.leaf_id = ANY($3::uuid[]))
+		  -- Redundancy: active history rows + one for any live NORMAL reservation
+		  -- (held by anyone, since there is no specific requester at refill time).
+		  -- Spot-check units are excluded from the reservation term (they carry their
+		  -- own history row and are counted by the history subquery).
+		  AND (
+		    (
+		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
+		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
+		    )
+		    + CASE
+		        WHEN NOT wu.spot_check
+		             AND wu.reserved_until IS NOT NULL AND wu.reserved_until > NOW()
+		        THEN 1 ELSE 0
+		      END
+		  ) < CASE WHEN wu.spot_check THEN 2
+		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
+		      END
+		  -- Reservation guard: a live NORMAL reservation hides the unit; a lapsed
+		  -- lease or a spot-check unit (must stay visible for corroboration) does not.
+		  AND (
+		    wu.spot_check
+		    OR wu.reserved_until IS NULL
+		    OR wu.reserved_until < NOW()
+		  )
+		ORDER BY wu.priority DESC, wu.created_at ASC
+		LIMIT $1
+		FOR UPDATE OF wu SKIP LOCKED`,
+		limit, excludeIDs, leafIDs,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to find dispatchable batch", err)
+	}
+	defer rows.Close()
+
+	var out []DispatchCandidate
+	for rows.Next() {
+		var wu WorkUnit
+		var redundancy, active int
+		var runtime string
+		if err := rows.Scan(
+			&wu.ID, &wu.LeafID, &wu.BatchID, &wu.State, &wu.Priority,
+			&wu.InputData, &wu.InputDataRef, &wu.CodeArtifactRef, &wu.Parameters,
+			&wu.EstimatedDurationSeconds, &wu.DeadlineSeconds, &wu.OutputSpec,
+			&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
+			&wu.ReassignmentCount, &wu.MaxReassignments, &wu.LastHeartbeatAt,
+			&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
+			&wu.ReservedUntil, &wu.ReservedVolunteerID, &wu.CreatedAt, &wu.UpdatedAt,
+			&redundancy, &active, &runtime,
+		); err != nil {
+			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
+		}
+		cand := wu
+		out = append(out, DispatchCandidate{
+			WorkUnit:          &cand,
+			LeafID:            wu.LeafID,
+			RedundancyFactor:  redundancy,
+			ActiveAssignments: active,
+			Runtime:           runtime,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate dispatchable work units", err)
+	}
+	return out, nil
+}
+
+// FlushReservation is one async reservation write produced by the dispatch cache.
+type FlushReservation struct {
+	WorkUnitID    types.ID
+	VolunteerID   types.ID
+	ReservedUntil time.Time
+}
+
+// FlushReservations writes a batch of dispatch-cache reservations in ONE multi-row
+// UPDATE, using the SAME optimistic guard ReserveNextAssignable uses per-row: a
+// reservation lands only if the unit is still QUEUED and either unreserved, lease-
+// lapsed, or already reserved to this same volunteer. The set of work_unit_ids that
+// actually landed is returned (via RETURNING); any id NOT in the returned set is a
+// conflict — the cache voids that in-memory hand-out (decrementing its headroom /
+// inflight counters) so a reservation it could not persist is never counted.
+//
+// This is the head's single batched reservation-write path that takes Postgres off
+// the RequestWorkUnit hot path: hand-out is authoritative in memory immediately and
+// the flush lags by at most flushInterval / flushBatchSize.
+func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []FlushReservation) ([]types.ID, error) {
+	if len(recs) == 0 {
+		return nil, nil
+	}
+	ids := make([]types.ID, len(recs))
+	vols := make([]types.ID, len(recs))
+	untils := make([]time.Time, len(recs))
+	for i, rec := range recs {
+		ids[i] = rec.WorkUnitID
+		vols[i] = rec.VolunteerID
+		untils[i] = rec.ReservedUntil
+	}
+	rows, err := r.db.Query(ctx, `
+		UPDATE work_units AS wu SET
+			reserved_until = v.reserved_until,
+			reserved_volunteer_id = v.vol
+		FROM (
+			SELECT unnest($1::uuid[]) AS id,
+			       unnest($2::uuid[]) AS vol,
+			       unnest($3::timestamptz[]) AS reserved_until
+		) AS v
+		WHERE wu.id = v.id
+		  AND wu.state = 'QUEUED'
+		  AND (wu.reserved_until IS NULL
+		       OR wu.reserved_until < NOW()
+		       OR wu.reserved_volunteer_id = v.vol)
+		RETURNING wu.id`,
+		ids, vols, untils,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to flush reservations", err)
+	}
+	defer rows.Close()
+
+	var landed []types.ID
+	for rows.Next() {
+		var id types.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, apierror.Internal("failed to scan flushed reservation id", err)
+		}
+		landed = append(landed, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate flushed reservations", err)
+	}
+	return landed, nil
+}
+
+// CountActiveByVolunteer returns the authoritative per-volunteer inflight count
+// (active history rows + live reservations) for every volunteer that currently
+// holds any, keyed by volunteer id. The dispatch cache reconciles its in-memory
+// inflight counters against this so crash/drift can never cause permanent
+// over-admission.
+func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT vol, SUM(cnt)::bigint FROM (
+			SELECT volunteer_id AS vol, COUNT(*) AS cnt
+			FROM work_unit_assignment_history
+			WHERE outcome IS NULL
+			GROUP BY volunteer_id
+			UNION ALL
+			SELECT reserved_volunteer_id AS vol, COUNT(*) AS cnt
+			FROM work_units
+			WHERE reserved_volunteer_id IS NOT NULL AND reserved_until > NOW()
+			GROUP BY reserved_volunteer_id
+		) t
+		GROUP BY vol`)
+	if err != nil {
+		return nil, apierror.Internal("failed to count active by volunteer", err)
+	}
+	defer rows.Close()
+
+	out := make(map[types.ID]int)
+	for rows.Next() {
+		var vol types.ID
+		var cnt int64
+		if err := rows.Scan(&vol, &cnt); err != nil {
+			return nil, apierror.Internal("failed to scan active-by-volunteer row", err)
+		}
+		out[vol] = int(cnt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate active-by-volunteer rows", err)
+	}
+	return out, nil
+}
+
 // ReserveNextAssignable is the batch-fill counterpart to FindNextAssignable: it
 // finds the next assignable QUEUED unit for the volunteer (honoring every
 // capability/redundancy/reservation/inflight predicate) and, instead of
@@ -628,19 +873,6 @@ func (r *PgxWorkUnitRepository) Assign(ctx context.Context, workUnitID types.ID,
 	return wu, nil
 }
 
-// UpdateHeartbeat updates last_heartbeat_at to NOW() for a work unit.
-func (r *PgxWorkUnitRepository) UpdateHeartbeat(ctx context.Context, id types.ID) error {
-	tag, err := r.db.Exec(ctx,
-		"UPDATE work_units SET last_heartbeat_at = NOW() WHERE id = $1", id)
-	if err != nil {
-		return apierror.Internal("failed to update heartbeat", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return apierror.NotFound("work_unit", id.String())
-	}
-	return nil
-}
-
 // CountByLeafAndState returns the count of work units for a project in a given state.
 func (r *PgxWorkUnitRepository) CountByLeafAndState(ctx context.Context, projectID types.ID, state WorkUnitState) (int64, error) {
 	var count int64
@@ -658,8 +890,12 @@ func (r *PgxWorkUnitRepository) CountByLeafAndState(ctx context.Context, project
 // - ASSIGNED or RUNNING work units past their deadline (based on assigned_at)
 // - Spot-check work units stuck in QUEUED state for over 1 hour (never picked up by a second volunteer)
 //
-// deadline_seconds = 0 means "no deadline" (leaf opted out via NoDeadline); such
-// units are never expired here and rely on heartbeat-based abandonment instead.
+// deadline_seconds = 0 means "no deadline" and is never expired here. NoDeadline
+// leafs no longer stamp 0: ResolveDeadlineSeconds gives them a large synthetic
+// reclaim ceiling (deadline_seconds > 0) so they remain covered by this sweep —
+// a unit on a vanished volunteer is always reclaimed, at most after the ceiling.
+// A unit still QUEUED+reserved (never run-started) is reclaimed separately by the
+// lapsed-reservation sweep (FindLapsedReservations) once its lease lapses.
 func (r *PgxWorkUnitRepository) FindExpiredWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+workUnitColumns+` FROM work_units
@@ -690,28 +926,30 @@ func (r *PgxWorkUnitRepository) FindExpiredWorkUnits(ctx context.Context, limit 
 	return workUnits, nil
 }
 
-// FindAbandonedWorkUnits returns ASSIGNED or RUNNING work units with stale
-// heartbeats. ASSIGNED is included so a volunteer that vanishes before its first
-// RUNNING heartbeat (e.g. mid image-pull, or while the unit waits in its
-// prefetch queue) is still reclaimed — critical for no_deadline leafs, which
-// FindExpiredWorkUnits never touches. last_heartbeat_at is set at assignment
-// time and refreshed by PREPARING heartbeats while the unit is held, so live
-// pulls/queued units are not falsely reclaimed.
-func (r *PgxWorkUnitRepository) FindAbandonedWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error) {
+// FindLapsedReservations returns still-QUEUED work units whose buffer lease has
+// lapsed (reserved_until IS NOT NULL AND reserved_until < NOW()). These are
+// buffered (reserved) units whose holder vanished before run-start — either an
+// ordinary client that buffered work then died, or a head crash that flushed a
+// reservation whose in-memory owner is gone (the #22 lapsed-lease reclaim gap).
+//
+// Neither FindExpiredWorkUnits nor the (removed) heartbeat sweep covered these:
+// both filter state IN ('ASSIGNED','RUNNING'), so a QUEUED-reserved unit whose
+// reservation lapsed was never actively reclaimed. With per-task heartbeats gone
+// and lease-renewal retired, this sweep is the load-bearing dead-holder reclaim
+// for units that never StartWork'd. The caller clears each returned unit's
+// reservation (ClearReservation), leaving it QUEUED and immediately re-stageable
+// by the dispatch cache — no TransitionToExpired/Reassign is needed (the unit
+// never left QUEUED).
+func (r *PgxWorkUnitRepository) FindLapsedReservations(ctx context.Context, limit int) ([]*WorkUnit, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT `+prefixedWorkUnitColumns+`
-		FROM work_units wu
-		JOIN leafs l ON wu.leaf_id = l.id
-		WHERE wu.state IN ('ASSIGNED', 'RUNNING')
-		  AND wu.last_heartbeat_at IS NOT NULL
-		  AND NOW() - wu.last_heartbeat_at >
-		      (l.fault_tolerance_config->>'heartbeat_interval_seconds')::int
-		      * (l.fault_tolerance_config->>'missed_heartbeats_threshold')::int
-		      * INTERVAL '1 second'
-		ORDER BY wu.last_heartbeat_at ASC
+		SELECT `+workUnitColumns+` FROM work_units
+		WHERE state = 'QUEUED'
+		  AND reserved_until IS NOT NULL
+		  AND reserved_until < NOW()
+		ORDER BY reserved_until ASC
 		LIMIT $1`, limit)
 	if err != nil {
-		return nil, apierror.Internal("failed to find abandoned work units", err)
+		return nil, apierror.Internal("failed to find lapsed reservations", err)
 	}
 	defer rows.Close()
 
@@ -719,12 +957,12 @@ func (r *PgxWorkUnitRepository) FindAbandonedWorkUnits(ctx context.Context, limi
 	for rows.Next() {
 		wu, err := scanWorkUnit(rows)
 		if err != nil {
-			return nil, apierror.Internal("failed to scan abandoned work unit", err)
+			return nil, apierror.Internal("failed to scan lapsed reservation", err)
 		}
 		workUnits = append(workUnits, wu)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, apierror.Internal("failed to iterate abandoned work units", err)
+		return nil, apierror.Internal("failed to iterate lapsed reservations", err)
 	}
 	return workUnits, nil
 }

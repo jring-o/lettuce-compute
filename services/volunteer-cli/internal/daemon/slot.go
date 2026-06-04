@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
@@ -19,7 +20,21 @@ var (
 	ErrTaskAlreadySuspended = errors.New("task is already suspended")
 	ErrTaskNotSuspended     = errors.New("task is not suspended")
 	ErrDaemonPaused         = errors.New("cannot resume task while daemon is paused")
+
+	// errStartWorkDropped is set as the slot's execErr when run-start (StartWork)
+	// reports the unit is no longer ours (Ok=false) or fails terminally. It signals
+	// "drop without submitting": the slot never executed, so there is nothing to
+	// submit and nothing to abandon (the head already re-staged the unit via its
+	// lapsed-reservation / deadline sweep). handleSlotResult treats a non-nil
+	// result.Err as a no-submit outcome, which is exactly the drop behavior the
+	// removed Heartbeat fast-path used to give the #20 reassigned-out case.
+	errStartWorkDropped = errors.New("work unit dropped at run-start (no longer reserved for this volunteer)")
 )
+
+// startWorkTimeout bounds the run-start RPC so a slow/overloaded head can't stall
+// a slot indefinitely before execution begins. On timeout the unit is dropped and
+// reclaimed by the head's deadline/lapsed-reservation sweep.
+const startWorkTimeout = 30 * time.Second
 
 // defaultWUMemoryMB is the conservative memory estimate for WUs that don't specify MaxMemoryMB.
 const defaultWUMemoryMB = 512
@@ -37,7 +52,6 @@ type ExecutionSlot struct {
 	startedAt         time.Time
 	checkpoint        *CheckpointManager
 	resumedFromCkp    bool
-	heartbeatInterval int32
 	preserved         *PersistedTask // non-nil if work dir was preserved on shutdown
 	processHandle     ProcessHandle  // for suspend/resume
 	suspended         bool
@@ -86,7 +100,8 @@ func NewSlotManager(maxSlots int, logger *slog.Logger) *SlotManager {
 }
 
 // StartSlot begins execution in the given slot with the provided pre-fetched item.
-// The slot goroutine handles: checkpoint restore, heartbeat, execution, cleanup.
+// The slot goroutine handles: checkpoint restore, run-start (StartWork), execution,
+// cleanup.
 func (sm *SlotManager) StartSlot(ctx context.Context, slotID int, item *PreFetchItem, d *Daemon) error {
 	slot := sm.slots[slotID]
 	slot.mu.Lock()
@@ -101,7 +116,6 @@ func (sm *SlotManager) StartSlot(ctx context.Context, slotID int, item *PreFetch
 		slot.startedAt = time.Now()
 	}
 	slot.resumedFromCkp = false
-	slot.heartbeatInterval = item.WUResp.HeartbeatIntervalSeconds
 	slot.preserved = nil
 	slot.fetchedAt = item.FetchedAt
 	slot.totalPausedDur = 0
@@ -118,7 +132,6 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 	prep := item.Prep
 	rt := item.Runtime
 	conn := item.Conn
-	heartbeatInterval := item.WUResp.HeartbeatIntervalSeconds
 
 	var execResult *runtime.ExecutionResult
 	var execErr error
@@ -126,7 +139,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 	defer func() {
 		// If daemon is shutting down and execution was interrupted (not completed
 		// successfully), preserve the work directory for resumption on next startup.
-		if sm.shuttingDown.Load() && execErr != nil {
+		// A unit dropped at run-start (errStartWorkDropped) is no longer ours, so it
+		// is never preserved — resuming it would only fail StartWork again.
+		if sm.shuttingDown.Load() && execErr != nil && !errors.Is(execErr, errStartWorkDropped) {
 			var ckptSeq int32
 			slot.mu.Lock()
 			if slot.checkpoint != nil {
@@ -151,7 +166,6 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 				VizBundlePath:          prep.VizBundlePath,
 				CheckpointSequence:     ckptSeq,
 				CheckpointIntervalSecs: wu.CheckpointIntervalSeconds,
-				HeartbeatIntervalSecs:  slot.heartbeatInterval,
 				StartedAt:              slot.startedAt,
 			}
 			slot.mu.Unlock()
@@ -240,19 +254,48 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		}()
 	}
 
-	// Hand off heartbeating: stop the PREPARING heartbeat (kept the unit fresh
-	// during the pull and queue wait) now that the slot's RUNNING heartbeat —
-	// which also transitions the unit ASSIGNED -> RUNNING — takes over.
-	item.stopHeartbeat()
-
-	// Start heartbeat goroutine.
-	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
-	defer heartbeatCancel()
-	workDir := ""
-	if prep != nil {
-		workDir = prep.WorkDir
+	// Run-start: the slot is now actually executing a unit pulled from the work
+	// buffer. With per-task heartbeats removed, the head's QUEUED -> ASSIGNED
+	// transition (and the deadline clock start) is performed by an explicit
+	// StartWork RPC here, replacing the old first-RUNNING-heartbeat run-start.
+	// Liveness from here is deadline-based.
+	//
+	// If StartWork reports the unit is no longer ours (Ok=false) or fails
+	// terminally, the head has already re-staged it (its reservation lapsed while
+	// it sat in the buffer, or it was reassigned). We DROP it instead of wasting an
+	// execution: cancel the (unused) exec context and return errStartWorkDropped so
+	// handleSlotResult skips submission. This relocates the removed Heartbeat
+	// fast-path's #20 reassigned-out drop to run-start. Signing is handled by the
+	// client's signing interceptor, so the request carries only the IDs.
+	if d != nil && conn != nil && conn.Client != nil {
+		swCtx, swCancel := context.WithTimeout(execCtx, startWorkTimeout)
+		swResp, swErr := conn.Client.StartWork(swCtx, &lettucev1.StartWorkRequest{
+			WorkUnitId:  wu.ID,
+			VolunteerId: conn.VolunteerID,
+		})
+		swCancel()
+		if swErr != nil {
+			// A terminal rejection (NotFound/FailedPrecondition/PermissionDenied/
+			// InvalidArgument) means the unit is definitively not run-startable for us;
+			// drop it. Anything else (transport blip, ResourceExhausted shed,
+			// DeadlineExceeded) also drops THIS attempt — the unit stays QUEUED/reserved
+			// at the head and is reclaimed by its reservation window, so we never run a
+			// unit the head doesn't believe is ours.
+			sm.logger.Warn("run-start StartWork failed; dropping unit",
+				"work_unit_id", wu.ID, "slot", slot.ID, "error", swErr)
+			cancelExec()
+			execErr = errStartWorkDropped
+			return
+		}
+		if !swResp.GetOk() {
+			sm.logger.Info("run-start denied (unit reassigned or reservation lapsed); dropping unit",
+				"work_unit_id", wu.ID, "slot", slot.ID, "message", swResp.GetMessage())
+			cancelExec()
+			execErr = errStartWorkDropped
+			return
+		}
+		sm.logger.Debug("run-start StartWork ok", "work_unit_id", wu.ID, "slot", slot.ID)
 	}
-	go d.runSlotHeartbeat(heartbeatCtx, wu, workDir, heartbeatInterval, cancelExec, conn, checkpointMgr)
 
 	// Wire process handle callbacks for suspend/resume.
 	if prep != nil {
@@ -279,13 +322,10 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		execResult, execErr = rt.Execute(execCtx, wu, prep)
 	}
 
-	// Stop checkpoint manager before heartbeat so final checkpoint is saved.
+	// Stop checkpoint manager once execution completes so a final checkpoint is saved.
 	if checkpointMgr != nil {
 		checkpointMgr.Stop()
 	}
-
-	// Stop heartbeat.
-	heartbeatCancel()
 }
 
 // isProcessAliveFunc is the function used to check whether a PID is still running.
@@ -563,7 +603,6 @@ func (sm *SlotManager) GetActivePersistableTasks() []PersistedTask {
 				ExecutionSpec:         slot.wu.ExecutionSpec,
 				RscFpopsEst:           slot.wu.RscFpopsEst,
 				VizBundlePath:         slot.prep.VizBundlePath,
-				HeartbeatIntervalSecs: slot.heartbeatInterval,
 				StartedAt:             slot.startedAt,
 			}
 			if slot.checkpoint != nil {

@@ -591,10 +591,12 @@ func TestHeadConfigValidate(t *testing.T) {
 }
 
 func TestHeadEffectiveDispatchDefaults(t *testing.T) {
-	// Zero-valued HeadConfig yields the documented Layer-1 defaults.
+	// Zero-valued HeadConfig yields the documented dispatch defaults. The
+	// max-batch ceiling was raised to 64 in Layer 2 (a safety ceiling, not the
+	// limiter) so short-unit leafs can fill their work_buffer_hours.
 	var h HeadConfig
-	if got := h.EffectiveMaxBatch(); got != 8 {
-		t.Errorf("EffectiveMaxBatch() = %d, want 8", got)
+	if got := h.EffectiveMaxBatch(); got != 64 {
+		t.Errorf("EffectiveMaxBatch() = %d, want 64", got)
 	}
 	if got := h.EffectiveMinRetryDelaySeconds(); got != 30 {
 		t.Errorf("EffectiveMinRetryDelaySeconds() = %d, want 30", got)

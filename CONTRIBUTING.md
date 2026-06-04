@@ -146,9 +146,24 @@ HTTP admin API, runs for a fixed duration, and prints a metrics report.
   (*work batching*), maintains an in-memory *client work buffer* sized in hours,
   **obeys** the *server-directed retry delay*, makes **zero** `RequestWorkUnit`
   calls while its buffer is full, and treats *per-client rate limiting*
-  (`ResourceExhausted`) as a fixed local backoff. The report shows the
-  `RenewReservations` rate on its own line so lease-renewal traffic stays
-  visible and separate from `RequestWorkUnit` noise.
+  (`ResourceExhausted`) as a fixed local backoff.
+- **`overload`** — the saturation driver: a hot `RequestWorkUnit` loop with
+  **no** inter-request delay that ignores the *server-directed retry delay*
+  entirely, so a fleet larger than the head's dispatch ceiling pins the hot
+  path. Use it to measure the single-head dispatch ceiling (the report's
+  per-second **peak dispatch/sec**) and to prove the head sheds gracefully
+  (`ResourceExhausted`) instead of collapsing the DB pool. The report's
+  `shed (ResourceExhausted)` ratio and the `DB-pool collapse` flag are the
+  pass/fail signals: under overload the head should shed (ratio > 0) and the
+  collapse flag should stay **no** (zero `DeadlineExceeded`/`Unavailable` on
+  `RequestWorkUnit`). By default the profile ignores sheds and re-requests
+  immediately (maximal pressure); pass `--honor-shed` to back off like a real
+  client.
+
+Run-start is the explicit `StartWork` RPC (one call per unit actually executed,
+**not** per request); there is no per-task heartbeat, so liveness is
+deadline-based. The report's per-RPC table shows `StartWork` and a `collaps`
+column alongside `throttl`.
 
 ### Seeding
 
@@ -198,6 +213,51 @@ simulator against a **standalone head process**:
    Run it once per profile (`--profile=naive`, then `--profile=buffered`) to
    compare fleet `RequestWorkUnit` rate at equal dispatch throughput.
 
+#### Ceiling / overload run (single-head dispatch ceiling + graceful shedding)
+
+To measure the single-head dispatch ceiling and confirm the head sheds
+gracefully under naive overload (the Layer 2 Definition of Done), drive the
+`overload` profile with a fleet well above capacity:
+
+```bash
+go run ./cmd/swarm-sim \
+  --head-grpc=127.0.0.1:9090 --head-http=http://127.0.0.1:8080 \
+  --admin-key=$LETTUCE_ADMIN_API_KEY --creator-id=<admin-user-id> \
+  --volunteers=2000 --profile=overload --duration=60s \
+  --seed-leaf=swarm-ceiling --seed-units=200000 --report=json
+```
+
+Read **`peak_dispatch_per_sec`** as the ceiling, **`shed_ratio`** as the
+graceful-backpressure fraction, and **`collapsed`** (must be `false`) as the
+no-pool-collapse assertion.
+
+Two head-side knobs are required for a meaningful ceiling run:
+
+- **Raise the gRPC rate limits.** A single-host swarm shares one source IP, so
+  the Layer 0 per-IP bucket (default 60/min) would shed the fleet before the
+  Layer 2 admission cap is exercised — and the `shed_ratio` would just measure
+  the per-IP limiter, not the head's dispatch capacity. Raise both budgets on
+  the **head process** when launching it:
+
+  ```bash
+  LETTUCE_GRPC_PER_IP_RATE_LIMIT=100000000 \
+  LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT=100000000 \
+  ...other env... lettuce-server --config ...
+  ```
+
+  (These map to `SetGRPCRateLimits`; a non-positive value leaves the default.)
+
+- **Set the DB pool to the operator size (~60)** to reproduce the collapse
+  threshold the load test originally found — the code default is 25:
+
+  ```bash
+  LETTUCE_DB_MAX_CONNS=60 ...
+  ```
+
+Run the overload profile **before** and **after** the Layer 2 changes to compare
+`peak_dispatch_per_sec` against the ~240/s baseline and to confirm `collapsed`
+flips from `true` (pre-Layer-2 pool collapse) to `false` (graceful shedding).
+
 ### Per-client rate limiting note
 
 The head's *per-client rate limiting* buckets gRPC callers per source IP. A
@@ -206,7 +266,10 @@ will be throttled (`ResourceExhausted`) — this is itself a valid Layer-0
 measurement, but it means request-rate numbers from a single-host swarm are
 bounded by the per-IP limit. The simulator retries **registration** through the
 limiter so the fleet still comes up; steady-state `RequestWorkUnit` numbers
-reflect whatever the limiter allows.
+reflect whatever the limiter allows. For a ceiling/overload run, raise the
+budgets on the head with `LETTUCE_GRPC_PER_IP_RATE_LIMIT` /
+`LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT` (see the ceiling-run recipe above) so the
+shed ratio measures the head's dispatch admission cap, not the per-IP bucket.
 
 ### Integration smoke test
 

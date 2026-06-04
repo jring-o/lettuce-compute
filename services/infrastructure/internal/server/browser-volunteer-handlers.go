@@ -43,9 +43,9 @@ type browserVolunteerDeps struct {
 // --- Request/Response types ---
 
 type browserRegisterRequest struct {
-	PublicKey   string                  `json:"public_key"`
+	PublicKey   string                 `json:"public_key"`
 	DisplayName string                 `json:"display_name"`
-	Hardware   browserHardwareRequest  `json:"hardware"`
+	Hardware    browserHardwareRequest `json:"hardware"`
 }
 
 type browserHardwareRequest struct {
@@ -57,7 +57,7 @@ type browserHardwareRequest struct {
 }
 
 type browserRegisterResponse struct {
-	VolunteerID string `json:"volunteer_id"`
+	VolunteerID  string `json:"volunteer_id"`
 	RegisteredAt string `json:"registered_at"`
 }
 
@@ -79,26 +79,25 @@ type browserExecutionSpec struct {
 }
 
 type browserRequestWorkResponse struct {
-	WorkUnitID               string               `json:"work_unit_id"`
-	LeafID                   string               `json:"leaf_id"`
-	Runtime                  string               `json:"runtime"`
-	InputData                string               `json:"input_data,omitempty"`
-	InputDataURL             string               `json:"input_data_url,omitempty"`
-	CodeArtifactURL          string               `json:"code_artifact_url,omitempty"`
-	ParametersJSON           string               `json:"parameters_json,omitempty"`
-	DeadlineSeconds          int                  `json:"deadline_seconds"`
-	HeartbeatIntervalSeconds int                  `json:"heartbeat_interval_seconds"`
-	EnvVars                  map[string]string    `json:"env_vars,omitempty"`
-	ExecutionSpec            browserExecutionSpec `json:"execution_spec"`
-	RscFpopsEst              float64              `json:"rsc_fpops_est,omitempty"`
+	WorkUnitID      string               `json:"work_unit_id"`
+	LeafID          string               `json:"leaf_id"`
+	Runtime         string               `json:"runtime"`
+	InputData       string               `json:"input_data,omitempty"`
+	InputDataURL    string               `json:"input_data_url,omitempty"`
+	CodeArtifactURL string               `json:"code_artifact_url,omitempty"`
+	ParametersJSON  string               `json:"parameters_json,omitempty"`
+	DeadlineSeconds int                  `json:"deadline_seconds"`
+	EnvVars         map[string]string    `json:"env_vars,omitempty"`
+	ExecutionSpec   browserExecutionSpec `json:"execution_spec"`
+	RscFpopsEst     float64              `json:"rsc_fpops_est,omitempty"`
 }
 
 type browserSubmitResultRequest struct {
-	WorkUnitID     string                 `json:"work_unit_id"`
-	OutputData     string                 `json:"output_data"`
-	OutputChecksum string                 `json:"output_checksum"`
-	ExitCode       int                    `json:"exit_code"`
-	Metrics        browserResultMetrics   `json:"metrics"`
+	WorkUnitID     string               `json:"work_unit_id"`
+	OutputData     string               `json:"output_data"`
+	OutputChecksum string               `json:"output_checksum"`
+	ExitCode       int                  `json:"exit_code"`
+	Metrics        browserResultMetrics `json:"metrics"`
 }
 
 type browserResultMetrics struct {
@@ -110,16 +109,6 @@ type browserResultMetrics struct {
 type browserSubmitResultResponse struct {
 	Accepted         bool   `json:"accepted"`
 	ValidationStatus string `json:"validation_status"`
-}
-
-type browserHeartbeatRequest struct {
-	WorkUnitID  string               `json:"work_unit_id"`
-	ProgressPct int                  `json:"progress_pct"`
-	Metrics     browserResultMetrics `json:"metrics"`
-}
-
-type browserHeartbeatResponse struct {
-	ContinueExecution bool `json:"continue_execution"`
 }
 
 // browserRegisterMaxBody limits the request body size for the unauthenticated register endpoint.
@@ -191,8 +180,8 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 
 		hw := volunteer.HardwareCapabilities{
-			CPUCores:    req.Hardware.CPUCores,
-			MaxCPUCores: req.Hardware.CPUCores,
+			CPUCores:      req.Hardware.CPUCores,
+			MaxCPUCores:   req.Hardware.CPUCores,
 			MemoryTotalMB: req.Hardware.MemoryMB,
 			MaxMemoryMB:   req.Hardware.MemoryMB,
 			GPUs:          gpus,
@@ -217,12 +206,12 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 
 			v := &volunteer.Volunteer{
 				PublicKey:            pubKeyBytes,
-				DisplayName:         displayName,
+				DisplayName:          displayName,
 				HardwareCapabilities: hw,
-				AvailableRuntimes:   req.Hardware.AvailableRuntimes,
-				SchedulingMode:      volunteer.ScheduleAlways,
-				IsActive:            true,
-				LastSeenAt:          &now,
+				AvailableRuntimes:    req.Hardware.AvailableRuntimes,
+				SchedulingMode:       volunteer.ScheduleAlways,
+				IsActive:             true,
+				LastSeenAt:           &now,
 			}
 
 			if createErr := deps.volunteerRepo.Create(r.Context(), v); createErr != nil {
@@ -419,17 +408,16 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 
 		resp := browserRequestWorkResponse{
-			WorkUnitID:               wu.ID.String(),
-			LeafID:                   wu.LeafID.String(),
-			Runtime:                  lf.ExecutionConfig.Runtime,
-			InputData:                inputDataB64,
-			InputDataURL:             derefString(wu.InputDataRef),
-			CodeArtifactURL:          wu.CodeArtifactRef,
-			ParametersJSON:           string(wu.Parameters),
-			DeadlineSeconds:          wu.DeadlineSeconds,
-			HeartbeatIntervalSeconds: lf.FaultToleranceConfig.HeartbeatIntervalSeconds,
-			EnvVars:                  safeEnvVars,
-			RscFpopsEst:              lf.ExecutionConfig.RscFpopsEst,
+			WorkUnitID:      wu.ID.String(),
+			LeafID:          wu.LeafID.String(),
+			Runtime:         lf.ExecutionConfig.Runtime,
+			InputData:       inputDataB64,
+			InputDataURL:    derefString(wu.InputDataRef),
+			CodeArtifactURL: wu.CodeArtifactRef,
+			ParametersJSON:  string(wu.Parameters),
+			DeadlineSeconds: wu.DeadlineSeconds,
+			EnvVars:         safeEnvVars,
+			RscFpopsEst:     lf.ExecutionConfig.RscFpopsEst,
 			ExecutionSpec: browserExecutionSpec{
 				Binaries:      lf.ExecutionConfig.Binaries,
 				GPURequired:   lf.ExecutionConfig.GPURequired,
@@ -713,145 +701,9 @@ func RegisterBrowserVolunteerRoutes(mux *http.ServeMux, pool *pgxpool.Pool, volu
 		ed25519AuthRequired(handleBrowserRequestWork(deps)))
 	mux.HandleFunc("POST /api/v1/volunteers/submit-result",
 		ed25519AuthRequired(handleBrowserSubmitResult(deps)))
-	mux.HandleFunc("POST /api/v1/volunteers/heartbeat",
-		ed25519AuthRequired(handleBrowserHeartbeat(deps)))
+	// NOTE: the browser REST heartbeat (POST /api/v1/volunteers/heartbeat) is
+	// removed. Browser/WASM units run-start at assignment time (immediate Assign in
+	// handleBrowserRequestWork) and liveness is deadline-based: a closed-tab unit is
+	// reclaimed at its deadline (or the synthetic NoDeadline ceiling) by the fault
+	// monitor. The browser submit path keeps its active-assignment precondition.
 }
-
-// handleBrowserHeartbeat handles POST /api/v1/volunteers/heartbeat.
-func handleBrowserHeartbeat(deps *browserVolunteerDeps) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		pubKey, ok := PublicKeyFromContext(r.Context())
-		if !ok {
-			apierror.WriteError(w, apierror.Unauthorized("missing Ed25519 authentication"))
-			return
-		}
-
-		var req browserHeartbeatRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
-			return
-		}
-
-		if req.WorkUnitID == "" {
-			apierror.WriteError(w, apierror.ValidationError("work_unit_id is required", nil))
-			return
-		}
-		workUnitID, err := types.ParseID(req.WorkUnitID)
-		if err != nil {
-			apierror.WriteError(w, apierror.ValidationError("invalid work_unit_id", nil))
-			return
-		}
-
-		// Look up volunteer.
-		vol, err := deps.volunteerRepo.GetByPublicKey(r.Context(), []byte(pubKey))
-		if err != nil {
-			apiErr, ok := err.(*apierror.APIError)
-			if ok && apiErr.HTTPStatus == 404 {
-				apierror.WriteError(w, apierror.Unauthorized("volunteer not registered"))
-				return
-			}
-			deps.logger.Error("failed to look up volunteer", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		// Load work unit.
-		wu, err := deps.wuRepo.GetByID(r.Context(), workUnitID)
-		if err != nil {
-			apiErr, ok := err.(*apierror.APIError)
-			if ok && apiErr.HTTPStatus == 404 {
-				apierror.WriteError(w, apierror.NotFound("work unit", req.WorkUnitID))
-				return
-			}
-			deps.logger.Error("failed to load work unit", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		// Verify assignment.
-		if wu.SpotCheck {
-			entry, assignErr := deps.assignRepo.FindActiveByWorkUnitAndVolunteer(r.Context(), workUnitID, vol.ID)
-			if assignErr != nil || entry == nil {
-				apierror.WriteError(w, apierror.NotFound("work unit assignment", req.WorkUnitID))
-				return
-			}
-		} else if wu.AssignedVolunteerID == nil || *wu.AssignedVolunteerID != vol.ID {
-			apierror.WriteError(w, apierror.NotFound("work unit assignment", req.WorkUnitID))
-			return
-		}
-
-		// Check work unit state.
-		switch wu.State {
-		case workunit.WorkUnitStateAssigned, workunit.WorkUnitStateRunning:
-			// OK
-		case workunit.WorkUnitStateQueued:
-			if !wu.SpotCheck {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(browserHeartbeatResponse{ContinueExecution: false})
-				return
-			}
-		default:
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(browserHeartbeatResponse{ContinueExecution: false})
-			return
-		}
-
-		// Transaction for atomic updates.
-		tx, err := deps.pool.Begin(r.Context())
-		if err != nil {
-			deps.logger.Error("failed to begin transaction", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-		defer tx.Rollback(r.Context())
-
-		if wu.State == workunit.WorkUnitStateAssigned {
-			_, err = tx.Exec(r.Context(), `
-				UPDATE work_units SET
-					state = 'RUNNING',
-					started_at = NOW(),
-					last_heartbeat_at = NOW()
-				WHERE id = $1 AND state = 'ASSIGNED'`, workUnitID)
-		} else {
-			_, err = tx.Exec(r.Context(),
-				"UPDATE work_units SET last_heartbeat_at = NOW() WHERE id = $1", workUnitID)
-		}
-		if err != nil {
-			deps.logger.Error("failed to update heartbeat", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		_, err = tx.Exec(r.Context(),
-			"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", vol.ID)
-		if err != nil {
-			deps.logger.Error("failed to update volunteer", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		if err := tx.Commit(r.Context()); err != nil {
-			deps.logger.Error("failed to commit heartbeat", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		// Check leaf state.
-		lf, err := deps.leafRepo.GetByID(r.Context(), wu.LeafID)
-		if err != nil {
-			deps.logger.Error("failed to load leaf", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
-
-		continueExec := true
-		switch lf.State {
-		case leaf.StatePaused, leaf.StateCompleted, leaf.StateArchived:
-			continueExec = false
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(browserHeartbeatResponse{ContinueExecution: continueExec})
-	}
-}
-

@@ -20,7 +20,6 @@ func WorkUnitFromProto(a *lettucev1.WorkUnitAssignment) *WorkUnit {
 		CodeArtifactURL:           a.GetCodeArtifactUrl(),
 		ParametersJSON:            a.GetParametersJson(),
 		DeadlineSeconds:           a.GetDeadlineSeconds(),
-		HeartbeatIntervalSeconds:  a.GetHeartbeatIntervalSeconds(),
 		EnvVars:                   a.GetEnvVars(),
 		RscFpopsEst:               a.GetRscFpopsEst(),
 		ReservedUntilUnix:         a.GetReservedUntilUnix(),

@@ -207,11 +207,41 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   fetching one unit at a time, the volunteer requests work in batches and holds
   roughly `work_buffer_hours` of work per concurrent task. While that buffer is
   full it makes **zero** work requests — it just runs what it has. Buffered work
-  is leased by the head (not yet started), so it is cheap to hand back if you
-  stop, and it is only downloaded/prepared right before it runs. The volunteer
-  keeps each buffered unit's lease alive while it holds it, so the head won't
-  hand the same unit to another volunteer — no duplicated work, even when a unit
-  sits in your buffer for a while.
+  is reserved for you by the head (not yet started), so it is cheap to hand back
+  if you stop, and it is only downloaded/prepared right before it runs.
+- **The buffer fills correctly even for fast leafs.** The head tells your
+  volunteer roughly how long one unit of each leaf takes, so a leaf with very
+  short units is requested in a single large batch (up to a safety ceiling)
+  instead of a trickle of tiny requests — your buffer fills to its
+  `work_buffer_hours` target and your CPUs stay busy between polls. You don't
+  configure this; longer-unit leafs are simply requested fewer at a time.
+- **Buffered work is reserved, not heartbeated.** There are no per-task
+  keep-alive messages. When you fetch a unit the head reserves it for you for a
+  bounded window; while it sits in your buffer the head won't hand that same unit
+  to anyone else. If you hold a unit far longer than its reservation window
+  (because your buffer is deep and the unit waits a long time for a free slot),
+  the head may reclaim and re-offer it — your volunteer notices and quietly drops
+  the stale copy rather than running work the head no longer believes is yours,
+  so there's no duplicated work.
+
+### Deadlines, not heartbeats
+
+Liveness is now **deadline-based**. Once one of your slots actually *starts* a
+unit, a clock begins: if the result isn't submitted before the unit's deadline,
+the head assumes the volunteer is gone and reassigns the unit to someone else.
+There are no per-task heartbeats to keep a running unit "alive" — just start work
+promptly and submit by the deadline.
+
+Two things make this volunteer-friendly:
+
+- **Time spent waiting in your buffer does not count against the deadline.** The
+  deadline clock starts when a free slot picks the unit up and begins running it,
+  not when you fetched it. A unit can sit in a deep `work_buffer_hours` buffer for
+  a while and still get its full run window.
+- **If you stop or crash, nothing is lost.** A reserved-but-never-started unit is
+  re-offered once its reservation window passes; a started-but-never-finished unit
+  is reassigned once its deadline passes. At worst a unit is re-dispatched, never
+  permanently stranded.
 
 ### Tuning the buffer
 
@@ -226,6 +256,43 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
 
 > **Replaces `work_buffer_size`.** Earlier releases sized the buffer as a unit
 > count via `work_buffer_size`. That key is gone; use `work_buffer_hours`.
+
+### Thermal protection
+
+`lettuce-volunteer` watches CPU/GPU temperature and **freezes all work when the
+machine gets too hot**, resuming once it cools. The thresholds live under the
+`thermal:` block in `~/.lettuce/config.yaml` and are **temperatures in °C — not
+workload limits.** When the temperature reaches a pause threshold the daemon
+suspends every running unit *and* stops fetching; when it falls back below the
+matching resume threshold it resumes everything. The gap between the two is
+hysteresis so it doesn't flap on and off — each `*_pause_threshold` must be
+greater than its `*_resume_threshold`.
+
+```yaml
+thermal:
+  enabled: true                # master switch for thermal protection
+  cpu_pause_threshold: 85      # °C — freeze ALL work when the CPU reaches this
+  cpu_resume_threshold: 75     # °C — resume once the CPU drops below this
+  gpu_pause_threshold: 80      # °C — freeze ALL work when the GPU reaches this
+  gpu_resume_threshold: 70     # °C — resume once the GPU drops below this
+  poll_interval_seconds: 10    # how often temperatures are sampled
+```
+
+> **These don't throttle *how much* runs.** Thermal pause is all-or-nothing
+> hardware protection, not a per-leaf or concurrency dial. To cap how much work
+> runs at once, use `max_concurrent_tasks` (above) and `resource_limits.*` (CPU
+> cores, memory, GPU VRAM) — those govern admission; the thermal thresholds only
+> decide *whether* work runs at all based on temperature.
+
+> **Hard to observe with very short work units.** Temperatures are sampled every
+> `poll_interval_seconds` (default 10s) and only sustained load crosses the pause
+> point, so a few-second unit usually finishes before anything triggers. To see it
+> on demand, set low thresholds — e.g. `lettuce-volunteer config set
+> thermal.cpu_pause_threshold 50` and `… config set thermal.cpu_resume_threshold
+> 45` (valid range 30–105, pause > resume) — lower `thermal.poll_interval_seconds`,
+> run a longer CPU-heavy leaf, and **restart the daemon** (config is read at
+> startup, not hot-reloaded). Watch the log for `thermal throttle activated` /
+> `thermal throttle released`.
 
 > **Breaking release — update required.** This release changes the
 > volunteer⇄head work protocol. **A volunteer older than this release cannot talk

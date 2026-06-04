@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +26,10 @@ import (
 type WorkClient interface {
 	RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error)
 	SubmitResult(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error)
-	Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error)
+	// StartWork run-starts a buffered reserved unit (QUEUED -> ASSIGNED) when a slot
+	// begins executing it. It replaces the removed per-task Heartbeat RPC; liveness
+	// is deadline-based.
+	StartWork(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error)
 	SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error)
 	GetCheckpoint(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
 	GetHeadInfo(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
@@ -381,11 +383,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.handleSlotResult(submitCtx, result)
 		}
 
-		// Return remaining queued (un-run) units to the head so they aren't
-		// orphaned as ASSIGNED, then clean up. abandonItem uses a detached
-		// context since the run context is already cancelled. See item 4.
+		// Return remaining buffered (un-run, reserved) units to the head so they
+		// aren't held until their reservation window lapses, then clean up.
+		// abandonItem uses a detached context since the run context is already
+		// cancelled. See item 4.
 		for _, item := range d.prefetchQueue.Clear() {
-			item.stopHeartbeat()
 			d.abandonItem(item, "volunteer shutdown")
 			if item.Runtime != nil && item.Prep != nil {
 				item.Runtime.Cleanup(item.Prep)
@@ -668,8 +670,7 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 		if err := d.slotManager.StartSlot(ctx, slotID, item, d); err != nil {
 			d.logger.Error("failed to start slot", "slot", slotID, "error", err)
 			d.slotManager.ReturnSlotID(slotID)
-			// Return the un-run unit to the head instead of orphaning it.
-			item.stopHeartbeat()
+			// Return the un-run unit to the head instead of holding its reservation.
 			d.abandonItem(item, "slot start failed")
 			if item.Runtime != nil && item.Prep != nil {
 				item.Runtime.Cleanup(item.Prep)
@@ -825,6 +826,28 @@ func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
 	sec := rscFpopsEst / d.benchmarkFPOPS
 	if d.dcfTracker != nil {
 		if dcf := d.dcfTracker.Get(leafID); dcf > 0 {
+			sec *= dcf
+		}
+	}
+	return sec
+}
+
+// leafEstSeconds estimates wall-clock seconds for one unit of a leaf to size the
+// FIRST batch request to it (#29), BEFORE any of that leaf's units have been
+// buffered (so estSecondsForUnit, which needs a per-unit rsc_fpops_est, can't
+// help yet). It uses the leaf-level, benchmark-INDEPENDENT estimate the head
+// carries on CachedLeafInfo, refined by this leaf's learned duration correction
+// factor when one is available. Because it does not divide by the local
+// benchmark, it stays non-zero on un-benchmarked hosts — the exact case the old
+// FP-ops-only seam tripped to 0, leaving the flat ceiling to bind. Returns 0 only
+// when the head supplied no estimate.
+func (d *Daemon) leafEstSeconds(leaf CachedLeafInfo) float64 {
+	sec := leaf.EstimatedDurationSeconds
+	if sec <= 0 {
+		return 0
+	}
+	if d.dcfTracker != nil {
+		if dcf := d.dcfTracker.Get(leaf.ID); dcf > 0 {
 			sec *= dcf
 		}
 	}
@@ -1149,79 +1172,12 @@ func (d *Daemon) restoreCheckpoint(ctx context.Context, wu *runtime.WorkUnit, pr
 	)
 }
 
-// runSlotHeartbeat sends periodic heartbeats for a slot's work unit.
-// Takes the checkpoint manager directly, making it safe for concurrent slots.
-func (d *Daemon) runSlotHeartbeat(ctx context.Context, wu *runtime.WorkUnit, workDir string, intervalSeconds int32, cancelExec context.CancelFunc, conn *ServerConnection, cm *CheckpointManager) {
-	interval := time.Duration(intervalSeconds) * time.Second
-	if interval <= 0 {
-		interval = 300 * time.Second
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// send issues one heartbeat. Returns false if the server asked us to abort.
-	send := func() bool {
-		hbStatus := "RUNNING"
-		if cm != nil && cm.LastSaveSuccess() {
-			hbStatus = "CHECKPOINT_SAVED"
-		}
-
-		resp, err := conn.Client.Heartbeat(ctx, &lettucev1.HeartbeatRequest{
-			WorkUnitId:  wu.ID,
-			VolunteerId: conn.VolunteerID,
-			Status:      hbStatus,
-			ProgressPct: ReadProgressFile(workDir),
-		})
-		if err != nil {
-			// A PermissionDenied "not assigned" verdict means the head no longer
-			// has this volunteer assigned to this work unit (e.g. the assignment
-			// expired and was reassigned while we were resuming or computing). The
-			// result we'd eventually submit is already doomed, so stop computing
-			// now: cancel execution and end the heartbeat. Mirrors the abort branch
-			// below. Any other error (transport, Unavailable, etc.) is transient —
-			// keep heartbeating.
-			if st, ok := status.FromError(err); ok &&
-				st.Code() == codes.PermissionDenied &&
-				strings.Contains(st.Message(), "not assigned") {
-				d.logger.Warn("heartbeat rejected: volunteer no longer assigned to this work unit, dropping task",
-					"work_unit_id", wu.ID, "server", conn.Name, "error", err)
-				cancelExec()
-				return false
-			}
-			d.logger.Warn("heartbeat failed", "work_unit_id", wu.ID, "server", conn.Name, "error", err)
-			return true
-		}
-		if !resp.ContinueExecution {
-			d.logger.Info("server requested execution abort",
-				"work_unit_id", wu.ID,
-				"server", conn.Name,
-				"message", resp.Message,
-			)
-			cancelExec()
-			return false
-		}
-		return true
-	}
-
-	// Send immediately so the unit transitions ASSIGNED -> RUNNING right at slot
-	// handoff (the PREPARING heartbeat that kept it fresh has just been stopped),
-	// rather than waiting a full interval for the first RUNNING heartbeat.
-	if !send() {
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !send() {
-				return
-			}
-		}
-	}
-}
+// runSlotHeartbeat (per-task heartbeat loop) is removed: per-task heartbeats no
+// longer exist. Run-start is now an explicit StartWork RPC issued at slot handoff
+// (see SlotManager.runSlot), and liveness is deadline-based. The abort/abandon
+// responsibilities the heartbeat used to carry (the #20 reassigned-out drop,
+// server-requested abort) are surfaced at StartWork (Ok=false / terminal error ->
+// drop the unit) and SubmitResult (FailedPrecondition -> drop) instead.
 
 // checkPauseSignals drains pause/resume signals from all sources.
 func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
@@ -2105,13 +2061,11 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 				}
 
 				item := &PreFetchItem{
-					WU:      wu,
-					Prep:    prep,
-					Runtime: rt,
-					Conn:    conn,
-					WUResp: &lettucev1.WorkUnitAssignment{
-						HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
-					},
+					WU:        wu,
+					Prep:      prep,
+					Runtime:   rt,
+					Conn:      conn,
+					WUResp:    &lettucev1.WorkUnitAssignment{}, // heartbeat interval removed
 					FetchedAt: time.Now(),
 				}
 
@@ -2198,13 +2152,11 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 
 		// Build a synthetic PreFetchItem for StartSlot.
 		item := &PreFetchItem{
-			WU:      wu,
-			Prep:    prep,
-			Runtime: rt,
-			Conn:    conn,
-			WUResp: &lettucev1.WorkUnitAssignment{
-				HeartbeatIntervalSeconds: pt.HeartbeatIntervalSecs,
-			},
+			WU:        wu,
+			Prep:      prep,
+			Runtime:   rt,
+			Conn:      conn,
+			WUResp:    &lettucev1.WorkUnitAssignment{}, // heartbeat interval removed
 			FetchedAt: time.Now(),
 		}
 

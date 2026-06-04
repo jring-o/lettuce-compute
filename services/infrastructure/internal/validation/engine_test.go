@@ -157,7 +157,16 @@ func (m *mockWorkUnitRepo) UpdateHeartbeat(_ context.Context, _ types.ID) error 
 func (m *mockWorkUnitRepo) FindExpiredWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWorkUnitRepo) FindAbandonedWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
+func (m *mockWorkUnitRepo) FindLapsedReservations(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) FindDispatchableBatch(_ context.Context, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation) ([]types.ID, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *mockWorkUnitRepo) TransitionToExpired(_ context.Context, _ types.ID) (*workunit.WorkUnit, error) {

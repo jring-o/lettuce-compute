@@ -173,25 +173,22 @@ func TestE2EF07VolunteerProtocol(t *testing.T) {
 	if wu.Runtime != "NATIVE" {
 		t.Errorf("step 5: runtime = %q, want NATIVE", wu.Runtime)
 	}
-	if wu.HeartbeatIntervalSeconds <= 0 {
-		t.Errorf("step 5: heartbeat_interval_seconds = %d, want > 0", wu.HeartbeatIntervalSeconds)
-	}
 	if len(wu.InputData) == 0 && wu.InputDataUrl == "" && wu.ParametersJson == "" {
 		t.Error("step 5: expected input_data, input_data_url, or parameters_json")
 	}
 
-	// --- Step 6: Send heartbeat ---
-	hbResp, err := grpcClient.Heartbeat(volKey.sign(ctx), &lettucev1.HeartbeatRequest{
+	// --- Step 6: Run-start the reserved unit (StartWork) ---
+	// The unit is dispatched as a QUEUED reservation; StartWork performs the
+	// QUEUED->ASSIGNED run-start that the first RUNNING heartbeat used to do.
+	swResp, err := grpcClient.StartWork(volKey.sign(ctx), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wu.WorkUnitId,
 		VolunteerId: volID,
-		Status:      "RUNNING",
-		ProgressPct: 0.0,
 	})
 	if err != nil {
-		t.Fatalf("step 6: Heartbeat: %v", err)
+		t.Fatalf("step 6: StartWork: %v", err)
 	}
-	if !hbResp.ContinueExecution {
-		t.Errorf("step 6: continue_execution = false, want true")
+	if !swResp.Ok {
+		t.Errorf("step 6: StartWork ok = false, want true (%s)", swResp.Message)
 	}
 
 	// --- Step 7: Submit result ---

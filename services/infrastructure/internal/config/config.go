@@ -13,7 +13,7 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Log      LogConfig      `yaml:"log"`
 	TLS      TLSConfig      `yaml:"tls"`
-	Signing  SigningConfig   `yaml:"signing"`
+	Signing  SigningConfig  `yaml:"signing"`
 	Storage  StorageConfig  `yaml:"storage"`
 	Head     HeadConfig     `yaml:"head"`
 }
@@ -49,12 +49,46 @@ type HeadConfig struct {
 	// before the lease lapses and the unit becomes re-reservable. Must stay below
 	// the 30-min stale threshold. Default 900 (15 min).
 	LeaseSeconds int `yaml:"lease_seconds"`
+
+	// --- Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY) ---
+	//
+	// The dispatch cache serves RequestWorkUnit from an in-memory pool bulk-refilled
+	// from Postgres, flushing reservations asynchronously, so the DB is off the
+	// hot path. It assumes ONE head process owns dispatch: two replicas would each
+	// refill independently and double-hand the same QUEUED unit. Run exactly one
+	// head replica until Layer 3 adds shared dispatch ownership.
+
+	// ReadyPoolSize bounds the in-memory pool of pre-fetched, ready-to-assign QUEUED
+	// units. Default 2000.
+	ReadyPoolSize int `yaml:"ready_pool_size"`
+	// RefillBatchSize is how many units one bulk refill (LIMIT N) pulls from
+	// Postgres. Default 500.
+	RefillBatchSize int `yaml:"refill_batch_size"`
+	// DispatchAdmissionCap bounds concurrent dispatch-cache DB operations (refill,
+	// flush, spot-check mark, StartWork, SubmitResult) so the pool cannot saturate.
+	// Default max(1, MaxConns/2); 0 = derive from the pool.
+	DispatchAdmissionCap int `yaml:"dispatch_admission_cap"`
+	// FlushIntervalMs is the async reservation-flush cadence (milliseconds).
+	// Default 100.
+	FlushIntervalMs int `yaml:"flush_interval_ms"`
+	// FlushBatchSize flushes early once this many pending reservation writes
+	// accumulate. Default 200.
+	FlushBatchSize int `yaml:"flush_batch_size"`
+	// NoDeadlineCeilingSeconds is the synthetic reclaim ceiling applied to NoDeadline
+	// leafs so a unit on a vanished volunteer is always reclaimed (heartbeats are
+	// gone). This is the DEADLINE, not a lease, so it is NOT bound by the 30-min
+	// stale threshold. Default 21600 (6h), operator-tunable.
+	NoDeadlineCeilingSeconds int `yaml:"no_deadline_ceiling_seconds"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
 // must stay strictly below.
 const (
-	defaultMaxBatchPerRequest      = 8
+	// defaultMaxBatchPerRequest is a SAFETY CEILING on the per-request batch, not
+	// the primary limiter — Layer 2 (#29) makes the client's hours-deficit math the
+	// real limiter, so this is raised to 64 to let short-unit leafs fill their
+	// work_buffer_hours instead of idling at the old flat cap of 8.
+	defaultMaxBatchPerRequest      = 64
 	defaultMinRetryDelaySeconds    = 30
 	defaultMaxRetryDelaySeconds    = 900
 	defaultRetryDelayJitterPct     = 0.20
@@ -64,6 +98,13 @@ const (
 	// inactivity threshold; retry delay and lease must stay strictly below it so a
 	// throttled-but-healthy volunteer is never marked inactive.
 	staleVolunteerThresholdSeconds = 1800
+
+	// --- Layer 2 dispatch-cache defaults ---
+	defaultReadyPoolSize            = 2000
+	defaultRefillBatchSize          = 500
+	defaultFlushIntervalMs          = 100
+	defaultFlushBatchSize           = 200
+	defaultNoDeadlineCeilingSeconds = 21600 // 6h
 )
 
 // Validate checks HeadConfig for required fields and valid values.
@@ -117,6 +158,26 @@ func (h HeadConfig) Validate() error {
 	if h.LeaseSeconds >= staleVolunteerThresholdSeconds {
 		return fmt.Errorf("head.lease_seconds must be < %d (the stale-volunteer threshold), got %d",
 			staleVolunteerThresholdSeconds, h.LeaseSeconds)
+	}
+	if h.ReadyPoolSize < 0 {
+		return fmt.Errorf("head.ready_pool_size must be >= 0, got %d", h.ReadyPoolSize)
+	}
+	if h.RefillBatchSize < 0 {
+		return fmt.Errorf("head.refill_batch_size must be >= 0, got %d", h.RefillBatchSize)
+	}
+	if h.DispatchAdmissionCap < 0 {
+		return fmt.Errorf("head.dispatch_admission_cap must be >= 0, got %d", h.DispatchAdmissionCap)
+	}
+	if h.FlushIntervalMs < 0 {
+		return fmt.Errorf("head.flush_interval_ms must be >= 0, got %d", h.FlushIntervalMs)
+	}
+	if h.FlushBatchSize < 0 {
+		return fmt.Errorf("head.flush_batch_size must be >= 0, got %d", h.FlushBatchSize)
+	}
+	// NoDeadlineCeilingSeconds is a DEADLINE, not a lease, so it is intentionally
+	// NOT bound by the 30-min stale threshold (a 6h reclaim ceiling is valid).
+	if h.NoDeadlineCeilingSeconds < 0 {
+		return fmt.Errorf("head.no_deadline_ceiling_seconds must be >= 0, got %d", h.NoDeadlineCeilingSeconds)
 	}
 	return nil
 }
@@ -178,6 +239,56 @@ func (h HeadConfig) EffectiveLeaseSeconds() int {
 		return defaultLeaseSeconds
 	}
 	return h.LeaseSeconds
+}
+
+// EffectiveReadyPoolSize returns the dispatch-cache ready-pool cap, default 2000.
+func (h HeadConfig) EffectiveReadyPoolSize() int {
+	if h.ReadyPoolSize <= 0 {
+		return defaultReadyPoolSize
+	}
+	return h.ReadyPoolSize
+}
+
+// EffectiveRefillBatchSize returns the bulk-refill LIMIT, default 500.
+func (h HeadConfig) EffectiveRefillBatchSize() int {
+	if h.RefillBatchSize <= 0 {
+		return defaultRefillBatchSize
+	}
+	return h.RefillBatchSize
+}
+
+// EffectiveDispatchAdmissionCap returns the configured admission cap, or 0 to let
+// the caller derive it from the DB pool (max(1, MaxConns/2)).
+func (h HeadConfig) EffectiveDispatchAdmissionCap() int {
+	if h.DispatchAdmissionCap < 0 {
+		return 0
+	}
+	return h.DispatchAdmissionCap
+}
+
+// EffectiveFlushIntervalMs returns the async flush cadence in ms, default 100.
+func (h HeadConfig) EffectiveFlushIntervalMs() int {
+	if h.FlushIntervalMs <= 0 {
+		return defaultFlushIntervalMs
+	}
+	return h.FlushIntervalMs
+}
+
+// EffectiveFlushBatchSize returns the early-flush threshold, default 200.
+func (h HeadConfig) EffectiveFlushBatchSize() int {
+	if h.FlushBatchSize <= 0 {
+		return defaultFlushBatchSize
+	}
+	return h.FlushBatchSize
+}
+
+// EffectiveNoDeadlineCeilingSeconds returns the synthetic reclaim ceiling for
+// NoDeadline leafs, default 21600 (6h).
+func (h HeadConfig) EffectiveNoDeadlineCeilingSeconds() int {
+	if h.NoDeadlineCeilingSeconds <= 0 {
+		return defaultNoDeadlineCeilingSeconds
+	}
+	return h.NoDeadlineCeilingSeconds
 }
 
 // StorageConfig defines local filesystem storage settings.

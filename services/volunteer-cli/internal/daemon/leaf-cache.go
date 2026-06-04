@@ -52,6 +52,14 @@ type CachedLeafInfo struct {
 	QueuedWorkUnits  int
 	ActiveVolunteers int
 	ExecutionSpec    *CachedExecutionSpec
+
+	// EstimatedDurationSeconds is a per-leaf, benchmark-INDEPENDENT estimate of
+	// wall-clock seconds for one unit of this leaf (#29). The head derives it in
+	// GetHeadInfo (from an explicit leaf estimate or rsc_fpops_est against the
+	// head's reference benchmark) so the volunteer can size its FIRST batch
+	// request to a leaf before it has seen any of that leaf's units — without
+	// needing a local CPU benchmark. 0 means "no estimate available".
+	EstimatedDurationSeconds float64
 }
 
 // NewLeafCache creates a new leaf cache with the given refresh interval.
@@ -80,15 +88,16 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 
 	for _, l := range resp.Leafs {
 		cli := CachedLeafInfo{
-			ID:               l.Id,
-			Slug:             l.Slug,
-			Name:             l.Name,
-			Description:      l.Description,
-			ResearchArea:     l.ResearchArea,
-			TaskPattern:      l.TaskPattern,
-			State:            l.State,
-			QueuedWorkUnits:  int(l.QueuedWorkUnits),
-			ActiveVolunteers: int(l.ActiveVolunteers),
+			ID:                       l.Id,
+			Slug:                     l.Slug,
+			Name:                     l.Name,
+			Description:              l.Description,
+			ResearchArea:             l.ResearchArea,
+			TaskPattern:              l.TaskPattern,
+			State:                    l.State,
+			QueuedWorkUnits:          int(l.QueuedWorkUnits),
+			ActiveVolunteers:         int(l.ActiveVolunteers),
+			EstimatedDurationSeconds: l.GetEstimatedDurationSeconds(),
 		}
 		if es := l.GetExecutionSpec(); es != nil {
 			cli.ExecutionSpec = &CachedExecutionSpec{

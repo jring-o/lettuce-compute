@@ -136,11 +136,13 @@ func (c *Client) SubmitResult(ctx context.Context, req *lettucev1.SubmitResultRe
 	return c.svc.SubmitResult(ctx, req)
 }
 
-// Heartbeat calls the Heartbeat RPC.
-func (c *Client) Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+// StartWork calls the StartWork RPC (run-start: QUEUED -> ASSIGNED for a buffered
+// reserved unit the slot has begun executing). It replaces the removed per-task
+// Heartbeat RPC; liveness is now deadline-based.
+func (c *Client) StartWork(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
 	ctx, cancel := c.rpcCtx(ctx)
 	defer cancel()
-	return c.svc.Heartbeat(ctx, req)
+	return c.svc.StartWork(ctx, req)
 }
 
 // SaveCheckpoint calls the SaveCheckpoint RPC.

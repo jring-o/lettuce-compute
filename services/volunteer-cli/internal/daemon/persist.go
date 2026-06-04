@@ -28,7 +28,6 @@ type PersistedTask struct {
 	ExecutionSpec           runtime.ExecutionSpec `json:"execution_spec"`
 	CheckpointSequence      int32             `json:"checkpoint_sequence"`
 	CheckpointIntervalSecs  int32             `json:"checkpoint_interval_seconds"`
-	HeartbeatIntervalSecs   int32             `json:"heartbeat_interval_seconds"`
 	RscFpopsEst             float64           `json:"rsc_fpops_est,omitempty"`
 	VizBundlePath           string            `json:"viz_bundle_path,omitempty"`
 	StartedAt               time.Time         `json:"started_at"`

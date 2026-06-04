@@ -18,7 +18,7 @@ import (
 func makeBlockingItem(id string, blockCh chan struct{}) *PreFetchItem {
 	return &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: id, LeafID: "leaf-1", Runtime: "native", DeadlineSeconds: 3600},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 		Runtime: &mockRuntime{
 			canHandle: true,

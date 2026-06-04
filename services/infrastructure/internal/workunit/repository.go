@@ -40,6 +40,28 @@ type WorkUnitRepository interface {
 	// the leaf's redundancy_factor. Returns nil, nil if no work available.
 	FindNextAssignable(ctx context.Context, opts AssignmentOptions) (*WorkUnit, error)
 
+	// FindDispatchableBatch bulk-selects up to `limit` QUEUED, dispatch-eligible
+	// (non-WASM, redundancy/reservation-eligible) work units for the in-memory
+	// dispatch cache, excluding any id the cache already holds (excludeIDs). It keeps
+	// the global no-double-hand guards in SQL (FOR UPDATE SKIP LOCKED, redundancy,
+	// reservation) but is volunteer-agnostic — the per-requester predicates are
+	// re-checked in memory at hand-out. When leafIDs is non-empty the select is scoped
+	// to those leafs (the on-demand leaf-scoped refill that prevents one leaf from
+	// monopolizing the ready pool and starving a leaf-filtered requester); nil/empty
+	// leafIDs selects across all ACTIVE non-WASM leafs.
+	FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]DispatchCandidate, error)
+
+	// FlushReservations writes a batch of dispatch-cache reservations in one
+	// multi-row UPDATE using the per-row optimistic reservation guard, returning the
+	// set of work_unit_ids whose reservation actually landed (ids not returned are
+	// conflicts the cache must void).
+	FlushReservations(ctx context.Context, recs []FlushReservation) ([]types.ID, error)
+
+	// CountActiveByVolunteer returns the authoritative per-volunteer inflight count
+	// (active history rows + live reservations) keyed by volunteer id, used to
+	// reconcile the dispatch cache's in-memory inflight counters.
+	CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error)
+
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
 	// predicates as FindNextAssignable, including the per-volunteer inflight cap
 	// counting live reservations) and stamps a lease on it (reserved_until,
@@ -52,20 +74,18 @@ type WorkUnitRepository interface {
 	// Returns the updated work unit. Fails if work unit is not in QUEUED state.
 	Assign(ctx context.Context, workUnitID types.ID, volunteerID types.ID) (*WorkUnit, error)
 
-	// UpdateHeartbeat updates last_heartbeat_at for a work unit.
-	UpdateHeartbeat(ctx context.Context, id types.ID) error
-
 	// CountByLeafAndState returns the count of work units for a leaf in a given state.
 	CountByLeafAndState(ctx context.Context, leafID types.ID, state WorkUnitState) (int64, error)
 
 	// FindExpiredWorkUnits returns ASSIGNED or RUNNING work units past their deadline.
 	FindExpiredWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error)
 
-	// FindAbandonedWorkUnits returns ASSIGNED or RUNNING work units with stale heartbeats.
-	// A work unit is abandoned if: NOW() - last_heartbeat_at > heartbeat_interval * missed_threshold.
-	// ASSIGNED units are included so orphans on no_deadline leafs (assigned but never
-	// run) are reclaimed; PREPARING heartbeats keep live pulls/queued units fresh.
-	FindAbandonedWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error)
+	// FindLapsedReservations returns still-QUEUED work units whose buffer lease has
+	// lapsed (reserved_until < NOW()), i.e. a buffered (reserved) unit whose holder
+	// vanished before run-start. The caller clears each reservation (ClearReservation),
+	// leaving the unit QUEUED and immediately re-stageable — no expire/reassign is
+	// needed. Closes the #22 lapsed-lease reclaim gap.
+	FindLapsedReservations(ctx context.Context, limit int) ([]*WorkUnit, error)
 
 	// TransitionToExpired moves a work unit to EXPIRED state.
 	TransitionToExpired(ctx context.Context, id types.ID) (*WorkUnit, error)

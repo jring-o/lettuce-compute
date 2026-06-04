@@ -106,6 +106,58 @@ func TestRequestBatchSize_BufferingDisabled(t *testing.T) {
 	}
 }
 
+// TestLeafEstSeconds_BenchmarkIndependent is the #29 core regression: the leaf-
+// level seconds estimate sizes the FIRST request to a leaf and must stay non-zero
+// even when the host has NO CPU benchmark (benchmarkFPOPS == 0), the exact case
+// the old FP-ops-only seam tripped to 0.
+func TestLeafEstSeconds_BenchmarkIndependent(t *testing.T) {
+	// benchmarkFPOPS = 0 (un-benchmarked host).
+	d := newBufferTestDaemon(t, 2.0, 1, 0)
+	leaf := CachedLeafInfo{ID: "leaf-1", EstimatedDurationSeconds: 30}
+	if got := d.leafEstSeconds(leaf); got != 30 {
+		t.Errorf("leafEstSeconds on un-benchmarked host = %g, want 30 (leaf-level estimate)", got)
+	}
+	// A leaf with no estimate yields 0 (caller falls back).
+	if got := d.leafEstSeconds(CachedLeafInfo{ID: "leaf-2"}); got != 0 {
+		t.Errorf("leafEstSeconds with no leaf estimate = %g, want 0", got)
+	}
+}
+
+// TestLeafEstSeconds_AppliesDCF verifies the learned duration-correction factor
+// refines the leaf-level estimate when one has been learned for that leaf.
+func TestLeafEstSeconds_AppliesDCF(t *testing.T) {
+	d := newBufferTestDaemon(t, 2.0, 1, 0)
+	d.dcfTracker = LoadDCFTracker(t.TempDir())
+	// Learn a DCF > 1: actual was twice the estimate.
+	d.dcfTracker.Update("leaf-1", 10, 20)
+	leaf := CachedLeafInfo{ID: "leaf-1", EstimatedDurationSeconds: 30}
+	got := d.leafEstSeconds(leaf)
+	if got <= 30 {
+		t.Errorf("leafEstSeconds with DCF>1 = %g, want > 30 (refined upward)", got)
+	}
+}
+
+// TestRequestBatchSize_ShortUnitLeafFillsPastEight is the #29 DoD: a short-unit
+// leaf must fill work_buffer_hours in ONE request with a batch well above the old
+// flat cap of 8, now that maxBatchPerRequest is a safety ceiling (64), not the
+// primary limiter.
+func TestRequestBatchSize_ShortUnitLeafFillsPastEight(t *testing.T) {
+	// 1 hour * 3600 * 1 slot = 3600s target, empty buffer.
+	d := newBufferTestDaemon(t, 1.0, 1, 1.0)
+	// 30s/unit short units: 3600/30 = 120 desired, clamped to the 64 ceiling.
+	got := d.requestBatchSize(30)
+	if got <= 8 {
+		t.Errorf("short-unit batch = %d, want > 8 (old flat cap should no longer bind)", got)
+	}
+	if got != maxBatchPerRequest {
+		t.Errorf("short-unit batch = %d, want %d (deficit exceeds ceiling)", got, maxBatchPerRequest)
+	}
+	// A 60s/unit leaf: 3600/60 = 60, under the 64 ceiling, so the deficit math binds.
+	if got := d.requestBatchSize(60); got != 60 {
+		t.Errorf("60s-unit batch = %d, want 60 (deficit math, not ceiling)", got)
+	}
+}
+
 // leaseItem builds a buffered item with a reservation lease expiry (unix seconds).
 func leaseItem(id string, reservedUntilUnix int64) *PreFetchItem {
 	return &PreFetchItem{WU: &runtime.WorkUnit{ID: id, LeafID: "leaf-1", ReservedUntilUnix: reservedUntilUnix}}

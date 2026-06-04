@@ -1454,8 +1454,8 @@ func (m *e2eMockWorkClient) RequestWorkUnit(ctx context.Context, req *lettucev1.
 func (m *e2eMockWorkClient) SubmitResult(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
 	return &lettucev1.SubmitResultResponse{ResultId: "r-1", Accepted: true}, nil
 }
-func (m *e2eMockWorkClient) Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
-	return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
+func (m *e2eMockWorkClient) StartWork(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
+	return &lettucev1.StartWorkResponse{Ok: true}, nil
 }
 func (m *e2eMockWorkClient) SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
 	return &lettucev1.SaveCheckpointResponse{Accepted: true}, nil
@@ -1568,8 +1568,7 @@ func setupTestEnvWithActiveTask(t *testing.T) (env *testEnv, workUnitID string, 
 			DeadlineSeconds: 3600,
 		},
 		WUResp: &lettucev1.WorkUnitAssignment{
-			HeartbeatIntervalSeconds: 300,
-		},
+			},
 		Prep: &runtime.PrepareResult{
 			WorkDir: workDir,
 		},

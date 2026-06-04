@@ -144,14 +144,15 @@ func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
 		t.Fatalf("reserved_volunteer_id = %v, want %s", reservedVol, volID)
 	}
 
-	// First RUNNING heartbeat = run start: flips to ASSIGNED->RUNNING and clears
-	// the reservation.
-	if _, err := env.grpc.Heartbeat(signFor(t, ctx, pubKey), &lettucev1.HeartbeatRequest{
+	// StartWork = run start: flips the reserved QUEUED unit to ASSIGNED, clears the
+	// reservation columns, and sets assigned_at (the deadline clock start). With
+	// per-task heartbeats removed there is no separate ASSIGNED->RUNNING step; the
+	// unit stays ASSIGNED until the result is submitted.
+	if _, err := env.grpc.StartWork(signFor(t, ctx, pubKey), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: volID,
-		Status:      "RUNNING",
 	}); err != nil {
-		t.Fatalf("Heartbeat (run start): %v", err)
+		t.Fatalf("StartWork (run start): %v", err)
 	}
 
 	var state2 string
@@ -162,14 +163,14 @@ func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
 		Scan(&state2, &reservedUntil, &assignedAt); err != nil {
 		t.Fatalf("query post-runstart state: %v", err)
 	}
-	if state2 != "RUNNING" {
-		t.Fatalf("post-runstart state = %q, want RUNNING", state2)
+	if state2 != "ASSIGNED" {
+		t.Fatalf("post-runstart state = %q, want ASSIGNED", state2)
 	}
 	if reservedUntil != nil {
 		t.Errorf("expected reservation cleared at run start, got reserved_until=%v", reservedUntil)
 	}
 	if assignedAt == nil {
-		t.Errorf("expected assigned_at set at run start (deadline/heartbeat clock starts)")
+		t.Errorf("expected assigned_at set at run start (deadline clock starts)")
 	}
 }
 

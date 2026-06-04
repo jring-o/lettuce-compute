@@ -34,7 +34,7 @@ import (
 // (Re-baseline both files together whenever protobuf-go is intentionally
 // upgraded in both modules.)
 
-const expectedDeterministicHash = "c499a96a52959df62f99b442a67fb7071cf6e639f2108e411da3760c64a9c5de"
+const expectedDeterministicHash = "c05bf60927406e51936da9d1c37c187d0cef9cdc4bc75af28a393c8f7dbc9316"
 
 // fixedRequestWorkUnitResponse is the canonical fixture mirrored from the
 // infrastructure test. Field values are deliberately identical — including
@@ -51,7 +51,6 @@ func fixedRequestWorkUnitResponse() *lettucev1.RequestWorkUnitResponse {
 				CodeArtifactUrl:          "https://example.invalid/code.tar.gz",
 				ParametersJson:           `{"k":"v"}`,
 				DeadlineSeconds:          3600,
-				HeartbeatIntervalSeconds: 300,
 				EnvVars: map[string]string{
 					"ZETA":  "z",
 					"alpha": "a",

@@ -568,12 +568,12 @@ func TestBetaE2E_Checkpointing(t *testing.T) {
 		t.Errorf("checkpoint_interval_seconds = %d, want %d", wu.CheckpointIntervalSeconds, cpInterval)
 	}
 
-	// Vol A sends heartbeat (transitions ASSIGNED → RUNNING).
-	_, err = env.grpc.Heartbeat(signFor(t, ctx, volAPubKey), &lettucev1.HeartbeatRequest{
-		WorkUnitId: wuID, VolunteerId: volAID, Status: "RUNNING", ProgressPct: 10,
+	// Vol A run-starts the reserved unit (StartWork: QUEUED -> ASSIGNED).
+	_, err = env.grpc.StartWork(signFor(t, ctx, volAPubKey), &lettucev1.StartWorkRequest{
+		WorkUnitId: wuID, VolunteerId: volAID,
 	})
 	if err != nil {
-		t.Fatalf("vol A heartbeat: %v", err)
+		t.Fatalf("vol A StartWork: %v", err)
 	}
 
 	// Vol A saves checkpoint (sequence=1).
@@ -589,13 +589,8 @@ func TestBetaE2E_Checkpointing(t *testing.T) {
 		t.Error("checkpoint should be accepted")
 	}
 
-	// Vol A sends heartbeat with CHECKPOINT_SAVED status.
-	_, err = env.grpc.Heartbeat(signFor(t, ctx, volAPubKey), &lettucev1.HeartbeatRequest{
-		WorkUnitId: wuID, VolunteerId: volAID, Status: "CHECKPOINT_SAVED", ProgressPct: 10,
-	})
-	if err != nil {
-		t.Fatalf("vol A checkpoint heartbeat: %v", err)
-	}
+	// (The CHECKPOINT_SAVED heartbeat status was informational only and is gone;
+	// checkpoint coordination rides SaveCheckpoint, which already persisted seq=1.)
 
 	// Verify checkpoint metadata in DB.
 	wuIDParsed := types.MustParseID(wuID)

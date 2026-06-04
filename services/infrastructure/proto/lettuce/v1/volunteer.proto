@@ -24,10 +24,14 @@ service VolunteerService {
   // Includes output data and execution metadata.
   rpc SubmitResult(SubmitResultRequest) returns (SubmitResultResponse);
 
-  // Send heartbeat during work unit execution.
-  // Must be called at leaf's configured interval (default: 5 min).
-  // Missing heartbeats trigger work unit abandonment.
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Mark a buffered (reserved) work unit as run-started. Called when a volunteer
+  // slot actually begins executing a unit pulled from its client work buffer.
+  // Performs the QUEUED -> ASSIGNED run-start transition (clears the reservation
+  // column, writes the active assignment history row, starts the deadline clock).
+  // Liveness is deadline-based: there are no per-task heartbeats. A unit not
+  // submitted by its deadline is reassigned; a reserved unit whose reservation
+  // window lapses before StartWork is reclaimed.
+  rpc StartWork(StartWorkRequest) returns (StartWorkResponse);
 
   // Query status of a specific work unit.
   rpc GetWorkUnitStatus(GetWorkUnitStatusRequest) returns (GetWorkUnitStatusResponse);
@@ -97,7 +101,7 @@ message WorkUnitAssignment {
   string code_artifact_url = 6;               // URL to download code/binary
   string parameters_json = 7;                 // parameter set as JSON string
   int32 deadline_seconds = 8;
-  int32 heartbeat_interval_seconds = 9;
+  reserved 9; // was heartbeat_interval_seconds (per-task heartbeats removed)
   map<string, string> env_vars = 10;
   ExecutionSpec execution_spec = 11;
   bool has_checkpoint = 12;                    // true if a checkpoint exists for this reassigned WU
@@ -123,17 +127,18 @@ message SubmitResultResponse {
   string message = 3;
 }
 
-message HeartbeatRequest {
+// StartWork marks a buffered (reserved) work unit as run-started: the volunteer
+// slot is now executing it. The head performs the QUEUED -> ASSIGNED transition,
+// clears the reservation column, writes the active assignment history row, and
+// starts the deadline clock (assigned_at = now).
+message StartWorkRequest {
   string work_unit_id = 1;
   string volunteer_id = 2;
-  string status = 3;                // RUNNING, CHECKPOINT_SAVED
-  double progress_pct = 4;          // 0.0-1.0, optional estimate
-  ExecutionMetadata current_metrics = 5;
 }
 
-message HeartbeatResponse {
-  bool continue_execution = 1;      // false = abort (leaf paused/cancelled)
-  string message = 2;
+message StartWorkResponse {
+  bool ok = 1;          // true if the unit was run-started for this volunteer
+  string message = 2;   // diagnostic; on !ok the volunteer should drop the unit
 }
 
 message GetWorkUnitStatusRequest {
@@ -251,6 +256,10 @@ message LeafInfo {
   int32 queued_work_units = 8;
   int32 active_volunteers = 9;
   ExecutionSpec execution_spec = 10;  // runtime badges for desktop/browser clients
+  // Benchmark-independent per-leaf duration estimate (seconds) used by the
+  // volunteer for duration-aware work batching: it sizes the first batch request
+  // to fill work_buffer_hours instead of idling at the flat per-request ceiling.
+  double estimated_duration_seconds = 11;
 }
 
 // --- AbandonWorkUnit ---

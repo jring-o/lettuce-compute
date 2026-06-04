@@ -330,16 +330,14 @@ func TestE2EF05Lifecycle(t *testing.T) {
 	}
 
 	// --- Step 8: Submit result for volunteer 1 ---
-	// Run-start: a RUNNING heartbeat flips the reserved (QUEUED) unit to
-	// ASSIGNED/RUNNING and creates the active assignment_history row SubmitResult
-	// requires (buffered units are leased via reservation columns, no history row,
-	// until run-start).
-	if _, hbErr := grpcClient.Heartbeat(key1.sign(ctx), &lettucev1.HeartbeatRequest{
+	// Run-start: StartWork flips the reserved (QUEUED) unit to ASSIGNED and creates
+	// the active assignment_history row SubmitResult requires (buffered units are
+	// leased via reservation columns, no history row, until run-start).
+	if _, swErr := grpcClient.StartWork(key1.sign(ctx), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wu.WorkUnitId,
 		VolunteerId: vol1ID,
-		Status:      "RUNNING",
-	}); hbErr != nil {
-		t.Fatalf("step 8: run-start heartbeat: %v", hbErr)
+	}); swErr != nil {
+		t.Fatalf("step 8: StartWork run-start: %v", swErr)
 	}
 
 	outputData := []byte(`{"result": "computation_complete", "value": 3.14159}`)

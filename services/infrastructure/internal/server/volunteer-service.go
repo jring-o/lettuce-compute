@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -29,18 +28,18 @@ import (
 
 type volunteerService struct {
 	lettucev1.UnimplementedVolunteerServiceServer
-	pool             *pgxpool.Pool
-	version          string
-	startTime        time.Time
-	volunteerRepo    volunteer.Repository
-	wuRepo           workunit.WorkUnitRepository
-	leafRepo      leaf.Repository
-	assignRepo       assignment.Repository
-	resultRepo       result.Repository
-	batchRepo        workunit.BatchRepository
-	checkpointRepo   checkpoint.Repository
-	validationEngine *validation.Engine
-	logger           *slog.Logger
+	pool                    *pgxpool.Pool
+	version                 string
+	startTime               time.Time
+	volunteerRepo           volunteer.Repository
+	wuRepo                  workunit.WorkUnitRepository
+	leafRepo                leaf.Repository
+	assignRepo              assignment.Repository
+	resultRepo              result.Repository
+	batchRepo               workunit.BatchRepository
+	checkpointRepo          checkpoint.Repository
+	validationEngine        *validation.Engine
+	logger                  *slog.Logger
 	headName                string
 	headDescription         string
 	headURL                 string
@@ -53,6 +52,35 @@ type volunteerService struct {
 
 	// Layer 1: load measurement → server-directed retry delay.
 	loadEstimator *loadEstimator
+
+	// Layer 2: in-process dispatch cache (single-replica). When non-nil,
+	// RequestWorkUnit serves reservations from the cache (zero DB on the hot path)
+	// and sheds with ResourceExhausted under overload. nil keeps the Layer-1
+	// per-request transaction path (used by the gRPC-plumbing unit tests that never
+	// start the cache goroutines).
+	dispatchCache *dispatchCache
+	// dispatchCfg holds the Layer-2 dispatch-cache knobs captured from SetHeadConfig
+	// so StartDispatchCache can build the cache later.
+	dispatchCfg HeadDispatchConfig
+}
+
+// referenceBenchmarkFPOPS is the head's fixed reference-host throughput (FP ops /
+// second) used to derive a per-leaf duration estimate from rsc_fpops_est for the
+// GetHeadInfo LeafInfo. It is a coarse seed only: the volunteer refines the estimate
+// with its OWN measured benchmark + DCF once it has buffered units. ~50 GFLOP/s is a
+// conservative single-core throughput, deliberately modest so a short-unit leaf is
+// never under-estimated to zero (the #29 zero-trap).
+const referenceBenchmarkFPOPS = 5.0e10
+
+// estimatedDurationSecondsForLeaf derives a per-leaf duration estimate (seconds)
+// from the leaf's rsc_fpops_est against the reference benchmark. Returns 0 when no
+// estimate is available (rsc_fpops_est <= 0), which the volunteer treats as "use the
+// flat cap" — the same behavior as before #29.
+func estimatedDurationSecondsForLeaf(rscFpopsEst float64) float64 {
+	if rscFpopsEst <= 0 {
+		return 0
+	}
+	return rscFpopsEst / referenceBenchmarkFPOPS
 }
 
 // NewVolunteerService creates a new VolunteerService gRPC implementation.
@@ -71,18 +99,18 @@ func NewVolunteerService(
 	logger *slog.Logger,
 ) lettucev1.VolunteerServiceServer {
 	s := &volunteerService{
-		pool:             pool,
-		version:          version,
-		startTime:        startTime,
-		volunteerRepo:    volunteerRepo,
-		wuRepo:           wuRepo,
-		leafRepo:      leafRepo,
-		assignRepo:       assignRepo,
-		resultRepo:       resultRepo,
-		batchRepo:        batchRepo,
-		checkpointRepo:   checkpointRepo,
-		validationEngine: validationEngine,
-		logger:           logger,
+		pool:               pool,
+		version:            version,
+		startTime:          startTime,
+		volunteerRepo:      volunteerRepo,
+		wuRepo:             wuRepo,
+		leafRepo:           leafRepo,
+		assignRepo:         assignRepo,
+		resultRepo:         resultRepo,
+		batchRepo:          batchRepo,
+		checkpointRepo:     checkpointRepo,
+		validationEngine:   validationEngine,
+		logger:             logger,
 		maxBatchPerRequest: defaultMaxBatchPerRequest,
 		leaseSeconds:       defaultLeaseSeconds,
 	}
@@ -104,6 +132,13 @@ type HeadDispatchConfig struct {
 	MaxRetryDelaySeconds    int
 	RetryDelayJitterPct     float64
 	TargetRequestRatePerSec float64
+
+	// --- Layer 2: dispatch-cache knobs ---
+	ReadyPoolSize        int
+	RefillBatchSize      int
+	DispatchAdmissionCap int // 0 = derive max(1, MaxConns/2) from the pool
+	FlushIntervalMs      int
+	FlushBatchSize       int
 }
 
 // SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
@@ -119,6 +154,7 @@ func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url 
 
 		vs.maxBatchPerRequest = defaultInt(dispatch.MaxBatchPerRequest, defaultMaxBatchPerRequest)
 		vs.leaseSeconds = defaultInt(dispatch.LeaseSeconds, defaultLeaseSeconds)
+		vs.dispatchCfg = dispatch
 
 		cfg := loadEstimatorConfig{
 			targetRequestRatePerSec: defaultFloat(dispatch.TargetRequestRatePerSec, defaultTargetRequestRatePerSec),
@@ -128,6 +164,16 @@ func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url 
 			jitterPct:               defaultFloat(dispatch.RetryDelayJitterPct, defaultRetryDelayJitterPct),
 		}
 		vs.loadEstimator = newLoadEstimator(cfg, poolSaturation(vs.pool))
+	}
+}
+
+// StartDispatchCache builds and launches the Layer-2 in-process dispatch cache on
+// the given service (a no-op if svc is not the concrete volunteerService). main.go
+// calls this once at startup AFTER SetHeadConfig has captured the dispatch knobs.
+// SINGLE-REPLICA: call this in exactly one head process.
+func StartDispatchCache(svc lettucev1.VolunteerServiceServer, ctx context.Context) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.StartDispatchCache(ctx)
 	}
 }
 
@@ -143,6 +189,53 @@ func defaultFloat(v, def float64) float64 {
 		return def
 	}
 	return v
+}
+
+// StartDispatchCache builds the Layer-2 in-process dispatch cache from the
+// captured dispatch config and the service's repos/pool, then launches its
+// refiller, flusher, and reconciler goroutines (returning when ctx is cancelled).
+// After this call RequestWorkUnit serves reservations from the cache (zero DB on
+// the hot path) and sheds with ResourceExhausted under overload.
+//
+// SINGLE-REPLICA: the cache assumes ONE head owns dispatch — call this in exactly
+// one process. main.go calls it once at startup.
+func (s *volunteerService) StartDispatchCache(ctx context.Context) {
+	admissionCap := s.dispatchCfg.DispatchAdmissionCap
+	if admissionCap <= 0 {
+		// Derive max(1, MaxConns/2) from the pool so the cache's DB ops cannot
+		// saturate it.
+		maxConns := 0
+		if s.pool != nil {
+			maxConns = int(s.pool.Stat().MaxConns())
+		}
+		admissionCap = maxConns / 2
+		if admissionCap < 1 {
+			admissionCap = 1
+		}
+	}
+	flushInterval := time.Duration(defaultInt(s.dispatchCfg.FlushIntervalMs, 100)) * time.Millisecond
+
+	cfg := dispatchCacheConfig{
+		readyPoolSize:           s.dispatchCfg.ReadyPoolSize,
+		refillBatchSize:         s.dispatchCfg.RefillBatchSize,
+		admissionCap:            admissionCap,
+		flushInterval:           flushInterval,
+		flushBatchSize:          s.dispatchCfg.FlushBatchSize,
+		leaseSeconds:            s.leaseSeconds,
+		maxInflightPerVolunteer: s.maxInflightPerVolunteer,
+	}
+	cache := newDispatchCache(cfg, dispatchDeps{
+		wuRepo:        s.wuRepo,
+		leafRepo:      s.leafRepo,
+		assignRepo:    s.assignRepo,
+		volunteerRepo: s.volunteerRepo,
+	}, s.logger)
+	s.dispatchCache = cache
+
+	go cache.runRefiller(ctx, defaultRefillTickInterval)
+	go cache.runFlusher(ctx)
+	go cache.runReconciler(ctx, defaultReconcileInterval)
+	s.logger.Info("dispatch cache started", "admission_cap", admissionCap, "single_replica", true)
 }
 
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
@@ -199,6 +292,15 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			MaxDiskMb:       int32(execConfig.MaxDiskMB),
 			NetworkAccess:   execConfig.NetworkAccess,
 		}
+		// #29 duration-aware batching (head side): give the volunteer a per-leaf
+		// duration estimate (seconds) so it can size its FIRST batch request to fill
+		// work_buffer_hours instead of idling at the flat batch cap. The head has no
+		// per-host benchmark, so it derives seconds from the leaf's rsc_fpops_est
+		// against a fixed reference-host FLOPS constant; the volunteer refines this
+		// with its own measured benchmark + DCF once it has buffered units. Benchmark-
+		// independent and seconds-based, so an un-benchmarked volunteer host still gets
+		// a usable, non-zero estimate (sidestepping the benchmark<=0 zero-trap).
+		li.EstimatedDurationSeconds = estimatedDurationSecondsForLeaf(execConfig.RscFpopsEst)
 		leafs = append(leafs, &li)
 	}
 	if leafs == nil {
@@ -318,17 +420,24 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 		// Not found — create new volunteer.
 		v := &volunteer.Volunteer{
 			PublicKey:            req.PublicKey,
-			DisplayName:         displayName,
+			DisplayName:          displayName,
 			HardwareCapabilities: hw,
-			AvailableRuntimes:   req.AvailableRuntimes,
-			SchedulingMode:      volunteer.SchedulingMode(schedulingMode),
-			IsActive:            true,
-			LastSeenAt:          &now,
+			AvailableRuntimes:    req.AvailableRuntimes,
+			SchedulingMode:       volunteer.SchedulingMode(schedulingMode),
+			IsActive:             true,
+			LastSeenAt:           &now,
 		}
 
 		if createErr := s.volunteerRepo.Create(ctx, v); createErr != nil {
 			s.logger.Error("failed to create volunteer", "method", "RegisterVolunteer", "error", createErr)
 			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+
+		// Warm the dispatch cache's in-memory identity snapshot so the FIRST
+		// RequestWorkUnit resolves this volunteer's identity/capabilities in memory
+		// (Blocker 1: identity off the hot path).
+		if s.dispatchCache != nil {
+			s.dispatchCache.putIdentity(v)
 		}
 
 		return &lettucev1.RegisterVolunteerResponse{
@@ -348,6 +457,12 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 	if updateErr := s.volunteerRepo.Update(ctx, existing); updateErr != nil {
 		s.logger.Error("failed to update volunteer", "method", "RegisterVolunteer", "error", updateErr)
 		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
+	// Refresh the dispatch cache's in-memory identity snapshot (the volunteer may have
+	// re-registered with changed hardware/runtimes) so the hot path stays in memory.
+	if s.dispatchCache != nil {
+		s.dispatchCache.putIdentity(existing)
 	}
 
 	return &lettucev1.RegisterVolunteerResponse{
@@ -378,22 +493,51 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		return nil, status.Errorf(codes.Unauthenticated, "request is not authenticated")
 	}
 
-	// Get volunteer and bind the proven identity to the volunteer being acted on.
-	vol, err := s.volunteerRepo.GetByID(ctx, volunteerID)
-	if err != nil {
-		apiErr, ok := err.(*apierror.APIError)
-		if ok && apiErr.HTTPStatus == 404 {
+	// Resolve the volunteer's identity (pubkey + hardware + available runtimes) and
+	// bind the proven identity to the volunteer being acted on.
+	//
+	// Blocker 1: when the dispatch cache is running, this resolves from the IN-MEMORY
+	// identity snapshot (warmed at RegisterVolunteer, refreshed lazily) so the hot
+	// path touches NO Postgres. Only a cold miss hits the pool, and that single read
+	// is bounded by the cache's admission semaphore + a short shed timeout — under
+	// overload it sheds with ResourceExhausted instead of blocking on the request ctx
+	// and collapsing with "context deadline exceeded". The pre-cache fallback path
+	// keeps the per-request DB read.
+	var (
+		identPubKey  []byte
+		identHW      volunteer.HardwareCapabilities
+		identRuntime []string
+	)
+	if s.dispatchCache != nil {
+		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
+		if shed {
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
+		}
+		if notFound {
 			return nil, status.Errorf(codes.NotFound, "volunteer not found")
 		}
-		s.logger.Error("failed to look up volunteer", "method", "RequestWorkUnit", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
+		identPubKey = ident.publicKey
+		identHW = ident.hardware
+		identRuntime = ident.availableRuntimes
+	} else {
+		vol, gerr := s.volunteerRepo.GetByID(ctx, volunteerID)
+		if gerr != nil {
+			if isNotFound(gerr) {
+				return nil, status.Errorf(codes.NotFound, "volunteer not found")
+			}
+			s.logger.Error("failed to look up volunteer", "method", "RequestWorkUnit", "error", gerr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		identPubKey = vol.PublicKey
+		identHW = vol.HardwareCapabilities
+		identRuntime = vol.AvailableRuntimes
 	}
-	if !bytes.Equal(vol.PublicKey, authedKey) {
+	if !bytes.Equal(identPubKey, authedKey) {
 		return nil, status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
 	}
 
 	// Determine capabilities: use current_available if provided, else registered.
-	hw := vol.HardwareCapabilities
+	hw := identHW
 	if req.CurrentAvailable != nil {
 		hw = volunteer.HardwareCapabilitiesFromProto(req.CurrentAvailable)
 	}
@@ -434,7 +578,7 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		MaxDiskMB:               hw.MaxDiskMB,
 		HasGPU:                  hasGPU,
 		MaxGPUVRAMMB:            maxGPUVRAM,
-		AvailableRuntimes:       vol.AvailableRuntimes,
+		AvailableRuntimes:       identRuntime,
 		GPUVendors:              gpuVendors,
 		GPUComputeCapabilities:  gpuCapabilities,
 		MaxInflightPerVolunteer: s.maxInflightPerVolunteer,
@@ -446,10 +590,9 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 	load := s.loadEstimator.currentLoad()
 	retryAfter := s.loadEstimator.computeRetryDelaySeconds(load)
 
-	// Batch size: client's requested max, clamped to ≥1 and the server batch cap.
-	// The per-volunteer inflight budget (active assignments + live reservations)
-	// is enforced inside ReserveNextAssignable's query, which returns nil once the
-	// cap is hit, ending the loop early.
+	// Batch size: client's requested max, clamped to ≥1 and the server batch cap
+	// (now a SAFETY CEILING, not the limiter — the client's hours-deficit math
+	// binds for short-unit leafs).
 	n := int(req.GetMaxAssignments())
 	if n < 1 {
 		n = 1
@@ -458,6 +601,58 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		n = s.maxBatchPerRequest
 	}
 
+	// Layer 2: serve from the in-process dispatch cache when it is running (the
+	// hot path touches NO Postgres). Falls back to the Layer-1 per-request
+	// transaction when the cache is not started (gRPC-plumbing unit tests).
+	if s.dispatchCache != nil {
+		return s.requestWorkUnitFromCache(volunteerID, opts, n, retryAfter)
+	}
+	return s.requestWorkUnitFromDB(ctx, volunteerID, opts, n, retryAfter)
+}
+
+// requestWorkUnitFromCache serves a hand-out from the in-memory dispatch cache
+// (zero DB I/O on this path) and sheds with ResourceExhausted under overload.
+func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts workunit.AssignmentOptions, n int, retryAfter int32) (*lettucev1.RequestWorkUnitResponse, error) {
+	cache := s.dispatchCache
+
+	// GRACEFUL SHEDDING: if the ready pool is empty AND the cache's DB-admission
+	// semaphore is saturated (a refill is already maxed out), shed immediately —
+	// return ResourceExhausted with NO DB touch and NO pool wait. The volunteer
+	// converts this to a fixed jittered local backoff. This is the hard backstop
+	// against the DB-pool congestion collapse.
+	if cache.readyLen() == 0 && cache.admissionSaturated() {
+		cache.signalRefill()
+		return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
+	}
+
+	assignStart := time.Now()
+	results, _ := cache.HandOut(volunteerID, opts, n)
+	// The near-zero in-memory hand-out duration folds into the latency signal,
+	// lowering the latency-saturation component of the load estimate.
+	s.loadEstimator.recordAssignLatency(time.Since(assignStart))
+
+	if len(results) == 0 {
+		return &lettucev1.RequestWorkUnitResponse{
+			Assignments:       nil,
+			RetryAfterSeconds: retryAfter,
+		}, nil
+	}
+
+	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(results))
+	for _, r := range results {
+		assignments = append(assignments, buildWorkUnitAssignment(r.unit, r.leaf))
+	}
+	return &lettucev1.RequestWorkUnitResponse{
+		Assignments:       assignments,
+		RetryAfterSeconds: retryAfter,
+	}, nil
+}
+
+// requestWorkUnitFromDB is the Layer-1 per-request reservation path, retained for
+// deployments / tests that do not start the dispatch cache. It opens ONE
+// transaction for the whole batch and loops ReserveNextAssignable, preserving
+// every reservation/redundancy/spot-check property in SQL.
+func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerID types.ID, opts workunit.AssignmentOptions, n int, retryAfter int32) (*lettucev1.RequestWorkUnitResponse, error) {
 	lease := time.Duration(s.leaseSeconds) * time.Second
 
 	// Begin ONE transaction for the whole batch: amortizes the transaction +
@@ -600,17 +795,16 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 // assignment, including the lease expiry (reserved_until_unix).
 func buildWorkUnitAssignment(wu *workunit.WorkUnit, lf *leaf.Leaf) *lettucev1.WorkUnitAssignment {
 	a := &lettucev1.WorkUnitAssignment{
-		WorkUnitId:               wu.ID.String(),
-		LeafId:                   wu.LeafID.String(),
-		Runtime:                  lf.ExecutionConfig.Runtime,
-		InputData:                wu.InputData,
-		InputDataUrl:             derefString(wu.InputDataRef),
-		CodeArtifactUrl:          wu.CodeArtifactRef,
-		ParametersJson:           string(wu.Parameters),
-		DeadlineSeconds:          int32(wu.DeadlineSeconds),
-		HeartbeatIntervalSeconds: int32(lf.FaultToleranceConfig.HeartbeatIntervalSeconds),
-		EnvVars:                  lf.ExecutionConfig.EnvVars,
-		RscFpopsEst:              lf.ExecutionConfig.RscFpopsEst,
+		WorkUnitId:      wu.ID.String(),
+		LeafId:          wu.LeafID.String(),
+		Runtime:         lf.ExecutionConfig.Runtime,
+		InputData:       wu.InputData,
+		InputDataUrl:    derefString(wu.InputDataRef),
+		CodeArtifactUrl: wu.CodeArtifactRef,
+		ParametersJson:  string(wu.Parameters),
+		DeadlineSeconds: int32(wu.DeadlineSeconds),
+		EnvVars:         lf.ExecutionConfig.EnvVars,
+		RscFpopsEst:     lf.ExecutionConfig.RscFpopsEst,
 		ExecutionSpec: &lettucev1.ExecutionSpec{
 			Binaries:        lf.ExecutionConfig.Binaries,
 			BinaryChecksums: lf.ExecutionConfig.BinaryChecksums,
@@ -875,6 +1069,14 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
+	// Dispatch cache: a completed unit must not linger in the in-memory ledger or
+	// ready pool. Evicting on full completion clears any stale snapshot/holder; a
+	// partial (redundancy>1) submit converted its hold to a history row at run-start,
+	// so there is nothing to release here for that case (the reconcile owns it).
+	if s.dispatchCache != nil && existingCount+1 >= effectiveRedundancy {
+		s.dispatchCache.onUnitDone(workUnitID)
+	}
+
 	// Best-effort updates outside the transaction.
 	_ = s.volunteerRepo.UpdateLastSeen(ctx, volunteerID)
 
@@ -918,7 +1120,26 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	}, nil
 }
 
-func (s *volunteerService) Heartbeat(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+// StartWork marks a buffered (reserved) work unit as run-started: the volunteer
+// slot has begun executing a unit it pulled from its client work buffer. This is
+// the relocated run-start that used to ride the FIRST RUNNING heartbeat. It flips
+// the still-QUEUED reserved unit to ASSIGNED via the normal Assign (which sets
+// assigned_at = now and clears the reservation columns) and writes the active
+// assignment_history row in ONE transaction, starting the deadline clock at run
+// time — not at buffer-fill. With per-task heartbeats removed, liveness is
+// deadline-based from here on: SubmitResult / AbandonWorkUnit / the fault monitor
+// all key off the active history row created here.
+//
+// Redundancy > 1: each distinct holder calls StartWork and gets its own history
+// row, serialized by the single reservation column being freed on each Assign —
+// exactly the Layer-1 run-start path, which already supports multiple holders.
+//
+// GRACEFUL SHEDDING: StartWork is not on the dispatch hot path (one call per unit
+// actually executed, not per request), but it does touch Postgres, so it acquires
+// the dispatch-cache admission semaphore and runs under a short shed-context
+// timeout. If the pool is saturated it returns ResourceExhausted immediately and
+// the volunteer backs off, rather than piling up "context deadline exceeded".
+func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
 	// Validate work_unit_id.
 	workUnitID, err := types.ParseID(req.WorkUnitId)
 	if err != nil {
@@ -932,21 +1153,21 @@ func (s *volunteerService) Heartbeat(ctx context.Context, req *lettucev1.Heartbe
 	}
 
 	// Bind the authenticated identity to the volunteer being acted on.
-	if err := s.requireAuthedVolunteer(ctx, volunteerID, "Heartbeat"); err != nil {
+	if err := s.requireAuthedVolunteer(ctx, volunteerID, "StartWork"); err != nil {
 		return nil, err
 	}
 
-	// Default status to RUNNING if empty.
-	hbStatus := req.Status
-	if hbStatus == "" {
-		hbStatus = "RUNNING"
-	}
-	// PREPARING: the volunteer holds the unit but hasn't started executing yet
-	// (pulling the image, or waiting in its local prefetch queue). It refreshes
-	// last_heartbeat_at so the fault monitor doesn't reclaim a live unit, but it
-	// must NOT transition ASSIGNED -> RUNNING (no work has started).
-	if hbStatus != "RUNNING" && hbStatus != "CHECKPOINT_SAVED" && hbStatus != "PREPARING" {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid status %q: must be RUNNING, PREPARING, or CHECKPOINT_SAVED", hbStatus)
+	// GRACEFUL SHEDDING: bound StartWork's DB touch by the dispatch admission
+	// semaphore and a short shed-context timeout so a saturated pool fails fast.
+	if s.dispatchCache != nil {
+		shedCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+		defer cancel()
+		release, ok := s.dispatchCache.acquire(shedCtx)
+		if !ok {
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry StartWork")
+		}
+		defer release()
+		ctx = shedCtx
 	}
 
 	// Load work unit.
@@ -956,204 +1177,117 @@ func (s *volunteerService) Heartbeat(ctx context.Context, req *lettucev1.Heartbe
 		if ok && apiErr.HTTPStatus == 404 {
 			return nil, status.Errorf(codes.NotFound, "work unit not found")
 		}
-		s.logger.Error("failed to load work unit", "error", err)
+		s.logger.Error("failed to load work unit", "method", "StartWork", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Lazy run-start for a buffered (reserved) unit: the volunteer pulled a
-	// reserved descriptor out of its work buffer and is now actually running it.
-	// Its FIRST RUNNING heartbeat flips the still-QUEUED unit to ASSIGNED via the
-	// normal Assign (which sets assigned_at/last_heartbeat_at = now and clears the
-	// reservation columns), starting the deadline/heartbeat clock at run time —
-	// not at buffer-fill. PREPARING heartbeats do NOT flip it (buffered units rely
-	// on the lease, not heartbeats). Spot-check units stay QUEUED for a second
-	// volunteer and are excluded here.
-	if !wu.SpotCheck &&
-		wu.State == workunit.WorkUnitStateQueued &&
-		wu.ReservedVolunteerID != nil && *wu.ReservedVolunteerID == volunteerID &&
-		hbStatus != "PREPARING" {
-		// Flip the reserved unit to ASSIGNED and create its active assignment_history
-		// row in ONE transaction. The history row is written HERE (at run-start), not
-		// at reservation time — a buffered unit is leased purely via the reservation
-		// columns, so a crashed holder leaves no stale active row to leak. From this
-		// point the active history row is what SubmitResult / AbandonWorkUnit / the
-		// fault monitor key off, and what the redundancy/inflight counts in
-		// FindNextAssignable count for a now-ASSIGNED unit.
-		startTx, terr := s.pool.Begin(ctx)
-		if terr != nil {
-			s.logger.Error("failed to begin run-start transaction", "error", terr)
-			return nil, status.Errorf(codes.Internal, "internal error")
-		}
-		txWURepo := workunit.NewPgxWorkUnitRepository(startTx)
-		txAssignRepo := assignment.NewPgxRepository(startTx)
-		assigned, aerr := txWURepo.Assign(ctx, workUnitID, volunteerID)
-		if aerr != nil {
-			// A concurrent reclaim (lapsed lease taken by another volunteer) or a
-			// state change lost the race: treat as no-longer-active.
-			_ = startTx.Rollback(ctx)
-			s.logger.Warn("run-start Assign failed for reserved unit", "work_unit_id", workUnitID, "error", aerr)
-			return &lettucev1.HeartbeatResponse{
-				ContinueExecution: false,
-				Message:           "work unit no longer active",
-			}, nil
-		}
-		if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
-			WorkUnitID:  workUnitID,
-			VolunteerID: volunteerID,
-			AssignedAt:  time.Now().UTC(),
-		}); cerr != nil {
-			_ = startTx.Rollback(ctx)
-			s.logger.Error("failed to record assignment history at run-start", "work_unit_id", workUnitID, "error", cerr)
-			return nil, status.Errorf(codes.Internal, "internal error")
-		}
-		if cerr := startTx.Commit(ctx); cerr != nil {
-			s.logger.Error("failed to commit run-start", "work_unit_id", workUnitID, "error", cerr)
-			return nil, status.Errorf(codes.Internal, "internal error")
-		}
-		wu = assigned
-	}
-
-	// PREPARING heartbeat for a still-buffered (reserved, un-started) unit: renew
-	// its lease. A buffered unit stays QUEUED and is kept alive ONLY by its
-	// reservation lease (reserved_until), NOT by last_heartbeat_at (which the
-	// abandonment monitor ignores for QUEUED units). Without this, a unit held in
-	// the volunteer's work buffer longer than lease_seconds has its lease lapse,
-	// and FindNextAssignable's reservation guard re-exposes the still-QUEUED unit
-	// to a SECOND volunteer (double-dispatch) while the original holder still
-	// intends to run it. The volunteer sends PREPARING heartbeats for every
-	// buffered unit, so bumping reserved_until here keeps a live holder's lease
-	// from lapsing. This path handles the unit BEFORE the "Verify assignment"
-	// block below, which would otherwise reject a QUEUED (never-ASSIGNED) unit
-	// with PermissionDenied. Spot-check units are excluded: they must stay
-	// reservable by a SECOND volunteer and are governed by FindExpiredWorkUnits.
-	if !wu.SpotCheck &&
-		wu.State == workunit.WorkUnitStateQueued &&
-		wu.ReservedVolunteerID != nil && *wu.ReservedVolunteerID == volunteerID {
-		lease := time.Duration(s.leaseSeconds) * time.Second
-		if _, rerr := s.wuRepo.StampReservation(ctx, workUnitID, volunteerID, lease); rerr != nil {
-			// Conflict means the unit is no longer QUEUED (it flipped to ASSIGNED via
-			// a concurrent run-start, or its lapsed lease was re-taken). Treat as
-			// no-longer-buffered: tell the volunteer to drop it from its buffer.
-			if apiErr, ok := rerr.(*apierror.APIError); ok && apiErr.HTTPStatus == 409 {
-				return &lettucev1.HeartbeatResponse{
-					ContinueExecution: false,
-					Message:           "reservation lapsed, work unit no longer held",
-				}, nil
+	// If the unit is already ASSIGNED/RUNNING for this volunteer, treat StartWork as
+	// idempotent: the run-start already happened (e.g. a retried StartWork after a
+	// lost response). Spot-check units carry their own history row, so verify via
+	// the assignment history; NORMAL units via the assigned column.
+	if wu.State == workunit.WorkUnitStateAssigned || wu.State == workunit.WorkUnitStateRunning {
+		if wu.SpotCheck {
+			entry, aerr := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
+			if aerr == nil && entry != nil {
+				return &lettucev1.StartWorkResponse{Ok: true, Message: "already run-started"}, nil
 			}
-			s.logger.Error("failed to renew reservation on PREPARING heartbeat", "work_unit_id", workUnitID, "error", rerr)
-			return nil, status.Errorf(codes.Internal, "internal error")
+		} else if wu.AssignedVolunteerID != nil && *wu.AssignedVolunteerID == volunteerID {
+			return &lettucev1.StartWorkResponse{Ok: true, Message: "already run-started"}, nil
 		}
-		// Best-effort liveness bookkeeping, consistent with the running-heartbeat path.
-		if _, uerr := s.pool.Exec(ctx,
-			"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", volunteerID); uerr != nil {
-			s.logger.Warn("failed to update volunteer liveness on PREPARING heartbeat", "volunteer_id", volunteerID, "error", uerr)
-		}
-		return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
+		// Assigned to someone else (redundancy>1 distinct holder still occupies the
+		// column, or this unit was reassigned out from under us): not run-startable
+		// for this volunteer right now. Tell the volunteer to drop it.
+		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit not reserved for this volunteer"}, nil
 	}
 
-	// Verify assignment.
+	// Spot-check units are the ONE case that never flips QUEUED->ASSIGNED: they stay
+	// QUEUED for corroboration and every placed volunteer (the marking volunteer AND
+	// any later corroborating volunteer) already has its active assignment_history row
+	// written at reservation time (RequestWorkUnit). So spot-check units need no
+	// run-start — flipping them to ASSIGNED here would hide them from the second
+	// corroborating volunteer's FindNextAssignable (which requires state='QUEUED'),
+	// breaking spot-check redundancy. StartWork is a harmless no-op: the volunteer
+	// submits directly against the existing history row.
 	if wu.SpotCheck {
-		// For spot-check WUs, verify via assignment history (multiple volunteers may be assigned).
-		entry, assignErr := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
-		if assignErr != nil || entry == nil {
-			return nil, status.Errorf(codes.PermissionDenied, "volunteer is not assigned to this work unit")
-		}
-	} else if wu.AssignedVolunteerID == nil || *wu.AssignedVolunteerID != volunteerID {
-		return nil, status.Errorf(codes.PermissionDenied, "volunteer is not assigned to this work unit")
+		return &lettucev1.StartWorkResponse{Ok: true, Message: "spot-check unit; submits against existing history row"}, nil
 	}
 
-	// Check work unit state.
-	switch wu.State {
-	case workunit.WorkUnitStateAssigned, workunit.WorkUnitStateRunning:
-		// OK — proceed.
-	case workunit.WorkUnitStateQueued:
-		if !wu.SpotCheck {
-			return &lettucev1.HeartbeatResponse{
-				ContinueExecution: false,
-				Message:           "work unit no longer active",
-			}, nil
-		}
-		// Spot-check WUs in QUEUED state are reclaimed by FindExpiredWorkUnits
-		// after 1 hour if a second volunteer is never assigned.
-	default:
-		return &lettucev1.HeartbeatResponse{
-			ContinueExecution: false,
-			Message:           "work unit no longer active",
-		}, nil
+	// Only a still-QUEUED unit reserved for THIS volunteer can be run-started.
+	if wu.State != workunit.WorkUnitStateQueued {
+		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
 	}
-
-	// Begin transaction for atomic updates.
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		s.logger.Error("failed to begin transaction", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	defer tx.Rollback(ctx)
-
-	// If first execution heartbeat (ASSIGNED), transition to RUNNING.
-	// PREPARING heartbeats refresh the timestamp only — the unit hasn't started.
-	// Skip for spot-check WUs in QUEUED state — they must stay QUEUED for second assignment.
-	if wu.State == workunit.WorkUnitStateAssigned && hbStatus != "PREPARING" {
-		_, err := tx.Exec(ctx, `
-			UPDATE work_units SET
-				state = 'RUNNING',
-				started_at = NOW(),
-				last_heartbeat_at = NOW()
-			WHERE id = $1 AND state = 'ASSIGNED'`, workUnitID)
-		if err != nil {
-			s.logger.Error("failed to transition to RUNNING", "error", err)
-			return nil, status.Errorf(codes.Internal, "internal error")
+	// The reservation must belong to this volunteer. Major 3 (flush race): a unit handed
+	// out from the dispatch cache is reserved IN MEMORY immediately, but its async
+	// reservation-write may not have landed yet — so the DB reserved_volunteer_id reads
+	// back NULL (or, transiently, stale) even though this volunteer legitimately holds
+	// it. If the DB column does not match, consult the cache's in-memory reservation: if
+	// the cache holds it for this volunteer, force the pending flush so the reservation
+	// becomes durable (and any flush conflict is resolved deterministically), then
+	// proceed. Without this, a volunteer that run-starts a buffered unit inside the
+	// flush window would be wrongly told to drop it.
+	if wu.ReservedVolunteerID == nil || *wu.ReservedVolunteerID != volunteerID {
+		reservedHere := s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID)
+		if !reservedHere {
+			return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
 		}
-	} else {
-		// Normal heartbeat — just update timestamp.
-		_, err := tx.Exec(ctx,
-			"UPDATE work_units SET last_heartbeat_at = NOW() WHERE id = $1", workUnitID)
-		if err != nil {
-			s.logger.Error("failed to update heartbeat", "error", err)
-			return nil, status.Errorf(codes.Internal, "internal error")
+		// Force the pending reservation flush so the reservation lands (or is voided on
+		// conflict) before the run-start Assign. flushOnce releases an in-memory hold it
+		// could not persist, so re-check after the flush: if the hold survived, this
+		// volunteer's reservation is durable and the Assign below is safe.
+		s.dispatchCache.flushPendingFor(ctx)
+		if !s.dispatchCache.hasInMemReservation(workUnitID, volunteerID) {
+			return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
 		}
 	}
 
-	// Update volunteer last_seen and is_active.
-	_, err = tx.Exec(ctx,
-		"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", volunteerID)
-	if err != nil {
-		s.logger.Error("failed to update volunteer", "error", err)
+	// Flip the reserved unit to ASSIGNED and create its active assignment_history
+	// row in ONE transaction. The history row is written HERE (at run-start), not at
+	// reservation time — a buffered unit is leased purely via the reservation
+	// columns, so a crashed holder leaves no stale active row to leak. From this
+	// point the active history row is what SubmitResult / AbandonWorkUnit / the fault
+	// monitor key off, and what the redundancy/inflight counts in FindNextAssignable
+	// count for a now-ASSIGNED unit.
+	startTx, terr := s.pool.Begin(ctx)
+	if terr != nil {
+		s.logger.Error("failed to begin run-start transaction", "method", "StartWork", "error", terr)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	defer startTx.Rollback(ctx)
+	txWURepo := workunit.NewPgxWorkUnitRepository(startTx)
+	txAssignRepo := assignment.NewPgxRepository(startTx)
+	if _, aerr := txWURepo.Assign(ctx, workUnitID, volunteerID); aerr != nil {
+		// A concurrent reclaim (lapsed lease taken by another volunteer) or a state
+		// change lost the race: treat as no-longer-startable for this volunteer.
+		s.logger.Warn("run-start Assign failed for reserved unit", "work_unit_id", workUnitID, "error", aerr)
+		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer active"}, nil
+	}
+	if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
+		WorkUnitID:  workUnitID,
+		VolunteerID: volunteerID,
+		AssignedAt:  time.Now().UTC(),
+	}); cerr != nil {
+		s.logger.Error("failed to record assignment history at run-start", "work_unit_id", workUnitID, "error", cerr)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	if cerr := startTx.Commit(ctx); cerr != nil {
+		s.logger.Error("failed to commit run-start", "work_unit_id", workUnitID, "error", cerr)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		s.logger.Error("failed to commit heartbeat", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
+	// Dispatch cache: the reservation is now an active history row, so stop tracking
+	// the in-memory reservation hold (the slot stays counted via the DB row, which
+	// the reconcile owns) and drop the now-ASSIGNED unit from the ready pool.
+	if s.dispatchCache != nil {
+		s.dispatchCache.onRunStart(workUnitID, volunteerID)
 	}
 
-	// Log checkpoint-saved status.
-	if hbStatus == "CHECKPOINT_SAVED" {
-		s.logger.Info("checkpoint saved for work unit",
-			"work_unit_id", workUnitID,
-			"volunteer_id", volunteerID,
-			"last_checkpoint_sequence", wu.LastCheckpointSequence,
-		)
+	// Best-effort liveness bookkeeping (last_seen drives the stale-volunteer monitor).
+	if _, uerr := s.pool.Exec(ctx,
+		"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", volunteerID); uerr != nil {
+		s.logger.Warn("failed to update volunteer liveness on StartWork", "volunteer_id", volunteerID, "error", uerr)
 	}
 
-	// Check leaf state.
-	lf, err := s.leafRepo.GetByID(ctx, wu.LeafID)
-	if err != nil {
-		s.logger.Error("failed to load leaf", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-
-	switch lf.State {
-	case leaf.StatePaused, leaf.StateCompleted, leaf.StateArchived:
-		return &lettucev1.HeartbeatResponse{
-			ContinueExecution: false,
-			Message:           fmt.Sprintf("leaf is %s", lf.State),
-		}, nil
-	}
-
-	return &lettucev1.HeartbeatResponse{
-		ContinueExecution: true,
-	}, nil
+	return &lettucev1.StartWorkResponse{Ok: true}, nil
 }
 
 func (s *volunteerService) SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
@@ -1351,6 +1485,11 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 				s.logger.Error("abandon: failed to clear reservation", "work_unit_id", req.WorkUnitId, "error", cerr)
 				return nil, status.Errorf(codes.Internal, "internal error")
 			}
+			// Dispatch cache: drop this volunteer's in-memory reservation hold so the
+			// cache stops counting it; the unit is now plain QUEUED and re-stageable.
+			if s.dispatchCache != nil {
+				s.dispatchCache.releaseInMem(workUnitID, volunteerID)
+			}
 			s.logger.Info("buffered work unit abandoned by volunteer (reservation dropped)",
 				"work_unit_id", req.WorkUnitId,
 				"volunteer_id", req.VolunteerId,
@@ -1382,6 +1521,13 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	if err != nil {
 		s.logger.Error("abandon: failed to reassign work unit", "work_unit_id", req.WorkUnitId, "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
+	// Dispatch cache: the abandoned unit's prior dispatch state is now void (it was
+	// transitioned and reassigned). Evict any stale in-memory ledger/ready entry; if
+	// it requeued, the refiller restages it fresh from Postgres.
+	if s.dispatchCache != nil {
+		s.dispatchCache.onUnitDone(workUnitID)
 	}
 
 	s.logger.Info("work unit abandoned by volunteer",

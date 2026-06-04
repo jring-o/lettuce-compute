@@ -12,11 +12,27 @@
 //     delay, makes zero RequestWorkUnit calls while the buffer is full, and
 //     treats per-client rate limiting (ResourceExhausted) as a fixed local
 //     backoff.
+//   - overload: the Layer 2 saturation driver — a hot RequestWorkUnit loop with
+//     NO inter-request delay that ignores the server-directed retry delay, so a
+//     fleet larger than the head's dispatch ceiling pins the hot path. It is how
+//     the simulator measures the single-head dispatch ceiling (peak dispatch/sec)
+//     and proves the head sheds gracefully (ResourceExhausted) instead of
+//     collapsing the DB pool (DeadlineExceeded / Unavailable).
 //
 // It can seed a test leaf with work units over the head's HTTP admin API, runs
-// the fleet for a fixed duration, and reports dispatch throughput, per-RPC
-// request rate, latency percentiles, and the server-directed retry delay the
-// head handed out. Lease renewal rides on Heartbeat (see metrics.go).
+// the fleet for a fixed duration, and reports dispatch throughput (whole-run and
+// per-second peak), per-RPC request rate, latency percentiles, the
+// server-directed retry delay the head handed out, and the Layer 2 overload
+// signals (ResourceExhausted shed-ratio and a pool-collapse flag).
+//
+// Liveness is deadline-based (no Heartbeat RPC); run-start is the explicit
+// StartWork RPC, one call per unit executed (see metrics.go).
+//
+// The per-IP and per-pubkey gRPC rate limits are raised on the HEAD process for
+// a ceiling/overload run (a single-host swarm shares one source IP, so the
+// Layer 0 per-IP bucket would otherwise mask the Layer 2 admission cap). Set
+// LETTUCE_GRPC_PER_IP_RATE_LIMIT / LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT very high
+// (or 0 to leave defaults) when launching lettuce-server for the ceiling run.
 package main
 
 import (
@@ -52,6 +68,7 @@ type options struct {
 	maxAssign     int
 	simFpops      float64
 	maxCompute    time.Duration
+	honorShed     bool
 
 	report string
 	quiet  bool
@@ -65,7 +82,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.adminKey, "admin-key", os.Getenv("LETTUCE_ADMIN_API_KEY"), "admin API key for seeding (defaults to $LETTUCE_ADMIN_API_KEY)")
 
 	fs.IntVar(&o.volunteers, "volunteers", 100, "number of simulated volunteers")
-	fs.StringVar(&o.profile, "profile", "buffered", "client profile: naive | buffered")
+	fs.StringVar(&o.profile, "profile", "buffered", "client profile: naive | buffered | overload")
 	fs.DurationVar(&o.duration, "duration", 60*time.Second, "how long to run the fleet")
 
 	fs.StringVar(&o.seedLeaf, "seed-leaf", "swarm-test", "name/slug of the leaf to seed and target")
@@ -78,6 +95,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.IntVar(&o.maxAssign, "max-assignments", 8, "buffered profile batch size (server-capped)")
 	fs.Float64Var(&o.simFpops, "sim-fpops", 1.0e9, "simulated benchmark FLOPS; pretend-compute = rsc_fpops_est/sim-fpops seconds")
 	fs.DurationVar(&o.maxCompute, "max-compute", 2*time.Second, "cap on pretend-compute per unit so runs progress")
+	fs.BoolVar(&o.honorShed, "honor-shed", false, "overload profile: back off on ResourceExhausted instead of immediately re-requesting (default false = maximal pressure for the ceiling run)")
 
 	fs.StringVar(&o.report, "report", "text", "report format: text | json")
 	fs.BoolVar(&o.quiet, "quiet", false, "suppress progress logging")
@@ -85,8 +103,8 @@ func parseFlags(args []string) (*options, error) {
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
-	if o.profile != string(profileNaive) && o.profile != string(profileBuffered) {
-		return nil, fmt.Errorf("invalid --profile %q: must be naive or buffered", o.profile)
+	if o.profile != string(profileNaive) && o.profile != string(profileBuffered) && o.profile != string(profileOverload) {
+		return nil, fmt.Errorf("invalid --profile %q: must be naive, buffered, or overload", o.profile)
 	}
 	if o.volunteers < 1 {
 		return nil, fmt.Errorf("--volunteers must be >= 1")
@@ -159,6 +177,7 @@ func runSimulation(ctx context.Context, o *options, logger *slog.Logger) (report
 		maxAssign:     int32(o.maxAssign),
 		simFpops:      o.simFpops,
 		maxCompute:    o.maxCompute,
+		honorShed:     o.honorShed,
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)), // quiet per-volunteer client
 	}
 	m := newMetrics()
@@ -214,6 +233,17 @@ func runSimulation(ctx context.Context, o *options, logger *slog.Logger) (report
 	runCtx, runCancel := context.WithTimeout(ctx, o.duration)
 	defer runCancel()
 	start := time.Now()
+
+	// Sample the per-second dispatch rate so the report can show the peak
+	// sustained dispatch/sec (the headline single-head ceiling number), which the
+	// whole-run average understates as the fleet ramps and seeded units run out.
+	var sampleWG sync.WaitGroup
+	sampleWG.Add(1)
+	go func() {
+		defer sampleWG.Done()
+		m.samplePeak(runCtx)
+	}()
+
 	var runWG sync.WaitGroup
 	for _, v := range vols {
 		if v.id == "" {
@@ -228,6 +258,8 @@ func runSimulation(ctx context.Context, o *options, logger *slog.Logger) (report
 	logger.Info("fleet running", "duration", o.duration)
 	runWG.Wait()
 	elapsed := time.Since(start)
+	runCancel() // stop the peak sampler
+	sampleWG.Wait()
 
 	rep := m.buildReport(o.profile, registered, elapsed)
 	return rep, nil
@@ -244,14 +276,20 @@ func writeReport(w io.Writer, rep report, format string) error {
 	fmt.Fprintf(w, "\n=== swarm-sim report (profile=%s) ===\n", rep.Profile)
 	fmt.Fprintf(w, "volunteers:            %d\n", rep.Volunteers)
 	fmt.Fprintf(w, "duration:              %.1fs\n", rep.DurationSeconds)
-	fmt.Fprintf(w, "assignments dispatched: %d (%.1f/s)\n", rep.AssignmentsDispatched, rep.DispatchPerSec)
+	fmt.Fprintf(w, "assignments dispatched: %d (%.1f/s avg, %.1f/s peak)\n", rep.AssignmentsDispatched, rep.DispatchPerSec, rep.PeakDispatchPerSec)
 	fmt.Fprintf(w, "results submitted:     %d\n", rep.ResultsSubmitted)
 	fmt.Fprintf(w, "RequestWorkUnit rate:  %.2f calls/s  (the request-noise metric)\n", rep.RequestRatePerSec)
 	fmt.Fprintf(w, "retry_after handed out: avg=%.1fs max=%ds\n", rep.RetryAfterAvgSeconds, rep.RetryAfterMaxSeconds)
-	fmt.Fprintf(w, "\n%-18s %8s %8s %8s %8s %9s %9s %9s %9s\n", "rpc", "calls", "ok", "errors", "throttl", "p50ms", "p90ms", "p99ms", "maxms")
+	fmt.Fprintf(w, "shed (ResourceExhausted): %.1f%% of RequestWorkUnit  (graceful backpressure)\n", rep.ShedRatio*100.0)
+	collapse := "no"
+	if rep.Collapsed {
+		collapse = fmt.Sprintf("YES (%d RequestWorkUnit calls hit DeadlineExceeded/Unavailable)", rep.CollapseCount)
+	}
+	fmt.Fprintf(w, "DB-pool collapse:      %s\n", collapse)
+	fmt.Fprintf(w, "\n%-18s %8s %8s %8s %8s %8s %9s %9s %9s %9s\n", "rpc", "calls", "ok", "errors", "throttl", "collaps", "p50ms", "p90ms", "p99ms", "maxms")
 	for _, r := range rep.RPCs {
-		fmt.Fprintf(w, "%-18s %8d %8d %8d %8d %9.2f %9.2f %9.2f %9.2f\n",
-			r.RPC, r.Calls, r.OK, r.Errors, r.Throttled,
+		fmt.Fprintf(w, "%-18s %8d %8d %8d %8d %8d %9.2f %9.2f %9.2f %9.2f\n",
+			r.RPC, r.Calls, r.OK, r.Errors, r.Throttled, r.Collapse,
 			r.Latency.P50, r.Latency.P90, r.Latency.P99, r.Latency.Max)
 	}
 	fmt.Fprintln(w)

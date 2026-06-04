@@ -48,7 +48,7 @@ func TestSlotManager_ConcurrentExecution(t *testing.T) {
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
 			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
-			WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp:  &lettucev1.WorkUnitAssignment{},
 			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -119,7 +119,7 @@ func TestSlotManager_GetCurrentTasks(t *testing.T) {
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
 			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-" + id},
-			WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp:  &lettucev1.WorkUnitAssignment{},
 			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -187,7 +187,7 @@ func TestSlotManager_GetCurrentTasks_WorkDirNilPrep(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-noprep", LeafID: "proj-1"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{}, // empty PrepareResult — WorkDir is ""
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -233,7 +233,7 @@ func TestSlotManager_StopAll(t *testing.T) {
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
 			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
-			WUResp:  &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp:  &lettucev1.WorkUnitAssignment{},
 			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -284,7 +284,7 @@ func TestSlotManager_TotalActiveMemoryMB(t *testing.T) {
 					MaxMemoryMB: memMB,
 				},
 			},
-			WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp: &lettucev1.WorkUnitAssignment{},
 			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -336,7 +336,7 @@ func TestSuspendAll_ResumeAll_PauseDurationAccumulation(t *testing.T) {
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-pause"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -421,7 +421,7 @@ func TestGetCurrentTasks_DuringActivePause(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-active-pause", LeafID: "leaf-1", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{Image: "ubuntu:22.04"}},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-active-pause"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -485,7 +485,7 @@ func TestSuspendAll_FailedSuspend_NoPauseAccumulation(t *testing.T) {
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-fail-suspend"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -553,7 +553,7 @@ func TestResumeAll_FailedResume_StaysSuspended(t *testing.T) {
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-fail-resume"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -619,7 +619,7 @@ func TestGetCurrentTasks_EstimatedSeconds_FromBenchmark(t *testing.T) {
 			RscFpopsEst:     1e12, // 1 trillion flops
 			DeadlineSeconds: 7200,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-est"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -683,7 +683,7 @@ func TestSlotResult_TotalPausedDur_TaskCompletesWhilePaused(t *testing.T) {
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-complete-paused"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -740,7 +740,7 @@ func TestSuspendAll_ResumeAll_MultiSlot(t *testing.T) {
 				Runtime:         "native",
 				DeadlineSeconds: 3600,
 			},
-			WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp: &lettucev1.WorkUnitAssignment{},
 			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -815,7 +815,7 @@ func TestSuspendSlot_ByWorkUnitID(t *testing.T) {
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
 			WU:     &runtime.WorkUnit{ID: id, LeafID: "leaf-1", Runtime: "native"},
-			WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+			WUResp: &lettucev1.WorkUnitAssignment{},
 			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
@@ -884,7 +884,7 @@ func TestSuspendSlot_AlreadySuspended(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-double-sus", LeafID: "leaf-1", Runtime: "native"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-double-sus"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -931,7 +931,7 @@ func TestResumeSlot_ByWorkUnitID(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-resume", LeafID: "leaf-1", Runtime: "native"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-resume"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -988,7 +988,7 @@ func TestResumeSlot_NotSuspended(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-not-sus", LeafID: "leaf-1"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-not-sus"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -1037,7 +1037,7 @@ func TestAbortSlot_CancelsContext(t *testing.T) {
 
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-abort", LeafID: "leaf-1"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-abort"},
 		Runtime: &mockRuntime{
 			canHandle: true,
@@ -1090,7 +1090,7 @@ func TestSuspendSlot_RecordsPausedAt(t *testing.T) {
 	blockCh := make(chan struct{})
 	item := &PreFetchItem{
 		WU:     &runtime.WorkUnit{ID: "wu-pauseat", LeafID: "leaf-1", Runtime: "native"},
-		WUResp: &lettucev1.WorkUnitAssignment{HeartbeatIntervalSeconds: 300},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep:   &runtime.PrepareResult{WorkDir: "/tmp/wu-pauseat"},
 		Runtime: &mockRuntime{
 			canHandle: true,

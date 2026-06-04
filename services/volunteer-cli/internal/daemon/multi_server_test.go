@@ -31,7 +31,7 @@ func TestMultiServerSingleServer(t *testing.T) {
 						{
 							WorkUnitId: fmt.Sprintf("00000000-0000-4000-8000-%012d", workCount), LeafId: "proj-1",
 							Runtime: "native", InputData: []byte("input"),
-							HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+							ExecutionSpec: &lettucev1.ExecutionSpec{},
 						},
 					},
 				}, nil
@@ -85,7 +85,7 @@ func TestMultiServerSubmitToCorrectServer(t *testing.T) {
 					{
 						WorkUnitId: "bbbb0000-0000-4000-8000-0000000f0b0b", LeafId: "proj-b",
 						Runtime: "native", InputData: []byte("input"),
-						HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+						ExecutionSpec: &lettucev1.ExecutionSpec{},
 					},
 				},
 			}, nil
@@ -161,7 +161,7 @@ func TestMultiServerHistoryTracksServer(t *testing.T) {
 					{
 						WorkUnitId: "11110000-0000-4000-8000-000000001515", LeafId: "proj-1",
 						Runtime: "native", InputData: []byte("input"),
-						HeartbeatIntervalSeconds: 300, ExecutionSpec: &lettucev1.ExecutionSpec{},
+						ExecutionSpec: &lettucev1.ExecutionSpec{},
 					},
 				},
 			}, nil
@@ -217,7 +217,7 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 					{
 						WorkUnitId: "bbbb0000-0000-4000-8000-00000000b00b", LeafId: "proj-b",
 						Runtime: "native", InputData: []byte("input"),
-						HeartbeatIntervalSeconds: 1, // 1 second for test
+						// 1 second for test
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -265,14 +265,15 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 
 	d.Run(ctx)
 
-	// Server B should have received heartbeats.
-	if serverB.getHeartbeatCalls() == 0 {
-		t.Error("server B heartbeat calls = 0, want >= 1")
+	// Server B (the one with work) should have received the result submission.
+	// (Per-task heartbeats are gone; SubmitResult is the proof the unit ran here.)
+	if serverB.getSubmitCalls() == 0 {
+		t.Error("server B submit calls = 0, want >= 1")
 	}
 
-	// Server A should NOT have received heartbeats.
-	if serverA.getHeartbeatCalls() != 0 {
-		t.Errorf("server A heartbeat calls = %d, want 0", serverA.getHeartbeatCalls())
+	// Server A should NOT have received any result submission.
+	if serverA.getSubmitCalls() != 0 {
+		t.Errorf("server A submit calls = %d, want 0", serverA.getSubmitCalls())
 	}
 }
 

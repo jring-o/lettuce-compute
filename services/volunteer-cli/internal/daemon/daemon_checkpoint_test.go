@@ -39,7 +39,6 @@ func TestDaemonCheckpointRestore(t *testing.T) {
 						WorkUnitId:                "2c7d1dae-749f-49cc-8adf-2b0f5cc9c7c8", // was wu-ckp-1
 						LeafId:                    "proj-1",
 						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  300,
 						HasCheckpoint:             true,
 						CheckpointSequence:        3,
 						CheckpointIntervalSeconds: 60,
@@ -117,7 +116,6 @@ func TestDaemonCheckpointGoroutineStarts(t *testing.T) {
 						WorkUnitId:                "1ddc58f0-695e-42e0-82cb-b9ab1342077f", // was wu-ckp-2
 						LeafId:                    "proj-1",
 						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  300,
 						CheckpointIntervalSeconds: 1, // 1 second â€” fast for test
 					},
 				},
@@ -193,7 +191,6 @@ func TestDaemonCheckpointNotStartedWhenDisabled(t *testing.T) {
 						WorkUnitId:                "b924d1be-435a-4d13-8641-f85ba261c54c", // was wu-no-ckp
 						LeafId:                    "proj-1",
 						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  300,
 						CheckpointIntervalSeconds: 0, // disabled
 					},
 				},
@@ -225,92 +222,11 @@ func TestDaemonCheckpointNotStartedWhenDisabled(t *testing.T) {
 	d.Run(ctx)
 }
 
-func TestDaemonHeartbeatCheckpointStatus(t *testing.T) {
-	workUnitServed := false
-	var mu sync.Mutex
-	var heartbeatStatuses []string
-
-	mc := &mockClient{
-		requestWorkUnitFn: func(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-			if workUnitServed {
-				return nil, status.Error(codes.NotFound, "no work")
-			}
-			workUnitServed = true
-			return &lettucev1.RequestWorkUnitResponse{
-				Assignments: []*lettucev1.WorkUnitAssignment{
-					{
-						WorkUnitId:                "821673a2-01aa-47ce-810b-d313b9492389", // was wu-hb-1
-						LeafId:                    "proj-1",
-						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  1,
-						CheckpointIntervalSeconds: 1,
-					},
-				},
-			}, nil
-		},
-		heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
-			mu.Lock()
-			heartbeatStatuses = append(heartbeatStatuses, req.Status)
-			mu.Unlock()
-			return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
-		},
-		saveCheckpointFn: func(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
-			return &lettucev1.SaveCheckpointResponse{Accepted: true}, nil
-		},
-	}
-
-	mr := &mockRuntime{
-		canHandle: true,
-		name:      "native",
-		prepareFn: func(ctx context.Context, wu *runtime.WorkUnit) (*runtime.PrepareResult, error) {
-			workDir := t.TempDir()
-			checkpointDir := filepath.Join(workDir, "checkpoint")
-			os.MkdirAll(checkpointDir, 0755)
-			os.WriteFile(filepath.Join(checkpointDir, "state.bin"), []byte("data"), 0644)
-			return &runtime.PrepareResult{WorkDir: workDir}, nil
-		},
-		executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(4 * time.Second):
-			}
-			return &runtime.ExecutionResult{
-				OutputData:     []byte("result"),
-				OutputChecksum: "abc",
-				ExitCode:       0,
-				Metrics:        runtime.ExecutionMetrics{WallClockSeconds: 4},
-			}, nil
-		},
-	}
-
-	d := newTestDaemon(mc, mr)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		time.Sleep(3500 * time.Millisecond)
-		cancel()
-	}()
-
-	d.Run(ctx)
-
-	mu.Lock()
-	statuses := heartbeatStatuses
-	mu.Unlock()
-
-	// After checkpoint saves, at least some heartbeats should report CHECKPOINT_SAVED.
-	hasCheckpointStatus := false
-	for _, s := range statuses {
-		if s == "CHECKPOINT_SAVED" {
-			hasCheckpointStatus = true
-			break
-		}
-	}
-
-	if !hasCheckpointStatus && len(statuses) > 1 {
-		t.Errorf("expected at least one CHECKPOINT_SAVED heartbeat status, got: %v", statuses)
-	}
-}
+// TestDaemonHeartbeatCheckpointStatus removed: it asserted that running heartbeats
+// reported a CHECKPOINT_SAVED status. Per-task heartbeats (and their progress /
+// CHECKPOINT_SAVED status field) are gone; checkpoint coordination rides the
+// independent SaveCheckpoint RPC, which has its own coverage. No StartWork
+// replacement is needed — StartWork carries no progress/status payload.
 
 func TestDaemonCheckpointRestoreFailure_StartsFresh(t *testing.T) {
 	// When GetCheckpoint fails, the daemon should log a warning and start fresh
@@ -330,7 +246,6 @@ func TestDaemonCheckpointRestoreFailure_StartsFresh(t *testing.T) {
 						WorkUnitId:                "5e84956d-05df-4c7c-8ade-cd9355c03da8", // was wu-ckp-fail
 						LeafId:                    "proj-1",
 						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  300,
 						HasCheckpoint:             true,
 						CheckpointSequence:        2,
 						CheckpointIntervalSeconds: 60,
@@ -399,7 +314,6 @@ func TestDaemonGetCurrentTasks_WithCheckpoint(t *testing.T) {
 						WorkUnitId:                "6d237510-ab4e-4073-86fa-30da90429d51", // was wu-current-1
 						LeafId:                    "proj-current",
 						Runtime:                   "native",
-						HeartbeatIntervalSeconds:  300,
 						HasCheckpoint:             true,
 						CheckpointSequence:        3,
 						CheckpointIntervalSeconds: 1,

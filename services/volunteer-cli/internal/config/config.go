@@ -40,7 +40,7 @@ type Config struct {
 	MaxConcurrentTasks int     `yaml:"max_concurrent_tasks"`
 	WorkBufferHours    float64 `yaml:"work_buffer_hours"` // hours of work to keep buffered per slot (default 2.0; 0 = a small unit-count fallback)
 	LogLevel           string  `yaml:"log_level"`
-	ResultCacheMaxMB   int    `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
+	ResultCacheMaxMB   int     `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
 
 	// Logging output. By default logs are written to both stderr and a
 	// size-rotated JSON file under <DataDir>/logs/ so problems remain
@@ -118,12 +118,12 @@ type ServerConfig struct {
 	HTTPAddress     string          `yaml:"http_address,omitempty" json:"http_address,omitempty"`
 	LeafID          string          `yaml:"leaf_id,omitempty" json:"leaf_id,omitempty"`
 	Name            string          `yaml:"name" json:"name"`
-	Insecure        bool            `yaml:"insecure,omitempty" json:"insecure,omitempty"`                     // default false — use TLS
-	CACertPath      string          `yaml:"ca_cert,omitempty" json:"ca_cert,omitempty"`                       // optional CA certificate for server verification
-	CertPath        string          `yaml:"cert,omitempty" json:"cert,omitempty"`                             // optional client cert for mTLS
-	KeyPath         string          `yaml:"key,omitempty" json:"key,omitempty"`                               // optional client key for mTLS
-	Weight          int             `yaml:"weight,omitempty" json:"weight,omitempty"`                         // head-level weight, default 100
-	LeafPreferences LeafPreferences `yaml:"leaf_preferences,omitempty" json:"leaf_preferences,omitempty"`     // per-leaf config
+	Insecure        bool            `yaml:"insecure,omitempty" json:"insecure,omitempty"`                 // default false — use TLS
+	CACertPath      string          `yaml:"ca_cert,omitempty" json:"ca_cert,omitempty"`                   // optional CA certificate for server verification
+	CertPath        string          `yaml:"cert,omitempty" json:"cert,omitempty"`                         // optional client cert for mTLS
+	KeyPath         string          `yaml:"key,omitempty" json:"key,omitempty"`                           // optional client key for mTLS
+	Weight          int             `yaml:"weight,omitempty" json:"weight,omitempty"`                     // head-level weight, default 100
+	LeafPreferences LeafPreferences `yaml:"leaf_preferences,omitempty" json:"leaf_preferences,omitempty"` // per-leaf config
 }
 
 // DisplayName returns the server's Name, falling back to GRPCAddress if Name is empty.
@@ -136,10 +136,10 @@ func (s ServerConfig) DisplayName() string {
 
 // LeafPreferences controls which leafs a volunteer computes on a given server.
 type LeafPreferences struct {
-	Mode     string         `yaml:"mode" json:"mode"`                                // "ALL" (use defaults), "SPECIFIC", "BLOCKLIST"
-	Weights  map[string]int `yaml:"weights,omitempty" json:"weights,omitempty"`       // slug -> weight overrides
-	Enabled  []string       `yaml:"enabled,omitempty" json:"enabled,omitempty"`       // for SPECIFIC mode
-	Disabled []string       `yaml:"disabled,omitempty" json:"disabled,omitempty"`     // for BLOCKLIST mode
+	Mode     string         `yaml:"mode" json:"mode"`                             // "ALL" (use defaults), "SPECIFIC", "BLOCKLIST"
+	Weights  map[string]int `yaml:"weights,omitempty" json:"weights,omitempty"`   // slug -> weight overrides
+	Enabled  []string       `yaml:"enabled,omitempty" json:"enabled,omitempty"`   // for SPECIFIC mode
+	Disabled []string       `yaml:"disabled,omitempty" json:"disabled,omitempty"` // for BLOCKLIST mode
 }
 
 // defaultDataDir returns the default data directory (~/.lettuce/).
@@ -178,7 +178,7 @@ func Defaults() *Config {
 		Leafs: LeafFilter{
 			Mode: "ALL",
 		},
-		AvailableRuntimes:  []string{"NATIVE", "WASM"},
+		AvailableRuntimes: []string{"NATIVE", "WASM"},
 		Notifications: NotificationConfig{
 			CreditMilestones:         true,
 			CreditMilestoneThreshold: 100,
@@ -233,12 +233,14 @@ func Load(path string) (*Config, error) {
 }
 
 // Save writes the config to a YAML file, creating parent directories if needed.
+// The file is emitted with short explanatory comments on the keys volunteers most
+// often tune (see marshalCommented).
 func (c *Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)
 	}
 
-	data, err := yaml.Marshal(c)
+	data, err := c.marshalCommented()
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
@@ -247,6 +249,92 @@ func (c *Config) Save(path string) error {
 		return fmt.Errorf("writing config file: %w", err)
 	}
 	return nil
+}
+
+// marshalCommented renders the config as YAML with one-line explanatory comments
+// on the keys volunteers most often tune. A plain struct marshal carries no
+// comments, so they are regenerated on every Save and always match the current
+// schema. Comment text is stored bare: the yaml.v3 emitter prepends "# " to each
+// comment line itself.
+func (c *Config) marshalCommented() ([]byte, error) {
+	raw, err := yaml.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Content) == 1 && doc.Content[0].Kind == yaml.MappingNode {
+		root := doc.Content[0]
+		applyKeyComments(root, topLevelConfigComments)
+		applyKeyComments(childMappingNode(root, "resource_limits"), resourceLimitsComments)
+		applyKeyComments(childMappingNode(root, "thermal"), thermalComments)
+		applyKeyComments(childMappingNode(root, "scheduling"), schedulingComments)
+	}
+	return yaml.Marshal(&doc)
+}
+
+// childMappingNode returns the value node mapped to key within mapping m, or nil
+// if m is not a mapping or the key is absent.
+func childMappingNode(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// applyKeyComments sets a head comment on each present key listed in comments,
+// leaving any existing comment untouched.
+func applyKeyComments(m *yaml.Node, comments map[string]string) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		key := m.Content[i]
+		if cmt, ok := comments[key.Value]; ok && key.HeadComment == "" {
+			key.HeadComment = cmt
+		}
+	}
+}
+
+// Comment maps keyed by YAML field name. Edited alongside the struct so the
+// generated config stays self-documenting.
+var topLevelConfigComments = map[string]string{
+	"max_concurrent_tasks": "How many work units run at once - THIS is the workload throttle (the thermal thresholds are not). The buffer target scales with it.",
+	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
+	"available_runtimes":   "Runtimes this volunteer will run. NATIVE and WASM are always available; CONTAINER also needs Docker or Podman.",
+	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
+	"scheduling":           "When the volunteer runs.",
+	"thermal":              "Hardware overheating protection. Temperatures in degrees C, NOT workload limits: ALL work freezes above the pause threshold and resumes below the resume threshold.",
+}
+
+var resourceLimitsComments = map[string]string{
+	"max_cpu_cores":      "Max CPU cores a single work unit may use.",
+	"max_memory_mb":      "Memory ceiling. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
+	"max_disk_gb":        "Disk under the data dir the volunteer may use. Work is not fetched unless at least this much is free.",
+	"max_bandwidth_mbps": "Bandwidth cap in Mbps. 0 = unlimited.",
+	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. 0 disables GPU work entirely.",
+}
+
+var thermalComments = map[string]string{
+	"enabled":               "Master switch for thermal protection.",
+	"cpu_pause_threshold":   "degrees C - freeze ALL work when the CPU reaches this.",
+	"cpu_resume_threshold":  "degrees C - resume once the CPU cools below this (must be < cpu_pause_threshold).",
+	"gpu_pause_threshold":   "degrees C - freeze ALL work when the GPU reaches this.",
+	"gpu_resume_threshold":  "degrees C - resume once the GPU cools below this (must be < gpu_pause_threshold).",
+	"poll_interval_seconds": "How often temperatures are sampled, in seconds.",
+}
+
+var schedulingComments = map[string]string{
+	"mode":                "ALWAYS, WHEN_IDLE (only when the machine is idle), or SCHEDULED (time windows).",
+	"idle_threshold_mins": "WHEN_IDLE only: minutes of inactivity before work starts.",
+	"cron_expression":     "SCHEDULED only: cron expression for active windows.",
 }
 
 // Validate checks that all config values are valid.
@@ -478,6 +566,42 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 		c.Leafs.Mode = strings.ToUpper(value)
 	case "container_backend":
 		c.ContainerBackend = value
+	case "thermal.enabled":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid boolean for %s: %w", dotPath, err)
+		}
+		c.Thermal.Enabled = v
+	case "thermal.cpu_pause_threshold":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.CPUPauseThresholdC = v
+	case "thermal.cpu_resume_threshold":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.CPUResumeThresholdC = v
+	case "thermal.gpu_pause_threshold":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.GPUPauseThresholdC = v
+	case "thermal.gpu_resume_threshold":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.GPUResumeThresholdC = v
+	case "thermal.poll_interval_seconds":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.PollIntervalSeconds = v
 	default:
 		return fmt.Errorf("unknown config path: %s", dotPath)
 	}
@@ -533,6 +657,18 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return c.Leafs.Mode, nil
 	case "container_backend":
 		return c.ContainerBackend, nil
+	case "thermal.enabled":
+		return strconv.FormatBool(c.Thermal.Enabled), nil
+	case "thermal.cpu_pause_threshold":
+		return strconv.Itoa(c.Thermal.CPUPauseThresholdC), nil
+	case "thermal.cpu_resume_threshold":
+		return strconv.Itoa(c.Thermal.CPUResumeThresholdC), nil
+	case "thermal.gpu_pause_threshold":
+		return strconv.Itoa(c.Thermal.GPUPauseThresholdC), nil
+	case "thermal.gpu_resume_threshold":
+		return strconv.Itoa(c.Thermal.GPUResumeThresholdC), nil
+	case "thermal.poll_interval_seconds":
+		return strconv.Itoa(c.Thermal.PollIntervalSeconds), nil
 	default:
 		return "", fmt.Errorf("unknown config path: %s", dotPath)
 	}

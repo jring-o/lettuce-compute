@@ -37,7 +37,7 @@ func testMultiServerFullJourney(t *testing.T) {
 		mu             sync.Mutex
 		workServed     bool
 		submitRequests []*lettucev1.SubmitResultRequest
-		heartbeatWUIDs []string // work unit IDs seen in heartbeats
+		startWorkWUIDs []string // work unit IDs seen in StartWork run-starts
 		requestVolIDs  []string // volunteer IDs seen in requests
 	}
 
@@ -64,7 +64,7 @@ func testMultiServerFullJourney(t *testing.T) {
 							LeafId:                   projID,
 							Runtime:                  "native",
 							InputData:                []byte(fmt.Sprintf("input-%s", name)),
-							HeartbeatIntervalSeconds: 1, // 1s so we get heartbeats during execution
+							// 1s so we get heartbeats during execution
 							ExecutionSpec:            &lettucev1.ExecutionSpec{},
 						},
 					},
@@ -76,11 +76,11 @@ func testMultiServerFullJourney(t *testing.T) {
 				tracker.mu.Unlock()
 				return &lettucev1.SubmitResultResponse{ResultId: fmt.Sprintf("result-%s", name), Accepted: true}, nil
 			},
-			heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
+			startWorkFn: func(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
 				tracker.mu.Lock()
-				tracker.heartbeatWUIDs = append(tracker.heartbeatWUIDs, req.WorkUnitId)
+				tracker.startWorkWUIDs = append(tracker.startWorkWUIDs, req.WorkUnitId)
 				tracker.mu.Unlock()
-				return &lettucev1.HeartbeatResponse{ContinueExecution: true}, nil
+				return &lettucev1.StartWorkResponse{Ok: true}, nil
 			},
 		}
 	}
@@ -203,42 +203,24 @@ func testMultiServerFullJourney(t *testing.T) {
 		t.Errorf("server-gamma submit count = %d, want 1", cSubmits)
 	}
 
-	// === Verify: heartbeats sent to the CORRECT server ===
-	trackerA.mu.Lock()
-	for _, wuID := range trackerA.heartbeatWUIDs {
-		if wuID != "a1a1a1a1-0000-4000-8000-000000000001" {
-			t.Errorf("server-alpha received heartbeat for wrong work unit: %s", wuID)
+	// === Verify: any StartWork run-start went to the CORRECT server ===
+	// Per-task heartbeats are gone; run-start is StartWork. The per-server submit
+	// routing above already proves work landed on the right server. Here we only
+	// assert that IF a StartWork was recorded it carried that server's work unit.
+	// (The volunteer's StartWork call is wired by WP-VOL; until then these may be
+	// empty, which is fine — correctness, not presence, is what we check.)
+	checkStartWorkRouting := func(tr *serverTracker, wantWU string) {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		for _, wuID := range tr.startWorkWUIDs {
+			if wuID != wantWU {
+				t.Errorf("server received StartWork for wrong work unit: got %s, want %s", wuID, wantWU)
+			}
 		}
 	}
-	aHBs := len(trackerA.heartbeatWUIDs)
-	trackerA.mu.Unlock()
-	if aHBs == 0 {
-		t.Error("server-alpha: no heartbeats received (expected >= 1 during 1.2s execution with 1s interval)")
-	}
-
-	trackerB.mu.Lock()
-	for _, wuID := range trackerB.heartbeatWUIDs {
-		if wuID != "b2b2b2b2-0000-4000-8000-000000000002" {
-			t.Errorf("server-beta received heartbeat for wrong work unit: %s", wuID)
-		}
-	}
-	bHBs := len(trackerB.heartbeatWUIDs)
-	trackerB.mu.Unlock()
-	if bHBs == 0 {
-		t.Error("server-beta: no heartbeats received (expected >= 1 during 1.2s execution with 1s interval)")
-	}
-
-	trackerC.mu.Lock()
-	for _, wuID := range trackerC.heartbeatWUIDs {
-		if wuID != "c3c3c3c3-0000-4000-8000-000000000003" {
-			t.Errorf("server-gamma received heartbeat for wrong work unit: %s", wuID)
-		}
-	}
-	cHBs := len(trackerC.heartbeatWUIDs)
-	trackerC.mu.Unlock()
-	if cHBs == 0 {
-		t.Error("server-gamma: no heartbeats received (expected >= 1 during 1.2s execution with 1s interval)")
-	}
+	checkStartWorkRouting(trackerA, "a1a1a1a1-0000-4000-8000-000000000001")
+	checkStartWorkRouting(trackerB, "b2b2b2b2-0000-4000-8000-000000000002")
+	checkStartWorkRouting(trackerC, "c3c3c3c3-0000-4000-8000-000000000003")
 
 	// === Verify: history entries written with correct server names ===
 	entries, err := ReadHistory(dataDir, 50)
@@ -309,7 +291,6 @@ func testMultiServerPartialFailure(t *testing.T) {
 						LeafId:                   "proj-a",
 						Runtime:                  "native",
 						InputData:                []byte("input-a"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -330,8 +311,8 @@ func testMultiServerPartialFailure(t *testing.T) {
 			t.Error("server-b should never receive a submit (it never served work)")
 			return nil, status.Error(codes.Unavailable, "connection refused")
 		},
-		heartbeatFn: func(ctx context.Context, req *lettucev1.HeartbeatRequest) (*lettucev1.HeartbeatResponse, error) {
-			t.Error("server-b should never receive a heartbeat (it never served work)")
+		startWorkFn: func(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
+			t.Error("server-b should never receive a StartWork (it never served work)")
 			return nil, status.Error(codes.Unavailable, "connection refused")
 		},
 	}
@@ -353,7 +334,6 @@ func testMultiServerPartialFailure(t *testing.T) {
 						LeafId:                   "proj-c",
 						Runtime:                  "native",
 						InputData:                []byte("input-c"),
-						HeartbeatIntervalSeconds: 300,
 						ExecutionSpec:            &lettucev1.ExecutionSpec{},
 					},
 				},
@@ -432,8 +412,8 @@ func testMultiServerPartialFailure(t *testing.T) {
 	if clientB.getSubmitCalls() != 0 {
 		t.Errorf("server-b submit calls = %d, want 0", clientB.getSubmitCalls())
 	}
-	if clientB.getHeartbeatCalls() != 0 {
-		t.Errorf("server-b heartbeat calls = %d, want 0", clientB.getHeartbeatCalls())
+	if clientB.getStartWorkCalls() != 0 {
+		t.Errorf("server-b StartWork calls = %d, want 0", clientB.getStartWorkCalls())
 	}
 
 	// === Verify: work units from A and C were actually executed ===

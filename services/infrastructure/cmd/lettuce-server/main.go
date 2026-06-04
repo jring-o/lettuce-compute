@@ -15,8 +15,8 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
-	"github.com/lettuce-compute/infrastructure/internal/bootstrap"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
+	"github.com/lettuce-compute/infrastructure/internal/bootstrap"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/config"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
@@ -25,11 +25,11 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/generate"
 	"github.com/lettuce-compute/infrastructure/internal/health"
 	"github.com/lettuce-compute/infrastructure/internal/identity"
+	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/logging"
 	"github.com/lettuce-compute/infrastructure/internal/mapreduce"
 	"github.com/lettuce-compute/infrastructure/internal/montecarlo"
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
-	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
@@ -67,6 +67,12 @@ func main() {
 	// Initialize logger.
 	logger := logging.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	logging.SetDefault(logger)
+
+	// Apply the operator-tuned NoDeadline reclaim ceiling so it actually changes
+	// the deadline_seconds stamped on NoDeadline work units (eager generation, the
+	// lazy generation manager, and custom bulk upload all read this). Done before
+	// any generation path is wired so the knob is never a silent no-op.
+	generate.SetNoDeadlineCeilingSeconds(cfg.Head.EffectiveNoDeadlineCeilingSeconds())
 
 	// Load TLS config.
 	tlsCfg, err := server.LoadTLSConfig(cfg.TLS)
@@ -165,7 +171,7 @@ func main() {
 		Version:          version,
 		StartTime:        startTime,
 		CORSOrigins:      cfg.Server.CORSOrigins,
-		SigningPublicKey:  attestationSigner.PublicKey(),
+		SigningPublicKey: attestationSigner.PublicKey(),
 		AdminAPIKey:      adminAPIKey,
 		ApiKeyRepo:       apiKeyRepo,
 		ChallengeStore:   challengeStore,
@@ -210,6 +216,12 @@ func main() {
 			MaxRetryDelaySeconds:    cfg.Head.EffectiveMaxRetryDelaySeconds(),
 			RetryDelayJitterPct:     cfg.Head.EffectiveRetryDelayJitterPct(),
 			TargetRequestRatePerSec: cfg.Head.EffectiveTargetRequestRatePerSec(),
+			// Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY).
+			ReadyPoolSize:        cfg.Head.EffectiveReadyPoolSize(),
+			RefillBatchSize:      cfg.Head.EffectiveRefillBatchSize(),
+			DispatchAdmissionCap: cfg.Head.EffectiveDispatchAdmissionCap(),
+			FlushIntervalMs:      cfg.Head.EffectiveFlushIntervalMs(),
+			FlushBatchSize:       cfg.Head.EffectiveFlushBatchSize(),
 		})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
@@ -248,6 +260,12 @@ func main() {
 
 	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, logger)
 	go faultMonitor.Start(monitorCtx)
+
+	// Layer 2: start the in-process dispatch cache (refiller + async flusher +
+	// reconciler). After this, RequestWorkUnit serves reservations from the cache
+	// with zero DB I/O on the hot path and sheds with ResourceExhausted under
+	// overload. SINGLE-REPLICA ONLY — run exactly one head against one database.
+	server.StartDispatchCache(volunteerSvc, monitorCtx)
 
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	go staleVolunteerMonitor.Start(monitorCtx)

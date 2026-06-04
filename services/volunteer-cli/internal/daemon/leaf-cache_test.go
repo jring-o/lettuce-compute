@@ -282,6 +282,39 @@ func TestRefresh_CachesExecutionSpec(t *testing.T) {
 	}
 }
 
+// TestRefresh_CachesEstimatedDurationSeconds verifies the #29 per-leaf, benchmark-
+// independent duration estimate round-trips from the GetHeadInfo LeafInfo into
+// CachedLeafInfo so the volunteer can size its first batch request to a leaf.
+func TestRefresh_CachesEstimatedDurationSeconds(t *testing.T) {
+	lc := NewLeafCache(5*time.Minute, testLogger())
+
+	mc := &mockClient{
+		getHeadInfoFn: func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
+			return &lettucev1.GetHeadInfoResponse{
+				Name: "Est Head",
+				Leafs: []*lettucev1.LeafInfo{
+					{Id: "leaf-short", Slug: "short", EstimatedDurationSeconds: 12.5},
+					{Id: "leaf-none", Slug: "none"}, // no estimate -> 0
+				},
+			}, nil
+		},
+	}
+
+	if err := lc.Refresh(context.Background(), "srv-est", mc); err != nil {
+		t.Fatalf("Refresh() error: %v", err)
+	}
+	leafs := lc.GetLeafs("srv-est")
+	if len(leafs) != 2 {
+		t.Fatalf("Leafs count = %d, want 2", len(leafs))
+	}
+	if leafs[0].EstimatedDurationSeconds != 12.5 {
+		t.Errorf("EstimatedDurationSeconds = %g, want 12.5", leafs[0].EstimatedDurationSeconds)
+	}
+	if leafs[1].EstimatedDurationSeconds != 0 {
+		t.Errorf("EstimatedDurationSeconds (no estimate) = %g, want 0", leafs[1].EstimatedDurationSeconds)
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	lc := NewLeafCache(5*time.Minute, testLogger())
 

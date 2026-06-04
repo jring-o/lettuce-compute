@@ -16,7 +16,7 @@ type FaultMonitor struct {
 	workUnitRepo   workunit.WorkUnitRepository
 	assignRepo     assignment.Repository
 	checkpointRepo checkpoint.Repository
-	leafRepo    leaf.Repository
+	leafRepo       leaf.Repository
 	logger         *slog.Logger
 	scanInterval   time.Duration
 	batchSize      int
@@ -34,7 +34,7 @@ func NewFaultMonitor(
 		workUnitRepo:   workUnitRepo,
 		assignRepo:     assignRepo,
 		checkpointRepo: checkpointRepo,
-		leafRepo:    leafRepo,
+		leafRepo:       leafRepo,
 		logger:         logger,
 		scanInterval:   30 * time.Second,
 		batchSize:      100,
@@ -120,54 +120,58 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 		}
 	}
 
-	// Find and process abandoned work units (missed heartbeats).
-	abandoned, err := m.workUnitRepo.FindAbandonedWorkUnits(ctx, m.batchSize)
-	if err != nil {
-		return err
-	}
-	for _, wu := range abandoned {
-		if _, err := m.workUnitRepo.TransitionToExpired(ctx, wu.ID); err != nil {
-			m.logger.Error("failed to expire abandoned work unit", "work_unit_id", wu.ID, "error", err)
-			continue
-		}
+	// The heartbeat-based abandoned sweep (FindAbandonedWorkUnits) is removed:
+	// per-task heartbeats no longer exist and liveness is deadline-based. ASSIGNED
+	// orphans (a volunteer that vanished after StartWork) are now covered by the
+	// deadline sweep above (FindExpiredWorkUnits includes ASSIGNED units).
 
-		// Update assignment history.
-		if wu.AssignedVolunteerID != nil {
-			m.updateAssignmentOutcome(ctx, wu, assignment.OutcomeAbandoned)
-		}
-
-		m.logger.Warn("work unit abandoned",
-			"work_unit_id", wu.ID,
-			"volunteer_id", wu.AssignedVolunteerID,
-			"last_heartbeat_at", wu.LastHeartbeatAt,
-		)
-
-		// Reassign or fail the abandoned work unit.
-		updated, requeued, err := m.workUnitRepo.Reassign(ctx, wu.ID)
-		if err != nil {
-			m.logger.Error("failed to reassign abandoned work unit", "work_unit_id", wu.ID, "error", err)
-			continue
-		}
-		if requeued {
-			// Log checkpoint preservation on reassignment.
-			if wu.LastCheckpointSequence > 0 {
-				m.logger.Info("checkpoint preserved for reassignment",
-					"work_unit_id", wu.ID,
-					"checkpoint_sequence", wu.LastCheckpointSequence,
-					"last_checkpoint_at", wu.LastCheckpointAt,
-				)
-			}
-			m.logger.Info("work unit reassigned", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
-		} else {
-			m.logger.Warn("work unit failed after max reassignments", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
-			// Clean up checkpoints for failed work units.
-			m.cleanupCheckpoint(ctx, wu)
-		}
+	// Lapsed-reservation sweep (#22 lapsed-lease reclaim gap). A buffered (reserved)
+	// unit stays QUEUED with reserved_until set; if its holder vanished before
+	// run-start (a client that buffered work then died, or a head crash that flushed
+	// a reservation whose in-memory owner is gone), the lease lapses but neither the
+	// deadline sweep nor the (removed) heartbeat sweep would ever touch it — both scan
+	// only ASSIGNED/RUNNING. With per-task heartbeats gone and lease-renewal retired,
+	// this sweep is the load-bearing dead-holder reclaim for never-started buffered
+	// units. Clearing the reservation leaves the unit QUEUED and immediately
+	// re-stageable by the dispatch cache — no expire/reassign is needed.
+	if err := m.reclaimLapsedReservations(ctx); err != nil {
+		m.logger.Error("lapsed-reservation sweep failed", "error", err)
 	}
 
 	// Check for stale checkpoints across all running work units with checkpointing enabled.
 	m.checkStaleCheckpoints(ctx)
 
+	return nil
+}
+
+// reclaimLapsedReservations clears the reservation columns on still-QUEUED units
+// whose buffer lease has lapsed, so they are immediately re-stageable. See the
+// call site in ScanOnce for why this is load-bearing post-heartbeat-removal.
+func (m *FaultMonitor) reclaimLapsedReservations(ctx context.Context) error {
+	lapsed, err := m.workUnitRepo.FindLapsedReservations(ctx, m.batchSize)
+	if err != nil {
+		return err
+	}
+	for _, wu := range lapsed {
+		if wu.ReservedVolunteerID == nil {
+			// Defensive: FindLapsedReservations only returns reserved units, but a
+			// concurrent ClearReservation could have raced. Skip cleanly.
+			continue
+		}
+		if _, err := m.workUnitRepo.ClearReservation(ctx, wu.ID, *wu.ReservedVolunteerID); err != nil {
+			// A concurrent run-start (Assign) or another monitor pass may have already
+			// cleared/flipped it; that is benign — the unit is no longer a stranded
+			// lapsed reservation either way.
+			m.logger.Debug("failed to clear lapsed reservation (likely raced)",
+				"work_unit_id", wu.ID, "error", err)
+			continue
+		}
+		m.logger.Info("lapsed reservation reclaimed",
+			"work_unit_id", wu.ID,
+			"reserved_volunteer_id", wu.ReservedVolunteerID,
+			"reserved_until", wu.ReservedUntil,
+		)
+	}
 	return nil
 }
 

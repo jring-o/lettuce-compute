@@ -395,7 +395,7 @@ the only one you should actively calibrate is `target_request_rate_per_sec`.
 
 | Key (env) | Default | What it does |
 |-----------|---------|--------------|
-| `max_batch_per_request` (`LETTUCE_HEAD_MAX_BATCH_PER_REQUEST`) | `8` | Max work units one work request may return (the server-side batch cap). |
+| `max_batch_per_request` (`LETTUCE_HEAD_MAX_BATCH_PER_REQUEST`) | `64` | Safety ceiling on how many work units one work request may return. This is a cap, not the limiter — the actual batch is sized by each volunteer's work-buffer deficit and per-unit duration estimate. |
 | `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max units (running + buffered/reserved) one volunteer may hold. Also caps how deep a volunteer's hours-based work buffer can fill. |
 | `min_retry_delay_seconds` (`LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS`) | `30` | Server-directed retry delay handed out when quiet. Stamped on **every** reply (including no-work); volunteers must obey it. |
 | `max_retry_delay_seconds` (`LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS`) | `900` | Retry delay under full load. Must stay below the 1800s stale-volunteer threshold (validated at startup). |
@@ -408,6 +408,63 @@ port: with it set, volunteers behind your reverse proxy are bucketed per real
 client IP (and per authenticated key) rather than sharing one proxy-IP bucket.
 The per-pubkey limiter sits *after* auth, so it does not shed
 signature-verification cost — the per-IP ceiling is the only pre-auth layer.
+
+### Dispatch cache (and why you run exactly ONE head)
+
+To keep Postgres off the work-request hot path, the head serves assignments from
+an **in-process dispatch cache**: a background refiller bulk-fetches queued units
+into memory, work requests are answered from that in-memory pool (no database
+round-trip on the hot path), and the resulting reservations are written back to
+Postgres asynchronously in batches. Under sustained overload the head serves from
+the cache until it empties, then **sheds** — it returns a fast "back off and retry"
+to volunteers (which obey a short local backoff) instead of letting database
+connections pile up. Run-start is an explicit step (the volunteer tells the head a
+buffered unit has begun executing), and **liveness is deadline-based**: a unit not
+submitted by its deadline is reassigned, and a buffered unit not started before its
+reservation lapses is reclaimed. There are no per-task heartbeats.
+
+> **⚠️ Run exactly ONE head replica.** The dispatch cache is an in-process ledger
+> that assumes a single writer owns "which queued unit is offered to whom." Two head
+> processes pointed at the same database would each refill independently and **hand
+> the same work unit to two volunteers** — a correctness bug, not just wasted work.
+> Do **not** run multiple head replicas against one database. Horizontal scale-out
+> (multiple coordinating replicas) is a planned later layer, not supported today.
+> Note that browser/WASM units are dispatched by a separate immediate-assign path,
+> partitioned from the cache by runtime, so within a single replica there is exactly
+> one writer per unit — but this partition does **not** make multiple replicas safe.
+
+These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `ready_pool_size` (`LETTUCE_HEAD_READY_POOL_SIZE`) | `2000` | Max pre-fetched queued units held in memory for hand-out. |
+| `refill_batch_size` (`LETTUCE_HEAD_REFILL_BATCH_SIZE`) | `500` | How many units one bulk refill pulls from Postgres. |
+| `dispatch_admission_cap` (`LETTUCE_HEAD_DISPATCH_ADMISSION_CAP`) | `MaxConns/2` | Bounds concurrent dispatch-cache database operations (refill, flush, run-start) so they cannot saturate the pool. |
+| `flush_interval_ms` (`LETTUCE_HEAD_FLUSH_INTERVAL_MS`) | `100` | How often buffered reservation writes are flushed to Postgres. |
+| `flush_batch_size` (`LETTUCE_HEAD_FLUSH_BATCH_SIZE`) | `200` | Flush early once this many reservation writes are pending. |
+| `no_deadline_ceiling_seconds` (`LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS`) | `21600` (6h) | Reclaim ceiling applied to no-deadline leafs so a unit on a vanished volunteer is always reclaimed (this is a *deadline*, not a lease, so it is intentionally not bound by the 1800s stale-volunteer threshold). The value is stamped into each no-deadline unit's `deadline_seconds` **at generation time**, so lowering it tightens reclaim for newly generated units; units generated under the old value keep it. Lower it if you need tighter reclaim for no-deadline work; or set a real deadline on the leaf. |
+
+> **"Inactive" ≠ "gone" for long-run volunteers.** With per-task heartbeats removed,
+> a volunteer steadily running long buffered units may go more than 30 minutes
+> without any RPC and show as `inactive` in the dashboard while perfectly healthy.
+> This is cosmetic — `inactive` does **not** stop a volunteer from being handed work.
+
+#### Redundancy and the dispatch cache
+
+> **Redundancy > 1 is not dispatched to two volunteers *concurrently* today.** A
+> work unit has a single state column. When a volunteer run-starts a buffered unit,
+> the head flips it `QUEUED → ASSIGNED`, and both the dispatch cache's refill and the
+> direct database find offer **only `QUEUED`** units. So once the first holder starts
+> running, that unit leaves the dispatchable set: the head will not hand the *same*
+> unit to a second distinct volunteer at the same time.
+>
+> Redundant corroboration still happens, but **serially** — a redundant copy is
+> produced when a unit is reassigned (its deadline lapses, or the holder abandons it)
+> and re-queued to a different volunteer, whose result is checked against the first.
+> If you set `redundancy_factor > 1` expecting two volunteers to crunch the same unit
+> in parallel and cross-check immediately, that is **not** what happens; you get
+> sequential re-validation on reassignment instead. True concurrent redundant dispatch
+> needs a per-volunteer dispatch table and arrives in a later layer.
 
 ### Back up
 

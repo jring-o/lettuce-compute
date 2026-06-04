@@ -93,7 +93,16 @@ func (m *mockWURepo) UpdateHeartbeat(ctx context.Context, id types.ID) error { r
 func (m *mockWURepo) FindExpiredWorkUnits(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWURepo) FindAbandonedWorkUnits(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
+func (m *mockWURepo) FindLapsedReservations(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation) ([]types.ID, error) {
+	return nil, nil
+}
+func (m *mockWURepo) CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *mockWURepo) TransitionToExpired(ctx context.Context, id types.ID) (*workunit.WorkUnit, error) {

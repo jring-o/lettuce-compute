@@ -23,7 +23,7 @@ const (
 	VolunteerService_RegisterVolunteer_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/RegisterVolunteer"
 	VolunteerService_RequestWorkUnit_FullMethodName   = "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"
 	VolunteerService_SubmitResult_FullMethodName      = "/lettuce.volunteer.v1.VolunteerService/SubmitResult"
-	VolunteerService_Heartbeat_FullMethodName         = "/lettuce.volunteer.v1.VolunteerService/Heartbeat"
+	VolunteerService_StartWork_FullMethodName         = "/lettuce.volunteer.v1.VolunteerService/StartWork"
 	VolunteerService_GetWorkUnitStatus_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/GetWorkUnitStatus"
 	VolunteerService_GetHeadInfo_FullMethodName       = "/lettuce.volunteer.v1.VolunteerService/GetHeadInfo"
 	VolunteerService_SaveCheckpoint_FullMethodName    = "/lettuce.volunteer.v1.VolunteerService/SaveCheckpoint"
@@ -50,10 +50,14 @@ type VolunteerServiceClient interface {
 	// Submit result for a completed work unit.
 	// Includes output data and execution metadata.
 	SubmitResult(ctx context.Context, in *SubmitResultRequest, opts ...grpc.CallOption) (*SubmitResultResponse, error)
-	// Send heartbeat during work unit execution.
-	// Must be called at leaf's configured interval (default: 5 min).
-	// Missing heartbeats trigger work unit abandonment.
-	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// Mark a buffered (reserved) work unit as run-started. Called when a volunteer
+	// slot actually begins executing a unit pulled from its client work buffer.
+	// Performs the QUEUED -> ASSIGNED run-start transition (clears the reservation
+	// column, writes the active assignment history row, starts the deadline clock).
+	// Liveness is deadline-based: there are no per-task heartbeats. A unit not
+	// submitted by its deadline is reassigned; a reserved unit whose reservation
+	// window lapses before StartWork is reclaimed.
+	StartWork(ctx context.Context, in *StartWorkRequest, opts ...grpc.CallOption) (*StartWorkResponse, error)
 	// Query status of a specific work unit.
 	GetWorkUnitStatus(ctx context.Context, in *GetWorkUnitStatusRequest, opts ...grpc.CallOption) (*GetWorkUnitStatusResponse, error)
 	// Get head identity and active leaf discovery info.
@@ -115,10 +119,10 @@ func (c *volunteerServiceClient) SubmitResult(ctx context.Context, in *SubmitRes
 	return out, nil
 }
 
-func (c *volunteerServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+func (c *volunteerServiceClient) StartWork(ctx context.Context, in *StartWorkRequest, opts ...grpc.CallOption) (*StartWorkResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(HeartbeatResponse)
-	err := c.cc.Invoke(ctx, VolunteerService_Heartbeat_FullMethodName, in, out, cOpts...)
+	out := new(StartWorkResponse)
+	err := c.cc.Invoke(ctx, VolunteerService_StartWork_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -194,10 +198,14 @@ type VolunteerServiceServer interface {
 	// Submit result for a completed work unit.
 	// Includes output data and execution metadata.
 	SubmitResult(context.Context, *SubmitResultRequest) (*SubmitResultResponse, error)
-	// Send heartbeat during work unit execution.
-	// Must be called at leaf's configured interval (default: 5 min).
-	// Missing heartbeats trigger work unit abandonment.
-	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// Mark a buffered (reserved) work unit as run-started. Called when a volunteer
+	// slot actually begins executing a unit pulled from its client work buffer.
+	// Performs the QUEUED -> ASSIGNED run-start transition (clears the reservation
+	// column, writes the active assignment history row, starts the deadline clock).
+	// Liveness is deadline-based: there are no per-task heartbeats. A unit not
+	// submitted by its deadline is reassigned; a reserved unit whose reservation
+	// window lapses before StartWork is reclaimed.
+	StartWork(context.Context, *StartWorkRequest) (*StartWorkResponse, error)
 	// Query status of a specific work unit.
 	GetWorkUnitStatus(context.Context, *GetWorkUnitStatusRequest) (*GetWorkUnitStatusResponse, error)
 	// Get head identity and active leaf discovery info.
@@ -231,8 +239,8 @@ func (UnimplementedVolunteerServiceServer) RequestWorkUnit(context.Context, *Req
 func (UnimplementedVolunteerServiceServer) SubmitResult(context.Context, *SubmitResultRequest) (*SubmitResultResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitResult not implemented")
 }
-func (UnimplementedVolunteerServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+func (UnimplementedVolunteerServiceServer) StartWork(context.Context, *StartWorkRequest) (*StartWorkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartWork not implemented")
 }
 func (UnimplementedVolunteerServiceServer) GetWorkUnitStatus(context.Context, *GetWorkUnitStatusRequest) (*GetWorkUnitStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetWorkUnitStatus not implemented")
@@ -342,20 +350,20 @@ func _VolunteerService_SubmitResult_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolunteerService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(HeartbeatRequest)
+func _VolunteerService_StartWork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartWorkRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(VolunteerServiceServer).Heartbeat(ctx, in)
+		return srv.(VolunteerServiceServer).StartWork(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: VolunteerService_Heartbeat_FullMethodName,
+		FullMethod: VolunteerService_StartWork_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(VolunteerServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+		return srv.(VolunteerServiceServer).StartWork(ctx, req.(*StartWorkRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -474,8 +482,8 @@ var VolunteerService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _VolunteerService_SubmitResult_Handler,
 		},
 		{
-			MethodName: "Heartbeat",
-			Handler:    _VolunteerService_Heartbeat_Handler,
+			MethodName: "StartWork",
+			Handler:    _VolunteerService_StartWork_Handler,
 		},
 		{
 			MethodName: "GetWorkUnitStatus",

@@ -25,6 +25,14 @@ type profileKind string
 const (
 	profileNaive    profileKind = "naive"
 	profileBuffered profileKind = "buffered"
+	// profileOverload is the Layer 2 saturation driver: a hot RequestWorkUnit
+	// loop with NO inter-request delay that ignores the server-directed retry
+	// delay entirely, so a fleet larger than the head's dispatch ceiling pins the
+	// hot path at saturation. It is how the simulator measures the single-head
+	// ceiling and proves the head sheds gracefully (ResourceExhausted) instead of
+	// collapsing the DB pool. Unlike naive (a pre-Layer-1 client at a fixed
+	// interval), overload never sleeps between RequestWorkUnit calls.
+	profileOverload profileKind = "overload"
 )
 
 // simConfig is the resolved, immutable configuration shared by every simulated
@@ -39,6 +47,13 @@ type simConfig struct {
 	simFpops      float64       // pretend benchmark FLOPS; pretend-compute = rsc_fpops_est/simFpops
 	maxCompute    time.Duration // cap on pretend-compute so the run progresses
 	logger        *slog.Logger
+
+	// honorShed controls the overload profile's reaction to a graceful shed
+	// (codes.ResourceExhausted). When true the volunteer backs off like a real
+	// client; when false (the default ceiling-run setting) it ignores the shed and
+	// immediately re-requests, which is the maximal pressure the head can face and
+	// the cleanest way to read the dispatch ceiling and confirm no pool collapse.
+	honorShed bool
 }
 
 // heldUnit is a reserved-but-not-yet-run descriptor in the buffered profile's
@@ -154,8 +169,50 @@ func (v *simVolunteer) run(ctx context.Context) {
 	switch v.cfg.profile {
 	case profileBuffered:
 		v.runBuffered(ctx)
+	case profileOverload:
+		v.runOverload(ctx)
 	default:
 		v.runNaive(ctx)
+	}
+}
+
+// runOverload is the Layer 2 saturation driver. It loops RequestWorkUnit
+// (MaxAssignments=1) with NO inter-request delay and IGNORES the server-directed
+// retry delay entirely, so a fleet larger than the head's dispatch ceiling pins
+// the hot path at maximum request pressure. It is the harness for the Layer 2
+// Definition of Done: the single-head dispatch ceiling (peak dispatch/sec) and
+// graceful shedding (ResourceExhausted shed-ratio > 0, NO DeadlineExceeded /
+// Unavailable pool collapse).
+//
+// Each returned unit is run-started (StartWork) and submitted to keep the
+// dispatch pipeline flowing (so the head's reservation cache actually recycles
+// units rather than draining once). When the head sheds with ResourceExhausted
+// the volunteer normally ignores it and immediately re-requests (the worst-case
+// pressure); set --honor-shed to make it back off like a real client instead.
+func (v *simVolunteer) runOverload(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		assigns, _, ok := v.requestWork(ctx, 1)
+		if ok {
+			for _, a := range assigns {
+				v.pretendComputeAndSubmit(ctx, a)
+				if ctx.Err() != nil {
+					return
+				}
+			}
+			// Got work: immediately ask again (no delay) to keep the pressure on.
+			continue
+		}
+		// No work or a shed/error. By default keep hammering with no delay to
+		// hold the hot path at saturation; --honor-shed backs off like a real
+		// client so the head's steady-state pacing can be observed instead.
+		if v.cfg.honorShed {
+			if !v.sleepUntil(ctx, time.Now().Add(time.Duration(v.resourceExhaustedBackoff())*time.Second)) {
+				return
+			}
+		}
 	}
 }
 
@@ -191,13 +248,14 @@ func (v *simVolunteer) runNaive(ctx context.Context) {
 // buffer by running (pretend-compute) and submitting units. ResourceExhausted
 // is treated as a fixed jittered local backoff.
 //
-// NOTE: in the real volunteer a buffered unit's reservation lease
-// (reserved_until) is kept alive by PREPARING heartbeats — the head bumps
-// reserved_until on each — so there is no separate renewal RPC. This load
-// simulator drains each buffered unit within a single loop iteration (well
-// inside lease_seconds) and does not model PREPARING heartbeats, so it never
-// needs to renew a lease; the reservedUntil field is carried purely so the
-// drain order can be lease-aware if a future profile holds units longer.
+// NOTE: with Layer 2 a buffered unit's reservation lease (reserved_until) is
+// sized once at hand-out and is NOT renewed mid-buffer — the per-task Heartbeat
+// RPC and its PREPARING lease-renewal are gone. The deadline clock starts only
+// at run-start (StartWork), so buffer dwell is not charged against the deadline.
+// This load simulator drains each buffered unit within a single loop iteration
+// (well inside the lease window), so it never needs to renew; the reservedUntil
+// field is carried purely so a future profile that holds units longer can drain
+// in lease order.
 func (v *simVolunteer) runBuffered(ctx context.Context) {
 	var nextContact time.Time
 	for {
@@ -241,8 +299,8 @@ func (v *simVolunteer) runBuffered(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			// Run-start (RUNNING heartbeat) flips the reserved QUEUED unit to
-			// ASSIGNED and creates its assignment_history row, then submit.
+			// Run-start (StartWork) flips the reserved QUEUED unit to ASSIGNED and
+			// creates its assignment_history row, then submit.
 			v.runAndSubmit(ctx, h.id)
 		} else if time.Now().Before(nextContact) {
 			if !v.sleepUntil(ctx, nextContact) {
@@ -267,11 +325,14 @@ func (v *simVolunteer) requestWork(ctx context.Context, maxAssign int32) ([]*let
 	resp, err := v.cl.RequestWorkUnit(ctx, req)
 	dur := time.Since(start)
 	if err != nil {
-		if status.Code(err) == codes.ResourceExhausted {
-			v.m.record(rpcRequestWorkUnit, dur, outcomeThrottled)
+		// Classify the failure: ResourceExhausted is the graceful shed (record it
+		// and surface a fixed local backoff); DeadlineExceeded/Unavailable is the
+		// pool-collapse signal Layer 2 must avoid; anything else is a plain error.
+		outcome := outcomeFor(err)
+		v.m.record(rpcRequestWorkUnit, dur, outcome)
+		if outcome == outcomeThrottled {
 			return nil, v.resourceExhaustedBackoff(), false
 		}
-		v.m.record(rpcRequestWorkUnit, dur, outcomeError)
 		return nil, 0, false
 	}
 	v.m.record(rpcRequestWorkUnit, dur, outcomeOK)
@@ -298,12 +359,11 @@ func (v *simVolunteer) pretendComputeAndSubmit(ctx context.Context, a *lettucev1
 // runAndSubmit models the run-start flow before submitting. A dispatched unit is
 // only RESERVED (state=QUEUED) — it has no active assignment_history row, so a
 // bare SubmitResult fails the head's precondition with FailedPrecondition
-// "no active assignment". The real volunteer's first RUNNING heartbeat flips the
-// reserved unit QUEUED->ASSIGNED and creates that history row (the run-start
-// transition in the Heartbeat handler); only then can the result be submitted.
-// This mirrors that: send one RUNNING heartbeat to start the run, and submit only
-// if the head confirms the unit is live (ContinueExecution=true). If the head
-// says the unit is no longer active (reservation lapsed / reclaimed), drop it
+// "no active assignment". A real volunteer calls StartWork to flip the reserved
+// unit QUEUED->ASSIGNED and create that history row (the relocated run-start);
+// only then can the result be submitted. This mirrors that: call StartWork to
+// start the run, and submit only if the head confirms the unit is live (ok=true).
+// If the head says the unit is no longer reserved (lapsed / reclaimed), drop it
 // without submitting.
 func (v *simVolunteer) runAndSubmit(ctx context.Context, wuID string) {
 	if !v.startRun(ctx, wuID) {
@@ -315,22 +375,20 @@ func (v *simVolunteer) runAndSubmit(ctx context.Context, wuID string) {
 	v.submitResult(ctx, wuID)
 }
 
-// startRun sends the RUNNING heartbeat that flips a reserved (QUEUED) unit to
-// ASSIGNED at run-start, satisfying SubmitResult's active-assignment precondition.
-// Returns true if the unit is live and the result may be submitted.
+// startRun calls StartWork, which flips a reserved (QUEUED) unit to ASSIGNED at
+// run-start, satisfying SubmitResult's active-assignment precondition. Returns
+// true if the unit is live and the result may be submitted.
 func (v *simVolunteer) startRun(ctx context.Context, wuID string) bool {
 	start := time.Now()
-	resp, err := v.cl.Heartbeat(ctx, &lettucev1.HeartbeatRequest{
+	resp, err := v.cl.StartWork(ctx, &lettucev1.StartWorkRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: v.id,
-		Status:      "RUNNING",
-		ProgressPct: 1.0,
 	})
-	v.m.record(rpcHeartbeat, time.Since(start), outcomeFor(err))
+	v.m.record(rpcStartWork, time.Since(start), outcomeFor(err))
 	if err != nil {
 		return false
 	}
-	return resp.GetContinueExecution()
+	return resp.GetOk()
 }
 
 func (v *simVolunteer) submitResult(ctx context.Context, wuID string) {
@@ -476,10 +534,19 @@ func outcomeFor(err error) rpcOutcome {
 	if err == nil {
 		return outcomeOK
 	}
-	if status.Code(err) == codes.ResourceExhausted {
+	switch status.Code(err) {
+	case codes.ResourceExhausted:
+		// Graceful shed: the Layer 2 admission cap or the Layer 0 per-client rate
+		// limiter. The DESIRED overload behavior.
 		return outcomeThrottled
+	case codes.DeadlineExceeded, codes.Unavailable:
+		// DB-pool congestion collapse: the head's per-request DB touch timed out
+		// ("context deadline exceeded") or the head became unavailable under load.
+		// Layer 2 must keep this at zero under overload by shedding first.
+		return outcomeCollapse
+	default:
+		return outcomeError
 	}
-	return outcomeError
 }
 
 // errNotRegistered is returned when a volunteer fails to register.
