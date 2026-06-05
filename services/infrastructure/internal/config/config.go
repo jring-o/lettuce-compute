@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/url"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Config is the top-level configuration for the Lettuce infrastructure server.
@@ -26,6 +28,35 @@ type HeadConfig struct {
 	URL                     string         `yaml:"url"`
 	DefaultLeafWeights      map[string]int `yaml:"default_leaf_weights"`
 	MaxInflightPerVolunteer int            `yaml:"max_inflight_per_volunteer"`
+
+	// --- Layer 3: horizontal scale-out (N stateless replicas, one Postgres) ---
+
+	// InstanceID is this head replica's stable identity. It is the dispatch-claim
+	// owner (dispatch_claimed_by), the leadership log field, and a log dimension.
+	// EMPTY by default: when empty, a process-stable uuid is generated once at
+	// boot via EffectiveInstanceID. Each replica MUST have a distinct value — do
+	// NOT hardcode the same id across replicas (it would collide claim ownership).
+	// Override via LETTUCE_HEAD_INSTANCE_ID.
+	InstanceID string `yaml:"instance_id"`
+	// RedisURL points at a shared Redis used as the cross-replica replay store and
+	// (optionally) the shared rate-limit store. EMPTY by default: when empty the
+	// head uses an in-process replay cache and in-process rate-limit buckets
+	// (single-replica behavior). Required for N>1 replicas. Override via
+	// LETTUCE_REDIS_URL.
+	RedisURL string `yaml:"redis_url"`
+	// ReplayFailMode controls behavior when the shared replay store errors (e.g. a
+	// Redis outage): "open" admits the request (favoring fleet availability and not
+	// losing completed compute on SubmitResult) with a loud alarm; "closed" rejects
+	// it (favoring strict replay protection). Default "open". Override via
+	// LETTUCE_REPLAY_FAIL_MODE.
+	ReplayFailMode string `yaml:"replay_fail_mode"`
+	// ClaimLeaseSeconds is how long a per-head dispatch claim is held before it
+	// expires and the unit becomes re-claimable by any replica. The claim of an
+	// actively-held unit is renewed every flush tick, so this is a backstop for a
+	// crashed/wedged replica, not the steady-state lifetime. Default 120. Validated
+	// against the flush cadence and the volunteer lease (see Validate). Override via
+	// LETTUCE_HEAD_CLAIM_LEASE_SECONDS.
+	ClaimLeaseSeconds int `yaml:"claim_lease_seconds"`
 
 	// --- Layer 1: work batching, server-directed retry delay, buffer lease ---
 
@@ -50,13 +81,15 @@ type HeadConfig struct {
 	// the 30-min stale threshold. Default 900 (15 min).
 	LeaseSeconds int `yaml:"lease_seconds"`
 
-	// --- Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY) ---
+	// --- Layer 2: in-process dispatch cache (per-replica, claim-coordinated) ---
 	//
 	// The dispatch cache serves RequestWorkUnit from an in-memory pool bulk-refilled
 	// from Postgres, flushing reservations asynchronously, so the DB is off the
-	// hot path. It assumes ONE head process owns dispatch: two replicas would each
-	// refill independently and double-hand the same QUEUED unit. Run exactly one
-	// head replica until Layer 3 adds shared dispatch ownership.
+	// hot path. Each replica runs its OWN cache: Layer 3 makes this safe under N
+	// replicas because the refill claims units on its head instance id (claim-on-
+	// refill), so two replicas never double-hand the same QUEUED unit. With no head
+	// instance id configured the refill is claim-free, which is correct for a single
+	// replica.
 
 	// ReadyPoolSize bounds the in-memory pool of pre-fetched, ready-to-assign QUEUED
 	// units. Default 2000.
@@ -113,6 +146,17 @@ const (
 	defaultFlushIntervalMs          = 100
 	defaultFlushBatchSize           = 200
 	defaultNoDeadlineCeilingSeconds = 21600 // 6h
+
+	// --- Layer 3 scale-out defaults ---
+	defaultClaimLeaseSeconds = 120
+	// minClaimLeaseFloorMs is the absolute lower bound (ms) on the dispatch-claim
+	// lease so it always vastly exceeds worst-case flush lag even if the flusher is
+	// briefly starved under shedding.
+	minClaimLeaseFloorMs = 5000
+	// replayFailModeOpen / replayFailModeClosed are the two valid replay_fail_mode
+	// values.
+	replayFailModeOpen   = "open"
+	replayFailModeClosed = "closed"
 )
 
 // Validate checks HeadConfig for required fields and valid values.
@@ -189,6 +233,47 @@ func (h HeadConfig) Validate() error {
 	// NOT bound by the 30-min stale threshold (a 6h reclaim ceiling is valid).
 	if h.NoDeadlineCeilingSeconds < 0 {
 		return fmt.Errorf("head.no_deadline_ceiling_seconds must be >= 0, got %d", h.NoDeadlineCeilingSeconds)
+	}
+
+	// --- Layer 3 scale-out validation ---
+
+	// InstanceID is optional; if set it must parse as a UUID so it is a valid
+	// claim owner / log identity.
+	if h.InstanceID != "" {
+		if _, err := uuid.Parse(h.InstanceID); err != nil {
+			return fmt.Errorf("head.instance_id must be a valid UUID, got %q: %w", h.InstanceID, err)
+		}
+	}
+	if h.ReplayFailMode != "" && h.ReplayFailMode != replayFailModeOpen && h.ReplayFailMode != replayFailModeClosed {
+		return fmt.Errorf("head.replay_fail_mode must be %q or %q, got %q", replayFailModeOpen, replayFailModeClosed, h.ReplayFailMode)
+	}
+	if h.ClaimLeaseSeconds < 0 {
+		return fmt.Errorf("head.claim_lease_seconds must be >= 0, got %d", h.ClaimLeaseSeconds)
+	}
+	// Enforce the design floors so a claim never expires while its unit is
+	// actively held. These compare the EFFECTIVE (defaulted) values, not the raw
+	// fields, because an unset claim_lease_seconds still resolves to a concrete
+	// 120s lease that must satisfy the invariants — e.g. a small explicit
+	// lease_seconds with claim_lease_seconds=0 (default 120) would otherwise
+	// silently violate "claim lease < reservation lease":
+	//   * the lease must vastly exceed worst-case flush lag (>= max(10*flush, 5s)),
+	//     so flush-renewal extends it long before expiry, and
+	//   * the lease must stay below the volunteer reservation lease so a stranded
+	//     dispatch claim can never outlive the unit's reservation window.
+	effClaimLease := h.EffectiveClaimLeaseSeconds()
+	leaseMs := effClaimLease * 1000
+	flushMs := h.EffectiveFlushIntervalMs()
+	floorMs := 10 * flushMs
+	if floorMs < minClaimLeaseFloorMs {
+		floorMs = minClaimLeaseFloorMs
+	}
+	if leaseMs < floorMs {
+		return fmt.Errorf("head.claim_lease_seconds (effective %d) is too short: must be >= %d ms (max(10*flush_interval_ms, %d))",
+			effClaimLease, floorMs, minClaimLeaseFloorMs)
+	}
+	if effClaimLease >= h.EffectiveLeaseSeconds() {
+		return fmt.Errorf("head.claim_lease_seconds (effective %d) must be < lease_seconds (effective %d)",
+			effClaimLease, h.EffectiveLeaseSeconds())
 	}
 	return nil
 }
@@ -309,6 +394,45 @@ func (h HeadConfig) EffectiveNoDeadlineCeilingSeconds() int {
 		return defaultNoDeadlineCeilingSeconds
 	}
 	return h.NoDeadlineCeilingSeconds
+}
+
+// EffectiveInstanceID returns this head replica's stable identity as a types.ID
+// (uuid). When InstanceID is configured it is parsed and returned; otherwise a
+// fresh uuid is generated. Generate ONCE at boot and reuse the result — calling
+// this repeatedly with an unset InstanceID yields different ids each time.
+func (h HeadConfig) EffectiveInstanceID() uuid.UUID {
+	if h.InstanceID != "" {
+		// Validate has already verified this parses; ignore the error here and
+		// fall back to a generated id on the impossible parse failure.
+		if id, err := uuid.Parse(h.InstanceID); err == nil {
+			return id
+		}
+	}
+	return uuid.New()
+}
+
+// EffectiveReplayFailMode returns the configured replay-store failure policy,
+// defaulting to "open" (admit on store error, favoring availability).
+func (h HeadConfig) EffectiveReplayFailMode() string {
+	if h.ReplayFailMode == "" {
+		return replayFailModeOpen
+	}
+	return h.ReplayFailMode
+}
+
+// ReplayFailsOpen reports whether a replay-store error should admit the request
+// (fail open) rather than reject it (fail closed).
+func (h HeadConfig) ReplayFailsOpen() bool {
+	return h.EffectiveReplayFailMode() == replayFailModeOpen
+}
+
+// EffectiveClaimLeaseSeconds returns the per-head dispatch-claim lease window in
+// seconds, default 120.
+func (h HeadConfig) EffectiveClaimLeaseSeconds() int {
+	if h.ClaimLeaseSeconds <= 0 {
+		return defaultClaimLeaseSeconds
+	}
+	return h.ClaimLeaseSeconds
 }
 
 // StorageConfig defines local filesystem storage settings.

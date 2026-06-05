@@ -138,6 +138,22 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 		m.logger.Error("lapsed-reservation sweep failed", "error", err)
 	}
 
+	// Layer 3 dispatch-claim HYGIENE sweep. A crashed replica leaves its claimed
+	// units QUEUED with a live claim it can no longer renew/release; once the
+	// flusher stops renewing, the claim expires and the unit is ALREADY re-claimable
+	// by any survivor's refill (the claim WHERE-term treats an expired claim as
+	// claimable) — passive expiry is the reclaim guarantee, NOT this sweep. This
+	// sweep only NULLs the now-meaningless expired-claim columns to keep the table
+	// tidy and observable. It is leader-gated (this whole monitor runs on the leader
+	// replica only), so during the bounded ≤15s leaderless window after a leader
+	// crash no replica actively NULLs expired claims, but passive re-claim needs no
+	// sweep, so dispatch is unaffected.
+	if cleared, err := m.workUnitRepo.ClearExpiredDispatchClaims(ctx); err != nil {
+		m.logger.Error("expired dispatch-claim hygiene sweep failed", "error", err)
+	} else if cleared > 0 {
+		m.logger.Debug("expired dispatch claims cleared", "count", cleared)
+	}
+
 	// Check for stale checkpoints across all running work units with checkpointing enabled.
 	m.checkStaleCheckpoints(ctx)
 

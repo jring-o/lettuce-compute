@@ -831,28 +831,30 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "heartbeat too low",
-			modify:  func(c *FaultToleranceConfig) { c.HeartbeatIntervalSeconds = 59 },
-			wantErr: true,
-			errMsg:  "heartbeat_interval_seconds",
+			// Deprecated/inert: heartbeat_interval_seconds is no longer range-checked.
+			// Omitting it (0) must be accepted, not rejected.
+			name:    "heartbeat omitted is accepted (deprecated field)",
+			modify:  func(c *FaultToleranceConfig) { c.HeartbeatIntervalSeconds = 0 },
+			wantErr: false,
 		},
 		{
-			name:    "heartbeat too high",
+			// Deprecated/inert: any heartbeat value, even out of the old 60-3600
+			// range, is now ignored rather than rejected.
+			name:    "heartbeat out-of-old-range is ignored (deprecated field)",
 			modify:  func(c *FaultToleranceConfig) { c.HeartbeatIntervalSeconds = 3601 },
-			wantErr: true,
-			errMsg:  "heartbeat_interval_seconds",
+			wantErr: false,
 		},
 		{
-			name:    "missed threshold too low",
+			// Deprecated/inert: missed_heartbeats_threshold is no longer range-checked.
+			name:    "missed threshold omitted is accepted (deprecated field)",
 			modify:  func(c *FaultToleranceConfig) { c.MissedHeartbeatsThreshold = 0 },
-			wantErr: true,
-			errMsg:  "missed_heartbeats_threshold",
+			wantErr: false,
 		},
 		{
-			name:    "missed threshold too high",
+			// Deprecated/inert: any missed_heartbeats_threshold value is now ignored.
+			name:    "missed threshold out-of-old-range is ignored (deprecated field)",
 			modify:  func(c *FaultToleranceConfig) { c.MissedHeartbeatsThreshold = 11 },
-			wantErr: true,
-			errMsg:  "missed_heartbeats_threshold",
+			wantErr: false,
 		},
 		{
 			name:    "deadline multiplier too low",

@@ -48,6 +48,35 @@ head:
   description: ""            # env: LETTUCE_HEAD_DESCRIPTION
   url: ""                    # env: LETTUCE_HEAD_URL
 
+  # --- Horizontal scale-out (Layer 3) ---
+  # Run N stateless head replicas behind a reverse proxy against ONE shared
+  # Postgres. Each replica needs a DISTINCT instance id, a shared Redis for the
+  # cross-replica replay store, and the trusted-proxy/client-IP wiring on the
+  # proxy. For a single-replica deploy leave instance_id and redis_url empty.
+
+  # This replica's stable identity (a UUID). EMPTY = auto-generate a fresh UUID at
+  # boot. It is the dispatch-claim owner and a log dimension. Each replica MUST be
+  # distinct — do NOT hardcode the same value across replicas (in compose, let
+  # each replica auto-generate one).
+  instance_id: ""            # env: LETTUCE_HEAD_INSTANCE_ID
+
+  # Shared Redis used as the cross-replica replay store (and optionally the shared
+  # rate-limit store). EMPTY = in-process replay cache + in-process rate limits
+  # (single-replica behavior). REQUIRED when running more than one replica.
+  redis_url: ""              # env: LETTUCE_REDIS_URL
+
+  # What to do when the shared replay store errors (e.g. a Redis outage):
+  #   open   = admit the request with a loud alarm (favors availability and does
+  #            not lose completed compute on SubmitResult) — DEFAULT
+  #   closed = reject the request (favors strict replay protection)
+  replay_fail_mode: "open"   # env: LETTUCE_REPLAY_FAIL_MODE
+
+  # How long (seconds) a per-head dispatch claim is held before it expires and the
+  # unit becomes re-claimable by any replica. A held unit's claim is renewed every
+  # flush tick, so this is a backstop for a crashed/wedged replica, not the
+  # steady-state lifetime. Must be >= max(10*flush_interval_ms, 5s) and < lease_seconds.
+  claim_lease_seconds: 120   # env: LETTUCE_HEAD_CLAIM_LEASE_SECONDS
+
   # Default leaf weights — map of leaf slug to relative weight (integer > 0).
   # Empty = equal weight among all active leafs. Higher weight = more work assigned.
   # Example:
@@ -61,10 +90,11 @@ head:
   # large fleet creates far less request noise. Defaults are sane for a small head;
   # tune target_request_rate_per_sec with the swarm-sim load test (see CONTRIBUTING.md).
   #
-  # SINGLE-REPLICA ONLY: dispatch is served from an in-process cache (below). Do NOT
-  # run multiple heads against one database in Layer 2 — two replicas would each
-  # refill independently and hand the same work unit to two volunteers. Horizontal
-  # scale-out is a planned later layer.
+  # Dispatch is served from an in-process cache (below). With horizontal scale-out
+  # (Layer 3) each replica claims the units it stages via a per-head dispatch claim
+  # (claim-on-refill), so multiple heads against one database no longer double-hand
+  # work. Multi-replica deploys additionally require a shared replay store
+  # (redis_url) and the proxy client-IP wiring — see the scale-out knobs above.
 
   # SAFETY CEILING on how many work units one RequestWorkUnit may return. This is a
   # cap, not the limiter: the actual batch is sized by each volunteer's work-buffer
@@ -100,7 +130,7 @@ head:
   # Adds reservation columns to work_units (migration 00002, auto-applied on boot).
   lease_seconds: 900                 # env: LETTUCE_HEAD_LEASE_SECONDS
 
-  # --- Dispatch cache (Layer 2, SINGLE-REPLICA ONLY) ---
+  # --- Dispatch cache (Layer 2) ---
   # The head serves work requests from an in-memory pool of queued units (no database
   # round-trip on the hot path) and flushes the resulting reservations to Postgres
   # asynchronously. Defaults are sane; you rarely need to change these.

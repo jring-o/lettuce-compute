@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/logging"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -43,6 +45,21 @@ const (
 // and only flipped to false by the integration-only test seam (see
 // grpc_auth_testsupport.go), which lets e2e tests replay byte-identical signed RPCs.
 var grpcReplayDetectionEnabled = true
+
+// replayFailsOpen controls behavior when the shared replay store ERRORS (e.g. a
+// Redis outage): true admits the request (fail open, favoring fleet availability
+// and not losing completed compute on SubmitResult) with a loud ERROR log; false
+// rejects it (fail closed, favoring strict replay protection). It is set once at
+// boot from cfg.Head.ReplayFailsOpen() (default open). It has NO effect on the
+// in-mem store, which never errors.
+var replayFailsOpen = true
+
+// SetReplayFailsOpen sets the replay-store failure policy. Call once at startup
+// before the gRPC/HTTP servers begin serving. true = fail open (admit on store
+// error), false = fail closed (reject on store error).
+func SetReplayFailsOpen(open bool) {
+	replayFailsOpen = open
+}
 
 // grpcAuthPublicKeyContextKey is a typed context key for the verified public key.
 type grpcAuthPublicKeyContextKey struct{}
@@ -120,40 +137,21 @@ func (c *replayCache) checkAndAdd(sig []byte, now time.Time) bool {
 
 // authInterceptor returns a UnaryServerInterceptor that requires and verifies an
 // Ed25519 request signature for every RPC except the public discovery methods. On
-// success it stores the verified public key in the context. It also returns a
-// cleanup func that stops the replay-cache janitor goroutine.
-func authInterceptor() (grpc.UnaryServerInterceptor, func()) {
-	cache := newReplayCache(ed25519TimestampSkew)
-
-	// Janitor periodically evicts expired entries so the cache cannot grow without
-	// bound during quiet periods between inserts.
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(ed25519TimestampSkew)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				now := timeNow()
-				cache.mu.Lock()
-				for k, t := range cache.seen {
-					if now.Sub(t) > cache.ttl {
-						delete(cache.seen, k)
-					}
-				}
-				cache.mu.Unlock()
-			}
-		}
-	}()
-
-	cleanup := func() {
-		close(stop)
-		wg.Wait()
+// success it stores the verified public key in the context.
+//
+// The replay store is INJECTED (Layer 3) so N head replicas can share ONE global
+// store (Redis) and reject a signature accepted by any replica. When no store is
+// passed (or it is nil) a fresh in-process in-mem store is used (single-replica /
+// no Redis URL); it self-bounds by evicting expired entries on every insert during
+// active traffic, so no janitor goroutine is needed — the cleanup func is retained
+// for call-site symmetry and is a no-op. The store is variadic so existing in-package
+// callers (tests) that pass none keep working; pass at most one.
+func authInterceptor(replay ...replayStore) (grpc.UnaryServerInterceptor, func()) {
+	var store replayStore
+	if len(replay) > 0 && replay[0] != nil {
+		store = replay[0]
+	} else {
+		store = newInMemReplayStore(ed25519TimestampSkew)
 	}
 
 	interceptor := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -161,19 +159,20 @@ func authInterceptor() (grpc.UnaryServerInterceptor, func()) {
 			return handler(ctx, req)
 		}
 
-		pubKey, err := verifyGRPCAuth(ctx, info.FullMethod, req, cache)
+		pubKey, err := verifyGRPCAuth(ctx, info.FullMethod, req, store)
 		if err != nil {
 			return nil, err
 		}
 		return handler(contextWithGRPCAuthPublicKey(ctx, pubKey), req)
 	}
 
+	cleanup := func() {}
 	return interceptor, cleanup
 }
 
 // verifyGRPCAuth parses and verifies the Ed25519 signature carried in gRPC metadata
 // for the given request. On success it returns the verified public key.
-func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *replayCache) (ed25519.PublicKey, error) {
+func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, replay replayStore) (ed25519.PublicKey, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "missing request metadata")
@@ -248,12 +247,30 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, cache *repl
 		return nil, status.Error(codes.Unauthenticated, "invalid signature")
 	}
 
-	// Anti-replay: reject a signature we have already accepted within the skew window.
+	// Anti-replay (Layer 3: SHARED across replicas). Reject a signature already
+	// accepted within the skew window. The dedup key is the SIGNATURE ALONE, GLOBAL
+	// across every replica via the injected store (Redis or a shared in-mem store),
+	// so a request accepted by replica A is rejected by replica B. TTL is the skew
+	// window: outside it the timestamp can no longer verify.
+	//
 	// grpcReplayDetectionEnabled is always true in production; integration tests turn
 	// it off via the integration-only test seam because they intentionally replay
 	// byte-identical signed RPCs (e.g. repeated RequestWorkUnit for the same volunteer).
-	if grpcReplayDetectionEnabled && !cache.checkAndAdd(sigBytes, now) {
-		return nil, status.Error(codes.Unauthenticated, "replayed signature")
+	if grpcReplayDetectionEnabled {
+		alreadySeen, serr := replay.SeenWithin(ctx, sigBytes, ed25519TimestampSkew)
+		if serr != nil {
+			// Store failure (e.g. Redis outage). Apply the configured policy:
+			// fail-open admits with a loud alarm (default — favors availability and
+			// not losing completed compute), fail-closed rejects.
+			if !replayFailsOpen {
+				return nil, status.Error(codes.Unavailable, "replay store unavailable")
+			}
+			logging.LoggerFromContext(ctx, slog.Default()).Error(
+				"replay store error; admitting request (fail-open)",
+				"method", fullMethod, "error", serr)
+		} else if alreadySeen {
+			return nil, status.Error(codes.Unauthenticated, "replayed signature")
+		}
 	}
 
 	return pubKey, nil

@@ -89,7 +89,6 @@ func (m *mockWURepo) ClearReservation(ctx context.Context, id, volunteerID types
 func (m *mockWURepo) Assign(ctx context.Context, workUnitID, volunteerID types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWURepo) UpdateHeartbeat(ctx context.Context, id types.ID) error { return nil }
 func (m *mockWURepo) FindExpiredWorkUnits(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
@@ -99,7 +98,13 @@ func (m *mockWURepo) FindLapsedReservations(ctx context.Context, limit int) ([]*
 func (m *mockWURepo) FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
 	return nil, nil
 }
-func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation) ([]types.ID, error) {
+func (m *mockWURepo) ClaimDispatchableBatch(_ context.Context, _ types.ID, _ time.Duration, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *mockWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
 	return nil, nil
 }
 func (m *mockWURepo) CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error) {

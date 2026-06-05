@@ -15,7 +15,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
-// --- Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY) -----------------
+// --- Layer 2/3: in-process dispatch cache (per-replica, claim-on-refill) -------
 //
 // The dispatch cache takes Postgres OFF the RequestWorkUnit hot path. A background
 // refiller bulk-fetches QUEUED, dispatch-eligible units into an in-memory ready
@@ -31,13 +31,24 @@ import (
 // is preserved. Run-start (QUEUED->ASSIGNED + active history row) is a separate
 // explicit StartWork step.
 //
-// SINGLE-WRITER: the cache assumes ONE head process owns dispatch. Two replicas
-// would each refill independently and double-hand the same QUEUED unit. Layer 2
-// ships single-replica; Layer 3 adds shared ownership.
+// HORIZONTAL SCALE-OUT (Layer 3, claim-on-refill): each replica runs its OWN cache
+// against the SHARED Postgres. The refill is NOT a plain SELECT but an atomic
+// ClaimDispatchableBatch UPDATE that stamps a per-head dispatch claim
+// (dispatch_claimed_by = this replica's instance id, dispatch_claim_expires_at = a
+// short lease) on each staged unit. A unit one replica stages is invisible to every
+// other replica's refill (its claim is live and owned by another head), so two
+// replicas can NEVER double-hand the same QUEUED unit. The claim is amortized at
+// bulk-refill, so the per-request hand-out hot path stays 100% in memory. A held
+// unit's claim is renewed off the hot path by the async reservation flush. When no
+// head id is configured (single-replica) the cache uses the claim-free Layer-2
+// refill/flush — identical behavior, no DB column writes for claims.
 //
 // CRASH SAFETY: the cache is an optimization over the source-of-truth Postgres.
 //   - An unflushed reservation lost at crash leaves the unit plain QUEUED in PG ->
-//     immediately re-dispatchable.
+//     immediately re-dispatchable. Its dispatch claim simply EXPIRES (the crashed
+//     owner stopped renewing it) and the unit becomes re-claimable by any survivor
+//     on its next refill — passive expiry is the reclaim guarantee, no active sweep
+//     is required for correctness (the leader-gated hygiene sweep only tidies).
 //   - A flushed-as-reserved unit whose in-memory owner vanished is reclaimed by the
 //     lapsed-reservation sweep (FindLapsedReservations, WP-HEAD-DEADLINE) once
 //     reserved_until passes.
@@ -114,6 +125,24 @@ type dispatchCacheConfig struct {
 	flushBatchSize          int
 	leaseSeconds            int
 	maxInflightPerVolunteer int
+
+	// --- Layer 3: horizontal scale-out (claim-on-refill) ---
+	//
+	// headID is this replica's stable instance id, stamped as the dispatch-claim
+	// owner (dispatch_claimed_by) at bulk-refill. When it is the zero value (single-
+	// replica / pre-Layer-3), the cache falls back to the claim-free
+	// FindDispatchableBatch refill and FlushReservations performs no claim renewal —
+	// identical to Layer-2 behavior.
+	headID types.ID
+	// claimLease is how long a dispatch claim is held before it expires and the unit
+	// becomes re-claimable. Renewed every flush tick for actively-held units.
+	claimLease time.Duration
+}
+
+// scaleOutEnabled reports whether claim-on-refill is active (a non-nil head id was
+// configured). When false the cache uses the Layer-2 claim-free refill/flush paths.
+func (cfg dispatchCacheConfig) scaleOutEnabled() bool {
+	return cfg.headID != (types.ID{})
 }
 
 // dispatchDeps is the cache's DB-facing dependency surface (the subset of repos it
@@ -965,7 +994,17 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	}
 	defer release()
 
-	cands, err := c.deps.wuRepo.FindDispatchableBatch(dbCtx, want, excluded, leafIDs)
+	// Layer 3: when scale-out is enabled, the refill ATOMICALLY stamps a per-head
+	// dispatch claim on each staged unit so no other replica can stage it (claim-on-
+	// refill). When disabled (single-replica), fall back to the claim-free Layer-2
+	// refill. The claim cost is amortized here at bulk-refill, NOT per request.
+	var cands []workunit.DispatchCandidate
+	var err error
+	if c.cfg.scaleOutEnabled() {
+		cands, err = c.deps.wuRepo.ClaimDispatchableBatch(dbCtx, c.cfg.headID, c.cfg.claimLease, want, excluded, leafIDs)
+	} else {
+		cands, err = c.deps.wuRepo.FindDispatchableBatch(dbCtx, want, excluded, leafIDs)
+	}
 	if err != nil {
 		c.logger.Warn("dispatch cache: refill failed", "error", err, "leaf_scoped", len(leafIDs) > 0)
 		return
@@ -1123,7 +1162,11 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 		defer release()
 	}
 
-	landed, err := c.deps.wuRepo.FlushReservations(dbCtx, batch)
+	// Layer 3: pass headID + claimLease so the flush also RENEWS this head's dispatch
+	// claim on each landed unit (off the hot path), keeping a held-but-unflushed
+	// unit's claim from expiring under it. headID == zero (single-replica) disables
+	// renewal inside FlushReservations.
+	landed, err := c.deps.wuRepo.FlushReservations(dbCtx, batch, c.cfg.headID, c.cfg.claimLease)
 	if err != nil {
 		// Transient DB error: requeue so the reservations are retried next tick.
 		c.requeueWrites(batch)

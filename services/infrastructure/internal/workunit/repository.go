@@ -51,11 +51,29 @@ type WorkUnitRepository interface {
 	// leafIDs selects across all ACTIVE non-WASM leafs.
 	FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]DispatchCandidate, error)
 
+	// ClaimDispatchableBatch is the Layer-3 (horizontal scale-out) claim-on-refill
+	// counterpart of FindDispatchableBatch: it selects the same LIMIT-N batch but
+	// ATOMICALLY stamps a per-head dispatch claim (dispatch_claimed_by = headID,
+	// dispatch_claim_expires_at = NOW() + lease) on each staged unit, so a unit one
+	// replica stages is invisible to every other replica's refill (its claim is live
+	// and owned by another head). The unit stays QUEUED. Closes the cross-replica
+	// double-hand while keeping the per-request hand-out hot path DB-free (the claim
+	// cost is amortized at bulk-refill).
+	ClaimDispatchableBatch(ctx context.Context, headID types.ID, lease time.Duration, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]DispatchCandidate, error)
+
+	// ClearExpiredDispatchClaims NULLs the dispatch-claim columns on every unit whose
+	// claim has expired. HYGIENE ONLY (an expired claim is already re-claimable by
+	// any refill): run from the leader-gated fault monitor. Returns rows cleared.
+	ClearExpiredDispatchClaims(ctx context.Context) (int64, error)
+
 	// FlushReservations writes a batch of dispatch-cache reservations in one
 	// multi-row UPDATE using the per-row optimistic reservation guard, returning the
 	// set of work_unit_ids whose reservation actually landed (ids not returned are
-	// conflicts the cache must void).
-	FlushReservations(ctx context.Context, recs []FlushReservation) ([]types.ID, error)
+	// conflicts the cache must void). The same statement RENEWS this head's dispatch
+	// claim (dispatch_claim_expires_at = NOW() + claimLease) on any unit still claimed
+	// by headID, so a held-but-unflushed unit's claim never expires under it. A
+	// headID of uuid.Nil disables claim renewal (single-replica / pre-Layer-3 paths).
+	FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error)
 
 	// CountActiveByVolunteer returns the authoritative per-volunteer inflight count
 	// (active history rows + live reservations) keyed by volunteer id, used to

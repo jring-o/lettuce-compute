@@ -229,23 +229,40 @@ be verified against this head again.
 ### 8 — [you] Start the stack
 head-setup.md Step 9. **If the server has ≤ 1 GB RAM, build images one at a time** to avoid
 the build being killed. **Check:** `docker compose -f compose.production.yaml ps` shows
-postgres, infrastructure, dashboard, registry, caddy all up.
+postgres, infrastructure, dashboard, registry, caddy, **redis** all up. (`redis` is the
+shared cross-replica replay + rate-limit store; it ships in `compose.production.yaml` and
+comes up even for a single replica — it is only *required* once you run more than one.)
 
 ### 9 — [you] Verify
 head-setup.md Step 10:
 - `curl https://your-domain.com/api/v1/health` → `"status":"healthy"`, `"database":"connected"`.
 - Startup logs show the schema migrations applied (`migrations applied successfully`,
-  through `00002_work_unit_reservations` — the v0.2.0 reservation columns) and a
+  through `00003_dispatch_claims` — the v0.3.0 dispatch-claim columns that make
+  horizontal scale-out safe, after `00002_work_unit_reservations`) and a
   `trusted proxies configured` line. No panics or restart loop.
 - Bootstrap log shows `admin user created via bootstrap` and `dashboard API key created via bootstrap`.
 - Ask the user to open `https://your-domain.com/sign-in`, log in with their email + password,
   and **share a screenshot** of the dashboard so you both confirm it works.
 
-**Note (v0.2.0):** this is a server-directed-dispatch head. Volunteers attaching
-to it must be on a **v0.2.0+** build. An older volunteer is rejected at
-registration with `volunteer too old for this head: update to a build that signs
-per-request nonces` — that's expected, not a deploy fault. Point contributors at
-the v0.2.0 release binaries.
+**Note (v0.3.0 — BREAKING):** this head removed per-task heartbeats — liveness is
+now deadline-based and run-start is the `StartWork` RPC. The head and ALL volunteers
+must be on **v0.3.0+** and update together: deploy the head first, then update every
+volunteer. An older (pre-v0.3.0) volunteer cannot talk to this head (it still calls
+the removed Heartbeat RPC) and is rejected — that's expected, not a deploy fault.
+Point contributors at the **v0.3.0** release binaries.
+
+**Scaling out (only if they ask — a single replica is the default and fine):** the
+head is stateless, so you can run **N replicas** behind Caddy against the one shared
+Postgres. The working knob is `--scale infrastructure=N` on the compose `up` (e.g.
+`docker compose -f compose.production.yaml up -d --build --scale infrastructure=2`).
+On **podman** this is the *only* knob — `podman-compose` ignores `deploy.replicas`, so
+`HEAD_REPLICAS` in `.env` is a no-op there (verified on podman-compose 1.6.0); always
+pass `--scale`. The bundled `redis` service is **required** once N > 1 (it backs the
+shared replay dedup + rate-limit buckets) and is already in `compose.production.yaml`.
+Do **not** pin `LETTUCE_HEAD_INSTANCE_ID` — each replica must auto-generate a distinct
+id at boot, or their dispatch claims collide. Caddy fans out to all replicas
+automatically; no `Caddyfile` edit. Full procedure: `guides/head-setup.md` →
+"Horizontal scale-out".
 
 ### 10 — Done → offer the leaf
 Tell them their head is live and where: `https://your-domain.com` (dashboard), admin console

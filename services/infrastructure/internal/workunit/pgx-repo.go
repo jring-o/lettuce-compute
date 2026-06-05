@@ -23,6 +23,11 @@ type DBTX interface {
 	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
 }
 
+// defaultClaimLeaseSeconds is the fallback dispatch-claim lease (seconds) used by
+// the repo when a caller passes a non-positive lease. It mirrors the config-package
+// default; the config Validate floors keep the configured value sane.
+const defaultClaimLeaseSeconds = 120
+
 // workUnitColumns is the standard column list for SELECT queries on work_units.
 const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	input_data, input_data_ref, code_artifact_ref, parameters,
@@ -310,7 +315,15 @@ func (r *PgxWorkUnitRepository) UpdateState(ctx context.Context, id types.ID, fr
 			validated_at = $8,
 			last_heartbeat_at = $9,
 			reassignment_count = $10,
-			flagged_for_review = $11
+			flagged_for_review = $11,
+			-- Layer 3: clear any dispatch claim on EVERY state transition (defensive /
+			-- self-healing). EXPIRED/REJECTED -> QUEUED reassignment routes through here
+			-- (Reassign -> UpdateState), so the requeue path is claim-clean independent
+			-- of Assign ordering: a re-QUEUED unit is always immediately re-claimable.
+			-- A pure no-op in the common case (a unit that reached ASSIGNED already had
+			-- its claim NULLed by Assign).
+			dispatch_claimed_by = NULL,
+			dispatch_claim_expires_at = NULL
 		WHERE id = $1 AND state = $12`,
 		id,
 		wu.State,
@@ -692,6 +705,157 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 	return out, nil
 }
 
+// ClaimDispatchableBatch is the horizontal-scale-out (Layer 3) claim-on-refill
+// counterpart of FindDispatchableBatch: it selects the same LIMIT-N batch of
+// QUEUED, dispatch-eligible units but ATOMICALLY stamps a per-head dispatch claim
+// on each one (dispatch_claimed_by = headID, dispatch_claim_expires_at = NOW() +
+// lease) in a single UPDATE...RETURNING. The unit stays state='QUEUED' — the claim
+// is a SECOND, head-owned lease distinct from the volunteer reservation (00002) —
+// but it is now DB-owned by headID, so every OTHER replica's refill excludes it
+// (its claim is live and owned by another head) and cannot stage the same unit. A
+// unit staged in this head's in-memory ready pool is therefore invisible to every
+// other replica, closing the cross-replica double-hand.
+//
+// The claim cost is amortized at bulk-refill (one UPDATE per LIMIT-N refill), so
+// the per-request HandOut hot path stays 100% in memory — the Layer-2 win is
+// preserved. A held unit's claim is renewed off the hot path by the async
+// reservation flush (FlushReservations bumps dispatch_claim_expires_at). A crashed
+// replica's claims simply expire and become re-claimable by any survivor.
+//
+// The claim WHERE-term added to the FindDispatchableBatch predicate set:
+//   - dispatch_claimed_by IS NULL  → never claimed: claimable.
+//   - dispatch_claim_expires_at < NOW()  → claim expired (e.g. a crashed owner that
+//     stopped renewing): re-claimable.
+//   - dispatch_claimed_by = headID  → this head's OWN claim (re-stage / renew on a
+//     subsequent refill tick): re-claimable.
+//   - otherwise (another head's LIVE claim): excluded.
+//
+// FOR UPDATE OF wu SKIP LOCKED is kept on the inner select (the proven
+// no-double-hand primitive); the outer UPDATE makes the claim atomic with that
+// select so two replicas cannot both stamp the same row.
+func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, headID types.ID, lease time.Duration, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]DispatchCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	leaseSecs := lease.Seconds()
+	if leaseSecs <= 0 {
+		leaseSecs = float64(defaultClaimLeaseSeconds)
+	}
+	rows, err := r.db.Query(ctx, `
+		UPDATE work_units AS wu SET
+			dispatch_claimed_by = $4,
+			dispatch_claim_expires_at = NOW() + make_interval(secs => $5)
+		FROM leafs l
+		WHERE wu.id IN (
+			SELECT wu2.id
+			FROM work_units wu2
+			JOIN leafs l2 ON wu2.leaf_id = l2.id
+			WHERE wu2.state = 'QUEUED'
+			  AND l2.state = 'ACTIVE'
+			  -- WASM is dispatched by the immediate-assign browser path, not the cache.
+			  AND COALESCE(l2.execution_config->>'runtime', 'NATIVE') <> 'WASM'
+			  -- DB-level backstop: never re-stage a unit the cache already holds in memory.
+			  AND (array_length($2::uuid[], 1) IS NULL OR NOT (wu2.id = ANY($2::uuid[])))
+			  -- Optional leaf scope (the on-demand leaf-scoped refill).
+			  AND (array_length($3::uuid[], 1) IS NULL OR wu2.leaf_id = ANY($3::uuid[]))
+			  -- CLAIM EXCLUDE: another replica's LIVE claim hides the unit; a NULL claim,
+			  -- an expired claim, or THIS head's own claim is re-claimable.
+			  AND (wu2.dispatch_claimed_by IS NULL
+			       OR wu2.dispatch_claim_expires_at < NOW()
+			       OR wu2.dispatch_claimed_by = $4)
+			  -- Redundancy: active history rows + one for any live NORMAL reservation
+			  -- (held by anyone). Spot-check units carry their own history row and are
+			  -- counted by the history subquery, so they are excluded from the term.
+			  AND (
+			    (
+			      SELECT COUNT(*) FROM work_unit_assignment_history wuah
+			      WHERE wuah.work_unit_id = wu2.id AND wuah.outcome IS NULL
+			    )
+			    + CASE
+			        WHEN NOT wu2.spot_check
+			             AND wu2.reserved_until IS NOT NULL AND wu2.reserved_until > NOW()
+			        THEN 1 ELSE 0
+			      END
+			  ) < CASE WHEN wu2.spot_check THEN 2
+			       ELSE COALESCE((l2.validation_config->>'redundancy_factor')::int, 2)
+			      END
+			  -- Reservation guard: a live NORMAL reservation hides the unit; a lapsed
+			  -- lease or a spot-check unit (must stay visible for corroboration) does not.
+			  AND (
+			    wu2.spot_check
+			    OR wu2.reserved_until IS NULL
+			    OR wu2.reserved_until < NOW()
+			  )
+			ORDER BY wu2.priority DESC, wu2.created_at ASC
+			LIMIT $1
+			FOR UPDATE OF wu2 SKIP LOCKED
+		)
+		  AND l.id = wu.leaf_id
+		RETURNING `+prefixedWorkUnitColumns+`,
+			CASE WHEN wu.spot_check THEN 2
+			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
+			END AS effective_redundancy,
+			(SELECT COUNT(*) FROM work_unit_assignment_history wuah
+			 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL) AS active_assignments,
+			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime`,
+		limit, excludeIDs, leafIDs, headID, leaseSecs,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to claim dispatchable batch", err)
+	}
+	defer rows.Close()
+
+	var out []DispatchCandidate
+	for rows.Next() {
+		var wu WorkUnit
+		var redundancy, active int
+		var runtime string
+		if err := rows.Scan(
+			&wu.ID, &wu.LeafID, &wu.BatchID, &wu.State, &wu.Priority,
+			&wu.InputData, &wu.InputDataRef, &wu.CodeArtifactRef, &wu.Parameters,
+			&wu.EstimatedDurationSeconds, &wu.DeadlineSeconds, &wu.OutputSpec,
+			&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
+			&wu.ReassignmentCount, &wu.MaxReassignments, &wu.LastHeartbeatAt,
+			&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
+			&wu.ReservedUntil, &wu.ReservedVolunteerID, &wu.CreatedAt, &wu.UpdatedAt,
+			&redundancy, &active, &runtime,
+		); err != nil {
+			return nil, apierror.Internal("failed to scan claimed work unit", err)
+		}
+		cand := wu
+		out = append(out, DispatchCandidate{
+			WorkUnit:          &cand,
+			LeafID:            wu.LeafID,
+			RedundancyFactor:  redundancy,
+			ActiveAssignments: active,
+			Runtime:           runtime,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate claimed work units", err)
+	}
+	return out, nil
+}
+
+// ClearExpiredDispatchClaims NULLs the dispatch-claim columns on every unit whose
+// claim has expired (dispatch_claim_expires_at < NOW()). This is HYGIENE ONLY: a
+// unit with an expired claim is ALREADY re-claimable by any replica's refill (the
+// claim WHERE-term treats an expired claim as claimable), so reclaim does not depend
+// on this sweep — it keeps the table tidy and observability clean. Run from the
+// leader-gated fault monitor. Returns the number of rows cleared.
+func (r *PgxWorkUnitRepository) ClearExpiredDispatchClaims(ctx context.Context) (int64, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_units SET
+			dispatch_claimed_by = NULL,
+			dispatch_claim_expires_at = NULL
+		WHERE dispatch_claimed_by IS NOT NULL
+		  AND dispatch_claim_expires_at < NOW()`)
+	if err != nil {
+		return 0, apierror.Internal("failed to clear expired dispatch claims", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // FlushReservation is one async reservation write produced by the dispatch cache.
 type FlushReservation struct {
 	WorkUnitID    types.ID
@@ -710,7 +874,18 @@ type FlushReservation struct {
 // This is the head's single batched reservation-write path that takes Postgres off
 // the RequestWorkUnit hot path: hand-out is authoritative in memory immediately and
 // the flush lags by at most flushInterval / flushBatchSize.
-func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []FlushReservation) ([]types.ID, error) {
+//
+// Layer 3 (claim renewal): the SAME statement that lands the reservation also
+// RENEWS this head's dispatch claim on the unit (dispatch_claim_expires_at = NOW()
+// + claimLease) whenever the unit is still claimed by headID. This is the
+// deterministic close of the unflushed-reservation race: a unit that lives in this
+// replica's ready pool or in-flight has its claim continuously renewed off the hot
+// path (piggybacked on the existing flush batch, ZERO new per-request DB write), so
+// a held-but-unflushed unit's claim never expires under it. The renewal is gated on
+// dispatch_claimed_by = headID so it can NEVER void or hijack another replica's
+// legitimate claim/flush (gotcha 1). headID == uuid.Nil disables renewal
+// (single-replica / pre-Layer-3 callers): the COALESCE keeps the existing claim.
+func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
 	if len(recs) == 0 {
 		return nil, nil
 	}
@@ -722,10 +897,22 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		vols[i] = rec.VolunteerID
 		untils[i] = rec.ReservedUntil
 	}
+	leaseSecs := claimLease.Seconds()
+	if leaseSecs <= 0 {
+		leaseSecs = float64(defaultClaimLeaseSeconds)
+	}
 	rows, err := r.db.Query(ctx, `
 		UPDATE work_units AS wu SET
 			reserved_until = v.reserved_until,
-			reserved_volunteer_id = v.vol
+			reserved_volunteer_id = v.vol,
+			-- Renew THIS head's claim (only ours: the equality guard prevents touching
+			-- another replica's claim). When the unit is not claimed by us the COALESCE
+			-- leaves the existing expiry untouched.
+			dispatch_claim_expires_at = CASE
+				WHEN wu.dispatch_claimed_by = $4
+				THEN NOW() + make_interval(secs => $5)
+				ELSE wu.dispatch_claim_expires_at
+			END
 		FROM (
 			SELECT unnest($1::uuid[]) AS id,
 			       unnest($2::uuid[]) AS vol,
@@ -737,7 +924,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		       OR wu.reserved_until < NOW()
 		       OR wu.reserved_volunteer_id = v.vol)
 		RETURNING wu.id`,
-		ids, vols, untils,
+		ids, vols, untils, headID, leaseSecs,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to flush reservations", err)
@@ -854,7 +1041,12 @@ func (r *PgxWorkUnitRepository) Assign(ctx context.Context, workUnitID types.ID,
 			assigned_at = $3,
 			last_heartbeat_at = $3,
 			reserved_until = NULL,
-			reserved_volunteer_id = NULL
+			reserved_volunteer_id = NULL,
+			-- Layer 3: run-start releases the dispatch claim in the SAME atomic UPDATE
+			-- that clears the reservation, so a unit leaving the dispatchable universe
+			-- never strands its claim.
+			dispatch_claimed_by = NULL,
+			dispatch_claim_expires_at = NULL
 		WHERE id = $1 AND state = 'QUEUED'
 		RETURNING `+workUnitColumns,
 		workUnitID, volunteerID, now,
@@ -1074,7 +1266,12 @@ func (r *PgxWorkUnitRepository) ClearReservation(ctx context.Context, id, volunt
 	row := r.db.QueryRow(ctx, `
 		UPDATE work_units SET
 			reserved_until = NULL,
-			reserved_volunteer_id = NULL
+			reserved_volunteer_id = NULL,
+			-- Layer 3: an abandon / flush-conflict void of a buffered (reserved) unit
+			-- also releases this head's dispatch claim so the unit is immediately
+			-- re-claimable by any replica (not left QUEUED with a stranded live claim).
+			dispatch_claimed_by = NULL,
+			dispatch_claim_expires_at = NULL
 		WHERE id = $1 AND state = 'QUEUED' AND reserved_volunteer_id = $2
 		RETURNING `+workUnitColumns,
 		id, volunteerID,

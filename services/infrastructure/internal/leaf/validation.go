@@ -134,6 +134,10 @@ func ApplyValidationConfigDefaults(c *ValidationConfig) {
 
 // ApplyFaultToleranceConfigDefaults fills zero-value fields with documented defaults.
 func ApplyFaultToleranceConfigDefaults(c *FaultToleranceConfig) {
+	// HeartbeatIntervalSeconds and MissedHeartbeatsThreshold are deprecated/inert
+	// (deadline-based reassignment replaced per-task heartbeats in v0.3.0). They no
+	// longer drive anything; the defaults below are kept only so persisted JSON keeps
+	// a stable shape for older callers that still read them.
 	if c.HeartbeatIntervalSeconds == 0 {
 		c.HeartbeatIntervalSeconds = 300
 	}
@@ -529,19 +533,14 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 }
 
 // ValidateFaultToleranceConfig validates fault tolerance configuration.
+//
+// heartbeat_interval_seconds and missed_heartbeats_threshold are DEPRECATED and
+// INERT: v0.3.0 removed per-task heartbeats in favour of deadline-based
+// reassignment (DeadlineMultiplier + the StartWork-stamped reclaim deadline), so
+// these two fields no longer drive anything. They are intentionally not required
+// or range-checked here — any value (including 0 / omitted) is accepted — but the
+// struct fields are retained so older callers that still send them do not break.
 func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
-	// Heartbeat interval: 60-3600
-	if c.HeartbeatIntervalSeconds < 60 || c.HeartbeatIntervalSeconds > 3600 {
-		return apierror.ValidationError("heartbeat_interval_seconds must be between 60 and 3600",
-			validationDetail{Field: "heartbeat_interval_seconds", Reason: "out_of_range"})
-	}
-
-	// Missed heartbeats threshold: 1-10
-	if c.MissedHeartbeatsThreshold < 1 || c.MissedHeartbeatsThreshold > 10 {
-		return apierror.ValidationError("missed_heartbeats_threshold must be between 1 and 10",
-			validationDetail{Field: "missed_heartbeats_threshold", Reason: "out_of_range"})
-	}
-
 	// Deadline multiplier: 1.0-10.0
 	if c.DeadlineMultiplier < 1.0 || c.DeadlineMultiplier > 10.0 {
 		return apierror.ValidationError("deadline_multiplier must be between 1.0 and 10.0",

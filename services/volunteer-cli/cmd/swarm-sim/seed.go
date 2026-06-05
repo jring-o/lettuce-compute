@@ -237,10 +237,11 @@ func (s *seeder) configureLeaf(ctx context.Context, leafID string) error {
 			"max_retries":         3,
 		},
 		"fault_tolerance_config": map[string]any{
-			"heartbeat_interval_seconds":  60,
-			"missed_heartbeats_threshold": 3,
-			"deadline_multiplier":         3.0,
-			"max_reassignments":           3,
+			// heartbeat fields are deprecated/inert (deadline-based reassignment
+			// replaced per-task heartbeats); only deadline_multiplier and
+			// max_reassignments are still used.
+			"deadline_multiplier": 3.0,
+			"max_reassignments":   3,
 		},
 		"data_config": map[string]any{
 			"transfer_strategy":     "INLINE",

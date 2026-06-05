@@ -140,6 +140,14 @@ type HeadDispatchConfig struct {
 	MaintenanceAdmissionCap int // 0 = derive max(1, admissionCap/4)
 	FlushIntervalMs         int
 	FlushBatchSize          int
+
+	// --- Layer 3: horizontal scale-out (claim-on-refill) ---
+	// HeadInstanceID is this replica's stable instance id, stamped as the dispatch-
+	// claim owner. The zero value (types.ID{}) keeps single-replica behavior (claim-
+	// free refill/flush). main.go fills it from HeadConfig.EffectiveInstanceID().
+	HeadInstanceID types.ID
+	// ClaimLeaseSeconds is the per-head dispatch-claim lease (seconds). Default 120.
+	ClaimLeaseSeconds int
 }
 
 // SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
@@ -170,8 +178,11 @@ func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url 
 
 // StartDispatchCache builds and launches the Layer-2 in-process dispatch cache on
 // the given service (a no-op if svc is not the concrete volunteerService). main.go
-// calls this once at startup AFTER SetHeadConfig has captured the dispatch knobs.
-// SINGLE-REPLICA: call this in exactly one head process.
+// calls this once per process at startup AFTER SetHeadConfig has captured the
+// dispatch knobs. Layer 3: EVERY replica runs its own cache safely — the refill
+// claims units on this head's instance id (claim-on-refill), so two replicas never
+// double-hand the same QUEUED unit. With no instance id configured the refill is
+// claim-free, which is correct for a single replica.
 func StartDispatchCache(svc lettucev1.VolunteerServiceServer, ctx context.Context) {
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.StartDispatchCache(ctx)
@@ -198,8 +209,12 @@ func defaultFloat(v, def float64) float64 {
 // After this call RequestWorkUnit serves reservations from the cache (zero DB on
 // the hot path) and sheds with ResourceExhausted under overload.
 //
-// SINGLE-REPLICA: the cache assumes ONE head owns dispatch — call this in exactly
-// one process. main.go calls it once at startup.
+// Layer 3: each replica runs its OWN cache safely under N replicas. The refill
+// stamps a per-head dispatch claim (this head's instance id) on the units it pulls,
+// so two caches never double-hand the same QUEUED unit and a crashed replica's
+// claims expire after the claim lease and become re-claimable. main.go calls it
+// once per process at startup. With no instance id configured the refill is
+// claim-free — the correct single-replica behaviour.
 func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	admissionCap := s.dispatchCfg.DispatchAdmissionCap
 	if admissionCap <= 0 {
@@ -227,6 +242,13 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		}
 	}
 
+	// Layer 3: derive the dispatch-claim lease (default 120s) when scale-out is on
+	// (a head instance id was configured). A zero head id keeps the claim-free
+	// single-replica refill/flush paths.
+	claimLeaseSeconds := s.dispatchCfg.ClaimLeaseSeconds
+	if claimLeaseSeconds <= 0 {
+		claimLeaseSeconds = defaultClaimLeaseSeconds
+	}
 	cfg := dispatchCacheConfig{
 		readyPoolSize:           s.dispatchCfg.ReadyPoolSize,
 		refillBatchSize:         s.dispatchCfg.RefillBatchSize,
@@ -236,6 +258,8 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		flushBatchSize:          s.dispatchCfg.FlushBatchSize,
 		leaseSeconds:            s.leaseSeconds,
 		maxInflightPerVolunteer: s.maxInflightPerVolunteer,
+		headID:                  s.dispatchCfg.HeadInstanceID,
+		claimLease:              time.Duration(claimLeaseSeconds) * time.Second,
 	}
 	cache := newDispatchCache(cfg, dispatchDeps{
 		wuRepo:        s.wuRepo,
@@ -251,7 +275,9 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	s.logger.Info("dispatch cache started",
 		"admission_cap", admissionCap,
 		"maintenance_admission_cap", maintCap,
-		"single_replica", true)
+		"scale_out", cfg.scaleOutEnabled(),
+		"head_instance_id", cfg.headID,
+		"claim_lease_seconds", claimLeaseSeconds)
 }
 
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {

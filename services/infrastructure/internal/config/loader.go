@@ -173,6 +173,22 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("LETTUCE_HEAD_URL"); v != "" {
 		cfg.Head.URL = v
 	}
+	if v := os.Getenv("LETTUCE_HEAD_INSTANCE_ID"); v != "" {
+		cfg.Head.InstanceID = v
+	}
+	if v := os.Getenv("LETTUCE_REDIS_URL"); v != "" {
+		cfg.Head.RedisURL = v
+	}
+	if v := os.Getenv("LETTUCE_REPLAY_FAIL_MODE"); v != "" {
+		cfg.Head.ReplayFailMode = v
+	}
+	if v := os.Getenv("LETTUCE_HEAD_CLAIM_LEASE_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_CLAIM_LEASE_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.ClaimLeaseSeconds = n
+	}
 	if v := os.Getenv("LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

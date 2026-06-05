@@ -64,8 +64,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize logger.
-	logger := logging.NewLogger(cfg.Log.Level, cfg.Log.Format)
+	// Resolve this head replica's stable instance id ONCE (Layer 3): it is the
+	// dispatch-claim owner, the leadership log identity, and a log dimension.
+	// Generated here from config/env (auto-uuid when unset) so every log line and
+	// the dispatch claim agree on the same value for the process lifetime.
+	instanceID := cfg.Head.EffectiveInstanceID()
+
+	// Initialize logger. Stamp the instance id on every log line so multi-replica
+	// deployments are attributable to a specific head.
+	logger := logging.NewLogger(cfg.Log.Level, cfg.Log.Format).With("head_instance_id", instanceID.String())
 	logging.SetDefault(logger)
 
 	// Apply the operator-tuned NoDeadline reclaim ceiling so it actually changes
@@ -164,6 +171,35 @@ func main() {
 		slog.Info("no trusted proxies configured; forwarding headers (X-Forwarded-For/X-Real-IP) are not trusted")
 	}
 
+	// Layer 3 scale-out: shared replay store + shared rate-limit store. When a
+	// Redis URL is configured, a single Redis client backs BOTH the cross-replica
+	// anti-replay dedup (key = signature alone, GLOBAL) and the cross-replica
+	// rate-limit buckets, so N replicas behind the proxy do not double-accept a
+	// replayed signature or grant each client N× its budget. Empty RedisURL keeps
+	// the single-replica in-process behavior (in-mem replay cache + token buckets).
+	//
+	// The replay-store failure policy (fail-open default vs fail-closed) is applied
+	// to BOTH the gRPC and HTTP auth paths.
+	server.SetReplayFailsOpen(cfg.Head.ReplayFailsOpen())
+	if cfg.Head.RedisURL != "" {
+		redisClient, rerr := server.NewRedisClient(ctx, cfg.Head.RedisURL)
+		if rerr != nil {
+			slog.Error("failed to connect to redis for shared replay/rate-limit store", "error", rerr)
+			os.Exit(1)
+		}
+		defer func() { _ = redisClient.Close() }()
+		// One Redis client backs the shared replay store (both HTTP and gRPC auth)
+		// and the shared rate-limit buckets. Install the shared replay store now;
+		// the gRPC auth path receives it via server.SetSharedReplayStore (read by
+		// NewGRPCServer below).
+		server.SetSharedReplayStore(redisClient)    // gRPC + HTTP auth paths
+		server.SetRateLimitRedisClient(redisClient) // shared rate-limit buckets
+		slog.Info("shared replay + rate-limit store enabled (multi-replica)",
+			"fail_mode", cfg.Head.EffectiveReplayFailMode())
+	} else {
+		slog.Info("no redis configured; using in-process replay cache + rate-limit buckets (single-replica)")
+	}
+
 	// Create HTTP router and server.
 	deps := &server.Dependencies{
 		Pool:             pool,
@@ -216,13 +252,19 @@ func main() {
 			MaxRetryDelaySeconds:    cfg.Head.EffectiveMaxRetryDelaySeconds(),
 			RetryDelayJitterPct:     cfg.Head.EffectiveRetryDelayJitterPct(),
 			TargetRequestRatePerSec: cfg.Head.EffectiveTargetRequestRatePerSec(),
-			// Layer 2: in-process dispatch cache (SINGLE-REPLICA ONLY).
+			// Layer 2/3: in-process dispatch cache.
 			ReadyPoolSize:           cfg.Head.EffectiveReadyPoolSize(),
 			RefillBatchSize:         cfg.Head.EffectiveRefillBatchSize(),
 			DispatchAdmissionCap:    cfg.Head.EffectiveDispatchAdmissionCap(),
 			MaintenanceAdmissionCap: cfg.Head.EffectiveMaintenanceAdmissionCap(),
 			FlushIntervalMs:         cfg.Head.EffectiveFlushIntervalMs(),
 			FlushBatchSize:          cfg.Head.EffectiveFlushBatchSize(),
+			// Layer 3: claim-on-refill. The instance id (configured or auto-generated)
+			// is this replica's dispatch-claim owner; the bulk refill stamps it on each
+			// staged unit so no other replica can double-hand it. Always set, so a
+			// single-replica deploy is correct too (it simply reclaims its own claims).
+			HeadInstanceID:    instanceID,
+			ClaimLeaseSeconds: cfg.Head.EffectiveClaimLeaseSeconds(),
 		})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
@@ -259,37 +301,59 @@ func main() {
 	monitorCtx, monitorCancel := context.WithCancel(ctx)
 	defer monitorCancel()
 
-	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, logger)
-	go faultMonitor.Start(monitorCtx)
-
-	// Layer 2: start the in-process dispatch cache (refiller + async flusher +
-	// reconciler). After this, RequestWorkUnit serves reservations from the cache
-	// with zero DB I/O on the hot path and sheds with ResourceExhausted under
-	// overload. SINGLE-REPLICA ONLY — run exactly one head against one database.
+	// Layer 3 scale-out: split background work into PER-REPLICA jobs (run on every
+	// head) and SINGLETON jobs (run on exactly one head — the advisory-lock leader).
+	//
+	// PER-REPLICA: the in-process dispatch cache (refiller + async flusher +
+	// reconciler). Each replica owns the dispatch claims it stamped at refill
+	// (claim-on-refill), so this MUST run everywhere — gating it would starve a
+	// non-leader replica of work. After this, RequestWorkUnit serves reservations
+	// from the cache with zero DB I/O on the hot path and sheds with
+	// ResourceExhausted under overload.
 	server.StartDispatchCache(volunteerSvc, monitorCtx)
 
+	// SINGLETON (leader-only): jobs that double-act or pollute derived data if run
+	// on every replica. A Postgres advisory lock elects exactly one leader; the
+	// leader runs the closure below under a child context that is cancelled the
+	// moment leadership is lost, so the jobs stop cleanly and a follower takes over.
+	//
+	//   - lazyManager: a per-leaf generation cursor read-modify-write with NO lock;
+	//     two replicas on the same tick double-generate units and clobber the cursor
+	//     (CONFIRMED-HARMFUL — the headline reason this gate exists).
+	//   - healthRecorder: a plain INSERT with no upsert; N replicas write duplicate
+	//     hourly metric rows that double-count operator dashboards.
+	//   - faultMonitor: deadline sweep + reassignment + lapsed-reservation reclaim +
+	//     the Layer 3 expired-dispatch-claim hygiene sweep. Its mutations are
+	//     single-winner-guarded (safe-but-wasteful), but gating eliminates duplicate
+	//     scans/logs AND keeps the hygiene sweep single-acting.
+	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
+	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
+	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, logger)
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
-	go staleVolunteerMonitor.Start(monitorCtx)
-
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
-	go racUpdater.Start(monitorCtx)
-
-	go challengeStore.StartCleanup(monitorCtx)
-
-	// Start lazy generation manager.
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
 	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, batchRepo, leafRepo, logger)
-	go lazyManager.Run(monitorCtx, 30*time.Second)
-
-	// Start operator health metrics recorder (always-on).
 	healthRecorder := health.NewRecorder(pool, stats.NewEngine(pool), leafRepo, logger)
-	go healthRecorder.Start(monitorCtx)
-	slog.Info("health metrics recorder started")
+
+	leadershipMgr := server.NewLeadershipManager(pool, logger)
+	go leadershipMgr.Run(monitorCtx, instanceID.String(), func(leaderCtx context.Context) {
+		// Each Start/Run blocks (ticker loop) and is started with its own goroutine
+		// on leaderCtx; all stop cleanly when leadership is lost or the head shuts
+		// down (leaderCtx is a child of monitorCtx, cancelled in either case).
+		go faultMonitor.Start(leaderCtx)
+		go staleVolunteerMonitor.Start(leaderCtx)
+		go racUpdater.Start(leaderCtx)
+		go challengeStore.StartCleanup(leaderCtx)
+		go lazyManager.Run(leaderCtx, 30*time.Second)
+		go healthRecorder.Start(leaderCtx)
+		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
+	})
 
 	slog.Info("startup complete",
 		"http_addr", cfg.Server.HTTPAddr,
 		"grpc_addr", cfg.Server.GRPCAddr,
 		"version", version,
+		"head_instance_id", instanceID.String(),
 	)
 
 	// Wait for graceful shutdown.

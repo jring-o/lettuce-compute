@@ -131,7 +131,6 @@ func (m *bvMockWURepo) Assign(_ context.Context, wuID types.ID, volID types.ID) 
 	}
 	return nil, apierror.NotFound("work_unit", wuID.String())
 }
-func (m *bvMockWURepo) UpdateHeartbeat(context.Context, types.ID) error { return nil }
 func (m *bvMockWURepo) CountByLeafAndState(context.Context, types.ID, workunit.WorkUnitState) (int64, error) {
 	return 0, nil
 }
@@ -144,7 +143,13 @@ func (m *bvMockWURepo) FindLapsedReservations(context.Context, int) ([]*workunit
 func (m *bvMockWURepo) FindDispatchableBatch(context.Context, int, []types.ID, []types.ID) ([]workunit.DispatchCandidate, error) {
 	return nil, nil
 }
-func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation) ([]types.ID, error) {
+func (m *bvMockWURepo) ClaimDispatchableBatch(context.Context, types.ID, time.Duration, int, []types.ID, []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) ClearExpiredDispatchClaims(context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]types.ID, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) CountActiveByVolunteer(context.Context) (map[types.ID]int, error) {

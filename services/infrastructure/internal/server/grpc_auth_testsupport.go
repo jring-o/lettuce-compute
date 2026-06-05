@@ -49,8 +49,64 @@ func ContextWithTestSigner(ctx context.Context, pub ed25519.PublicKey, priv ed25
 // linked into the production server.
 func SetGRPCSecurityForIntegrationTests() {
 	grpcReplayDetectionEnabled = false
+	ed25519ReplayDetectionEnabled = false
 	grpcRateLimit = 1_000_000
 	grpcPerPubkeyRateLimit = 1_000_000
+}
+
+// InstallSharedInMemReplayStoreForTests builds ONE in-memory replay store and
+// installs it as the shared cross-replica store for BOTH the gRPC auth path
+// (grpcSharedReplayStore, consumed by NewGRPCServer when no explicit store is
+// passed) and the HTTP/REST auth path (ed25519ReplayStore). It models the Layer-3
+// scale-out wiring where N head replicas share ONE global store: a signature
+// accepted by any replica is then rejected by every replica (key = signature alone,
+// GLOBAL), WITHOUT Redis. The in-process two-replica scale-out test calls this once
+// so both replicas' gRPC servers (built via NewGRPCServer) and HTTP handlers dedup
+// against the same store. Integration-only.
+func InstallSharedInMemReplayStoreForTests() {
+	store := newInMemReplayStore(ed25519TimestampSkew)
+	grpcSharedReplayStore = store
+	ed25519ReplayStore = store
+}
+
+// SetReplayDetectionForTests toggles BOTH replay-detection gates (gRPC + REST).
+// The integration harness disables detection globally (byte-identical loopback
+// replays), so the cross-replica replay-rejection test re-enables it for its
+// duration via t.Cleanup. Integration-only.
+func SetReplayDetectionForTests(enabled bool) {
+	grpcReplayDetectionEnabled = enabled
+	ed25519ReplayDetectionEnabled = enabled
+}
+
+// SignedAuthMetadataForTests builds the EXACT gRPC auth metadata (pubkey,
+// timestamp, signature, nonce) for one signed RPC, using the volunteer's keypair
+// and a single fresh nonce. Because the returned metadata.MD carries fixed
+// signature bytes, sending it to two replicas replays the SAME signature — the
+// cross-replica replay the shared store must reject. It mirrors
+// TestSigningInterceptor's canonical form exactly. Integration-only.
+//
+// fullMethod is the gRPC full method name (e.g.
+// lettucev1.VolunteerService_RequestWorkUnit_FullMethodName); req is the request
+// message; pub/priv are the volunteer's Ed25519 keypair.
+func SignedAuthMetadataForTests(fullMethod string, req proto.Message, pub ed25519.PublicKey, priv ed25519.PrivateKey) (metadata.MD, error) {
+	requestBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	unixTs := timeNow().Unix()
+	var nonceBytes [16]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
+		return nil, err
+	}
+	nonce := hex.EncodeToString(nonceBytes[:])
+	signed := canonicalGRPCAuthMessage(unixTs, fullMethod, requestBytes, nonce)
+	sig := ed25519.Sign(priv, []byte(signed))
+	return metadata.New(map[string]string{
+		grpcAuthPubKeyMeta:    string(pub),
+		grpcAuthTimestampMeta: strconv.FormatInt(unixTs, 10),
+		grpcAuthSignatureMeta: string(sig),
+		grpcAuthNonceMeta:     nonce,
+	}), nil
 }
 
 // TestSigningInterceptor returns a UnaryClientInterceptor that signs outgoing

@@ -36,10 +36,19 @@ type fakeWURepo struct {
 	stampFn         func(id, vol types.ID, lease time.Duration) (*workunit.WorkUnit, error)
 	// countFn backs the reconcile.
 	countFn func() (map[types.ID]int, error)
-	// dispatchFn backs FindDispatchableBatch (the refill); it observes the leaf scope.
+	// dispatchFn backs FindDispatchableBatch AND ClaimDispatchableBatch (the refill);
+	// it observes the leaf scope.
 	dispatchFn func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error)
 
 	flushedBatches int
+
+	// --- Layer 3 (claim-on-refill) observation fields ---
+	claimCalls          int
+	clearExpiredCalls   int
+	lastClaimHeadID     types.ID
+	lastClaimLease      time.Duration
+	lastFlushHeadID     types.ID
+	lastFlushClaimLease time.Duration
 }
 
 func (f *fakeWURepo) FindDispatchableBatch(_ context.Context, limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -52,9 +61,34 @@ func (f *fakeWURepo) FindDispatchableBatch(_ context.Context, limit int, exclude
 	return nil, nil
 }
 
-func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation) ([]types.ID, error) {
+// ClaimDispatchableBatch (Layer 3) reuses the same dispatchFn seam as
+// FindDispatchableBatch so existing fakes need no change; it records the claim
+// (headID, lease) the cache passed so scale-out tests can assert on it.
+func (f *fakeWURepo) ClaimDispatchableBatch(_ context.Context, headID types.ID, lease time.Duration, limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
+	f.mu.Lock()
+	f.claimCalls++
+	f.lastClaimHeadID = headID
+	f.lastClaimLease = lease
+	fn := f.dispatchFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(limit, excludeIDs, leafIDs)
+	}
+	return nil, nil
+}
+
+func (f *fakeWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clearExpiredCalls++
+	return 0, nil
+}
+
+func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
 	f.mu.Lock()
 	f.flushedBatches++
+	f.lastFlushHeadID = headID
+	f.lastFlushClaimLease = claimLease
 	fn := f.flushFn
 	f.mu.Unlock()
 	if fn != nil {

@@ -338,7 +338,7 @@ func TestEd25519Auth_ReplayedRequestRejected(t *testing.T) {
 func TestEd25519Auth_ExpiredTimestampNotCached(t *testing.T) {
 	// An expired timestamp must be rejected by the skew check BEFORE the replay
 	// cache is touched, so it never depends on (nor populates) the cache.
-	cache := newReplayCache(ed25519TimestampSkew)
+	store := newInMemReplayStore(ed25519TimestampSkew)
 	pubKey, privKey, _ := ed25519.GenerateKey(rand.Reader)
 	ts := time.Now().Add(-10 * time.Minute).Unix()
 	body := ""
@@ -347,12 +347,12 @@ func TestEd25519Auth_ExpiredTimestampNotCached(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Authorization", signRequest(t, privKey, pubKey, "POST", path, body, ts))
 
-	if _, err := verifyEd25519Auth(req, cache); err == nil {
+	if _, err := verifyEd25519Auth(req, store); err == nil {
 		t.Fatal("expected error for expired timestamp")
 	}
-	// The expired signature must not have been recorded in the cache.
-	if len(cache.seen) != 0 {
-		t.Fatalf("expired request should not populate the replay cache, size=%d", len(cache.seen))
+	// The expired signature must not have been recorded in the store.
+	if len(store.cache.seen) != 0 {
+		t.Fatalf("expired request should not populate the replay store, size=%d", len(store.cache.seen))
 	}
 }
 

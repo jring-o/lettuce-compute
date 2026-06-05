@@ -211,25 +211,25 @@ to `VALIDATED`, use `redundancy_factor: 2` until that's resolved.
   going to be big.
 - WASM has a hard 4 GB memory ceiling and no network.
 
-### 7. Cost shape (per-unit duration, total count, heartbeat)
+### 7. Cost shape (per-unit duration, total count, deadline strategy)
 
-Three numbers:
+Three things:
 
 - **Estimated wall-clock per work unit** (in seconds). Researcher guesses;
-  you confirm during the smoke-test phase later.
+  you confirm during the smoke-test phase later. This becomes the leaf's
+  `estimated_duration_seconds` (it also sizes how much work volunteers buffer).
 - **Total work units** (from step 3).
-- **Heartbeat interval and missed-threshold** — pick from:
+- **Deadline strategy.** Liveness is deadline-based: the head reassigns any
+  work unit not submitted by its deadline — there are NO per-task heartbeats.
 
-  | Per-unit duration | `heartbeat_interval_seconds` | `missed_heartbeats_threshold` |
-  |---|---|---|
-  | < 5 min | 60 | 3 |
-  | 5–30 min | 300 | 3 |
-  | 30 min – 3 h | 300 | 3 |
-  | 3+ h (long-running) | 1800 | 6 |
+For long-running leafs (hours+), set `no_deadline: true` so a wall-clock
+deadline doesn't kill genuine work; the head then reclaims a unit only after a
+generous ceiling (`no_deadline_ceiling_seconds`, default 6 h). (This is the
+GREP pattern.)
 
-For long-running leafs (hours+), set `no_deadline: true` so wall-clock
-deadline doesn't kill genuine work; liveness is heartbeat-only. (This
-is the GREP pattern.)
+(The leaf config still carries a legacy `heartbeat_interval_seconds` field that
+no longer drives liveness; the next skill fills a safe default, so you don't
+design around it.)
 
 ### 8. Aggregation (what does "the result" mean across all work units?)
 
@@ -288,9 +288,9 @@ from there. Use this template:
 - Estimated artifact size: <MB or GB if large>
 
 ## Cost
-- Per-unit estimate: <seconds / minutes>
+- Per-unit estimate: <seconds / minutes>  (→ estimated_duration_seconds)
 - Total work units: <N>
-- Heartbeat: every <s>s, missed threshold <n>
+- Deadline strategy: <default deadline / no_deadline for long-running>
 - `no_deadline:` <true/false>
 
 ## Aggregation

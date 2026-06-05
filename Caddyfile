@@ -1,13 +1,23 @@
 your-domain.com {
 	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
 
-	# gRPC — detect via content-type, proxy to infrastructure over h2c
+	# gRPC — detect via content-type, proxy to infrastructure over h2c.
+	# Horizontal scale-out: use a dynamic A-record upstream so Caddy re-resolves
+	# the `infrastructure` service DNS and fans out across ALL replica IPs
+	# (a bare `reverse_proxy infrastructure:9090` resolves once and can pin to a
+	# single replica). round_robin spreads volunteer gRPC across every head, so
+	# scaling HEAD_REPLICAS needs no Caddyfile edit.
 	@grpc header Content-Type application/grpc*
 	handle @grpc {
-		reverse_proxy infrastructure:9090 {
+		reverse_proxy {
+			dynamic a {
+				name infrastructure
+				port 9090
+			}
 			transport http {
 				versions h2c
 			}
+			lb_policy round_robin
 		}
 	}
 
@@ -25,9 +35,19 @@ your-domain.com {
 		file_server
 	}
 
-	# REST API — plain HTTP to infrastructure (Caddy terminates TLS)
+	# REST API — plain HTTP to infrastructure (Caddy terminates TLS).
+	# Dynamic A-record upstream + round_robin so the REST API fans out across all
+	# head replicas the same way the gRPC block does. Caddy forwards the real
+	# client IP in X-Forwarded-For; set LETTUCE_TRUSTED_PROXIES (already wired in
+	# compose.production.yaml) so the head buckets per real client, not per proxy.
 	handle /api/v1/* {
-		reverse_proxy infrastructure:8080
+		reverse_proxy {
+			dynamic a {
+				name infrastructure
+				port 8080
+			}
+			lb_policy round_robin
+		}
 	}
 
 	handle {

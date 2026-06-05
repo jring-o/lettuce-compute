@@ -9,12 +9,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
+	"github.com/lettuce-compute/infrastructure/internal/logging"
 )
 
 // ed25519TimestampSkew is the maximum allowed clock skew for Ed25519 signatures.
@@ -37,20 +39,37 @@ func PublicKeyFromContext(ctx context.Context) (ed25519.PublicKey, bool) {
 	return pk, ok
 }
 
-// ed25519ReplayCache is the package-level anti-replay cache shared by every
-// Ed25519-protected REST route. It rejects a signature that has already been
-// accepted within the clock-skew window (TTL = ed25519TimestampSkew). It reuses
-// the same replayCache type as the C1 gRPC auth fix. checkAndAdd evicts expired
-// entries on every insert, so the cache stays bounded by the skew window and no
-// janitor goroutine is required (and ed25519AuthRequired has no lifecycle to hang
-// one off, since it is a free per-route wrapper).
-var ed25519ReplayCache = newReplayCache(ed25519TimestampSkew)
+// ed25519ReplayStore is the package-level anti-replay store shared by every
+// Ed25519-protected REST route (browser / WASM volunteer path). It rejects a
+// signature already accepted within the clock-skew window (TTL =
+// ed25519TimestampSkew). Layer 3 makes this a swappable replayStore: by default it
+// is an in-process in-mem store (single-replica behavior, all existing tests
+// green); at boot SetEd25519ReplayStore replaces it with the SHARED store (Redis,
+// or one in-mem store shared with the gRPC path) so a signature accepted by one
+// replica is rejected by another. The dedup key is the SIGNATURE ALONE, GLOBAL.
+var ed25519ReplayStore replayStore = newInMemReplayStore(ed25519TimestampSkew)
+
+// SetEd25519ReplayStore swaps the REST-path replay store. Call once at startup,
+// before serving, to install the shared cross-replica store. A nil store is
+// ignored (keeps the default in-mem store) so callers can pass an unconditionally-
+// constructed value.
+func SetEd25519ReplayStore(store replayStore) {
+	if store != nil {
+		ed25519ReplayStore = store
+	}
+}
+
+// ed25519ReplayDetectionEnabled gates the REST anti-replay check, mirroring
+// grpcReplayDetectionEnabled. It is true in production; the integration-only test
+// seam flips it to false so e2e tests can replay byte-identical signed requests,
+// and the cross-replica replay test toggles it true for its duration.
+var ed25519ReplayDetectionEnabled = true
 
 // ed25519AuthRequired wraps an http.HandlerFunc to require a valid Ed25519 signature
 // in the Authorization header. Format: Ed25519 <base64url-pubkey>:<base64url-signature>:<unix-timestamp>
 func ed25519AuthRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		pubKey, err := verifyEd25519Auth(r, ed25519ReplayCache)
+		pubKey, err := verifyEd25519Auth(r, ed25519ReplayStore)
 		if err != nil {
 			apierror.WriteError(w, apierror.Unauthorized(err.Error()))
 			return
@@ -66,8 +85,8 @@ var timeNow = time.Now
 // verifyEd25519Auth parses and verifies the Ed25519 signature from the request.
 // The check order is: parse → timestamp-skew → signature verify → anti-replay.
 // The replay check runs only AFTER the signature is cryptographically verified so
-// that unauthenticated input can never populate the cache.
-func verifyEd25519Auth(r *http.Request, cache *replayCache) (ed25519.PublicKey, error) {
+// that unauthenticated input can never populate the store.
+func verifyEd25519Auth(r *http.Request, replay replayStore) (ed25519.PublicKey, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		return nil, fmt.Errorf("missing Authorization header")
@@ -147,11 +166,24 @@ func verifyEd25519Auth(r *http.Request, cache *replayCache) (ed25519.PublicKey, 
 		return nil, fmt.Errorf("invalid signature")
 	}
 
-	// Anti-replay: reject a signature we have already accepted within the skew
-	// window. Runs only after the signature is verified so unauthenticated input
-	// cannot populate the cache. now is the same timestamp used for the skew check.
-	if !cache.checkAndAdd(sigBytes, now) {
-		return nil, fmt.Errorf("replayed request")
+	// Anti-replay (Layer 3: SHARED across replicas). Reject a signature already
+	// accepted within the skew window. The dedup key is the SIGNATURE ALONE, GLOBAL,
+	// so a request accepted by replica A is rejected by replica B. Runs only after
+	// the signature is verified so unauthenticated input cannot populate the store.
+	if ed25519ReplayDetectionEnabled {
+		alreadySeen, serr := replay.SeenWithin(r.Context(), sigBytes, ed25519TimestampSkew)
+		if serr != nil {
+			// Store failure (e.g. Redis outage): apply the configured policy.
+			// Fail-open admits with a loud alarm (default); fail-closed rejects.
+			if !replayFailsOpen {
+				return nil, fmt.Errorf("replay store unavailable")
+			}
+			logging.LoggerFromContext(r.Context(), slog.Default()).Error(
+				"replay store error; admitting request (fail-open)",
+				"path", r.URL.Path, "error", serr)
+		} else if alreadySeen {
+			return nil, fmt.Errorf("replayed request")
+		}
 	}
 
 	return pubKey, nil

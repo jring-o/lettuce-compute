@@ -60,8 +60,9 @@ type Identity struct {
 // requests in the same second would sign the same string and produce the same
 // signature, which the server's signature-keyed replay cache would reject. The
 // nonce de-duplicates the signed bytes so each request is unique within the skew
-// window. A server that receives no nonce reconstructs the legacy
-// <unix-ts>:<method>:<hash> form instead (backward compatibility).
+// window. The nonce is REQUIRED, not optional: the head reconstructs the signed
+// message with the nonce and rejects any request without one as Unauthenticated
+// (there is no legacy no-nonce form — head and volunteers ship on the same release).
 //
 // If id is nil (discovery-only client built before registration), no auth metadata
 // is attached; the public discovery methods still succeed and any authenticated

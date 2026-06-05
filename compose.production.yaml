@@ -14,6 +14,23 @@ services:
       timeout: 5s
       retries: 5
 
+  # Shared store for horizontal scale-out (Layer 3). Backs the cross-replica
+  # anti-replay dedup (a signature accepted by one replica is rejected by all)
+  # and the cross-replica rate-limit buckets. REQUIRED when HEAD_REPLICAS > 1.
+  # With a single replica the head ignores LETTUCE_REDIS_URL only if it is
+  # empty; here it is always wired, which is harmless for one replica and means
+  # scaling up is a one-number change. No host port is published — only the
+  # infrastructure replicas on this private network reach it.
+  redis:
+    image: docker.io/library/redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   infrastructure:
     build:
       context: ./services/infrastructure
@@ -26,8 +43,27 @@ services:
         VERSION: ${LETTUCE_VERSION:-dev}
     init: true
     restart: unless-stopped
+    # Horizontal scale-out: the head is stateless behind Caddy, so the replica
+    # count is one number. Set HEAD_REPLICAS in .env (default 1). Each replica
+    # auto-generates a distinct LETTUCE_HEAD_INSTANCE_ID at boot (do NOT pin one
+    # — a shared id would collide dispatch-claim ownership), claims the units it
+    # stages (claim-on-refill), shares the replay/rate-limit store via redis, and
+    # contends for an advisory-lock leadership that runs the singleton background
+    # jobs on exactly one replica. Concurrent migration on N-replica boot is safe
+    # (golang-migrate takes an internal advisory lock). Infra publishes NO host
+    # ports — only Caddy (on this private network) reaches it — so >1 replica can
+    # coexist without host-port conflicts.
+    #
+    # SCALING: pass `--scale infrastructure=N` on the compose `up` command. NOTE:
+    # podman-compose IGNORES the `deploy.replicas` key below (verified v1.6.0) and
+    # runs ONE replica regardless of HEAD_REPLICAS — on podman you MUST use --scale.
+    # Docker Compose v2 honors deploy.replicas/HEAD_REPLICAS; --scale works on both.
+    deploy:
+      replicas: ${HEAD_REPLICAS:-1}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       LETTUCE_DB_HOST: postgres
@@ -49,6 +85,26 @@ services:
       LETTUCE_HEAD_DESCRIPTION: ${LETTUCE_HEAD_DESCRIPTION:-}
       LETTUCE_HEAD_URL: ${PLATFORM_URL}
       LETTUCE_CORS_ORIGINS: ${LETTUCE_CORS_ORIGINS:-}
+      # --- Horizontal scale-out (Layer 3) ---
+      # Shared store for the cross-replica replay dedup + rate-limit buckets.
+      # Always wired; with one replica it is harmless. REQUIRED when
+      # HEAD_REPLICAS > 1 (without it each replica keeps a private in-process
+      # replay cache and per-process rate-limit buckets, so a replayed signature
+      # passes a second replica and each client gets N× its rate budget).
+      LETTUCE_REDIS_URL: redis://redis:6379
+      # What to do when the shared replay store errors (e.g. a redis outage):
+      # "open" (default) admits the request with a loud alarm so a redis blip
+      # never takes the whole fleet offline or drops completed compute on
+      # SubmitResult; "closed" rejects it (stricter replay protection). Flip to
+      # closed only if you run adversarial workloads.
+      LETTUCE_REPLAY_FAIL_MODE: ${LETTUCE_REPLAY_FAIL_MODE:-}
+      # Per-head dispatch-claim lease (seconds). Optional; default 120. A held
+      # unit's claim is renewed every flush tick, so this is a backstop for a
+      # crashed/wedged replica, not the steady-state lifetime.
+      LETTUCE_HEAD_CLAIM_LEASE_SECONDS: ${LETTUCE_HEAD_CLAIM_LEASE_SECONDS:-}
+      # Do NOT set LETTUCE_HEAD_INSTANCE_ID here — each replica must auto-generate
+      # a unique UUID at boot. A pinned shared value would collide claim ownership
+      # across replicas.
       # Trust the X-Forwarded-For / X-Real-IP headers that Caddy adds, so the
       # infrastructure server can rate-limit and audit-log by the REAL client IP
       # instead of Caddy's container IP. Infra publishes no host ports — only

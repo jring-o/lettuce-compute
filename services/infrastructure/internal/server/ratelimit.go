@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -61,21 +62,57 @@ func (b *tokenBucket) allow(now time.Time) (allowed bool, remaining int, resetAt
 	return true, remaining, resetAt
 }
 
-// rateLimitStore is an in-memory store of token buckets keyed by client identity.
+// rateLimitRedisClient, when non-nil, is the shared cross-replica rate-limit store
+// (Layer 3, BREAK 3). It is installed once at startup via SetRateLimitRedisClient,
+// before any rateLimitStore is constructed/served, and is read by newRateLimitStore
+// so both the gRPC limiters (NewGRPCServer) and the HTTP limiter (rateLimitMiddleware)
+// pick it up without threading it through every constructor + test call site. nil =
+// in-process token buckets (single-replica behavior, all existing tests unchanged).
+var rateLimitRedisClient rateLimitCmd
+
+// SetRateLimitRedisClient installs the shared rate-limit store. Call once at
+// startup before the gRPC/HTTP servers are constructed. A nil client leaves the
+// in-process token-bucket behavior in place. Accepts redis.Cmdable (a *redis.Client
+// satisfies the narrow rateLimitCmd this uses).
+func SetRateLimitRedisClient(client redis.Cmdable) {
+	rateLimitRedisClient = client
+}
+
+// rateLimitStore is a store of per-client limiters. By default the limiters are
+// in-process token buckets; when a Redis client is installed (Layer 3, BREAK 3)
+// getBucket returns cross-replica fixed-window sharedBuckets instead, so a client's
+// budget is GLOBAL across all replicas rather than N× per process. The in-process
+// map is retained either way (it is the source for the stale-bucket reaper and for
+// the in-mem path); shared limiters hold no per-key in-process state worth reaping.
 type rateLimitStore struct {
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket
+
+	// redisClient, when non-nil, switches getBucket to cross-replica sharedBuckets.
+	// rlWindow is the fixed window for the shared path (one minute, matching the
+	// token-bucket refill period).
+	redisClient rateLimitCmd
+	rlWindow    time.Duration
 }
 
 func newRateLimitStore() *rateLimitStore {
 	return &rateLimitStore{
-		buckets: make(map[string]*tokenBucket),
+		buckets:     make(map[string]*tokenBucket),
+		rlWindow:    time.Minute,
+		redisClient: rateLimitRedisClient,
 	}
 }
 
-func (s *rateLimitStore) getBucket(key string, maxTokens int) *tokenBucket {
+// getBucket returns the limiter for key. With a Redis client installed it returns
+// a cross-replica sharedBucket (no per-key in-process allocation retained);
+// otherwise it returns (and memoizes) an in-process tokenBucket.
+func (s *rateLimitStore) getBucket(key string, maxTokens int) limiter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.redisClient != nil {
+		return newSharedBucket(s.redisClient, key, maxTokens, s.rlWindow)
+	}
 
 	b, ok := s.buckets[key]
 	if !ok {

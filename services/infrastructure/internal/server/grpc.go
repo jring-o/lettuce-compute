@@ -47,7 +47,14 @@ const grpcMaxMsgSize = 128 * 1024 * 1024 // 128 MB
 //
 // logging/recovery remain outermost so every request is still logged and panics
 // recovered even when rate-limiting or authentication rejects the call.
-func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*net.IPNet) (*grpc.Server, func()) {
+//
+// replay is the OPTIONAL cross-replica anti-replay store (Layer 3). When supplied
+// (and non-nil) it is shared with the auth interceptor so a signature accepted by
+// one replica is rejected by another. When omitted (the variadic is empty) or nil,
+// a fresh in-process in-mem store is built — single-replica behavior, and what
+// every existing call site that passes no store gets. Pass at most one store; any
+// extra are ignored.
+func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*net.IPNet, replay ...replayStore) (*grpc.Server, func()) {
 	// Pre-auth per-IP rate limiter. Uses the same rateLimitStore/tokenBucket
 	// pattern as the HTTP limiter, with its own store and cleanup goroutine.
 	ipStore := newRateLimitStore()
@@ -65,7 +72,22 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*ne
 	// signature carried in gRPC metadata and binds the proven public key into the
 	// context. Ordered after logging/recovery so requests are still logged and
 	// panics recovered even when authentication fails.
-	authIntercept, authCleanup := authInterceptor()
+	//
+	// The replay store is shared with the auth interceptor (Layer 3): a supplied,
+	// non-nil store (tests) makes the anti-replay dedup GLOBAL across replicas;
+	// otherwise the package-level shared store installed by SetSharedReplayStore
+	// (production multi-replica) is used; failing that, a fresh in-process in-mem
+	// store gives single-replica behavior.
+	var replayStr replayStore
+	switch {
+	case len(replay) > 0 && replay[0] != nil:
+		replayStr = replay[0]
+	case grpcSharedReplayStore != nil:
+		replayStr = grpcSharedReplayStore
+	default:
+		replayStr = newInMemReplayStore(ed25519TimestampSkew)
+	}
+	authIntercept, authCleanup := authInterceptor(replayStr)
 
 	opts := []grpc.ServerOption{
 		// M3: bound memory from oversized messages. The default gRPC receive cap is

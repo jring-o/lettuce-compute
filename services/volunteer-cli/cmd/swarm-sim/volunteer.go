@@ -89,13 +89,17 @@ type simVolunteer struct {
 	buffer []heldUnit
 }
 
-func newSimVolunteer(cfg *simConfig, m *metrics, seed int64) (*simVolunteer, error) {
+// newSimVolunteer builds one simulated volunteer. target is the gRPC address it
+// connects to; for a single-head run it is cfg.headGRPC, and for a multi-head
+// scale-out run the caller passes one of the round-robin-assigned replica
+// addresses so the fleet is spread across all heads.
+func newSimVolunteer(cfg *simConfig, m *metrics, seed int64, target string) (*simVolunteer, error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate volunteer key: %w", err)
 	}
 	cl, err := client.New(client.ClientConfig{
-		ServerURL: cfg.headGRPC,
+		ServerURL: target,
 		Insecure:  true,
 		Identity:  &client.Identity{PublicKey: pub, PrivateKey: priv},
 	}, cfg.logger)

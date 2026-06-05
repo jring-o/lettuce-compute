@@ -19,6 +19,10 @@ const (
 	defaultRetryDelayJitterPct     = 0.20
 	defaultTargetRequestRatePerSec = 500.0
 	defaultLeaseSeconds            = 900
+	// defaultClaimLeaseSeconds mirrors config.defaultClaimLeaseSeconds: the per-head
+	// dispatch-claim lease (Layer 3) used when scale-out is enabled but no explicit
+	// claim lease was configured.
+	defaultClaimLeaseSeconds = 120
 	// defaultTargetAssignLatency is the FindNextAssignable/reserve duration that
 	// maps to latency saturation 1.0. SIMULATOR-CALIBRATED.
 	defaultTargetAssignLatency = 50 * time.Millisecond

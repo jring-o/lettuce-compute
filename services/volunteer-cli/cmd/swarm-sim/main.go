@@ -50,6 +50,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -83,8 +84,8 @@ type options struct {
 func parseFlags(args []string) (*options, error) {
 	fs := flag.NewFlagSet("swarm-sim", flag.ContinueOnError)
 	o := &options{}
-	fs.StringVar(&o.headGRPC, "head-grpc", "127.0.0.1:9090", "head gRPC address host:port")
-	fs.StringVar(&o.headHTTP, "head-http", "http://127.0.0.1:8080", "head HTTP base URL (for seeding)")
+	fs.StringVar(&o.headGRPC, "head-grpc", "127.0.0.1:9090", "head gRPC address(es) host:port — COMMA-SEPARATED for a multi-head scale-out run; the fleet is spread round-robin across the listed heads, so a load test can hit N replicas directly (no proxy) and the no-double-dispatch audit exercises every replica's refiller")
+	fs.StringVar(&o.headHTTP, "head-http", "http://127.0.0.1:8080", "head HTTP base URL (for seeding; one head is enough since all replicas share one database)")
 	fs.StringVar(&o.adminKey, "admin-key", os.Getenv("LETTUCE_ADMIN_API_KEY"), "admin API key for seeding (defaults to $LETTUCE_ADMIN_API_KEY)")
 
 	fs.IntVar(&o.volunteers, "volunteers", 100, "number of simulated volunteers")
@@ -119,7 +120,26 @@ func parseFlags(args []string) (*options, error) {
 	if o.maxAssign < 1 {
 		return nil, fmt.Errorf("--max-assignments must be >= 1")
 	}
+	if len(o.headGRPCTargets()) == 0 {
+		return nil, fmt.Errorf("--head-grpc must list at least one host:port")
+	}
 	return o, nil
+}
+
+// headGRPCTargets splits the comma-separated --head-grpc value into one or more
+// gRPC target addresses, trimming whitespace and dropping empty entries. A
+// single address (the default) yields a one-element slice; multiple addresses
+// drive a multi-head scale-out load test where the fleet is spread round-robin
+// across the listed replicas (so every replica's dispatch refiller is exercised
+// and the post-run no-double-dispatch DB audit covers all of them).
+func (o *options) headGRPCTargets() []string {
+	var targets []string
+	for _, t := range strings.Split(o.headGRPC, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			targets = append(targets, t)
+		}
+	}
+	return targets
 }
 
 func main() {
@@ -175,8 +195,9 @@ func runSimulation(ctx context.Context, o *options, logger *slog.Logger) (report
 		logger.Info("seeded leaf", "leaf", o.seedLeaf, "leaf_id", leafID, "units_created", res.UnitsCreated, "reused", res.Reused)
 	}
 
+	targets := o.headGRPCTargets()
 	cfg := &simConfig{
-		headGRPC:      o.headGRPC,
+		headGRPC:      targets[0],
 		profile:       profileKind(o.profile),
 		leafID:        leafID,
 		naiveInterval: o.naiveInterval,
@@ -197,14 +218,21 @@ func runSimulation(ctx context.Context, o *options, logger *slog.Logger) (report
 		}
 	}()
 
-	logger.Info("building fleet", "volunteers", o.volunteers, "profile", o.profile)
+	if len(targets) > 1 {
+		logger.Info("building fleet (multi-head scale-out)", "volunteers", o.volunteers, "profile", o.profile, "heads", targets)
+	} else {
+		logger.Info("building fleet", "volunteers", o.volunteers, "profile", o.profile)
+	}
 	regCtx, regCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer regCancel()
 	var regWG sync.WaitGroup
 	regErrs := make(chan error, o.volunteers)
 	sem := make(chan struct{}, 64) // bound concurrent registrations
 	for i := 0; i < o.volunteers; i++ {
-		v, err := newSimVolunteer(cfg, m, int64(i)+1)
+		// Spread the fleet round-robin across the configured heads so a
+		// multi-head run exercises every replica's dispatch refiller.
+		target := targets[i%len(targets)]
+		v, err := newSimVolunteer(cfg, m, int64(i)+1, target)
 		if err != nil {
 			return report{}, fmt.Errorf("creating volunteer %d: %w", i, err)
 		}

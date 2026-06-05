@@ -61,7 +61,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/lettuce-compute/lettuce/services/infrastructure/internal/database"
+	"github.com/lettuce-compute/infrastructure/internal/database"
 )
 
 func main() {

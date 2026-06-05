@@ -20,15 +20,16 @@ Pick a path:
 
 ## What you're deploying (production)
 
-A production head is five containers behind one domain, all traffic on port 443:
+A production head is six containers behind one domain, all traffic on port 443:
 
 | Container | What it does |
 |-----------|--------------|
 | **postgres** | PostgreSQL database — stores leafs, work units, results, volunteers |
-| **infrastructure** | Go server — task distribution, result validation, credit tracking |
+| **infrastructure** | Go server — task distribution, result validation, credit tracking. Runs as N stateless replicas — scale with `--scale infrastructure=N` (default 1). |
+| **redis** | Shared store for the cross-replica replay dedup + rate-limit buckets. Used when you run more than one `infrastructure` replica (see [Horizontal scale-out](#horizontal-scale-out)). |
 | **dashboard** | Next.js web app — public leaf browser + admin console |
 | **registry** | OCI image registry — hosts container images for container leafs |
-| **caddy** | Reverse proxy — automatic HTTPS, routes everything on port 443 |
+| **caddy** | Reverse proxy — automatic HTTPS, routes everything on port 443, load-balances across head replicas |
 
 Caddy routes by request:
 
@@ -373,18 +374,19 @@ docker compose -f compose.production.yaml up -d
 ```
 
 Migrations run automatically on startup. This release adds a migration
-(`00002_work_unit_reservations`) that adds nullable `reserved_until` /
-`reserved_volunteer_id` columns to `work_units`; it applies automatically and
-needs no data migration. A reserved (buffered) unit stays `QUEUED` with
-`reserved_until > now()` and is invisible to deadline/abandonment reclaim until
-the volunteer actually starts running it.
+(`00003_dispatch_claims`) that adds nullable `dispatch_claimed_by` /
+`dispatch_claim_expires_at` columns to `work_units` plus a partial index; it
+applies automatically and needs no data migration. These columns carry the
+per-head dispatch claim that makes [horizontal scale-out](#horizontal-scale-out)
+safe. Booting several replicas at once is safe — the migration runner takes an
+internal advisory lock, so exactly one replica applies the migration and the
+others wait.
 
-> **Breaking release — head and all volunteers update together.** This release
-> redesigns the volunteer⇄head work protocol (server-directed retry delay, work
-> batching, leased buffered work). **A volunteer older than this release cannot
-> talk to the new head.** Redeploy the head first, then update every volunteer
-> binary (and the desktop-app sidecar). See the volunteer setup guide for the
-> volunteer-side note.
+> **Volunteers are unaffected by this release.** Horizontal scale-out is entirely
+> head-internal — there is **no change to the volunteer⇄head protocol**. Volunteers
+> keep speaking the same protocol and simply reach a proxy in front of N replicas
+> instead of one head. You do **not** need to update volunteer binaries for this
+> release.
 
 ### Work dispatch tuning
 
@@ -409,7 +411,7 @@ client IP (and per authenticated key) rather than sharing one proxy-IP bucket.
 The per-pubkey limiter sits *after* auth, so it does not shed
 signature-verification cost — the per-IP ceiling is the only pre-auth layer.
 
-### Dispatch cache (and why you run exactly ONE head)
+### Dispatch cache
 
 To keep Postgres off the work-request hot path, the head serves assignments from
 an **in-process dispatch cache**: a background refiller bulk-fetches queued units
@@ -423,15 +425,14 @@ buffered unit has begun executing), and **liveness is deadline-based**: a unit n
 submitted by its deadline is reassigned, and a buffered unit not started before its
 reservation lapses is reclaimed. There are no per-task heartbeats.
 
-> **⚠️ Run exactly ONE head replica.** The dispatch cache is an in-process ledger
-> that assumes a single writer owns "which queued unit is offered to whom." Two head
-> processes pointed at the same database would each refill independently and **hand
-> the same work unit to two volunteers** — a correctness bug, not just wasted work.
-> Do **not** run multiple head replicas against one database. Horizontal scale-out
-> (multiple coordinating replicas) is a planned later layer, not supported today.
-> Note that browser/WASM units are dispatched by a separate immediate-assign path,
-> partitioned from the cache by runtime, so within a single replica there is exactly
-> one writer per unit — but this partition does **not** make multiple replicas safe.
+> **Running more than one head?** The dispatch cache is safe across multiple
+> replicas: each replica stamps a **per-head dispatch claim** on the queued units
+> it stages (claim-on-refill), so a unit held in one replica's memory is invisible
+> to every other replica's refiller and is never handed to two volunteers. See
+> **[Horizontal scale-out](#horizontal-scale-out)** below for how to run N replicas.
+> Single-replica deploys are unchanged — a single head simply re-claims its own
+> units. Browser/WASM units are dispatched by a separate immediate-assign path,
+> partitioned from the cache by runtime.
 
 These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 
@@ -466,6 +467,92 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > in parallel and cross-check immediately, that is **not** what happens; you get
 > sequential re-validation on reassignment instead. True concurrent redundant dispatch
 > needs a per-volunteer dispatch table and arrives in a later layer.
+
+### Horizontal scale-out
+
+The head is **stateless** and can run as **N replicas** behind Caddy against one
+shared Postgres. The replica count is a single number.
+
+```bash
+# In .env:
+HEAD_REPLICAS=2          # run two head replicas (default 1)
+
+docker compose -f compose.production.yaml up -d --build --scale infrastructure=2
+# podman: podman-compose -f compose.production.yaml up -d --build --scale infrastructure=2
+```
+
+> **⚠️ podman: use `--scale`, not `HEAD_REPLICAS`.** `podman-compose` **ignores** the
+> `deploy.replicas` key (verified on podman-compose 1.6.0), so the `HEAD_REPLICAS`
+> value above silently runs only **one** replica. Always pass `--scale infrastructure=N`
+> on the `up` command. (Docker Compose v2 honors `HEAD_REPLICAS` via `deploy.replicas`;
+> `--scale` works on both, so prefer it.)
+
+That's the whole change. Caddy fans out volunteer gRPC and the REST API across all
+replicas automatically (dynamic upstreams), so you never edit the `Caddyfile` to
+scale. Each replica:
+
+- Auto-generates a **distinct head instance id** at boot (do **not** pin
+  `LETTUCE_HEAD_INSTANCE_ID` — a shared id collides dispatch-claim ownership). The
+  id appears as a log field, so you can confirm both replicas are receiving traffic:
+
+  ```bash
+  docker compose -f compose.production.yaml logs infrastructure | grep instance_id
+  ```
+
+- **Claims the work units it stages** (claim-on-refill): a unit held in one
+  replica's memory is invisible to every other replica's refiller, so **no unit is
+  handed to two volunteers** across replicas. A crashed replica's claims expire and
+  any survivor re-claims the units on its next refill.
+- Shares the **replay store** and **rate-limit buckets** through the bundled
+  `redis` service, so a captured signed request replayed to a *different* replica is
+  rejected, and each client gets its intended rate budget (not N× it).
+- Contends for an **advisory-lock leadership**: exactly one replica (the leader)
+  runs the singleton background jobs (lazy work-unit generation, health metrics, the
+  fault-monitor sweep + reclaim). If the leader crashes, a follower takes over within
+  ~15 seconds.
+
+#### What the `redis` service is for
+
+Running **more than one replica** **requires** the `redis` service (it is started for you
+in `compose.production.yaml`). It backs two cross-replica concerns:
+
+- **Anti-replay.** Each authenticated request carries a one-time signature. With one
+  head, an in-process cache rejects a replay; with N heads that cache must be shared,
+  or a captured request replayed to a second replica would slip through. Redis holds
+  the shared, global signature dedup (keyed on the signature alone), TTL = the 5-minute
+  signature-skew window.
+- **Rate-limit fairness.** Per-IP and per-pubkey budgets become global counters, so a
+  client does not get N× its budget by hitting different replicas.
+
+**Failure policy (default fail-open).** If Redis is briefly unreachable, the head
+**admits** the request and logs a loud error rather than rejecting authenticated
+traffic — a Redis blip never takes the whole fleet offline or drops completed compute
+on `SubmitResult`. Set `LETTUCE_REPLAY_FAIL_MODE=closed` to flip to strict rejection
+if you run adversarial workloads. Run Redis with `restart: unless-stopped` (already
+set). A single-replica deploy that leaves `LETTUCE_REDIS_URL` empty never touches this
+path and keeps the in-process cache.
+
+#### Client IP behind the proxy
+
+The pre-auth per-IP rate limiter must see the **real** client IP, not Caddy's. The
+bundled `compose.production.yaml` already sets `LETTUCE_TRUSTED_PROXIES` to the Docker
+network and Caddy forwards the client IP, so this works out of the box. If you front
+the head with a *different* proxy, set `LETTUCE_TRUSTED_PROXIES` to that proxy's network
+and make it forward the client IP — otherwise every client collapses into one bucket
+keyed on the proxy IP and the whole fleet is throttled together.
+
+#### Honest limitations
+
+- **Rate-limit window.** Cross-replica budgets use a fixed window, which permits up to
+  2× the limit across a window boundary. This is a DoS backstop, not a security
+  boundary; the burst is accepted.
+- **Per-volunteer inflight cap** can transiently over-admit across replicas (a volunteer
+  may briefly hold a few more units than the configured max while replicas reconcile).
+  It self-corrects within the ~30s reconcile and never corrupts or strands work.
+- **Leader-failover reclaim pause.** During the ≤15s window after a leader crash, the
+  singleton reclaim/sweep jobs pause. This is bounded and well below the reservation
+  lease (900s) and deadlines, so it only delays — never breaks — reclaim. Passive
+  re-claim of crashed-replica dispatch claims needs no leader and is unaffected.
 
 ### Back up
 

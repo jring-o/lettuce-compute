@@ -15,6 +15,21 @@ services:
       timeout: 5s
       retries: 5
 
+  # Shared store for horizontal scale-out (Layer 3). The dev stack runs ONE head
+  # replica (single-replica is unchanged), so redis is wired but not strictly
+  # required here; it lets you exercise the multi-replica code path locally. To
+  # actually run >1 dev replica, drop the infrastructure host-port mappings below
+  # (a published port cannot be shared by replicas) and front the replicas with a
+  # proxy, or use compose.production.yaml with `--scale infrastructure=N`.
+  redis:
+    image: docker.io/library/redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   infrastructure:
     build:
       context: ./services/infrastructure
@@ -22,6 +37,8 @@ services:
     init: true
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       LETTUCE_DB_HOST: postgres
@@ -34,6 +51,9 @@ services:
       LETTUCE_SERVER_GRPC_ADDR: ":9090"
       LETTUCE_LOG_LEVEL: debug
       LETTUCE_LOG_FORMAT: json
+      # Shared replay + rate-limit store (Layer 3). Wired so the dev stack
+      # exercises the multi-replica code path; harmless with one replica.
+      LETTUCE_REDIS_URL: redis://redis:6379
       LETTUCE_ADMIN_API_KEY: dev-admin-key-not-for-production
       # The signing key fails closed (fatal) when missing in production. The dev
       # stack mounts no pre-generated key, so explicitly opt into auto-generating

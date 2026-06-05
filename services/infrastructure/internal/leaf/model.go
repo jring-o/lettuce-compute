@@ -119,8 +119,14 @@ type ValidationConfig struct {
 	SpotCheckPercentage float64  `json:"spot_check_percentage"`
 }
 
-// FaultToleranceConfig defines heartbeat and deadline settings.
+// FaultToleranceConfig defines deadline-based reassignment settings.
 type FaultToleranceConfig struct {
+	// HeartbeatIntervalSeconds and MissedHeartbeatsThreshold are DEPRECATED and
+	// INERT: v0.3.0 removed per-task heartbeats in favour of deadline-based
+	// reassignment (DeadlineMultiplier + the StartWork-stamped reclaim deadline).
+	// They are no longer required, range-checked, or read by any liveness logic.
+	// The fields are retained only so older callers that still send them do not
+	// break; new callers should omit them.
 	HeartbeatIntervalSeconds  int     `json:"heartbeat_interval_seconds"`
 	MissedHeartbeatsThreshold int     `json:"missed_heartbeats_threshold"`
 	DeadlineMultiplier        float64 `json:"deadline_multiplier"`

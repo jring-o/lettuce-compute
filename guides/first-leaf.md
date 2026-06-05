@@ -187,8 +187,6 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_retries": 3
     },
     "fault_tolerance_config": {
-      "heartbeat_interval_seconds": 60,
-      "missed_heartbeats_threshold": 3,
       "deadline_multiplier": 3.0,
       "max_reassignments": 3
     },
@@ -364,8 +362,6 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_retries": 3
     },
     "fault_tolerance_config": {
-      "heartbeat_interval_seconds": 60,
-      "missed_heartbeats_threshold": 3,
       "deadline_multiplier": 3.0,
       "max_reassignments": 3
     },

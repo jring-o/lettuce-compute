@@ -153,7 +153,6 @@ func (m *mockWorkUnitRepo) ClearReservation(_ context.Context, _, _ types.ID) (*
 func (m *mockWorkUnitRepo) Assign(_ context.Context, _ types.ID, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWorkUnitRepo) UpdateHeartbeat(_ context.Context, _ types.ID) error { return nil }
 func (m *mockWorkUnitRepo) FindExpiredWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
@@ -163,7 +162,13 @@ func (m *mockWorkUnitRepo) FindLapsedReservations(_ context.Context, _ int) ([]*
 func (m *mockWorkUnitRepo) FindDispatchableBatch(_ context.Context, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
 	return nil, nil
 }
-func (m *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation) ([]types.ID, error) {
+func (m *mockWorkUnitRepo) ClaimDispatchableBatch(_ context.Context, _ types.ID, _ time.Duration, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
+	return 0, nil
+}
+func (m *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation, _ types.ID, _ time.Duration) ([]types.ID, error) {
 	return nil, nil
 }
 func (m *mockWorkUnitRepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {

@@ -175,9 +175,14 @@ with a large fleet:
 - **Per-client rate limiting** — the gRPC port is rate-limited per real client IP
   (trust-aware behind a reverse proxy) and per authenticated volunteer key.
 
-> **Run exactly one head replica.** Dispatch is owned by an in-process cache;
-> running two head processes against one database would hand the same work unit to
-> two volunteers. Horizontal scale-out across replicas is a planned later layer.
+> **Horizontal scale-out is supported.** The head is stateless and runs as N
+> replicas behind Caddy against one shared Postgres — scale with
+> `--scale infrastructure=N` on the compose `up` (podman-compose ignores
+> `deploy.replicas`/`HEAD_REPLICAS` — verified on podman-compose 1.6.0 — so
+> `--scale` is the working knob; Docker Compose honors both). A bundled redis backs
+> the cross-replica replay dedup + rate-limit buckets, and exactly one head still
+> owns each work unit via claim-on-refill, so no unit is handed to two volunteers.
+> See [`guides/head-setup.md`](guides/head-setup.md) → "Horizontal scale-out".
 
 Heads and volunteers ship together as a breaking release: a volunteer older than
 the head's protocol version cannot attach. Update the head first, then volunteers.
