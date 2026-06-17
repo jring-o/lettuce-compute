@@ -401,3 +401,102 @@ func TestGRPCRateLimitInterceptor_TrustedProxyBucketsPerClient(t *testing.T) {
 		t.Fatalf("clientB should have an independent bucket: got %v", err)
 	}
 }
+
+// --- in-flight work-lifecycle exemption (TODO #32) ---
+
+// TestIsRateLimitExempt verifies the trailing-method-name classification: the
+// in-flight lifecycle RPCs are exempt; the discovery/registration/public methods
+// are not. Independent of the proto package path prefix.
+func TestIsRateLimitExempt(t *testing.T) {
+	exempt := []string{"StartWork", "SubmitResult", "AbandonWorkUnit", "SaveCheckpoint", "GetCheckpoint"}
+	for _, m := range exempt {
+		if !isRateLimitExempt("/lettuce.v1.VolunteerService/" + m) {
+			t.Errorf("%s should be exempt", m)
+		}
+		// Path-prefix independence.
+		if !isRateLimitExempt("/some.other.pkg.Svc/" + m) {
+			t.Errorf("%s should be exempt regardless of package path", m)
+		}
+	}
+	limited := []string{"RegisterVolunteer", "RequestWorkUnit", "GetServerStatus", "GetHeadInfo", "GetWorkUnitStatus"}
+	for _, m := range limited {
+		if isRateLimitExempt("/lettuce.v1.VolunteerService/" + m) {
+			t.Errorf("%s must NOT be exempt", m)
+		}
+	}
+}
+
+// TestGRPCRateLimit_LifecycleMethodsExempt verifies that the in-flight lifecycle
+// RPCs sail past BOTH limiters even when the budgets are tiny, while
+// RequestWorkUnit on the same IP/pubkey is still throttled — i.e. a fast volunteer
+// can always finish work it holds, but new-work discovery stays limited.
+func TestGRPCRateLimit_LifecycleMethodsExempt(t *testing.T) {
+	oldIP, oldPK := grpcRateLimit, grpcPerPubkeyRateLimit
+	grpcRateLimit, grpcPerPubkeyRateLimit = 2, 2
+	defer func() { grpcRateLimit, grpcPerPubkeyRateLimit = oldIP, oldPK }()
+
+	// Per-IP interceptor: StartWork/SubmitResult from one IP, far past the limit.
+	t.Run("per-IP exempt", func(t *testing.T) {
+		store := newRateLimitStore()
+		ic := grpcRateLimitInterceptor(store, nil)
+		for _, m := range []string{"StartWork", "SubmitResult", "AbandonWorkUnit", "SaveCheckpoint", "GetCheckpoint"} {
+			info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/" + m}
+			for i := 0; i < 10; i++ {
+				ctx := peerCtx("198.51.100.10:5555", "", "")
+				var ran bool
+				if _, err := ic(ctx, nil, info, okHandler(&ran)); err != nil {
+					t.Fatalf("%s call %d should be exempt from per-IP limit: got %v", m, i+1, err)
+				}
+			}
+		}
+		// New-work request from the SAME IP is still throttled past the budget.
+		rwu := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/RequestWorkUnit"}
+		for i := 0; i < grpcRateLimit; i++ {
+			ctx := peerCtx("198.51.100.10:5555", "", "")
+			var ran bool
+			if _, err := ic(ctx, nil, rwu, okHandler(&ran)); err != nil {
+				t.Fatalf("RequestWorkUnit call %d: unexpected error %v", i+1, err)
+			}
+		}
+		ctx := peerCtx("198.51.100.10:5555", "", "")
+		var ran bool
+		if _, err := ic(ctx, nil, rwu, okHandler(&ran)); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("RequestWorkUnit over budget: want ResourceExhausted, got %v", err)
+		}
+	})
+
+	// Per-pubkey interceptor: SubmitResult from one pubkey, far past the limit.
+	t.Run("per-pubkey exempt", func(t *testing.T) {
+		store := newRateLimitStore()
+		ic := grpcPerPubkeyRateLimitInterceptor(store)
+		pk := newPubkey(t)
+		for _, m := range []string{"StartWork", "SubmitResult", "AbandonWorkUnit", "SaveCheckpoint", "GetCheckpoint"} {
+			info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/" + m}
+			for i := 0; i < 10; i++ {
+				ctx := contextWithGRPCAuthPublicKey(context.Background(), pk)
+				var ran bool
+				if _, err := ic(ctx, nil, info, okHandler(&ran)); err != nil {
+					t.Fatalf("%s call %d should be exempt from per-pubkey limit: got %v", m, i+1, err)
+				}
+			}
+		}
+		// Exempt methods must mint NO per-pubkey buckets.
+		if len(store.buckets) != 0 {
+			t.Fatalf("exempt methods should mint no per-pubkey buckets, got %d", len(store.buckets))
+		}
+		// RequestWorkUnit from the SAME pubkey is still throttled past the budget.
+		rwu := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/RequestWorkUnit"}
+		for i := 0; i < grpcPerPubkeyRateLimit; i++ {
+			ctx := contextWithGRPCAuthPublicKey(context.Background(), pk)
+			var ran bool
+			if _, err := ic(ctx, nil, rwu, okHandler(&ran)); err != nil {
+				t.Fatalf("RequestWorkUnit call %d: unexpected error %v", i+1, err)
+			}
+		}
+		ctx := contextWithGRPCAuthPublicKey(context.Background(), pk)
+		var ran bool
+		if _, err := ic(ctx, nil, rwu, okHandler(&ran)); status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("RequestWorkUnit over budget: want ResourceExhausted, got %v", err)
+		}
+	})
+}
