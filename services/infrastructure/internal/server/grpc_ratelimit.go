@@ -51,6 +51,50 @@ func SetGRPCRateLimits(perIPPerMin, perPubkeyPerMin int) {
 	}
 }
 
+// rateLimitExemptMethods are the in-flight work-lifecycle RPCs a volunteer can
+// only call for an assignment it ALREADY holds: StartWork (run-start on a unit it
+// reserved), SubmitResult / AbandonWorkUnit (on a unit it is running), and the
+// checkpoint pair. They are EXEMPT from both the per-IP and per-pubkey
+// request-rate limiters (keyed by trailing method name, see isRateLimitExempt).
+//
+// Why exempt: their rate is already bounded by max_inflight_per_volunteer and the
+// volunteer's genuine completion speed, and the Layer-2 dispatch-cache admission
+// semaphore is the correct backpressure for the DB load they incur (it sheds them
+// with ResourceExhausted ONLY under real DB-pool pressure). Shedding them via the
+// request-rate limiter is never desirable: it drops prepared work at run-start,
+// strands a completed result (credit loss on the redundancy-1 reassignment race),
+// or leaks a stale reservation (a shed AbandonWorkUnit). Sub-second-unit leafs
+// (beyblade) make a single honest volunteer emit 200+ of these per minute once
+// batch sizes reached 64 — far past the 60/min per-IP ceiling — so the limiter was
+// shedding volunteers trying to finish their own work (TODO #32).
+//
+// Only the new-work/discovery surface (RegisterVolunteer, RequestWorkUnit) and the
+// public methods remain rate-limited. Residual: the per-IP limiter no longer caps
+// Ed25519-verify cost for these methods, but a forged-signature flood is still
+// rejected at the auth interceptor (one verify, no DB/handler work) and the
+// expensive unauthenticated surfaces stay per-IP capped, so the crypto-DoS
+// exposure increase is minor.
+var rateLimitExemptMethods = map[string]struct{}{
+	"StartWork":       {},
+	"SubmitResult":    {},
+	"AbandonWorkUnit": {},
+	"SaveCheckpoint":  {},
+	"GetCheckpoint":   {},
+}
+
+// isRateLimitExempt reports whether a gRPC full method (e.g.
+// "/lettuce.v1.VolunteerService/StartWork") is an in-flight work-lifecycle RPC
+// exempt from request-rate limiting. It matches on the trailing method name so it
+// is independent of the proto package path.
+func isRateLimitExempt(fullMethod string) bool {
+	name := fullMethod
+	if i := strings.LastIndex(fullMethod, "/"); i >= 0 {
+		name = fullMethod[i+1:]
+	}
+	_, ok := rateLimitExemptMethods[name]
+	return ok
+}
+
 // grpcRateLimitInterceptor applies pre-auth per-IP rate limiting to gRPC calls.
 // Uses the same rateLimitStore/tokenBucket pattern as the HTTP rate limiter.
 //
@@ -59,8 +103,14 @@ func SetGRPCRateLimits(perIPPerMin, perPubkeyPerMin int) {
 // empty, forwarding metadata is ignored and the direct gRPC peer IP is used —
 // the secure default that prevents metadata-spoofed bucket evasion. This mirrors
 // the HTTP limiter's trust-aware extraction (clientIPFromForwarded).
+//
+// In-flight work-lifecycle RPCs are skipped (see rateLimitExemptMethods): a
+// volunteer must never be shed while finishing work it already holds.
 func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if isRateLimitExempt(info.FullMethod) {
+			return handler(ctx, req)
+		}
 		ip := grpcClientIP(ctx, trustedProxies)
 		key := "grpc:" + ip
 
@@ -79,12 +129,17 @@ func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet
 // keyed on the verified Ed25519 public key the auth interceptor placed in the
 // context. It MUST be chained AFTER the auth interceptor. Public discovery methods
 // carry no pubkey and are never throttled here (the per-IP ceiling still applies).
+// In-flight work-lifecycle RPCs are also skipped (see rateLimitExemptMethods) so a
+// volunteer is never shed while finishing work it already holds.
 //
 // No trailer/server-directed delay is stamped: ResourceExhausted is a pure
 // load-shedding signal the caller treats as a fixed local backoff (the single
 // server-directed-delay mechanism is the RequestWorkUnit response body field).
 func grpcPerPubkeyRateLimitInterceptor(store *rateLimitStore) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if isRateLimitExempt(info.FullMethod) {
+			return handler(ctx, req)
+		}
 		pk, ok := GRPCAuthPublicKeyFromContext(ctx)
 		if !ok {
 			// Public methods carry no verified pubkey: no per-volunteer bucket.
