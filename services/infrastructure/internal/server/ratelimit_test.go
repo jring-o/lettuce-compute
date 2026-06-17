@@ -77,6 +77,45 @@ func TestRateLimitMiddleware_ExceedsLimitReturns429(t *testing.T) {
 	}
 }
 
+// TestRateLimitMiddleware_HealthExempt verifies the liveness probe is never rate
+// limited: GET /api/v1/health from one IP passes far past the anon limit (so the
+// container healthcheck can't be 429'd into marking a serving head "unhealthy"),
+// while a normal path from the same IP is still throttled. See TODO #35.
+func TestRateLimitMiddleware_HealthExempt(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler, cleanup := rateLimitMiddleware(inner, nil)
+	defer cleanup()
+
+	// Hammer the liveness probe well past the anon limit from one IP.
+	for i := 0; i < unauthenticatedRateLimit*3; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/health", nil)
+		req.RemoteAddr = "10.9.9.9:5555"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("health probe %d should never be rate-limited, got %d", i+1, w.Code)
+		}
+	}
+
+	// A non-health path from the SAME IP is still throttled past the budget.
+	var got429 bool
+	for i := 0; i < unauthenticatedRateLimit+5; i++ {
+		req := httptest.NewRequest("GET", "/api/v1/leafs", nil)
+		req.RemoteAddr = "10.9.9.9:5555"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("a non-health path should still be rate-limited from the same IP")
+	}
+}
+
 func TestRateLimitMiddleware_AuthenticatedGetHigherLimit(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

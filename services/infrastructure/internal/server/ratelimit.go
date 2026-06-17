@@ -162,6 +162,18 @@ func rateLimitMiddleware(next http.Handler, trustedProxies []*net.IPNet) (http.H
 	go store.startCleanup(bucketCleanupInterval, bucketStaleThreshold, stop)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Liveness probe is exempt from rate limiting. The container healthcheck,
+		// any load balancer, and external monitors poll GET /api/v1/health
+		// continuously; metering it means a saturated per-IP bucket returns 429 and
+		// the orchestrator marks a healthy, serving head "unhealthy" (observed in
+		// prod — TODO #35). The handler is a cheap DB-ping, so leaving it unmetered
+		// is the standard load-balancer-health-check tradeoff. Only the bare
+		// liveness path is exempt; the operator health subpaths stay limited.
+		if r.URL.Path == "/api/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		user := UserFromContext(r.Context())
 
 		var key string
