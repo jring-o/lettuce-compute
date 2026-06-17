@@ -13,11 +13,15 @@ import (
 )
 
 // countingService is a mock that fails for the first N GetServerStatus calls.
+// failCode is the gRPC code returned while failing; zero (codes.OK) defaults to
+// codes.Unavailable so existing tests keep their "transient connection failure"
+// semantics.
 type countingService struct {
 	lettucev1.UnimplementedVolunteerServiceServer
 	mu        sync.Mutex
 	calls     int
 	failUntil int
+	failCode  codes.Code
 }
 
 func (s *countingService) GetServerStatus(_ context.Context, _ *lettucev1.GetServerStatusRequest) (*lettucev1.GetServerStatusResponse, error) {
@@ -27,7 +31,11 @@ func (s *countingService) GetServerStatus(_ context.Context, _ *lettucev1.GetSer
 	s.mu.Unlock()
 
 	if n <= s.failUntil {
-		return nil, status.Error(codes.Unavailable, "not ready yet")
+		code := s.failCode
+		if code == codes.OK {
+			code = codes.Unavailable
+		}
+		return nil, status.Error(code, "not ready yet")
 	}
 	return &lettucev1.GetServerStatusResponse{
 		Status:  "ok",
@@ -254,6 +262,75 @@ func TestConnectWithRetryPreCancelledContext(t *testing.T) {
 	}, slog.Default())
 	if err == nil {
 		t.Fatal("expected error with cancelled context")
+	}
+}
+
+// TestConnectWithRetryRateLimitDoesNotConsumeBudget verifies that
+// codes.ResourceExhausted (the head rate-limiting connects) does NOT count toward
+// MaxRetries: the volunteer keeps retrying through the rate-limit window and
+// connects once it clears, instead of giving up after MaxRetries and (for a
+// single head) exiting the daemon. See TODO #33.
+func TestConnectWithRetryRateLimitDoesNotConsumeBudget(t *testing.T) {
+	// Shrink the rate-limit backoff for the test (it defaults to a 30s window).
+	old := connectRateLimitBackoff
+	connectRateLimitBackoff = 10 * time.Millisecond
+	defer func() { connectRateLimitBackoff = old }()
+
+	// Rate-limited for the first 5 probes, then OK. MaxRetries=3 would normally
+	// give up at 3 — but rate-limits must not count, so it must reach the 6th.
+	svc := &countingService{failUntil: 5, failCode: codes.ResourceExhausted}
+	addr, cleanup := startMockServer(t, svc)
+	defer cleanup()
+
+	client, err := ConnectWithRetry(context.Background(), ClientConfig{
+		ServerURL:   addr,
+		Insecure:    true,
+		ConnTimeout: 2 * time.Second,
+	}, RetryConfig{
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     100 * time.Millisecond,
+		Multiplier:     2.0,
+		MaxRetries:     3,
+	}, slog.Default())
+	if err != nil {
+		t.Fatalf("ConnectWithRetry should ride out the rate limit, got: %v", err)
+	}
+	defer client.Close()
+
+	svc.mu.Lock()
+	calls := svc.calls
+	svc.mu.Unlock()
+	if calls != 6 {
+		t.Errorf("calls = %d, want 6 (5 rate-limited + 1 success; rate limits must not consume MaxRetries)", calls)
+	}
+}
+
+// TestConnectWithRetryGenuineFailureStillCountsAfterRateLimit verifies that mixing
+// rate-limits with a genuinely-unreachable head still honors MaxRetries for the
+// genuine failures (a down head is not masked by treating it as rate-limited).
+func TestConnectWithRetryGenuineFailureStillCounts(t *testing.T) {
+	svc := &countingService{failUntil: 100, failCode: codes.Unavailable}
+	addr, cleanup := startMockServer(t, svc)
+	defer cleanup()
+
+	_, err := ConnectWithRetry(context.Background(), ClientConfig{
+		ServerURL:   addr,
+		Insecure:    true,
+		ConnTimeout: 1 * time.Second,
+	}, RetryConfig{
+		InitialBackoff: 10 * time.Millisecond,
+		MaxBackoff:     50 * time.Millisecond,
+		Multiplier:     2.0,
+		MaxRetries:     3,
+	}, slog.Default())
+	if err == nil {
+		t.Fatal("expected error for a genuinely unreachable head")
+	}
+	svc.mu.Lock()
+	calls := svc.calls
+	svc.mu.Unlock()
+	if calls != 3 {
+		t.Errorf("calls = %d, want 3 (Unavailable still consumes MaxRetries)", calls)
 	}
 }
 

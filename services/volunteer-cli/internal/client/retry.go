@@ -6,7 +6,21 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// connectRateLimitBackoff is the floor backoff applied when a connect probe is
+// rejected with codes.ResourceExhausted (the head's gRPC rate limiter). It is
+// sized to outlast the head's per-IP rate-limit window (~60s fixed / continuous
+// token refill) so a retry actually gets through. CRUCIALLY, rate-limit retries do
+// NOT count against RetryConfig.MaxRetries: a rate limit is the head saying "slow
+// down", not an unreachable head, so a transiently-rate-limited single head must
+// never make the daemon give up and exit (TODO #33). Genuine connection failures
+// (Unavailable, DNS, refused) still consume MaxRetries and surface as a hard error.
+// It is a var (not const) solely so tests can shrink it via a test seam.
+var connectRateLimitBackoff = 30 * time.Second
 
 // RetryConfig controls connection retry behavior.
 type RetryConfig struct {
@@ -51,33 +65,44 @@ func ConnectWithRetry(ctx context.Context, cfg ClientConfig, retryCfg RetryConfi
 	}
 
 	backoff := retryCfg.InitialBackoff
+	attempt := 0 // counts only genuine (non-rate-limit) connect failures
 
-	for attempt := 1; ; attempt++ {
+	for {
 		connCtx, cancel := context.WithTimeout(ctx, cfg.ConnTimeout)
 		_, err := client.GetServerStatus(connCtx)
 		cancel()
 		if err == nil {
-			logger.Info("connected to server", "address", cfg.ServerURL, "attempt", attempt)
+			logger.Info("connected to server", "address", cfg.ServerURL, "attempt", attempt+1)
 			return client, nil
 		}
 
-		if retryCfg.MaxRetries > 0 && attempt >= retryCfg.MaxRetries {
-			client.Close()
-			return nil, fmt.Errorf("max retries (%d) exceeded: %w", retryCfg.MaxRetries, err)
-		}
+		// A rate-limit (ResourceExhausted) is the head shedding load, not an
+		// unreachable head: back off a full window and keep retrying WITHOUT
+		// consuming the MaxRetries budget, so a single rate-limited head can never
+		// make the daemon exit (TODO #33). Any other error is a genuine connection
+		// failure and counts toward MaxRetries with exponential backoff.
+		rateLimited := status.Code(err) == codes.ResourceExhausted
 
-		// Add jitter: random 0-25% of backoff.
-		var jitter time.Duration
-		if jitterMax := int64(backoff) / 4; jitterMax > 0 {
-			jitter = time.Duration(rand.Int64N(jitterMax))
+		var sleepDur time.Duration
+		if rateLimited {
+			sleepDur = connectRateLimitBackoff + jitter(connectRateLimitBackoff)
+			logger.Info("server rate-limited, backing off (will keep retrying)",
+				"address", cfg.ServerURL,
+				"backoff", sleepDur,
+			)
+		} else {
+			attempt++
+			if retryCfg.MaxRetries > 0 && attempt >= retryCfg.MaxRetries {
+				client.Close()
+				return nil, fmt.Errorf("max retries (%d) exceeded: %w", retryCfg.MaxRetries, err)
+			}
+			sleepDur = backoff + jitter(backoff)
+			logger.Info("connection failed, retrying",
+				"attempt", attempt,
+				"error", err,
+				"backoff", sleepDur,
+			)
 		}
-		sleepDur := backoff + jitter
-
-		logger.Info("connection failed, retrying",
-			"attempt", attempt,
-			"error", err,
-			"backoff", sleepDur,
-		)
 
 		select {
 		case <-ctx.Done():
@@ -86,9 +111,22 @@ func ConnectWithRetry(ctx context.Context, cfg ClientConfig, retryCfg RetryConfi
 		case <-time.After(sleepDur):
 		}
 
-		backoff = time.Duration(float64(backoff) * retryCfg.Multiplier)
-		if backoff > retryCfg.MaxBackoff {
-			backoff = retryCfg.MaxBackoff
+		// Only grow the exponential backoff on genuine failures; the rate-limit
+		// backoff is a fixed window-sized floor.
+		if !rateLimited {
+			backoff = time.Duration(float64(backoff) * retryCfg.Multiplier)
+			if backoff > retryCfg.MaxBackoff {
+				backoff = retryCfg.MaxBackoff
+			}
 		}
 	}
+}
+
+// jitter returns a random 0-25% of d (0 if d is too small to jitter), used to
+// spread retry backoffs and prevent a thundering herd.
+func jitter(d time.Duration) time.Duration {
+	if jitterMax := int64(d) / 4; jitterMax > 0 {
+		return time.Duration(rand.Int64N(jitterMax))
+	}
+	return 0
 }
