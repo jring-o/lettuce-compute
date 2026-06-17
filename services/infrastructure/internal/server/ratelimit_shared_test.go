@@ -11,69 +11,81 @@ import (
 )
 
 // fakeRateLimitRedis is an in-memory fake implementing the narrow rateLimitCmd
-// surface (Incr + PExpire). It is sufficient to exercise the shared fixed-window
-// limiter without a live Redis. When failAfter > 0, Incr returns an error once the
-// call count exceeds it (to test fail-open). It also models per-key TTLs so a test
-// can assert a window key is never left WITHOUT a TTL, and can be told to fail the
-// first PExpire to exercise the self-healing re-assert path.
+// surface (a single EVAL). It models the fixedWindowScript faithfully, INCLUDING
+// time-based key expiry against a virtual clock the test advances. Modeling real
+// expiry is the whole point: the previous fake recorded only the last TTL value and
+// never expired keys, so it structurally could not catch the "TTL re-stamped every
+// call ⇒ window never closes ⇒ permanent lockout" bug. With a virtual clock, a test
+// can prove the counter actually resets when the window elapses.
+//
+// When evalErr is set, Eval returns it once the call count exceeds evalFailAfter
+// (0 = fail from the first call) so the fail-open path is testable.
 type fakeRateLimitRedis struct {
-	mu        sync.Mutex
-	counts    map[string]int64
-	ttls      map[string]time.Duration // last PEXPIRE per key; absent = no TTL set
-	failErr   error
-	failAfter int
-	calls     int
+	mu     sync.Mutex
+	counts map[string]int64
+	expiry map[string]time.Time // absolute virtual expiry; absent = no TTL set
+	now    time.Time            // virtual clock; advance() moves it forward
 
-	// pexpireErr, when set, is returned by the first pexpireFailFor PExpire calls
-	// (0 = never fail). pexpireCalls counts PExpire invocations.
-	pexpireErr     error
-	pexpireFailFor int
-	pexpireCalls   int
+	evalErr       error
+	evalFailAfter int
+	calls         int
 }
 
 func newFakeRateLimitRedis() *fakeRateLimitRedis {
 	return &fakeRateLimitRedis{
 		counts: make(map[string]int64),
-		ttls:   make(map[string]time.Duration),
+		expiry: make(map[string]time.Time),
+		// A fixed, non-zero base so tests are deterministic and clock math is obvious.
+		now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
 
-func (f *fakeRateLimitRedis) Incr(_ context.Context, key string) *redis.IntCmd {
+// advance moves the virtual clock forward (simulating wall-clock passing between
+// requests). The next Eval lazily expires any key whose TTL has elapsed.
+func (f *fakeRateLimitRedis) advance(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = f.now.Add(d)
+}
+
+// Eval replicates fixedWindowScript: lazy-expire the key, INCR, then set the TTL
+// only on the first request of a window (count == 1) or to repair a key with no TTL.
+func (f *fakeRateLimitRedis) Eval(_ context.Context, _ string, keys []string, args ...interface{}) *redis.Cmd {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	cmd := redis.NewIntCmd(context.Background())
-	if f.failErr != nil && (f.failAfter == 0 || f.calls > f.failAfter) {
-		cmd.SetErr(f.failErr)
+	cmd := redis.NewCmd(context.Background())
+
+	if f.evalErr != nil && (f.evalFailAfter == 0 || f.calls > f.evalFailAfter) {
+		cmd.SetErr(f.evalErr)
 		return cmd
 	}
+
+	key := keys[0]
+	window := time.Duration(args[0].(int64)) * time.Millisecond
+
+	// Lazy expiry: a real Redis would have dropped the key once its TTL elapsed.
+	if exp, ok := f.expiry[key]; ok && !f.now.Before(exp) {
+		delete(f.counts, key)
+		delete(f.expiry, key)
+	}
+
 	f.counts[key]++
-	cmd.SetVal(f.counts[key])
-	return cmd
-}
-
-func (f *fakeRateLimitRedis) PExpire(_ context.Context, key string, d time.Duration) *redis.BoolCmd {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pexpireCalls++
-	cmd := redis.NewBoolCmd(context.Background())
-	if f.pexpireErr != nil && f.pexpireCalls <= f.pexpireFailFor {
-		// Simulate an EXPIRE that did not land: the key keeps whatever TTL it had
-		// (none, on the very first hit) and the command reports the error.
-		cmd.SetErr(f.pexpireErr)
-		return cmd
+	c := f.counts[key]
+	if _, hasTTL := f.expiry[key]; c == 1 || !hasTTL {
+		f.expiry[key] = f.now.Add(window)
 	}
-	f.ttls[key] = d
-	cmd.SetVal(true)
+
+	cmd.SetVal(c)
 	return cmd
 }
 
-// hasTTL reports whether the given key currently has a TTL recorded. A key that
-// has been INCR'd but has no TTL is the unbounded-block hazard this guards against.
+// hasTTL reports whether the given key currently has a (virtual) TTL set. A key that
+// has been INCR'd but has no TTL is the stranded, never-resetting hazard.
 func (f *fakeRateLimitRedis) hasTTL(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_, ok := f.ttls[key]
+	_, ok := f.expiry[key]
 	return ok
 }
 
@@ -87,7 +99,7 @@ func TestSharedBucket_FixedWindowGlobal(t *testing.T) {
 	replicaA := newSharedBucket(fake, "grpc:1.2.3.4", limit, time.Minute)
 	replicaB := newSharedBucket(fake, "grpc:1.2.3.4", limit, time.Minute)
 
-	now := time.Now()
+	now := fake.now
 	allowedCount := 0
 	// Alternate across the two replicas; the shared counter must cap the TOTAL.
 	for i := 0; i < limit*2; i++ {
@@ -108,59 +120,89 @@ func TestSharedBucket_FixedWindowGlobal(t *testing.T) {
 // (fail-open) rather than throttling the whole fleet.
 func TestSharedBucket_FailOpenOnError(t *testing.T) {
 	fake := newFakeRateLimitRedis()
-	fake.failErr = errors.New("simulated redis outage")
+	fake.evalErr = errors.New("simulated redis outage")
 	b := newSharedBucket(fake, "grpc:1.2.3.4", 1, time.Minute)
 
-	allowed, _, _ := b.allow(time.Now())
+	allowed, _, _ := b.allow(fake.now)
 	if !allowed {
 		t.Fatal("shared rate limiter must fail OPEN (admit) on a store error")
 	}
 }
 
-// TestSharedBucket_FirstExpireFailureSelfHeals is the HARDENING 2 guard: if the
-// VERY FIRST PEXPIRE fails (the count==1 hit), the window key would, under the old
-// "EXPIRE only on first hit" logic, be left with NO TTL forever — the counter would
-// climb past the limit and the client would be blocked PERMANENTLY because the
-// window never resets. The fix re-asserts PEXPIRE on EVERY call, so the second call
-// repairs the missing TTL. This test fails the first PExpire and asserts (a) the
-// key gains a TTL on the next call and (b) the client is NOT permanently blocked.
-func TestSharedBucket_FirstExpireFailureSelfHeals(t *testing.T) {
+// TestSharedBucket_WindowResetsUnderSustainedTraffic is the core regression for the
+// permanent-lockout bug. The window must close a fixed `window` after its FIRST
+// request, regardless of intervening traffic. The old implementation re-stamped the
+// TTL on EVERY call, so a steady trickle of requests (each < window apart) rolled the
+// expiry forward forever: the counter never reset and the client was rejected
+// permanently once it crossed the limit. This test drives traffic that stays under
+// the per-window limit overall yet keeps the key continuously busy, and asserts the
+// counter resets at the fixed boundary — which only holds when the TTL is set once.
+func TestSharedBucket_WindowResetsUnderSustainedTraffic(t *testing.T) {
 	fake := newFakeRateLimitRedis()
-	fake.pexpireErr = errors.New("simulated EXPIRE failure")
-	fake.pexpireFailFor = 1 // only the FIRST PExpire fails
+	limit := 3
+	window := time.Minute
+	b := newSharedBucket(fake, "grpc:7.7.7.7", limit, window)
 
+	// Fill the window: limit allows, then reject.
+	for i := 0; i < limit; i++ {
+		if ok, _, _ := b.allow(fake.now); !ok {
+			t.Fatalf("request %d within the budget should be allowed", i+1)
+		}
+	}
+	if ok, _, _ := b.allow(fake.now); ok {
+		t.Fatal("request over the per-window limit should be rejected")
+	}
+
+	// Keep the key continuously busy with a sub-window trickle. Under the OLD
+	// "re-stamp TTL every call" code each of these would push the expiry forward and
+	// the window would never close. With the TTL set once, the expiry stays pinned to
+	// (first request + window).
+	b.allow(fake.now)        // still in window 1 → rejected, must NOT extend the TTL
+	fake.advance(30 * time.Second)
+	b.allow(fake.now)        // t+30s, still window 1 → rejected, must NOT extend the TTL
+
+	// Cross the original window boundary. The key must have expired and the counter
+	// reset, so a fresh request is admitted again.
+	fake.advance(31 * time.Second) // t+61s, past the fixed window that began at t0
+	if ok, _, _ := b.allow(fake.now); !ok {
+		t.Fatal("window never reset under sustained traffic: the TTL is being rolled forward on every call (permanent-lockout bug)")
+	}
+}
+
+// TestSharedBucket_RepairsStrandedTTL guards the self-heal path: if a key is ever
+// left with a count but NO TTL (e.g. a crash between a prior INCR and its EXPIRE),
+// the next call must (re)set a TTL via the PTTL == -1 branch so the key can still
+// expire and reset — it must never become a permanently-stranded, never-resetting
+// counter.
+func TestSharedBucket_RepairsStrandedTTL(t *testing.T) {
+	fake := newFakeRateLimitRedis()
 	clientKey := "grpc:9.9.9.9"
 	redisKey := redisRateLimitKeyPrefix + clientKey
-	b := newSharedBucket(fake, clientKey, 3, time.Minute)
+	limit := 3
+	b := newSharedBucket(fake, clientKey, limit, time.Minute)
 
-	now := time.Now()
-
-	// First hit: INCR -> count 1, PEXPIRE FAILS. Request is still admitted (the
-	// expire error is non-fatal) but the key currently has no TTL.
-	if ok, _, _ := b.allow(now); !ok {
-		t.Fatal("first request should be admitted even when the initial PEXPIRE fails")
-	}
+	// Force a stranded state: a counter already over the limit with NO TTL recorded.
+	fake.mu.Lock()
+	fake.counts[redisKey] = 5
+	delete(fake.expiry, redisKey)
+	fake.mu.Unlock()
 	if fake.hasTTL(redisKey) {
-		t.Fatal("precondition: first PEXPIRE was supposed to fail, leaving no TTL")
+		t.Fatal("precondition: key should start with no TTL")
 	}
 
-	// Second hit: PEXPIRE now succeeds and MUST repair the missing TTL. Without the
-	// always-re-assert fix the key would stay TTL-less forever.
-	if ok, _, _ := b.allow(now); !ok {
-		t.Fatal("second request should be admitted")
+	// The next call increments to 6 (rejected) but MUST repair the missing TTL so the
+	// key can expire later instead of blocking the client forever.
+	if ok, _, _ := b.allow(fake.now); ok {
+		t.Fatal("a count over the limit should be rejected")
 	}
 	if !fake.hasTTL(redisKey) {
-		t.Fatal("window key still has NO TTL after a second call: PEXPIRE is not being re-asserted — client can be blocked indefinitely")
+		t.Fatal("stranded TTL-less key was not repaired: client could be blocked indefinitely")
 	}
 
-	// Drive well past the limit; the limiter must REJECT (a healthy fixed window),
-	// not the indefinite block we are guarding against vs. the never-resetting key.
-	// The point is that the window key is bounded by a TTL so it CAN reset.
-	for i := 0; i < 10; i++ {
-		b.allow(now)
-	}
-	if !fake.hasTTL(redisKey) {
-		t.Fatal("window key lost its TTL under sustained traffic; a stranded key blocks the client permanently")
+	// And it does expire: after the window the counter resets and traffic flows again.
+	fake.advance(61 * time.Second)
+	if ok, _, _ := b.allow(fake.now); !ok {
+		t.Fatal("repaired key should expire after the window and admit a fresh request")
 	}
 }
 

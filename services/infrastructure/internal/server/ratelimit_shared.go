@@ -20,16 +20,21 @@ type limiter interface {
 // rateLimitCmd is the narrow subset of redis commands the shared rate limiter uses.
 // *redis.Client (redis.Cmdable) satisfies it; a fake satisfies it in unit tests so
 // the fixed-window logic and fail-open path are testable without a live Redis.
+//
+// The limiter runs its INCR + conditional-EXPIRE as a single atomic Lua script
+// (fixedWindowScript) via EVAL, so the counter and its TTL can never diverge under
+// concurrent callers — see sharedBucket.allow for why setting the TTL exactly once
+// per window (rather than on every call) is load-bearing.
 type rateLimitCmd interface {
-	Incr(ctx context.Context, key string) *redis.IntCmd
-	PExpire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
 // sharedBucket is a cross-replica fixed-window limiter (Layer 3, BREAK 3) backed by
-// Redis. Each call does an atomic INCR and ALWAYS (re)asserts a PEXPIRE so the
-// window key can never be left without a TTL. Because all replicas INCR the SAME
-// key, a client gets its intended GLOBAL budget regardless of replica count (the
-// per-process tokenBucket gave each client N× its budget across N replicas).
+// Redis. Each call runs fixedWindowScript: an atomic INCR plus a TTL set EXACTLY
+// ONCE per window (and repaired only if the key ever lost its TTL). Because all
+// replicas INCR the SAME key, a client gets its intended GLOBAL budget regardless of
+// replica count (the per-process tokenBucket gave each client N× its budget across
+// N replicas).
 //
 // Fairness, not dispatch correctness: a Redis error fails OPEN (admits the request)
 // — over-admitting a few requests during an outage beats locking out the fleet; the
@@ -57,36 +62,42 @@ func newSharedBucket(client rateLimitCmd, clientKey string, limit int, window ti
 	}
 }
 
-// allow performs the atomic INCR and then ALWAYS (re)asserts the window TTL.
-// resetAt is the end of the current fixed window. On a Redis INCR error it fails
-// OPEN (allowed=true) and logs at ERROR so an outage degrades to today's
-// per-process over-admission rather than a fleet lockout.
+// fixedWindowScript is the atomic body of the limiter. It INCRements the window
+// counter and sets the window TTL EXACTLY ONCE per window — on the first request of
+// the window (c == 1), or to repair a key that somehow lost its TTL (PTTL == -1,
+// e.g. a crash between a prior INCR and its EXPIRE). It deliberately does NOT
+// re-stamp the TTL on every call.
 //
-// The TTL is (re)asserted on EVERY call, not just the first hit of a window. If
-// the very first PEXPIRE failed (e.g. a transient store hiccup) the key would
-// otherwise be left with NO expiry: every later call sees count>1, the counter
-// climbs past the limit, and the client is blocked PERMANENTLY because the window
-// never resets. Re-asserting PEXPIRE each call means a single failed expire is
-// self-healing on the next request — the key can never be stranded without a TTL.
-// PEXPIRE is cheap and idempotent; re-stamping a sub-window-old key with the full
-// window is the accepted fixed-window approximation (already up to 2× at a window
-// boundary). A PEXPIRE error is non-fatal: we log and admit per the request's INCR
-// result, and the next call retries the expire.
+// Why "once, not every call" is load-bearing: PEXPIRE resets the key's countdown to
+// the full window from NOW. Re-stamping on every call rolls the expiry forward on
+// each request, so under sustained traffic (any request arriving < window after the
+// previous one) the key NEVER expires, the counter climbs without bound, and the
+// client is locked out PERMANENTLY once it crosses the limit — regardless of how far
+// below the limit its actual rate is. Setting the TTL once means the window closes a
+// fixed `window` after its first request irrespective of later traffic: a true fixed
+// window (≤2× only at a window boundary). Running INCR + PTTL + PEXPIRE in one script
+// keeps the counter and its TTL atomic across concurrent replicas.
+const fixedWindowScript = `
+local c = redis.call('INCR', KEYS[1])
+if c == 1 or redis.call('PTTL', KEYS[1]) == -1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return c`
+
+// allow runs the atomic fixed-window script and decides admission from the returned
+// count. resetAt is the (approximate) end of the current window, used for the
+// X-RateLimit-* headers. On a Redis error it fails OPEN (allowed=true) and logs at
+// ERROR so an outage degrades to per-process over-admission rather than a fleet-wide
+// lockout — the limiter is a DoS backstop, not a security boundary.
 func (b *sharedBucket) allow(now time.Time) (bool, int, time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	count, err := b.client.Incr(ctx, b.key).Result()
+	count, err := b.client.Eval(ctx, fixedWindowScript, []string{b.key}, b.window.Milliseconds()).Int64()
 	if err != nil {
 		slog.Default().Error("rate-limit store error; admitting request (fail-open)",
 			"key", b.clientKey, "error", err)
 		return true, b.limit, now.Add(b.window)
-	}
-	// Always (re)assert the TTL so a window key can never be left without one. A
-	// failure here is non-fatal — the next call retries it — but we log it.
-	if _, eerr := b.client.PExpire(ctx, b.key, b.window).Result(); eerr != nil {
-		slog.Default().Error("rate-limit store PEXPIRE error",
-			"key", b.clientKey, "error", eerr)
 	}
 
 	resetAt := now.Add(b.window)
