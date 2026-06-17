@@ -97,3 +97,42 @@ func TestSharedRateLimit_Integration(t *testing.T) {
 		t.Fatalf("shared Redis budget should allow exactly %d across replicas, allowed %d", limit, allowed)
 	}
 }
+
+// TestSharedRateLimit_WindowResetsUnderSustainedTraffic_Integration is the
+// real-Redis regression for the permanent-lockout bug, run against an actual Redis
+// EVAL of fixedWindowScript (not the in-memory fake). It keeps the key continuously
+// busy with sub-window requests for longer than the window. The old "re-stamp the
+// TTL on every call" logic would roll the expiry forward on each request so the
+// window never closed and only `limit` requests were EVER admitted; the fix sets the
+// TTL once, so the window closes a fixed `window` after its first request and the
+// counter resets — admitting strictly MORE than `limit` over multiple windows.
+func TestSharedRateLimit_WindowResetsUnderSustainedTraffic_Integration(t *testing.T) {
+	ctx := context.Background()
+	client, err := NewRedisClient(ctx, redisURLForTest(t))
+	if err != nil {
+		t.Skipf("redis unavailable for integration test: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	clientKey := "grpc:reset-" + time.Now().Format("150405.000000000")
+	limit := 3
+	window := time.Second
+	b := newSharedBucket(client, clientKey, limit, window)
+
+	// Issue a sub-window trickle (spacing < window so the buggy code would keep
+	// rolling the TTL forward) for longer than two windows.
+	allowed := 0
+	deadline := time.Now().Add(2*window + 200*time.Millisecond)
+	for time.Now().Before(deadline) {
+		if ok, _, _ := b.allow(time.Now()); ok {
+			allowed++
+		}
+		time.Sleep(window / 4)
+	}
+
+	// Buggy (TTL re-stamped every call): the window never closes → exactly `limit`
+	// admitted for the whole run. Fixed: the window resets, so we admit more.
+	if allowed <= limit {
+		t.Fatalf("window never reset under sustained sub-window traffic: admitted %d (<= limit %d) — TTL is being rolled forward (permanent-lockout bug)", allowed, limit)
+	}
+}
