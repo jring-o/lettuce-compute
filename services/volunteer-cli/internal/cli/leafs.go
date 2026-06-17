@@ -68,11 +68,12 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Try to get leaf info from the management API (daemon running).
-	mgmtURL := fmt.Sprintf("http://127.0.0.1:%d", managementPort())
-	heads, err := fetchHeadsFromAPI(mgmtURL)
+	// Query the running daemon's local management API for live per-head state.
+	// On any failure, fall back to config-only info but name the REAL reason
+	// instead of always claiming "not running" (TODO #21).
+	heads, err := fetchHeadsFromAPI()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Daemon not running or unreachable, showing config-only info.\n\n")
+		fmt.Fprintf(os.Stderr, "Showing config-only info (%v).\n\n", err)
 		return printLeafsFromConfig()
 	}
 
@@ -96,11 +97,30 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func fetchHeadsFromAPI(baseURL string) ([]leafsAPIHead, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(baseURL + "/api/v1/heads")
+// fetchHeadsFromAPI queries the running daemon's local management API for live
+// per-head leaf state. It reads the port AND the bearer token from daemon.json and
+// authenticates the request: the management API rejects unauthenticated calls with
+// 401 (which is why this command previously ALWAYS showed the config-only fallback
+// even while the daemon was running — TODO #21). The request targets
+// 127.0.0.1:<port> so it also satisfies the management API's Host-header allowlist.
+// Errors are returned verbatim so the caller can show the real reason.
+func fetchHeadsFromAPI() ([]leafsAPIHead, error) {
+	info, err := management.ReadDaemonInfo(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("daemon not running (no daemon.json)")
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/v1/heads", info.Port)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+info.Token)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("daemon unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -140,14 +160,6 @@ func printLeafsFromConfig() error {
 	}
 	w.Flush()
 	return nil
-}
-
-func managementPort() int {
-	info, err := management.ReadDaemonInfo(cfg.DataDir)
-	if err == nil && info.Port > 0 {
-		return info.Port
-	}
-	return 7780
 }
 
 // --- leafs enable ---
