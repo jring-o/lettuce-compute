@@ -1039,7 +1039,15 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 		return nil, nil
 	}
 
-	reservedUntil := time.Now().UTC().Add(lease)
+	// Hold a buffered unit until its head-owned deadline, not a short liveness
+	// lease: a volunteer keeps buffered work until the deadline lapses, and only a
+	// deadline-miss returns it to the queue. The passed lease is a fallback for a
+	// unit with no positive deadline.
+	hold := lease
+	if wu.DeadlineSeconds > 0 {
+		hold = time.Duration(wu.DeadlineSeconds) * time.Second
+	}
+	reservedUntil := time.Now().UTC().Add(hold)
 	row := r.db.QueryRow(ctx, `
 		UPDATE work_units SET
 			reserved_until = $2,

@@ -215,10 +215,10 @@ func (h HeadConfig) Validate() error {
 	if h.LeaseSeconds < 0 {
 		return fmt.Errorf("head.lease_seconds must be >= 0, got %d", h.LeaseSeconds)
 	}
-	if h.LeaseSeconds >= staleVolunteerThresholdSeconds {
-		return fmt.Errorf("head.lease_seconds must be < %d (the stale-volunteer threshold), got %d",
-			staleVolunteerThresholdSeconds, h.LeaseSeconds)
-	}
+	// lease_seconds is only a fallback reservation window for a unit that has no
+	// positive deadline. The buffered hold is the unit's head-owned deadline, so it
+	// is no longer bounded by the stale-volunteer threshold — a volunteer keeps
+	// buffered work until that deadline regardless of how long it is.
 	if h.ReadyPoolSize < 0 {
 		return fmt.Errorf("head.ready_pool_size must be >= 0, got %d", h.ReadyPoolSize)
 	}

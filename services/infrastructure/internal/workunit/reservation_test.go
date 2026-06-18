@@ -136,9 +136,14 @@ func TestReserveNextAssignable_LapsedRedundancyTwoReReservable(t *testing.T) {
 
 	wu := mustQueuedWU(t, ctx, wuRepo, leafID)
 
-	// vol1 reserves with an already-lapsed lease (simulates a crashed buffer holder).
-	if _, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), -1*time.Second); err != nil {
-		t.Fatalf("reserve vol1 (lapsed): %v", err)
+	// vol1 reserves, then its hold is expired directly to simulate a crashed buffer
+	// holder whose reservation has lapsed. The buffered hold is now the unit's
+	// deadline, so we expire the column rather than pass a short lease.
+	if _, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), 60*time.Second); err != nil {
+		t.Fatalf("reserve vol1: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE work_units SET reserved_until = NOW() - INTERVAL '1 second' WHERE id = $1`, wu.ID); err != nil {
+		t.Fatalf("expire vol1 reservation: %v", err)
 	}
 
 	r2, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
@@ -200,14 +205,17 @@ func TestReserveNextAssignable_LapsedReservationReReservableByOther(t *testing.T
 
 	wu := mustQueuedWU(t, ctx, wuRepo, leafID)
 
-	// vol1 reserves with a lease that is ALREADY in the past (simulates a crashed
-	// holder whose lease has since lapsed).
-	first, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), -1*time.Second)
+	// vol1 reserves, then its hold is expired directly (simulates a crashed holder
+	// whose reservation has since lapsed).
+	first, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), 60*time.Second)
 	if err != nil {
-		t.Fatalf("reserve vol1 (lapsed): %v", err)
+		t.Fatalf("reserve vol1: %v", err)
 	}
 	if first == nil || first.ID != wu.ID {
 		t.Fatalf("expected vol1 to reserve %v, got %v", wu.ID, first)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE work_units SET reserved_until = NOW() - INTERVAL '1 second' WHERE id = $1`, wu.ID); err != nil {
+		t.Fatalf("expire vol1 reservation: %v", err)
 	}
 
 	// The unit is still QUEUED with a lapsed lease; vol2 can re-reserve it.

@@ -449,7 +449,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	if n < 1 {
 		n = 1
 	}
-	reservedUntil := c.now().UTC().Add(time.Duration(c.cfg.leaseSeconds) * time.Second)
+	leaseFallback := time.Duration(c.cfg.leaseSeconds) * time.Second
 
 	c.mu.Lock()
 	kept := c.ready[:0]
@@ -473,6 +473,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		if !c.eligibleLocked(volunteerID, opts, cand) {
 			kept = append(kept, cand)
 			continue
+		}
+		// Hold the buffered unit until its head-owned deadline (the buffer window);
+		// fall back to the configured lease only when the unit has no deadline.
+		reservedUntil := c.now().UTC().Add(leaseFallback)
+		if cand.unit.DeadlineSeconds > 0 {
+			reservedUntil = c.now().UTC().Add(time.Duration(cand.unit.DeadlineSeconds) * time.Second)
 		}
 		// Accept this candidate as a reservation for volunteerID.
 		uid := cand.unit.ID
