@@ -538,6 +538,101 @@ func TestPrepareChecksumMatch(t *testing.T) {
 	}
 }
 
+// TestPrepareVizBrokenNonFatal verifies the core TODO #39 guarantee: a broken
+// viz bundle in the spec must NOT block compute. Prepare succeeds and returns an
+// empty VizBundlePath (viz is a dashboard-only concern the binary never reads).
+func TestPrepareVizBrokenNonFatal(t *testing.T) {
+	echoBin := buildTestBinary(t, "echo", echoSource)
+	echoBinData, _ := os.ReadFile(echoBin)
+
+	// A viz tarball with NO index.html anywhere -> extraction always fails.
+	brokenViz := createTestTarball(t, map[string]string{
+		"./main.js":   "console.log('no index');",
+		"./style.css": "body{}",
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "viz") {
+			w.Write(brokenViz)
+			return
+		}
+		w.Write(echoBinData)
+	}))
+	defer ts.Close()
+
+	nr := NewNativeRuntime(t.TempDir(), newTestLogger())
+	nr.httpClient = ts.Client()
+
+	pk := platformKey()
+	wu := &WorkUnit{
+		ID:      "d2b7c0a1-9f3e-4c21-bb55-0a1b2c3d4e5f",
+		Runtime: "native",
+		ExecutionSpec: ExecutionSpec{
+			Binaries:        map[string]string{pk: ts.URL + "/binary", "viz": ts.URL + "/beyblade-viz.tar.gz"},
+			BinaryChecksums: map[string]string{pk: checksumSHA256(echoBinData), "viz": checksumSHA256(brokenViz)},
+		},
+	}
+
+	prep, err := nr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("broken viz must NOT fail compute prepare: %v", err)
+	}
+	defer nr.Cleanup(prep)
+	if prep.VizBundlePath != "" {
+		t.Errorf("expected empty VizBundlePath on broken viz, got %q", prep.VizBundlePath)
+	}
+	if prep.BinaryPath == "" {
+		t.Error("expected binary to be prepared despite broken viz")
+	}
+}
+
+// TestPrepareVizWrappedDir verifies that a viz bundle wrapped in a single
+// top-level directory (the beyblade-viz shape) prepares successfully end-to-end,
+// with VizBundlePath pointing at the resolved wrapper root (TODO #39).
+func TestPrepareVizWrappedDir(t *testing.T) {
+	echoBin := buildTestBinary(t, "echo", echoSource)
+	echoBinData, _ := os.ReadFile(echoBin)
+
+	wrappedViz := createTestTarball(t, map[string]string{
+		"beyblade-viz/index.html": "<html>wrapped</html>",
+		"beyblade-viz/player.js":  "console.log('ok');",
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "viz") {
+			w.Write(wrappedViz)
+			return
+		}
+		w.Write(echoBinData)
+	}))
+	defer ts.Close()
+
+	nr := NewNativeRuntime(t.TempDir(), newTestLogger())
+	nr.httpClient = ts.Client()
+
+	pk := platformKey()
+	wu := &WorkUnit{
+		ID:      "f1e2d3c4-b5a6-4978-8869-7a6b5c4d3e2f",
+		Runtime: "native",
+		ExecutionSpec: ExecutionSpec{
+			Binaries:        map[string]string{pk: ts.URL + "/binary", "viz": ts.URL + "/beyblade-viz.tar.gz"},
+			BinaryChecksums: map[string]string{pk: checksumSHA256(echoBinData), "viz": checksumSHA256(wrappedViz)},
+		},
+	}
+
+	prep, err := nr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("wrapped viz should prepare: %v", err)
+	}
+	defer nr.Cleanup(prep)
+	if prep.VizBundlePath == "" {
+		t.Fatal("expected non-empty VizBundlePath for wrapped viz")
+	}
+	if _, err := os.Stat(filepath.Join(prep.VizBundlePath, "index.html")); err != nil {
+		t.Errorf("index.html should resolve under VizBundlePath: %v", err)
+	}
+}
+
 // TestPrepareChecksumMismatch verifies that a native binary whose bytes do not
 // match the declared checksum is rejected (C2 anti-tamper).
 func TestPrepareChecksumMismatch(t *testing.T) {

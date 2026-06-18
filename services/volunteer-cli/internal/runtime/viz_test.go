@@ -259,6 +259,109 @@ func TestPrepareVizBundle_NilSpec(t *testing.T) {
 	}
 }
 
+// TestExtractVizBundle_WrappedSingleDir verifies the TODO #39 fix: a bundle that
+// wraps all of its files in a single top-level directory (the shape assemble.sh
+// produces for beyblade-viz, and what the dashboard's viz route already strips)
+// extracts successfully, with the wrapper directory returned as the bundle root.
+func TestExtractVizBundle_WrappedSingleDir(t *testing.T) {
+	tarball := createTestTarball(t, map[string]string{
+		"beyblade-viz/index.html":                       "<html><body>Wrapped</body></html>",
+		"beyblade-viz/player.js":                         "console.log('wrapped');",
+		"beyblade-viz/style.css":                         "body{}",
+		"beyblade-viz/lib/three.module.min.js":           "// three",
+		"beyblade-viz/lib/addons/controls/OrbitControls.js": "// orbit",
+	})
+
+	tmpDir := t.TempDir()
+	tarPath := filepath.Join(tmpDir, "viz.tar.gz")
+	if err := os.WriteFile(tarPath, tarball, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(tmpDir, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	vizDir, err := ExtractVizBundle(tarPath, workDir)
+	if err != nil {
+		t.Fatalf("wrapped bundle should extract: %v", err)
+	}
+
+	// The returned root must be the wrapper directory, and index.html must live
+	// directly inside it.
+	wantRoot := filepath.Join(workDir, vizBundleDir, "beyblade-viz")
+	if vizDir != wantRoot {
+		t.Errorf("viz root = %q, want %q", vizDir, wantRoot)
+	}
+	idx, err := os.ReadFile(filepath.Join(vizDir, "index.html"))
+	if err != nil {
+		t.Fatalf("index.html not found in wrapper root: %v", err)
+	}
+	if string(idx) != "<html><body>Wrapped</body></html>" {
+		t.Errorf("unexpected index.html content: %s", idx)
+	}
+	// A nested asset must resolve relative to the wrapper root too.
+	if _, err := os.Stat(filepath.Join(vizDir, "lib", "three.module.min.js")); err != nil {
+		t.Errorf("nested lib asset missing: %v", err)
+	}
+}
+
+// TestExtractVizBundle_WrappedDirNoIndex verifies that a single wrapper directory
+// that does NOT contain index.html is still rejected (the strip is only a
+// convenience, not a way to skip the index.html requirement).
+func TestExtractVizBundle_WrappedDirNoIndex(t *testing.T) {
+	tarball := createTestTarball(t, map[string]string{
+		"wrapper/player.js": "console.log('no index');",
+		"wrapper/style.css": "body{}",
+	})
+
+	tmpDir := t.TempDir()
+	tarPath := filepath.Join(tmpDir, "viz.tar.gz")
+	if err := os.WriteFile(tarPath, tarball, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(tmpDir, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ExtractVizBundle(tarPath, workDir)
+	if err == nil {
+		t.Fatal("expected error when wrapper dir lacks index.html")
+	}
+	if !strings.Contains(err.Error(), "index.html") {
+		t.Errorf("error should mention index.html: %v", err)
+	}
+}
+
+// TestExtractVizBundle_MultipleTopLevelDirsRejected verifies the strip only fires
+// for EXACTLY one top-level directory; an ambiguous multi-dir layout with no root
+// index.html is rejected rather than guessing which dir is the root.
+func TestExtractVizBundle_MultipleTopLevelDirsRejected(t *testing.T) {
+	tarball := createTestTarball(t, map[string]string{
+		"dirA/index.html": "<html>A</html>",
+		"dirB/index.html": "<html>B</html>",
+	})
+
+	tmpDir := t.TempDir()
+	tarPath := filepath.Join(tmpDir, "viz.tar.gz")
+	if err := os.WriteFile(tarPath, tarball, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	workDir := filepath.Join(tmpDir, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ExtractVizBundle(tarPath, workDir)
+	if err == nil {
+		t.Fatal("expected error for ambiguous multi-dir bundle with no root index.html")
+	}
+	if !strings.Contains(err.Error(), "index.html") {
+		t.Errorf("error should mention index.html: %v", err)
+	}
+}
+
 func TestExtractVizBundle_Subdirectories(t *testing.T) {
 	tarball := createTestTarball(t, map[string]string{
 		"./index.html":          "<html><body>App</body></html>",

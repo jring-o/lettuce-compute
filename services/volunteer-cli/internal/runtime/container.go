@@ -200,10 +200,14 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 
 	result := &PrepareResult{WorkDir: workDir}
 
-	// Download and extract viz bundle if present.
+	// Download and extract viz bundle if present. Viz is a dashboard-only concern
+	// (the container never reads it); a bad/missing bundle must NEVER block compute,
+	// so we warn and continue without it. See TODO #39.
 	vizPath, err := PrepareVizBundle(ctx, c.dataDir, workDir, &wu.ExecutionSpec, c.httpClient, c.logger)
 	if err != nil {
-		return nil, fmt.Errorf("prepare viz bundle: %w", err)
+		c.logger.Warn("container.Prepare: viz bundle prep failed; continuing without viz (compute unaffected)",
+			"work_unit_id", wu.ID, "error", err)
+		vizPath = ""
 	}
 	result.VizBundlePath = vizPath
 

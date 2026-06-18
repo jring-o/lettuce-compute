@@ -113,10 +113,14 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 		}
 	}
 
-	// Download and extract viz bundle if present.
+	// Download and extract viz bundle if present. Viz is a dashboard-only concern
+	// (the wasm module never reads it); a bad/missing bundle must NEVER block
+	// compute, so we warn and continue without it. See TODO #39.
 	vizPath, err := PrepareVizBundle(ctx, w.dataDir, workDir, &wu.ExecutionSpec, w.httpClient, w.logger)
 	if err != nil {
-		return nil, fmt.Errorf("prepare viz bundle: %w", err)
+		w.logger.Warn("wasm.Prepare: viz bundle prep failed; continuing without viz (compute unaffected)",
+			"work_unit_id", wu.ID, "error", err)
+		vizPath = ""
 	}
 	result.VizBundlePath = vizPath
 

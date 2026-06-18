@@ -261,14 +261,47 @@ func ExtractVizBundle(tarballPath string, workDir string) (string, error) {
 		}
 	}
 
-	// Validate index.html exists.
-	indexPath := filepath.Join(destDir, "index.html")
-	if _, err := os.Stat(indexPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("viz bundle missing required index.html")
+	// Resolve the bundle root: index.html must live at the extraction root, OR —
+	// when the bundle wraps everything in a single top-level directory (the shape
+	// assemble.sh produces and the dashboard's viz bundle route already strips) —
+	// inside that one wrapper directory. Returning the wrapper as the root keeps
+	// the extractor tolerant of both layouts without weakening the traversal/size
+	// caps enforced above. See TODO #39.
+	root, err := resolveVizRoot(destDir)
+	if err != nil {
+		return "", err
 	}
 
 	ok = true
-	return destDir, nil
+	return root, nil
+}
+
+// resolveVizRoot returns the directory that contains index.html: destDir itself,
+// or the single top-level subdirectory when the bundle is wrapped in exactly one.
+// Returns an error (preserving the "missing required index.html" message) if no
+// index.html can be found at either level.
+func resolveVizRoot(destDir string) (string, error) {
+	if _, err := os.Stat(filepath.Join(destDir, "index.html")); err == nil {
+		return destDir, nil
+	}
+
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		return "", fmt.Errorf("read viz bundle dir: %w", err)
+	}
+	var subDirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			subDirs = append(subDirs, e.Name())
+		}
+	}
+	if len(subDirs) == 1 {
+		nested := filepath.Join(destDir, subDirs[0])
+		if _, err := os.Stat(filepath.Join(nested, "index.html")); err == nil {
+			return nested, nil
+		}
+	}
+	return "", fmt.Errorf("viz bundle missing required index.html")
 }
 
 // PrepareVizBundle handles the viz bundle download and extraction for any runtime.
