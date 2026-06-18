@@ -153,10 +153,14 @@ func (n *NativeRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResu
 	n.logger.Debug("native.Prepare: checking viz bundle", "work_unit_id", wu.ID)
 	vizPath, err := PrepareVizBundle(ctx, n.dataDir, workDir, &wu.ExecutionSpec, n.httpClient, n.logger)
 	if err != nil {
-		n.logger.Warn("native.Prepare: viz bundle FAILED", "work_unit_id", wu.ID, "error", err)
-		return nil, fmt.Errorf("prepare viz bundle: %w", err)
-	}
-	if vizPath != "" {
+		// Viz is a dashboard-only rendering concern; the compute binary never reads
+		// it. A bad/missing viz bundle must NEVER block computation, so we warn and
+		// continue without viz (forgoing only the optional local replay copy that
+		// SaveResult would persist). See TODO #39.
+		n.logger.Warn("native.Prepare: viz bundle prep failed; continuing without viz (compute unaffected)",
+			"work_unit_id", wu.ID, "error", err)
+		vizPath = ""
+	} else if vizPath != "" {
 		n.logger.Info("native.Prepare: viz bundle ready", "work_unit_id", wu.ID, "path", vizPath)
 	}
 	result.VizBundlePath = vizPath
