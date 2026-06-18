@@ -572,14 +572,15 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			continue
 		}
 		r.leaf = lf
-		// Homogeneous redundancy (TODO #38): for a redundancy>1 unit on a versioned
-		// leaf, pin it to the current version at first dispatch (first-writer-wins); if
-		// it was ALREADY pinned to a different version, build this assignment from the
-		// PINNED version so corroborating replicas compare like-with-like across a
-		// mid-flight publish. Redundancy-1 units need no cross-result comparison, so they
-		// skip the pin and build from the leaf's current (denormalized) config.
-		if c.deps.artifactVersionRepo != nil && lf.CurrentArtifactVersionID != nil &&
-			(lf.ValidationConfig.RedundancyFactor > 1 || r.unit.SpotCheck) {
+		// Artifact pinning (TODO #38): on a versioned leaf, pin EVERY unit to the
+		// current version at its first dispatch (first-writer-wins). This gives every
+		// work unit and result exact per-unit version provenance (BOINC's per-WU model)
+		// and is what makes redundant replicas of one unit run a homogeneous version. If
+		// a unit was ALREADY pinned to a different version (e.g. a reassignment after a
+		// mid-flight publish), the assignment is built from the PINNED version, not the
+		// leaf's current one. Unversioned leaves (no current version) keep the legacy
+		// path with no pin.
+		if c.deps.artifactVersionRepo != nil && lf.CurrentArtifactVersionID != nil {
 			r.execConfig = c.resolvePinnedExecConfig(r.unit.ID, *lf.CurrentArtifactVersionID)
 		}
 		final = append(final, r)
