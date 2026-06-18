@@ -23,6 +23,13 @@ const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_
 	output_checksum, execution_metadata, validation_status,
 	submitted_at, validated_at, created_at, updated_at, artifact_version_id`
 
+// prefixedResultColumns is resultColumns with an r. table alias prefix, for
+// queries that JOIN results against another table (e.g. ListByLeaf). Keep it in
+// lockstep with resultColumns — TestResultColumnsParity enforces that.
+const prefixedResultColumns = `r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
+	r.output_checksum, r.execution_metadata, r.validation_status,
+	r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id`
+
 func scanResult(row pgx.Row) (*Result, error) {
 	var r Result
 	var metadataJSON []byte
@@ -199,10 +206,8 @@ func (repo *PgxRepository) ListByLeaf(ctx context.Context, projectID types.ID, f
 	var args []any
 	args = append(args, projectID)
 
-	query := `SELECT r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
-		r.output_checksum, r.execution_metadata, r.validation_status,
-		r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id
-		FROM results r JOIN work_units wu ON r.work_unit_id = wu.id WHERE wu.leaf_id = $1`
+	query := "SELECT " + prefixedResultColumns +
+		" FROM results r JOIN work_units wu ON r.work_unit_id = wu.id WHERE wu.leaf_id = $1"
 
 	argIdx := 2
 	if filters.ValidationStatus != nil {
