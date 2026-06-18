@@ -34,6 +34,7 @@ type volunteerService struct {
 	volunteerRepo           volunteer.Repository
 	wuRepo                  workunit.WorkUnitRepository
 	leafRepo                leaf.Repository
+	artifactVersionRepo     leaf.ArtifactVersionRepository
 	assignRepo              assignment.Repository
 	resultRepo              result.Repository
 	batchRepo               workunit.BatchRepository
@@ -83,6 +84,14 @@ func estimatedDurationSecondsForLeaf(rscFpopsEst float64) float64 {
 	return rscFpopsEst / referenceBenchmarkFPOPS
 }
 
+// asArtifactVersionRepo returns leafRepo as an ArtifactVersionRepository when the
+// concrete repo implements it (the *leaf.PgxRepository does), else nil — so a test
+// mock leafRepo simply disables versioning/pinning.
+func asArtifactVersionRepo(r leaf.Repository) leaf.ArtifactVersionRepository {
+	av, _ := r.(leaf.ArtifactVersionRepository)
+	return av
+}
+
 // NewVolunteerService creates a new VolunteerService gRPC implementation.
 func NewVolunteerService(
 	pool *pgxpool.Pool,
@@ -103,10 +112,11 @@ func NewVolunteerService(
 		version:            version,
 		startTime:          startTime,
 		volunteerRepo:      volunteerRepo,
-		wuRepo:             wuRepo,
-		leafRepo:           leafRepo,
-		assignRepo:         assignRepo,
-		resultRepo:         resultRepo,
+		wuRepo:              wuRepo,
+		leafRepo:            leafRepo,
+		artifactVersionRepo: asArtifactVersionRepo(leafRepo),
+		assignRepo:          assignRepo,
+		resultRepo:          resultRepo,
 		batchRepo:          batchRepo,
 		checkpointRepo:     checkpointRepo,
 		validationEngine:   validationEngine,
@@ -261,11 +271,16 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		headID:                  s.dispatchCfg.HeadInstanceID,
 		claimLease:              time.Duration(claimLeaseSeconds) * time.Second,
 	}
+	// artifactVersionRepo (the same *leaf.PgxRepository) lets the cache resolve the
+	// current/pinned artifact version per assignment and pin units for homogeneous
+	// redundancy (TODO #38). Nil on a non-Pgx leafRepo (tests) -> versioning/pinning
+	// disabled, legacy behavior preserved.
 	cache := newDispatchCache(cfg, dispatchDeps{
-		wuRepo:        s.wuRepo,
-		leafRepo:      s.leafRepo,
-		assignRepo:    s.assignRepo,
-		volunteerRepo: s.volunteerRepo,
+		wuRepo:              s.wuRepo,
+		leafRepo:            s.leafRepo,
+		assignRepo:          s.assignRepo,
+		volunteerRepo:       s.volunteerRepo,
+		artifactVersionRepo: s.artifactVersionRepo,
 	}, s.logger)
 	s.dispatchCache = cache
 
@@ -682,7 +697,7 @@ func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts w
 
 	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(results))
 	for _, r := range results {
-		assignments = append(assignments, buildWorkUnitAssignment(r.unit, r.leaf))
+		assignments = append(assignments, buildWorkUnitAssignment(r.unit, r.leaf, r.execConfig))
 	}
 	return &lettucev1.RequestWorkUnitResponse{
 		Assignments:       assignments,
@@ -824,7 +839,7 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 
 	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(reserved))
 	for _, ru := range reserved {
-		assignments = append(assignments, buildWorkUnitAssignment(ru.wu, ru.leaf))
+		assignments = append(assignments, buildWorkUnitAssignment(ru.wu, ru.leaf, nil))
 	}
 
 	return &lettucev1.RequestWorkUnitResponse{
@@ -835,27 +850,34 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 
 // buildWorkUnitAssignment renders a reserved work unit + its leaf into the proto
 // assignment, including the lease expiry (reserved_until_unix).
-func buildWorkUnitAssignment(wu *workunit.WorkUnit, lf *leaf.Leaf) *lettucev1.WorkUnitAssignment {
+func buildWorkUnitAssignment(wu *workunit.WorkUnit, lf *leaf.Leaf, exec *leaf.ExecutionConfig) *lettucev1.WorkUnitAssignment {
+	// ec is the EFFECTIVE artifact config: the pinned version's config when supplied
+	// (homogeneous redundancy across a mid-flight publish), else the leaf's current
+	// (denormalized) config.
+	ec := &lf.ExecutionConfig
+	if exec != nil {
+		ec = exec
+	}
 	a := &lettucev1.WorkUnitAssignment{
 		WorkUnitId:      wu.ID.String(),
 		LeafId:          wu.LeafID.String(),
-		Runtime:         lf.ExecutionConfig.Runtime,
+		Runtime:         ec.Runtime,
 		InputData:       wu.InputData,
 		InputDataUrl:    derefString(wu.InputDataRef),
 		CodeArtifactUrl: wu.CodeArtifactRef,
 		ParametersJson:  string(wu.Parameters),
 		DeadlineSeconds: int32(wu.DeadlineSeconds),
-		EnvVars:         lf.ExecutionConfig.EnvVars,
-		RscFpopsEst:     lf.ExecutionConfig.RscFpopsEst,
+		EnvVars:         ec.EnvVars,
+		RscFpopsEst:     ec.RscFpopsEst,
 		ExecutionSpec: &lettucev1.ExecutionSpec{
-			Binaries:        lf.ExecutionConfig.Binaries,
-			BinaryChecksums: lf.ExecutionConfig.BinaryChecksums,
-			Image:           derefString(lf.ExecutionConfig.Image),
-			GpuRequired:     lf.ExecutionConfig.GPURequired,
-			GpuType:         lf.ExecutionConfig.GPUType,
-			MaxMemoryMb:     int32(lf.ExecutionConfig.MaxMemoryMB),
-			MaxDiskMb:       int32(lf.ExecutionConfig.MaxDiskMB),
-			NetworkAccess:   lf.ExecutionConfig.NetworkAccess,
+			Binaries:        ec.Binaries,
+			BinaryChecksums: ec.BinaryChecksums,
+			Image:           derefString(ec.Image),
+			GpuRequired:     ec.GPURequired,
+			GpuType:         ec.GPUType,
+			MaxMemoryMb:     int32(ec.MaxMemoryMB),
+			MaxDiskMb:       int32(ec.MaxDiskMB),
+			NetworkAccess:   ec.NetworkAccess,
 		},
 	}
 	if wu.ReservedUntil != nil {
@@ -1037,6 +1059,17 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		outputDataRef = &req.OutputDataUrl
 	}
 
+	// Stamp the result with the artifact version the volunteer ran (TODO #38): the
+	// unit's pinned version (redundancy>1) else the leaf's current version. Drives
+	// version-homogeneous validation and per-result provenance. Best-effort: a resolve
+	// failure (or an unversioned leaf) leaves it nil — legacy behavior.
+	var artifactVersionID *types.ID
+	if s.artifactVersionRepo != nil {
+		if vid, verr := s.artifactVersionRepo.ResolveWorkUnitVersion(ctx, workUnitID); verr == nil {
+			artifactVersionID = vid
+		}
+	}
+
 	r := &result.Result{
 		WorkUnitID:        workUnitID,
 		VolunteerID:       volunteerID,
@@ -1045,6 +1078,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		OutputChecksum:    req.OutputChecksumSha256,
 		ExecutionMetadata: result.ExecutionMetadataFromProto(req.Metadata),
 		ValidationStatus:  result.ValidationPending,
+		ArtifactVersionID: artifactVersionID,
 	}
 
 	// Insert result.

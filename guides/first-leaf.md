@@ -43,6 +43,35 @@ The flow you'll follow:
 
 ---
 
+## Updating a leaf's artifact — versions & rollback
+
+When you change a leaf's compute artifact (a new native binary, or a new container
+image), publish it as an **immutable version** so already-RUNNING volunteers pick it up
+automatically — no restart, no manual `podman pull`:
+
+```
+# 1. Update the artifact as usual: scp the new binary + set the new checksum, OR push
+#    a NEW immutable image tag/digest; then PUT the new execution_config.
+# 2. Publish it as a named, immutable version (activates it by default):
+curl -s -X POST $HEAD/api/v1/leafs/$LEAF_ID/versions \
+  -H "Authorization: Bearer $LETTUCE_ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"version_label":"native-go-2.0","notes":"3D rewrite"}'
+```
+
+The head stamps the current version into every new assignment, so a running volunteer
+runs the new artifact on its **next work request** (within the leaf-snapshot TTL, ~30s)
+— no restart. Old in-flight work finishes on its pinned version, and redundant copies
+of one work unit always run the same version (homogeneous redundancy).
+
+- **List history:** `GET /api/v1/leafs/{id}/versions`
+- **Roll back / re-point:** `POST /api/v1/leafs/{id}/versions/{version_id}/activate`
+- **Container leaves must be immutable:** publishing **rejects a `:latest` image** —
+  pin a digest (`repo@sha256:…`) or an immutable tag (`:2.0`). A re-pushed `:latest` is
+  never re-pulled by volunteers, the exact bug this versioning fixes.
+
+---
+
 ## Before you start
 
 You'll run the API calls from anywhere with `curl` (your laptop or the server). Set two

@@ -107,6 +107,14 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 		}
 	}
 
+	// Version-homogeneous validation (TODO #38, interacts with #12): never compare
+	// results produced by DIFFERENT artifact versions — a version difference is not a
+	// disagreement. Homogeneous-redundancy pinning means all replicas of a unit run one
+	// version, so this normally leaves `pending` unchanged; it is the defensive guard
+	// against a cross-version straggler (e.g. a result from before the leaf was
+	// versioned). The redundancy gate below then applies to the single-version group.
+	pending = versionHomogeneousGroup(pending)
+
 	// Determine effective redundancy: spot-check WUs always require 2 results.
 	effectiveRedundancy := proj.ValidationConfig.RedundancyFactor
 	if wu.SpotCheck {
@@ -128,6 +136,37 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 	default:
 		return nil, fmt.Errorf("unknown comparison mode: %s", cfg.ComparisonMode)
 	}
+}
+
+// versionHomogeneousGroup returns the largest subset of pending results that all share
+// one artifact version (nil/legacy is its own group), so validation never compares
+// across artifact versions. Ties break deterministically by version key. With
+// homogeneous-redundancy pinning there is normally a single group, so the input is
+// returned unchanged.
+func versionHomogeneousGroup(pending []*result.Result) []*result.Result {
+	if len(pending) < 2 {
+		return pending
+	}
+	groups := make(map[string][]*result.Result)
+	for _, r := range pending {
+		key := ""
+		if r.ArtifactVersionID != nil {
+			key = r.ArtifactVersionID.String()
+		}
+		groups[key] = append(groups[key], r)
+	}
+	if len(groups) == 1 {
+		return pending
+	}
+	var best []*result.Result
+	var bestKey string
+	for k, g := range groups {
+		if len(g) > len(best) || (len(g) == len(best) && (best == nil || k < bestKey)) {
+			best = g
+			bestKey = k
+		}
+	}
+	return best
 }
 
 // validateExact groups results by output checksum and applies quorum selection.

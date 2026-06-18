@@ -331,6 +331,7 @@ func main() {
 	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, logger)
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
+	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
 	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, batchRepo, leafRepo, logger)
 	healthRecorder := health.NewRecorder(pool, stats.NewEngine(pool), leafRepo, logger)
@@ -346,6 +347,7 @@ func main() {
 		go challengeStore.StartCleanup(leaderCtx)
 		go lazyManager.Run(leaderCtx, 30*time.Second)
 		go healthRecorder.Start(leaderCtx)
+		go artifactGC.Start(leaderCtx)
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

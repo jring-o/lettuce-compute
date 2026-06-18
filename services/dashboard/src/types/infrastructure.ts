@@ -140,6 +140,31 @@ export interface Leaf {
   stats_cache_seconds: number;
   created_at: string;
   updated_at: string;
+  current_artifact_version_id?: string | null;
+}
+
+// --- Artifact versions (TODO #38) ---
+
+export interface ArtifactVersion {
+  id: string;
+  leaf_id: string;
+  version_label: string;
+  runtime_type: string;
+  execution_config: ExecutionConfig | null;
+  image_digest?: string | null;
+  notes?: string | null;
+  published_by?: string | null;
+  published_at: string;
+  superseded_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PublishVersionRequest {
+  version_label: string;
+  notes?: string;
+  image_digest?: string;
+  activate?: boolean;
 }
 
 export interface LeafSummary {

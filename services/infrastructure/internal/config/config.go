@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -28,6 +29,13 @@ type HeadConfig struct {
 	URL                     string         `yaml:"url"`
 	DefaultLeafWeights      map[string]int `yaml:"default_leaf_weights"`
 	MaxInflightPerVolunteer int            `yaml:"max_inflight_per_volunteer"`
+
+	// ArtifactRetention is the operator's retention policy for the per-leaf artifact
+	// version registry (TODO #38): "all" (default — never auto-delete), "last:N" (keep
+	// the N most-recently-published versions per leaf), or "current+previous" (keep
+	// two). The leader-gated GC sweep enforces it and never deletes the current version
+	// or a version pinned by in-flight work. Override via LETTUCE_ARTIFACT_RETENTION.
+	ArtifactRetention string `yaml:"artifact_retention"`
 
 	// --- Layer 3: horizontal scale-out (N stateless replicas, one Postgres) ---
 
@@ -280,6 +288,27 @@ func (h HeadConfig) Validate() error {
 
 // EffectiveMaxInflight returns the max inflight WUs per volunteer,
 // defaulting to 10 if not set (0).
+// EffectiveArtifactRetentionKeep parses ArtifactRetention into the number of newest
+// versions to keep per leaf for the GC sweep: 0 means "keep all" (GC disabled).
+// Unknown values fail safe to "all" (a typo never auto-deletes artifacts).
+func (h HeadConfig) EffectiveArtifactRetentionKeep() int {
+	p := strings.TrimSpace(strings.ToLower(h.ArtifactRetention))
+	switch {
+	case p == "" || p == "all":
+		return 0
+	case p == "current+previous":
+		return 2
+	case strings.HasPrefix(p, "last:"):
+		n, err := strconv.Atoi(strings.TrimSpace(p[len("last:"):]))
+		if err != nil || n < 1 {
+			return 0
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
 func (h HeadConfig) EffectiveMaxInflight() int {
 	if h.MaxInflightPerVolunteer <= 0 {
 		return 10

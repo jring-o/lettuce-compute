@@ -225,6 +225,11 @@ type Leaf struct {
 	StatsCacheSeconds    int                  `json:"stats_cache_seconds"`
 	CreatedAt            time.Time            `json:"created_at"`
 	UpdatedAt            time.Time            `json:"updated_at"`
+	// CurrentArtifactVersionID points at the leaf_artifact_versions row this leaf
+	// currently dispatches (TODO #38). Nil = no published version yet: the legacy
+	// path, where assignments build from ExecutionConfig directly. Owned by
+	// ArtifactVersionRepository.SetCurrentVersion; never written by Update.
+	CurrentArtifactVersionID *types.ID `json:"current_artifact_version_id,omitempty"`
 }
 
 // SortField specifies which column to sort by.

@@ -64,6 +64,11 @@ type Result struct {
 	OutputChecksum    string           `json:"output_checksum"`
 	ExecutionMetadata ExecutionMetadata `json:"execution_metadata"`
 	ValidationStatus  ValidationStatus `json:"validation_status"`
+	// ArtifactVersionID records which leaf_artifact_versions row produced this result
+	// (TODO #38): the unit's pinned version, else the leaf's current version at submit.
+	// nil = legacy / unversioned leaf. Lets validation refuse to compare results from
+	// different artifact versions and gives per-result version provenance.
+	ArtifactVersionID *types.ID        `json:"artifact_version_id,omitempty"`
 	SubmittedAt       time.Time        `json:"submitted_at"`
 	ValidatedAt       *time.Time       `json:"validated_at,omitempty"`
 	CreatedAt         time.Time        `json:"created_at"`

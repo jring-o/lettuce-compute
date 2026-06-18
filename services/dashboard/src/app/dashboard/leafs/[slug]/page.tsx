@@ -5,6 +5,7 @@ import {
   InfrastructureApiError,
 } from "@/lib/infrastructure-client";
 import { ProjectDashboard } from "@/components/projects/project-dashboard";
+import { VersionManager } from "@/components/projects/version-manager";
 
 export async function generateMetadata({
   params,
@@ -80,6 +81,12 @@ export default async function LeafDashboardPage({
       "Infrastructure service is unavailable. Some data may be missing.";
   }
 
+  // Artifact version registry (TODO #38) — graceful: an empty list on any error.
+  const initialVersions = await infrastructureClient
+    .listVersions(fullLeaf.id)
+    .then((r) => r.data)
+    .catch(() => []);
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
       {infraError && (
@@ -91,6 +98,12 @@ export default async function LeafDashboardPage({
         leaf={fullLeaf}
         initialStats={stats ?? null}
         aggregation={aggregation}
+      />
+      <VersionManager
+        leafId={fullLeaf.id}
+        slug={slug}
+        initialVersions={initialVersions}
+        currentVersionId={fullLeaf.current_artifact_version_id ?? null}
       />
     </div>
   );

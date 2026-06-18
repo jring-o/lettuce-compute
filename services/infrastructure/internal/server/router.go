@@ -157,6 +157,13 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/archive", authOwner(leafHandler.HandleArchive))
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", authOwner(leafHandler.HandleConfigure))
 
+	// Artifact version registry (TODO #38): publish an immutable version (snapshots the
+	// leaf's current execution_config), list history, activate/roll back, purge.
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/versions", authOwner(leafHandler.HandlePublishVersion))
+	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/versions", authOwner(leafHandler.HandleListVersions))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/versions/{version_id}/activate", authOwner(leafHandler.HandleActivateVersion))
+	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}/versions/{version_id}", authOwner(leafHandler.HandleDeleteVersion))
+
 	// Work unit routes (sensitive reads + mutations).
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/work-units", authOwner(wuHandler.HandleList))
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}", authOwner(wuHandler.HandleGet))
