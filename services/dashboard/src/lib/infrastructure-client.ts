@@ -1,5 +1,6 @@
 import type {
   AggregationResult,
+  ArtifactVersion,
   CreateLeafRequest,
   GenerateWorkUnitsRequest,
   GenerateWorkUnitsResponse,
@@ -11,6 +12,7 @@ import type {
   ListResultsParams,
   ListWorkUnitsParams,
   PaginatedResponse,
+  PublishVersionRequest,
   Result,
   StatsHistoryParams,
   UpdateLeafRequest,
@@ -145,6 +147,36 @@ export class InfrastructureClient {
 
   async configureLeaf(leafId: string): Promise<Leaf> {
     return this.request("POST", `/api/v1/leafs/${leafId}/configure`);
+  }
+
+  // --- Artifact Versions (TODO #38) ---
+
+  async listVersions(leafId: string): Promise<{ data: ArtifactVersion[] }> {
+    return this.request("GET", `/api/v1/leafs/${leafId}/versions`);
+  }
+
+  async publishVersion(
+    leafId: string,
+    data: PublishVersionRequest,
+  ): Promise<ArtifactVersion> {
+    return this.request("POST", `/api/v1/leafs/${leafId}/versions`, data);
+  }
+
+  async activateVersion(
+    leafId: string,
+    versionId: string,
+  ): Promise<ArtifactVersion> {
+    return this.request(
+      "POST",
+      `/api/v1/leafs/${leafId}/versions/${versionId}/activate`,
+    );
+  }
+
+  async deleteVersion(leafId: string, versionId: string): Promise<void> {
+    return this.request(
+      "DELETE",
+      `/api/v1/leafs/${leafId}/versions/${versionId}`,
+    );
   }
 
   // --- Work Units ---

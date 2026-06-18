@@ -60,6 +60,11 @@ const (
 	defaultRefillTickInterval = 250 * time.Millisecond
 	defaultReconcileInterval  = 30 * time.Second
 	dispatchDBTimeout         = 2 * time.Second
+	// defaultLeafSnapshotTTL bounds how long the cache trusts a cached leaf snapshot
+	// before re-reading it on the assignment-build path. It is the propagation
+	// ceiling for an artifact publish/rollback (TODO #38): a RUNNING volunteer picks
+	// up a new version on its next work request within this window, with no restart.
+	defaultLeafSnapshotTTL = 30 * time.Second
 )
 
 // candidate is one pre-fetched, ready-to-assign QUEUED unit in the ready pool. It
@@ -125,6 +130,11 @@ type dispatchCacheConfig struct {
 	flushBatchSize          int
 	leaseSeconds            int
 	maxInflightPerVolunteer int
+	// leafSnapshotTTL bounds staleness of the cached leaf snapshot used to build
+	// assignments, so a published/rolled-back artifact version (or a direct
+	// execution_config change) propagates to RUNNING volunteers within the TTL with
+	// no head restart (TODO #38). 0 -> defaultLeafSnapshotTTL.
+	leafSnapshotTTL time.Duration
 
 	// --- Layer 3: horizontal scale-out (claim-on-refill) ---
 	//
@@ -152,6 +162,11 @@ type dispatchDeps struct {
 	leafRepo      leaf.Repository
 	assignRepo    assignment.Repository
 	volunteerRepo volunteer.Repository
+	// artifactVersionRepo resolves immutable artifact version rows and pins a unit to
+	// a version for homogeneous redundancy (TODO #38). May be nil (legacy / tests):
+	// the cache then builds assignments from the leaf's denormalized current
+	// execution_config only, with no pinning.
+	artifactVersionRepo leaf.ArtifactVersionRepository
 }
 
 // volunteerIdentity is the in-process snapshot of a volunteer's identity +
@@ -207,7 +222,13 @@ type dispatchCache struct {
 	// and proto building). Guarded by leafMu (separate from mu so a leaf fetch under
 	// admission does not block hand-outs).
 	leafMu    sync.Mutex
-	leafCache map[types.ID]*leaf.Leaf
+	leafCache map[types.ID]*cachedLeaf
+
+	// versionCache caches IMMUTABLE artifact version rows by id. A published version
+	// never changes, so these are safe to keep for the process lifetime; only used to
+	// build an assignment for a unit pinned to a version other than the leaf's current.
+	versionMu    sync.Mutex
+	versionCache map[types.ID]*leaf.ArtifactVersion
 
 	// identityCache caches per-volunteer identity snapshots (pubkey + hardware +
 	// available runtimes) so RequestWorkUnit resolves identity/capabilities in memory
@@ -279,6 +300,9 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 			cfg.maintenanceAdmissionCap = 1
 		}
 	}
+	if cfg.leafSnapshotTTL <= 0 {
+		cfg.leafSnapshotTTL = defaultLeafSnapshotTTL
+	}
 	return &dispatchCache{
 		cfg:                  cfg,
 		deps:                 deps,
@@ -286,7 +310,8 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		now:                  time.Now,
 		reservedInMem:        make(map[types.ID]map[types.ID]time.Time),
 		inflight:             make(map[types.ID]int),
-		leafCache:            make(map[types.ID]*leaf.Leaf),
+		leafCache:            make(map[types.ID]*cachedLeaf),
+		versionCache:         make(map[types.ID]*leaf.ArtifactVersion),
 		identityCache:        make(map[types.ID]*volunteerIdentity),
 		admission:            make(chan struct{}, cfg.admissionCap),
 		maintenanceAdmission: make(chan struct{}, cfg.maintenanceAdmissionCap),
@@ -301,6 +326,10 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 type handOutResult struct {
 	unit *workunit.WorkUnit
 	leaf *leaf.Leaf
+	// execConfig overrides leaf.ExecutionConfig when the unit is pinned to an artifact
+	// version that differs from the leaf's current one (homogeneous redundancy across a
+	// mid-flight publish). Nil = build from leaf.ExecutionConfig (the common path).
+	execConfig *leaf.ExecutionConfig
 }
 
 // admissionSaturated reports whether the DB-admission semaphore is currently full
@@ -543,6 +572,16 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			continue
 		}
 		r.leaf = lf
+		// Homogeneous redundancy (TODO #38): for a redundancy>1 unit on a versioned
+		// leaf, pin it to the current version at first dispatch (first-writer-wins); if
+		// it was ALREADY pinned to a different version, build this assignment from the
+		// PINNED version so corroborating replicas compare like-with-like across a
+		// mid-flight publish. Redundancy-1 units need no cross-result comparison, so they
+		// skip the pin and build from the leaf's current (denormalized) config.
+		if c.deps.artifactVersionRepo != nil && lf.CurrentArtifactVersionID != nil &&
+			(lf.ValidationConfig.RedundancyFactor > 1 || r.unit.SpotCheck) {
+			r.execConfig = c.resolvePinnedExecConfig(r.unit.ID, *lf.CurrentArtifactVersionID)
+		}
 		final = append(final, r)
 	}
 	if drained {
@@ -757,38 +796,66 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 
 // --- leaf metadata cache -----------------------------------------------------
 
-// peekLeaf returns a cached leaf without a DB fetch (nil if not warmed).
+// cachedLeaf is a leaf snapshot plus the time it was read, so getLeaf can bound its
+// staleness (leafSnapshotTTL) and re-read after an artifact publish/rollback or a
+// direct execution_config change — the fix for RUNNING volunteers keeping the old
+// artifact (TODO #38).
+type cachedLeaf struct {
+	leaf      *leaf.Leaf
+	fetchedAt time.Time
+}
+
+// peekLeaf returns a cached leaf without a DB fetch (nil if not warmed). Used by the
+// hot-path capability check; a slightly stale capability snapshot is harmless (the
+// build path re-resolves freshness via getLeaf).
 func (c *dispatchCache) peekLeaf(id types.ID) *leaf.Leaf {
 	c.leafMu.Lock()
 	defer c.leafMu.Unlock()
-	return c.leafCache[id]
+	if cl := c.leafCache[id]; cl != nil {
+		return cl.leaf
+	}
+	return nil
 }
 
-// getLeaf returns the leaf, fetching+caching it under admission on a miss. Off the
-// hot path (only called when building an accepted hand-out's assignment).
+// getLeaf returns the leaf for building an accepted hand-out's assignment. Off the
+// hot path. It re-reads from Postgres on a miss OR when the cached snapshot is older
+// than leafSnapshotTTL, so a new artifact version propagates to assignments within
+// the TTL with no head restart. On a refresh that cannot be admitted (DB pressure) or
+// errors, it serves the existing snapshot rather than failing the hand-out.
 func (c *dispatchCache) getLeaf(id types.ID) (*leaf.Leaf, error) {
-	if lf := c.peekLeaf(id); lf != nil {
-		return lf, nil
+	c.leafMu.Lock()
+	cl := c.leafCache[id]
+	c.leafMu.Unlock()
+	if cl != nil && c.now().Sub(cl.fetchedAt) < c.cfg.leafSnapshotTTL {
+		return cl.leaf, nil
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), dispatchDBTimeout)
 	defer cancel()
 	release, ok := c.acquire(ctx)
 	if !ok {
+		if cl != nil {
+			return cl.leaf, nil // serve the (stale) snapshot under admission pressure
+		}
 		return nil, ctx.Err()
 	}
 	defer release()
 	lf, err := c.deps.leafRepo.GetByID(ctx, id)
 	if err != nil {
+		if cl != nil {
+			return cl.leaf, nil // serve the (stale) snapshot on a transient read error
+		}
 		return nil, err
 	}
 	c.leafMu.Lock()
-	c.leafCache[id] = lf
+	c.leafCache[id] = &cachedLeaf{leaf: lf, fetchedAt: c.now()}
 	c.leafMu.Unlock()
 	return lf, nil
 }
 
 // warmLeaf caches a leaf if not present (best-effort, called by the refiller so the
-// capability check in eligibleLocked has metadata for newly-staged units).
+// capability check in eligibleLocked has metadata for newly-staged units). Freshness
+// for the build path is handled by getLeaf's TTL, not here.
 func (c *dispatchCache) warmLeaf(ctx context.Context, id types.ID) {
 	if c.peekLeaf(id) != nil {
 		return
@@ -799,8 +866,85 @@ func (c *dispatchCache) warmLeaf(ctx context.Context, id types.ID) {
 		return
 	}
 	c.leafMu.Lock()
-	c.leafCache[id] = lf
+	c.leafCache[id] = &cachedLeaf{leaf: lf, fetchedAt: c.now()}
 	c.leafMu.Unlock()
+}
+
+// InvalidateLeaf drops a cached leaf snapshot so the next getLeaf re-reads it
+// immediately. Called when a leaf's artifact version is published/rolled back (or its
+// config changes) so the change reaches assignments at once on THIS replica; other
+// replicas converge within leafSnapshotTTL. Safe from any goroutine.
+func (c *dispatchCache) InvalidateLeaf(id types.ID) {
+	c.leafMu.Lock()
+	delete(c.leafCache, id)
+	c.leafMu.Unlock()
+}
+
+// getVersion returns an immutable artifact version row, caching it for the process
+// lifetime (a published version never changes). Off the hot path. (nil, nil) when no
+// artifact repo is wired.
+func (c *dispatchCache) getVersion(id types.ID) (*leaf.ArtifactVersion, error) {
+	if c.deps.artifactVersionRepo == nil {
+		return nil, nil
+	}
+	c.versionMu.Lock()
+	v := c.versionCache[id]
+	c.versionMu.Unlock()
+	if v != nil {
+		return v, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquire(ctx)
+	if !ok {
+		return nil, ctx.Err()
+	}
+	defer release()
+	ver, err := c.deps.artifactVersionRepo.GetVersionByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	c.versionMu.Lock()
+	c.versionCache[id] = ver
+	c.versionMu.Unlock()
+	return ver, nil
+}
+
+// ensurePin pins unitID to currentVersionID if unpinned and returns the effective pin
+// (ok=false on DB pressure / error, so the caller falls back to the current config).
+func (c *dispatchCache) ensurePin(unitID, currentVersionID types.ID) (types.ID, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquire(ctx)
+	if !ok {
+		return types.ID{}, false
+	}
+	defer release()
+	pinned, err := c.deps.artifactVersionRepo.EnsureWorkUnitPin(ctx, unitID, currentVersionID)
+	if err != nil {
+		c.logger.Warn("dispatch cache: failed to pin work unit version", "work_unit_id", unitID, "error", err)
+		return types.ID{}, false
+	}
+	return pinned, true
+}
+
+// resolvePinnedExecConfig pins the unit (first dispatch) and returns the pinned
+// version's execution config when it differs from the leaf's current (denormalized)
+// config — else nil (build from leaf.ExecutionConfig). Off the hot path; acquires and
+// releases admission per call (never nests acquires).
+func (c *dispatchCache) resolvePinnedExecConfig(unitID, currentVersionID types.ID) *leaf.ExecutionConfig {
+	pinned, ok := c.ensurePin(unitID, currentVersionID)
+	if !ok || pinned == currentVersionID {
+		return nil
+	}
+	ver, err := c.getVersion(pinned)
+	if err != nil || ver == nil {
+		c.logger.Warn("dispatch cache: failed to load pinned version",
+			"work_unit_id", unitID, "version_id", pinned, "error", err)
+		return nil
+	}
+	cfg := ver.ExecutionConfig
+	return &cfg
 }
 
 // --- volunteer identity cache (Blocker 1: identity off the hot path) ----------

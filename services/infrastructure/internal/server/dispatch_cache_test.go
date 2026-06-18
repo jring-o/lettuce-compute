@@ -267,7 +267,7 @@ func (c *dispatchCache) warm(lf *leaf.Leaf, leafRepo *fakeLeafRepo) {
 	leafRepo.leafs[lf.ID] = lf
 	leafRepo.mu.Unlock()
 	c.leafMu.Lock()
-	c.leafCache[lf.ID] = lf
+	c.leafCache[lf.ID] = &cachedLeaf{leaf: lf, fetchedAt: c.now()}
 	c.leafMu.Unlock()
 }
 

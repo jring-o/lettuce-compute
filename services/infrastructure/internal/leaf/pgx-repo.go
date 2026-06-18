@@ -48,6 +48,7 @@ func scanLeaf(row pgx.Row) (*Leaf, error) {
 		&p.StatsCacheSeconds,
 		&p.CreatedAt,
 		&p.UpdatedAt,
+		&p.CurrentArtifactVersionID,
 	)
 	return &p, err
 }
@@ -57,7 +58,8 @@ const leafColumns = `id, name, slug, description, research_area,
 	creator_id, creator_public_key, state, task_pattern,
 	execution_config, validation_config, fault_tolerance_config,
 	data_config, credit_config, resource_requirements,
-	is_ongoing, visibility, stats_cache_seconds, created_at, updated_at`
+	is_ongoing, visibility, stats_cache_seconds, created_at, updated_at,
+	current_artifact_version_id`
 
 // Create inserts a new leaf. The slug is generated automatically from the name.
 // On return, p is populated with the DB-generated id, slug, and timestamps.

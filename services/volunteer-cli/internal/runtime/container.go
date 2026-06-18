@@ -166,14 +166,35 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 		}
 	}
 
-	// Pull image if not cached locally.
-	exists, err := c.dockerClient.ImageExists(ctx, wu.ExecutionSpec.Image)
+	// Pull policy (TODO #38): make sure we run the artifact the head actually points
+	// at, not a staler cached copy under the same tag.
+	//
+	//   * Digest-pinned ref (…@sha256:…): content-addressed and immutable, so a copy
+	//     already present is provably the right bytes — pull only on a cache miss. A
+	//     new version means a NEW digest -> new ref -> miss -> pull. This is the
+	//     recommended path (the head's publish lint pushes container leaves to digests).
+	//   * Tag ref (which MAY be mutable, e.g. a re-pushed :latest — the exact footgun
+	//     behind #38): attempt a pull so a re-pushed tag is refreshed. If the pull
+	//     fails but we already hold the image, fall back to the cached copy so a
+	//     registry outage can't break an otherwise-runnable unit.
+	image := wu.ExecutionSpec.Image
+	exists, err := c.dockerClient.ImageExists(ctx, image)
 	if err != nil {
 		return nil, fmt.Errorf("check image: %w", err)
 	}
-	if !exists {
-		if err := c.dockerClient.ImagePull(ctx, wu.ExecutionSpec.Image); err != nil {
-			return nil, interpretPullError(c.backend, wu.ExecutionSpec.Image, err)
+	if strings.Contains(image, "@sha256:") {
+		if !exists {
+			if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+				return nil, interpretPullError(c.backend, image, err)
+			}
+		}
+	} else {
+		if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+			if !exists {
+				return nil, interpretPullError(c.backend, image, err)
+			}
+			c.logger.Warn("container.Prepare: image pull failed; using cached image",
+				"image", image, "error", err)
 		}
 	}
 

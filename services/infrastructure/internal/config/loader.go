@@ -167,6 +167,9 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("LETTUCE_HEAD_NAME"); v != "" {
 		cfg.Head.Name = v
 	}
+	if v := os.Getenv("LETTUCE_ARTIFACT_RETENTION"); v != "" {
+		cfg.Head.ArtifactRetention = v
+	}
 	if v := os.Getenv("LETTUCE_HEAD_DESCRIPTION"); v != "" {
 		cfg.Head.Description = v
 	}

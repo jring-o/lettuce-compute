@@ -21,7 +21,7 @@ type DBTX interface {
 
 const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_ref,
 	output_checksum, execution_metadata, validation_status,
-	submitted_at, validated_at, created_at, updated_at`
+	submitted_at, validated_at, created_at, updated_at, artifact_version_id`
 
 func scanResult(row pgx.Row) (*Result, error) {
 	var r Result
@@ -39,6 +39,7 @@ func scanResult(row pgx.Row) (*Result, error) {
 		&r.ValidatedAt,
 		&r.CreatedAt,
 		&r.UpdatedAt,
+		&r.ArtifactVersionID,
 	)
 	if err != nil {
 		return nil, err
@@ -69,11 +70,11 @@ func (repo *PgxRepository) Create(ctx context.Context, r *Result) error {
 	row := repo.db.QueryRow(ctx, `
 		INSERT INTO results (
 			work_unit_id, volunteer_id, output_data, output_data_ref,
-			output_checksum, execution_metadata, validation_status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			output_checksum, execution_metadata, validation_status, artifact_version_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING `+resultColumns,
 		r.WorkUnitID, r.VolunteerID, r.OutputData, r.OutputDataRef,
-		r.OutputChecksum, metadataJSON, r.ValidationStatus,
+		r.OutputChecksum, metadataJSON, r.ValidationStatus, r.ArtifactVersionID,
 	)
 
 	created, err := scanResult(row)
