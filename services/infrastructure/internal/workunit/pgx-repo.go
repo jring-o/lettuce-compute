@@ -486,6 +486,14 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
 		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
 		    )
+		    -- Results already submitted for this unit count toward the redundancy
+		    -- need: a corroborator that finished holds one of the N slots even though
+		    -- its assignment row is now closed and the unit has been returned to the
+		    -- queue for the next distinct volunteer.
+		    + (
+		      SELECT COUNT(*) FROM results res
+		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
+		    )
 		    + CASE
 		        WHEN NOT wu.spot_check
 		             AND wu.reserved_until IS NOT NULL AND wu.reserved_until > NOW()
@@ -523,6 +531,16 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    wu.reserved_volunteer_id = $9
 		    AND wu.reserved_until IS NOT NULL
 		    AND wu.reserved_until > NOW()
+		  )
+		  -- Never hand this volunteer a unit it has already produced a result for, so
+		  -- each of the N redundant results comes from a DISTINCT volunteer (the unit
+		  -- is returned to the queue after each partial submit, which would otherwise
+		  -- let the same volunteer pick it up again).
+		  AND NOT EXISTS (
+		    SELECT 1 FROM results res3
+		    WHERE res3.work_unit_id = wu.id
+		      AND res3.volunteer_id = $9
+		      AND res3.validation_status = 'PENDING'
 		  )
 		  -- Per-volunteer inflight cap counts BOTH active assignments (active history
 		  -- rows) AND this volunteer's live reservations, so one volunteer cannot
@@ -619,8 +637,12 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 			CASE WHEN wu.spot_check THEN 2
 			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 			END AS effective_redundancy,
-			(SELECT COUNT(*) FROM work_unit_assignment_history wuah
-			 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL) AS active_assignments,
+			(
+				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
+				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
+				+ (SELECT COUNT(*) FROM results res2
+				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
+			) AS active_assignments,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
@@ -647,6 +669,12 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		    (
 		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
 		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
+		    )
+		    -- Already-submitted results hold a redundancy slot even after their
+		    -- assignment row closes and the unit returns to the queue.
+		    + (
+		      SELECT COUNT(*) FROM results res
+		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
 		    + CASE
 		        WHEN NOT wu.spot_check
@@ -795,8 +823,12 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			CASE WHEN wu.spot_check THEN 2
 			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 			END AS effective_redundancy,
-			(SELECT COUNT(*) FROM work_unit_assignment_history wuah
-			 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL) AS active_assignments,
+			(
+				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
+				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
+				+ (SELECT COUNT(*) FROM results res2
+				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
+			) AS active_assignments,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime`,
 		limit, excludeIDs, leafIDs, headID, leaseSecs,
 	)

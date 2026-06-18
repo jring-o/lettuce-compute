@@ -1134,15 +1134,39 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 				completed_at = NOW(),
 				reserved_until = NULL,
 				reserved_volunteer_id = NULL
-			WHERE id = $1 AND (
-				state IN ('ASSIGNED', 'RUNNING')
-				OR (state = 'QUEUED' AND spot_check = true)
-				OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
-			)`,
+			-- A submitted result implies the work ran. Complete from ASSIGNED/RUNNING,
+			-- and also from QUEUED — the unit may sit QUEUED because a prior partial
+			-- corroboration returned it to the queue (the redundancy-meeting result can
+			-- arrive while it is queued for the next volunteer), or as a still-reserved
+			-- buffered/spot-check unit whose redundancy was met before run-start.
+			WHERE id = $1 AND state IN ('ASSIGNED', 'RUNNING', 'QUEUED')`,
 			workUnitID,
 		)
 		if err != nil {
 			s.logger.Error("failed to transition work unit to COMPLETED", "error", err)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+	} else {
+		// Redundancy not yet met: this result is recorded, but more distinct results
+		// are still needed. Return the unit to the queue immediately so the next
+		// volunteer can corroborate without waiting for this holder's deadline to
+		// lapse. A partial result is a SUCCESS, not a failure, so reassignment_count is
+		// left untouched. The redundancy gate counts the PENDING result just inserted,
+		// so the unit is offered only to the remaining distinct volunteers.
+		_, err := tx.Exec(ctx, `
+			UPDATE work_units SET
+				state = 'QUEUED',
+				priority = 'HIGH',
+				assigned_volunteer_id = NULL,
+				assigned_at = NULL,
+				started_at = NULL,
+				reserved_until = NULL,
+				reserved_volunteer_id = NULL
+			WHERE id = $1 AND state IN ('ASSIGNED', 'RUNNING')`,
+			workUnitID,
+		)
+		if err != nil {
+			s.logger.Error("failed to requeue work unit for further corroboration", "error", err)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 	}

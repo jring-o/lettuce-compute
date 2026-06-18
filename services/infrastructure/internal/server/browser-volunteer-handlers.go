@@ -637,14 +637,34 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 					reserved_until = NULL,
 					reserved_volunteer_id = NULL
 				WHERE id = $1 AND (
-					state IN ('ASSIGNED', 'RUNNING')
-					OR (state = 'QUEUED' AND spot_check = true)
-					OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
+					state IN ('ASSIGNED', 'RUNNING', 'QUEUED')
 				)`,
 				workUnitID,
 			)
 			if err != nil {
 				deps.logger.Error("failed to transition work unit", "error", err)
+				apierror.WriteError(w, apierror.Internal("internal server error", err))
+				return
+			}
+		} else {
+			// Redundancy not yet met: return the unit to the queue immediately so the
+			// next volunteer can corroborate without waiting for a deadline to lapse. A
+			// partial result is a success, not a failure, so reassignment_count is left
+			// untouched (mirrors the gRPC SubmitResult path).
+			_, err := tx.Exec(r.Context(), `
+				UPDATE work_units SET
+					state = 'QUEUED',
+					priority = 'HIGH',
+					assigned_volunteer_id = NULL,
+					assigned_at = NULL,
+					started_at = NULL,
+					reserved_until = NULL,
+					reserved_volunteer_id = NULL
+				WHERE id = $1 AND state IN ('ASSIGNED', 'RUNNING')`,
+				workUnitID,
+			)
+			if err != nil {
+				deps.logger.Error("failed to requeue work unit for further corroboration", "error", err)
 				apierror.WriteError(w, apierror.Internal("internal server error", err))
 				return
 			}

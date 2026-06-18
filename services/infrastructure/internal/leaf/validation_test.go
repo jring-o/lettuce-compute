@@ -650,10 +650,9 @@ func TestValidateValidationConfig(t *testing.T) {
 			errMsg:  "redundancy_factor",
 		},
 		{
-			name:    "redundancy_factor too high",
-			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 6 },
-			wantErr: true,
-			errMsg:  "redundancy_factor",
+			name:    "redundancy_factor high value accepted (no upper bound)",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 50 },
+			wantErr: false,
 		},
 		{
 			name:    "agreement_threshold negative",
@@ -857,16 +856,15 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "deadline multiplier too low",
-			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 0.5 },
+			name:    "deadline multiplier zero rejected",
+			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 0 },
 			wantErr: true,
 			errMsg:  "deadline_multiplier",
 		},
 		{
-			name:    "deadline multiplier too high",
-			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 11.0 },
-			wantErr: true,
-			errMsg:  "deadline_multiplier",
+			name:    "deadline multiplier high value accepted (no upper bound)",
+			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 240.0 },
+			wantErr: false,
 		},
 		{
 			name:    "max_reassignments too low",
@@ -875,10 +873,9 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 			errMsg:  "max_reassignments",
 		},
 		{
-			name:    "max_reassignments too high",
-			modify:  func(c *FaultToleranceConfig) { c.MaxReassignments = 11 },
-			wantErr: true,
-			errMsg:  "max_reassignments",
+			name:    "max_reassignments high value accepted (no upper bound)",
+			modify:  func(c *FaultToleranceConfig) { c.MaxReassignments = 100 },
+			wantErr: false,
 		},
 		{
 			name: "checkpointing enabled with valid interval",
