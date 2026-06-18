@@ -17,6 +17,7 @@ type WorkUnitSummary struct {
 	ReassignmentCount   int              `json:"reassignment_count"`
 	FlaggedForReview    bool             `json:"flagged_for_review"`
 	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
 }
 
 // ToWorkUnitSummary converts a full WorkUnit to a WorkUnitSummary.
@@ -30,6 +31,7 @@ func ToWorkUnitSummary(wu *WorkUnit) WorkUnitSummary {
 		ReassignmentCount:   wu.ReassignmentCount,
 		FlaggedForReview:    wu.FlaggedForReview,
 		CreatedAt:           wu.CreatedAt,
+		UpdatedAt:           wu.UpdatedAt,
 	}
 }
 

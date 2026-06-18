@@ -201,7 +201,7 @@ func (repo *PgxRepository) ListByLeaf(ctx context.Context, projectID types.ID, f
 
 	query := `SELECT r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
 		r.output_checksum, r.execution_metadata, r.validation_status,
-		r.submitted_at, r.validated_at, r.created_at, r.updated_at
+		r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id
 		FROM results r JOIN work_units wu ON r.work_unit_id = wu.id WHERE wu.leaf_id = $1`
 
 	argIdx := 2
