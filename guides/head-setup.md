@@ -398,12 +398,12 @@ the only one you should actively calibrate is `target_request_rate_per_sec`.
 | Key (env) | Default | What it does |
 |-----------|---------|--------------|
 | `max_batch_per_request` (`LETTUCE_HEAD_MAX_BATCH_PER_REQUEST`) | `64` | Safety ceiling on how many work units one work request may return. This is a cap, not the limiter — the actual batch is sized by each volunteer's work-buffer deficit and per-unit duration estimate. |
-| `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max units (running + buffered/reserved) one volunteer may hold. Also caps how deep a volunteer's hours-based work buffer can fill. |
+| `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max live copies (running + buffered) one volunteer may hold across all units. Also caps how deep a volunteer's hours-based work buffer can fill. |
 | `min_retry_delay_seconds` (`LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS`) | `30` | Server-directed retry delay handed out when quiet. Stamped on **every** reply (including no-work); volunteers must obey it. |
 | `max_retry_delay_seconds` (`LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS`) | `900` | Retry delay under full load. Must stay below the 1800s stale-volunteer threshold (validated at startup). |
 | `retry_delay_jitter_pct` (`LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT`) | `0.20` | Server-side ± jitter on the stamped delay so a fleet does not re-contact in lockstep. |
 | `target_request_rate_per_sec` (`LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC`) | `500` | Per-head work-request rate the load estimator treats as "fully loaded". **Not calibrated** — measure your single-head dispatch ceiling with `swarm-sim` (see `CONTRIBUTING.md`) and set this to it. The 2026-06-01 reference run measured ~240 assignments/sec on a single head, well below the default. |
-| `lease_seconds` (`LETTUCE_HEAD_LEASE_SECONDS`) | `900` | How long a buffered/reserved unit is held for a volunteer before the head may reclaim it. Must stay below 1800s. |
+| `lease_seconds` (`LETTUCE_HEAD_LEASE_SECONDS`) | `900` | Fallback hold for a buffered copy **only when its work unit has no positive deadline**. Normally a buffered copy is held until its own `deadline_seconds`, so this rarely applies (no-deadline leafs get the `no_deadline_ceiling_seconds` deadline). No longer bound by the 1800s stale-volunteer threshold — the hold is the deadline, not a short liveness lease. |
 
 `LETTUCE_TRUSTED_PROXIES` also governs **per-client rate limiting** on the gRPC
 port: with it set, volunteers behind your reverse proxy are bucketed per real
@@ -417,13 +417,15 @@ To keep Postgres off the work-request hot path, the head serves assignments from
 an **in-process dispatch cache**: a background refiller bulk-fetches queued units
 into memory, work requests are answered from that in-memory pool (no database
 round-trip on the hot path), and the resulting reservations are written back to
-Postgres asynchronously in batches. Under sustained overload the head serves from
-the cache until it empties, then **sheds** — it returns a fast "back off and retry"
-to volunteers (which obey a short local backoff) instead of letting database
-connections pile up. Run-start is an explicit step (the volunteer tells the head a
-buffered unit has begun executing), and **liveness is deadline-based**: a unit not
-submitted by its deadline is reassigned, and a buffered unit not started before its
-reservation lapses is reclaimed. There are no per-task heartbeats.
+Postgres asynchronously in batches. Each hand-out lands as a **per-copy** reservation
+row, so one unit can have several copies in flight at once (see *Redundancy and the
+dispatch cache* below). Under sustained overload the head serves from the cache until
+it empties, then **sheds** — it returns a fast "back off and retry" to volunteers
+(which obey a short local backoff) instead of letting database connections pile up.
+Run-start is an explicit step (the volunteer tells the head a buffered copy has begun
+executing), and **liveness is deadline-based**: a copy not submitted by its deadline is
+dropped and the unit redispatches a fresh copy, and a buffered copy not started before
+its hold lapses is reclaimed. There are no per-task heartbeats.
 
 > **Running more than one head?** The dispatch cache is safe across multiple
 > replicas: each replica stamps a **per-head dispatch claim** on the queued units
@@ -453,20 +455,27 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 
 #### Redundancy and the dispatch cache
 
-> **Redundancy > 1 is not dispatched to two volunteers *concurrently* today.** A
-> work unit has a single state column. When a volunteer run-starts a buffered unit,
-> the head flips it `QUEUED → ASSIGNED`, and both the dispatch cache's refill and the
-> direct database find offer **only `QUEUED`** units. So once the first holder starts
-> running, that unit leaves the dispatchable set: the head will not hand the *same*
-> unit to a second distinct volunteer at the same time.
+> **Redundancy > 1 dispatches the same work unit to N distinct volunteers in
+> parallel.** A unit with `redundancy_factor: N` is handed to up to N different
+> volunteers at once — each gets its own independent copy with its own lease and
+> deadline, and all N run **simultaneously**. The head never hands two copies of the
+> same unit to the same volunteer. As copies come back, their outputs are cross-checked
+> (per `comparison_mode`) and the unit validates once `agreement_threshold` of them
+> agree (e.g. `redundancy_factor: 3` + `agreement_threshold: 0.67` ⇒ 2 of 3 must match).
 >
-> Redundant corroboration still happens, but **serially** — a redundant copy is
-> produced when a unit is reassigned (its deadline lapses, or the holder abandons it)
-> and re-queued to a different volunteer, whose result is checked against the first.
-> If you set `redundancy_factor > 1` expecting two volunteers to crunch the same unit
-> in parallel and cross-check immediately, that is **not** what happens; you get
-> sequential re-validation on reassignment instead. True concurrent redundant dispatch
-> needs a per-volunteer dispatch table and arrives in a later layer.
+> Each dispatched copy is its own row in the dispatch ledger, so the unit stays
+> dispatchable until N copies are out — the cache stages it to several distinct holders
+> from a single ready snapshot. (Volunteers buffer work, so you'll typically see the N
+> copies fan out as different volunteers poll, within a refill cycle of each other.)
+>
+> If a copy **times out** (its volunteer never returns it by the deadline), that copy
+> is dropped and the unit immediately dispatches a **fresh copy to another volunteer** —
+> with **no per-attempt retry cap**. The only terminal stop is a dead-letter ceiling
+> (`max_total_copies`, currently auto-derived to `redundancy_factor + 6`): a unit that
+> can never be completed is parked `FAILED` + flagged for review rather than retried
+> forever. A volunteer whose copy just timed out is briefly benched so a fresh
+> volunteer gets first refusal, then becomes eligible again if the pool is otherwise
+> exhausted (so work never strands).
 
 ### Horizontal scale-out
 
@@ -550,9 +559,9 @@ keyed on the proxy IP and the whole fleet is throttled together.
   may briefly hold a few more units than the configured max while replicas reconcile).
   It self-corrects within the ~30s reconcile and never corrupts or strands work.
 - **Leader-failover reclaim pause.** During the ≤15s window after a leader crash, the
-  singleton reclaim/sweep jobs pause. This is bounded and well below the reservation
-  lease (900s) and deadlines, so it only delays — never breaks — reclaim. Passive
-  re-claim of crashed-replica dispatch claims needs no leader and is unaffected.
+  singleton reclaim/sweep jobs pause. This is bounded and well below typical copy
+  deadlines, so it only delays — never breaks — reclaim. Passive re-claim of
+  crashed-replica dispatch claims needs no leader and is unaffected.
 
 ### Back up
 
