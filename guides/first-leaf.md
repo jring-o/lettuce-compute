@@ -244,8 +244,10 @@ What the key settings mean:
 | `binaries` | Download URLs per platform. Volunteers fetch the one that matches them. |
 | `binary_checksums` | SHA-256 (lowercase hex) of each binary. **Required for NATIVE.** Volunteers verify the download and refuse to run a binary whose hash doesn't match. |
 | `max_cpu_seconds: 30` | Volunteer kills the binary after 30s of CPU time. |
-| `redundancy_factor: 1` | Each work unit goes to one volunteer. Set 2+ to validate by comparison. |
+| `redundancy_factor: 1` | Each work unit goes to one volunteer. Set 2+ and the unit is sent to that many volunteers **in parallel**; their results are cross-checked and the unit validates once `agreement_threshold` of them agree (e.g. `3` + `0.67` ⇒ 2 of 3). |
 | `comparison_mode: NUMERIC_TOLERANCE` | Results agree if within `numeric_tolerance`. Monte Carlo is stochastic, so exact match won't do. |
+| `agreement_threshold: 1.0` | Fraction of the redundant copies that must agree to validate (the quorum). `1.0` = unanimous. |
+| `deadline_multiplier: 3.0` | Sets each work unit's timeout: `deadline_seconds = 3600 × multiplier` (so `3.0` = 3h, `0.5` = 30min). Any value, no cap. **Stamped at generation** — changing it only affects newly generated units. A copy not returned by its deadline is redispatched to another volunteer (no per-attempt cap; a hopeless unit eventually dead-letters after `redundancy_factor + 6` total copies). `max_reassignments` is a deprecated no-op, kept only so older configs still validate. |
 | `aggregation_config.output_field: "result"` | The JSON field the aggregator reads from each result (the π estimate). |
 | `max_output_size_bytes: 10485760` | Hard cap (bytes) on a single result payload — the server **rejects** larger submissions. Must be > 0; size it to the largest reasonable result for this leaf. |
 
