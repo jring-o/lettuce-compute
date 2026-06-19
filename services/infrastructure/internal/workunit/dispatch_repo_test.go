@@ -485,7 +485,9 @@ func TestFlushReservationsRenewsClaim(t *testing.T) {
 	ctx := context.Background()
 	headA := types.NewID()
 	headB := types.NewID()
-	vol := types.NewID()
+	// Seed a real volunteer: FlushReservations inserts work_unit_assignment_history rows
+	// with a volunteer_id FK, so the holder must exist (other tests use this helper too).
+	vol := createTestVolunteer(t, pool)
 
 	// Unit owned by head A with a SHORT (about-to-expire) claim.
 	ownUnit := mustQueuedWU(t, ctx, repo, leafID)

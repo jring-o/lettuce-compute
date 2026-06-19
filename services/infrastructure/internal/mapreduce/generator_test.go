@@ -74,6 +74,9 @@ func (m *mockWorkUnitRepo) CountByLeafAndState(context.Context, types.ID, workun
 	return 0, nil
 }
 func (m *mockWorkUnitRepo) MarkSpotCheck(context.Context, types.ID) error  { return nil }
+func (m *mockWorkUnitRepo) EnsureWorkUnitHRClass(_ context.Context, _ types.ID, class string) (string, error) {
+	return class, nil
+}
 func (m *mockWorkUnitRepo) ClearSpotCheck(context.Context, types.ID) error { return nil }
 func (m *mockWorkUnitRepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil

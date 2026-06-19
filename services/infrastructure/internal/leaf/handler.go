@@ -2,6 +2,7 @@ package leaf
 
 import (
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -314,8 +315,21 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+		return
+	}
 	var req UpdateLeafRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+		return
+	}
+	// Also capture the raw top-level keys so config blocks can be MERGED field-by-field
+	// (overlay only the keys the caller actually sent) rather than whole-block REPLACED.
+	// Whole-block replace (#41) silently zeroed any field the caller omitted.
+	var rawReq map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawReq); err != nil {
 		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
 		return
 	}
@@ -354,30 +368,94 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		p.StatsCacheSeconds = v
 	}
 
-	// Config updates — check immutable-while-active constraints.
-	if req.ExecutionConfig != nil {
-		if p.State == StateActive && req.ExecutionConfig.Runtime != p.ExecutionConfig.Runtime {
+	// Config updates — MERGE (overlay only the JSON keys the caller sent onto the
+	// existing block) and RE-VALIDATE the affected block. This fixes #41: the old code
+	// whole-block-REPLACED each config (zeroing omitted fields) and skipped re-validation,
+	// so a one-field change required resending the whole block and an invalid config (e.g.
+	// redundancy_factor: 0) was accepted silently on an ACTIVE leaf.
+	if raw, ok := rawReq["execution_config"]; ok {
+		merged := p.ExecutionConfig
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid execution_config", nil))
+			return
+		}
+		if p.State == StateActive && merged.Runtime != p.ExecutionConfig.Runtime {
 			apierror.WriteError(w, apierror.Conflict(
 				"execution_config.runtime cannot be changed while leaf is ACTIVE",
 				map[string]string{"field": "execution_config.runtime"}))
 			return
 		}
-		p.ExecutionConfig = *req.ExecutionConfig
+		ApplyExecutionConfigDefaults(&merged)
+		if apiErr := ValidateExecutionConfig(&merged); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.ExecutionConfig = merged
 	}
-	if req.ValidationConfig != nil {
-		p.ValidationConfig = *req.ValidationConfig
+	if raw, ok := rawReq["validation_config"]; ok {
+		merged := p.ValidationConfig
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid validation_config", nil))
+			return
+		}
+		ApplyValidationConfigDefaults(&merged)
+		if apiErr := ValidateValidationConfig(&merged); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.ValidationConfig = merged
 	}
-	if req.FaultToleranceConfig != nil {
-		p.FaultToleranceConfig = *req.FaultToleranceConfig
+	if raw, ok := rawReq["fault_tolerance_config"]; ok {
+		merged := p.FaultToleranceConfig
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid fault_tolerance_config", nil))
+			return
+		}
+		ApplyFaultToleranceConfigDefaults(&merged)
+		if apiErr := ValidateFaultToleranceConfig(&merged); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.FaultToleranceConfig = merged
 	}
-	if req.DataConfig != nil {
-		p.DataConfig = *req.DataConfig
+	if raw, ok := rawReq["data_config"]; ok {
+		merged := p.DataConfig
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid data_config", nil))
+			return
+		}
+		ApplyDataConfigDefaults(&merged)
+		if apiErr := ValidateDataConfig(&merged, p.TaskPattern); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.DataConfig = merged
 	}
-	if req.CreditConfig != nil {
-		p.CreditConfig = *req.CreditConfig
+	if raw, ok := rawReq["credit_config"]; ok {
+		merged := p.CreditConfig
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid credit_config", nil))
+			return
+		}
+		ApplyCreditConfigDefaults(&merged)
+		if apiErr := ValidateCreditConfig(&merged); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.CreditConfig = merged
 	}
-	if req.ResourceRequirements != nil {
-		p.ResourceRequirements = *req.ResourceRequirements
+	if raw, ok := rawReq["resource_requirements"]; ok {
+		merged := p.ResourceRequirements
+		if err := json.Unmarshal(raw, &merged); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid resource_requirements", nil))
+			return
+		}
+		ApplyResourceRequirementsDefaults(&merged)
+		if apiErr := ValidateResourceRequirements(&merged); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		p.ResourceRequirements = merged
 	}
 
 	// Validate updated metadata.

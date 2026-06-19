@@ -3,6 +3,7 @@ package client
 import (
 	"log/slog"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,8 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 			MaxDiskMb:        int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
 			MaxBandwidthMbps: int32(cfg.ResourceLimits.MaxBandwidthMbps),
 			Gpus:             []*lettucev1.GpuInfo{},
+			Os:               runtime.GOOS,
+			CpuArch:          runtime.GOARCH,
 		}
 	}
 
@@ -106,6 +109,33 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 		MaxDiskMb:        int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
 		MaxBandwidthMbps: int32(cfg.ResourceLimits.MaxBandwidthMbps),
 		Gpus:             gpus,
+		// Hardware-class inputs for Homogeneous Redundancy. OS/arch come straight from the
+		// Go runtime; vendor is derived from the detected CPU model string (Intel/AMD/Apple)
+		// — coarse but reliable, since /proc/cpuinfo, WMI, and sysctl all embed the vendor in
+		// the brand string. (A CPUID-based vendor probe could tighten this later.)
+		Os:        runtime.GOOS,
+		CpuArch:   runtime.GOARCH,
+		CpuVendor: cpuVendorFromModel(cpuModel),
+	}
+}
+
+// cpuVendorFromModel derives a coarse CPU vendor token from the detected CPU model/brand
+// string (and the runtime arch for Apple Silicon). Returns "" when unknown; the head's
+// HRClass() then collapses that to "unknown" so the class stays well-formed.
+func cpuVendorFromModel(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "intel"):
+		return "GenuineIntel"
+	case strings.Contains(m, "amd"):
+		return "AuthenticAMD"
+	case strings.Contains(m, "apple"):
+		return "Apple"
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
+		// Apple Silicon brand strings are sometimes just "Apple Mx".
+		return "Apple"
+	default:
+		return ""
 	}
 }
 

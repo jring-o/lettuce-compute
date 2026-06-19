@@ -1179,8 +1179,14 @@ type HardwareCapabilities struct {
 	MaxBandwidthMbps int32                  `protobuf:"varint,8,opt,name=max_bandwidth_mbps,json=maxBandwidthMbps,proto3" json:"max_bandwidth_mbps,omitempty"`
 	Gpus             []*GpuInfo             `protobuf:"bytes,9,rep,name=gpus,proto3" json:"gpus,omitempty"`
 	BenchmarkFpops   float64                `protobuf:"fixed64,10,opt,name=benchmark_fpops,json=benchmarkFpops,proto3" json:"benchmark_fpops,omitempty"` // CPU benchmark: floating-point ops per second
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Hardware-class inputs for Homogeneous Redundancy (HR): the head derives an HR
+	// class string from these so all redundant copies of a work unit run on the same
+	// class of machine and their floating-point results are bit-comparable.
+	Os            string `protobuf:"bytes,11,opt,name=os,proto3" json:"os,omitempty"`                                // GOOS: linux, darwin, windows
+	CpuArch       string `protobuf:"bytes,12,opt,name=cpu_arch,json=cpuArch,proto3" json:"cpu_arch,omitempty"`       // GOARCH: amd64, arm64
+	CpuVendor     string `protobuf:"bytes,13,opt,name=cpu_vendor,json=cpuVendor,proto3" json:"cpu_vendor,omitempty"` // GenuineIntel, AuthenticAMD, Apple, ... ("" if unknown)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HardwareCapabilities) Reset() {
@@ -1281,6 +1287,27 @@ func (x *HardwareCapabilities) GetBenchmarkFpops() float64 {
 		return x.BenchmarkFpops
 	}
 	return 0
+}
+
+func (x *HardwareCapabilities) GetOs() string {
+	if x != nil {
+		return x.Os
+	}
+	return ""
+}
+
+func (x *HardwareCapabilities) GetCpuArch() string {
+	if x != nil {
+		return x.CpuArch
+	}
+	return ""
+}
+
+func (x *HardwareCapabilities) GetCpuVendor() string {
+	if x != nil {
+		return x.CpuVendor
+	}
+	return ""
 }
 
 type GpuInfo struct {
@@ -2063,7 +2090,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x13checkpoint_sequence\x18\x03 \x01(\x05R\x12checkpointSequence\x125\n" +
 	"\x17created_by_volunteer_id\x18\x04 \x01(\tR\x14createdByVolunteerId\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\x05 \x01(\tR\tcreatedAt\"\x96\x03\n" +
+	"created_at\x18\x05 \x01(\tR\tcreatedAt\"\xe0\x03\n" +
 	"\x14HardwareCapabilities\x12\x1b\n" +
 	"\tcpu_cores\x18\x01 \x01(\x05R\bcpuCores\x12\x1b\n" +
 	"\tcpu_model\x18\x02 \x01(\tR\bcpuModel\x12\"\n" +
@@ -2075,7 +2102,11 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x12max_bandwidth_mbps\x18\b \x01(\x05R\x10maxBandwidthMbps\x121\n" +
 	"\x04gpus\x18\t \x03(\v2\x1d.lettuce.volunteer.v1.GpuInfoR\x04gpus\x12'\n" +
 	"\x0fbenchmark_fpops\x18\n" +
-	" \x01(\x01R\x0ebenchmarkFpops\"\xa1\x01\n" +
+	" \x01(\x01R\x0ebenchmarkFpops\x12\x0e\n" +
+	"\x02os\x18\v \x01(\tR\x02os\x12\x19\n" +
+	"\bcpu_arch\x18\f \x01(\tR\acpuArch\x12\x1d\n" +
+	"\n" +
+	"cpu_vendor\x18\r \x01(\tR\tcpuVendor\"\xa1\x01\n" +
 	"\aGpuInfo\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x16\n" +
 	"\x06vendor\x18\x02 \x01(\tR\x06vendor\x12\x17\n" +

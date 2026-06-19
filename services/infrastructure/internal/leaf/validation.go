@@ -529,6 +529,45 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 		}
 	}
 
+	// Comparison field-path lists (ignore_fields / compare_fields): each entry must be a
+	// non-empty, reasonably-bounded dotted JSON path. compare_fields only applies to
+	// NUMERIC_TOLERANCE; ignore_fields applies to EXACT (canonical) and NUMERIC_TOLERANCE.
+	if err := validateFieldPaths("ignore_fields", c.IgnoreFields); err != nil {
+		return err
+	}
+	if err := validateFieldPaths("compare_fields", c.CompareFields); err != nil {
+		return err
+	}
+	if len(c.CompareFields) > 0 && c.ComparisonMode != ComparisonNumericTolerance {
+		return apierror.ValidationError(
+			"compare_fields is only valid when comparison_mode is NUMERIC_TOLERANCE",
+			validationDetail{Field: "compare_fields", Reason: "not_applicable_for_mode"})
+	}
+
+	return nil
+}
+
+// validateFieldPaths checks a list of output JSON field paths (ignore_fields /
+// compare_fields): at most 256 entries, each a non-empty path <= 256 chars with no
+// surrounding whitespace.
+func validateFieldPaths(field string, paths []string) *apierror.APIError {
+	if len(paths) > 256 {
+		return apierror.ValidationError(
+			fmt.Sprintf("%s may have at most 256 entries", field),
+			validationDetail{Field: field, Reason: "too_many"})
+	}
+	for _, p := range paths {
+		if p == "" || strings.TrimSpace(p) != p {
+			return apierror.ValidationError(
+				fmt.Sprintf("%s entries must be non-empty and not surrounded by whitespace", field),
+				validationDetail{Field: field, Reason: "invalid_value"})
+		}
+		if len(p) > 256 {
+			return apierror.ValidationError(
+				fmt.Sprintf("%s entries must be at most 256 characters", field),
+				validationDetail{Field: field, Reason: "too_long"})
+		}
+	}
 	return nil
 }
 

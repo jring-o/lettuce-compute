@@ -23,6 +23,32 @@ jobs:
         working-directory: services/infrastructure
     env:
       GOWORK: "off"
+      # DB-backed tests connect here; setupTestDB only connects + DELETE-cleans, it does
+      # NOT create the schema, so the migrate step below must run first (#43).
+      LETTUCE_TEST_DB_URL: postgres://lettuce:lettuce@localhost:5432/lettuce_test?sslmode=disable
+      # The database package's tests build their pool from the DISCRETE vars (not the URL),
+      # and Password has no default — so set them explicitly to match the service above.
+      LETTUCE_TEST_DB_HOST: localhost
+      LETTUCE_TEST_DB_PORT: "5432"
+      LETTUCE_TEST_DB_NAME: lettuce_test
+      LETTUCE_TEST_DB_USER: lettuce
+      LETTUCE_TEST_DB_PASSWORD: lettuce
+      # Dev escape hatch so e2e tests that need a signer can autogenerate one.
+      LETTUCE_SIGNING_KEY_AUTOGEN: "true"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lettuce
+          POSTGRES_PASSWORD: lettuce
+          POSTGRES_DB: lettuce_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -30,7 +56,27 @@ jobs:
           go-version-file: services/infrastructure/go.mod
           cache-dependency-path: services/infrastructure/go.sum
       - run: go vet ./...
-      - run: go test ./...
+      # Apply the schema before the DB-backed tests run. There is no --migrate-only server
+      # flag (migrations only run inside cmd/lettuce-server boot), so use the golang-migrate
+      # CLI directly against the migrations directory.
+      - name: Apply migrations
+        run: go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest -source "file://migrations" -database "$LETTUCE_TEST_DB_URL" up
+      # Run unit AND integration (-tags integration) tests. The integration suite is
+      # DB-gated and was previously invisible in CI (no Postgres). -p 1 serializes PACKAGE
+      # execution: every DB-backed package shares the one Postgres and setupTestDB does a
+      # global DELETE-clean, so running package binaries in parallel makes them stomp each
+      # other's rows (FK violations). -p 1 gives each package exclusive DB access in turn.
+      # The e2e lifecycle packages (./internal and ./internal/e2e) are EXCLUDED here and run
+      # in the non-blocking step below — they were rewritten for the per-copy dispatch model
+      # but have only ever been compiled, so they still need a round of assertion fixups
+      # (TODO #43/#45) and would otherwise block on pre-existing failures unrelated to a PR.
+      - name: Integration tests (DB-backed)
+        run: go test -tags integration -p 1 $(go list ./... | grep -vE '/infrastructure/internal$|/infrastructure/internal/e2e$')
+      # The per-copy e2e lifecycle suites — RUN and reported, but non-blocking until their
+      # assertion fixups land (TODO #43/#45). Flip to blocking once they are green.
+      - name: E2E lifecycle tests (non-blocking until per-copy fixups land)
+        continue-on-error: true
+        run: go test -tags integration -p 1 ./internal/ ./internal/e2e/
 
   volunteer-cli:
     name: Volunteer CLI (Go)
