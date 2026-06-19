@@ -1336,6 +1336,64 @@ func TestFindNextAssignable_BasicMatch(t *testing.T) {
 	}
 }
 
+// TestFindNextAssignable_HomogeneousRedundancy verifies the HR filter + first-writer-wins
+// pin at the DB layer: EnsureWorkUnitHRClass is idempotent, a unit pinned to one class is
+// excluded from a different-class requester, and returned to a same-class requester.
+func TestFindNextAssignable_HomogeneousRedundancy(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "assign-hr")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
+	volunteerID := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := newTestWorkUnit(leafID, nil)
+	wu.State = WorkUnitStateQueued
+	if err := repo.Create(ctx, wu); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	const intel = "GenuineIntel/linux/amd64"
+	const amd = "AuthenticAMD/linux/amd64"
+
+	got, err := repo.EnsureWorkUnitHRClass(ctx, wu.ID, intel)
+	if err != nil {
+		t.Fatalf("EnsureWorkUnitHRClass: %v", err)
+	}
+	if got != intel {
+		t.Fatalf("first pin = %q, want %q", got, intel)
+	}
+	if got, _ := repo.EnsureWorkUnitHRClass(ctx, wu.ID, amd); got != intel {
+		t.Fatalf("second pin = %q, want first-writer-wins %q", got, intel)
+	}
+
+	base := AssignmentOptions{
+		VolunteerID:       volunteerID,
+		MaxCPUCores:       4,
+		MaxMemoryMB:       16384,
+		MaxDiskMB:         10240,
+		AvailableRuntimes: []string{"NATIVE"},
+	}
+
+	diff := base
+	diff.HRClass = amd
+	if found, err := repo.FindNextAssignable(ctx, diff); err != nil {
+		t.Fatalf("FindNextAssignable(diff): %v", err)
+	} else if found != nil {
+		t.Fatalf("different-class requester should get nil, got %v", found.ID)
+	}
+
+	same := base
+	same.HRClass = intel
+	if found, err := repo.FindNextAssignable(ctx, same); err != nil {
+		t.Fatalf("FindNextAssignable(same): %v", err)
+	} else if found == nil || found.ID != wu.ID {
+		t.Fatalf("same-class requester should get the unit, got %v", found)
+	}
+}
+
 func TestFindNextAssignable_NoWorkReturnsNil(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()

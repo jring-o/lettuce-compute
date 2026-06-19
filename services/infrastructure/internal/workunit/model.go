@@ -62,6 +62,13 @@ type WorkUnit struct {
 	LastHeartbeatAt          *time.Time       `json:"last_heartbeat_at,omitempty"`
 	FlaggedForReview         bool             `json:"flagged_for_review"`
 	SpotCheck                bool             `json:"spot_check"`
+	// HRClass is the Homogeneous-Redundancy hardware class this unit is pinned to. It is
+	// NULL until the first copy is dispatched; when the leaf enables homogeneous_redundancy
+	// the first hand-out stamps it (first-writer-wins) with the holder's class (CPU vendor +
+	// OS + arch), and every later copy is then restricted to volunteers of that same class so
+	// redundant results are bit-comparable even for non-portably-deterministic engines.
+	// NULL = unpinned / HR disabled (no class restriction).
+	HRClass                  *string          `json:"hr_class,omitempty"`
 	LastCheckpointAt         *time.Time       `json:"last_checkpoint_at,omitempty"`
 	LastCheckpointSequence   int              `json:"last_checkpoint_sequence"`
 	// ReservedUntil / ReservedVolunteerID are TRANSIENT, not DB columns (the single

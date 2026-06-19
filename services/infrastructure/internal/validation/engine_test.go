@@ -174,6 +174,17 @@ func (m *mockWorkUnitRepo) Reassign(_ context.Context, id types.ID) (*workunit.W
 func (m *mockWorkUnitRepo) CountByLeafAndState(_ context.Context, _ types.ID, _ workunit.WorkUnitState) (int64, error) {
 	return 0, nil
 }
+func (m *mockWorkUnitRepo) EnsureWorkUnitHRClass(_ context.Context, id types.ID, class string) (string, error) {
+	if wu, ok := m.wus[id]; ok {
+		if wu.HRClass == nil {
+			c := class
+			wu.HRClass = &c
+		}
+		return *wu.HRClass, nil
+	}
+	return class, nil
+}
+
 func (m *mockWorkUnitRepo) MarkSpotCheck(_ context.Context, id types.ID) error {
 	if wu, ok := m.wus[id]; ok {
 		wu.SpotCheck = true
@@ -1062,8 +1073,8 @@ func TestNumericTolerance_NaN_DoesNotAgree(t *testing.T) {
 	// numericMatch directly and via 1e400 (which DOES decode to +Inf). Here we
 	// assert numericMatch never treats NaN as a match.
 	nan := math.NaN()
-	a := map[string]float64{"x": nan}
-	b := map[string]float64{"x": nan}
+	a := map[string]flatVal{"x": {Num: nan, IsNum: true}}
+	b := map[string]flatVal{"x": {Num: nan, IsNum: true}}
 	if numericMatch(a, b, 0.01) {
 		t.Fatal("numericMatch must NOT treat two NaN values as matching")
 	}
@@ -1079,9 +1090,9 @@ func TestParseNumericOutput_RejectsNaN(t *testing.T) {
 	// NaN, so we write the literal token that exercises post-decode finiteness.
 	// We test parse rejection by directly constructing the decoded path is not
 	// possible through json (NaN is not valid JSON), so cover +Inf via 1e400.
-	_, err := parseNumericOutput(json.RawMessage(`{"x": 1e400}`))
+	_, err := flattenOutput(json.RawMessage(`{"x": 1e400}`), nil, nil)
 	if err == nil {
-		t.Fatal("parseNumericOutput must reject +Inf (from 1e400) as non-finite")
+		t.Fatal("flattenOutput must reject +Inf (from 1e400) as non-finite")
 	}
 }
 
@@ -1128,7 +1139,7 @@ func TestNumericMatch_DefensiveNonFinite(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if numericMatch(map[string]float64{"x": tc.a}, map[string]float64{"x": tc.b}, 0.5) {
+			if numericMatch(map[string]flatVal{"x": {Num: tc.a, IsNum: true}}, map[string]flatVal{"x": {Num: tc.b, IsNum: true}}, 0.5) {
 				t.Errorf("numericMatch(%v, %v) = true, want false for non-finite operand", tc.a, tc.b)
 			}
 		})

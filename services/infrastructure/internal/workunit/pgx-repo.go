@@ -38,7 +38,7 @@ const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 	reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
-	created_at, updated_at`
+	created_at, updated_at, hr_class`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
 // The column order must match workUnitColumns.
@@ -72,6 +72,7 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.LastCheckpointSequence,
 		&wu.CreatedAt,
 		&wu.UpdatedAt,
+		&wu.HRClass,
 	)
 	return &wu, err
 }
@@ -432,7 +433,7 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.assigned_volunteer_id, wu.assigned_at, wu.started_at, wu.completed_at, wu.validated_at,
 	wu.reassignment_count, wu.max_reassignments, wu.max_total_copies, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
-	wu.created_at, wu.updated_at`
+	wu.created_at, wu.updated_at, wu.hr_class`
 
 // scanDispatchCandidate scans the prefixedWorkUnitColumns set (column order matching
 // the const above) into a WorkUnit. Shared by FindDispatchableBatch /
@@ -445,7 +446,7 @@ func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
 		&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
 		&wu.ReassignmentCount, &wu.MaxReassignments, &wu.MaxTotalCopies, &wu.LastHeartbeatAt,
 		&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
-		&wu.CreatedAt, &wu.UpdatedAt,
+		&wu.CreatedAt, &wu.UpdatedAt, &wu.HRClass,
 	}
 	dst = append(dst, extra...)
 	return rows.Scan(dst...)
@@ -541,6 +542,10 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    OR (SELECT COUNT(*) FROM work_unit_assignment_history wuah5
 		        WHERE wuah5.volunteer_id = $9 AND wuah5.outcome IS NULL) < $12
 		  )
+		  -- Homogeneous Redundancy: a unit already pinned to a hardware class only goes to
+		  -- volunteers of that SAME class. Unpinned units (hr_class IS NULL, incl. all
+		  -- non-HR leafs) and an empty requester class are unconstrained.
+		  AND (wu.hr_class IS NULL OR $13::text = '' OR wu.hr_class = $13)
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT 1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -556,6 +561,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		opts.GPUVendors,
 		opts.GPUComputeCapabilities,
 		opts.MaxInflightPerVolunteer,
+		opts.HRClass,
 	)
 
 	wu, err := scanWorkUnit(row)
@@ -1341,6 +1347,25 @@ func (r *PgxWorkUnitRepository) MarkSpotCheck(ctx context.Context, id types.ID) 
 		return apierror.NotFound("work_unit", id.String())
 	}
 	return nil
+}
+
+// EnsureWorkUnitHRClass stamps the homogeneous-redundancy hardware class first-writer-wins
+// and returns the effective (post-COALESCE) class. The UPDATE is a no-op once a class is
+// set, so concurrent first hand-outs converge on whichever landed first. Mirrors the
+// artifact-version pin (EnsureWorkUnitPin) but for the hardware class.
+func (r *PgxWorkUnitRepository) EnsureWorkUnitHRClass(ctx context.Context, workUnitID types.ID, class string) (string, error) {
+	var effective string
+	err := r.db.QueryRow(ctx,
+		`UPDATE work_units SET hr_class = COALESCE(hr_class, $2) WHERE id = $1 RETURNING hr_class`,
+		workUnitID, class,
+	).Scan(&effective)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", apierror.NotFound("work_unit", workUnitID.String())
+		}
+		return "", apierror.Internal("failed to ensure work unit hr_class", err)
+	}
+	return effective, nil
 }
 
 // ClearSpotCheck sets spot_check = false for a work unit, allowing it to complete

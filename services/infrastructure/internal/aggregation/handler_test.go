@@ -139,6 +139,9 @@ func (m *mockWURepo) CountByLeafAndState(_ context.Context, _ types.ID, _ workun
 	return 0, nil
 }
 func (m *mockWURepo) MarkSpotCheck(_ context.Context, _ types.ID) error  { return nil }
+func (m *mockWURepo) EnsureWorkUnitHRClass(_ context.Context, _ types.ID, class string) (string, error) {
+	return class, nil
+}
 func (m *mockWURepo) ClearSpotCheck(_ context.Context, _ types.ID) error { return nil }
 func (m *mockWURepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil

@@ -640,6 +640,10 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		GPUVendors:              gpuVendors,
 		GPUComputeCapabilities:  gpuCapabilities,
 		MaxInflightPerVolunteer: s.maxInflightPerVolunteer,
+		// Homogeneous Redundancy: the requester's hardware class. Always populated; it only
+		// filters units that are actually pinned (HR-enabled leaves), so non-HR leaves are
+		// unaffected (their hr_class stays NULL).
+		HRClass:                 hw.HRClass(),
 	}
 
 	// Server-directed retry delay: computed once from the current load and

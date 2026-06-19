@@ -52,6 +52,23 @@ type fakeWURepo struct {
 	lastClaimLease      time.Duration
 	lastFlushHeadID     types.ID
 	lastFlushClaimLease time.Duration
+
+	// hrClasses records homogeneous-redundancy pins (first-writer-wins) so HR dispatch
+	// tests can assert which class a unit was pinned to.
+	hrClasses map[types.ID]string
+}
+
+func (f *fakeWURepo) EnsureWorkUnitHRClass(_ context.Context, id types.ID, class string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hrClasses == nil {
+		f.hrClasses = map[types.ID]string{}
+	}
+	if existing, ok := f.hrClasses[id]; ok {
+		return existing, nil
+	}
+	f.hrClasses[id] = class
+	return class, nil
 }
 
 func (f *fakeWURepo) FindDispatchableBatch(_ context.Context, limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -282,6 +299,90 @@ func (c *dispatchCache) warm(lf *leaf.Leaf, leafRepo *fakeLeafRepo) {
 }
 
 // --- tests --------------------------------------------------------------------
+
+// hrOpts returns capable AssignmentOptions tagged with a hardware class.
+func hrOpts(vol types.ID, class string) workunit.AssignmentOptions {
+	o := capableOpts(vol, 0)
+	o.HRClass = class
+	return o
+}
+
+// TestHandOut_HomogeneousRedundancy_PinsAndFiltersByClass verifies HR: the first holder
+// pins the unit to its hardware class, a DIFFERENT-class volunteer is then filtered out,
+// and a SAME-class volunteer gets the second redundant copy.
+func TestHandOut_HomogeneousRedundancy_PinsAndFiltersByClass(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	lf := nativeLeaf(leafID, 2, false, 0)
+	lf.ValidationConfig.HomogeneousRedundancy = true
+	c.warm(lf, leafRepo)
+
+	unitID := types.NewID()
+	c.stageUnit(unitID, leafID, 2, 0)
+
+	const intel = "GenuineIntel/linux/amd64"
+	const amd = "AuthenticAMD/linux/amd64"
+
+	// First holder (Intel) takes a copy and pins the unit to its class.
+	volA := types.NewID()
+	resA, _ := c.HandOut(volA, hrOpts(volA, intel), 1)
+	if len(resA) != 1 {
+		t.Fatalf("volA hand-out = %d results, want 1", len(resA))
+	}
+	wuRepo.mu.Lock()
+	pinned := wuRepo.hrClasses[unitID]
+	wuRepo.mu.Unlock()
+	if pinned != intel {
+		t.Fatalf("durable hr_class pin = %q, want %q", pinned, intel)
+	}
+
+	// Different-class volunteer (AMD) is filtered out — gets nothing.
+	volB := types.NewID()
+	resB, _ := c.HandOut(volB, hrOpts(volB, amd), 1)
+	if len(resB) != 0 {
+		t.Fatalf("volB (different class) hand-out = %d results, want 0 (HR filtered)", len(resB))
+	}
+
+	// Same-class volunteer (Intel) gets the second redundant copy.
+	volC := types.NewID()
+	resC, _ := c.HandOut(volC, hrOpts(volC, intel), 1)
+	if len(resC) != 1 {
+		t.Fatalf("volC (same class) hand-out = %d results, want 1 (second copy)", len(resC))
+	}
+}
+
+// TestHandOut_NonHR_NoClassFilter verifies a non-HR leaf is unaffected: copies go to
+// volunteers of any class (no pin, no filter).
+func TestHandOut_NonHR_NoClassFilter(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	lf := nativeLeaf(leafID, 2, false, 0) // HomogeneousRedundancy defaults false
+	c.warm(lf, leafRepo)
+	unitID := types.NewID()
+	c.stageUnit(unitID, leafID, 2, 0)
+
+	volA := types.NewID()
+	if resA, _ := c.HandOut(volA, hrOpts(volA, "GenuineIntel/linux/amd64"), 1); len(resA) != 1 {
+		t.Fatalf("volA hand-out = %d, want 1", len(resA))
+	}
+	// Different class still gets the second copy (no HR pin on a non-HR leaf).
+	volB := types.NewID()
+	if resB, _ := c.HandOut(volB, hrOpts(volB, "AuthenticAMD/darwin/arm64"), 1); len(resB) != 1 {
+		t.Fatalf("volB (different class, non-HR leaf) = %d, want 1 (no class filter)", len(resB))
+	}
+	wuRepo.mu.Lock()
+	_, pinned := wuRepo.hrClasses[unitID]
+	wuRepo.mu.Unlock()
+	if pinned {
+		t.Fatal("non-HR leaf should not pin hr_class")
+	}
+}
 
 // TestHandOutBasic: a single capable volunteer gets a reservation with a window,
 // and the unit leaves the ready pool (redundancy 1).

@@ -31,6 +31,9 @@ func (r *mockWorkUnitRepo) CountByLeafAndState(_ context.Context, leafID types.I
 }
 
 func (r *mockWorkUnitRepo) Create(_ context.Context, _ *workunit.WorkUnit) error { return nil }
+func (r *mockWorkUnitRepo) EnsureWorkUnitHRClass(_ context.Context, _ types.ID, class string) (string, error) {
+	return class, nil
+}
 func (r *mockWorkUnitRepo) GetByID(_ context.Context, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

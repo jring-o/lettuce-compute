@@ -117,6 +117,27 @@ type ValidationConfig struct {
 	MaxRetries          int      `json:"max_retries"`
 	SpotCheckEnabled    bool     `json:"spot_check_enabled"`
 	SpotCheckPercentage float64  `json:"spot_check_percentage"`
+
+	// IgnoreFields lists output JSON field paths to EXCLUDE from result comparison —
+	// volatile provenance like a wall-clock "compute_time_ms" that legitimately differs
+	// run-to-run and would otherwise break agreement. A path matches a field iff it
+	// equals the field's dotted path, or is a dot-boundary prefix of it (subtree match);
+	// inside arrays the index is elided, so "fights.compute_time_ms" drops that key from
+	// every element. Honored by EXACT (the comparison checksum is recomputed from the
+	// stored output with these fields stripped + keys sorted) and by NUMERIC_TOLERANCE.
+	// Requires INLINE output (the head must have the bytes); ignored for EXTERNAL_REFERENCE.
+	IgnoreFields []string `json:"ignore_fields,omitempty"`
+	// CompareFields, when non-empty, RESTRICTS NUMERIC_TOLERANCE comparison to exactly
+	// these output JSON field paths (numeric leaves compared within numeric_tolerance,
+	// non-numeric leaves compared for equality). Use it to verify only aggregate science
+	// (e.g. ["a_win_rate","knockout_rate","mean_duration_s"]) on a chaotic sim whose raw
+	// per-fight trajectories legitimately diverge across volunteers. Empty = compare all
+	// numeric leaves (minus IgnoreFields). No effect on EXACT.
+	CompareFields []string `json:"compare_fields,omitempty"`
+	// HomogeneousRedundancy, when true, pins every copy of a work unit to volunteers of a
+	// single hardware class (CPU vendor + OS + arch), so bit-for-bit agreement is
+	// achievable even for engines that are not portably deterministic. See dispatch.
+	HomogeneousRedundancy bool `json:"homogeneous_redundancy,omitempty"`
 }
 
 // FaultToleranceConfig defines deadline-based reassignment settings.

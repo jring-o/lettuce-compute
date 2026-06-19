@@ -21,6 +21,10 @@ type AssignmentOptions struct {
 	GPUVendors              []string // ["NVIDIA", "AMD"] — vendors of volunteer's GPUs
 	GPUComputeCapabilities  []string // ["8.6", "gfx1030"] — compute capabilities
 	MaxInflightPerVolunteer int      // server-enforced cap on concurrent assigned WUs
+	// HRClass is the requesting volunteer's hardware class (CPU vendor + OS + arch). When
+	// set, a unit already pinned to a DIFFERENT class (homogeneous redundancy) is excluded;
+	// an unpinned unit (hr_class IS NULL) is eligible regardless. Empty = no HR filtering.
+	HRClass string
 }
 
 // WorkUnitRepository defines the data-access interface for work units.
@@ -136,6 +140,13 @@ type WorkUnitRepository interface {
 	// Reassign returns an EXPIRED or REJECTED work unit to QUEUED for further
 	// corroboration (uncapped — property 6). Always requeued=true on success.
 	Reassign(ctx context.Context, id types.ID) (wu *WorkUnit, requeued bool, err error)
+
+	// EnsureWorkUnitHRClass stamps the homogeneous-redundancy hardware class on a unit
+	// first-writer-wins (SET hr_class = COALESCE(hr_class, $2)) and returns the effective
+	// class. Idempotent: once the first copy pins a class, later callers get that class
+	// back regardless of their own. Used at first hand-out so every subsequent copy of the
+	// unit is restricted to the same class.
+	EnsureWorkUnitHRClass(ctx context.Context, workUnitID types.ID, class string) (string, error)
 
 	// MarkSpotCheck sets spot_check = true for a work unit.
 	MarkSpotCheck(ctx context.Context, id types.ID) error

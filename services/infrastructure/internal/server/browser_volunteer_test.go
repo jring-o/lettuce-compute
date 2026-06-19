@@ -169,6 +169,9 @@ func (m *bvMockWURepo) Reassign(context.Context, types.ID) (*workunit.WorkUnit, 
 }
 func (m *bvMockWURepo) MarkSpotCheck(context.Context, types.ID) error  { return nil }
 func (m *bvMockWURepo) ClearSpotCheck(context.Context, types.ID) error { return nil }
+func (m *bvMockWURepo) EnsureWorkUnitHRClass(_ context.Context, _ types.ID, class string) (string, error) {
+	return class, nil
+}
 func (m *bvMockWURepo) FindRunningWithStaleCheckpoints(context.Context, int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
 }

@@ -1,11 +1,15 @@
 package validation
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
@@ -170,11 +174,22 @@ func versionHomogeneousGroup(pending []*result.Result) []*result.Result {
 }
 
 // validateExact groups results by output checksum and applies quorum selection.
+//
+// When the leaf declares ignore_fields, the grouping key is recomputed canonically
+// from the stored output (volatile fields stripped + object keys sorted) so that a
+// wall-clock field like compute_time_ms no longer prevents agreement; otherwise the
+// raw submitted checksum is used (historical behavior, unchanged).
 func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) (*ValidationResult, error) {
-	// Group results by checksum.
+	ignoreFields := proj.ValidationConfig.IgnoreFields
+
+	// Group results by (canonical) checksum.
 	groups := make(map[string][]*result.Result)
 	for _, r := range pending {
-		groups[r.OutputChecksum] = append(groups[r.OutputChecksum], r)
+		key, err := comparisonKey(r, ignoreFields)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize output for result %s: %w", r.ID, err)
+		}
+		groups[key] = append(groups[key], r)
 	}
 
 	// Find the largest group (majority).
@@ -200,11 +215,17 @@ func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.Work
 	if proj.ValidationConfig.NumericTolerance != nil {
 		epsilon = *proj.ValidationConfig.NumericTolerance
 	}
+	ignoreFields := proj.ValidationConfig.IgnoreFields
+	compareFields := proj.ValidationConfig.CompareFields
 
-	// Parse all result output data as map[string]float64.
-	parsed := make([]map[string]float64, len(pending))
+	// Flatten all result output data into path -> value maps. Nested objects/arrays
+	// are flattened to dotted/indexed paths; numeric leaves compare within epsilon and
+	// non-numeric leaves compare for equality. ignore_fields are dropped; if
+	// compare_fields is non-empty only matching paths are kept (so a chaotic sim can be
+	// validated on its aggregate science while its raw per-fight trajectory is excluded).
+	parsed := make([]map[string]flatVal, len(pending))
 	for i, r := range pending {
-		m, err := parseNumericOutput(r.OutputData)
+		m, err := flattenOutput(r.OutputData, ignoreFields, compareFields)
 		if err != nil {
 			return nil, fmt.Errorf("parse output_data for result %s: %w", r.ID, err)
 		}
@@ -508,34 +529,103 @@ func (e *Engine) checkRejectionRate(ctx context.Context, volunteerID types.ID) {
 	}
 }
 
-// parseNumericOutput parses JSON output data as a flat map of string keys to float64 values.
+// flatVal is one flattened JSON leaf: either a finite number (IsNum) or a stringified
+// non-numeric scalar (string/bool/null). Numeric leaves compare within epsilon;
+// non-numeric leaves compare for equality.
+type flatVal struct {
+	Num   float64
+	IsNum bool
+	Str   string
+}
+
+// flattenOutput parses JSON output data and flattens it to a path -> leaf map.
 //
-// Non-finite values (NaN, +Inf, -Inf) are rejected as invalid: a result whose
-// numeric output contains any non-finite value is treated identically to a
-// malformed/unparseable output (an error is returned). This is a security
-// safeguard — comparing non-finite values with math.Abs(va-vb) > epsilon yields
-// false for NaN, which would otherwise let two such results be judged "matching"
-// and reach quorum. Note that JSON like 1e400 unmarshals to ±Inf without a parse
-// error, so this finiteness check (not json.Unmarshal alone) is what catches it.
-func parseNumericOutput(data json.RawMessage) (map[string]float64, error) {
+// Objects nest as dotted paths ("replay.dt"); array elements index as "fights.0.winner".
+// ignoreFields paths are dropped; if compareFields is non-empty ONLY matching paths are
+// kept. Path matching is exact or dot-boundary-prefix (subtree), so "fights" selects all
+// of fights.* and "compute_time_ms" drops just that field.
+//
+// Non-finite numbers (NaN, ±Inf) are rejected as invalid — the same security safeguard as
+// the original flat parser: comparing NaN with math.Abs(va-vb) > epsilon yields false,
+// which would otherwise let two poisoned results be judged "matching" and reach quorum.
+// JSON like 1e400 decodes to ±Inf, so this finiteness check (not the decoder alone) is
+// what catches it.
+func flattenOutput(data json.RawMessage, ignoreFields, compareFields []string) (map[string]flatVal, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty output data")
 	}
-	var m map[string]float64
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("unmarshal numeric output: %w", err)
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v interface{}
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("unmarshal output: %w", err)
 	}
-	for key, v := range m {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return nil, fmt.Errorf("non-finite numeric output for key %q: %v", key, v)
-		}
+	out := make(map[string]flatVal)
+	if err := flattenInto(out, "", v, ignoreFields, compareFields); err != nil {
+		return nil, err
 	}
-	return m, nil
+	return out, nil
 }
 
-// numericMatch returns true if all shared keys have values within epsilon.
-func numericMatch(a, b map[string]float64, epsilon float64) bool {
-	// Both must have the same keys.
+func flattenInto(out map[string]flatVal, path string, v interface{}, ignore, compare []string) error {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, val := range t {
+			p := k
+			if path != "" {
+				p = path + "." + k
+			}
+			if err := flattenInto(out, p, val, ignore, compare); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for i, val := range t {
+			p := path + "." + itoa(i)
+			if path == "" {
+				p = itoa(i)
+			}
+			if err := flattenInto(out, p, val, ignore, compare); err != nil {
+				return err
+			}
+		}
+	default: // scalar leaf
+		if matchesFieldPath(ignore, path) {
+			return nil
+		}
+		if len(compare) > 0 && !matchesFieldPath(compare, path) {
+			return nil
+		}
+		switch x := v.(type) {
+		case json.Number:
+			f, err := x.Float64()
+			if err != nil {
+				return fmt.Errorf("non-numeric number at %q: %v", path, x)
+			}
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return fmt.Errorf("non-finite numeric output at %q: %v", path, x)
+			}
+			out[path] = flatVal{Num: f, IsNum: true}
+		case string:
+			out[path] = flatVal{Str: x}
+		case bool:
+			if x {
+				out[path] = flatVal{Str: "true"}
+			} else {
+				out[path] = flatVal{Str: "false"}
+			}
+		case nil:
+			out[path] = flatVal{Str: "null"}
+		default:
+			return fmt.Errorf("unsupported leaf type %T at %q", v, path)
+		}
+	}
+	return nil
+}
+
+// numericMatch returns true if two flattened outputs agree: identical path sets, numeric
+// leaves within epsilon, non-numeric leaves equal.
+func numericMatch(a, b map[string]flatVal, epsilon float64) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -544,18 +634,99 @@ func numericMatch(a, b map[string]float64, epsilon float64) bool {
 		if !ok {
 			return false
 		}
-		// Defense in depth: never treat non-finite values as matching. NaN
-		// comparisons (e.g. math.Abs(NaN-NaN) > epsilon) evaluate to false,
-		// which would otherwise incorrectly mark the pair as compatible. Parse
-		// rejection should already exclude these, but guard here regardless.
-		if math.IsNaN(va) || math.IsInf(va, 0) || math.IsNaN(vb) || math.IsInf(vb, 0) {
+		if va.IsNum != vb.IsNum {
 			return false
 		}
-		if math.Abs(va-vb) > epsilon {
+		if va.IsNum {
+			// Defense in depth: never treat non-finite values as matching (parse
+			// rejection should already exclude these, but guard regardless).
+			if math.IsNaN(va.Num) || math.IsInf(va.Num, 0) || math.IsNaN(vb.Num) || math.IsInf(vb.Num, 0) {
+				return false
+			}
+			if math.Abs(va.Num-vb.Num) > epsilon {
+				return false
+			}
+		} else if va.Str != vb.Str {
 			return false
 		}
 	}
 	return true
+}
+
+// comparisonKey returns the EXACT-mode grouping key for a result. With no ignore_fields
+// (or no inline output to canonicalize) it is the raw submitted checksum — identical to
+// the historical behavior. With ignore_fields AND inline output present, it is a canonical
+// SHA-256 over the output with those fields stripped and object keys sorted, so volatile
+// provenance (e.g. a wall-clock compute_time_ms) no longer prevents agreement.
+func comparisonKey(r *result.Result, ignoreFields []string) (string, error) {
+	if len(ignoreFields) == 0 || len(r.OutputData) == 0 {
+		return r.OutputChecksum, nil
+	}
+	canon, err := canonicalizeJSON(r.OutputData, ignoreFields)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canon)
+	return "canon:" + hex.EncodeToString(sum[:]), nil
+}
+
+// canonicalizeJSON parses output JSON, strips ignoreFields, and re-marshals
+// deterministically (json.Marshal sorts object keys and emits json.Number verbatim, so
+// numeric tokens and key order are normalized identically for every result).
+func canonicalizeJSON(data json.RawMessage, ignoreFields []string) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v interface{}
+	if err := dec.Decode(&v); err != nil {
+		return nil, fmt.Errorf("parse output as JSON: %w", err)
+	}
+	return json.Marshal(stripFields(v, "", ignoreFields))
+}
+
+// stripFields recursively removes object fields whose dotted path matches an ignore
+// pattern. Array indices are elided from the path, so "fights.compute_time_ms" drops that
+// key from every element of the fights array.
+func stripFields(v interface{}, prefix string, ignore []string) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			p := k
+			if prefix != "" {
+				p = prefix + "." + k
+			}
+			if matchesFieldPath(ignore, p) {
+				continue
+			}
+			out[k] = stripFields(val, p, ignore)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, val := range t {
+			out[i] = stripFields(val, prefix, ignore)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// matchesFieldPath reports whether path equals, or is a dot-boundary descendant of, any
+// pattern.
+func matchesFieldPath(patterns []string, path string) bool {
+	for _, p := range patterns {
+		if path == p || strings.HasPrefix(path, p+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// itoa is a tiny non-allocating-ish int formatter for flatten paths (avoids importing
+// strconv solely for this).
+func itoa(i int) string {
+	return fmt.Sprintf("%d", i)
 }
 
 // findLargestClique finds the largest subset of nodes where all pairs are mutually compatible.

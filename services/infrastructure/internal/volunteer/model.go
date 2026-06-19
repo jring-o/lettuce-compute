@@ -37,6 +37,30 @@ type HardwareCapabilities struct {
 	MaxBandwidthMbps int       `json:"max_bandwidth_mbps"`
 	GPUs             []GpuInfo `json:"gpus"`
 	BenchmarkFPOPS   float64   `json:"benchmark_fpops,omitempty"` // CPU benchmark (FP ops/sec)
+	// Hardware-class inputs for Homogeneous Redundancy (HR). See HRClass.
+	OS               string    `json:"os,omitempty"`         // GOOS: linux, darwin, windows
+	CPUArch          string    `json:"cpu_arch,omitempty"`   // GOARCH: amd64, arm64
+	CPUVendor        string    `json:"cpu_vendor,omitempty"` // GenuineIntel, AuthenticAMD, Apple, ...
+}
+
+// HRClass returns the volunteer's Homogeneous-Redundancy hardware class — a coarse
+// "<vendor>/<os>/<arch>" key (e.g. "GenuineIntel/linux/amd64"). All redundant copies of a
+// work unit are pinned to one class so their floating-point results are bit-comparable even
+// for engines that are not portably deterministic. Missing components collapse to "unknown"
+// so a class is always well-formed. Granularity is deliberately coarse to start (vendor +
+// OS + arch); it can be tightened later (e.g. CPU microarchitecture) without schema change.
+func (hw HardwareCapabilities) HRClass() string {
+	vendor, os, arch := hw.CPUVendor, hw.OS, hw.CPUArch
+	if vendor == "" {
+		vendor = "unknown"
+	}
+	if os == "" {
+		os = "unknown"
+	}
+	if arch == "" {
+		arch = "unknown"
+	}
+	return vendor + "/" + os + "/" + arch
 }
 
 // Volunteer is a compute contributor identified by an Ed25519 keypair.
@@ -75,6 +99,9 @@ func HardwareCapabilitiesFromProto(pb *lettucev1.HardwareCapabilities) HardwareC
 		MaxDiskMB:        pb.MaxDiskMb,
 		MaxBandwidthMbps: int(pb.MaxBandwidthMbps),
 		BenchmarkFPOPS:   pb.BenchmarkFpops,
+		OS:               pb.Os,
+		CPUArch:          pb.CpuArch,
+		CPUVendor:        pb.CpuVendor,
 	}
 
 	for _, g := range pb.Gpus {
@@ -102,6 +129,9 @@ func HardwareCapabilitiesToProto(hw HardwareCapabilities) *lettucev1.HardwareCap
 		MaxDiskMb:        hw.MaxDiskMB,
 		MaxBandwidthMbps: int32(hw.MaxBandwidthMbps),
 		BenchmarkFpops:   hw.BenchmarkFPOPS,
+		Os:               hw.OS,
+		CpuArch:          hw.CPUArch,
+		CpuVendor:        hw.CPUVendor,
 	}
 
 	for _, g := range hw.GPUs {

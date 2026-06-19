@@ -488,6 +488,9 @@ func (m *mockWorkUnitRepo) CountByLeafAndState(_ context.Context, _ types.ID, _ 
 	return 0, nil
 }
 func (m *mockWorkUnitRepo) MarkSpotCheck(_ context.Context, _ types.ID) error  { return nil }
+func (m *mockWorkUnitRepo) EnsureWorkUnitHRClass(_ context.Context, _ types.ID, class string) (string, error) {
+	return class, nil
+}
 func (m *mockWorkUnitRepo) ClearSpotCheck(_ context.Context, _ types.ID) error { return nil }
 func (m *mockWorkUnitRepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil

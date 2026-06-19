@@ -467,6 +467,19 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		holders[volunteerID] = reservedUntil
 		c.inflight[volunteerID]++
 
+		// HR pin (in-memory, first-writer-wins): the first holder of an unpinned unit on
+		// an HR-enabled leaf pins it to that holder's class HERE, under c.mu, so the very
+		// next hand-out (which must re-acquire c.mu) is already constrained to the same
+		// class by eligibleLocked — closing the window where one ready snapshot could hand
+		// copies to two different classes before any DB pin lands. The durable pin is
+		// written off-lock in the metadata loop below; a re-stage from DB rehydrates it.
+		if cand.unit.HRClass == nil && opts.HRClass != "" {
+			if lf := c.peekLeaf(cand.unit.LeafID); lf != nil && lf.ValidationConfig.HomogeneousRedundancy {
+				cls := opts.HRClass
+				cand.unit.HRClass = &cls
+			}
+		}
+
 		// Spot-check decision: evaluated in memory at the FIRST reservation of a
 		// redundancy-1, spot-check-enabled unit that is not already a spot-check.
 		// A spot-checked unit stays QUEUED for a SECOND corroborating volunteer, so
@@ -565,6 +578,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		if c.deps.artifactVersionRepo != nil && lf.CurrentArtifactVersionID != nil {
 			r.execConfig = c.resolvePinnedExecConfig(r.unit.ID, *lf.CurrentArtifactVersionID)
 		}
+		// HR durable pin (first-writer-wins): persist the hardware-class pin set in memory
+		// during hand-out so it survives a re-stage / restart / cross-replica and gates the
+		// DB-fallback FindNextAssignable. Off the hot lock, under the admission semaphore.
+		if c.deps.wuRepo != nil && lf.ValidationConfig.HomogeneousRedundancy && opts.HRClass != "" {
+			c.ensureHRPin(r.unit.ID, opts.HRClass)
+		}
 		final = append(final, r)
 	}
 	if drained {
@@ -606,6 +625,12 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 		return false
 	}
 	if containsID(opts.BlockedLeafIDs, leafID) {
+		return false
+	}
+	// Homogeneous Redundancy: once a unit is pinned to a hardware class, only volunteers
+	// of that SAME class may take a copy (so redundant results are bit-comparable).
+	// Unpinned units (hr_class == nil, incl. every non-HR leaf) are unconstrained.
+	if cand.unit.HRClass != nil && *cand.unit.HRClass != "" && *cand.unit.HRClass != opts.HRClass {
 		return false
 	}
 	// Capability fit against the cached leaf metadata.
@@ -914,6 +939,23 @@ func (c *dispatchCache) ensurePin(unitID, currentVersionID types.ID) (types.ID, 
 		return types.ID{}, false
 	}
 	return pinned, true
+}
+
+// ensureHRPin durably stamps the homogeneous-redundancy hardware class on a unit
+// (first-writer-wins). Mirrors ensurePin: off the hot lock, under the admission
+// semaphore, best-effort (a failed pin just means the next hand-out retries it — the
+// in-memory pin already constrains same-process dispatch).
+func (c *dispatchCache) ensureHRPin(unitID types.ID, class string) {
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquire(ctx)
+	if !ok {
+		return
+	}
+	defer release()
+	if _, err := c.deps.wuRepo.EnsureWorkUnitHRClass(ctx, unitID, class); err != nil {
+		c.logger.Warn("dispatch cache: failed to pin work unit hr_class", "work_unit_id", unitID, "error", err)
+	}
 }
 
 // resolvePinnedExecConfig pins the unit (first dispatch) and returns the pinned
