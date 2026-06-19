@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -100,125 +101,101 @@ func createFMTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID, sta
 	return id
 }
 
-// TestFaultMonitorScanOnce_DeadlineExpiry asserts the deadline-based reassignment
-// path: an ASSIGNED unit whose volunteer vanished after run-start is reclaimed once
-// it is past its deadline (assigned_at + deadline_seconds < NOW()).
-//
-// With per-task heartbeats removed, this deadline sweep is the only liveness
-// mechanism for run-started units. The NoDeadline synthetic-ceiling case and the
-// lapsed-reservation reclaim case are owned by WP-HEAD-DEADLINE.
-func TestFaultMonitorScanOnce_DeadlineExpiry(t *testing.T) {
-	pool, cleanup := fmTestPool(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	userID := createFMTestUser(t, pool)
-	leafID := createFMTestLeaf(t, pool, &userID, "ACTIVE")
-
-	volunteerID := types.NewID()
-	now := time.Now().UTC()
+// fmInsertVolunteer inserts an active NATIVE volunteer and returns its id.
+func fmInsertVolunteer(t *testing.T, ctx context.Context, pool *pgxpool.Pool) types.ID {
+	t.Helper()
+	id := types.NewID()
 	pubKey := []byte(newFMTestKeyPair(t))
-	_, err := pool.Exec(ctx, `
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO volunteers (id, public_key, hardware_capabilities, available_runtimes,
 			scheduling_mode, is_active, last_seen_at)
 		VALUES ($1, $2, '{"cpu_cores":4,"cpu_model":"test","max_cpu_cores":4,"memory_total_mb":8192,"max_memory_mb":8192,"disk_available_mb":10240,"max_disk_mb":10240}',
 			'{NATIVE}', 'ALWAYS', true, $3)`,
-		volunteerID, pubKey, now)
-	if err != nil {
+		id, pubKey, time.Now().UTC()); err != nil {
 		t.Fatalf("create volunteer: %v", err)
-	}
-
-	// Expired work unit: assigned 2 hours ago with a 1-second deadline.
-	expiredWUID := types.NewID()
-	pastTime := now.Add(-2 * time.Hour)
-	_, err = pool.Exec(ctx, `
-		INSERT INTO work_units (
-			id, leaf_id, state, priority,
-			input_data, code_artifact_ref, parameters,
-			estimated_duration_seconds, deadline_seconds,
-			assigned_volunteer_id, assigned_at,
-			reassignment_count, max_reassignments, flagged_for_review
-		) VALUES (
-			$1, $2, 'ASSIGNED', 'NORMAL',
-			'{"x": 1}', 'ref://test', '{"n": 1}',
-			1, 1,
-			$3, $4,
-			0, 3, false
-		)`, expiredWUID, leafID, volunteerID, pastTime)
-	if err != nil {
-		t.Fatalf("create expired work unit: %v", err)
-	}
-	_, err = pool.Exec(ctx, `
-		INSERT INTO work_unit_assignment_history (work_unit_id, volunteer_id, assigned_at)
-		VALUES ($1, $2, $3)`, expiredWUID, volunteerID, pastTime)
-	if err != nil {
-		t.Fatalf("create expired assignment history: %v", err)
-	}
-
-	// Run a single fault-monitor scan.
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
-	assignRepo := assignment.NewPgxRepository(pool)
-	monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, logger)
-
-	if err := monitor.ScanOnce(ctx); err != nil {
-		t.Fatalf("ScanOnce: %v", err)
-	}
-
-	// The expired unit should transition EXPIRED -> reassigned QUEUED.
-	var expiredState string
-	if err := pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", expiredWUID).Scan(&expiredState); err != nil {
-		t.Fatalf("query expired state: %v", err)
-	}
-	if expiredState != "QUEUED" {
-		t.Errorf("expired work unit state = %s, want QUEUED (reassigned)", expiredState)
-	}
-
-	// Its assignment history row should carry the EXPIRED outcome.
-	var expiredOutcome *string
-	if err := pool.QueryRow(ctx, "SELECT outcome FROM work_unit_assignment_history WHERE work_unit_id = $1", expiredWUID).Scan(&expiredOutcome); err != nil {
-		t.Fatalf("query expired outcome: %v", err)
-	}
-	if expiredOutcome == nil || *expiredOutcome != "EXPIRED" {
-		t.Errorf("expired assignment outcome = %v, want EXPIRED", expiredOutcome)
-	}
-}
-
-// fmInsertReservedQueuedWU inserts a QUEUED unit that is reserved to volunteerID
-// with the given reserved_until (pass a past time to simulate a lapsed lease). It
-// mirrors the buffered-but-never-started state the dispatch cache produces.
-func fmInsertReservedQueuedWU(t *testing.T, ctx context.Context, pool *pgxpool.Pool, leafID, volunteerID types.ID, reservedUntil time.Time) types.ID {
-	t.Helper()
-	id := types.NewID()
-	_, err := pool.Exec(ctx, `
-		INSERT INTO work_units (
-			id, leaf_id, state, priority,
-			input_data, code_artifact_ref, parameters,
-			estimated_duration_seconds, deadline_seconds,
-			reserved_until, reserved_volunteer_id,
-			reassignment_count, max_reassignments, flagged_for_review
-		) VALUES (
-			$1, $2, 'QUEUED', 'NORMAL',
-			'{"x": 1}', 'ref://test', '{"n": 1}',
-			1, 10800,
-			$3, $4,
-			0, 3, false
-		)`, id, leafID, reservedUntil, volunteerID)
-	if err != nil {
-		t.Fatalf("insert reserved QUEUED work unit: %v", err)
 	}
 	return id
 }
 
-// TestFaultMonitorScanOnce_LapsedReservationReclaim asserts the #22 lapsed-lease
-// reclaim: a still-QUEUED unit whose reservation lapsed (its buffered holder
-// vanished before StartWork) has its reservation cleared by the monitor, leaving the
-// unit plain QUEUED and immediately re-stageable. A unit with a LIVE reservation is
-// left untouched. This is the load-bearing dead-holder reclaim now that per-task
-// heartbeats and lease-renewal are gone.
-func TestFaultMonitorScanOnce_LapsedReservationReclaim(t *testing.T) {
+// fmNewMonitor builds a FaultMonitor over the real pgx repos. A real checkpoint repo
+// (rooted at a temp dir) is wired so the dead-letter cleanup path never nil-derefs.
+func fmNewMonitor(t *testing.T, pool *pgxpool.Pool) *server.FaultMonitor {
+	t.Helper()
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
+	assignRepo := assignment.NewPgxRepository(pool)
+	checkpointRepo := checkpoint.NewPgxRepository(pool, t.TempDir())
+	return server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, nil, logger)
+}
+
+// fmInsertQueuedWU inserts a QUEUED work unit. Per-copy dispatch (migration 00006)
+// keeps the unit QUEUED while its copies run; deadlineSeconds is the unit's deadline
+// and maxTotalCopies is the dead-letter ceiling (0 = derive from redundancy).
+func fmInsertQueuedWU(t *testing.T, ctx context.Context, pool *pgxpool.Pool, leafID types.ID, deadlineSeconds, maxTotalCopies int) types.ID {
+	t.Helper()
+	id := types.NewID()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_units (
+			id, leaf_id, state, priority,
+			input_data, code_artifact_ref, parameters,
+			estimated_duration_seconds, deadline_seconds, max_total_copies,
+			reassignment_count, max_reassignments, flagged_for_review
+		) VALUES (
+			$1, $2, 'QUEUED', 'NORMAL',
+			'{"x":1}', 'ref://test', '{"n":1}',
+			1, $3, $4,
+			0, 3, false
+		)`, id, leafID, deadlineSeconds, maxTotalCopies); err != nil {
+		t.Fatalf("insert QUEUED work unit: %v", err)
+	}
+	return id
+}
+
+// fmInsertCopy inserts one dispatched COPY (a work_unit_assignment_history row) of a
+// unit with outcome NULL (a LIVE copy). A RUNNING copy passes a non-nil startedAt; a
+// buffered RESERVED copy passes reservedUntil with a nil startedAt. deadlineSeconds is
+// the per-copy snapshot the running-deadline sweep reads. Returns the copy id.
+func fmInsertCopy(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wuID, volID types.ID, assignedAt time.Time, startedAt, reservedUntil *time.Time, deadlineSeconds int) types.ID {
+	t.Helper()
+	id := types.NewID()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_unit_assignment_history (
+			id, work_unit_id, volunteer_id, assigned_at,
+			reserved_until, started_at, deadline_seconds
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		id, wuID, volID, assignedAt, reservedUntil, startedAt, deadlineSeconds); err != nil {
+		t.Fatalf("insert copy: %v", err)
+	}
+	return id
+}
+
+// fmCopyOutcome returns a copy's outcome (nil = still live).
+func fmCopyOutcome(t *testing.T, ctx context.Context, pool *pgxpool.Pool, copyID types.ID) *string {
+	t.Helper()
+	var outcome *string
+	if err := pool.QueryRow(ctx, "SELECT outcome FROM work_unit_assignment_history WHERE id = $1", copyID).Scan(&outcome); err != nil {
+		t.Fatalf("query copy outcome: %v", err)
+	}
+	return outcome
+}
+
+// fmUnitState returns a work unit's state.
+func fmUnitState(t *testing.T, ctx context.Context, pool *pgxpool.Pool, wuID types.ID) string {
+	t.Helper()
+	var state string
+	if err := pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", wuID).Scan(&state); err != nil {
+		t.Fatalf("query unit state: %v", err)
+	}
+	return state
+}
+
+// TestFaultMonitorScanOnce_RunningCopyDeadlineExpiry asserts the per-copy deadline
+// sweep: a RUNNING copy (started_at set) past started_at + deadline_seconds is closed
+// with the EXPIRED outcome (FindExpiredCopies -> CloseCopy), while its work UNIT stays
+// QUEUED so it immediately redispatches a fresh copy to a distinct volunteer
+// (property 6). The unit is NOT dead-lettered: its total copies (1) is far below the
+// retry ceiling (redundancy 2 + margin).
+func TestFaultMonitorScanOnce_RunningCopyDeadlineExpiry(t *testing.T) {
 	pool, cleanup := fmTestPool(t)
 	defer cleanup()
 
@@ -227,67 +204,34 @@ func TestFaultMonitorScanOnce_LapsedReservationReclaim(t *testing.T) {
 
 	userID := createFMTestUser(t, pool)
 	leafID := createFMTestLeaf(t, pool, &userID, "ACTIVE")
+	volunteerID := fmInsertVolunteer(t, ctx, pool)
 
-	volunteerID := types.NewID()
-	pubKey := []byte(newFMTestKeyPair(t))
-	now := time.Now().UTC()
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO volunteers (id, public_key, hardware_capabilities, available_runtimes,
-			scheduling_mode, is_active, last_seen_at)
-		VALUES ($1, $2, '{"cpu_cores":4,"max_cpu_cores":4,"memory_total_mb":8192,"max_memory_mb":8192,"disk_available_mb":10240,"max_disk_mb":10240}',
-			'{NATIVE}', 'ALWAYS', true, $3)`,
-		volunteerID, pubKey, now); err != nil {
-		t.Fatalf("create volunteer: %v", err)
-	}
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	// QUEUED unit with one RUNNING copy started 2h ago with a 1s deadline -> expired.
+	wuID := fmInsertQueuedWU(t, ctx, pool, leafID, 1, 0)
+	copyID := fmInsertCopy(t, ctx, pool, wuID, volunteerID, past, &past, nil, 1)
 
-	// Lapsed reservation: reserved_until two minutes in the past.
-	lapsedWUID := fmInsertReservedQueuedWU(t, ctx, pool, leafID, volunteerID, now.Add(-2*time.Minute))
-	// Live reservation: reserved_until an hour in the future — must be left alone.
-	liveWUID := fmInsertReservedQueuedWU(t, ctx, pool, leafID, volunteerID, now.Add(time.Hour))
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
-	assignRepo := assignment.NewPgxRepository(pool)
-	monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, logger)
-
-	if err := monitor.ScanOnce(ctx); err != nil {
+	if err := fmNewMonitor(t, pool).ScanOnce(ctx); err != nil {
 		t.Fatalf("ScanOnce: %v", err)
 	}
 
-	// The lapsed unit stays QUEUED but its reservation is cleared.
-	var state string
-	var reservedUntil *time.Time
-	var reservedVol *types.ID
-	if err := pool.QueryRow(ctx,
-		"SELECT state, reserved_until, reserved_volunteer_id FROM work_units WHERE id = $1", lapsedWUID).
-		Scan(&state, &reservedUntil, &reservedVol); err != nil {
-		t.Fatalf("query lapsed unit: %v", err)
+	// The copy is closed EXPIRED (a run-started copy that missed its deadline).
+	if oc := fmCopyOutcome(t, ctx, pool, copyID); oc == nil || *oc != "EXPIRED" {
+		t.Errorf("running copy outcome = %v, want EXPIRED", oc)
 	}
-	if state != "QUEUED" {
-		t.Errorf("lapsed unit state = %s, want QUEUED", state)
-	}
-	if reservedUntil != nil || reservedVol != nil {
-		t.Errorf("lapsed unit reservation not cleared: until=%v vol=%v", reservedUntil, reservedVol)
-	}
-
-	// The live reservation is untouched.
-	var liveVol *types.ID
-	if err := pool.QueryRow(ctx,
-		"SELECT reserved_volunteer_id FROM work_units WHERE id = $1", liveWUID).Scan(&liveVol); err != nil {
-		t.Fatalf("query live unit: %v", err)
-	}
-	if liveVol == nil || *liveVol != volunteerID {
-		t.Errorf("live reservation should be untouched, got reserved_volunteer_id=%v", liveVol)
+	// The unit stays QUEUED (it redispatches a fresh copy; not dead-lettered).
+	if st := fmUnitState(t, ctx, pool, wuID); st != "QUEUED" {
+		t.Errorf("unit state = %s, want QUEUED (redispatch, not dead-lettered)", st)
 	}
 }
 
-// TestFaultMonitorScanOnce_NoDeadlineCeilingReclaim asserts that a unit carrying the
-// synthetic NoDeadline ceiling (deadline_seconds > 0, what ResolveDeadlineSeconds now
-// stamps for a NoDeadline leaf) IS reclaimed once it is past that ceiling, while a
-// unit with deadline_seconds = 0 (the OLD NoDeadline behavior) is NEVER reclaimed.
-// This is the guarantee that, with heartbeats gone, a NoDeadline unit on a vanished
-// volunteer is no longer permanently stranded.
-func TestFaultMonitorScanOnce_NoDeadlineCeilingReclaim(t *testing.T) {
+// TestFaultMonitorScanOnce_BufferedCopyAbandon asserts the buffered-lapse reclaim: a
+// RESERVED copy (started_at NULL) whose holder vanished before run-start is found once
+// reserved_until < NOW() and closed with the ABANDONED outcome, leaving the unit plain
+// QUEUED and immediately re-dispatchable. A RESERVED copy still within its lease is left
+// untouched (outcome stays NULL). This is the load-bearing dead-holder reclaim now that
+// per-task heartbeats are gone.
+func TestFaultMonitorScanOnce_BufferedCopyAbandon(t *testing.T) {
 	pool, cleanup := fmTestPool(t)
 	defer cleanup()
 
@@ -296,73 +240,110 @@ func TestFaultMonitorScanOnce_NoDeadlineCeilingReclaim(t *testing.T) {
 
 	userID := createFMTestUser(t, pool)
 	leafID := createFMTestLeaf(t, pool, &userID, "ACTIVE")
+	volunteerID := fmInsertVolunteer(t, ctx, pool)
 
-	volunteerID := types.NewID()
-	pubKey := []byte(newFMTestKeyPair(t))
 	now := time.Now().UTC()
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO volunteers (id, public_key, hardware_capabilities, available_runtimes,
-			scheduling_mode, is_active, last_seen_at)
-		VALUES ($1, $2, '{"cpu_cores":4,"max_cpu_cores":4,"memory_total_mb":8192,"max_memory_mb":8192,"disk_available_mb":10240,"max_disk_mb":10240}',
-			'{NATIVE}', 'ALWAYS', true, $3)`,
-		volunteerID, pubKey, now); err != nil {
-		t.Fatalf("create volunteer: %v", err)
-	}
+	// Lapsed buffered copy: reserved_until two minutes in the past, never run-started.
+	lapsedWU := fmInsertQueuedWU(t, ctx, pool, leafID, 10800, 0)
+	lapsedReserved := now.Add(-2 * time.Minute)
+	lapsedCopy := fmInsertCopy(t, ctx, pool, lapsedWU, volunteerID, lapsedReserved, nil, &lapsedReserved, 10800)
+	// Live buffered copy: reserved_until an hour in the future — must be left alone.
+	liveWU := fmInsertQueuedWU(t, ctx, pool, leafID, 10800, 0)
+	liveReserved := now.Add(time.Hour)
+	liveCopy := fmInsertCopy(t, ctx, pool, liveWU, volunteerID, now, nil, &liveReserved, 10800)
 
-	// ceilingWU: stamped with a small synthetic "ceiling" (1s here for test speed),
-	// assigned 2h ago — past the ceiling, so it must be reclaimed. This models the
-	// NoDeadline-ceiling unit (deadline_seconds > 0).
-	insertAssigned := func(deadline int) types.ID {
-		id := types.NewID()
-		past := now.Add(-2 * time.Hour)
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO work_units (
-				id, leaf_id, state, priority,
-				input_data, code_artifact_ref, parameters,
-				estimated_duration_seconds, deadline_seconds,
-				assigned_volunteer_id, assigned_at,
-				reassignment_count, max_reassignments, flagged_for_review
-			) VALUES (
-				$1, $2, 'ASSIGNED', 'NORMAL',
-				'{"x":1}', 'ref://test', '{"n":1}',
-				1, $5,
-				$3, $4,
-				0, 3, false
-			)`, id, leafID, volunteerID, past, deadline); err != nil {
-			t.Fatalf("insert assigned work unit (deadline=%d): %v", deadline, err)
-		}
-		if _, err := pool.Exec(ctx, `
-			INSERT INTO work_unit_assignment_history (work_unit_id, volunteer_id, assigned_at)
-			VALUES ($1, $2, $3)`, id, volunteerID, past); err != nil {
-			t.Fatalf("insert assignment history (deadline=%d): %v", deadline, err)
-		}
-		return id
-	}
-	ceilingWUID := insertAssigned(1)  // synthetic ceiling -> reclaimable
-	zeroWUID := insertAssigned(0)     // deadline_seconds=0 -> never reclaimed
-
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
-	assignRepo := assignment.NewPgxRepository(pool)
-	monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, logger)
-
-	if err := monitor.ScanOnce(ctx); err != nil {
+	if err := fmNewMonitor(t, pool).ScanOnce(ctx); err != nil {
 		t.Fatalf("ScanOnce: %v", err)
 	}
 
-	var ceilingState string
-	if err := pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", ceilingWUID).Scan(&ceilingState); err != nil {
-		t.Fatalf("query ceiling unit: %v", err)
+	// The lapsed copy is closed ABANDONED (a buffered copy whose holder vanished).
+	if oc := fmCopyOutcome(t, ctx, pool, lapsedCopy); oc == nil || *oc != "ABANDONED" {
+		t.Errorf("lapsed buffered copy outcome = %v, want ABANDONED", oc)
 	}
-	if ceilingState != "QUEUED" {
-		t.Errorf("ceiling (NoDeadline-synthetic) unit state = %s, want QUEUED (reassigned)", ceilingState)
+	if st := fmUnitState(t, ctx, pool, lapsedWU); st != "QUEUED" {
+		t.Errorf("lapsed unit state = %s, want QUEUED", st)
+	}
+	// The live buffered copy is untouched (still RESERVED, outcome NULL).
+	if oc := fmCopyOutcome(t, ctx, pool, liveCopy); oc != nil {
+		t.Errorf("live buffered copy should be untouched, got outcome=%v", *oc)
+	}
+}
+
+// TestFaultMonitorScanOnce_RunningDeadlineVsZero asserts the running-deadline sweep
+// only fires for copies with a positive deadline: a RUNNING copy with deadline_seconds
+// > 0, past its deadline, is closed EXPIRED, while a RUNNING copy with deadline_seconds
+// = 0 (a NoDeadline leaf) is NEVER swept and stays live. The per-copy snapshot keeps
+// the sweep index-driven with no join.
+func TestFaultMonitorScanOnce_RunningDeadlineVsZero(t *testing.T) {
+	pool, cleanup := fmTestPool(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	userID := createFMTestUser(t, pool)
+	leafID := createFMTestLeaf(t, pool, &userID, "ACTIVE")
+	volunteerID := fmInsertVolunteer(t, ctx, pool)
+
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	// Positive-deadline RUNNING copy past its deadline -> reclaimable.
+	ceilingWU := fmInsertQueuedWU(t, ctx, pool, leafID, 1, 0)
+	ceilingCopy := fmInsertCopy(t, ctx, pool, ceilingWU, volunteerID, past, &past, nil, 1)
+	// deadline_seconds=0 RUNNING copy -> never reclaimed.
+	zeroWU := fmInsertQueuedWU(t, ctx, pool, leafID, 0, 0)
+	zeroCopy := fmInsertCopy(t, ctx, pool, zeroWU, volunteerID, past, &past, nil, 0)
+
+	if err := fmNewMonitor(t, pool).ScanOnce(ctx); err != nil {
+		t.Fatalf("ScanOnce: %v", err)
 	}
 
-	var zeroState string
-	if err := pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", zeroWUID).Scan(&zeroState); err != nil {
-		t.Fatalf("query zero-deadline unit: %v", err)
+	if oc := fmCopyOutcome(t, ctx, pool, ceilingCopy); oc == nil || *oc != "EXPIRED" {
+		t.Errorf("positive-deadline copy outcome = %v, want EXPIRED", oc)
 	}
-	if zeroState != "ASSIGNED" {
-		t.Errorf("deadline_seconds=0 unit state = %s, want ASSIGNED (never reclaimed); the synthetic ceiling is why NoDeadline units no longer strand", zeroState)
+	if oc := fmCopyOutcome(t, ctx, pool, zeroCopy); oc != nil {
+		t.Errorf("deadline_seconds=0 copy must never be swept, got outcome=%v", *oc)
+	}
+}
+
+// TestFaultMonitorScanOnce_DeadLetterExhausted asserts the property-6 dead-letter
+// ceiling: when a unit's last live copy times out AND it has reached its
+// max_total_copies ceiling with redundancy still unmet and no live copy left,
+// DeadLetterIfExhausted parks it FAILED + flagged-for-review (the ONLY cap on requeue).
+func TestFaultMonitorScanOnce_DeadLetterExhausted(t *testing.T) {
+	pool, cleanup := fmTestPool(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	userID := createFMTestUser(t, pool)
+	leafID := createFMTestLeaf(t, pool, &userID, "ACTIVE")
+	volunteerID := fmInsertVolunteer(t, ctx, pool)
+
+	past := time.Now().UTC().Add(-2 * time.Hour)
+	// max_total_copies = 1: a single timed-out copy exhausts the ceiling.
+	wuID := fmInsertQueuedWU(t, ctx, pool, leafID, 1, 1)
+	copyID := fmInsertCopy(t, ctx, pool, wuID, volunteerID, past, &past, nil, 1)
+
+	if err := fmNewMonitor(t, pool).ScanOnce(ctx); err != nil {
+		t.Fatalf("ScanOnce: %v", err)
+	}
+
+	// The copy is closed EXPIRED, and the now-exhausted unit is dead-lettered.
+	if oc := fmCopyOutcome(t, ctx, pool, copyID); oc == nil || *oc != "EXPIRED" {
+		t.Errorf("copy outcome = %v, want EXPIRED", oc)
+	}
+	var state string
+	var flagged bool
+	if err := pool.QueryRow(ctx,
+		"SELECT state, flagged_for_review FROM work_units WHERE id = $1", wuID).
+		Scan(&state, &flagged); err != nil {
+		t.Fatalf("query dead-lettered unit: %v", err)
+	}
+	if state != "FAILED" {
+		t.Errorf("exhausted unit state = %s, want FAILED (dead-lettered)", state)
+	}
+	if !flagged {
+		t.Errorf("dead-lettered unit should be flagged_for_review")
 	}
 }

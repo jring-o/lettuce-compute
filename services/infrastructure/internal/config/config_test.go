@@ -537,13 +537,12 @@ func TestHeadConfigValidate(t *testing.T) {
 			errMsg:  "max_retry_delay_seconds must be < 1800",
 		},
 		{
-			name: "lease at stale threshold rejected",
+			name: "lease above former stale threshold accepted (no upper bound)",
 			cfg: HeadConfig{
-				Name:         "Stale Lease Head",
-				LeaseSeconds: 1800,
+				Name:         "Long Lease Head",
+				LeaseSeconds: 100000,
 			},
-			wantErr: true,
-			errMsg:  "lease_seconds must be < 1800",
+			wantErr: false,
 		},
 		{
 			name: "min greater than max retry delay rejected",

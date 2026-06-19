@@ -83,40 +83,17 @@ type candidate struct {
 // inMemHolderCap is the maximum number of DISTINCT in-memory reservation holders the
 // cache may stage for this candidate concurrently, before the flush has landed.
 //
-// This is NOT the leaf redundancy_factor: it is bounded by how many concurrent live
-// reservations Postgres can actually persist for the unit before a run-start frees
-// the column. A NORMAL (non-spot-check) reservation lands in the SINGLE
-// reserved_volunteer_id column, so AT MOST ONE NORMAL reservation can be live at a
-// time (reservation_test.go's columns-only "one reserver at a time" invariant). If
-// the cache staged a redundancy>1 NORMAL unit to a second distinct holder from one
-// ready snapshot, that holder's flush would conflict on the column (only one
-// reserved_volunteer_id row landed via RETURNING) and — worse — the void-check could
-// not tell which holder lost, leaking a phantom in-memory reservation + inflight that
-// reconcile never clears. So the cache caps NORMAL in-memory holders at 1.
-//
-// LIMITATION (pre-existing, not introduced by the cache): a redundancy>1 NORMAL
-// unit's SECOND distinct holder is NOT reached concurrently through dispatch. Once
-// the first holder run-starts, Assign flips the unit QUEUED -> ASSIGNED, and BOTH
-// the refiller (FindDispatchableBatch) and the Layer-1 DB path (FindNextAssignable)
-// gate on state='QUEUED' — so the unit leaves the dispatchable universe and neither
-// path re-stages it for a second distinct volunteer. Concurrent redundant dispatch
-// would need a per-volunteer dispatch table (out of scope; a later layer). Redundant
-// corroboration is produced SERIALLY: when the unit is reassigned (deadline lapse or
-// abandon re-queues it to QUEUED), a different volunteer is offered it and its result
-// is cross-checked. The single-holder cap here only preserves that existing serial
-// flow; it does not enable concurrent redundancy. See the NOTE on the
-// TestDispatchCache_RedundancyTwo... e2e test and head-setup.md
-// "Redundancy and the dispatch cache".
-//
-// A spot-check unit is the one exception: each holder gets its OWN
-// assignment_history row at flush (the history-row-at-reservation model), not the
-// shared column, so two distinct holders can be staged concurrently — its in-memory
-// cap is the full effectiveRedundancy (2).
+// Per-copy dispatch (migration 00006): each reservation lands as its OWN copy row
+// (a work_unit_assignment_history row), not a shared single column, so a redundancy=N
+// unit can have up to N live copies AT ONCE, each held by a DISTINCT volunteer. The
+// cache therefore stages up to effectiveRedundancy concurrent holders from one ready
+// snapshot — the N copies of one unit go out to N different volunteers IN PARALLEL
+// (property 7), and run-starting one copy no longer flips the whole unit out of the
+// dispatchable universe (the unit stays QUEUED while its copies run). Each holder is
+// a distinct volunteer (the self-exclusion in eligibleLocked + the live-copy partial
+// unique guarantee no two copies to one volunteer).
 func (cd candidate) inMemHolderCap() int {
-	if cd.unit.SpotCheck {
-		return cd.effectiveRedundancy
-	}
-	return 1
+	return cd.effectiveRedundancy
 }
 
 // dispatchCacheConfig holds the cache's tunables.
@@ -183,9 +160,9 @@ type volunteerIdentity struct {
 	availableRuntimes []string
 }
 
-// spotCheckWrite is one deferred spot-check marking (MarkSpotCheck +
-// StampReservation + a history row), flushed asynchronously like a normal
-// reservation but via a distinct DB shape.
+// spotCheckWrite is one deferred spot-check marking (MarkSpotCheck + ReserveCopy to
+// land the spot-check copy row), flushed asynchronously like a normal reservation but
+// via a distinct DB shape.
 type spotCheckWrite struct {
 	workUnitID    types.ID
 	volunteerID   types.ID
@@ -210,12 +187,12 @@ type dispatchCache struct {
 	reservedInMem map[types.ID]map[types.ID]time.Time
 	// inflight is the per-volunteer (live reservations + active history rows) count.
 	inflight map[types.ID]int
-	// pendingWrites is the async NORMAL reservation-write queue.
+	// pendingWrites is the async copy-reservation write queue (each lands as a
+	// RESERVED copy row via FlushReservations).
 	pendingWrites []workunit.FlushReservation
-	// pendingSpotChecks is the async spot-check marking queue: each is MarkSpotCheck
-	// + StampReservation + one assignment_history row (the one history-row-at-
-	// reservation case, kept from Layer 1). Kept separate from pendingWrites because
-	// it is a different (non-batchable) DB shape.
+	// pendingSpotChecks is the async spot-check marking queue: each is MarkSpotCheck +
+	// ReserveCopy (land the spot-check copy row). Kept separate from pendingWrites
+	// because it is a different (non-batchable) DB shape.
 	pendingSpotChecks []spotCheckWrite
 
 	// leafCache caches per-leaf metadata (the full leaf, used for capability matching
@@ -449,7 +426,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	if n < 1 {
 		n = 1
 	}
-	reservedUntil := c.now().UTC().Add(time.Duration(c.cfg.leaseSeconds) * time.Second)
+	leaseFallback := time.Duration(c.cfg.leaseSeconds) * time.Second
 
 	c.mu.Lock()
 	kept := c.ready[:0]
@@ -473,6 +450,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		if !c.eligibleLocked(volunteerID, opts, cand) {
 			kept = append(kept, cand)
 			continue
+		}
+		// Hold the buffered unit until its head-owned deadline (the buffer window);
+		// fall back to the configured lease only when the unit has no deadline.
+		reservedUntil := c.now().UTC().Add(leaseFallback)
+		if cand.unit.DeadlineSeconds > 0 {
+			reservedUntil = c.now().UTC().Add(time.Duration(cand.unit.DeadlineSeconds) * time.Second)
 		}
 		// Accept this candidate as a reservation for volunteerID.
 		uid := cand.unit.ID
@@ -510,9 +493,10 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			})
 		} else {
 			c.pendingWrites = append(c.pendingWrites, workunit.FlushReservation{
-				WorkUnitID:    uid,
-				VolunteerID:   volunteerID,
-				ReservedUntil: reservedUntil,
+				WorkUnitID:      uid,
+				VolunteerID:     volunteerID,
+				ReservedUntil:   reservedUntil,
+				DeadlineSeconds: cand.unit.DeadlineSeconds,
 			})
 		}
 
@@ -525,13 +509,11 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		results = append(results, handOutResult{unit: &unitCopy})
 		taken++
 
-		// Keep the candidate staged only if it still has BOTH total-redundancy headroom
-		// AND concurrent in-memory-holder headroom for another DISTINCT volunteer;
-		// otherwise it is exhausted for now and dropped from ready. A NORMAL unit (cap 1)
-		// is always dropped after its first hold — its next distinct holder is re-staged
-		// by the refiller once the first holder run-starts and frees the column. A
-		// spot-check unit (cap = effectiveRedundancy) stays until its in-memory holders
-		// are exhausted, so the SAME ready snapshot can serve its second corroborator.
+		// Keep the candidate staged while it still has redundancy headroom for another
+		// DISTINCT volunteer, so the SAME ready snapshot hands the N copies of one unit
+		// to N different volunteers in parallel (property 7). Dropped once its copies
+		// are exhausted; a copy that later times out frees a slot and the refiller
+		// re-stages the unit for a fresh distinct volunteer.
 		if cand.dbActiveCount+len(holders) < cand.effectiveRedundancy &&
 			len(holders) < cand.inMemHolderCap() {
 			kept = append(kept, cand)
@@ -574,7 +556,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		r.leaf = lf
 		// Artifact pinning (TODO #38): on a versioned leaf, pin EVERY unit to the
 		// current version at its first dispatch (first-writer-wins). This gives every
-		// work unit and result exact per-unit version provenance (BOINC's per-WU model)
+		// work unit and result exact per-unit version provenance
 		// and is what makes redundant replicas of one unit run a homogeneous version. If
 		// a unit was ALREADY pinned to a different version (e.g. a reassignment after a
 		// mid-flight publish), the assignment is built from the PINNED version, not the
@@ -600,15 +582,10 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 	// Redundancy headroom, enforced by TWO bounds:
 	//   (1) total redundancy: dbActiveCount (already-running history rows) + distinct
 	//       in-memory holders must stay under the leaf's effectiveRedundancy;
-	//   (2) concurrent in-memory holders: at most inMemHolderCap() at once — 1 for a
-	//       NORMAL unit (the single reserved_volunteer_id column persists only one live
-	//       reservation at a time), effectiveRedundancy for a spot-check unit (whose
-	//       holders each get their own history row).
-	// NOTE: for a NORMAL unit this caps concurrent dispatch to ONE holder. The second
-	// distinct holder is NOT reached concurrently — once the first run-starts the unit
-	// is ASSIGNED (no longer QUEUED) and neither the refiller nor the DB find re-stages
-	// it. Redundant corroboration is serial (on reassignment). See inMemHolderCap and
-	// head-setup.md "Redundancy and the dispatch cache".
+	//   (2) concurrent in-memory holders: at most inMemHolderCap() == effectiveRedundancy
+	//       at once. Each holder lands as its own copy row, so a redundancy=N unit is
+	//       dispatched to N distinct volunteers IN PARALLEL (property 7); run-starting
+	//       one copy keeps the unit QUEUED so the others still dispatch.
 	holders := c.reservedInMem[uid]
 	if cand.dbActiveCount+len(holders) >= cand.effectiveRedundancy {
 		return false
@@ -767,12 +744,16 @@ func (c *dispatchCache) onUnitDone(unitID types.ID) {
 	}
 }
 
-// onRunStart converts one volunteer's in-memory reservation into an active history
-// row (the StartWork transaction wrote it). The cache stops tracking the
-// reservation hold but KEEPS the volunteer's inflight count: the slot is still
-// occupied, now by an active history row the reconcile counts authoritatively. Any
-// other distinct holder of a redundancy>1 unit is preserved. The unit is removed
-// from the ready pool (it is now ASSIGNED, no longer QUEUED) when no holder remains.
+// onRunStart converts one volunteer's in-memory reservation hold into a RUNNING copy
+// (the StartWork transaction set started_at on the copy row). The cache drops the
+// reservation hold but KEEPS the volunteer's inflight count (the slot is still
+// occupied, now by a live RUNNING copy the reconcile counts authoritatively).
+//
+// Per-copy dispatch: the WORK UNIT stays QUEUED while its copies run, so the cache
+// keeps it staged for its REMAINING redundancy copies — it moves the run-started
+// holder from the in-memory holder set into the candidate's dbActiveCount so the
+// accounting is exact, and only evicts the unit once its redundancy is fully covered.
+// A redundancy=1 unit (or one whose copies are now all accounted) is evicted.
 func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -785,11 +766,17 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 			}
 		}
 	}
-	// Once ASSIGNED the unit is no longer QUEUED; drop it from ready so a stale
-	// snapshot is never handed out.
 	for i := range c.ready {
 		if c.ready[i].unit.ID == unitID {
-			c.ready = append(c.ready[:i], c.ready[i+1:]...)
+			// The run-started copy is now a live DB row: move it from the holder set
+			// into dbActiveCount so eligibleLocked still sees the correct coverage.
+			c.ready[i].dbActiveCount++
+			remainingHolders := len(c.reservedInMem[unitID])
+			if c.ready[i].dbActiveCount+remainingHolders >= c.ready[i].effectiveRedundancy {
+				// Redundancy fully covered: drop it from ready (the refiller re-stages it
+				// if a copy later times out and frees a slot).
+				c.ready = append(c.ready[:i], c.ready[i+1:]...)
+			}
 			break
 		}
 	}
@@ -1319,24 +1306,19 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 		return
 	}
 
-	// Void any reservation that did NOT land (a flush conflict): the unit was taken
-	// by someone else / no longer QUEUED. Remove the in-memory hold so the cache does
-	// not count a reservation it could not persist.
+	// Void any copy that did NOT land (a flush conflict: the unit is no longer QUEUED,
+	// redundancy was already met, or this volunteer already holds a live copy). Remove
+	// the in-memory hold so the cache does not count a copy it could not persist.
 	//
-	// NORMAL units are staged to at most ONE concurrent in-memory holder
-	// (inMemHolderCap), so a batch never carries two records for the same WorkUnitID
-	// and the RETURNING id set maps cleanly to "this volunteer's reservation landed".
-	// We still consume landed ids per-occurrence rather than as a plain set so that —
-	// even if a same-unit pair ever reached one batch — the single landed row is
-	// credited to exactly one record and the other is correctly voided, never leaving
-	// a phantom in-memory holder that reconcile cannot clear.
-	landedCount := make(map[types.ID]int, len(landed))
-	for _, id := range landed {
-		landedCount[id]++
+	// Per-copy dispatch: a batch CAN legitimately carry several records for the SAME
+	// unit (distinct volunteers — the parallel-copy case), so landed is matched on the
+	// exact (work_unit, volunteer) pair, not just the unit id.
+	landedPairs := make(map[[2]types.ID]bool, len(landed))
+	for _, fc := range landed {
+		landedPairs[[2]types.ID{fc.WorkUnitID, fc.VolunteerID}] = true
 	}
 	for _, rec := range batch {
-		if landedCount[rec.WorkUnitID] > 0 {
-			landedCount[rec.WorkUnitID]--
+		if landedPairs[[2]types.ID{rec.WorkUnitID, rec.VolunteerID}] {
 			continue
 		}
 		c.releaseInMem(rec.WorkUnitID, rec.VolunteerID)
@@ -1354,10 +1336,9 @@ func (c *dispatchCache) requeueWrites(batch []workunit.FlushReservation) {
 }
 
 // flushSpotChecksOnce drains pending spot-check markings: each is MarkSpotCheck +
-// StampReservation + one assignment_history row (the one history-row-at-reservation
-// case, unchanged from Layer 1). The unit stays QUEUED so the second corroborating
-// volunteer can still be dispatched it. Unlike the NORMAL flush, a spot-check that
-// fails to land (the unit is no longer QUEUED) voids the in-memory hold.
+// ReserveCopy (land the spot-check copy row). The unit stays QUEUED so a second
+// corroborating volunteer can still be dispatched it. Unlike the NORMAL flush, a
+// spot-check that fails to land (the unit is no longer QUEUED) voids the in-memory hold.
 func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 	c.mu.Lock()
 	if len(c.pendingSpotChecks) == 0 {
@@ -1378,7 +1359,7 @@ func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 
 	for _, sc := range batch {
 		dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
-		// FIX 4: the spot-check landing (MarkSpotCheck + StampReservation + history
+		// FIX 4: the spot-check landing (MarkSpotCheck + ReserveCopy + history
 		// row) is part of the flusher goroutine and is correctness-bearing for
 		// spot-check deferral, so it pulls from the SEPARATE maintenance budget. After
 		// FIX 3, Submit/Abandon hold heavier client slots; leaving this on the client
@@ -1398,24 +1379,19 @@ func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 				"work_unit_id", sc.workUnitID, "error", err)
 			continue
 		}
-		if _, err := c.deps.wuRepo.StampReservation(dbCtx, sc.workUnitID, sc.volunteerID, time.Until(sc.reservedUntil)); err != nil {
+		// Land the spot-check copy as a RESERVED copy row (per-copy model). A
+		// spot-check unit's effective deadline still governs its buffered hold.
+		deadline := int(time.Until(sc.reservedUntil).Seconds())
+		if deadline < 0 {
+			deadline = 0
+		}
+		if _, err := c.deps.wuRepo.ReserveCopy(dbCtx, sc.workUnitID, sc.volunteerID, sc.reservedUntil, deadline); err != nil {
 			release()
 			cancel()
 			c.releaseInMem(sc.workUnitID, sc.volunteerID)
-			c.logger.Warn("dispatch cache: spot-check reservation stamp failed; voided",
+			c.logger.Warn("dispatch cache: spot-check copy reserve failed; voided",
 				"work_unit_id", sc.workUnitID, "error", err)
 			continue
-		}
-		if err := c.deps.assignRepo.Create(dbCtx, &assignment.AssignmentHistoryEntry{
-			WorkUnitID:  sc.workUnitID,
-			VolunteerID: sc.volunteerID,
-			AssignedAt:  c.now().UTC(),
-		}); err != nil {
-			c.logger.Warn("dispatch cache: spot-check history-row create failed",
-				"work_unit_id", sc.workUnitID, "error", err)
-			// The spot-check mark + reservation landed; a missing history row is
-			// recoverable (the unit is still QUEUED+reserved and re-stageable on lease
-			// lapse), so we do NOT void the in-memory hold here.
 		}
 		release()
 		cancel()

@@ -53,20 +53,46 @@ type WorkUnit struct {
 	ValidatedAt              *time.Time       `json:"validated_at,omitempty"`
 	ReassignmentCount        int              `json:"reassignment_count"`
 	MaxReassignments         int              `json:"max_reassignments"`
+	// MaxTotalCopies is the head-owned dead-letter ceiling (property 6): the total
+	// number of copies (dispatch attempts) ever created for this unit before, if its
+	// redundancy is still unmet and no copy is live, it is parked FAILED. 0 = derive a
+	// default from the leaf's redundancy_factor (EffectiveMaxTotalCopies). Floor only,
+	// no upper cap — a timed-out copy is otherwise redispatched without per-attempt cap.
+	MaxTotalCopies           int              `json:"max_total_copies"`
 	LastHeartbeatAt          *time.Time       `json:"last_heartbeat_at,omitempty"`
 	FlaggedForReview         bool             `json:"flagged_for_review"`
 	SpotCheck                bool             `json:"spot_check"`
 	LastCheckpointAt         *time.Time       `json:"last_checkpoint_at,omitempty"`
 	LastCheckpointSequence   int              `json:"last_checkpoint_sequence"`
-	// ReservedUntil / ReservedVolunteerID model a lightweight lease on a buffered
-	// (still-QUEUED) work unit: while reserved_until > NOW() the unit is hidden
-	// from other volunteers by FindNextAssignable's reservation guard, without the
-	// reclaim monitors treating it as assigned. Nil when not reserved.
+	// ReservedUntil / ReservedVolunteerID are TRANSIENT, not DB columns (the single
+	// per-unit reservation columns were retired in migration 00006 in favor of
+	// per-copy rows). HandOut populates them on the unit copy it returns so the proto
+	// assignment can echo reserved_until_unix (the buffered copy's lease window). They
+	// are never scanned from or written to work_units. Nil except on a hand-out echo.
 	ReservedUntil            *time.Time       `json:"reserved_until,omitempty"`
 	ReservedVolunteerID      *types.ID        `json:"reserved_volunteer_id,omitempty"`
 	CreatedAt                time.Time        `json:"created_at"`
 	UpdatedAt                time.Time        `json:"updated_at"`
 }
+
+// EffectiveMaxTotalCopies returns the dead-letter ceiling for this unit: the
+// configured MaxTotalCopies if positive, else a derived default of redundancy + a
+// retry margin so honest timeouts redispatch freely while a hopeless (poison) unit
+// still eventually parks. redundancy is the leaf's effective redundancy_factor.
+func (wu *WorkUnit) EffectiveMaxTotalCopies(redundancy int) int {
+	if wu.MaxTotalCopies > 0 {
+		return wu.MaxTotalCopies
+	}
+	if redundancy < 1 {
+		redundancy = 1
+	}
+	// redundancy + 6: the redundancy target plus a retry margin.
+	return redundancy + defaultCopyRetryMargin
+}
+
+// defaultCopyRetryMargin is how many timed-out/failed copies above the redundancy
+// target a unit tolerates before dead-lettering, when MaxTotalCopies is unset.
+const defaultCopyRetryMargin = 6
 
 // Batch groups work units within a leaf for progress tracking.
 type Batch struct {

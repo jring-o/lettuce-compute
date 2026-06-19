@@ -115,10 +115,7 @@ func (m *bvMockWURepo) ReserveNextAssignable(context.Context, workunit.Assignmen
 	}
 	return m.wus[0], nil
 }
-func (m *bvMockWURepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *bvMockWURepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
+func (m *bvMockWURepo) ReserveCopy(_ context.Context, _, _ types.ID, _ time.Time, _ int) (*workunit.Copy, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) Assign(_ context.Context, wuID types.ID, volID types.ID) (*workunit.WorkUnit, error) {
@@ -134,10 +131,10 @@ func (m *bvMockWURepo) Assign(_ context.Context, wuID types.ID, volID types.ID) 
 func (m *bvMockWURepo) CountByLeafAndState(context.Context, types.ID, workunit.WorkUnitState) (int64, error) {
 	return 0, nil
 }
-func (m *bvMockWURepo) FindExpiredWorkUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
+func (m *bvMockWURepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {
 	return nil, nil
 }
-func (m *bvMockWURepo) FindLapsedReservations(context.Context, int) ([]*workunit.WorkUnit, error) {
+func (m *bvMockWURepo) FindStuckSpotCheckUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) FindDispatchableBatch(context.Context, int, []types.ID, []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -149,14 +146,23 @@ func (m *bvMockWURepo) ClaimDispatchableBatch(context.Context, types.ID, time.Du
 func (m *bvMockWURepo) ClearExpiredDispatchClaims(context.Context) (int64, error) {
 	return 0, nil
 }
-func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]types.ID, error) {
+func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) CountActiveByVolunteer(context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
-func (m *bvMockWURepo) TransitionToExpired(context.Context, types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
+func (m *bvMockWURepo) CloseCopy(context.Context, types.ID, string) error { return nil }
+func (m *bvMockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
+	return nil
+}
+func (m *bvMockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
+	return 0, nil
+}
+func (m *bvMockWURepo) CountLiveCopies(context.Context, types.ID) (int, error)  { return 0, nil }
+func (m *bvMockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (m *bvMockWURepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
+	return false, nil
 }
 func (m *bvMockWURepo) Reassign(context.Context, types.ID) (*workunit.WorkUnit, bool, error) {
 	return nil, false, nil

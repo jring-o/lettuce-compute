@@ -114,19 +114,7 @@ func (m *mockWURepo) FindNextAssignable(_ context.Context, _ workunit.Assignment
 func (m *mockWURepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWURepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
 func (m *mockWURepo) Assign(_ context.Context, _ types.ID, _ types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) FindExpiredWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) FindLapsedReservations(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) FindDispatchableBatch(_ context.Context, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -138,13 +126,10 @@ func (m *mockWURepo) ClaimDispatchableBatch(_ context.Context, _ types.ID, _ tim
 func (m *mockWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
 	return 0, nil
 }
-func (m *mockWURepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation, _ types.ID, _ time.Duration) ([]types.ID, error) {
+func (m *mockWURepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation, _ types.ID, _ time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }
 func (m *mockWURepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
-	return nil, nil
-}
-func (m *mockWURepo) TransitionToExpired(_ context.Context, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) Reassign(_ context.Context, _ types.ID) (*workunit.WorkUnit, bool, error) {
@@ -157,6 +142,33 @@ func (m *mockWURepo) MarkSpotCheck(_ context.Context, _ types.ID) error  { retur
 func (m *mockWURepo) ClearSpotCheck(_ context.Context, _ types.ID) error { return nil }
 func (m *mockWURepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
+}
+func (m *mockWURepo) ReserveCopy(context.Context, types.ID, types.ID, time.Time, int) (*workunit.Copy, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FindStuckSpotCheckUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) CloseCopy(context.Context, types.ID, string) error {
+	return nil
+}
+func (m *mockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
+	return nil
+}
+func (m *mockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) CountLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
+	return false, nil
 }
 
 func setupTestHandler(t *testing.T) (*AggregationHandler, types.ID) {

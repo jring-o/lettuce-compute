@@ -78,7 +78,13 @@ Thumbs.db
 # Operator notes (cross-project blockers/follow-ups, not for the public repo)
 /TODO.md
 /TODO.md.bak-*
+/layer2-hardening-handoff-prompt.md
 
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
+layer2-hardening-handoff-prompt.md
+bug-bashing-discovery-prompt.md
+BUG_BASHING_PRIMER copy.md
+BUG_BASHING_PRIMER.md
+logs

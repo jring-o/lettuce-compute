@@ -310,15 +310,20 @@ func TestHeadsLeafsE2E_PreFetchDeadline(t *testing.T) {
 		t.Errorf("unique WU IDs = %d, want 4", len(wuIDs))
 	}
 
-	// Under Layer 1, a dispatched (batched) work unit is LEASED, not assigned:
-	// it stays QUEUED with a live reservation held by this volunteer (the
-	// deadline/heartbeat clock starts only at run-start). Verify the reservation,
-	// and that each assignment carries the lease expiry.
+	// Under Layer 1, a dispatched (batched) work unit is LEASED, not assigned: it stays
+	// QUEUED with a live RESERVED copy held by this volunteer (the deadline/heartbeat
+	// clock starts only at run-start). Per-copy model (migration 00006): the hold is a
+	// work_unit_assignment_history row (outcome IS NULL, started_at IS NULL), not the
+	// retired reserved_volunteer_id column. Verify the reserved copy and the lease expiry.
 	for _, resp := range wuResps {
 		var state string
 		var reservedVol *string
 		err := env.pool.QueryRow(ctx,
-			"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1",
+			`SELECT wu.state,
+			        (SELECT h.volunteer_id::text FROM work_unit_assignment_history h
+			         WHERE h.work_unit_id = wu.id AND h.outcome IS NULL AND h.started_at IS NULL
+			         ORDER BY h.assigned_at DESC LIMIT 1)
+			 FROM work_units wu WHERE wu.id = $1`,
 			types.MustParseID(resp.WorkUnitId),
 		).Scan(&state, &reservedVol)
 		if err != nil {
@@ -328,7 +333,7 @@ func TestHeadsLeafsE2E_PreFetchDeadline(t *testing.T) {
 			t.Errorf("WU %s state = %q, want QUEUED (reserved)", resp.WorkUnitId, state)
 		}
 		if reservedVol == nil || *reservedVol != volID {
-			t.Errorf("WU %s reserved_volunteer_id = %v, want %s", resp.WorkUnitId, reservedVol, volID)
+			t.Errorf("WU %s reserved copy volunteer = %v, want %s", resp.WorkUnitId, reservedVol, volID)
 		}
 		if resp.ReservedUntilUnix <= 0 {
 			t.Errorf("WU %s reserved_until_unix = %d, want > 0", resp.WorkUnitId, resp.ReservedUntilUnix)

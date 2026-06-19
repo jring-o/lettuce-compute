@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
@@ -98,10 +99,11 @@ func TestBatchDispatch_ReturnsDistinctUnitsAndDelay(t *testing.T) {
 	}
 }
 
-// TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation verifies that the
-// first RUNNING heartbeat on a reserved unit flips QUEUED -> ASSIGNED, starting
-// the deadline/heartbeat clock and clearing the reservation columns.
-func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
+// TestBatchDispatch_RunStartFlipsCopyToRunningUnitStaysQueued verifies that the
+// first RUNNING heartbeat run-starts THIS volunteer's COPY (RESERVED -> RUNNING,
+// starting its per-copy deadline clock) while the WORK UNIT stays QUEUED so its other
+// redundancy copies keep dispatching in parallel (per-copy model, migration 00006).
+func TestBatchDispatch_RunStartFlipsCopyToRunningUnitStaysQueued(t *testing.T) {
 	env, cleanup := setupHeadsLeafsServer(t)
 	defer cleanup()
 
@@ -129,11 +131,17 @@ func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
 	}
 	wuID := resp.Assignments[0].WorkUnitId
 
-	// While reserved, the unit is still QUEUED with reservation columns set.
+	// While reserved, the unit is QUEUED with a live RESERVED copy (started_at NULL)
+	// held by volID — the per-copy replacement for the retired reserved_volunteer_id
+	// column.
 	var state string
 	var reservedVol *string
 	if err := env.pool.QueryRow(ctx,
-		"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).
+		`SELECT wu.state,
+		        (SELECT h.volunteer_id::text FROM work_unit_assignment_history h
+		         WHERE h.work_unit_id = wu.id AND h.outcome IS NULL AND h.started_at IS NULL
+		         ORDER BY h.assigned_at DESC LIMIT 1)
+		 FROM work_units wu WHERE wu.id = $1`, wuID).
 		Scan(&state, &reservedVol); err != nil {
 		t.Fatalf("query reserved state: %v", err)
 	}
@@ -141,13 +149,12 @@ func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
 		t.Fatalf("reserved unit state = %q, want QUEUED", state)
 	}
 	if reservedVol == nil || *reservedVol != volID {
-		t.Fatalf("reserved_volunteer_id = %v, want %s", reservedVol, volID)
+		t.Fatalf("reserved copy volunteer = %v, want %s", reservedVol, volID)
 	}
 
-	// StartWork = run start: flips the reserved QUEUED unit to ASSIGNED, clears the
-	// reservation columns, and sets assigned_at (the deadline clock start). With
-	// per-task heartbeats removed there is no separate ASSIGNED->RUNNING step; the
-	// unit stays ASSIGNED until the result is submitted.
+	// StartWork = run start: flips THIS volunteer's RESERVED copy to RUNNING (started_at
+	// set, the per-copy deadline clock start). The WORK UNIT stays QUEUED; assigned_at on
+	// the unit is updated best-effort for observability.
 	if _, err := env.grpc.StartWork(signFor(t, ctx, pubKey), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: volID,
@@ -156,18 +163,22 @@ func TestBatchDispatch_RunStartFlipsAssignedAndClearsReservation(t *testing.T) {
 	}
 
 	var state2 string
-	var reservedUntil *time.Time
 	var assignedAt *time.Time
+	var runningCopies int
 	if err := env.pool.QueryRow(ctx,
-		"SELECT state, reserved_until, assigned_at FROM work_units WHERE id = $1", wuID).
-		Scan(&state2, &reservedUntil, &assignedAt); err != nil {
+		`SELECT wu.state, wu.assigned_at,
+		        (SELECT COUNT(*) FROM work_unit_assignment_history h
+		         WHERE h.work_unit_id = wu.id AND h.volunteer_id::text = $2
+		           AND h.outcome IS NULL AND h.started_at IS NOT NULL)
+		 FROM work_units wu WHERE wu.id = $1`, wuID, volID).
+		Scan(&state2, &assignedAt, &runningCopies); err != nil {
 		t.Fatalf("query post-runstart state: %v", err)
 	}
-	if state2 != "ASSIGNED" {
-		t.Fatalf("post-runstart state = %q, want ASSIGNED", state2)
+	if state2 != "QUEUED" {
+		t.Fatalf("post-runstart unit state = %q, want QUEUED (per-copy: only the copy runs)", state2)
 	}
-	if reservedUntil != nil {
-		t.Errorf("expected reservation cleared at run start, got reserved_until=%v", reservedUntil)
+	if runningCopies != 1 {
+		t.Errorf("expected the volunteer's copy RUNNING (started_at set) after run start, got %d running copies", runningCopies)
 	}
 	if assignedAt == nil {
 		t.Errorf("expected assigned_at set at run start (deadline clock starts)")
@@ -209,9 +220,10 @@ func TestBatchDispatch_AbandonReservedUnitIsReReservable(t *testing.T) {
 	}
 	wuID := resp.Assignments[0].WorkUnitId
 
-	// Abandon the buffered (reserved, un-started) unit before it ever heartbeats.
-	// Pre-fix this returned codes.Internal (TransitionToExpired requires
-	// ASSIGNED/RUNNING); now it drops the reservation and requeues.
+	// Abandon the buffered (reserved, un-started) copy before it ever heartbeats.
+	// Per-copy model: abandon closes THIS volunteer's live copy as ABANDONED; the unit
+	// stays QUEUED and redispatches a fresh copy (uncapped). Pre-fix this returned
+	// codes.Internal (TransitionToExpired required ASSIGNED/RUNNING).
 	ab, err := env.grpc.AbandonWorkUnit(signFor(t, ctx, pubKey1), &lettucev1.AbandonWorkUnitRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: volID1,
@@ -224,19 +236,22 @@ func TestBatchDispatch_AbandonReservedUnitIsReReservable(t *testing.T) {
 		t.Fatalf("expected reserved unit requeued on abandon, got %+v", ab)
 	}
 
-	// The unit is QUEUED with no reservation columns.
+	// The unit is QUEUED with NO live copy (the abandoned copy is closed, outcome set).
 	var state string
-	var reservedVol *string
+	var liveCopies int
 	if err := env.pool.QueryRow(ctx,
-		"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).
-		Scan(&state, &reservedVol); err != nil {
+		`SELECT wu.state,
+		        (SELECT COUNT(*) FROM work_unit_assignment_history h
+		         WHERE h.work_unit_id = wu.id AND h.outcome IS NULL)
+		 FROM work_units wu WHERE wu.id = $1`, wuID).
+		Scan(&state, &liveCopies); err != nil {
 		t.Fatalf("query post-abandon state: %v", err)
 	}
 	if state != "QUEUED" {
 		t.Fatalf("post-abandon state = %q, want QUEUED", state)
 	}
-	if reservedVol != nil {
-		t.Fatalf("expected reservation cleared after abandon, got reserved_volunteer_id=%v", *reservedVol)
+	if liveCopies != 0 {
+		t.Fatalf("expected no live copy after abandon, got %d", liveCopies)
 	}
 
 	// A second volunteer can now reserve the freed unit.
@@ -254,12 +269,17 @@ func TestBatchDispatch_AbandonReservedUnitIsReReservable(t *testing.T) {
 	}
 }
 
-// TestBatchDispatch_LapsedReservationReReservable verifies the orphaned-buffered-
-// work leak is fixed end to end: a unit whose holder vanished (its lease lapsed,
-// simulated by backdating reserved_until) stays QUEUED with no stale active history
-// row and is re-reservable by another volunteer through the normal gRPC path, with
-// no manual transition or sweeper.
-func TestBatchDispatch_LapsedReservationReReservable(t *testing.T) {
+// TestBatchDispatch_LapsedReservationReclaimedBySweepThenReReservable verifies the
+// orphaned-buffered-work reclaim under the per-copy model: a unit whose holder
+// vanished (its RESERVED copy's lease lapsed, simulated by backdating the copy's
+// reserved_until) is reclaimed by the fault-monitor copy sweep — FindExpiredCopies
+// surfaces the lapsed RESERVED copy and CloseCopy parks it EXPIRED — after which the
+// unit (QUEUED, no live copy) is re-reservable by another volunteer through the normal
+// gRPC path. Per-copy model (migration 00006): a reservation is a live history row
+// (outcome IS NULL), so unlike the retired reserved_until column it counts toward
+// redundancy until the deadline sweep closes it (property 5: the deadline is the only
+// early-reclaim clock).
+func TestBatchDispatch_LapsedReservationReclaimedBySweepThenReReservable(t *testing.T) {
 	env, cleanup := setupHeadsLeafsServer(t)
 	defer cleanup()
 
@@ -289,25 +309,58 @@ func TestBatchDispatch_LapsedReservationReReservable(t *testing.T) {
 	}
 	wuID := resp.Assignments[0].WorkUnitId
 
-	// Simulate the holder crashing: backdate the lease so it has lapsed. No reclaim
-	// sweep runs — the lapsed lease is re-reservable purely via the assignment guard.
+	// Simulate the holder crashing: backdate the RESERVED copy's lease so it has lapsed.
 	if _, err := env.pool.Exec(ctx,
-		"UPDATE work_units SET reserved_until = NOW() - INTERVAL '1 minute' WHERE id = $1", wuID); err != nil {
-		t.Fatalf("backdate reservation: %v", err)
+		`UPDATE work_unit_assignment_history SET reserved_until = NOW() - INTERVAL '1 minute'
+		 WHERE work_unit_id = $1 AND outcome IS NULL AND started_at IS NULL`, wuID); err != nil {
+		t.Fatalf("backdate reserved copy lease: %v", err)
 	}
 
-	// Confirm there is NO stale active assignment_history row (the leak's signature).
-	var activeRows int
+	// The lapsed RESERVED copy is still a live history row, so it still counts toward the
+	// leaf's redundancy until the deadline sweep closes it.
+	var liveBefore int
 	if err := env.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND outcome IS NULL", wuID).
-		Scan(&activeRows); err != nil {
-		t.Fatalf("count active history rows: %v", err)
+		Scan(&liveBefore); err != nil {
+		t.Fatalf("count live copies before sweep: %v", err)
 	}
-	if activeRows != 0 {
-		t.Fatalf("expected no active assignment_history row for a reservation, got %d (leak)", activeRows)
+	if liveBefore != 1 {
+		t.Fatalf("expected the lapsed reservation to remain a live copy until swept, got %d", liveBefore)
 	}
 
-	// vol2 re-reserves the lapsed unit with no manual transition.
+	// Fault-monitor copy sweep: FindExpiredCopies surfaces the lapsed RESERVED copy and
+	// CloseCopy parks it EXPIRED — the per-copy reclaim path (no per-unit transition).
+	wuRepo := workunit.NewPgxWorkUnitRepository(env.pool)
+	expired, err := wuRepo.FindExpiredCopies(ctx, 10)
+	if err != nil {
+		t.Fatalf("FindExpiredCopies: %v", err)
+	}
+	swept := false
+	for _, cp := range expired {
+		if cp.WorkUnitID.String() == wuID {
+			if cerr := wuRepo.CloseCopy(ctx, cp.ID, "EXPIRED"); cerr != nil {
+				t.Fatalf("CloseCopy(EXPIRED): %v", cerr)
+			}
+			swept = true
+		}
+	}
+	if !swept {
+		t.Fatalf("expected the lapsed RESERVED copy of %s to be surfaced by FindExpiredCopies", wuID)
+	}
+
+	// After the sweep there is no live copy and the unit stays QUEUED, so it is
+	// dispatchable again.
+	var liveAfter int
+	if err := env.pool.QueryRow(ctx,
+		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND outcome IS NULL", wuID).
+		Scan(&liveAfter); err != nil {
+		t.Fatalf("count live copies after sweep: %v", err)
+	}
+	if liveAfter != 0 {
+		t.Fatalf("expected no live copy after the sweep closed the lapsed reservation, got %d", liveAfter)
+	}
+
+	// vol2 re-reserves the reclaimed unit through the normal gRPC path.
 	resp2, err := env.grpc.RequestWorkUnit(signFor(t, ctx, pubKey2), &lettucev1.RequestWorkUnitRequest{
 		VolunteerId:    volID2,
 		PublicKey:      pubKey2,

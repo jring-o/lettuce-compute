@@ -80,19 +80,7 @@ func (m *mockWURepo) FindNextAssignable(ctx context.Context, opts workunit.Assig
 func (m *mockWURepo) ReserveNextAssignable(ctx context.Context, opts workunit.AssignmentOptions, lease time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (m *mockWURepo) StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) ClearReservation(ctx context.Context, id, volunteerID types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
 func (m *mockWURepo) Assign(ctx context.Context, workUnitID, volunteerID types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) FindExpiredWorkUnits(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (m *mockWURepo) FindLapsedReservations(ctx context.Context, limit int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) FindDispatchableBatch(ctx context.Context, limit int, excludeIDs []types.ID, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -104,13 +92,10 @@ func (m *mockWURepo) ClaimDispatchableBatch(_ context.Context, _ types.ID, _ tim
 func (m *mockWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
 	return 0, nil
 }
-func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
+func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }
 func (m *mockWURepo) CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error) {
-	return nil, nil
-}
-func (m *mockWURepo) TransitionToExpired(ctx context.Context, id types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (m *mockWURepo) Reassign(ctx context.Context, id types.ID) (*workunit.WorkUnit, bool, error) {
@@ -123,6 +108,33 @@ func (m *mockWURepo) MarkSpotCheck(_ context.Context, _ types.ID) error  { retur
 func (m *mockWURepo) ClearSpotCheck(_ context.Context, _ types.ID) error { return nil }
 func (m *mockWURepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
+}
+func (m *mockWURepo) ReserveCopy(context.Context, types.ID, types.ID, time.Time, int) (*workunit.Copy, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {
+	return nil, nil
+}
+func (m *mockWURepo) FindStuckSpotCheckUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (m *mockWURepo) CloseCopy(context.Context, types.ID, string) error {
+	return nil
+}
+func (m *mockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
+	return nil
+}
+func (m *mockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) CountLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (m *mockWURepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
+	return false, nil
 }
 
 type mockBatchRepo struct {

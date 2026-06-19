@@ -138,8 +138,9 @@ func TestFindDispatchableBatch_LeafScoped(t *testing.T) {
 }
 
 // TestFlushReservations_LandsAndConflicts asserts the batched reservation write
-// lands a reservation on a QUEUED unit (returning its id) and reports a conflict
-// (id NOT returned) when the unit is already reserved to a DIFFERENT volunteer.
+// lands a copy on a QUEUED unit with headroom (returning its (unit, volunteer) pair)
+// and reports a conflict (pair NOT returned) when the unit's redundancy is already
+// met by a live copy held by a DIFFERENT volunteer.
 func TestFlushReservations_LandsAndConflicts(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -152,85 +153,96 @@ func TestFlushReservations_LandsAndConflicts(t *testing.T) {
 	free := mustQueuedWU(t, ctx, repo, leafID)
 	taken := mustQueuedWU(t, ctx, repo, leafID)
 
-	volA := types.NewID()
-	volB := types.NewID()
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
 
-	// Pre-reserve `taken` to volA via the existing stamp path.
-	if _, err := repo.StampReservation(ctx, taken.ID, volA, time.Hour); err != nil {
-		t.Fatalf("StampReservation: %v", err)
+	// Pre-reserve `taken` to volA via a per-copy RESERVED row (redundancy-1 met).
+	if _, err := repo.ReserveCopy(ctx, taken.ID, volA, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+		t.Fatalf("ReserveCopy(taken): %v", err)
 	}
 
-	// volB tries to flush both: `free` lands, `taken` conflicts (held by volA).
+	// volB tries to flush both: `free` lands, `taken` conflicts (redundancy already
+	// met by volA's live copy).
 	until := time.Now().UTC().Add(15 * time.Minute)
 	landed, err := repo.FlushReservations(ctx, []FlushReservation{
-		{WorkUnitID: free.ID, VolunteerID: volB, ReservedUntil: until},
-		{WorkUnitID: taken.ID, VolunteerID: volB, ReservedUntil: until},
+		{WorkUnitID: free.ID, VolunteerID: volB, ReservedUntil: until, DeadlineSeconds: 3600},
+		{WorkUnitID: taken.ID, VolunteerID: volB, ReservedUntil: until, DeadlineSeconds: 3600},
 	}, types.ID{}, 0)
 	if err != nil {
 		t.Fatalf("FlushReservations: %v", err)
 	}
-	if len(landed) != 1 || landed[0] != free.ID {
-		t.Fatalf("expected only %s to land, got %v", free.ID, landed)
+	if len(landed) != 1 || landed[0].WorkUnitID != free.ID || landed[0].VolunteerID != volB {
+		t.Fatalf("expected only (%s, volB) to land, got %v", free.ID, landed)
 	}
 
-	// `free` is now reserved to volB; `taken` is still reserved to volA.
-	got, err := repo.GetByID(ctx, free.ID)
-	if err != nil {
-		t.Fatalf("GetByID(free): %v", err)
+	// `free` now has a live copy held by volB; `taken` still by volA.
+	if vols := liveCopyVolunteers(t, pool, free.ID); len(vols) != 1 || vols[0] != volB {
+		t.Fatalf("free should have one live copy held by volB, got %v", vols)
 	}
-	if got.ReservedVolunteerID == nil || *got.ReservedVolunteerID != volB {
-		t.Fatalf("free should be reserved to volB")
-	}
-	gotTaken, err := repo.GetByID(ctx, taken.ID)
-	if err != nil {
-		t.Fatalf("GetByID(taken): %v", err)
-	}
-	if gotTaken.ReservedVolunteerID == nil || *gotTaken.ReservedVolunteerID != volA {
-		t.Fatalf("taken should remain reserved to volA")
+	if vols := liveCopyVolunteers(t, pool, taken.ID); len(vols) != 1 || vols[0] != volA {
+		t.Fatalf("taken should remain held by volA, got %v", vols)
 	}
 }
 
-// TestFlushReservations_ReReservesOwnAndLapsed asserts the optimistic guard allows
-// re-reserving a unit already held by the SAME volunteer (idempotent re-flush) and
-// a unit whose lease has lapsed.
-func TestFlushReservations_ReReservesOwnAndLapsed(t *testing.T) {
+// TestFlushReservations_ParallelCopiesUpToRedundancy asserts the per-copy flush:
+// under a redundancy-2 leaf a SECOND distinct volunteer lands a parallel copy on a
+// unit already holding one, an idempotent re-flush for a volunteer that already
+// holds a live copy is silently dropped (ON CONFLICT DO NOTHING — not returned),
+// and a THIRD volunteer is rejected once redundancy is met.
+func TestFlushReservations_ParallelCopiesUpToRedundancy(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
 	userID := createTestUser(t, pool, "dispatch-rereserve")
-	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
+	// Default valConfig has redundancy_factor 2.
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
 
-	own := mustQueuedWU(t, ctx, repo, leafID)
-	lapsed := mustQueuedWU(t, ctx, repo, leafID)
+	unit := mustQueuedWU(t, ctx, repo, leafID)
 
-	vol := types.NewID()
-	other := types.NewID()
+	first := createTestVolunteer(t, pool)
+	second := createTestVolunteer(t, pool)
+	third := createTestVolunteer(t, pool)
 
-	// `own` already reserved to vol; `lapsed` reserved to `other` but expired.
-	if _, err := repo.StampReservation(ctx, own.ID, vol, time.Hour); err != nil {
-		t.Fatalf("StampReservation(own): %v", err)
-	}
-	if _, err := repo.StampReservation(ctx, lapsed.ID, other, -time.Minute); err != nil {
-		t.Fatalf("StampReservation(lapsed): %v", err)
+	// `first` already holds a live copy.
+	if _, err := repo.ReserveCopy(ctx, unit.ID, first, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+		t.Fatalf("ReserveCopy(first): %v", err)
 	}
 
 	until := time.Now().UTC().Add(15 * time.Minute)
+
+	// `second` lands a parallel copy (1 live < redundancy 2); a re-flush for `first`
+	// is dropped (it already holds a live copy → ON CONFLICT DO NOTHING).
 	landed, err := repo.FlushReservations(ctx, []FlushReservation{
-		{WorkUnitID: own.ID, VolunteerID: vol, ReservedUntil: until},
-		{WorkUnitID: lapsed.ID, VolunteerID: vol, ReservedUntil: until},
+		{WorkUnitID: unit.ID, VolunteerID: second, ReservedUntil: until, DeadlineSeconds: 3600},
+		{WorkUnitID: unit.ID, VolunteerID: first, ReservedUntil: until, DeadlineSeconds: 3600},
 	}, types.ID{}, 0)
 	if err != nil {
 		t.Fatalf("FlushReservations: %v", err)
 	}
-	if len(landed) != 2 {
-		t.Fatalf("re-reserve-own + lapsed-takeover should both land, got %v", landed)
+	if len(landed) != 1 || landed[0].VolunteerID != second {
+		t.Fatalf("expected only the parallel copy for `second` to land, got %v", landed)
+	}
+	if vols := liveCopyVolunteers(t, pool, unit.ID); len(vols) != 2 {
+		t.Fatalf("expected two distinct live copies after parallel flush, got %v", vols)
+	}
+
+	// `third` is rejected: redundancy 2 is now met (2 live copies).
+	landed2, err := repo.FlushReservations(ctx, []FlushReservation{
+		{WorkUnitID: unit.ID, VolunteerID: third, ReservedUntil: until, DeadlineSeconds: 3600},
+	}, types.ID{}, 0)
+	if err != nil {
+		t.Fatalf("FlushReservations(third): %v", err)
+	}
+	if len(landed2) != 0 {
+		t.Fatalf("expected redundancy cap to reject `third`, got %v", landed2)
 	}
 }
 
-// TestCountActiveByVolunteer counts live reservations + active history rows per
-// volunteer (the inflight reconcile source).
+// TestCountActiveByVolunteer counts live copies (RESERVED + RUNNING history rows,
+// outcome IS NULL) per volunteer (the inflight reconcile source). A CLOSED copy is
+// not counted.
 func TestCountActiveByVolunteer(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -240,22 +252,27 @@ func TestCountActiveByVolunteer(t *testing.T) {
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
 
-	vol := types.NewID()
+	vol := createTestVolunteer(t, pool)
+	until := time.Now().UTC().Add(time.Hour)
 
-	// Two live reservations for vol.
+	// Two live copies for vol.
 	r1 := mustQueuedWU(t, ctx, repo, leafID)
 	r2 := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.StampReservation(ctx, r1.ID, vol, time.Hour); err != nil {
-		t.Fatalf("StampReservation(r1): %v", err)
+	if _, err := repo.ReserveCopy(ctx, r1.ID, vol, until, 3600); err != nil {
+		t.Fatalf("ReserveCopy(r1): %v", err)
 	}
-	if _, err := repo.StampReservation(ctx, r2.ID, vol, time.Hour); err != nil {
-		t.Fatalf("StampReservation(r2): %v", err)
+	if _, err := repo.ReserveCopy(ctx, r2.ID, vol, until, 3600); err != nil {
+		t.Fatalf("ReserveCopy(r2): %v", err)
 	}
 
-	// One LAPSED reservation must NOT be counted.
-	rl := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.StampReservation(ctx, rl.ID, vol, -time.Minute); err != nil {
-		t.Fatalf("StampReservation(rl): %v", err)
+	// One CLOSED copy must NOT be counted (a lapsed reserved_until alone keeps the
+	// copy live — only a set outcome retires it from the inflight count).
+	rc := mustQueuedWU(t, ctx, repo, leafID)
+	if _, err := repo.ReserveCopy(ctx, rc.ID, vol, until, 3600); err != nil {
+		t.Fatalf("ReserveCopy(rc): %v", err)
+	}
+	if err := repo.CloseCopyByVolunteer(ctx, rc.ID, vol, "ABANDONED", nil); err != nil {
+		t.Fatalf("CloseCopyByVolunteer(rc): %v", err)
 	}
 
 	counts, err := repo.CountActiveByVolunteer(ctx)
@@ -263,7 +280,7 @@ func TestCountActiveByVolunteer(t *testing.T) {
 		t.Fatalf("CountActiveByVolunteer: %v", err)
 	}
 	if counts[vol] != 2 {
-		t.Fatalf("expected 2 live reservations for vol, got %d", counts[vol])
+		t.Fatalf("expected 2 live copies for vol, got %d", counts[vol])
 	}
 }
 
@@ -383,45 +400,43 @@ func TestClaimDispatchableBatch_ExpiredIsReclaimable(t *testing.T) {
 	}
 }
 
-// TestClaimReleaseOnAssignAndReservationClear: Assign and ClearReservation both NULL
-// the dispatch-claim columns so a unit leaving the dispatchable universe (run-start)
-// or abandoned never strands its claim.
-func TestClaimReleaseOnAssignAndReservationClear(t *testing.T) {
+// TestClaimPersistsThroughRunStart: in the per-copy model a unit stays QUEUED through
+// run-start (Assign), so the dispatching head KEEPS its claim — the unit may still
+// need more redundancy copies dispatched, and the claim is what keeps every other
+// replica from also staging it. (The claim is released by a state transition via
+// UpdateState — see TestUpdateStateClearsClaim — or simply expires.)
+func TestClaimPersistsThroughRunStart(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	userID := createTestUser(t, pool, "dispatch-claim-release")
+	userID := createTestUser(t, pool, "dispatch-claim-runstart")
 	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
 	head := types.NewID()
 	vol := createTestVolunteer(t, pool)
 
-	// Assign clears the claim.
 	a := mustQueuedWU(t, ctx, repo, leafID)
 	if _, err := repo.ClaimDispatchableBatch(ctx, head, 5*time.Minute, 10, nil, nil); err != nil {
 		t.Fatalf("claim(a): %v", err)
 	}
+	// Buffer a copy, then run-start it. The unit stays QUEUED.
+	if _, err := repo.ReserveCopy(ctx, a.ID, vol, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+		t.Fatalf("ReserveCopy: %v", err)
+	}
 	if _, err := repo.Assign(ctx, a.ID, vol); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
-	if owner, exp := claimOf(t, pool, a.ID); owner != nil || exp != nil {
-		t.Fatalf("Assign must NULL the claim columns, got owner=%v exp=%v", owner, exp)
-	}
 
-	// ClearReservation (abandon path) clears the claim on a reserved+claimed unit.
-	b := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ClaimDispatchableBatch(ctx, head, 5*time.Minute, 10, nil, nil); err != nil {
-		t.Fatalf("claim(b): %v", err)
+	got, err := repo.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
 	}
-	if _, err := repo.StampReservation(ctx, b.ID, vol, time.Hour); err != nil {
-		t.Fatalf("StampReservation(b): %v", err)
+	if got.State != WorkUnitStateQueued {
+		t.Fatalf("run-start must keep the unit QUEUED, got %s", got.State)
 	}
-	if _, err := repo.ClearReservation(ctx, b.ID, vol); err != nil {
-		t.Fatalf("ClearReservation(b): %v", err)
-	}
-	if owner, exp := claimOf(t, pool, b.ID); owner != nil || exp != nil {
-		t.Fatalf("ClearReservation must NULL the claim columns, got owner=%v exp=%v", owner, exp)
+	if owner, exp := claimOf(t, pool, a.ID); owner == nil || *owner != head || exp == nil {
+		t.Fatalf("run-start must keep the head's dispatch claim, got owner=%v exp=%v", owner, exp)
 	}
 }
 

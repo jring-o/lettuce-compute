@@ -315,7 +315,6 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		defer tx.Rollback(r.Context())
 
 		txWURepo := workunit.NewPgxWorkUnitRepository(tx)
-		txAssignRepo := assignment.NewPgxRepository(tx)
 
 		wu, err := txWURepo.FindNextAssignable(r.Context(), opts)
 		if err != nil {
@@ -351,6 +350,20 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 
 		now := time.Now().UTC()
+		// Per-copy dispatch: create this browser volunteer's copy. The unit stays
+		// QUEUED (its other redundancy copies keep dispatching in parallel). A
+		// spot-check first-placement leaves the copy RESERVED (it waits for a second
+		// corroborator); a normal placement immediately run-starts it (RUNNING).
+		hold := wu.DeadlineSeconds
+		if hold <= 0 {
+			hold = 3600
+		}
+		reservedUntil := now.Add(time.Duration(hold) * time.Second)
+		if _, rerr := txWURepo.ReserveCopy(r.Context(), wu.ID, vol.ID, reservedUntil, wu.DeadlineSeconds); rerr != nil {
+			deps.logger.Error("failed to reserve copy", "error", rerr)
+			apierror.WriteError(w, apierror.Internal("internal server error", rerr))
+			return
+		}
 		if isSpotCheckFirst {
 			if err := txWURepo.MarkSpotCheck(r.Context(), wu.ID); err != nil {
 				deps.logger.Error("failed to mark spot-check", "error", err)
@@ -359,23 +372,11 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 			}
 			wu.SpotCheck = true
 		} else {
-			wu, err = txWURepo.Assign(r.Context(), wu.ID, vol.ID)
-			if err != nil {
-				deps.logger.Error("failed to assign work unit", "error", err)
+			if _, err = txWURepo.Assign(r.Context(), wu.ID, vol.ID); err != nil {
+				deps.logger.Error("failed to run-start copy", "error", err)
 				apierror.WriteError(w, apierror.Internal("internal server error", err))
 				return
 			}
-		}
-
-		historyEntry := &assignment.AssignmentHistoryEntry{
-			WorkUnitID:  wu.ID,
-			VolunteerID: vol.ID,
-			AssignedAt:  now,
-		}
-		if err := txAssignRepo.Create(r.Context(), historyEntry); err != nil {
-			deps.logger.Error("failed to record assignment", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
 		}
 
 		if err := tx.Commit(r.Context()); err != nil {
@@ -545,6 +546,14 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		txAssignRepo := assignment.NewPgxRepository(tx)
 		txResultRepo := result.NewPgxRepository(tx)
 
+		// Serialize concurrent submits for the same unit (parallel copies) so the
+		// PENDING-result count that decides COMPLETED is accurate.
+		if _, lerr := tx.Exec(r.Context(), `SELECT 1 FROM work_units WHERE id = $1 FOR UPDATE`, workUnitID); lerr != nil {
+			deps.logger.Error("failed to lock work unit for submit", "error", lerr)
+			apierror.WriteError(w, apierror.Internal("internal server error", lerr))
+			return
+		}
+
 		// Verify active assignment.
 		activeAssignment, err := txAssignRepo.FindActiveByWorkUnitAndVolunteer(r.Context(), workUnitID, vol.ID)
 		if err != nil {
@@ -624,23 +633,14 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 
 		if existingCount+1 >= effectiveRedundancy {
-			// Mirror the gRPC SubmitResult completion predicate: also complete a
-			// buffered (QUEUED + reserved) unit whose redundancy is met by results
-			// submitted before a RUNNING heartbeat flipped it to ASSIGNED — e.g. a
-			// gRPC volunteer reserved the unit and a browser volunteer corroborates
-			// it. Clear the reservation columns on completion.
+			// Redundancy met: mark COMPLETED (the unit was QUEUED while its copies ran
+			// in parallel; ASSIGNED/RUNNING tolerated only for legacy in-flight units).
 			_, err := tx.Exec(r.Context(), `
 				UPDATE work_units SET
 					state = 'COMPLETED',
 					started_at = COALESCE(started_at, NOW()),
-					completed_at = NOW(),
-					reserved_until = NULL,
-					reserved_volunteer_id = NULL
-				WHERE id = $1 AND (
-					state IN ('ASSIGNED', 'RUNNING')
-					OR (state = 'QUEUED' AND spot_check = true)
-					OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
-				)`,
+					completed_at = NOW()
+				WHERE id = $1 AND state IN ('QUEUED', 'ASSIGNED', 'RUNNING')`,
 				workUnitID,
 			)
 			if err != nil {
@@ -649,6 +649,9 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 				return
 			}
 		}
+		// Redundancy not yet met: no unit-state change — this volunteer's copy is closed
+		// and its PENDING result holds a slot; the unit stays QUEUED so its remaining
+		// parallel copies continue (no requeue-on-partial).
 
 		if err := tx.Commit(r.Context()); err != nil {
 			deps.logger.Error("failed to commit result", "error", err)

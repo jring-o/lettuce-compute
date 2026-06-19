@@ -471,9 +471,9 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 
 // ValidateValidationConfig validates result validation configuration.
 func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
-	// Redundancy factor: 1-5
-	if c.RedundancyFactor < 1 || c.RedundancyFactor > 5 {
-		return apierror.ValidationError("redundancy_factor must be between 1 and 5",
+	// Redundancy factor: head-owned, no upper bound. Must be at least 1.
+	if c.RedundancyFactor < 1 {
+		return apierror.ValidationError("redundancy_factor must be at least 1",
 			validationDetail{Field: "redundancy_factor", Reason: "out_of_range"})
 	}
 
@@ -541,15 +541,15 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 // or range-checked here — any value (including 0 / omitted) is accepted — but the
 // struct fields are retained so older callers that still send them do not break.
 func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
-	// Deadline multiplier: 1.0-10.0
-	if c.DeadlineMultiplier < 1.0 || c.DeadlineMultiplier > 10.0 {
-		return apierror.ValidationError("deadline_multiplier must be between 1.0 and 10.0",
+	// Deadline multiplier: head-owned, no upper bound. Must be positive.
+	if c.DeadlineMultiplier <= 0 {
+		return apierror.ValidationError("deadline_multiplier must be greater than 0",
 			validationDetail{Field: "deadline_multiplier", Reason: "out_of_range"})
 	}
 
-	// Max reassignments: 1-10
-	if c.MaxReassignments < 1 || c.MaxReassignments > 10 {
-		return apierror.ValidationError("max_reassignments must be between 1 and 10",
+	// Max reassignments: head-owned, no upper bound. Must be at least 1.
+	if c.MaxReassignments < 1 {
+		return apierror.ValidationError("max_reassignments must be at least 1",
 			validationDetail{Field: "max_reassignments", Reason: "out_of_range"})
 	}
 

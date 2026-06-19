@@ -311,11 +311,12 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
 		LEFT JOIN (
-			SELECT leaf_id, COUNT(DISTINCT assigned_volunteer_id) AS cnt
-			FROM work_units
-			WHERE state IN ('ASSIGNED', 'RUNNING')
-			AND assigned_volunteer_id IS NOT NULL
-			GROUP BY leaf_id
+			-- Per-copy dispatch: active volunteers = those holding a LIVE copy.
+			SELECT wu.leaf_id, COUNT(DISTINCT h.volunteer_id) AS cnt
+			FROM work_unit_assignment_history h
+			JOIN work_units wu ON wu.id = h.work_unit_id
+			WHERE h.outcome IS NULL AND h.volunteer_id IS NOT NULL
+			GROUP BY wu.leaf_id
 		) a ON a.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
 		ORDER BY l.name ASC`)
@@ -723,7 +724,6 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 	defer tx.Rollback(ctx)
 
 	txWURepo := workunit.NewPgxWorkUnitRepository(tx)
-	txAssignRepo := assignment.NewPgxRepository(tx)
 
 	// leafCache collapses repeated GetByID lookups so N units from one leaf cost
 	// one lookup (the spot-check check and the response build share it). The leaf
@@ -769,9 +769,12 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 
-		// Spot-check first assignment: keep the unit QUEUED (so a second volunteer
-		// can also be assigned) but mark it spot_check and stamp the reservation (to
-		// hide it from THIS volunteer's later loop iterations).
+		// Per-copy dispatch: ReserveNextAssignable already inserted this volunteer's
+		// RESERVED copy row (a work_unit_assignment_history row held until the unit's
+		// deadline). The unit stays QUEUED so up to redundancy distinct volunteers each
+		// get their own parallel copy. A spot-check decision on a redundancy-1 unit
+		// just flips spot_check on the unit so it waits for a SECOND corroborator; the
+		// copy row is already in place.
 		if !wu.SpotCheck &&
 			lf.ValidationConfig.SpotCheckEnabled &&
 			lf.ValidationConfig.RedundancyFactor == 1 &&
@@ -780,40 +783,8 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 				s.logger.Error("failed to mark spot-check", "method", "RequestWorkUnit", "error", serr)
 				return nil, status.Errorf(codes.Internal, "internal error")
 			}
-			stamped, serr := txWURepo.StampReservation(ctx, wu.ID, volunteerID, lease)
-			if serr != nil {
-				s.logger.Error("failed to stamp spot-check reservation", "method", "RequestWorkUnit", "error", serr)
-				return nil, status.Errorf(codes.Internal, "internal error")
-			}
-			stamped.SpotCheck = true
-			wu = stamped
+			wu.SpotCheck = true
 		}
-
-		if wu.SpotCheck {
-			// Spot-check units are the ONE case that keeps the history-row model:
-			// they never flip to ASSIGNED (they stay QUEUED for corroboration), so
-			// EVERY volunteer placed on a spot-check unit — the marking volunteer AND
-			// any later corroborating volunteer — submits directly against an active
-			// history row written here (there is no run-start to create it). The
-			// 1-hour QUEUED-spot-check sweep in FindExpiredWorkUnits reclaims a
-			// never-corroborated spot-check, so these rows do not leak the way a
-			// normal reservation's would.
-			if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
-				WorkUnitID:  wu.ID,
-				VolunteerID: volunteerID,
-				AssignedAt:  time.Now().UTC(),
-			}); cerr != nil {
-				s.logger.Error("failed to record spot-check assignment history", "method", "RequestWorkUnit", "error", cerr)
-				return nil, status.Errorf(codes.Internal, "internal error")
-			}
-		}
-		// For a NORMAL (non-spot-check) reservation, NO assignment_history row is
-		// written: the buffered unit is leased purely via the reservation columns
-		// (reserved_until / reserved_volunteer_id) and stays QUEUED. This prevents
-		// the orphaned-buffered-work leak — a crashed holder leaves no stale active
-		// history row; its lapsed lease (reserved_until < NOW()) makes the unit
-		// re-reservable with no manual transition. The active history row is written
-		// by Assign at run-start, when the deadline/heartbeat clock starts.
 		reserved = append(reserved, reservedUnit{wu: wu, leaf: lf})
 	}
 	// Fold the batch's assignment-query cost into the latency signal (per call,
@@ -1029,6 +1000,15 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	txAssignRepo := assignment.NewPgxRepository(tx)
 	txResultRepo := result.NewPgxRepository(tx)
 
+	// Per-copy dispatch: with N copies of a unit running in PARALLEL, several results
+	// can land concurrently. Serialize submits for the SAME unit by locking its row, so
+	// the PENDING-result count used to decide COMPLETED is accurate (the last result to
+	// meet redundancy reliably triggers completion, with no lost-completion race).
+	if _, lerr := tx.Exec(ctx, `SELECT 1 FROM work_units WHERE id = $1 FOR UPDATE`, workUnitID); lerr != nil {
+		s.logger.Error("failed to lock work unit for submit", "error", lerr)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
 	// Verify active assignment exists.
 	activeAssignment, err := txAssignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
 	if err != nil {
@@ -1120,25 +1100,16 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	}
 
 	if existingCount+1 >= effectiveRedundancy {
-		// The QUEUED + reserved branch handles a buffered (reserved) unit whose
-		// redundancy is met by results submitted before any RUNNING heartbeat
-		// flipped it to ASSIGNED: a submitted result implies the work ran, so
-		// complete the unit and clear its reservation columns. reserved_volunteer_id
-		// IS NOT NULL (rather than = the submitter) because with redundancy > 1 the
-		// volunteer whose submit MEETS the redundancy need not be the lease holder.
-		// The QUEUED + spot_check branch is the existing spot-check completion path.
+		// Redundancy met: this submit completed the last needed copy. Mark the unit
+		// COMPLETED (a submitted result implies the work ran). The unit was QUEUED
+		// throughout (its copies ran in parallel); the ASSIGNED/RUNNING values are
+		// tolerated only for any legacy in-flight unit during migration.
 		_, err := tx.Exec(ctx, `
 			UPDATE work_units SET
 				state = 'COMPLETED',
 				started_at = COALESCE(started_at, NOW()),
-				completed_at = NOW(),
-				reserved_until = NULL,
-				reserved_volunteer_id = NULL
-			WHERE id = $1 AND (
-				state IN ('ASSIGNED', 'RUNNING')
-				OR (state = 'QUEUED' AND spot_check = true)
-				OR (state = 'QUEUED' AND reserved_volunteer_id IS NOT NULL)
-			)`,
+				completed_at = NOW()
+			WHERE id = $1 AND state IN ('QUEUED', 'ASSIGNED', 'RUNNING')`,
 			workUnitID,
 		)
 		if err != nil {
@@ -1146,6 +1117,11 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 	}
+	// Redundancy not yet met: no unit-state change is needed. This volunteer's copy is
+	// closed (UpdateOutcome above) and its PENDING result holds a redundancy slot; the
+	// unit stays QUEUED so its REMAINING copies — already dispatched in parallel to
+	// other volunteers — continue and corroborate. (No requeue-on-partial: copies are
+	// parallel, not serial.)
 
 	// Commit transaction.
 	if err := tx.Commit(ctx); err != nil {
@@ -1265,102 +1241,31 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// If the unit is already ASSIGNED/RUNNING for this volunteer, treat StartWork as
-	// idempotent: the run-start already happened (e.g. a retried StartWork after a
-	// lost response). Spot-check units carry their own history row, so verify via
-	// the assignment history; NORMAL units via the assigned column.
-	if wu.State == workunit.WorkUnitStateAssigned || wu.State == workunit.WorkUnitStateRunning {
-		if wu.SpotCheck {
-			entry, aerr := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
-			if aerr == nil && entry != nil {
-				return &lettucev1.StartWorkResponse{Ok: true, Message: "already run-started"}, nil
-			}
-		} else if wu.AssignedVolunteerID != nil && *wu.AssignedVolunteerID == volunteerID {
-			return &lettucev1.StartWorkResponse{Ok: true, Message: "already run-started"}, nil
-		}
-		// Assigned to someone else (redundancy>1 distinct holder still occupies the
-		// column, or this unit was reassigned out from under us): not run-startable
-		// for this volunteer right now. Tell the volunteer to drop it.
-		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit not reserved for this volunteer"}, nil
-	}
-
-	// Spot-check units are the ONE case that never flips QUEUED->ASSIGNED: they stay
-	// QUEUED for corroboration and every placed volunteer (the marking volunteer AND
-	// any later corroborating volunteer) already has its active assignment_history row
-	// written at reservation time (RequestWorkUnit). So spot-check units need no
-	// run-start — flipping them to ASSIGNED here would hide them from the second
-	// corroborating volunteer's FindNextAssignable (which requires state='QUEUED'),
-	// breaking spot-check redundancy. StartWork is a harmless no-op: the volunteer
-	// submits directly against the existing history row.
-	if wu.SpotCheck {
-		return &lettucev1.StartWorkResponse{Ok: true, Message: "spot-check unit; submits against existing history row"}, nil
-	}
-
-	// Only a still-QUEUED unit reserved for THIS volunteer can be run-started.
+	// Per-copy dispatch: a work unit stays QUEUED while its copies run, so a terminal
+	// (COMPLETED/VALIDATED/REJECTED/FAILED) unit has nothing to run-start.
 	if wu.State != workunit.WorkUnitStateQueued {
+		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer dispatchable"}, nil
+	}
+
+	// Flush race (Major 3): a copy handed out from the dispatch cache is held IN MEMORY
+	// immediately, but its async copy-insert may not have landed yet. If the cache
+	// holds this volunteer's reservation, force the pending flush so the RESERVED copy
+	// row is durable (or voided on conflict) before the run-start.
+	if s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID) {
+		s.dispatchCache.flushPendingFor(ctx)
+	}
+
+	// Run-start: flip THIS volunteer's reserved copy to RUNNING (started_at = NOW),
+	// starting the per-copy deadline clock. Idempotent (Assign uses COALESCE), so a
+	// retried StartWork is a no-op success. The WORK UNIT stays QUEUED so its other
+	// redundancy copies keep dispatching in parallel. 0 rows -> this volunteer holds no
+	// live copy (its reservation lapsed / was voided): tell it to drop the unit.
+	if _, aerr := s.wuRepo.Assign(ctx, workUnitID, volunteerID); aerr != nil {
 		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
 	}
-	// The reservation must belong to this volunteer. Major 3 (flush race): a unit handed
-	// out from the dispatch cache is reserved IN MEMORY immediately, but its async
-	// reservation-write may not have landed yet — so the DB reserved_volunteer_id reads
-	// back NULL (or, transiently, stale) even though this volunteer legitimately holds
-	// it. If the DB column does not match, consult the cache's in-memory reservation: if
-	// the cache holds it for this volunteer, force the pending flush so the reservation
-	// becomes durable (and any flush conflict is resolved deterministically), then
-	// proceed. Without this, a volunteer that run-starts a buffered unit inside the
-	// flush window would be wrongly told to drop it.
-	if wu.ReservedVolunteerID == nil || *wu.ReservedVolunteerID != volunteerID {
-		reservedHere := s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID)
-		if !reservedHere {
-			return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
-		}
-		// Force the pending reservation flush so the reservation lands (or is voided on
-		// conflict) before the run-start Assign. flushOnce releases an in-memory hold it
-		// could not persist, so re-check after the flush: if the hold survived, this
-		// volunteer's reservation is durable and the Assign below is safe.
-		s.dispatchCache.flushPendingFor(ctx)
-		if !s.dispatchCache.hasInMemReservation(workUnitID, volunteerID) {
-			return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
-		}
-	}
 
-	// Flip the reserved unit to ASSIGNED and create its active assignment_history
-	// row in ONE transaction. The history row is written HERE (at run-start), not at
-	// reservation time — a buffered unit is leased purely via the reservation
-	// columns, so a crashed holder leaves no stale active row to leak. From this
-	// point the active history row is what SubmitResult / AbandonWorkUnit / the fault
-	// monitor key off, and what the redundancy/inflight counts in FindNextAssignable
-	// count for a now-ASSIGNED unit.
-	startTx, terr := s.pool.Begin(ctx)
-	if terr != nil {
-		s.logger.Error("failed to begin run-start transaction", "method", "StartWork", "error", terr)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	defer startTx.Rollback(ctx)
-	txWURepo := workunit.NewPgxWorkUnitRepository(startTx)
-	txAssignRepo := assignment.NewPgxRepository(startTx)
-	if _, aerr := txWURepo.Assign(ctx, workUnitID, volunteerID); aerr != nil {
-		// A concurrent reclaim (lapsed lease taken by another volunteer) or a state
-		// change lost the race: treat as no-longer-startable for this volunteer.
-		s.logger.Warn("run-start Assign failed for reserved unit", "work_unit_id", workUnitID, "error", aerr)
-		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer active"}, nil
-	}
-	if cerr := txAssignRepo.Create(ctx, &assignment.AssignmentHistoryEntry{
-		WorkUnitID:  workUnitID,
-		VolunteerID: volunteerID,
-		AssignedAt:  time.Now().UTC(),
-	}); cerr != nil {
-		s.logger.Error("failed to record assignment history at run-start", "work_unit_id", workUnitID, "error", cerr)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-	if cerr := startTx.Commit(ctx); cerr != nil {
-		s.logger.Error("failed to commit run-start", "work_unit_id", workUnitID, "error", cerr)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-
-	// Dispatch cache: the reservation is now an active history row, so stop tracking
-	// the in-memory reservation hold (the slot stays counted via the DB row, which
-	// the reconcile owns) and drop the now-ASSIGNED unit from the ready pool.
+	// Dispatch cache: the in-memory reservation hold is now a live RUNNING copy; stop
+	// tracking the hold while keeping the unit dispatchable for its remaining copies.
 	if s.dispatchCache != nil {
 		s.dispatchCache.onRunStart(workUnitID, volunteerID)
 	}
@@ -1567,72 +1472,31 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		ctx = shedCtx
 	}
 
-	// Find the active assignment for this volunteer + work unit.
-	activeAssignment, err := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
-	if err != nil {
-		// No active assignment means the unit may be a buffered (reserved,
-		// un-started) unit: the volunteer abandons it on prepare failure,
-		// queue-full, or a slot-start failure before it ever flips to ASSIGNED. A
-		// reservation writes no assignment_history row, so there is nothing to mark
-		// ABANDONED — just drop the lease, leaving the unit QUEUED and immediately
-		// re-reservable by any volunteer.
-		if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPStatus == 404 {
-			if _, cerr := s.wuRepo.ClearReservation(ctx, workUnitID, volunteerID); cerr != nil {
-				// Conflict: the unit is no longer reserved to this volunteer in QUEUED
-				// state (e.g. its lease already lapsed and it was re-taken, or it
-				// already ran). Treat as a stale abandon — nothing to do.
-				if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
-					return nil, status.Errorf(codes.FailedPrecondition, "no active assignment or live reservation found for this volunteer and work unit")
-				}
-				s.logger.Error("abandon: failed to clear reservation", "work_unit_id", req.WorkUnitId, "error", cerr)
-				return nil, status.Errorf(codes.Internal, "internal error")
-			}
-			// Dispatch cache: drop this volunteer's in-memory reservation hold so the
-			// cache stops counting it; the unit is now plain QUEUED and re-stageable.
-			if s.dispatchCache != nil {
-				s.dispatchCache.releaseInMem(workUnitID, volunteerID)
-			}
-			s.logger.Info("buffered work unit abandoned by volunteer (reservation dropped)",
-				"work_unit_id", req.WorkUnitId,
-				"volunteer_id", req.VolunteerId,
-				"reason", req.Reason,
-			)
-			return &lettucev1.AbandonWorkUnitResponse{
-				Requeued: true,
-				Message:  "reservation dropped, work unit requeued",
-			}, nil
+	// Per-copy dispatch: abandoning a unit just closes THIS volunteer's live copy
+	// (RESERVED or RUNNING) as ABANDONED. The work unit stays QUEUED and redispatches
+	// a fresh copy to a distinct volunteer — no per-unit expire/reassign, no cap.
+	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(assignment.OutcomeAbandoned), nil); cerr != nil {
+		if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
+			// No live copy for this volunteer (already lapsed/closed): stale abandon.
+			return nil, status.Errorf(codes.FailedPrecondition, "no live copy found for this volunteer and work unit")
 		}
-		s.logger.Error("abandon: failed to find active assignment", "work_unit_id", req.WorkUnitId, "error", err)
+		s.logger.Error("abandon: failed to close copy", "work_unit_id", req.WorkUnitId, "error", cerr)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Mark assignment as ABANDONED.
-	if err := s.assignRepo.UpdateOutcome(ctx, activeAssignment.ID, assignment.OutcomeAbandoned, nil); err != nil {
-		s.logger.Error("abandon: failed to update assignment outcome", "work_unit_id", req.WorkUnitId, "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-
-	// Transition work unit to EXPIRED so it can be reassigned.
-	if _, err := s.wuRepo.TransitionToExpired(ctx, workUnitID); err != nil {
-		s.logger.Error("abandon: failed to transition work unit", "work_unit_id", req.WorkUnitId, "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-
-	// Reassign (requeue or fail if max reassignments exceeded).
-	_, requeued, err := s.wuRepo.Reassign(ctx, workUnitID)
-	if err != nil {
-		s.logger.Error("abandon: failed to reassign work unit", "work_unit_id", req.WorkUnitId, "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
-
-	// Dispatch cache: the abandoned unit's prior dispatch state is now void (it was
-	// transitioned and reassigned). Evict any stale in-memory ledger/ready entry; if
-	// it requeued, the refiller restages it fresh from Postgres.
+	// Dispatch cache: drop this volunteer's in-memory hold so the cache stops counting
+	// it; the unit stays QUEUED and is re-stageable for a fresh distinct volunteer.
 	if s.dispatchCache != nil {
-		s.dispatchCache.onUnitDone(workUnitID)
+		s.dispatchCache.releaseInMem(workUnitID, volunteerID)
 	}
 
-	s.logger.Info("work unit abandoned by volunteer",
+	// Dead-letter only if the unit has exhausted its retry ceiling (property 6).
+	requeued := true
+	if failed, derr := s.wuRepo.DeadLetterIfExhausted(ctx, workUnitID); derr == nil && failed {
+		requeued = false
+	}
+
+	s.logger.Info("work unit copy abandoned by volunteer",
 		"work_unit_id", req.WorkUnitId,
 		"volunteer_id", req.VolunteerId,
 		"reason", req.Reason,
@@ -1641,7 +1505,7 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 
 	msg := "work unit requeued"
 	if !requeued {
-		msg = "work unit failed (max reassignments exceeded)"
+		msg = "work unit dead-lettered (retry ceiling exhausted)"
 	}
 	return &lettucev1.AbandonWorkUnitResponse{
 		Requeued: requeued,

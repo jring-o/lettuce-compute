@@ -243,20 +243,41 @@ func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Per-copy model: abandon every in-flight copy of the unit (so a fresh set of
+	// copies dispatches), then ensure the unit is QUEUED. Closing the live copies
+	// also stops them counting toward redundancy and frees their volunteers.
 	switch wu.State {
-	case WorkUnitStateAssigned, WorkUnitStateRunning:
-		// Move to EXPIRED first so Reassign (EXPIRED|REJECTED → QUEUED) applies.
-		if _, err := h.wuRepo.TransitionToExpired(r.Context(), workUnitID); err != nil {
-			l.Error("requeue: failed to expire work unit", "error", err, "work_unit_id", workUnitID)
+	case WorkUnitStateQueued:
+		if _, err := h.wuRepo.ExpireLiveCopies(r.Context(), workUnitID, string(assignment.OutcomeAbandoned)); err != nil {
+			l.Error("requeue: failed to abandon live copies", "error", err, "work_unit_id", workUnitID)
 			apierror.WriteError(w, apierror.FromError(err))
 			return
 		}
-		// Close the prior volunteer's open assignment-history row. Without this,
-		// FindNextAssignable permanently excludes that volunteer (outcome IS NULL)
-		// and the requeue is a no-op for them. Mirrors fault-monitor on expiry.
-		h.closeActiveAssignment(r.Context(), l, wu, assignment.OutcomeExpired)
+		// Already QUEUED; dispatchable now that its live copies are closed.
+		l.Info("work unit requeued by operator (live copies abandoned)",
+			"work_unit_id", workUnitID, "leaf_id", leafID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"work_unit_id": workUnitID.String(),
+			"requeued":     true,
+			"state":        string(WorkUnitStateQueued),
+		})
+		return
 	case WorkUnitStateExpired, WorkUnitStateRejected:
-		// Already in a requeue-able state.
+		_, _ = h.wuRepo.ExpireLiveCopies(r.Context(), workUnitID, string(assignment.OutcomeAbandoned))
+		updated, requeued, err := h.wuRepo.Reassign(r.Context(), workUnitID)
+		if err != nil {
+			l.Error("requeue: failed to reassign work unit", "error", err, "work_unit_id", workUnitID)
+			apierror.WriteError(w, apierror.FromError(err))
+			return
+		}
+		l.Info("work unit requeued by operator",
+			"work_unit_id", workUnitID, "leaf_id", leafID, "requeued", requeued, "state", updated.State)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"work_unit_id": workUnitID.String(),
+			"requeued":     requeued,
+			"state":        string(updated.State),
+		})
+		return
 	default:
 		apierror.WriteError(w, apierror.Conflict(
 			"work unit cannot be requeued from its current state",
@@ -264,22 +285,6 @@ func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) 
 		))
 		return
 	}
-
-	updated, requeued, err := h.wuRepo.Reassign(r.Context(), workUnitID)
-	if err != nil {
-		l.Error("requeue: failed to reassign work unit", "error", err, "work_unit_id", workUnitID)
-		apierror.WriteError(w, apierror.FromError(err))
-		return
-	}
-
-	l.Info("work unit requeued by operator",
-		"work_unit_id", workUnitID, "leaf_id", leafID, "requeued", requeued, "state", updated.State)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"work_unit_id": workUnitID.String(),
-		"requeued":     requeued,
-		"state":        string(updated.State),
-	})
 }
 
 // closeActiveAssignment sets the outcome on the prior volunteer's open

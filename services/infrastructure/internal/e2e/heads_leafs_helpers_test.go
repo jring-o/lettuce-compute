@@ -425,26 +425,35 @@ func submitWUResult(t *testing.T, env *headsLeafsEnv, ctx context.Context, volID
 }
 
 // ensureRunStart sends a RUNNING heartbeat (run-start) for wuID ONLY when the unit
-// is still QUEUED and reserved to this volunteer — i.e. the volunteer that actually
-// reserved the unit via RequestWorkUnit. This flips it to ASSIGNED/RUNNING and
-// creates the active assignment_history row SubmitResult needs. It is a deliberate
-// no-op for a redundant volunteer (placed on the unit via a direct history-row
-// insert, never reserved) and for an already-running unit, so it can be called
-// generically from the submit helpers without breaking redundant-volunteer flows.
+// is still QUEUED and this volunteer holds a live DISPATCH RESERVATION of it — a
+// RESERVED copy (outcome IS NULL, started_at IS NULL) with reserved_until set, i.e.
+// the volunteer that actually reserved the unit via RequestWorkUnit. Run-start flips
+// that copy RESERVED -> RUNNING (the unit itself stays QUEUED) so SubmitResult has a
+// live copy to close. Per-copy model (migration 00006): the hold is a
+// work_unit_assignment_history row, not the retired reserved_volunteer_id column. It
+// is a deliberate no-op for a redundant volunteer (placed on the unit via a direct
+// history-row insert with NULL reserved_until, never reserved through dispatch) and
+// for an already-running copy, so it can be called generically from the submit helpers
+// without breaking redundant-volunteer flows.
 func ensureRunStart(t *testing.T, pool *pgxpool.Pool, grpc lettucev1.VolunteerServiceClient, ctx context.Context, volID string, pubKey []byte, wuID string) {
 	t.Helper()
 	var state string
 	var reservedVol *string
 	if err := pool.QueryRow(ctx,
-		"SELECT state, reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).
+		`SELECT wu.state,
+		        (SELECT h.volunteer_id::text FROM work_unit_assignment_history h
+		         WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
+		           AND h.started_at IS NULL AND h.reserved_until IS NOT NULL
+		         ORDER BY h.assigned_at DESC LIMIT 1)
+		 FROM work_units wu WHERE wu.id = $1`, wuID).
 		Scan(&state, &reservedVol); err != nil {
 		t.Fatalf("ensureRunStart: query work unit %s: %v", wuID, err)
 	}
 	if state != "QUEUED" || reservedVol == nil || *reservedVol != volID {
 		return
 	}
-	// Run-start the reserved unit via StartWork (the relocated QUEUED->ASSIGNED
-	// transition that the first RUNNING heartbeat used to perform).
+	// Run-start the reserved copy via StartWork (RESERVED -> RUNNING; the unit stays
+	// QUEUED so its other redundancy copies keep dispatching in parallel).
 	if _, err := grpc.StartWork(signFor(t, ctx, pubKey), &lettucev1.StartWorkRequest{
 		WorkUnitId:  wuID,
 		VolunteerId: volID,
