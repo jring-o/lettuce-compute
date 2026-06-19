@@ -68,6 +68,7 @@ export function WorkUnitSelector({
         {workUnits.map((wu) => (
           <option key={wu.id} value={wu.id}>
             {wu.id.slice(0, 8)} — {formatDate(wu.updated_at)}
+            {wu.state === "VALIDATED" ? " · validated" : " · unvalidated"}
           </option>
         ))}
       </select>
