@@ -427,6 +427,15 @@ executing), and **liveness is deadline-based**: a copy not submitted by its dead
 dropped and the unit redispatches a fresh copy, and a buffered copy not started before
 its hold lapses is reclaimed. There are no per-task heartbeats.
 
+On top of deadline-based reclaim, the head also reconciles each volunteer's
+**client-reported buffer**: every work request carries the units the volunteer is
+currently holding, and the head promptly releases any buffered (not-yet-started)
+reservation a volunteer no longer holds — e.g. after a client restart that dropped its
+buffer — so those units redispatch within seconds instead of waiting out the full
+deadline, and they stop counting against that volunteer's `max_inflight_per_volunteer`.
+This needs volunteers on **v0.5.1+**; older clients don't report a held set and fall back
+to deadline-based reclaim only (so keep the fleet updated with `lettuce-volunteer update`).
+
 > **Running more than one head?** The dispatch cache is safe across multiple
 > replicas: each replica stamps a **per-head dispatch claim** on the queued units
 > it stages (claim-on-refill), so a unit held in one replica's memory is invisible
