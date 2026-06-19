@@ -15,9 +15,11 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    // No validation_status filter: the viz replays any submitted result's
+    // output_data (validated or not), matching the visualize page's listing of
+    // COMPLETED as well as VALIDATED work units.
     const results = await infrastructureClient.listResults(leafId, {
       work_unit_id: workUnitId,
-      validation_status: "AGREED",
       limit: 1,
       ...(volunteerId ? { volunteer_id: volunteerId } : {}),
     });

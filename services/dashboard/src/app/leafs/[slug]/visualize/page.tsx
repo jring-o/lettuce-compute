@@ -64,20 +64,29 @@ export default async function VisualizePage({
     );
   }
 
-  // Fetch validated work units
-  const wuResponse = await infrastructureClient.listWorkUnits(leaf.id, {
-    state: "VALIDATED",
-    limit: 50,
-  });
-  const workUnits = wuResponse.data;
+  // Fetch work units that have results to replay. Visualization is a
+  // presentation feature, not a scientific claim, so it does NOT require the
+  // redundancy/validation gate: any COMPLETED unit (its redundant runs are in)
+  // is replayable, alongside VALIDATED ones. A unit is in exactly one state, so
+  // the two sets are disjoint; we dedupe by id defensively and show newest first.
+  const [validatedWus, completedWus] = await Promise.all([
+    infrastructureClient.listWorkUnits(leaf.id, { state: "VALIDATED", limit: 50 }),
+    infrastructureClient.listWorkUnits(leaf.id, { state: "COMPLETED", limit: 50 }),
+  ]);
+  const seen = new Set<string>();
+  const workUnits = [...validatedWus.data, ...completedWus.data]
+    .filter((wu) => (seen.has(wu.id) ? false : (seen.add(wu.id), true)))
+    .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+    .slice(0, 50);
 
-  // Fetch the first WU's result for initial render (avoids client-side loading flash)
+  // Fetch the first WU's result for initial render (avoids client-side loading
+  // flash). No validation_status filter — an unvalidated result still carries
+  // the replay data in output_data.
   let initialResult = null;
   if (workUnits.length > 0) {
     try {
       const results = await infrastructureClient.listResults(leaf.id, {
         work_unit_id: workUnits[0].id,
-        validation_status: "AGREED",
         limit: 1,
         ...(volunteerFilter ? { volunteer_id: volunteerFilter } : {}),
       });
