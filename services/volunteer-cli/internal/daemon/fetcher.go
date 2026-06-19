@@ -56,6 +56,12 @@ type Fetcher struct {
 	// benchmark — the exact case the old FP-ops-only path tripped to 0.
 	leafEstSecondsFn func(leaf CachedLeafInfo) float64
 
+	// heldWorkUnitIDsFn returns the ids of every work unit the volunteer currently
+	// holds — its prefetch buffer (buffered, not yet started) plus its active slots
+	// (in-transit and running) — reported on every RequestWorkUnit so the head can
+	// release reservations the volunteer no longer holds. nil disables reporting.
+	heldWorkUnitIDsFn func() []string
+
 	// rateLimitBackoff is the fixed local backoff floor applied when a head
 	// answers codes.ResourceExhausted. ResourceExhausted carries NO
 	// server-directed value (the head is shedding load and wants the caller gone
@@ -140,10 +146,11 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		enabledLeafsFunc: d.enabledLeafs,
 		leafPrefsFunc:    d.leafPreferences,
 		shouldFetchFunc:  d.shouldFetch,
-		workBufferFullFn: d.workBufferFull,
-		batchSizeFn:      d.requestBatchSize,
-		leafEstSecondsFn: d.leafEstSeconds,
-		rateLimitBackoff: defaultRateLimitBackoff,
+		workBufferFullFn:  d.workBufferFull,
+		batchSizeFn:       d.requestBatchSize,
+		leafEstSecondsFn:  d.leafEstSeconds,
+		heldWorkUnitIDsFn: d.heldWorkUnitIDs,
+		rateLimitBackoff:  defaultRateLimitBackoff,
 		runtimeAbandons:  make(map[string]int),
 		pausedRuntimes:   make(map[string]time.Time),
 		now:              time.Now,
@@ -462,7 +469,17 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		maxAssignments = f.batchSizeFn(estSec)
 	}
 
-	f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug, "max_assignments", maxAssignments)
+	// Report the work units this volunteer currently holds so the head can release
+	// any reservations it no longer holds (e.g. dropped across a restart). The set
+	// spans buffer + running slots across all heads; ids are globally unique, so a
+	// head only ever matches its own units — over-reporting is safe, under-reporting
+	// is what must be avoided.
+	var heldIDs []string
+	if f.heldWorkUnitIDsFn != nil {
+		heldIDs = f.heldWorkUnitIDsFn()
+	}
+
+	f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug, "max_assignments", maxAssignments, "held", len(heldIDs))
 	resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 		VolunteerId:      head.VolunteerID,
 		PublicKey:        f.pubKey,
@@ -470,6 +487,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		BlockedLeafIds:   blockedIDs,
 		MaxAssignments:   maxAssignments,
 		CurrentAvailable: f.cachedHW,
+		HeldWorkUnitIds:  heldIDs,
 	})
 	if err != nil {
 		st, ok := status.FromError(err)

@@ -572,3 +572,66 @@ func TestClearExpiredDispatchClaims(t *testing.T) {
 		t.Fatalf("live claim must remain intact")
 	}
 }
+
+// TestReleaseStaleBufferedCopies asserts the buffer reconcile closes a volunteer's
+// buffered (RESERVED, un-started) copies it no longer reports holding, while leaving
+// the ones it still holds, leaving RUNNING copies untouched, and respecting the grace
+// window (a copy newer than the cutoff is never released).
+func TestReleaseStaleBufferedCopies(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "release-stale-buffered")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+	vol := createTestVolunteer(t, pool)
+
+	until := time.Now().UTC().Add(time.Hour)
+	heldUnit := mustQueuedWU(t, ctx, repo, leafID)
+	droppedUnit := mustQueuedWU(t, ctx, repo, leafID)
+	runningUnit := mustQueuedWU(t, ctx, repo, leafID)
+
+	for _, wu := range []*WorkUnit{heldUnit, droppedUnit, runningUnit} {
+		if _, err := repo.ReserveCopy(ctx, wu.ID, vol, until, 3600); err != nil {
+			t.Fatalf("ReserveCopy(%s): %v", wu.ID, err)
+		}
+	}
+	// Run-start the running unit so its copy is no longer buffered (started_at set).
+	if _, err := repo.Assign(ctx, runningUnit.ID, vol); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	// Volunteer reports holding only heldUnit. Future cutoff so the grace window does
+	// not protect the just-created copies.
+	released, err := repo.ReleaseStaleBufferedCopies(ctx, vol, []types.ID{heldUnit.ID}, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ReleaseStaleBufferedCopies: %v", err)
+	}
+	if len(released) != 1 || released[0] != droppedUnit.ID {
+		t.Fatalf("expected only droppedUnit released, got %v", released)
+	}
+	if n, _ := repo.CountLiveCopies(ctx, droppedUnit.ID); n != 0 {
+		t.Errorf("droppedUnit should have 0 live copies after release, got %d", n)
+	}
+	if n, _ := repo.CountLiveCopies(ctx, heldUnit.ID); n != 1 {
+		t.Errorf("heldUnit must remain live (still reported held), got %d", n)
+	}
+	if n, _ := repo.CountLiveCopies(ctx, runningUnit.ID); n != 1 {
+		t.Errorf("runningUnit must remain live (started copies ride their deadline), got %d", n)
+	}
+
+	// Grace window: a buffered copy newer than the cutoff is NOT released even when not
+	// held (empty held set = volunteer holds nothing).
+	graceUnit := mustQueuedWU(t, ctx, repo, leafID)
+	if _, err := repo.ReserveCopy(ctx, graceUnit.ID, vol, until, 3600); err != nil {
+		t.Fatalf("ReserveCopy(grace): %v", err)
+	}
+	releasedGrace, err := repo.ReleaseStaleBufferedCopies(ctx, vol, nil, time.Now().UTC().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ReleaseStaleBufferedCopies (grace): %v", err)
+	}
+	if len(releasedGrace) != 0 {
+		t.Fatalf("grace window must protect a freshly-created copy, got %v", releasedGrace)
+	}
+}

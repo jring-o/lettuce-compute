@@ -32,6 +32,12 @@ type PersistedTask struct {
 	VizBundlePath           string            `json:"viz_bundle_path,omitempty"`
 	StartedAt               time.Time         `json:"started_at"`
 	PID                     int               `json:"pid,omitempty"` // OS PID for resuming suspended orphans
+	// ReservedUntilUnix and FetchedAt are used for buffered (not-yet-started) tasks
+	// persisted from the prefetch queue: the reservation window drives the on-resume
+	// lapse check, and the fetch time drives the deadline-expiry check, so a restored
+	// buffer item is treated exactly like a freshly fetched one.
+	ReservedUntilUnix int64     `json:"reserved_until_unix,omitempty"`
+	FetchedAt         time.Time `json:"fetched_at,omitempty"`
 }
 
 // PersistedState is the top-level structure saved to disk.
@@ -78,4 +84,47 @@ func LoadActiveState(dataDir string) (*PersistedState, error) {
 // ClearActiveState removes the active tasks file.
 func ClearActiveState(dataDir string) {
 	os.Remove(activeTasksPath(dataDir))
+}
+
+func bufferedTasksPath(dataDir string) string {
+	return filepath.Join(dataDir, "prefetch-buffer.json")
+}
+
+// SaveBufferState writes the current prefetch-buffer contents (buffered, not-yet-
+// started units) to disk so they survive a non-graceful exit. On the next startup the
+// volunteer re-enqueues them and reports them as held, so the head keeps their
+// reservations instead of leaving them stranded until their deadline. A graceful
+// shutdown returns buffered units to the head and clears this file instead.
+func SaveBufferState(dataDir string, tasks []PersistedTask) error {
+	state := PersistedState{
+		SavedAt: time.Now().UTC(),
+		Tasks:   tasks,
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling buffered tasks: %w", err)
+	}
+	return os.WriteFile(bufferedTasksPath(dataDir), data, 0600)
+}
+
+// LoadBufferState reads previously saved prefetch-buffer contents from disk.
+// Returns nil, nil if no state file exists.
+func LoadBufferState(dataDir string) (*PersistedState, error) {
+	data, err := os.ReadFile(bufferedTasksPath(dataDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading buffered tasks: %w", err)
+	}
+	var state PersistedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("parsing buffered tasks: %w", err)
+	}
+	return &state, nil
+}
+
+// ClearBufferState removes the prefetch-buffer file.
+func ClearBufferState(dataDir string) {
+	os.Remove(bufferedTasksPath(dataDir))
 }

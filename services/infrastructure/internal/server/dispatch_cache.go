@@ -65,6 +65,16 @@ const (
 	// ceiling for an artifact publish/rollback (TODO #38): a RUNNING volunteer picks
 	// up a new version on its next work request within this window, with no restart.
 	defaultLeafSnapshotTTL = 30 * time.Second
+	// reconcileGracePeriod is the minimum age a buffered (un-started) copy must reach
+	// before the buffer reconcile may release it as no-longer-held. It protects a copy
+	// handed out moments ago from being reaped before the volunteer's next request
+	// reports holding it.
+	reconcileGracePeriod = 60 * time.Second
+	// heldReportFreshness bounds how recent a volunteer's reported held set must be for
+	// the buffer reconcile to act on it. A volunteer that has stopped polling (stale
+	// report) is not reconciled against — its buffered copies are reclaimed by the
+	// deadline instead, so a transient disconnect never wrongly drops its buffer.
+	heldReportFreshness = 90 * time.Second
 )
 
 // candidate is one pre-fetched, ready-to-assign QUEUED unit in the ready pool. It
@@ -247,6 +257,23 @@ type dispatchCache struct {
 	// requests into one targeted refill.
 	leafRefillMu       sync.Mutex
 	pendingLeafRefills map[types.ID]struct{}
+
+	// heldReports records, per volunteer, the set of work units it last reported
+	// holding in its client buffer (NoteVolunteerHeld, set on every RequestWorkUnit).
+	// The buffer reconcile (reconcileBuffers) releases buffered reservations a
+	// volunteer no longer holds, so a client that drops its buffer (e.g. across a
+	// restart) stops being charged for reservations it forgot. Guarded by heldMu,
+	// separate from mu so recording a report on the hot path never blocks hand-outs.
+	heldMu      sync.Mutex
+	heldReports map[types.ID]heldReport
+}
+
+// heldReport is a volunteer's most recently reported client-buffer contents (the work
+// units it currently holds) plus when it reported them. `at` gates staleness so the
+// reconcile only trusts a recent report.
+type heldReport struct {
+	units map[types.ID]struct{}
+	at    time.Time
 }
 
 // newDispatchCache builds a cache. admissionCap <= 0 is treated as 1.
@@ -295,6 +322,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		refillSignal:         make(chan struct{}, 1),
 		leafRefillSignal:     make(chan struct{}, 1),
 		pendingLeafRefills:   make(map[types.ID]struct{}),
+		heldReports:          make(map[types.ID]heldReport),
 	}
 }
 
@@ -1477,11 +1505,103 @@ func (c *dispatchCache) runReconciler(ctx context.Context, interval time.Duratio
 	}
 }
 
+// NoteVolunteerHeld records the set of work units a volunteer reports holding in its
+// client buffer on a RequestWorkUnit (every buffered and running unit it currently
+// has). The buffer reconcile uses the latest report to release reservations the
+// volunteer no longer holds. Cheap and purely in-memory — it does NOT touch Postgres,
+// so it stays off the request hot path; the DB reconciliation happens on the reconciler
+// tick.
+func (c *dispatchCache) NoteVolunteerHeld(volunteerID types.ID, held []types.ID) {
+	set := make(map[types.ID]struct{}, len(held))
+	for _, id := range held {
+		set[id] = struct{}{}
+	}
+	c.heldMu.Lock()
+	c.heldReports[volunteerID] = heldReport{units: set, at: c.now()}
+	c.heldMu.Unlock()
+}
+
+// reconcileBuffers releases each volunteer's buffered (RESERVED, not-yet-run-started)
+// reservations that it no longer holds, per the held set it last reported. This is the
+// durable correction for a client whose buffer and the head's reservations have
+// diverged — a client that dropped its buffer across a restart, or a head restart that
+// left buffered copies in the DB the volunteer no longer tracks: the stale copy is
+// closed, its work unit redispatches at once, and it stops counting against the
+// volunteer's inflight cap. Only reports fresh enough to trust are acted on (a
+// volunteer that stopped polling has its copies reclaimed by the deadline instead), and
+// only copies older than the grace window are released (so a just-handed copy is never
+// reaped before the volunteer's next report includes it). Running copies are untouched.
+func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
+	now := c.now()
+
+	// Snapshot fresh reports and prune stale ones (a returning volunteer re-reports).
+	type pending struct {
+		vol  types.ID
+		held []types.ID
+	}
+	var todo []pending
+	c.heldMu.Lock()
+	for vol, r := range c.heldReports {
+		if now.Sub(r.at) > heldReportFreshness {
+			delete(c.heldReports, vol)
+			continue
+		}
+		held := make([]types.ID, 0, len(r.units))
+		for u := range r.units {
+			held = append(held, u)
+		}
+		todo = append(todo, pending{vol: vol, held: held})
+	}
+	c.heldMu.Unlock()
+	if len(todo) == 0 {
+		return
+	}
+
+	cutoff := now.Add(-reconcileGracePeriod)
+	releasedAny := false
+	for _, p := range todo {
+		relCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+		release, ok := c.acquireMaintenance(relCtx)
+		if !ok {
+			cancel()
+			continue // admission/ctx pressure: retry on the next tick
+		}
+		released, err := c.deps.wuRepo.ReleaseStaleBufferedCopies(relCtx, p.vol, p.held, cutoff)
+		release()
+		cancel()
+		if err != nil {
+			c.logger.Warn("dispatch cache: buffer reconcile failed", "volunteer_id", p.vol, "error", err)
+			continue
+		}
+		if len(released) == 0 {
+			continue
+		}
+		releasedAny = true
+		// Drop the released units from this replica's in-memory ledger so they stop
+		// counting as held and can be re-staged. A no-op for copies this replica never
+		// held in memory (e.g. recovered from the DB after a head restart).
+		c.mu.Lock()
+		for _, uid := range released {
+			c.releaseInMemLocked(uid, p.vol)
+		}
+		c.mu.Unlock()
+		c.logger.Info("dispatch cache: released stale buffered reservations",
+			"volunteer_id", p.vol, "released", len(released))
+	}
+	if releasedAny {
+		c.signalRefill()
+	}
+}
+
 // reconcileOnce reconciles the in-memory inflight counters with the authoritative
 // DB per-volunteer count. The DB count (active history rows + live reservations) is
 // authoritative; the in-memory deltas for not-yet-flushed reservations are layered
 // on top so a freshly handed-out (still-unflushed) reservation is not under-counted.
 func (c *dispatchCache) reconcileOnce(ctx context.Context) {
+	// First release any buffered reservations volunteers no longer hold, so the freed
+	// copies are reflected in the authoritative inflight counts recomputed below.
+	c.reconcileBuffers(ctx)
+
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 	defer cancel()
 	release, ok := c.acquire(dbCtx)

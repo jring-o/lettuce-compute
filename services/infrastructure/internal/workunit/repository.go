@@ -83,6 +83,19 @@ type WorkUnitRepository interface {
 	// in-memory inflight counters.
 	CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error)
 
+	// ReleaseStaleBufferedCopies closes a volunteer's buffered (RESERVED, not-yet-
+	// run-started) live copies that the volunteer no longer holds in its client
+	// buffer. heldWorkUnitIDs is the set the volunteer reports it still has; any of
+	// its buffered copies for a unit NOT in that set, and older than olderThan (a
+	// grace window so a copy handed out moments ago is not reaped before the
+	// volunteer's next report includes it), is closed ABANDONED. The work unit stays
+	// QUEUED, so it redispatches immediately, and the freed copy stops counting
+	// against the volunteer's inflight cap. RUNNING copies (started_at set) are never
+	// touched here — they ride their deadline. An empty heldWorkUnitIDs means the
+	// volunteer holds nothing, so all its grace-aged buffered copies are released.
+	// Returns the work-unit ids whose copies were released so the cache can evict them.
+	ReleaseStaleBufferedCopies(ctx context.Context, volunteerID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error)
+
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
 	// predicates as FindNextAssignable) and inserts a RESERVED copy held until the
 	// unit's deadline, keeping the unit QUEUED. Used by the non-cache batch-fill path

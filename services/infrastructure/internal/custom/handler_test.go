@@ -92,6 +92,9 @@ func (m *mockWURepo) ClaimDispatchableBatch(_ context.Context, _ types.ID, _ tim
 func (m *mockWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
 	return 0, nil
 }
+func (m *mockWURepo) ReleaseStaleBufferedCopies(context.Context, types.ID, []types.ID, time.Time) ([]types.ID, error) {
+	return nil, nil
+}
 func (m *mockWURepo) FlushReservations(ctx context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }

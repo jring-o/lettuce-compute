@@ -38,6 +38,10 @@ type fakeWURepo struct {
 	reserveCopyFn   func(wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error)
 	// countFn backs the reconcile.
 	countFn func() (map[types.ID]int, error)
+	// releaseFn backs ReleaseStaleBufferedCopies (the buffer reconcile); releaseCalls
+	// counts invocations so a test can assert it was (or was not) run.
+	releaseFn    func(vol types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error)
+	releaseCalls int
 	// dispatchFn backs FindDispatchableBatch AND ClaimDispatchableBatch (the refill);
 	// it observes the leaf scope.
 	dispatchFn func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error)
@@ -148,6 +152,17 @@ func (f *fakeWURepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int
 		return f.countFn()
 	}
 	return map[types.ID]int{}, nil
+}
+
+func (f *fakeWURepo) ReleaseStaleBufferedCopies(_ context.Context, vol types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error) {
+	f.mu.Lock()
+	f.releaseCalls++
+	fn := f.releaseFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(vol, held, olderThan)
+	}
+	return nil, nil
 }
 
 type fakeLeafRepo struct {
@@ -1505,5 +1520,95 @@ func TestReleaseInMemPurgesPending(t *testing.T) {
 	c.releaseInMem(unitID, otherVol) // purges only (unitID, otherVol)
 	if c.pendingWriteCount() != 1 {
 		t.Fatalf("purge must drop ONLY the matching pair, leaving the unrelated write, got %d", c.pendingWriteCount())
+	}
+}
+
+// TestReconcileBuffers_ReleasesUnheldBufferedReservations verifies the buffer
+// reconcile: a volunteer reports holding only a subset of the units the cache has
+// reserved for it, and the reconcile releases the dropped one (with the grace cutoff)
+// while leaving the held one — clearing the released unit's in-memory hold so it can
+// redispatch.
+func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 2, false, 0), leafRepo)
+
+	vol := types.NewID()
+	kept := types.NewID()
+	dropped := types.NewID()
+	c.stageUnit(kept, leafID, 2, 0)
+	c.stageUnit(dropped, leafID, 2, 0)
+
+	// Hand both units to vol so the cache holds an in-memory reservation for each.
+	if r, _ := c.HandOut(vol, capableOpts(vol, 0), 2); len(r) != 2 {
+		t.Fatalf("expected 2 hand-outs, got %d", len(r))
+	}
+
+	// vol reports holding only `kept` — it dropped `dropped` from its buffer.
+	c.NoteVolunteerHeld(vol, []types.ID{kept})
+
+	var gotVol types.ID
+	var gotHeld []types.ID
+	var gotCutoff time.Time
+	wuRepo.releaseFn = func(v types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error) {
+		gotVol, gotHeld, gotCutoff = v, held, olderThan
+		return []types.ID{dropped}, nil
+	}
+
+	c.reconcileBuffers(context.Background())
+
+	if gotVol != vol {
+		t.Fatalf("release called for %v, want %v", gotVol, vol)
+	}
+	if len(gotHeld) != 1 || gotHeld[0] != kept {
+		t.Fatalf("release held set = %v, want [%v]", gotHeld, kept)
+	}
+	if !gotCutoff.Equal(now.Add(-reconcileGracePeriod)) {
+		t.Fatalf("release cutoff = %v, want now-grace %v", gotCutoff, now.Add(-reconcileGracePeriod))
+	}
+
+	c.mu.Lock()
+	_, droppedHeld := c.reservedInMem[dropped][vol]
+	_, keptHeld := c.reservedInMem[kept][vol]
+	c.mu.Unlock()
+	if droppedHeld {
+		t.Errorf("dropped unit must be cleared from the in-memory ledger after release")
+	}
+	if !keptHeld {
+		t.Errorf("kept unit must remain reserved (volunteer still holds it)")
+	}
+}
+
+// TestReconcileBuffers_SkipsStaleReports verifies a volunteer whose last held-set
+// report is older than the freshness window is NOT reconciled (its buffered copies
+// ride the deadline instead), and its stale report is pruned.
+func TestReconcileBuffers_SkipsStaleReports(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	c := newTestCache(wuRepo, &fakeLeafRepo{}, &fakeAssignRepo{})
+
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	vol := types.NewID()
+	// Record a report and then advance the clock past the freshness window.
+	c.NoteVolunteerHeld(vol, []types.ID{types.NewID()})
+	c.now = func() time.Time { return now.Add(heldReportFreshness + time.Second) }
+
+	c.reconcileBuffers(context.Background())
+
+	if wuRepo.releaseCalls != 0 {
+		t.Fatalf("stale report must not trigger a DB release, got %d calls", wuRepo.releaseCalls)
+	}
+	c.heldMu.Lock()
+	_, present := c.heldReports[vol]
+	c.heldMu.Unlock()
+	if present {
+		t.Errorf("stale report must be pruned")
 	}
 }

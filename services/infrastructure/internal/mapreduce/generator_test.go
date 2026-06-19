@@ -61,6 +61,9 @@ func (m *mockWorkUnitRepo) ClaimDispatchableBatch(context.Context, types.ID, tim
 func (m *mockWorkUnitRepo) ClearExpiredDispatchClaims(context.Context) (int64, error) {
 	return 0, nil
 }
+func (m *mockWorkUnitRepo) ReleaseStaleBufferedCopies(context.Context, types.ID, []types.ID, time.Time) ([]types.ID, error) {
+	return nil, nil
+}
 func (m *mockWorkUnitRepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }
