@@ -339,8 +339,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		defer d.thermalMonitor.Stop()
 	}
 
-	// Resume any tasks preserved from the previous daemon session.
+	// Resume any tasks preserved from the previous daemon session: first the running
+	// tasks (back into slots), then the buffered prefetch units (back into the queue),
+	// so the volunteer reports its full held set on its first request and the head
+	// keeps the matching reservations instead of stranding them.
 	d.resumePersistedTasks(ctx)
+	d.resumePrefetchBuffer(ctx)
 
 	// Start the pending-result retry worker. It sweeps once now (recovering any
 	// results stranded by a previous run's submission failure) then periodically.
@@ -393,6 +397,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 				item.Runtime.Cleanup(item.Prep)
 			}
 		}
+		// Buffered units were just returned to the head and their work dirs cleaned, so
+		// the persisted buffer is stale — clear it to make the next startup's resume a
+		// no-op (these units must NOT be re-enqueued; they are no longer ours).
+		ClearBufferState(d.cfg.DataDir)
 
 		// Save preserved tasks to disk for next startup.
 		if len(preserved) > 0 {
@@ -497,6 +505,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Fill available slots from the pre-fetch queue.
 		d.logger.Debug("daemon: filling slots", "active_slots", d.slotManager.ActiveCount(), "queue_len", d.prefetchQueue.Len())
 		d.fillSlots(ctx)
+
+		// Keep the persisted prefetch buffer current so a non-graceful exit can resume
+		// it. Runs every iteration — the loop wakes on a queue push (Notify) and on slot
+		// completion, so additions and pops are captured promptly.
+		d.persistPrefetchBuffer()
 
 		// Wait for next event: slot completion, queue item, pause signal, or tick.
 		select {
@@ -631,6 +644,79 @@ func (d *Daemon) persistActiveTasks() {
 		}
 	} else {
 		ClearActiveState(d.cfg.DataDir)
+	}
+}
+
+// heldWorkUnitIDs returns the ids of every work unit this volunteer currently holds:
+// its prefetch buffer (buffered, not yet started) plus its active slots (in-transit
+// and running). Reported on each RequestWorkUnit so the head can release any
+// reservation the volunteer no longer holds. The set deliberately includes running
+// units too: the head never reaps a started copy, but reporting it closes the window
+// between popping a unit from the buffer and the head recording its run-start.
+func (d *Daemon) heldWorkUnitIDs() []string {
+	var ids []string
+	if d.prefetchQueue != nil {
+		for _, item := range d.prefetchQueue.Items() {
+			if item.WU != nil {
+				ids = append(ids, item.WU.ID)
+			}
+		}
+	}
+	if d.slotManager != nil {
+		for _, wu := range d.slotManager.ActiveWorkUnits() {
+			if wu != nil {
+				ids = append(ids, wu.ID)
+			}
+		}
+	}
+	return ids
+}
+
+// persistPrefetchBuffer writes the current prefetch-buffer contents (buffered,
+// not-yet-started units) to disk so a non-graceful exit (crash/force-kill) does not
+// strand them: on the next startup the volunteer re-enqueues them and reports them as
+// held, so the head keeps their reservations instead of leaving them stranded until
+// their deadline. Called every coordinator iteration so the file stays current without
+// a graceful shutdown; a graceful shutdown returns buffered units to the head and
+// clears the file, making the next resume a no-op.
+func (d *Daemon) persistPrefetchBuffer() {
+	if d.prefetchQueue == nil {
+		return
+	}
+	items := d.prefetchQueue.Items()
+	tasks := make([]PersistedTask, 0, len(items))
+	for _, it := range items {
+		if it.WU == nil || it.Prep == nil || it.Conn == nil {
+			continue
+		}
+		tasks = append(tasks, PersistedTask{
+			WorkUnitID:             it.WU.ID,
+			LeafID:                 it.WU.LeafID,
+			ServerGRPCAddress:      it.Conn.Config.GRPCAddress,
+			ServerName:             it.Conn.Name,
+			VolunteerID:            it.Conn.VolunteerID,
+			RuntimeName:            it.WU.Runtime,
+			WorkDir:                it.Prep.WorkDir,
+			BinaryPath:             it.Prep.BinaryPath,
+			InputPath:              it.Prep.InputPath,
+			CodeArtifactURL:        it.WU.CodeArtifactURL,
+			ParametersJSON:         it.WU.ParametersJSON,
+			DeadlineSeconds:        it.WU.DeadlineSeconds,
+			EnvVars:                it.WU.EnvVars,
+			ExecutionSpec:          it.WU.ExecutionSpec,
+			RscFpopsEst:            it.WU.RscFpopsEst,
+			VizBundlePath:          it.Prep.VizBundlePath,
+			CheckpointIntervalSecs: int32(it.WU.CheckpointIntervalSeconds),
+			ReservedUntilUnix:      it.WU.ReservedUntilUnix,
+			FetchedAt:              it.FetchedAt,
+		})
+	}
+	if len(tasks) == 0 {
+		ClearBufferState(d.cfg.DataDir)
+		return
+	}
+	if err := SaveBufferState(d.cfg.DataDir, tasks); err != nil {
+		d.logger.Warn("failed to persist prefetch buffer", "error", err)
 	}
 }
 
@@ -2181,5 +2267,109 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 
 	if resumed > 0 {
 		d.logger.Info("task resumption complete", "resumed", resumed, "total", len(state.Tasks))
+	}
+}
+
+// resumePrefetchBuffer re-enqueues the prefetch-buffer units persisted from a previous
+// session (a non-graceful exit) so the volunteer reports them as held on its first
+// request and the head keeps their reservations. Unlike resumePersistedTasks these are
+// buffered, NOT started: they are pushed back into the prefetch queue and run normally
+// when a slot frees. A unit whose work directory, server, or runtime is gone is dropped
+// (the head reclaims it via the buffer reconcile or its deadline).
+func (d *Daemon) resumePrefetchBuffer(ctx context.Context) {
+	state, err := LoadBufferState(d.cfg.DataDir)
+	if err != nil {
+		d.logger.Warn("failed to load persisted prefetch buffer", "error", err)
+		ClearBufferState(d.cfg.DataDir)
+		return
+	}
+	if state == nil || len(state.Tasks) == 0 {
+		return
+	}
+
+	d.logger.Info("found persisted prefetch buffer from previous session",
+		"count", len(state.Tasks), "saved_at", state.SavedAt)
+
+	serverByAddr := make(map[string]*ServerConnection)
+	if mc := d.multiClient; mc != nil {
+		for _, srv := range mc.Servers() {
+			serverByAddr[srv.Config.GRPCAddress] = srv
+		}
+	}
+
+	restored := 0
+	for _, pt := range state.Tasks {
+		// The buffered unit was already prepared; its work dir must survive for us to
+		// run it without re-fetching. If it is gone, drop the item.
+		if _, statErr := os.Stat(pt.WorkDir); statErr != nil {
+			d.logger.Warn("work directory missing, dropping buffered task",
+				"work_unit_id", pt.WorkUnitID, "work_dir", pt.WorkDir)
+			continue
+		}
+		conn := serverByAddr[pt.ServerGRPCAddress]
+		if conn == nil {
+			d.logger.Warn("server no longer configured, dropping buffered task",
+				"work_unit_id", pt.WorkUnitID, "server", pt.ServerGRPCAddress)
+			os.RemoveAll(pt.WorkDir)
+			continue
+		}
+		rtName := pt.RuntimeName
+		if rtName == "" {
+			rtName = "native"
+		}
+		rt := d.runtimeRegistry.GetRuntime(rtName)
+		if rt == nil {
+			d.logger.Warn("runtime not available, dropping buffered task",
+				"work_unit_id", pt.WorkUnitID, "runtime", rtName)
+			os.RemoveAll(pt.WorkDir)
+			continue
+		}
+
+		wu := &runtime.WorkUnit{
+			ID:                        pt.WorkUnitID,
+			LeafID:                    pt.LeafID,
+			Runtime:                   pt.RuntimeName,
+			CodeArtifactURL:           pt.CodeArtifactURL,
+			ParametersJSON:            pt.ParametersJSON,
+			DeadlineSeconds:           pt.DeadlineSeconds,
+			EnvVars:                   pt.EnvVars,
+			ExecutionSpec:             pt.ExecutionSpec,
+			RscFpopsEst:               pt.RscFpopsEst,
+			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+			ReservedUntilUnix:         pt.ReservedUntilUnix,
+		}
+		prep := &runtime.PrepareResult{
+			WorkDir:       pt.WorkDir,
+			BinaryPath:    pt.BinaryPath,
+			InputPath:     pt.InputPath,
+			VizBundlePath: pt.VizBundlePath,
+		}
+		fetchedAt := pt.FetchedAt
+		if fetchedAt.IsZero() {
+			fetchedAt = time.Now()
+		}
+		item := &PreFetchItem{
+			WU:        wu,
+			Prep:      prep,
+			Runtime:   rt,
+			Conn:      conn,
+			WUResp:    &lettucev1.WorkUnitAssignment{},
+			FetchedAt: fetchedAt,
+		}
+		if pushErr := d.prefetchQueue.Push(item); pushErr != nil {
+			d.logger.Warn("prefetch buffer full while restoring; dropping task",
+				"work_unit_id", pt.WorkUnitID, "error", pushErr)
+			os.RemoveAll(pt.WorkDir)
+			continue
+		}
+		restored++
+		d.logger.Info("restored buffered task",
+			"work_unit_id", pt.WorkUnitID, "leaf_id", pt.LeafID, "work_dir", pt.WorkDir)
+	}
+
+	// Consume the file now that it has been processed.
+	ClearBufferState(d.cfg.DataDir)
+	if restored > 0 {
+		d.logger.Info("prefetch buffer restoration complete", "restored", restored, "total", len(state.Tasks))
 	}
 }

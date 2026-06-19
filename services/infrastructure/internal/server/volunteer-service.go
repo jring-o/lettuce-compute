@@ -663,6 +663,22 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		n = s.maxBatchPerRequest
 	}
 
+	// Record the volunteer's reported client-buffer contents (the work units it
+	// currently holds) so the head can reconcile its per-volunteer reservations
+	// against what the volunteer actually has — releasing buffered reservations it no
+	// longer holds (e.g. dropped across a client restart) so they stop counting
+	// against its inflight cap and the units redispatch. Parsed leniently: a malformed
+	// id is skipped rather than failing the work request.
+	if s.dispatchCache != nil {
+		held := make([]types.ID, 0, len(req.GetHeldWorkUnitIds()))
+		for _, raw := range req.GetHeldWorkUnitIds() {
+			if id, perr := types.ParseID(raw); perr == nil {
+				held = append(held, id)
+			}
+		}
+		s.dispatchCache.NoteVolunteerHeld(volunteerID, held)
+	}
+
 	// Layer 2: serve from the in-process dispatch cache when it is running (the
 	// hot path touches NO Postgres). Falls back to the Layer-1 per-request
 	// transaction when the cache is not started (gRPC-plumbing unit tests).

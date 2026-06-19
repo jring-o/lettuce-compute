@@ -261,8 +261,16 @@ type RequestWorkUnitRequest struct {
 	LeafIds          []string               `protobuf:"bytes,4,rep,name=leaf_ids,json=leafIds,proto3" json:"leaf_ids,omitempty"`                            // empty = any matching leaf
 	BlockedLeafIds   []string               `protobuf:"bytes,5,rep,name=blocked_leaf_ids,json=blockedLeafIds,proto3" json:"blocked_leaf_ids,omitempty"`
 	MaxAssignments   int32                  `protobuf:"varint,6,opt,name=max_assignments,json=maxAssignments,proto3" json:"max_assignments,omitempty"` // client's requested batch size (server-capped)
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The work units the volunteer currently holds in its client buffer: every
+	// buffered (not-yet-run-started) and running unit. The head reconciles its
+	// per-volunteer reservations against this set on each request, releasing any
+	// buffered reservation the volunteer no longer holds (e.g. dropped across a
+	// client restart) so it stops counting against the volunteer's inflight cap
+	// and the unit redispatches immediately. An empty list means the volunteer
+	// holds nothing. Sent on every request; the head treats it as authoritative.
+	HeldWorkUnitIds []string `protobuf:"bytes,7,rep,name=held_work_unit_ids,json=heldWorkUnitIds,proto3" json:"held_work_unit_ids,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RequestWorkUnitRequest) Reset() {
@@ -335,6 +343,13 @@ func (x *RequestWorkUnitRequest) GetMaxAssignments() int32 {
 		return x.MaxAssignments
 	}
 	return 0
+}
+
+func (x *RequestWorkUnitRequest) GetHeldWorkUnitIds() []string {
+	if x != nil {
+		return x.HeldWorkUnitIds
+	}
+	return nil
 }
 
 type RequestWorkUnitResponse struct {
@@ -2004,7 +2019,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1e\n" +
 	"\n" +
 	"registered\x18\x02 \x01(\bR\n" +
-	"registered\"\xa1\x02\n" +
+	"registered\"\xce\x02\n" +
 	"\x16RequestWorkUnitRequest\x12!\n" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1d\n" +
 	"\n" +
@@ -2012,7 +2027,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x11current_available\x18\x03 \x01(\v2*.lettuce.volunteer.v1.HardwareCapabilitiesR\x10currentAvailable\x12\x19\n" +
 	"\bleaf_ids\x18\x04 \x03(\tR\aleafIds\x12(\n" +
 	"\x10blocked_leaf_ids\x18\x05 \x03(\tR\x0eblockedLeafIds\x12'\n" +
-	"\x0fmax_assignments\x18\x06 \x01(\x05R\x0emaxAssignments\"\x95\x01\n" +
+	"\x0fmax_assignments\x18\x06 \x01(\x05R\x0emaxAssignments\x12+\n" +
+	"\x12held_work_unit_ids\x18\a \x03(\tR\x0fheldWorkUnitIds\"\x95\x01\n" +
 	"\x17RequestWorkUnitResponse\x12J\n" +
 	"\vassignments\x18\x01 \x03(\v2(.lettuce.volunteer.v1.WorkUnitAssignmentR\vassignments\x12.\n" +
 	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\"\xfa\x05\n" +

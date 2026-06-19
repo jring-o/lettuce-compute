@@ -998,6 +998,46 @@ func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map
 	return out, nil
 }
 
+// ReleaseStaleBufferedCopies closes a volunteer's buffered (RESERVED, not-yet-run-
+// started) live copies that it no longer holds in its client buffer, per the held
+// set the volunteer reports on each request. See the WorkUnitRepository interface
+// for the full contract. The work unit stays QUEUED so it redispatches at once;
+// RUNNING copies (started_at set) are never touched here — they ride their deadline.
+// The created_at < olderThan guard is the grace window that protects a copy handed
+// out moments ago from being reaped before the volunteer's next report includes it.
+func (r *PgxWorkUnitRepository) ReleaseStaleBufferedCopies(ctx context.Context, volunteerID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		UPDATE work_unit_assignment_history
+		SET outcome = 'ABANDONED', outcome_at = NOW()
+		WHERE volunteer_id = $1
+		  AND outcome IS NULL
+		  AND started_at IS NULL
+		  AND created_at < $2
+		  -- Held-set guard: an empty/absent set (volunteer holds nothing) releases every
+		  -- grace-aged buffered copy; otherwise release only those NOT in the held set.
+		  AND (array_length($3::uuid[], 1) IS NULL OR NOT (work_unit_id = ANY($3::uuid[])))
+		RETURNING work_unit_id`,
+		volunteerID, olderThan, heldWorkUnitIDs,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to release stale buffered copies", err)
+	}
+	defer rows.Close()
+
+	var released []types.ID
+	for rows.Next() {
+		var wuID types.ID
+		if err := rows.Scan(&wuID); err != nil {
+			return nil, apierror.Internal("failed to scan released buffered copy", err)
+		}
+		released = append(released, wuID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate released buffered copies", err)
+	}
+	return released, nil
+}
+
 // ReserveNextAssignable is the batch-fill counterpart to FindNextAssignable: it
 // finds the next assignable QUEUED unit for the volunteer (honoring every
 // capability/redundancy/reservation/inflight predicate) and, instead of

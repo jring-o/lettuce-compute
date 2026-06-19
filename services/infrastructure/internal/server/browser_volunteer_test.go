@@ -146,6 +146,9 @@ func (m *bvMockWURepo) ClaimDispatchableBatch(context.Context, types.ID, time.Du
 func (m *bvMockWURepo) ClearExpiredDispatchClaims(context.Context) (int64, error) {
 	return 0, nil
 }
+func (m *bvMockWURepo) ReleaseStaleBufferedCopies(context.Context, types.ID, []types.ID, time.Time) ([]types.ID, error) {
+	return nil, nil
+}
 func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }

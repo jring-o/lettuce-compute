@@ -83,6 +83,14 @@ message RequestWorkUnitRequest {
   repeated string leaf_ids = 4;               // empty = any matching leaf
   repeated string blocked_leaf_ids = 5;
   int32 max_assignments = 6;                  // client's requested batch size (server-capped)
+  // The work units the volunteer currently holds in its client buffer: every
+  // buffered (not-yet-run-started) and running unit. The head reconciles its
+  // per-volunteer reservations against this set on each request, releasing any
+  // buffered reservation the volunteer no longer holds (e.g. dropped across a
+  // client restart) so it stops counting against the volunteer's inflight cap
+  // and the unit redispatches immediately. An empty list means the volunteer
+  // holds nothing. Sent on every request; the head treats it as authoritative.
+  repeated string held_work_unit_ids = 7;
 }
 
 message RequestWorkUnitResponse {
