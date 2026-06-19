@@ -66,68 +66,79 @@ type WorkUnitRepository interface {
 	// any refill): run from the leader-gated fault monitor. Returns rows cleared.
 	ClearExpiredDispatchClaims(ctx context.Context) (int64, error)
 
-	// FlushReservations writes a batch of dispatch-cache reservations in one
-	// multi-row UPDATE using the per-row optimistic reservation guard, returning the
-	// set of work_unit_ids whose reservation actually landed (ids not returned are
-	// conflicts the cache must void). The same statement RENEWS this head's dispatch
-	// claim (dispatch_claim_expires_at = NOW() + claimLease) on any unit still claimed
-	// by headID, so a held-but-unflushed unit's claim never expires under it. A
-	// headID of uuid.Nil disables claim renewal (single-replica / pre-Layer-3 paths).
-	FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error)
+	// FlushReservations materializes a batch of dispatch-cache in-memory holds as
+	// per-copy RESERVED rows (one work_unit_assignment_history row each), returning the
+	// (work_unit, volunteer) pairs whose copy actually landed (pairs not returned are
+	// conflicts the cache must void). The same call RENEWS this head's dispatch claim
+	// on the batch's units when headID is non-zero. Two rows for the SAME unit but
+	// DISTINCT volunteers both land when redundancy allows — the parallel-copy case.
+	FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]FlushedCopy, error)
 
 	// CountActiveByVolunteer returns the authoritative per-volunteer inflight count
-	// (active history rows + live reservations) keyed by volunteer id, used to
-	// reconcile the dispatch cache's in-memory inflight counters.
+	// (live copies) keyed by volunteer id, used to reconcile the dispatch cache's
+	// in-memory inflight counters.
 	CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error)
 
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
-	// predicates as FindNextAssignable, including the per-volunteer inflight cap
-	// counting live reservations) and stamps a lease on it (reserved_until,
-	// reserved_volunteer_id), keeping state='QUEUED'. Used by the batch-fill path
-	// to lease buffered work without starting the deadline/heartbeat clock.
-	// Returns nil, nil if no work available.
+	// predicates as FindNextAssignable) and inserts a RESERVED copy held until the
+	// unit's deadline, keeping the unit QUEUED. Used by the non-cache batch-fill path
+	// to lease buffered work without starting the deadline clock. Returns nil, nil if
+	// no work available. The returned unit carries transient ReservedUntil/ReservedVolunteerID
+	// for the proto echo.
 	ReserveNextAssignable(ctx context.Context, opts AssignmentOptions, lease time.Duration) (*WorkUnit, error)
 
-	// Assign transitions a work unit from QUEUED to ASSIGNED and sets assignment metadata.
-	// Returns the updated work unit. Fails if work unit is not in QUEUED state.
+	// ReserveCopy inserts a RESERVED copy for (workUnitID, volunteerID) held until
+	// reservedUntil, snapshotting deadlineSeconds. Returns apierror.Conflict if the
+	// volunteer already holds a live copy or the unit is not QUEUED.
+	ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error)
+
+	// Assign run-starts a volunteer's reserved copy (started_at = NOW), starting the
+	// per-copy deadline clock. The WORK UNIT stays QUEUED so its other redundancy
+	// copies keep dispatching in parallel. Fails if the volunteer has no live
+	// un-started copy.
 	Assign(ctx context.Context, workUnitID types.ID, volunteerID types.ID) (*WorkUnit, error)
 
 	// CountByLeafAndState returns the count of work units for a leaf in a given state.
 	CountByLeafAndState(ctx context.Context, leafID types.ID, state WorkUnitState) (int64, error)
 
-	// FindExpiredWorkUnits returns ASSIGNED or RUNNING work units past their deadline.
-	FindExpiredWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error)
+	// FindExpiredCopies returns LIVE copies past their deadline — RUNNING copies past
+	// started_at + deadline_seconds, or RESERVED (buffered) copies past reserved_until.
+	FindExpiredCopies(ctx context.Context, limit int) ([]*Copy, error)
 
-	// FindLapsedReservations returns still-QUEUED work units whose buffer lease has
-	// lapsed (reserved_until < NOW()), i.e. a buffered (reserved) unit whose holder
-	// vanished before run-start. The caller clears each reservation (ClearReservation),
-	// leaving the unit QUEUED and immediately re-stageable — no expire/reassign is
-	// needed. Closes the #22 lapsed-lease reclaim gap.
-	FindLapsedReservations(ctx context.Context, limit int) ([]*WorkUnit, error)
+	// FindStuckSpotCheckUnits returns QUEUED spot-check units that sat over an hour
+	// without a second corroborator (the caller clears spot_check to accept the single
+	// result).
+	FindStuckSpotCheckUnits(ctx context.Context, limit int) ([]*WorkUnit, error)
 
-	// TransitionToExpired moves a work unit to EXPIRED state.
-	TransitionToExpired(ctx context.Context, id types.ID) (*WorkUnit, error)
+	// CloseCopy closes a copy by id with the given outcome (EXPIRED/ABANDONED), idempotently.
+	CloseCopy(ctx context.Context, copyID types.ID, outcome string) error
 
-	// Reassign transitions an EXPIRED or REJECTED work unit back to QUEUED
-	// with incremented reassignment_count and HIGH priority. Clears assignment fields.
-	// If reassignment_count >= max_reassignments, transitions to FAILED and sets flagged_for_review.
-	// Returns the updated work unit and whether it was re-queued (true) or failed (false).
+	// CloseCopyByVolunteer closes a volunteer's live copy of a unit with the given
+	// outcome (submit/abandon). Returns apierror.Conflict if no live copy exists.
+	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID) error
+
+	// ExpireLiveCopies closes ALL live copies of a unit with the given outcome
+	// (operator manual-requeue). Returns how many were closed.
+	ExpireLiveCopies(ctx context.Context, workUnitID types.ID, outcome string) (int, error)
+
+	// CountLiveCopies returns the number of live (RESERVED + RUNNING) copies of a unit.
+	CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
+
+	// CountTotalCopies returns the total copies ever created for a unit (dead-letter probe).
+	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
+
+	// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review when it is QUEUED
+	// with no live copy, redundancy unmet, and total copies >= its dead-letter ceiling
+	// (max_total_copies / derived default). The only cap on requeue (property 6).
+	// Returns whether the unit was failed.
+	DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error)
+
+	// Reassign returns an EXPIRED or REJECTED work unit to QUEUED for further
+	// corroboration (uncapped — property 6). Always requeued=true on success.
 	Reassign(ctx context.Context, id types.ID) (wu *WorkUnit, requeued bool, err error)
 
 	// MarkSpotCheck sets spot_check = true for a work unit.
 	MarkSpotCheck(ctx context.Context, id types.ID) error
-
-	// StampReservation sets reserved_until / reserved_volunteer_id on a still-QUEUED
-	// work unit (used by the batch spot-check branch to hide the unit from the same
-	// volunteer's subsequent iterations). Returns the updated WorkUnit.
-	StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*WorkUnit, error)
-
-	// ClearReservation drops the reservation columns on a still-QUEUED unit
-	// reserved to volunteerID, leaving it QUEUED so it is immediately
-	// re-reservable. Used when a volunteer abandons a buffered (reserved,
-	// un-started) unit. Returns the updated WorkUnit, or apierror.Conflict if no
-	// matching reserved QUEUED unit exists.
-	ClearReservation(ctx context.Context, id, volunteerID types.ID) (*WorkUnit, error)
 
 	// ClearSpotCheck sets spot_check = false, allowing single-result validation.
 	ClearSpotCheck(ctx context.Context, id types.ID) error

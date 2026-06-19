@@ -8,6 +8,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
@@ -60,82 +61,60 @@ func (m *FaultMonitor) Start(ctx context.Context) {
 	}
 }
 
-// ScanOnce performs a single scan for expired and abandoned work units.
+// ScanOnce performs a single scan for timed-out copies and stuck spot-check units.
+//
+// Per-copy dispatch (migration 00006): timeouts are detected on COPIES (per-copy
+// rows), not units. A timed-out copy is closed (EXPIRED for a run-started copy,
+// ABANDONED for a buffered copy whose holder vanished before run-start); its work
+// unit stays QUEUED and immediately redispatches a FRESH copy to a DISTINCT volunteer
+// — with NO per-reassignment cap (property 6). Only when a unit has exhausted its
+// dead-letter ceiling (max_total_copies) with redundancy unmet is it parked FAILED.
 func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
-	// Find and process expired work units (past deadline).
-	expired, err := m.workUnitRepo.FindExpiredWorkUnits(ctx, m.batchSize)
+	// 1. Timed-out copies (the deadline is the only early-reclaim clock — property 5).
+	expired, err := m.workUnitRepo.FindExpiredCopies(ctx, m.batchSize)
 	if err != nil {
 		return err
 	}
-	for _, wu := range expired {
-		// Spot-check WUs stuck in QUEUED state: clear the spot-check flag so the
-		// first volunteer's result is accepted with single-result validation.
-		if wu.State == workunit.WorkUnitStateQueued && wu.SpotCheck {
-			if err := m.workUnitRepo.ClearSpotCheck(ctx, wu.ID); err != nil {
-				m.logger.Error("failed to clear spot-check on timed-out work unit", "work_unit_id", wu.ID, "error", err)
-			} else {
-				m.logger.Info("spot-check timed out, accepting single result",
-					"work_unit_id", wu.ID,
-				)
-			}
+	for _, cp := range expired {
+		outcome := assignment.OutcomeExpired // run-started copy missed its deadline
+		if cp.StartedAt == nil {
+			outcome = assignment.OutcomeAbandoned // buffered copy: holder vanished pre-start
+		}
+		if err := m.workUnitRepo.CloseCopy(ctx, cp.ID, string(outcome)); err != nil {
+			m.logger.Error("failed to close timed-out copy",
+				"copy_id", cp.ID, "work_unit_id", cp.WorkUnitID, "error", err)
 			continue
 		}
+		m.logger.Warn("work unit copy timed out",
+			"copy_id", cp.ID, "work_unit_id", cp.WorkUnitID, "volunteer_id", cp.VolunteerID,
+			"outcome", outcome, "deadline_seconds", cp.DeadlineSeconds)
 
-		if _, err := m.workUnitRepo.TransitionToExpired(ctx, wu.ID); err != nil {
-			m.logger.Error("failed to expire work unit", "work_unit_id", wu.ID, "error", err)
-			continue
-		}
-
-		// Update assignment history.
-		if wu.AssignedVolunteerID != nil {
-			m.updateAssignmentOutcome(ctx, wu, assignment.OutcomeExpired)
-		}
-
-		m.logger.Warn("work unit expired",
-			"work_unit_id", wu.ID,
-			"volunteer_id", wu.AssignedVolunteerID,
-			"deadline_seconds", wu.DeadlineSeconds,
-		)
-
-		// Reassign or fail the expired work unit.
-		updated, requeued, err := m.workUnitRepo.Reassign(ctx, wu.ID)
+		// Dead-letter only if the unit has exhausted its retry ceiling with redundancy
+		// unmet and no live copy left; otherwise it stays QUEUED and redispatches.
+		failed, err := m.workUnitRepo.DeadLetterIfExhausted(ctx, cp.WorkUnitID)
 		if err != nil {
-			m.logger.Error("failed to reassign expired work unit", "work_unit_id", wu.ID, "error", err)
+			m.logger.Error("dead-letter check failed", "work_unit_id", cp.WorkUnitID, "error", err)
 			continue
 		}
-		if requeued {
-			// Log checkpoint preservation on reassignment.
-			if wu.LastCheckpointSequence > 0 {
-				m.logger.Info("checkpoint preserved for reassignment",
-					"work_unit_id", wu.ID,
-					"checkpoint_sequence", wu.LastCheckpointSequence,
-					"last_checkpoint_at", wu.LastCheckpointAt,
-				)
-			}
-			m.logger.Info("work unit reassigned", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
-		} else {
-			m.logger.Warn("work unit failed after max reassignments", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
-			// Clean up checkpoints for failed work units.
-			m.cleanupCheckpoint(ctx, wu)
+		if failed {
+			m.logger.Warn("work unit dead-lettered after exhausting retry ceiling",
+				"work_unit_id", cp.WorkUnitID)
+			m.cleanupCheckpointByID(ctx, cp.WorkUnitID)
 		}
 	}
 
-	// The heartbeat-based abandoned sweep (FindAbandonedWorkUnits) is removed:
-	// per-task heartbeats no longer exist and liveness is deadline-based. ASSIGNED
-	// orphans (a volunteer that vanished after StartWork) are now covered by the
-	// deadline sweep above (FindExpiredWorkUnits includes ASSIGNED units).
-
-	// Lapsed-reservation sweep (#22 lapsed-lease reclaim gap). A buffered (reserved)
-	// unit stays QUEUED with reserved_until set; if its holder vanished before
-	// run-start (a client that buffered work then died, or a head crash that flushed
-	// a reservation whose in-memory owner is gone), the lease lapses but neither the
-	// deadline sweep nor the (removed) heartbeat sweep would ever touch it — both scan
-	// only ASSIGNED/RUNNING. With per-task heartbeats gone and lease-renewal retired,
-	// this sweep is the load-bearing dead-holder reclaim for never-started buffered
-	// units. Clearing the reservation leaves the unit QUEUED and immediately
-	// re-stageable by the dispatch cache — no expire/reassign is needed.
-	if err := m.reclaimLapsedReservations(ctx); err != nil {
-		m.logger.Error("lapsed-reservation sweep failed", "error", err)
+	// 2. Spot-check units stuck QUEUED with no second corroborator: clear spot_check
+	//    so the single result validates.
+	stuck, err := m.workUnitRepo.FindStuckSpotCheckUnits(ctx, m.batchSize)
+	if err != nil {
+		m.logger.Error("stuck spot-check sweep failed", "error", err)
+	}
+	for _, wu := range stuck {
+		if err := m.workUnitRepo.ClearSpotCheck(ctx, wu.ID); err != nil {
+			m.logger.Error("failed to clear spot-check on timed-out work unit", "work_unit_id", wu.ID, "error", err)
+		} else {
+			m.logger.Info("spot-check timed out, accepting single result", "work_unit_id", wu.ID)
+		}
 	}
 
 	// Layer 3 dispatch-claim HYGIENE sweep. A crashed replica leaves its claimed
@@ -160,67 +139,10 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	return nil
 }
 
-// reclaimLapsedReservations clears the reservation columns on still-QUEUED units
-// whose buffer lease has lapsed, so they are immediately re-stageable. See the
-// call site in ScanOnce for why this is load-bearing post-heartbeat-removal.
-func (m *FaultMonitor) reclaimLapsedReservations(ctx context.Context) error {
-	lapsed, err := m.workUnitRepo.FindLapsedReservations(ctx, m.batchSize)
-	if err != nil {
-		return err
-	}
-	for _, wu := range lapsed {
-		if wu.ReservedVolunteerID == nil {
-			// Defensive: FindLapsedReservations only returns reserved units, but a
-			// concurrent ClearReservation could have raced. Skip cleanly.
-			continue
-		}
-		if _, err := m.workUnitRepo.ClearReservation(ctx, wu.ID, *wu.ReservedVolunteerID); err != nil {
-			// A concurrent run-start (Assign) or another monitor pass may have already
-			// cleared/flipped it; that is benign — the unit is no longer a stranded
-			// lapsed reservation either way.
-			m.logger.Debug("failed to clear lapsed reservation (likely raced)",
-				"work_unit_id", wu.ID, "error", err)
-			continue
-		}
-		m.logger.Info("lapsed reservation reclaimed",
-			"work_unit_id", wu.ID,
-			"reserved_volunteer_id", wu.ReservedVolunteerID,
-			"reserved_until", wu.ReservedUntil,
-		)
-	}
-	return nil
-}
-
-// updateAssignmentOutcome finds the active assignment for a work unit and sets its outcome.
-func (m *FaultMonitor) updateAssignmentOutcome(ctx context.Context, wu *workunit.WorkUnit, outcome assignment.AssignmentOutcome) {
-	active, err := m.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, wu.ID, *wu.AssignedVolunteerID)
-	if err != nil {
-		m.logger.Error("failed to find active assignment",
-			"work_unit_id", wu.ID,
-			"volunteer_id", wu.AssignedVolunteerID,
-			"error", err,
-		)
-		return
-	}
-	if err := m.assignRepo.UpdateOutcome(ctx, active.ID, outcome, nil); err != nil {
-		m.logger.Error("failed to update assignment outcome",
-			"assignment_id", active.ID,
-			"outcome", outcome,
-			"error", err,
-		)
-	}
-}
-
-// cleanupCheckpoint deletes checkpoint data for a work unit (best effort).
-func (m *FaultMonitor) cleanupCheckpoint(ctx context.Context, wu *workunit.WorkUnit) {
-	if wu.LastCheckpointSequence == 0 {
-		return
-	}
-	if err := m.checkpointRepo.Delete(ctx, wu.ID); err != nil {
-		m.logger.Error("failed to clean up checkpoint",
-			"work_unit_id", wu.ID,
-			"error", err,
-		)
+// cleanupCheckpointByID deletes checkpoint data for a work unit (best effort).
+func (m *FaultMonitor) cleanupCheckpointByID(ctx context.Context, workUnitID types.ID) {
+	if err := m.checkpointRepo.Delete(ctx, workUnitID); err != nil {
+		m.logger.Debug("failed to clean up checkpoint", "work_unit_id", workUnitID, "error", err)
 	}
 }
 

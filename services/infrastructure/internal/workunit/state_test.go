@@ -16,6 +16,11 @@ func TestValidateTransition(t *testing.T) {
 	}{
 		{"CREATED → QUEUED", WorkUnitStateCreated, WorkUnitStateQueued},
 		{"QUEUED → ASSIGNED", WorkUnitStateQueued, WorkUnitStateAssigned},
+		// Per-copy model: a unit is a pure aggregate over its copies and can go
+		// QUEUED → COMPLETED / FAILED directly (enough results accumulated, or the
+		// dead-letter ceiling hit) without passing through ASSIGNED/RUNNING.
+		{"QUEUED → COMPLETED", WorkUnitStateQueued, WorkUnitStateCompleted},
+		{"QUEUED → FAILED", WorkUnitStateQueued, WorkUnitStateFailed},
 		{"ASSIGNED → RUNNING", WorkUnitStateAssigned, WorkUnitStateRunning},
 		{"ASSIGNED → COMPLETED", WorkUnitStateAssigned, WorkUnitStateCompleted},
 		{"ASSIGNED → EXPIRED", WorkUnitStateAssigned, WorkUnitStateExpired},
@@ -42,11 +47,9 @@ func TestValidateTransition(t *testing.T) {
 		from WorkUnitState
 		to   WorkUnitState
 	}{
-		{"QUEUED → COMPLETED", WorkUnitStateQueued, WorkUnitStateCompleted},
 		{"VALIDATED → QUEUED", WorkUnitStateValidated, WorkUnitStateQueued},
 		{"FAILED → QUEUED", WorkUnitStateFailed, WorkUnitStateQueued},
 		{"CREATED → RUNNING", WorkUnitStateCreated, WorkUnitStateRunning},
-		{"RUNNING → QUEUED", WorkUnitStateRunning, WorkUnitStateQueued},
 		{"COMPLETED → QUEUED", WorkUnitStateCompleted, WorkUnitStateQueued},
 		{"VALIDATED → FAILED", WorkUnitStateValidated, WorkUnitStateFailed},
 		{"FAILED → VALIDATED", WorkUnitStateFailed, WorkUnitStateValidated},
@@ -143,36 +146,40 @@ func TestTransitionToQueued(t *testing.T) {
 		}
 	})
 
-	t.Run("error: max reassignments exceeded", func(t *testing.T) {
+	// Property 6 (uncapped requeue): TransitionToQueued no longer caps on
+	// max_reassignments. A unit at or beyond its old cap still requeues; the only
+	// terminal stop is the dead-letter ceiling (DeadLetterIfExhausted), enforced
+	// where copies time out, not here.
+	t.Run("uncapped: requeues even at/over max_reassignments", func(t *testing.T) {
 		wu := &WorkUnit{
 			State:             WorkUnitStateExpired,
 			ReassignmentCount: 3,
 			MaxReassignments:  3,
 		}
 
-		err := TransitionToQueued(wu)
-		if err == nil {
-			t.Fatal("expected error when max reassignments exceeded")
+		if err := TransitionToQueued(wu); err != nil {
+			t.Fatalf("expected no error (requeue is uncapped), got %v", err)
 		}
-		apiErr, ok := err.(*apierror.APIError)
-		if !ok {
-			t.Fatalf("expected *apierror.APIError, got %T", err)
+		if wu.State != WorkUnitStateQueued {
+			t.Errorf("State = %s, want QUEUED", wu.State)
 		}
-		if apiErr.HTTPStatus != 409 {
-			t.Errorf("HTTPStatus = %d, want 409", apiErr.HTTPStatus)
+		if wu.ReassignmentCount != 4 {
+			t.Errorf("ReassignmentCount = %d, want 4 (bumped past old cap)", wu.ReassignmentCount)
 		}
 	})
 
-	t.Run("error: exactly at max", func(t *testing.T) {
+	t.Run("uncapped: requeues at exactly old max", func(t *testing.T) {
 		wu := &WorkUnit{
 			State:             WorkUnitStateRejected,
 			ReassignmentCount: 1,
 			MaxReassignments:  1,
 		}
 
-		err := TransitionToQueued(wu)
-		if err == nil {
-			t.Fatal("expected error when reassignment_count equals max_reassignments")
+		if err := TransitionToQueued(wu); err != nil {
+			t.Fatalf("expected no error when count equals max (uncapped), got %v", err)
+		}
+		if wu.State != WorkUnitStateQueued {
+			t.Errorf("State = %s, want QUEUED", wu.State)
 		}
 	})
 }

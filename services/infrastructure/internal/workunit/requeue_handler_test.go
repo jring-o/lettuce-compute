@@ -14,52 +14,31 @@ import (
 )
 
 // stubRequeueRepo implements just the WorkUnitRepository methods handleRequeue
-// uses. The embedded interface is nil, so any unexpected call panics — keeping
-// the test honest about which methods the handler touches.
+// uses in the per-copy model: GetByID, ExpireLiveCopies (abandon a unit's live
+// copies), and Reassign. The embedded interface is nil, so any unexpected call
+// panics — keeping the test honest about which methods the handler touches.
 type stubRequeueRepo struct {
 	WorkUnitRepository
-	getByID    func(ctx context.Context, id types.ID) (*WorkUnit, error)
-	expire     func(ctx context.Context, id types.ID) (*WorkUnit, error)
-	reassign   func(ctx context.Context, id types.ID) (*WorkUnit, bool, error)
-	expireCals int
+	getByID       func(ctx context.Context, id types.ID) (*WorkUnit, error)
+	reassign      func(ctx context.Context, id types.ID) (*WorkUnit, bool, error)
+	expireCalls   int
+	expireOutcome string
 }
 
 func (s *stubRequeueRepo) GetByID(ctx context.Context, id types.ID) (*WorkUnit, error) {
 	return s.getByID(ctx, id)
 }
 
-func (s *stubRequeueRepo) TransitionToExpired(ctx context.Context, id types.ID) (*WorkUnit, error) {
-	s.expireCals++
-	return s.expire(ctx, id)
+// ExpireLiveCopies records the operator-requeue abandon of a unit's live copies
+// (the per-copy replacement for closing the prior volunteer's active assignment row).
+func (s *stubRequeueRepo) ExpireLiveCopies(_ context.Context, _ types.ID, outcome string) (int, error) {
+	s.expireCalls++
+	s.expireOutcome = outcome
+	return 0, nil
 }
 
 func (s *stubRequeueRepo) Reassign(ctx context.Context, id types.ID) (*WorkUnit, bool, error) {
 	return s.reassign(ctx, id)
-}
-
-// stubAssignRepo implements just the assignment.Repository methods handleRequeue
-// uses. The embedded interface is nil, so any unexpected call panics.
-type stubAssignRepo struct {
-	assignment.Repository
-	active         *assignment.AssignmentHistoryEntry
-	findErr        error
-	updateCalls    int
-	updatedID      types.ID
-	updatedOutcome assignment.AssignmentOutcome
-}
-
-func (s *stubAssignRepo) FindActiveByWorkUnitAndVolunteer(_ context.Context, _, _ types.ID) (*assignment.AssignmentHistoryEntry, error) {
-	if s.findErr != nil {
-		return nil, s.findErr
-	}
-	return s.active, nil
-}
-
-func (s *stubAssignRepo) UpdateOutcome(_ context.Context, id types.ID, outcome assignment.AssignmentOutcome, _ *types.ID) error {
-	s.updateCalls++
-	s.updatedID = id
-	s.updatedOutcome = outcome
-	return nil
 }
 
 func newRequeueRequest(t *testing.T, leafID, wuID types.ID) (*httptest.ResponseRecorder, *http.Request) {
@@ -75,21 +54,21 @@ func newRequeueHandler(repo WorkUnitRepository) *WorkUnitHandler {
 	return NewWorkUnitHandler(repo, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// TestHandleRequeue_AssignedUnitIsExpiredThenReassigned verifies a stuck ASSIGNED
-// unit is moved EXPIRED → QUEUED via the existing transition path.
-func TestHandleRequeue_AssignedUnitIsExpiredThenReassigned(t *testing.T) {
+// TestHandleRequeue_QueuedUnitAbandonsLiveCopies verifies the per-copy requeue of
+// a QUEUED unit: it abandons the unit's in-flight copies and returns 200
+// requeued=true while the unit stays QUEUED (units no longer reach ASSIGNED/RUNNING,
+// so a fresh set of copies simply dispatches once the old ones are closed).
+func TestHandleRequeue_QueuedUnitAbandonsLiveCopies(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 
 	repo := &stubRequeueRepo{
 		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateAssigned}, nil
-		},
-		expire: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateExpired}, nil
+			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, nil
 		},
 		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, true, nil
+			t.Fatal("Reassign must not be called for a QUEUED unit")
+			return nil, false, nil
 		},
 	}
 
@@ -99,8 +78,11 @@ func TestHandleRequeue_AssignedUnitIsExpiredThenReassigned(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if repo.expireCals != 1 {
-		t.Errorf("TransitionToExpired called %d times, want 1", repo.expireCals)
+	if repo.expireCalls != 1 {
+		t.Errorf("ExpireLiveCopies called %d times, want 1", repo.expireCalls)
+	}
+	if repo.expireOutcome != string(assignment.OutcomeAbandoned) {
+		t.Errorf("expire outcome = %q, want ABANDONED", repo.expireOutcome)
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -114,63 +96,48 @@ func TestHandleRequeue_AssignedUnitIsExpiredThenReassigned(t *testing.T) {
 	}
 }
 
-// TestHandleRequeue_ClosesActiveAssignment verifies that requeuing an ASSIGNED
-// unit closes the prior volunteer's open assignment-history row (outcome EXPIRED),
-// so FindNextAssignable no longer permanently excludes that volunteer.
-func TestHandleRequeue_ClosesActiveAssignment(t *testing.T) {
+// TestHandleRequeue_ClosesLiveCopies verifies that requeuing a QUEUED unit closes
+// (abandons) its live copies directly in work_unit_assignment_history — the
+// per-copy replacement for closing the prior volunteer's open assignment-history
+// row — so those volunteers are freed and stop counting toward redundancy.
+func TestHandleRequeue_ClosesLiveCopies(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 	volID := types.NewID()
-	assignID := types.NewID()
 
 	repo := &stubRequeueRepo{
 		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateAssigned, AssignedVolunteerID: &volID}, nil
-		},
-		expire: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateExpired, AssignedVolunteerID: &volID}, nil
+			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued, AssignedVolunteerID: &volID}, nil
 		},
 		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
-			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, true, nil
+			t.Fatal("Reassign must not be called for a QUEUED unit")
+			return nil, false, nil
 		},
 	}
-	assignRepo := &stubAssignRepo{
-		active: &assignment.AssignmentHistoryEntry{ID: assignID, WorkUnitID: wuID, VolunteerID: volID},
-	}
-
-	h := newRequeueHandler(repo)
-	h.SetAssignmentRepo(assignRepo)
 
 	rec, req := newRequeueRequest(t, leafID, wuID)
-	h.HandleRequeue(rec, req)
+	newRequeueHandler(repo).HandleRequeue(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if assignRepo.updateCalls != 1 {
-		t.Fatalf("UpdateOutcome called %d times, want 1", assignRepo.updateCalls)
+	if repo.expireCalls != 1 {
+		t.Fatalf("ExpireLiveCopies called %d times, want 1", repo.expireCalls)
 	}
-	if assignRepo.updatedID != assignID {
-		t.Errorf("closed assignment id = %v, want %v", assignRepo.updatedID, assignID)
-	}
-	if assignRepo.updatedOutcome != assignment.OutcomeExpired {
-		t.Errorf("outcome = %q, want EXPIRED", assignRepo.updatedOutcome)
+	if repo.expireOutcome != string(assignment.OutcomeAbandoned) {
+		t.Errorf("expire outcome = %q, want ABANDONED", repo.expireOutcome)
 	}
 }
 
-// TestHandleRequeue_ExpiredUnitSkipsExpireTransition verifies an already-EXPIRED
-// unit is reassigned directly without a redundant TransitionToExpired.
-func TestHandleRequeue_ExpiredUnitSkipsExpireTransition(t *testing.T) {
+// TestHandleRequeue_ExpiredUnitReassigned verifies an EXPIRED unit abandons any
+// live copies (best-effort) and is then reassigned back to QUEUED.
+func TestHandleRequeue_ExpiredUnitReassigned(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 
 	repo := &stubRequeueRepo{
 		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
 			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateExpired}, nil
-		},
-		expire: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			t.Fatal("TransitionToExpired should not be called for an already-EXPIRED unit")
-			return nil, nil
 		},
 		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
 			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, true, nil
@@ -183,8 +150,18 @@ func TestHandleRequeue_ExpiredUnitSkipsExpireTransition(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if repo.expireCals != 0 {
-		t.Errorf("TransitionToExpired called %d times, want 0", repo.expireCals)
+	if repo.expireCalls != 1 {
+		t.Errorf("ExpireLiveCopies called %d times, want 1", repo.expireCalls)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["requeued"] != true {
+		t.Errorf("requeued = %v, want true", body["requeued"])
+	}
+	if body["state"] != string(WorkUnitStateQueued) {
+		t.Errorf("state = %v, want QUEUED", body["state"])
 	}
 }
 
@@ -197,11 +174,7 @@ func TestHandleRequeue_WrongLeafReturns404(t *testing.T) {
 
 	repo := &stubRequeueRepo{
 		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			return &WorkUnit{ID: wuID, LeafID: otherLeafID, State: WorkUnitStateAssigned}, nil
-		},
-		expire: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			t.Fatal("must not transition a work unit from another leaf")
-			return nil, nil
+			return &WorkUnit{ID: wuID, LeafID: otherLeafID, State: WorkUnitStateQueued}, nil
 		},
 		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
 			t.Fatal("must not reassign a work unit from another leaf")
@@ -215,10 +188,13 @@ func TestHandleRequeue_WrongLeafReturns404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
+	if repo.expireCalls != 0 {
+		t.Errorf("ExpireLiveCopies must not be called for a wrong-leaf unit, got %d", repo.expireCalls)
+	}
 }
 
 // TestHandleRequeue_TerminalStateRejected verifies a COMPLETED unit cannot be
-// requeued.
+// requeued (it is neither QUEUED nor EXPIRED/REJECTED).
 func TestHandleRequeue_TerminalStateRejected(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
@@ -226,10 +202,6 @@ func TestHandleRequeue_TerminalStateRejected(t *testing.T) {
 	repo := &stubRequeueRepo{
 		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
 			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateCompleted}, nil
-		},
-		expire: func(_ context.Context, id types.ID) (*WorkUnit, error) {
-			t.Fatal("must not expire a terminal unit")
-			return nil, nil
 		},
 		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
 			t.Fatal("must not reassign a terminal unit")
@@ -242,5 +214,8 @@ func TestHandleRequeue_TerminalStateRejected(t *testing.T) {
 
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	if repo.expireCalls != 0 {
+		t.Errorf("ExpireLiveCopies must not be called for a terminal unit, got %d", repo.expireCalls)
 	}
 }

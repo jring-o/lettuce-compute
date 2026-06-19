@@ -641,7 +641,12 @@ func TestWorkUnitUpdateStateRejectedToQueued(t *testing.T) {
 	}
 }
 
-func TestWorkUnitUpdateStateExpiredToFailed(t *testing.T) {
+// TestWorkUnitUpdateStateExpiredRequeueUncappedThenFailed: requeue is UNCAPPED
+// (property 6) — UpdateState EXPIRED → QUEUED no longer caps on max_reassignments, so
+// a unit at/over its old cap still requeues. A unit is parked FAILED only via an
+// explicit EXPIRED → FAILED transition (or the dead-letter ceiling), not by a
+// per-reassignment cap.
+func TestWorkUnitUpdateStateExpiredRequeueUncappedThenFailed(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -651,7 +656,7 @@ func TestWorkUnitUpdateStateExpiredToFailed(t *testing.T) {
 	ctx := context.Background()
 
 	wu := newTestWorkUnit(leafID, nil)
-	wu.MaxReassignments = 1
+	wu.MaxReassignments = 1 // old cap — now ignored for requeue capping.
 	if err := repo.Create(ctx, wu); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -670,10 +675,13 @@ func TestWorkUnitUpdateStateExpiredToFailed(t *testing.T) {
 		}
 	}
 
-	// Requeue once (count goes to 1, which equals max_reassignments).
+	// Requeue once (count goes to 1, which equals the old max_reassignments).
 	wu, err := repo.UpdateState(ctx, wu.ID, WorkUnitStateExpired, WorkUnitStateQueued)
 	if err != nil {
 		t.Fatalf("first requeue: %v", err)
+	}
+	if wu.ReassignmentCount != 1 {
+		t.Fatalf("ReassignmentCount = %d, want 1", wu.ReassignmentCount)
 	}
 
 	// Walk to EXPIRED again.
@@ -688,13 +696,25 @@ func TestWorkUnitUpdateStateExpiredToFailed(t *testing.T) {
 		}
 	}
 
-	// Now requeue should fail (count=1, max=1).
-	_, err = repo.UpdateState(ctx, wu.ID, WorkUnitStateExpired, WorkUnitStateQueued)
-	if err == nil {
-		t.Fatal("expected error when max reassignments exceeded")
+	// Requeue AGAIN — now SUCCEEDS even though count(1) == old max(1): uncapped.
+	wu, err = repo.UpdateState(ctx, wu.ID, WorkUnitStateExpired, WorkUnitStateQueued)
+	if err != nil {
+		t.Fatalf("second requeue should succeed (requeue is uncapped): %v", err)
+	}
+	if wu.State != WorkUnitStateQueued {
+		t.Errorf("State = %s, want QUEUED", wu.State)
+	}
+	if wu.ReassignmentCount != 2 {
+		t.Errorf("ReassignmentCount = %d, want 2 (bumped past old cap)", wu.ReassignmentCount)
 	}
 
-	// Transition to FAILED instead.
+	// Walk to EXPIRED and park it FAILED via the explicit transition.
+	for _, tr := range transitions2 {
+		wu, err = repo.UpdateState(ctx, wu.ID, tr.from, tr.to)
+		if err != nil {
+			t.Fatalf("UpdateState %s → %s: %v", tr.from, tr.to, err)
+		}
+	}
 	updated, err := repo.UpdateState(ctx, wu.ID, WorkUnitStateExpired, WorkUnitStateFailed)
 	if err != nil {
 		t.Fatalf("UpdateState EXPIRED → FAILED: %v", err)
@@ -1581,7 +1601,11 @@ func TestFindNextAssignable_InlineDataDelivered(t *testing.T) {
 	}
 }
 
-func TestAssign_QueuedToAssigned(t *testing.T) {
+// TestAssign_RunStartsReservedCopy: Assign run-starts a volunteer's RESERVED copy
+// (sets started_at), keeping the WORK UNIT QUEUED so its other redundancy copies keep
+// dispatching in parallel. The denormalized work_units.assigned_* pointer is updated
+// best-effort for observability.
+func TestAssign_RunStartsReservedCopy(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -1597,13 +1621,18 @@ func TestAssign_QueuedToAssigned(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
+	// Buffer a copy first; Assign run-starts it.
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volunteerID, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+		t.Fatalf("ReserveCopy: %v", err)
+	}
+
 	assigned, err := repo.Assign(ctx, wu.ID, volunteerID)
 	if err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 
-	if assigned.State != WorkUnitStateAssigned {
-		t.Errorf("State = %s, want ASSIGNED", assigned.State)
+	if assigned.State != WorkUnitStateQueued {
+		t.Errorf("State = %s, want QUEUED (unit stays QUEUED through run-start)", assigned.State)
 	}
 	if assigned.AssignedVolunteerID == nil || *assigned.AssignedVolunteerID != volunteerID {
 		t.Errorf("AssignedVolunteerID = %v, want %v", assigned.AssignedVolunteerID, volunteerID)
@@ -1614,9 +1643,22 @@ func TestAssign_QueuedToAssigned(t *testing.T) {
 	if assigned.LastHeartbeatAt == nil {
 		t.Error("LastHeartbeatAt should be set")
 	}
+
+	// The volunteer's copy is now RUNNING (started_at set).
+	var startedAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT started_at FROM work_unit_assignment_history
+		 WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`, wu.ID, volunteerID).Scan(&startedAt); err != nil {
+		t.Fatalf("read copy started_at: %v", err)
+	}
+	if startedAt == nil {
+		t.Error("copy started_at should be set at run-start")
+	}
 }
 
-func TestAssign_NotQueued_Fails(t *testing.T) {
+// TestAssign_NoReservedCopy_Fails: Assign fails with Conflict when the volunteer holds
+// no live (un-started) copy to run-start.
+func TestAssign_NoReservedCopy_Fails(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -1626,16 +1668,16 @@ func TestAssign_NotQueued_Fails(t *testing.T) {
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
 
-	// Work unit in CREATED state (not QUEUED).
+	// QUEUED unit but the volunteer never reserved a copy.
 	wu := newTestWorkUnit(leafID, nil)
-	wu.State = WorkUnitStateCreated
+	wu.State = WorkUnitStateQueued
 	if err := repo.Create(ctx, wu); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
 	_, err := repo.Assign(ctx, wu.ID, volunteerID)
 	if err == nil {
-		t.Fatal("expected error for non-QUEUED work unit")
+		t.Fatal("expected error when the volunteer holds no reserved copy")
 	}
 	apiErr, ok := err.(*apierror.APIError)
 	if !ok {
@@ -1963,59 +2005,89 @@ func TestReassign_RejectedToQueued(t *testing.T) {
 	}
 }
 
-func TestReassign_ExpiredToFailed_MaxReassignments(t *testing.T) {
+// insertClosedCopy writes a CLOSED copy (outcome set) for a unit/volunteer — a
+// dispatch attempt that timed out/abandoned, counting toward the dead-letter total
+// but not toward the live-copy count.
+func insertClosedCopy(t *testing.T, pool *pgxpool.Pool, wuID, volID types.ID, outcome string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO work_unit_assignment_history (work_unit_id, volunteer_id, assigned_at, outcome, outcome_at)
+		VALUES ($1, $2, NOW(), $3::assignment_outcome, NOW())`, wuID, volID, outcome); err != nil {
+		t.Fatalf("insert closed copy: %v", err)
+	}
+}
+
+// TestDeadLetterIfExhausted replaces the retired per-reassignment cap (property 6):
+// requeue is uncapped, and the ONLY terminal stop is the dead-letter ceiling. A
+// QUEUED unit with NO live copy, redundancy still unmet, and total copies ever
+// created >= its ceiling (max_total_copies) is parked FAILED + flagged. Units that
+// still have a live copy, or are under the ceiling, are NOT dead-lettered.
+func TestDeadLetterIfExhausted(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	userID := createTestUser(t, pool, "reassign-exp-f")
-	leafID := createTestLeaf(t, pool, &userID)
+	userID := createTestUser(t, pool, "deadletter")
+	leafID := createTestLeaf(t, pool, &userID) // redundancy_factor 2
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
 
-	wu := newTestWorkUnit(leafID, nil)
-	wu.MaxReassignments = 1
-	if err := repo.Create(ctx, wu); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	// Walk to EXPIRED, reassign once (count goes to 1 = max).
-	wu = walkToState(t, repo, wu, WorkUnitStateExpired)
-	wu, requeued, err := repo.Reassign(ctx, wu.ID)
-	if err != nil {
-		t.Fatalf("first Reassign: %v", err)
-	}
-	if !requeued {
-		t.Fatal("first reassign should have requeued")
-	}
-	if wu.ReassignmentCount != 1 {
-		t.Fatalf("ReassignmentCount = %d, want 1", wu.ReassignmentCount)
-	}
-
-	// Walk to EXPIRED again.
-	transitions := []struct{ from, to WorkUnitState }{
-		{WorkUnitStateQueued, WorkUnitStateAssigned},
-		{WorkUnitStateAssigned, WorkUnitStateExpired},
-	}
-	for _, tr := range transitions {
-		wu, err = repo.UpdateState(ctx, wu.ID, tr.from, tr.to)
-		if err != nil {
-			t.Fatalf("UpdateState %s → %s: %v", tr.from, tr.to, err)
+	mkQueued := func(maxTotal int) *WorkUnit {
+		wu := newTestWorkUnit(leafID, nil)
+		wu.MaxTotalCopies = maxTotal
+		if err := repo.Create(ctx, wu); err != nil {
+			t.Fatalf("Create: %v", err)
 		}
+		if _, err := repo.UpdateState(ctx, wu.ID, WorkUnitStateCreated, WorkUnitStateQueued); err != nil {
+			t.Fatalf("UpdateState CREATED→QUEUED: %v", err)
+		}
+		return wu
 	}
 
-	// Second reassign — should FAIL (count=1 >= max=1).
-	updated, requeued, err := repo.Reassign(ctx, wu.ID)
+	// Exhausted: ceiling 2, two CLOSED copies (total 2 >= 2), no live copy, redundancy
+	// unmet (0 PENDING results < 2) → dead-lettered.
+	exhausted := mkQueued(2)
+	insertClosedCopy(t, pool, exhausted.ID, volA, "EXPIRED")
+	insertClosedCopy(t, pool, exhausted.ID, volB, "ABANDONED")
+
+	failed, err := repo.DeadLetterIfExhausted(ctx, exhausted.ID)
 	if err != nil {
-		t.Fatalf("second Reassign: %v", err)
+		t.Fatalf("DeadLetterIfExhausted(exhausted): %v", err)
 	}
-	if requeued {
-		t.Error("expected requeued = false")
+	if !failed {
+		t.Fatal("expected exhausted unit to be dead-lettered")
 	}
-	if updated.State != WorkUnitStateFailed {
-		t.Errorf("State = %s, want FAILED", updated.State)
+	got, err := repo.GetByID(ctx, exhausted.ID)
+	if err != nil {
+		t.Fatalf("GetByID(exhausted): %v", err)
 	}
-	if !updated.FlaggedForReview {
-		t.Error("FlaggedForReview should be true")
+	if got.State != WorkUnitStateFailed {
+		t.Errorf("State = %s, want FAILED", got.State)
+	}
+	if !got.FlaggedForReview {
+		t.Error("dead-lettered unit should be flagged for review")
+	}
+
+	// Under ceiling: only 1 total copy (< 2) → NOT dead-lettered.
+	underCeiling := mkQueued(2)
+	insertClosedCopy(t, pool, underCeiling.ID, volA, "EXPIRED")
+	if failed, err := repo.DeadLetterIfExhausted(ctx, underCeiling.ID); err != nil {
+		t.Fatalf("DeadLetterIfExhausted(underCeiling): %v", err)
+	} else if failed {
+		t.Error("a unit under its copy ceiling must not be dead-lettered")
+	}
+
+	// Live copy present: total >= ceiling but a copy is still live → NOT dead-lettered.
+	hasLive := mkQueued(2)
+	insertClosedCopy(t, pool, hasLive.ID, volA, "EXPIRED")
+	if _, err := repo.ReserveCopy(ctx, hasLive.ID, volB, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+		t.Fatalf("ReserveCopy(hasLive): %v", err)
+	}
+	if failed, err := repo.DeadLetterIfExhausted(ctx, hasLive.ID); err != nil {
+		t.Fatalf("DeadLetterIfExhausted(hasLive): %v", err)
+	} else if failed {
+		t.Error("a unit with a live copy must not be dead-lettered")
 	}
 }
 
@@ -2068,28 +2140,27 @@ func TestReassign_FieldsClearedOnRequeue(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Walk to ASSIGNED so assignment fields get populated.
-	wu, err := repo.UpdateState(ctx, wu.ID, WorkUnitStateCreated, WorkUnitStateQueued)
-	if err != nil {
-		t.Fatalf("to QUEUED: %v", err)
-	}
-	wu, err = repo.Assign(ctx, wu.ID, volunteerID)
-	if err != nil {
-		t.Fatalf("Assign: %v", err)
+	// Simulate a dispatched-then-EXPIRED unit with the denormalized assignment
+	// pointer populated (in the per-copy model run-start keeps the unit QUEUED, so
+	// set the EXPIRED state + denormalized fields directly to reach the requeue case).
+	if _, err := pool.Exec(ctx, `
+		UPDATE work_units SET state = 'EXPIRED',
+			assigned_volunteer_id = $2, assigned_at = NOW(),
+			started_at = NOW(), last_heartbeat_at = NOW()
+		WHERE id = $1`, wu.ID, volunteerID); err != nil {
+		t.Fatalf("seed EXPIRED unit with assignment fields: %v", err)
 	}
 
-	// Verify assignment fields are populated.
+	// Precondition: denormalized assignment fields are populated.
+	wu, err := repo.GetByID(ctx, wu.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
 	if wu.AssignedVolunteerID == nil {
 		t.Fatal("precondition: AssignedVolunteerID should be set")
 	}
 	if wu.AssignedAt == nil {
 		t.Fatal("precondition: AssignedAt should be set")
-	}
-
-	// Transition to EXPIRED.
-	wu, err = repo.UpdateState(ctx, wu.ID, WorkUnitStateAssigned, WorkUnitStateExpired)
-	if err != nil {
-		t.Fatalf("to EXPIRED: %v", err)
 	}
 
 	// Reassign.
@@ -2125,7 +2196,7 @@ func TestReassign_FieldsClearedOnRequeue(t *testing.T) {
 	}
 }
 
-func TestFindExpiredWorkUnits_SpotCheckQueuedTimeout(t *testing.T) {
+func TestFindStuckSpotCheckUnits_QueuedTimeout(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -2167,23 +2238,24 @@ func TestFindExpiredWorkUnits_SpotCheckQueuedTimeout(t *testing.T) {
 		t.Fatalf("backdating created_at: %v", err)
 	}
 
-	// FindExpiredWorkUnits should return only WU1.
-	expired, err := repo.FindExpiredWorkUnits(ctx, 100)
+	// FindStuckSpotCheckUnits should return only WU1 (QUEUED spot-check unit that
+	// has sat over an hour without a second corroborator).
+	stuck, err := repo.FindStuckSpotCheckUnits(ctx, 100)
 	if err != nil {
-		t.Fatalf("FindExpiredWorkUnits: %v", err)
+		t.Fatalf("FindStuckSpotCheckUnits: %v", err)
 	}
 
-	if len(expired) != 1 {
-		t.Fatalf("expected 1 expired work unit, got %d", len(expired))
+	if len(stuck) != 1 {
+		t.Fatalf("expected 1 stuck spot-check work unit, got %d", len(stuck))
 	}
-	if expired[0].ID != wu1.ID {
-		t.Errorf("expected expired WU to be wu1 (%v), got %v", wu1.ID, expired[0].ID)
+	if stuck[0].ID != wu1.ID {
+		t.Errorf("expected stuck WU to be wu1 (%v), got %v", wu1.ID, stuck[0].ID)
 	}
-	if !expired[0].SpotCheck {
-		t.Error("expired WU should have SpotCheck=true")
+	if !stuck[0].SpotCheck {
+		t.Error("stuck WU should have SpotCheck=true")
 	}
-	if expired[0].State != WorkUnitStateQueued {
-		t.Errorf("expired WU state = %s, want QUEUED", expired[0].State)
+	if stuck[0].State != WorkUnitStateQueued {
+		t.Errorf("stuck WU state = %s, want QUEUED", stuck[0].State)
 	}
 }
 

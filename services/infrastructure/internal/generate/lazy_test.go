@@ -53,19 +53,7 @@ func (r *mockWorkUnitRepo) FindNextAssignable(_ context.Context, _ workunit.Assi
 func (r *mockWorkUnitRepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
-func (r *mockWorkUnitRepo) StampReservation(_ context.Context, _, _ types.ID, _ time.Duration) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (r *mockWorkUnitRepo) ClearReservation(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
 func (r *mockWorkUnitRepo) Assign(_ context.Context, _, _ types.ID) (*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (r *mockWorkUnitRepo) FindExpiredWorkUnits(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
-	return nil, nil
-}
-func (r *mockWorkUnitRepo) FindLapsedReservations(_ context.Context, _ int) ([]*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (r *mockWorkUnitRepo) FindDispatchableBatch(_ context.Context, _ int, _ []types.ID, _ []types.ID) ([]workunit.DispatchCandidate, error) {
@@ -77,13 +65,10 @@ func (r *mockWorkUnitRepo) ClaimDispatchableBatch(_ context.Context, _ types.ID,
 func (r *mockWorkUnitRepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error) {
 	return 0, nil
 }
-func (r *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation, _ types.ID, _ time.Duration) ([]types.ID, error) {
+func (r *mockWorkUnitRepo) FlushReservations(_ context.Context, _ []workunit.FlushReservation, _ types.ID, _ time.Duration) ([]workunit.FlushedCopy, error) {
 	return nil, nil
 }
 func (r *mockWorkUnitRepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
-	return nil, nil
-}
-func (r *mockWorkUnitRepo) TransitionToExpired(_ context.Context, _ types.ID) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
 func (r *mockWorkUnitRepo) Reassign(_ context.Context, _ types.ID) (*workunit.WorkUnit, bool, error) {
@@ -93,6 +78,33 @@ func (r *mockWorkUnitRepo) MarkSpotCheck(_ context.Context, _ types.ID) error  {
 func (r *mockWorkUnitRepo) ClearSpotCheck(_ context.Context, _ types.ID) error { return nil }
 func (r *mockWorkUnitRepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
+}
+func (r *mockWorkUnitRepo) ReserveCopy(context.Context, types.ID, types.ID, time.Time, int) (*workunit.Copy, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) FindStuckSpotCheckUnits(context.Context, int) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) CloseCopy(context.Context, types.ID, string) error {
+	return nil
+}
+func (r *mockWorkUnitRepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
+	return nil
+}
+func (r *mockWorkUnitRepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
+	return 0, nil
+}
+func (r *mockWorkUnitRepo) CountLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (r *mockWorkUnitRepo) CountTotalCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
+func (r *mockWorkUnitRepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
+	return false, nil
 }
 
 // mockBatchRepo implements workunit.BatchRepository for lazy manager tests.

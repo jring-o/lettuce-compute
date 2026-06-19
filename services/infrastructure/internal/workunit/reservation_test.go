@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -37,9 +38,41 @@ func mustQueuedWU(t *testing.T, ctx context.Context, repo *PgxWorkUnitRepository
 
 const valConfigRedundancy1 = `{"redundancy_factor":1,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`
 
-// A buffered (reserved) unit is leased PURELY via the reservation columns — NO
-// assignment_history row is written. A redundancy-1 unit reserved by one volunteer
-// is hidden from a second volunteer by the reservation guard alone.
+// liveCopyVolunteers returns the volunteer ids of a unit's LIVE (outcome IS NULL)
+// copies, ordered, for per-copy assertions. With per-copy dispatch a unit can hold
+// up to redundancy live copies, each by a DISTINCT volunteer.
+func liveCopyVolunteers(t *testing.T, pool *pgxpool.Pool, wuID types.ID) []types.ID {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		`SELECT volunteer_id FROM work_unit_assignment_history
+		 WHERE work_unit_id = $1 AND outcome IS NULL
+		 ORDER BY volunteer_id`, wuID)
+	if err != nil {
+		t.Fatalf("query live copies: %v", err)
+	}
+	defer rows.Close()
+	var out []types.ID
+	for rows.Next() {
+		var v types.ID
+		if err := rows.Scan(&v); err != nil {
+			t.Fatalf("scan live copy volunteer: %v", err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func containsID(ids []types.ID, want types.ID) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A redundancy-1 unit reserved by one volunteer (a single live RESERVED copy) is
+// hidden from a second volunteer: the live-copy count has reached the redundancy.
 func TestReserveNextAssignable_RedundancyOneHidesFromOther(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -64,7 +97,11 @@ func TestReserveNextAssignable_RedundancyOneHidesFromOther(t *testing.T) {
 		t.Fatalf("reserved unit state = %s, want QUEUED", first.State)
 	}
 	if first.ReservedUntil == nil || first.ReservedVolunteerID == nil || *first.ReservedVolunteerID != vol1 {
-		t.Fatalf("reserved unit missing reservation columns: %+v", first)
+		t.Fatalf("reserved unit missing transient reservation echo: %+v", first)
+	}
+	// Exactly one live copy, held by vol1.
+	if vols := liveCopyVolunteers(t, pool, wu.ID); len(vols) != 1 || vols[0] != vol1 {
+		t.Fatalf("expected one live copy held by vol1, got %v", vols)
 	}
 
 	second, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
@@ -76,17 +113,10 @@ func TestReserveNextAssignable_RedundancyOneHidesFromOther(t *testing.T) {
 	}
 }
 
-// A redundancy-2 unit can be reserved by TWO distinct volunteers concurrently
-// (redundant validation still works): the redundancy count includes one live
-// reservation by another volunteer plus any active history rows. Here, neither
-// reservation has flipped to ASSIGNED, so the column-based reservation guard only
-// hides the unit once it has reached the redundancy factor in distinct holders.
-//
-// NOTE: with the columns-only model a single reserved_volunteer_id column can only
-// record ONE live reservation at a time. The redundancy-2 "two distinct holders"
-// case is therefore exercised at run-start (Assign writes the history row and frees
-// the column) — see TestReserveNextAssignable_AfterAssignSecondVolunteerCanReserve.
-func TestReserveNextAssignable_RedundancyTwoSecondReserverBlockedWhileFirstHolds(t *testing.T) {
+// A redundancy-2 unit can be reserved by TWO distinct volunteers CONCURRENTLY: each
+// gets its own live RESERVED copy (the parallel-copy case, property 7). A third
+// volunteer is then blocked because the live-copy count has reached redundancy.
+func TestReserveNextAssignable_RedundancyTwoParallelReservers(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -95,6 +125,7 @@ func TestReserveNextAssignable_RedundancyTwoSecondReserverBlockedWhileFirstHolds
 	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
 	vol1 := createTestVolunteer(t, pool)
 	vol2 := createTestVolunteer(t, pool)
+	vol3 := createTestVolunteer(t, pool)
 	wuRepo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
 
@@ -107,28 +138,41 @@ func TestReserveNextAssignable_RedundancyTwoSecondReserverBlockedWhileFirstHolds
 	if r1 == nil || r1.ID != wu.ID {
 		t.Fatalf("expected vol1 to reserve %v, got %v", wu.ID, r1)
 	}
-	// While vol1 holds the live reservation, the single reservation column is taken,
-	// so vol2 cannot also reserve the SAME unit (the guard hides it).
+	// A SECOND distinct volunteer reserves the SAME unit in parallel (redundancy 2).
 	r2, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
 	if err != nil {
 		t.Fatalf("reserve vol2: %v", err)
 	}
-	if r2 != nil {
-		t.Fatalf("expected unit hidden from vol2 while vol1 holds the reservation, got %v", r2.ID)
+	if r2 == nil || r2.ID != wu.ID {
+		t.Fatalf("expected vol2 to reserve a parallel copy of %v, got %v", wu.ID, r2)
+	}
+
+	vols := liveCopyVolunteers(t, pool, wu.ID)
+	if len(vols) != 2 || !containsID(vols, vol1) || !containsID(vols, vol2) {
+		t.Fatalf("expected two distinct live copies (vol1+vol2), got %v", vols)
+	}
+
+	// Redundancy is now met: a THIRD volunteer is blocked.
+	r3, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol3, 0), 60*time.Second)
+	if err != nil {
+		t.Fatalf("reserve vol3: %v", err)
+	}
+	if r3 != nil {
+		t.Fatalf("expected unit hidden from vol3 once redundancy 2 is met, got %v", r3.ID)
 	}
 }
 
-// Once the first volunteer's reservation LAPSES (without ever starting), the same
-// still-QUEUED redundancy-2 unit becomes reservable by a SECOND volunteer with no
-// manual transition — the lapsed-lease re-reservability property applied to a
-// redundancy>1 leaf. (While the first reservation is live it occupies the single
-// reservation column and hides the unit; once lapsed the guard frees it.)
-func TestReserveNextAssignable_LapsedRedundancyTwoReReservable(t *testing.T) {
+// A lapsed RESERVED copy (reserved_until in the past) is NOT automatically
+// re-reservable in the per-copy model: while its outcome is still NULL it counts as
+// a live copy and keeps the redundancy slot taken. The slot frees only once the
+// expiry sweep CLOSES the copy (FindExpiredCopies → CloseCopy).
+func TestReserveNextAssignable_LapsedCopyStillBlocksUntilClosed(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	userID := createTestUser(t, pool, "reserve-r2-lapse")
-	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
+	userID := createTestUser(t, pool, "reserve-lapse")
+	// redundancy-1 so a single live copy hides the unit.
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
 	vol1 := createTestVolunteer(t, pool)
 	vol2 := createTestVolunteer(t, pool)
 	wuRepo := NewPgxWorkUnitRepository(pool)
@@ -136,30 +180,52 @@ func TestReserveNextAssignable_LapsedRedundancyTwoReReservable(t *testing.T) {
 
 	wu := mustQueuedWU(t, ctx, wuRepo, leafID)
 
-	// vol1 reserves, then its hold is expired directly to simulate a crashed buffer
-	// holder whose reservation has lapsed. The buffered hold is now the unit's
-	// deadline, so we expire the column rather than pass a short lease.
 	if _, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve vol1: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE work_units SET reserved_until = NOW() - INTERVAL '1 second' WHERE id = $1`, wu.ID); err != nil {
-		t.Fatalf("expire vol1 reservation: %v", err)
+	// Lapse vol1's copy: reserved_until in the past, but outcome still NULL (live).
+	if _, err := pool.Exec(ctx,
+		`UPDATE work_unit_assignment_history SET reserved_until = NOW() - INTERVAL '1 second'
+		 WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`, wu.ID, vol1); err != nil {
+		t.Fatalf("lapse vol1 copy: %v", err)
 	}
 
-	r2, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
+	// vol2 is STILL blocked: the lapsed-but-open copy keeps the redundancy slot.
+	blocked, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
 	if err != nil {
-		t.Fatalf("reserve vol2: %v", err)
+		t.Fatalf("reserve vol2 (pre-close): %v", err)
 	}
-	if r2 == nil || r2.ID != wu.ID {
-		t.Fatalf("expected vol2 to re-reserve the unit after vol1's lease lapsed, got %v", r2)
+	if blocked != nil {
+		t.Fatalf("a lapsed-but-open copy must still block re-reservation, got %v", blocked.ID)
 	}
-	if r2.ReservedVolunteerID == nil || *r2.ReservedVolunteerID != vol2 {
-		t.Fatalf("expected unit now reserved to vol2, got %+v", r2)
+
+	// The expiry sweep finds and closes the lapsed copy.
+	expired, err := wuRepo.FindExpiredCopies(ctx, 100)
+	if err != nil {
+		t.Fatalf("FindExpiredCopies: %v", err)
+	}
+	if len(expired) != 1 || expired[0].WorkUnitID != wu.ID {
+		t.Fatalf("expected the lapsed copy of %v, got %v", wu.ID, expired)
+	}
+	if err := wuRepo.CloseCopy(ctx, expired[0].ID, "ABANDONED"); err != nil {
+		t.Fatalf("CloseCopy: %v", err)
+	}
+
+	// Now the slot is free: vol2 can reserve.
+	second, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
+	if err != nil {
+		t.Fatalf("reserve vol2 (post-close): %v", err)
+	}
+	if second == nil || second.ID != wu.ID {
+		t.Fatalf("expected unit re-reservable by vol2 after the lapsed copy was closed, got %v", second)
+	}
+	if second.ReservedVolunteerID == nil || *second.ReservedVolunteerID != vol2 {
+		t.Fatalf("expected unit now reserved to vol2, got %+v", second)
 	}
 }
 
 // The reservation holder is not handed its own already-reserved unit again (the
-// self-exclusion guard on the live reservation excludes it).
+// self-exclusion guard on the volunteer's live copy excludes it).
 func TestReserveNextAssignable_SameVolunteerNotHandedTwice(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -188,52 +254,10 @@ func TestReserveNextAssignable_SameVolunteerNotHandedTwice(t *testing.T) {
 	}
 }
 
-// A LAPSED reservation (reserved_until < NOW()) is automatically re-reservable by
-// ANOTHER volunteer with no manual transition — the core leak-prevention property.
-// This is what makes a crashed holder's buffered work recoverable.
-func TestReserveNextAssignable_LapsedReservationReReservableByOther(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	userID := createTestUser(t, pool, "reserve-lapse")
-	// redundancy-1 so a single live reservation would otherwise hide the unit.
-	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
-	vol1 := createTestVolunteer(t, pool)
-	vol2 := createTestVolunteer(t, pool)
-	wuRepo := NewPgxWorkUnitRepository(pool)
-	ctx := context.Background()
-
-	wu := mustQueuedWU(t, ctx, wuRepo, leafID)
-
-	// vol1 reserves, then its hold is expired directly (simulates a crashed holder
-	// whose reservation has since lapsed).
-	first, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), 60*time.Second)
-	if err != nil {
-		t.Fatalf("reserve vol1: %v", err)
-	}
-	if first == nil || first.ID != wu.ID {
-		t.Fatalf("expected vol1 to reserve %v, got %v", wu.ID, first)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE work_units SET reserved_until = NOW() - INTERVAL '1 second' WHERE id = $1`, wu.ID); err != nil {
-		t.Fatalf("expire vol1 reservation: %v", err)
-	}
-
-	// The unit is still QUEUED with a lapsed lease; vol2 can re-reserve it.
-	second, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
-	if err != nil {
-		t.Fatalf("reserve vol2: %v", err)
-	}
-	if second == nil || second.ID != wu.ID {
-		t.Fatalf("expected lapsed reservation re-reservable by vol2, got %v", second)
-	}
-	if second.ReservedVolunteerID == nil || *second.ReservedVolunteerID != vol2 {
-		t.Fatalf("expected unit now reserved to vol2, got %+v", second)
-	}
-}
-
-// Run-start (Assign) flips QUEUED -> ASSIGNED, clears the reservation columns,
-// and starts the assignment clock (assigned_at set).
-func TestAssign_ClearsReservationAndStartsClock(t *testing.T) {
+// Run-start (Assign) flips the volunteer's RESERVED copy to RUNNING (started_at set)
+// and starts the per-copy deadline clock. The WORK UNIT stays QUEUED — it is a pure
+// aggregate over its copies, so its other redundancy copies keep dispatching.
+func TestAssign_ReservedCopyRunStartsAndStaysQueued(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -253,22 +277,33 @@ func TestAssign_ClearsReservationAndStartsClock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
-	if assigned.State != WorkUnitStateAssigned {
-		t.Fatalf("state = %s, want ASSIGNED", assigned.State)
+	if assigned.State != WorkUnitStateQueued {
+		t.Fatalf("state = %s, want QUEUED (unit stays QUEUED through run-start)", assigned.State)
 	}
-	if assigned.ReservedUntil != nil || assigned.ReservedVolunteerID != nil {
-		t.Fatalf("expected reservation cleared on Assign, got until=%v vol=%v",
-			assigned.ReservedUntil, assigned.ReservedVolunteerID)
+	if assigned.AssignedVolunteerID == nil || *assigned.AssignedVolunteerID != vol {
+		t.Fatalf("expected denormalized assigned_volunteer_id = vol, got %v", assigned.AssignedVolunteerID)
 	}
 	if assigned.AssignedAt == nil {
 		t.Fatalf("expected assigned_at set at run-start")
 	}
+
+	// The volunteer's copy is now RUNNING (started_at set).
+	var startedAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT started_at FROM work_unit_assignment_history
+		 WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`, wu.ID, vol).Scan(&startedAt); err != nil {
+		t.Fatalf("read copy started_at: %v", err)
+	}
+	if startedAt == nil {
+		t.Fatalf("expected the copy's started_at set at run-start")
+	}
 }
 
-// ClearReservation drops the lease on a still-QUEUED unit reserved to the caller,
-// leaving it QUEUED and immediately re-reservable by another volunteer. This is the
-// head-side handling of a volunteer abandoning a buffered (un-started) unit.
-func TestClearReservation_DropsLeaseAndIsReReservable(t *testing.T) {
+// Abandoning a volunteer's buffered (un-started) copy via CloseCopyByVolunteer
+// frees the unit's redundancy slot, leaving it QUEUED and immediately re-reservable
+// by another volunteer. This is the head-side handling of a volunteer dropping a
+// buffered unit (the per-copy replacement for the old ClearReservation path).
+func TestCloseCopyByVolunteer_AbandonBufferedCopyReReservable(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -285,31 +320,28 @@ func TestClearReservation_DropsLeaseAndIsReReservable(t *testing.T) {
 		t.Fatalf("reserve vol1: %v", err)
 	}
 
-	cleared, err := wuRepo.ClearReservation(ctx, wu.ID, vol1)
-	if err != nil {
-		t.Fatalf("ClearReservation: %v", err)
+	if err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol1, "ABANDONED", nil); err != nil {
+		t.Fatalf("CloseCopyByVolunteer: %v", err)
 	}
-	if cleared.State != WorkUnitStateQueued {
-		t.Fatalf("cleared unit state = %s, want QUEUED", cleared.State)
-	}
-	if cleared.ReservedUntil != nil || cleared.ReservedVolunteerID != nil {
-		t.Fatalf("expected reservation columns cleared, got %+v", cleared)
+	// No live copy remains.
+	if vols := liveCopyVolunteers(t, pool, wu.ID); len(vols) != 0 {
+		t.Fatalf("expected no live copies after abandon, got %v", vols)
 	}
 
-	// Now vol2 can reserve it immediately (no live reservation, redundancy-1 free).
+	// Now vol2 can reserve it immediately (redundancy-1 free again).
 	second, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
 	if err != nil {
 		t.Fatalf("reserve vol2: %v", err)
 	}
 	if second == nil || second.ID != wu.ID {
-		t.Fatalf("expected unit re-reservable by vol2 after ClearReservation, got %v", second)
+		t.Fatalf("expected unit re-reservable by vol2 after abandon, got %v", second)
 	}
 }
 
-// ClearReservation is a no-op-safe guard: clearing a unit that is NOT reserved to
-// the caller (e.g. lease lapsed and re-taken by another volunteer, or never
-// reserved) returns a Conflict rather than touching the row.
-func TestClearReservation_NotReservedToCallerConflicts(t *testing.T) {
+// CloseCopyByVolunteer is a no-op-safe guard: closing a copy for a volunteer that
+// holds NO live copy of the unit returns a Conflict rather than touching another
+// volunteer's copy.
+func TestCloseCopyByVolunteer_NoLiveCopyConflicts(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -325,15 +357,62 @@ func TestClearReservation_NotReservedToCallerConflicts(t *testing.T) {
 		t.Fatalf("reserve vol1: %v", err)
 	}
 
-	// vol2 never reserved this unit; clearing it must conflict, not silently drop
-	// vol1's reservation.
-	if _, err := wuRepo.ClearReservation(ctx, wu.ID, vol2); err == nil {
-		t.Fatalf("expected Conflict clearing a reservation not held by vol2")
+	// vol2 never reserved this unit; closing its (nonexistent) copy must conflict,
+	// not silently drop vol1's copy.
+	if err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol2, "ABANDONED", nil); err == nil {
+		t.Fatalf("expected Conflict closing a copy not held by vol2")
 	}
 }
 
-// The per-volunteer inflight cap counts a live reservation (no history row): with
-// cap=1 and one live reservation, the same volunteer cannot reserve a second unit.
+// ReserveCopy inserts a RESERVED copy (a buffered work_unit_assignment_history row,
+// outcome NULL / started_at NULL) on a still-QUEUED unit.
+func TestReserveCopy_InsertsReservedRow(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "reserve-copy")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
+	vol := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+
+	cp, err := repo.ReserveCopy(ctx, wu.ID, vol, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds)
+	if err != nil {
+		t.Fatalf("ReserveCopy: %v", err)
+	}
+	if cp.WorkUnitID != wu.ID || cp.VolunteerID != vol {
+		t.Fatalf("copy identity mismatch: %+v", cp)
+	}
+	if cp.StartedAt != nil || cp.Outcome != nil {
+		t.Fatalf("a fresh reserved copy must be RESERVED (started_at/outcome NULL), got %+v", cp)
+	}
+	if cp.State() != CopyStateReserved {
+		t.Fatalf("copy state = %s, want RESERVED", cp.State())
+	}
+	if cp.DeadlineSeconds != wu.DeadlineSeconds {
+		t.Fatalf("deadline_seconds = %d, want %d", cp.DeadlineSeconds, wu.DeadlineSeconds)
+	}
+
+	// The unit row itself stays QUEUED.
+	got, err := repo.GetByID(ctx, wu.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.State != WorkUnitStateQueued {
+		t.Fatalf("unit state = %s, want QUEUED", got.State)
+	}
+
+	// A second ReserveCopy for the SAME volunteer conflicts (one live copy per
+	// volunteer per unit — the partial unique).
+	if _, err := repo.ReserveCopy(ctx, wu.ID, vol, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+		t.Fatalf("expected Conflict reserving a second live copy for the same volunteer")
+	}
+}
+
+// The per-volunteer inflight cap counts a live copy: with cap=1 and one live copy,
+// the same volunteer cannot reserve a second unit.
 func TestReserveNextAssignable_InflightCapCountsReservations(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -364,7 +443,8 @@ func TestReserveNextAssignable_InflightCapCountsReservations(t *testing.T) {
 }
 
 // Batching: looping reserve inside one transaction reserves distinct units and
-// never returns the same work_unit_id twice (no history rows written).
+// never returns the same work_unit_id twice (each prior live copy excludes its unit
+// from the same volunteer).
 func TestReserveNextAssignable_BatchInOneTxNoDuplicates(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -407,52 +487,6 @@ func TestReserveNextAssignable_BatchInOneTxNoDuplicates(t *testing.T) {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("Commit: %v", err)
-	}
-}
-
-// Renewing a buffered unit's lease before it lapses keeps the unit hidden from a
-// SECOND volunteer — i.e. a unit held in the buffer LONGER than the original
-// lease window is NOT re-dispatched, as long as the holder renews. This is the
-// repo-level analog of the PREPARING-heartbeat-renews-reservation path in the
-// Heartbeat handler (which calls StampReservation), and the core guard against
-// the double-dispatch the lapsed-lease behavior would otherwise cause.
-func TestStampReservation_RenewKeepsUnitHiddenPastOriginalLease(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	userID := createTestUser(t, pool, "reserve-renew")
-	// redundancy-1 so a single live reservation hides the unit; a lapsed one would
-	// expose it.
-	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
-	vol1 := createTestVolunteer(t, pool)
-	vol2 := createTestVolunteer(t, pool)
-	wuRepo := NewPgxWorkUnitRepository(pool)
-	ctx := context.Background()
-
-	wu := mustQueuedWU(t, ctx, wuRepo, leafID)
-
-	// vol1 reserves with a SHORT lease (the original window).
-	if _, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol1, 0), 50*time.Millisecond); err != nil {
-		t.Fatalf("reserve vol1: %v", err)
-	}
-
-	// Before that short lease lapses, vol1 renews it (what a PREPARING heartbeat
-	// does) to a fresh, longer window.
-	if _, err := wuRepo.StampReservation(ctx, wu.ID, vol1, 60*time.Second); err != nil {
-		t.Fatalf("renew (StampReservation) vol1: %v", err)
-	}
-
-	// Wait out the ORIGINAL short lease window. The renewed lease is still live.
-	time.Sleep(80 * time.Millisecond)
-
-	// vol2 must NOT be able to re-reserve: the renewal kept the lease alive past
-	// the original window, so the unit is not re-dispatched.
-	second, err := wuRepo.ReserveNextAssignable(ctx, reserveOpts(vol2, 0), 60*time.Second)
-	if err != nil {
-		t.Fatalf("reserve vol2: %v", err)
-	}
-	if second != nil {
-		t.Fatalf("expected renewed reservation to keep unit hidden from vol2 past the original lease, got %v", second.ID)
 	}
 }
 
@@ -545,33 +579,5 @@ func TestFindNextAssignable_PlanUsesIndexNoSort(t *testing.T) {
 	}
 	if !strings.Contains(planText, "idx_work_units_queue_order") {
 		t.Fatalf("assignment query plan does not use idx_work_units_queue_order:\n%s", planText)
-	}
-}
-
-// StampReservation marks a still-QUEUED unit with the reservation columns.
-func TestStampReservation_StampsColumns(t *testing.T) {
-	pool, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	userID := createTestUser(t, pool, "stamp-reserve")
-	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
-	vol := createTestVolunteer(t, pool)
-	repo := NewPgxWorkUnitRepository(pool)
-	ctx := context.Background()
-
-	wu := mustQueuedWU(t, ctx, repo, leafID)
-
-	stamped, err := repo.StampReservation(ctx, wu.ID, vol, 60*time.Second)
-	if err != nil {
-		t.Fatalf("StampReservation: %v", err)
-	}
-	if stamped.State != WorkUnitStateQueued {
-		t.Fatalf("stamped unit state = %s, want QUEUED", stamped.State)
-	}
-	if stamped.ReservedVolunteerID == nil || *stamped.ReservedVolunteerID != vol {
-		t.Fatalf("expected reservation stamped for vol, got %+v", stamped)
-	}
-	if stamped.ReservedUntil == nil {
-		t.Fatalf("expected reserved_until set")
 	}
 }

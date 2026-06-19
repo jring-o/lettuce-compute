@@ -29,13 +29,15 @@ type DBTX interface {
 const defaultClaimLeaseSeconds = 120
 
 // workUnitColumns is the standard column list for SELECT queries on work_units.
+// The per-unit reserved_until/reserved_volunteer_id columns were retired in
+// migration 00006 (live dispatch state is now per-copy in work_unit_assignment_history);
+// max_total_copies (the dead-letter ceiling) takes their place.
 const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	input_data, input_data_ref, code_artifact_ref, parameters,
 	estimated_duration_seconds, deadline_seconds, output_spec,
 	assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
-	reassignment_count, max_reassignments, last_heartbeat_at,
+	reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
-	reserved_until, reserved_volunteer_id,
 	created_at, updated_at`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
@@ -62,13 +64,12 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.ValidatedAt,
 		&wu.ReassignmentCount,
 		&wu.MaxReassignments,
+		&wu.MaxTotalCopies,
 		&wu.LastHeartbeatAt,
 		&wu.FlaggedForReview,
 		&wu.SpotCheck,
 		&wu.LastCheckpointAt,
 		&wu.LastCheckpointSequence,
-		&wu.ReservedUntil,
-		&wu.ReservedVolunteerID,
 		&wu.CreatedAt,
 		&wu.UpdatedAt,
 	)
@@ -116,21 +117,21 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 			input_data, input_data_ref, code_artifact_ref, parameters,
 			estimated_duration_seconds, deadline_seconds, output_spec,
 			assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
-			reassignment_count, max_reassignments, last_heartbeat_at,
+			reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 			flagged_for_review, spot_check
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8,
 			$9, $10, $11,
 			$12, $13, $14, $15, $16,
-			$17, $18, $19,
-			$20, $21
+			$17, $18, $19, $20,
+			$21, $22
 		) RETURNING `+workUnitColumns,
 		wu.LeafID, wu.BatchID, wu.State, wu.Priority,
 		wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
 		wu.EstimatedDurationSeconds, wu.DeadlineSeconds, wu.OutputSpec,
 		wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
-		wu.ReassignmentCount, wu.MaxReassignments, wu.LastHeartbeatAt,
+		wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 		wu.FlaggedForReview, wu.SpotCheck,
 	)
 
@@ -318,10 +319,10 @@ func (r *PgxWorkUnitRepository) UpdateState(ctx context.Context, id types.ID, fr
 			flagged_for_review = $11,
 			-- Layer 3: clear any dispatch claim on EVERY state transition (defensive /
 			-- self-healing). EXPIRED/REJECTED -> QUEUED reassignment routes through here
-			-- (Reassign -> UpdateState), so the requeue path is claim-clean independent
-			-- of Assign ordering: a re-QUEUED unit is always immediately re-claimable.
-			-- A pure no-op in the common case (a unit that reached ASSIGNED already had
-			-- its claim NULLed by Assign).
+			-- (Reassign -> UpdateState), so the requeue path is claim-clean: a re-QUEUED
+			-- unit is always immediately re-claimable. Per-copy run-start (Assign) keeps
+			-- the unit QUEUED and does NOT touch the claim, so terminal transitions
+			-- (COMPLETED/VALIDATED/FAILED) here are what release a finished unit's claim.
 			dispatch_claimed_by = NULL,
 			dispatch_claim_expires_at = NULL
 		WHERE id = $1 AND state = $12`,
@@ -365,7 +366,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 		"input_data", "input_data_ref", "code_artifact_ref", "parameters",
 		"estimated_duration_seconds", "deadline_seconds", "output_spec",
 		"assigned_volunteer_id", "assigned_at", "started_at", "completed_at", "validated_at",
-		"reassignment_count", "max_reassignments", "last_heartbeat_at",
+		"reassignment_count", "max_reassignments", "max_total_copies", "last_heartbeat_at",
 		"flagged_for_review", "spot_check",
 	}
 
@@ -376,7 +377,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 			wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
 			wu.EstimatedDurationSeconds, wu.DeadlineSeconds, wu.OutputSpec,
 			wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
-			wu.ReassignmentCount, wu.MaxReassignments, wu.LastHeartbeatAt,
+			wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 			wu.FlaggedForReview, wu.SpotCheck,
 		}
 	}
@@ -429,10 +430,26 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.input_data, wu.input_data_ref, wu.code_artifact_ref, wu.parameters,
 	wu.estimated_duration_seconds, wu.deadline_seconds, wu.output_spec,
 	wu.assigned_volunteer_id, wu.assigned_at, wu.started_at, wu.completed_at, wu.validated_at,
-	wu.reassignment_count, wu.max_reassignments, wu.last_heartbeat_at,
+	wu.reassignment_count, wu.max_reassignments, wu.max_total_copies, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
-	wu.reserved_until, wu.reserved_volunteer_id,
 	wu.created_at, wu.updated_at`
+
+// scanDispatchCandidate scans the prefixedWorkUnitColumns set (column order matching
+// the const above) into a WorkUnit. Shared by FindDispatchableBatch /
+// ClaimDispatchableBatch which append three extra trailing columns.
+func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
+	dst := []any{
+		&wu.ID, &wu.LeafID, &wu.BatchID, &wu.State, &wu.Priority,
+		&wu.InputData, &wu.InputDataRef, &wu.CodeArtifactRef, &wu.Parameters,
+		&wu.EstimatedDurationSeconds, &wu.DeadlineSeconds, &wu.OutputSpec,
+		&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
+		&wu.ReassignmentCount, &wu.MaxReassignments, &wu.MaxTotalCopies, &wu.LastHeartbeatAt,
+		&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
+		&wu.CreatedAt, &wu.UpdatedAt,
+	}
+	dst = append(dst, extra...)
+	return rows.Scan(dst...)
+}
 
 // FindNextAssignable finds the highest-priority QUEUED work unit from active projects
 // that matches the volunteer's capabilities and has fewer active assignments than
@@ -469,92 +486,60 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    OR (l.resource_requirements->>'gpu_compute_capability') IS NULL
 		    OR (l.resource_requirements->>'gpu_compute_capability') = ANY($11::text[])
 		  )
-		  -- Redundancy: a NORMAL buffered (reserved) unit is leased purely via the
-		  -- reservation columns and writes NO assignment_history row (so a crashed
-		  -- holder leaves no stale active row to leak — a lapsed lease is re-reservable
-		  -- with zero cleanup). The active-redundancy count is therefore the active
-		  -- history rows PLUS one for a live NORMAL reservation held by any OTHER
-		  -- volunteer. Spot-check units are excluded from the reservation term: they
-		  -- DO write a history row alongside their reservation, so they are already
-		  -- counted by the history-row subquery (adding the reservation too would
-		  -- double-count and wrongly block the second corroborating volunteer). A live
-		  -- reservation by THIS volunteer is excluded by the self-exclusion guard
-		  -- below; once a unit flips to ASSIGNED at run-start, Assign clears the
-		  -- reservation columns, so there is no overlap between the two terms.
+		  -- Per-copy redundancy (migration 00006): a unit is dispatchable while the
+		  -- copies already covering its redundancy need are below the leaf's effective
+		  -- redundancy. Coverage = live copies (RESERVED/RUNNING history rows, outcome
+		  -- IS NULL) + already-submitted PENDING results (a copy that finished closed
+		  -- its history row and holds its slot via the result). Each live copy and each
+		  -- result is a DISTINCT volunteer (uq_wuah_live_copy_per_volunteer +
+		  -- uq_results_work_unit_volunteer), so up to N copies of one unit are dispatched
+		  -- IN PARALLEL to N different volunteers. The two terms never overlap (a
+		  -- completed copy is closed, no longer outcome IS NULL).
 		  AND (
 		    (
 		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
 		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
 		    )
-		    -- Results already submitted for this unit count toward the redundancy
-		    -- need: a corroborator that finished holds one of the N slots even though
-		    -- its assignment row is now closed and the unit has been returned to the
-		    -- queue for the next distinct volunteer.
 		    + (
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		    + CASE
-		        WHEN NOT wu.spot_check
-		             AND wu.reserved_until IS NOT NULL AND wu.reserved_until > NOW()
-		             AND wu.reserved_volunteer_id IS DISTINCT FROM $9
-		        THEN 1 ELSE 0
-		      END
 		  ) < CASE WHEN wu.spot_check THEN 2
 		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 		      END
-		  -- Reservation guard: a live reservation held by ANOTHER volunteer hides the
-		  -- unit; a lapsed lease (reserved_until < NOW()) or this volunteer's own
-		  -- reservation does not (the latter is then handled by the self-exclusion
-		  -- guard below so the holder is never handed its own held unit twice).
-		  -- Spot-check units are exempt: they must stay visible to a SECOND volunteer
-		  -- for corroboration despite the first volunteer's reservation — their
-		  -- dedup/redundancy is enforced by the history-row subqueries (the
-		  -- "not already assigned" guard excludes the first volunteer; the
-		  -- redundancy < 2 admits exactly one more).
-		  AND (
-		    wu.spot_check
-		    OR wu.reserved_until IS NULL
-		    OR wu.reserved_until < NOW()
-		    OR wu.reserved_volunteer_id = $9
-		  )
-		  -- Self-exclusion: never hand this volunteer a unit it already holds — either
-		  -- via an active history row (assigned, or a spot-checked unit it touched) or
-		  -- via a live reservation of its own.
+		  -- Hard distinctness: never hand this volunteer a unit it already holds a LIVE
+		  -- copy of (no two concurrent copies to one volunteer).
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history wuah2
 		    WHERE wuah2.work_unit_id = wu.id
 		      AND wuah2.volunteer_id = $9
-		      AND (wuah2.outcome IS NULL OR wu.spot_check)
+		      AND wuah2.outcome IS NULL
 		  )
-		  AND NOT (
-		    wu.reserved_volunteer_id = $9
-		    AND wu.reserved_until IS NOT NULL
-		    AND wu.reserved_until > NOW()
-		  )
-		  -- Never hand this volunteer a unit it has already produced a result for, so
-		  -- each of the N redundant results comes from a DISTINCT volunteer (the unit
-		  -- is returned to the queue after each partial submit, which would otherwise
-		  -- let the same volunteer pick it up again).
+		  -- Never hand this volunteer a unit it already produced a result for, so each
+		  -- of the N redundant results comes from a DISTINCT volunteer.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res3
 		    WHERE res3.work_unit_id = wu.id
 		      AND res3.volunteer_id = $9
 		      AND res3.validation_status = 'PENDING'
 		  )
-		  -- Per-volunteer inflight cap counts BOTH active assignments (active history
-		  -- rows) AND this volunteer's live reservations, so one volunteer cannot
-		  -- reserve the whole queue. The two terms never overlap: a reserved QUEUED
-		  -- unit has no history row, and Assign clears the reservation when it writes
-		  -- the history row at run-start.
+		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
+		  -- this unit TIMED OUT or was abandoned is benched for roughly one more
+		  -- deadline so a fresh volunteer gets first refusal; after that cooldown it is
+		  -- eligible again, so a small volunteer pool never strands the work.
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history wuah4
+		    WHERE wuah4.work_unit_id = wu.id
+		      AND wuah4.volunteer_id = $9
+		      AND wuah4.outcome IN ('EXPIRED', 'ABANDONED')
+		      AND wuah4.outcome_at IS NOT NULL
+		      AND wuah4.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+		  )
+		  -- Per-volunteer inflight cap: this volunteer's live copies across all units.
 		  AND (
 		    $12::int <= 0
-		    OR (
-		      (SELECT COUNT(*) FROM work_unit_assignment_history wuah3
-		       WHERE wuah3.volunteer_id = $9 AND wuah3.outcome IS NULL)
-		      + (SELECT COUNT(*) FROM work_units wur
-		         WHERE wur.reserved_volunteer_id = $9 AND wur.reserved_until > NOW())
-		    ) < $12
+		    OR (SELECT COUNT(*) FROM work_unit_assignment_history wuah5
+		        WHERE wuah5.volunteer_id = $9 AND wuah5.outcome IS NULL) < $12
 		  )
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT 1
@@ -661,36 +646,23 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		  -- leafs so a leaf-filtered requester can be served even when the ready pool is
 		  -- monopolized by a higher-priority/older leaf.
 		  AND (array_length($3::uuid[], 1) IS NULL OR wu.leaf_id = ANY($3::uuid[]))
-		  -- Redundancy: active history rows + one for any live NORMAL reservation
-		  -- (held by anyone, since there is no specific requester at refill time).
-		  -- Spot-check units are excluded from the reservation term (they carry their
-		  -- own history row and are counted by the history subquery).
+		  -- Per-copy redundancy (volunteer-agnostic at refill): live copies (history
+		  -- rows with outcome IS NULL) + already-submitted PENDING results must be below
+		  -- the leaf's effective redundancy. A unit with one live copy but unmet
+		  -- redundancy stays stageable so a SECOND distinct volunteer gets a parallel
+		  -- copy; the per-requester distinctness is re-checked in memory at hand-out.
 		  AND (
 		    (
 		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
 		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
 		    )
-		    -- Already-submitted results hold a redundancy slot even after their
-		    -- assignment row closes and the unit returns to the queue.
 		    + (
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		    + CASE
-		        WHEN NOT wu.spot_check
-		             AND wu.reserved_until IS NOT NULL AND wu.reserved_until > NOW()
-		        THEN 1 ELSE 0
-		      END
 		  ) < CASE WHEN wu.spot_check THEN 2
 		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 		      END
-		  -- Reservation guard: a live NORMAL reservation hides the unit; a lapsed
-		  -- lease or a spot-check unit (must stay visible for corroboration) does not.
-		  AND (
-		    wu.spot_check
-		    OR wu.reserved_until IS NULL
-		    OR wu.reserved_until < NOW()
-		  )
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -706,16 +678,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		if err := rows.Scan(
-			&wu.ID, &wu.LeafID, &wu.BatchID, &wu.State, &wu.Priority,
-			&wu.InputData, &wu.InputDataRef, &wu.CodeArtifactRef, &wu.Parameters,
-			&wu.EstimatedDurationSeconds, &wu.DeadlineSeconds, &wu.OutputSpec,
-			&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
-			&wu.ReassignmentCount, &wu.MaxReassignments, &wu.LastHeartbeatAt,
-			&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
-			&wu.ReservedUntil, &wu.ReservedVolunteerID, &wu.CreatedAt, &wu.UpdatedAt,
-			&redundancy, &active, &runtime,
-		); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime); err != nil {
 			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
 		}
 		cand := wu
@@ -791,29 +754,20 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			  AND (wu2.dispatch_claimed_by IS NULL
 			       OR wu2.dispatch_claim_expires_at < NOW()
 			       OR wu2.dispatch_claimed_by = $4)
-			  -- Redundancy: active history rows + one for any live NORMAL reservation
-			  -- (held by anyone). Spot-check units carry their own history row and are
-			  -- counted by the history subquery, so they are excluded from the term.
+			  -- Per-copy redundancy: live copies (history rows, outcome IS NULL) +
+			  -- already-submitted PENDING results below the leaf's effective redundancy.
 			  AND (
 			    (
 			      SELECT COUNT(*) FROM work_unit_assignment_history wuah
 			      WHERE wuah.work_unit_id = wu2.id AND wuah.outcome IS NULL
 			    )
-			    + CASE
-			        WHEN NOT wu2.spot_check
-			             AND wu2.reserved_until IS NOT NULL AND wu2.reserved_until > NOW()
-			        THEN 1 ELSE 0
-			      END
+			    + (
+			      SELECT COUNT(*) FROM results res
+			      WHERE res.work_unit_id = wu2.id AND res.validation_status = 'PENDING'
+			    )
 			  ) < CASE WHEN wu2.spot_check THEN 2
 			       ELSE COALESCE((l2.validation_config->>'redundancy_factor')::int, 2)
 			      END
-			  -- Reservation guard: a live NORMAL reservation hides the unit; a lapsed
-			  -- lease or a spot-check unit (must stay visible for corroboration) does not.
-			  AND (
-			    wu2.spot_check
-			    OR wu2.reserved_until IS NULL
-			    OR wu2.reserved_until < NOW()
-			  )
 			ORDER BY wu2.priority DESC, wu2.created_at ASC
 			LIMIT $1
 			FOR UPDATE OF wu2 SKIP LOCKED
@@ -842,16 +796,7 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		if err := rows.Scan(
-			&wu.ID, &wu.LeafID, &wu.BatchID, &wu.State, &wu.Priority,
-			&wu.InputData, &wu.InputDataRef, &wu.CodeArtifactRef, &wu.Parameters,
-			&wu.EstimatedDurationSeconds, &wu.DeadlineSeconds, &wu.OutputSpec,
-			&wu.AssignedVolunteerID, &wu.AssignedAt, &wu.StartedAt, &wu.CompletedAt, &wu.ValidatedAt,
-			&wu.ReassignmentCount, &wu.MaxReassignments, &wu.LastHeartbeatAt,
-			&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
-			&wu.ReservedUntil, &wu.ReservedVolunteerID, &wu.CreatedAt, &wu.UpdatedAt,
-			&redundancy, &active, &runtime,
-		); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime); err != nil {
 			return nil, apierror.Internal("failed to scan claimed work unit", err)
 		}
 		cand := wu
@@ -888,11 +833,22 @@ func (r *PgxWorkUnitRepository) ClearExpiredDispatchClaims(ctx context.Context) 
 	return tag.RowsAffected(), nil
 }
 
-// FlushReservation is one async reservation write produced by the dispatch cache.
+// FlushReservation is one async copy-reservation write produced by the dispatch
+// cache: it materializes an in-memory hold as a RESERVED copy row (a
+// work_unit_assignment_history row with reserved_until set, started_at NULL,
+// outcome NULL).
 type FlushReservation struct {
-	WorkUnitID    types.ID
-	VolunteerID   types.ID
-	ReservedUntil time.Time
+	WorkUnitID      types.ID
+	VolunteerID     types.ID
+	ReservedUntil   time.Time
+	DeadlineSeconds int
+}
+
+// FlushedCopy identifies a copy reservation that actually landed in the DB, so the
+// cache can void exactly the (unit, volunteer) holds whose copy did NOT persist.
+type FlushedCopy struct {
+	WorkUnitID  types.ID
+	VolunteerID types.ID
 }
 
 // FlushReservations writes a batch of dispatch-cache reservations in ONE multi-row
@@ -917,62 +873,87 @@ type FlushReservation struct {
 // dispatch_claimed_by = headID so it can NEVER void or hijack another replica's
 // legitimate claim/flush (gotcha 1). headID == uuid.Nil disables renewal
 // (single-replica / pre-Layer-3 callers): the COALESCE keeps the existing claim.
-func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
+func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []FlushReservation, headID types.ID, claimLease time.Duration) ([]FlushedCopy, error) {
 	if len(recs) == 0 {
 		return nil, nil
 	}
 	ids := make([]types.ID, len(recs))
 	vols := make([]types.ID, len(recs))
 	untils := make([]time.Time, len(recs))
+	deadlines := make([]int, len(recs))
 	for i, rec := range recs {
 		ids[i] = rec.WorkUnitID
 		vols[i] = rec.VolunteerID
 		untils[i] = rec.ReservedUntil
+		deadlines[i] = rec.DeadlineSeconds
 	}
-	leaseSecs := claimLease.Seconds()
-	if leaseSecs <= 0 {
-		leaseSecs = float64(defaultClaimLeaseSeconds)
-	}
+	// Land each in-memory hold as a RESERVED copy row. Guards:
+	//   * the unit is still QUEUED (the aggregate accepts copies),
+	//   * redundancy headroom remains (live copies + PENDING results < redundancy) —
+	//     defense-in-depth; the cache already capped concurrent holders,
+	//   * ON CONFLICT on the live-copy partial unique enforces "one live copy per
+	//     volunteer" (a duplicate hold for the same volunteer is silently dropped and
+	//     thus voided by the caller).
+	// Two rows for the SAME unit but DISTINCT volunteers both land when redundancy
+	// allows — that is exactly the parallel-copy case (property 7).
 	rows, err := r.db.Query(ctx, `
-		UPDATE work_units AS wu SET
-			reserved_until = v.reserved_until,
-			reserved_volunteer_id = v.vol,
-			-- Renew THIS head's claim (only ours: the equality guard prevents touching
-			-- another replica's claim). When the unit is not claimed by us the COALESCE
-			-- leaves the existing expiry untouched.
-			dispatch_claim_expires_at = CASE
-				WHEN wu.dispatch_claimed_by = $4
-				THEN NOW() + make_interval(secs => $5)
-				ELSE wu.dispatch_claim_expires_at
-			END
+		INSERT INTO work_unit_assignment_history
+			(work_unit_id, volunteer_id, assigned_at, reserved_until, deadline_seconds)
+		SELECT v.id, v.vol, NOW(), v.reserved_until, v.deadline_seconds
 		FROM (
 			SELECT unnest($1::uuid[]) AS id,
 			       unnest($2::uuid[]) AS vol,
-			       unnest($3::timestamptz[]) AS reserved_until
+			       unnest($3::timestamptz[]) AS reserved_until,
+			       unnest($4::int[]) AS deadline_seconds
 		) AS v
-		WHERE wu.id = v.id
-		  AND wu.state = 'QUEUED'
-		  AND (wu.reserved_until IS NULL
-		       OR wu.reserved_until < NOW()
-		       OR wu.reserved_volunteer_id = v.vol)
-		RETURNING wu.id`,
-		ids, vols, untils, headID, leaseSecs,
+		JOIN work_units wu ON wu.id = v.id AND wu.state = 'QUEUED'
+		JOIN leafs l ON l.id = wu.leaf_id
+		WHERE (
+		        (SELECT COUNT(*) FROM work_unit_assignment_history h
+		         WHERE h.work_unit_id = v.id AND h.outcome IS NULL)
+		        + (SELECT COUNT(*) FROM results res
+		           WHERE res.work_unit_id = v.id AND res.validation_status = 'PENDING')
+		      ) < CASE WHEN wu.spot_check THEN 2
+		           ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
+		          END
+		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
+		RETURNING work_unit_id, volunteer_id`,
+		ids, vols, untils, deadlines,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to flush reservations", err)
 	}
 	defer rows.Close()
 
-	var landed []types.ID
+	var landed []FlushedCopy
 	for rows.Next() {
-		var id types.ID
-		if err := rows.Scan(&id); err != nil {
-			return nil, apierror.Internal("failed to scan flushed reservation id", err)
+		var fc FlushedCopy
+		if err := rows.Scan(&fc.WorkUnitID, &fc.VolunteerID); err != nil {
+			return nil, apierror.Internal("failed to scan flushed copy", err)
 		}
-		landed = append(landed, id)
+		landed = append(landed, fc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, apierror.Internal("failed to iterate flushed reservations", err)
+		return nil, apierror.Internal("failed to iterate flushed copies", err)
+	}
+
+	// Layer 3: renew this head's dispatch claim on the batch's units (off the hot
+	// path), so a held-but-unflushed unit's claim never expires under it. Gated on
+	// dispatch_claimed_by = headID so it can never touch another replica's claim;
+	// headID == zero (single-replica) disables renewal.
+	if headID != (types.ID{}) {
+		leaseSecs := claimLease.Seconds()
+		if leaseSecs <= 0 {
+			leaseSecs = float64(defaultClaimLeaseSeconds)
+		}
+		if _, err := r.db.Exec(ctx, `
+			UPDATE work_units SET dispatch_claim_expires_at = NOW() + make_interval(secs => $2)
+			WHERE id = ANY($1::uuid[]) AND dispatch_claimed_by = $3`,
+			ids, leaseSecs, headID,
+		); err != nil {
+			// Non-fatal: the claim simply lapses and the unit becomes re-claimable.
+			return landed, nil
+		}
 	}
 	return landed, nil
 }
@@ -983,19 +964,14 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 // inflight counters against this so crash/drift can never cause permanent
 // over-admission.
 func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error) {
+	// A volunteer's inflight count is its live copies (RESERVED + RUNNING history
+	// rows). With per-copy dispatch this single source covers both buffered and
+	// run-started work — there are no separate per-unit reservations to add.
 	rows, err := r.db.Query(ctx, `
-		SELECT vol, SUM(cnt)::bigint FROM (
-			SELECT volunteer_id AS vol, COUNT(*) AS cnt
-			FROM work_unit_assignment_history
-			WHERE outcome IS NULL
-			GROUP BY volunteer_id
-			UNION ALL
-			SELECT reserved_volunteer_id AS vol, COUNT(*) AS cnt
-			FROM work_units
-			WHERE reserved_volunteer_id IS NOT NULL AND reserved_until > NOW()
-			GROUP BY reserved_volunteer_id
-		) t
-		GROUP BY vol`)
+		SELECT volunteer_id, COUNT(*)::bigint
+		FROM work_unit_assignment_history
+		WHERE outcome IS NULL AND volunteer_id IS NOT NULL
+		GROUP BY volunteer_id`)
 	if err != nil {
 		return nil, apierror.Internal("failed to count active by volunteer", err)
 	}
@@ -1039,70 +1015,92 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 		return nil, nil
 	}
 
-	// Hold a buffered unit until its head-owned deadline, not a short liveness
-	// lease: a volunteer keeps buffered work until the deadline lapses, and only a
-	// deadline-miss returns it to the queue. The passed lease is a fallback for a
-	// unit with no positive deadline.
+	// Hold a buffered copy until its head-owned deadline, not a short liveness lease:
+	// a volunteer keeps buffered work until the deadline lapses, and only a
+	// deadline-miss reclaims the copy. The passed lease is a fallback for a unit with
+	// no positive deadline.
 	hold := lease
 	if wu.DeadlineSeconds > 0 {
 		hold = time.Duration(wu.DeadlineSeconds) * time.Second
 	}
 	reservedUntil := time.Now().UTC().Add(hold)
-	row := r.db.QueryRow(ctx, `
-		UPDATE work_units SET
-			reserved_until = $2,
-			reserved_volunteer_id = $3
-		WHERE id = $1 AND state = 'QUEUED'
-		RETURNING `+workUnitColumns,
-		wu.ID, reservedUntil, opts.VolunteerID,
-	)
+	if _, err := r.ReserveCopy(ctx, wu.ID, opts.VolunteerID, reservedUntil, wu.DeadlineSeconds); err != nil {
+		return nil, err
+	}
+	// Echo the reservation window on the returned unit (transient, for the proto
+	// reserved_until_unix). The unit row itself stays QUEUED.
+	ru := reservedUntil
+	vid := opts.VolunteerID
+	wu.ReservedUntil = &ru
+	wu.ReservedVolunteerID = &vid
+	return wu, nil
+}
 
-	reserved, err := scanWorkUnit(row)
+// ReserveCopy inserts a RESERVED copy (a buffered work_unit_assignment_history row,
+// outcome NULL / started_at NULL) for (workUnitID, volunteerID), held until
+// reservedUntil. deadlineSeconds is snapshotted onto the copy so the expiry sweep
+// needs no join. Returns apierror.Conflict if the volunteer already holds a live copy
+// of the unit (the live-copy partial unique) or the unit is not QUEUED.
+func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error) {
+	row := r.db.QueryRow(ctx, `
+		INSERT INTO work_unit_assignment_history
+			(work_unit_id, volunteer_id, assigned_at, reserved_until, deadline_seconds)
+		SELECT $1, $2, NOW(), $3, $4
+		WHERE EXISTS (SELECT 1 FROM work_units wu WHERE wu.id = $1 AND wu.state = 'QUEUED')
+		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
+		RETURNING `+copyColumns,
+		workUnitID, volunteerID, reservedUntil, deadlineSeconds,
+	)
+	cp, err := scanCopy(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.Conflict(
-				"work unit is no longer in QUEUED state",
+				"work unit not QUEUED or volunteer already holds a live copy",
 				map[string]string{"code": "RESERVATION_CONFLICT"},
 			)
 		}
-		return nil, apierror.Internal("failed to reserve work unit", err)
+		return nil, apierror.Internal("failed to reserve copy", err)
 	}
-	return reserved, nil
+	return cp, nil
 }
 
-// Assign transitions a work unit from QUEUED to ASSIGNED and sets assignment metadata.
-// Uses optimistic concurrency: the update succeeds only if the work unit is currently QUEUED.
+// Assign is the run-start of a volunteer's copy: it flips that volunteer's live
+// RESERVED copy to RUNNING (started_at = NOW), which starts the per-copy deadline
+// clock. The WORK UNIT stays QUEUED (a pure aggregate) so its other redundancy copies
+// keep dispatching in parallel. If the volunteer has no live un-started copy (the
+// reservation lapsed or was never flushed), it returns apierror.Conflict so StartWork
+// reports Ok=false and the client drops the unit. The denormalized
+// work_units.assigned_volunteer_id/assigned_at are updated best-effort to the most
+// recent run-start for observability only.
 func (r *PgxWorkUnitRepository) Assign(ctx context.Context, workUnitID types.ID, volunteerID types.ID) (*WorkUnit, error) {
 	now := time.Now().UTC()
-	row := r.db.QueryRow(ctx, `
-		UPDATE work_units SET
-			state = 'ASSIGNED',
-			assigned_volunteer_id = $2,
-			assigned_at = $3,
-			last_heartbeat_at = $3,
-			reserved_until = NULL,
-			reserved_volunteer_id = NULL,
-			-- Layer 3: run-start releases the dispatch claim in the SAME atomic UPDATE
-			-- that clears the reservation, so a unit leaving the dispatchable universe
-			-- never strands its claim.
-			dispatch_claimed_by = NULL,
-			dispatch_claim_expires_at = NULL
-		WHERE id = $1 AND state = 'QUEUED'
-		RETURNING `+workUnitColumns,
+	// Idempotent: COALESCE keeps an already-started copy's started_at, and matches any
+	// LIVE copy (reserved or running) so a retried StartWork after a lost response is a
+	// no-op success. 0 rows affected means this volunteer holds no live copy.
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_unit_assignment_history
+		SET started_at = COALESCE(started_at, $3)
+		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
 		workUnitID, volunteerID, now,
 	)
-
-	wu, err := scanWorkUnit(row)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, apierror.Conflict(
-				"work unit is no longer in QUEUED state",
-				map[string]string{"code": "ASSIGNMENT_CONFLICT"},
-			)
-		}
-		return nil, apierror.Internal("failed to assign work unit", err)
+		return nil, apierror.Internal("failed to start work unit copy", err)
 	}
-	return wu, nil
+	if tag.RowsAffected() == 0 {
+		return nil, apierror.Conflict(
+			"no reserved copy to start for this volunteer",
+			map[string]string{"code": "ASSIGNMENT_CONFLICT"},
+		)
+	}
+	// Best-effort denormalized "most recent copy" pointer for observability.
+	_, _ = r.db.Exec(ctx, `
+		UPDATE work_units
+		SET assigned_volunteer_id = $2, assigned_at = $3, last_heartbeat_at = $3,
+		    started_at = COALESCE(started_at, $3)
+		WHERE id = $1`,
+		workUnitID, volunteerID, now,
+	)
+	return r.GetByID(ctx, workUnitID)
 }
 
 // CountByLeafAndState returns the count of work units for a project in a given state.
@@ -1118,29 +1116,66 @@ func (r *PgxWorkUnitRepository) CountByLeafAndState(ctx context.Context, project
 	return count, nil
 }
 
-// FindExpiredWorkUnits returns work units past their deadline. This includes:
-// - ASSIGNED or RUNNING work units past their deadline (based on assigned_at)
-// - Spot-check work units stuck in QUEUED state for over 1 hour (never picked up by a second volunteer)
-//
-// deadline_seconds = 0 means "no deadline" and is never expired here. NoDeadline
-// leafs no longer stamp 0: ResolveDeadlineSeconds gives them a large synthetic
-// reclaim ceiling (deadline_seconds > 0) so they remain covered by this sweep —
-// a unit on a vanished volunteer is always reclaimed, at most after the ceiling.
-// A unit still QUEUED+reserved (never run-started) is reclaimed separately by the
-// lapsed-reservation sweep (FindLapsedReservations) once its lease lapses.
-func (r *PgxWorkUnitRepository) FindExpiredWorkUnits(ctx context.Context, limit int) ([]*WorkUnit, error) {
+// scanCopy scans a copy row (copyColumns order) into a Copy.
+func scanCopy(row pgx.Row) (*Copy, error) {
+	var c Copy
+	err := row.Scan(
+		&c.ID, &c.WorkUnitID, &c.VolunteerID, &c.AssignedAt,
+		&c.ReservedUntil, &c.StartedAt, &c.DeadlineSeconds, &c.Outcome, &c.OutcomeAt, &c.ResultID,
+	)
+	return &c, err
+}
+
+// FindExpiredCopies returns LIVE copies (outcome IS NULL) that have timed out — the
+// per-copy replacement for the old unit-level deadline sweep. Two cases, both keyed
+// on the deadline (property 5: the deadline is the only early-reclaim clock):
+//   - RUNNING copy (started_at set) past started_at + deadline_seconds, or
+//   - RESERVED copy (started_at NULL, buffered) past reserved_until — a holder that
+//     vanished before run-start.
+// deadline_seconds = 0 means "no deadline" and a RUNNING copy is never expired here.
+func (r *PgxWorkUnitRepository) FindExpiredCopies(ctx context.Context, limit int) ([]*Copy, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT `+copyColumns+` FROM work_unit_assignment_history
+		WHERE outcome IS NULL
+		  AND (
+		    (started_at IS NOT NULL AND deadline_seconds > 0
+		       AND NOW() - started_at > deadline_seconds * INTERVAL '1 second')
+		    OR (started_at IS NULL AND reserved_until IS NOT NULL AND reserved_until < NOW())
+		  )
+		ORDER BY assigned_at ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find expired copies", err)
+	}
+	defer rows.Close()
+
+	var copies []*Copy
+	for rows.Next() {
+		cp, err := scanCopy(rows)
+		if err != nil {
+			return nil, apierror.Internal("failed to scan expired copy", err)
+		}
+		copies = append(copies, cp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate expired copies", err)
+	}
+	return copies, nil
+}
+
+// FindStuckSpotCheckUnits returns QUEUED spot-check units that have sat for over an
+// hour without a second corroborator. The caller clears spot_check so the single
+// result validates (the spot-check-never-got-a-partner reclaim, unchanged in intent
+// from the old unit sweep's QUEUED+spot_check arm).
+func (r *PgxWorkUnitRepository) FindStuckSpotCheckUnits(ctx context.Context, limit int) ([]*WorkUnit, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT `+workUnitColumns+` FROM work_units
-		WHERE (state IN ('ASSIGNED', 'RUNNING')
-		  AND assigned_at IS NOT NULL
-		  AND deadline_seconds > 0
-		  AND NOW() - assigned_at > deadline_seconds * INTERVAL '1 second')
-		   OR (state = 'QUEUED' AND spot_check = true
-		  AND created_at < NOW() - INTERVAL '1 hour')
+		WHERE state = 'QUEUED' AND spot_check = true
+		  AND created_at < NOW() - INTERVAL '1 hour'
 		ORDER BY created_at ASC
 		LIMIT $1`, limit)
 	if err != nil {
-		return nil, apierror.Internal("failed to find expired work units", err)
+		return nil, apierror.Internal("failed to find stuck spot-check units", err)
 	}
 	defer rows.Close()
 
@@ -1148,102 +1183,146 @@ func (r *PgxWorkUnitRepository) FindExpiredWorkUnits(ctx context.Context, limit 
 	for rows.Next() {
 		wu, err := scanWorkUnit(rows)
 		if err != nil {
-			return nil, apierror.Internal("failed to scan expired work unit", err)
+			return nil, apierror.Internal("failed to scan stuck spot-check unit", err)
 		}
 		workUnits = append(workUnits, wu)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, apierror.Internal("failed to iterate expired work units", err)
+		return nil, apierror.Internal("failed to iterate stuck spot-check units", err)
 	}
 	return workUnits, nil
 }
 
-// FindLapsedReservations returns still-QUEUED work units whose buffer lease has
-// lapsed (reserved_until IS NOT NULL AND reserved_until < NOW()). These are
-// buffered (reserved) units whose holder vanished before run-start — either an
-// ordinary client that buffered work then died, or a head crash that flushed a
-// reservation whose in-memory owner is gone (the #22 lapsed-lease reclaim gap).
-//
-// Neither FindExpiredWorkUnits nor the (removed) heartbeat sweep covered these:
-// both filter state IN ('ASSIGNED','RUNNING'), so a QUEUED-reserved unit whose
-// reservation lapsed was never actively reclaimed. With per-task heartbeats gone
-// and lease-renewal retired, this sweep is the load-bearing dead-holder reclaim
-// for units that never StartWork'd. The caller clears each returned unit's
-// reservation (ClearReservation), leaving it QUEUED and immediately re-stageable
-// by the dispatch cache — no TransitionToExpired/Reassign is needed (the unit
-// never left QUEUED).
-func (r *PgxWorkUnitRepository) FindLapsedReservations(ctx context.Context, limit int) ([]*WorkUnit, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT `+workUnitColumns+` FROM work_units
-		WHERE state = 'QUEUED'
-		  AND reserved_until IS NOT NULL
-		  AND reserved_until < NOW()
-		ORDER BY reserved_until ASC
-		LIMIT $1`, limit)
+// CloseCopy closes a copy by id with the given outcome (e.g. EXPIRED, ABANDONED),
+// stamping outcome_at = NOW(). Idempotent: only a still-live copy is closed.
+func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, outcome string) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE work_unit_assignment_history
+		SET outcome = $2, outcome_at = NOW()
+		WHERE id = $1 AND outcome IS NULL`,
+		copyID, outcome,
+	)
 	if err != nil {
-		return nil, apierror.Internal("failed to find lapsed reservations", err)
+		return apierror.Internal("failed to close copy", err)
 	}
-	defer rows.Close()
-
-	var workUnits []*WorkUnit
-	for rows.Next() {
-		wu, err := scanWorkUnit(rows)
-		if err != nil {
-			return nil, apierror.Internal("failed to scan lapsed reservation", err)
-		}
-		workUnits = append(workUnits, wu)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, apierror.Internal("failed to iterate lapsed reservations", err)
-	}
-	return workUnits, nil
+	return nil
 }
 
-// TransitionToExpired moves a work unit to EXPIRED state.
-// Uses optimistic concurrency on the current state (ASSIGNED or RUNNING).
-func (r *PgxWorkUnitRepository) TransitionToExpired(ctx context.Context, id types.ID) (*WorkUnit, error) {
-	row := r.db.QueryRow(ctx, `
-		UPDATE work_units SET state = 'EXPIRED'
-		WHERE id = $1 AND state IN ('ASSIGNED', 'RUNNING')
-		RETURNING `+workUnitColumns, id)
-
-	wu, err := scanWorkUnit(row)
+// CloseCopyByVolunteer closes a volunteer's live copy of a unit with the given
+// outcome (used by submit/abandon). resultID may be nil. Returns apierror.Conflict
+// if the volunteer has no live copy of the unit.
+func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID) error {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_unit_assignment_history
+		SET outcome = $3, outcome_at = NOW(), result_id = COALESCE($4, result_id)
+		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
+		workUnitID, volunteerID, outcome, resultID,
+	)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, apierror.Conflict(
-				"work unit is not in ASSIGNED or RUNNING state",
-				map[string]string{"code": "TRANSITION_CONFLICT"},
-			)
-		}
-		return nil, apierror.Internal("failed to transition work unit to expired", err)
+		return apierror.Internal("failed to close copy by volunteer", err)
 	}
-	return wu, nil
+	if tag.RowsAffected() == 0 {
+		return apierror.Conflict(
+			"no live copy for this volunteer to close",
+			map[string]string{"code": "COPY_CONFLICT"},
+		)
+	}
+	return nil
 }
 
-// Reassign transitions an EXPIRED or REJECTED work unit back to QUEUED with HIGH
-// priority and incremented reassignment_count. If max reassignments is reached,
-// transitions to FAILED instead and sets flagged_for_review.
+// ExpireLiveCopies closes ALL live copies of a unit with the given outcome (used by
+// the operator manual-requeue: abandon every in-flight copy so fresh ones dispatch).
+// Returns how many copies were closed.
+func (r *PgxWorkUnitRepository) ExpireLiveCopies(ctx context.Context, workUnitID types.ID, outcome string) (int, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_unit_assignment_history
+		SET outcome = $2, outcome_at = NOW()
+		WHERE work_unit_id = $1 AND outcome IS NULL`,
+		workUnitID, outcome,
+	)
+	if err != nil {
+		return 0, apierror.Internal("failed to expire live copies", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// CountLiveCopies returns the number of live (RESERVED + RUNNING) copies of a unit.
+func (r *PgxWorkUnitRepository) CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error) {
+	var n int
+	if err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND outcome IS NULL`,
+		workUnitID,
+	).Scan(&n); err != nil {
+		return 0, apierror.Internal("failed to count live copies", err)
+	}
+	return n, nil
+}
+
+// CountTotalCopies returns the total number of copies (history rows) ever created for
+// a unit — the dead-letter ceiling probe (property 6).
+func (r *PgxWorkUnitRepository) CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error) {
+	var n int
+	if err := r.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1`,
+		workUnitID,
+	).Scan(&n); err != nil {
+		return 0, apierror.Internal("failed to count total copies", err)
+	}
+	return n, nil
+}
+
+// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED,
+// has NO live copy outstanding, its redundancy is still unmet (PENDING results <
+// redundancy), AND the total copies ever created has reached its dead-letter ceiling
+// (max_total_copies, defaulting to redundancy + a margin). This is the ONLY cap on
+// requeue (property 6): honest timeouts redispatch with no per-attempt limit, but a
+// hopeless (poison) unit eventually stops burning the volunteer pool. Returns whether
+// the unit was failed.
+func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
+		FROM leafs l
+		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state = 'QUEUED'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history h
+		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
+		  )
+		  AND (
+		    SELECT COUNT(*) FROM results res
+		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
+		  ) < CASE WHEN wu.spot_check THEN 2
+		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
+		      END
+		  AND (
+		    SELECT COUNT(*) FROM work_unit_assignment_history h2
+		    WHERE h2.work_unit_id = wu.id
+		  ) >= CASE
+		         WHEN wu.max_total_copies > 0 THEN wu.max_total_copies
+		         ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2) + `+fmt.Sprintf("%d", defaultCopyRetryMargin)+`
+		       END`,
+		workUnitID,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to dead-letter work unit", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Reassign returns an EXPIRED or REJECTED work unit to QUEUED for further
+// corroboration. Property 6: there is NO per-reassignment cap — a unit is requeued as
+// many times as needed; the dead-letter ceiling (DeadLetterIfExhausted) is the only
+// terminal stop. Always returns requeued=true on success.
 func (r *PgxWorkUnitRepository) Reassign(ctx context.Context, id types.ID) (*WorkUnit, bool, error) {
 	wu, err := r.GetByID(ctx, id)
 	if err != nil {
 		return nil, false, err
 	}
-
 	if wu.State != WorkUnitStateExpired && wu.State != WorkUnitStateRejected {
 		return nil, false, apierror.Conflict(
 			fmt.Sprintf("cannot reassign work unit in state %s: must be EXPIRED or REJECTED", wu.State),
 			map[string]string{"code": "INVALID_REASSIGNMENT_STATE"},
 		)
 	}
-
-	if wu.ReassignmentCount >= wu.MaxReassignments {
-		updated, err := r.UpdateState(ctx, id, wu.State, WorkUnitStateFailed)
-		if err != nil {
-			return nil, false, fmt.Errorf("reassign to FAILED: %w", err)
-		}
-		return updated, false, nil
-	}
-
 	updated, err := r.UpdateState(ctx, id, wu.State, WorkUnitStateQueued)
 	if err != nil {
 		return nil, false, fmt.Errorf("reassign to QUEUED: %w", err)
@@ -1262,71 +1341,6 @@ func (r *PgxWorkUnitRepository) MarkSpotCheck(ctx context.Context, id types.ID) 
 		return apierror.NotFound("work_unit", id.String())
 	}
 	return nil
-}
-
-// StampReservation sets reserved_until / reserved_volunteer_id on a still-QUEUED
-// work unit without re-running the assignment predicate. Used in the batch
-// spot-check branch (belt-and-suspenders): the "not already assigned" subquery
-// already excludes a spot-checked volunteer on the next loop iteration, and the
-// reservation guard reinforces it. Returns the updated WorkUnit (so the response
-// can echo reserved_until_unix).
-func (r *PgxWorkUnitRepository) StampReservation(ctx context.Context, id, volunteerID types.ID, lease time.Duration) (*WorkUnit, error) {
-	reservedUntil := time.Now().UTC().Add(lease)
-	row := r.db.QueryRow(ctx, `
-		UPDATE work_units SET
-			reserved_until = $2,
-			reserved_volunteer_id = $3
-		WHERE id = $1 AND state = 'QUEUED'
-		RETURNING `+workUnitColumns,
-		id, reservedUntil, volunteerID,
-	)
-	wu, err := scanWorkUnit(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, apierror.Conflict(
-				"work unit is no longer in QUEUED state",
-				map[string]string{"code": "RESERVATION_CONFLICT"},
-			)
-		}
-		return nil, apierror.Internal("failed to stamp reservation", err)
-	}
-	return wu, nil
-}
-
-// ClearReservation drops the reservation columns (reserved_until /
-// reserved_volunteer_id) on a still-QUEUED unit currently reserved to
-// volunteerID, leaving it QUEUED so it is immediately re-reservable by any
-// volunteer. Used when a volunteer abandons a buffered (reserved, un-started)
-// unit — e.g. a prepare failure or queue-full drop before the unit ever ran. It
-// is a no-op-safe guard: it only matches a unit still reserved to this
-// volunteer, so a unit that has since flipped to ASSIGNED (different volunteer,
-// or run-started) is not touched. Returns the updated WorkUnit, or
-// apierror.Conflict if no matching reserved QUEUED unit exists.
-func (r *PgxWorkUnitRepository) ClearReservation(ctx context.Context, id, volunteerID types.ID) (*WorkUnit, error) {
-	row := r.db.QueryRow(ctx, `
-		UPDATE work_units SET
-			reserved_until = NULL,
-			reserved_volunteer_id = NULL,
-			-- Layer 3: an abandon / flush-conflict void of a buffered (reserved) unit
-			-- also releases this head's dispatch claim so the unit is immediately
-			-- re-claimable by any replica (not left QUEUED with a stranded live claim).
-			dispatch_claimed_by = NULL,
-			dispatch_claim_expires_at = NULL
-		WHERE id = $1 AND state = 'QUEUED' AND reserved_volunteer_id = $2
-		RETURNING `+workUnitColumns,
-		id, volunteerID,
-	)
-	wu, err := scanWorkUnit(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, apierror.Conflict(
-				"work unit is not reserved to this volunteer in QUEUED state",
-				map[string]string{"code": "RESERVATION_CONFLICT"},
-			)
-		}
-		return nil, apierror.Internal("failed to clear reservation", err)
-	}
-	return wu, nil
 }
 
 // ClearSpotCheck sets spot_check = false for a work unit, allowing it to complete
@@ -1352,7 +1366,10 @@ func (r *PgxWorkUnitRepository) FindRunningWithStaleCheckpoints(ctx context.Cont
 			EXTRACT(EPOCH FROM NOW() - wu.last_checkpoint_at)::bigint AS age_seconds
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
-		WHERE wu.state = 'RUNNING'
+		WHERE EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history h
+		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL AND h.started_at IS NOT NULL
+		  )
 		  AND wu.last_checkpoint_at IS NOT NULL
 		  AND COALESCE((l.fault_tolerance_config->>'checkpointing_enabled')::boolean, false) = true
 		  AND NOW() - wu.last_checkpoint_at >

@@ -409,8 +409,8 @@ func TestScaleOut_NoCrossReplicaDoubleDispatch(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Allow the async flushers on both replicas to land their in-memory reservations
-	// into the DB before the audit reads reserved_volunteer_id.
+	// Allow the async flushers on both replicas to land their in-memory reservations as
+	// RESERVED copy rows in the DB before the audit counts each unit's live copies.
 	time.Sleep(1 * time.Second)
 
 	auditNoDoubleDispatch(t, ctx, env.pool)
@@ -458,15 +458,15 @@ func requireBothReplicasClaimed(t *testing.T, ctx context.Context, pool *pgxpool
 	t.Logf("dispatch-claim ownership after load: A=%d B=%d units", owners[a], owners[b])
 }
 
-// auditNoDoubleDispatch is the DB-level invariant check. For every work unit the
-// distinct holders are reserved_volunteer_id (a LIVE reservation) UNION the
-// volunteer_ids of its active assignment history rows (outcome IS NULL). It asserts:
-//   - COUNT(DISTINCT holder) <= the unit's effective redundancy, and
-//   - no NORMAL (non-spot-check) unit has >1 live reservation row (the single
-//     reserved_volunteer_id column enforces this, audited here for completeness), and
-//   - dispatch_claimed_by is single-valued per unit (a single column, so the audit
-//     simply confirms no unit is multiply claimed — vacuously true for a column, but
-//     asserted so a future model change can't silently regress it).
+// auditNoDoubleDispatch is the DB-level invariant check. Per-copy model (migration
+// 00006): the distinct holders of a unit are the volunteer_ids of its LIVE copies
+// (work_unit_assignment_history rows with outcome IS NULL — RESERVED or RUNNING). It
+// asserts COUNT(DISTINCT holder) <= the unit's effective redundancy: redundancy>1
+// dispatches up to N parallel copies to N DISTINCT volunteers, but never more, and
+// never two live copies of one unit to the SAME volunteer across replicas. The retired
+// per-unit reserved_volunteer_id column is gone — a hold is now a copy row, so the old
+// "at most one live reservation" rule is REPLACED by this per-copy redundancy cap, which
+// is the genuine cross-replica no-double-dispatch invariant.
 //
 // effective redundancy mirrors the dispatch SQL: spot-check => 2, else the leaf's
 // validation_config redundancy_factor (default 2).
@@ -480,18 +480,10 @@ func auditNoDoubleDispatch(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 			END AS effective_redundancy,
 			(
-				SELECT COUNT(DISTINCT v) FROM (
-					SELECT wu.reserved_volunteer_id AS v
-					WHERE wu.reserved_volunteer_id IS NOT NULL
-					UNION
-					SELECT wuah.volunteer_id AS v
-					FROM work_unit_assignment_history wuah
-					WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
-				) holders
-			) AS distinct_holders,
-			(
-				CASE WHEN wu.reserved_volunteer_id IS NOT NULL THEN 1 ELSE 0 END
-			) AS live_reservations
+				SELECT COUNT(DISTINCT wuah.volunteer_id)
+				FROM work_unit_assignment_history wuah
+				WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
+			) AS distinct_holders
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
 	`)
@@ -504,8 +496,8 @@ func auditNoDoubleDispatch(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 	var maxHolders int
 	for rows.Next() {
 		var id types.ID
-		var effRedundancy, distinctHolders, liveReservations int
-		if err := rows.Scan(&id, &effRedundancy, &distinctHolders, &liveReservations); err != nil {
+		var effRedundancy, distinctHolders int
+		if err := rows.Scan(&id, &effRedundancy, &distinctHolders); err != nil {
 			t.Fatalf("audit scan: %v", err)
 		}
 		audited++
@@ -515,12 +507,6 @@ func auditNoDoubleDispatch(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 		if distinctHolders > effRedundancy {
 			t.Errorf("unit %s dispatched to %d distinct volunteers across replicas, exceeds effective redundancy %d (cross-replica double-dispatch)",
 				id, distinctHolders, effRedundancy)
-		}
-		// reserved_volunteer_id is a single column so live_reservations is 0 or 1 by
-		// construction; assert it so a future schema/model change can't reintroduce a
-		// second concurrent reservation for a NORMAL unit.
-		if liveReservations > 1 {
-			t.Errorf("unit %s has %d live reservations (a NORMAL unit must hold at most one)", id, liveReservations)
 		}
 	}
 	if err := rows.Err(); err != nil {

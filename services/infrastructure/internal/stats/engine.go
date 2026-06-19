@@ -31,9 +31,24 @@ func (e *Engine) ComputeSnapshot(ctx context.Context, leafID types.ID) (*LeafSta
 	err := e.pool.QueryRow(ctx, `
 		SELECT
 			COUNT(*) AS total_work_units,
-			COUNT(*) FILTER (WHERE state = 'QUEUED') AS work_units_queued,
-			COUNT(*) FILTER (WHERE state = 'ASSIGNED') AS work_units_assigned,
-			COUNT(*) FILTER (WHERE state = 'RUNNING') AS work_units_running,
+			-- Per-copy dispatch: a unit stays QUEUED while its copies run, so "assigned"
+			-- and "running" are derived from its live copies, not the unit state. queued =
+			-- a QUEUED unit with NO live copy; assigned = a live RESERVED-only copy
+			-- (buffered, not started); running = at least one RUNNING copy.
+			COUNT(*) FILTER (WHERE state = 'QUEUED' AND NOT EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL)) AS work_units_queued,
+			COUNT(*) FILTER (WHERE EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL AND h.started_at IS NULL
+			) AND NOT EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h2
+				WHERE h2.work_unit_id = work_units.id AND h2.outcome IS NULL AND h2.started_at IS NOT NULL
+			)) AS work_units_assigned,
+			COUNT(*) FILTER (WHERE EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL AND h.started_at IS NOT NULL
+			)) AS work_units_running,
 			COUNT(*) FILTER (WHERE state = 'COMPLETED') AS work_units_completed,
 			COUNT(*) FILTER (WHERE state = 'VALIDATED') AS work_units_validated,
 			COUNT(*) FILTER (WHERE state IN ('REJECTED', 'EXPIRED', 'FAILED')) AS work_units_failed,
@@ -105,9 +120,20 @@ func (e *Engine) ComputeLeafStatsBatch(ctx context.Context, leafIDs []types.ID) 
 		SELECT
 			leaf_id,
 			COUNT(*) AS total_work_units,
-			COUNT(*) FILTER (WHERE state = 'QUEUED') AS work_units_queued,
-			COUNT(*) FILTER (WHERE state = 'ASSIGNED') AS work_units_assigned,
-			COUNT(*) FILTER (WHERE state = 'RUNNING') AS work_units_running,
+			COUNT(*) FILTER (WHERE state = 'QUEUED' AND NOT EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL)) AS work_units_queued,
+			COUNT(*) FILTER (WHERE EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL AND h.started_at IS NULL
+			) AND NOT EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h2
+				WHERE h2.work_unit_id = work_units.id AND h2.outcome IS NULL AND h2.started_at IS NOT NULL
+			)) AS work_units_assigned,
+			COUNT(*) FILTER (WHERE EXISTS (
+				SELECT 1 FROM work_unit_assignment_history h
+				WHERE h.work_unit_id = work_units.id AND h.outcome IS NULL AND h.started_at IS NOT NULL
+			)) AS work_units_running,
 			COUNT(*) FILTER (WHERE state = 'COMPLETED') AS work_units_completed,
 			COUNT(*) FILTER (WHERE state = 'VALIDATED') AS work_units_validated,
 			COUNT(*) FILTER (WHERE state IN ('REJECTED', 'EXPIRED', 'FAILED')) AS work_units_failed

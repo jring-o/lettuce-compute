@@ -6,12 +6,20 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 )
 
-// validTransitions defines the 12 valid state transitions for a work unit.
+// validTransitions defines the valid state transitions for a work unit.
+//
+// Per-copy dispatch (migration 00006): a work unit's state is now a pure AGGREGATE
+// over its copies. Run-start/timeout live on the per-copy rows, so a unit no longer
+// transitions through ASSIGNED/RUNNING/EXPIRED itself — it sits QUEUED while up to
+// redundancy copies run in parallel, then goes COMPLETED once enough results
+// accumulate (or FAILED when it hits the dead-letter ceiling with redundancy unmet).
+// The ASSIGNED/RUNNING/EXPIRED transitions are retained (inert) for backward
+// compatibility with any legacy/manual paths and historical fixtures.
 var validTransitions = map[WorkUnitState][]WorkUnitState{
 	WorkUnitStateCreated:   {WorkUnitStateQueued},
-	WorkUnitStateQueued:    {WorkUnitStateAssigned},
-	WorkUnitStateAssigned:  {WorkUnitStateRunning, WorkUnitStateCompleted, WorkUnitStateExpired},
-	WorkUnitStateRunning:   {WorkUnitStateCompleted, WorkUnitStateExpired},
+	WorkUnitStateQueued:    {WorkUnitStateAssigned, WorkUnitStateCompleted, WorkUnitStateFailed},
+	WorkUnitStateAssigned:  {WorkUnitStateRunning, WorkUnitStateCompleted, WorkUnitStateExpired, WorkUnitStateQueued},
+	WorkUnitStateRunning:   {WorkUnitStateCompleted, WorkUnitStateExpired, WorkUnitStateQueued},
 	WorkUnitStateCompleted: {WorkUnitStateValidated, WorkUnitStateRejected},
 	WorkUnitStateRejected:  {WorkUnitStateQueued, WorkUnitStateFailed},
 	WorkUnitStateExpired:   {WorkUnitStateQueued, WorkUnitStateFailed},
@@ -41,22 +49,15 @@ func IsTerminalState(state WorkUnitState) bool {
 	return state == WorkUnitStateValidated || state == WorkUnitStateFailed
 }
 
-// TransitionToQueued handles REJECTED/EXPIRED → QUEUED business logic.
-// Checks that reassignment_count < max_reassignments, increments the count,
-// clears assignment fields, and sets priority to HIGH.
-// Returns apierror.Conflict if max reassignments exceeded.
+// TransitionToQueued handles REJECTED/EXPIRED → QUEUED business logic. It returns a
+// unit to the dispatchable queue for further corroboration, bumps reassignment_count
+// (kept for observability), clears the denormalized assignment fields, and raises
+// priority so the requeued unit is picked up promptly.
+//
+// Property 6 (uncapped requeue): there is NO per-reassignment cap here. A unit is
+// redispatched as many times as needed for the work to get done; the only ceiling is
+// the dead-letter (max_total_copies), enforced where copies time out, not here.
 func TransitionToQueued(wu *WorkUnit) error {
-	if wu.ReassignmentCount >= wu.MaxReassignments {
-		return apierror.Conflict(
-			fmt.Sprintf("max reassignments exceeded (%d/%d)", wu.ReassignmentCount, wu.MaxReassignments),
-			map[string]string{
-				"code":              "MAX_REASSIGNMENTS_EXCEEDED",
-				"reassignment_count": fmt.Sprintf("%d", wu.ReassignmentCount),
-				"max_reassignments":  fmt.Sprintf("%d", wu.MaxReassignments),
-			},
-		)
-	}
-
 	wu.State = WorkUnitStateQueued
 	wu.ReassignmentCount++
 	wu.Priority = WorkUnitPriorityHigh

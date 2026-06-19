@@ -9,7 +9,6 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/server"
-	"github.com/lettuce-compute/infrastructure/internal/types"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
@@ -33,15 +32,22 @@ func pollWorkUnitState(t *testing.T, ctx context.Context, env *headsLeafsEnv, wu
 	return state
 }
 
-// pollReservedVolunteer waits up to timeout for the unit's reserved_volunteer_id to be
-// non-null (the async flush landed) and returns it.
+// pollReservedVolunteer waits up to timeout for a live RESERVED copy of the unit to
+// land in work_unit_assignment_history (the async flush wrote it) and returns its
+// volunteer_id. Per-copy model (migration 00006): the single per-unit
+// reserved_volunteer_id column was retired; a hold is now a RESERVED copy row
+// (outcome IS NULL, started_at IS NULL, reserved_until set). The scalar subquery
+// yields NULL (not ErrNoRows) while no such row exists, so the poll loop keeps the
+// original nil-keep-polling control flow.
 func pollReservedVolunteer(t *testing.T, ctx context.Context, env *headsLeafsEnv, wuID string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var reservedVol *string
 		if err := env.pool.QueryRow(ctx,
-			"SELECT reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).Scan(&reservedVol); err != nil {
+			`SELECT (SELECT volunteer_id::text FROM work_unit_assignment_history
+			         WHERE work_unit_id = $1 AND outcome IS NULL AND started_at IS NULL
+			         ORDER BY assigned_at DESC LIMIT 1)`, wuID).Scan(&reservedVol); err != nil {
 			t.Fatalf("pollReservedVolunteer: query %s: %v", wuID, err)
 		}
 		if reservedVol != nil && *reservedVol != "" {
@@ -109,13 +115,16 @@ func TestDispatchCache_ServeFlushStartSubmit(t *testing.T) {
 	// The async flush must land the reservation while the unit stays QUEUED.
 	reserved := pollReservedVolunteer(t, ctx, env, wuID, 5*time.Second)
 	if reserved != volID {
-		t.Fatalf("flushed reserved_volunteer_id = %q, want %s", reserved, volID)
+		t.Fatalf("flushed RESERVED copy volunteer = %q, want %s", reserved, volID)
 	}
 	if st := pollWorkUnitState(t, ctx, env, wuID, "QUEUED", time.Second); st != "QUEUED" {
 		t.Fatalf("a flushed reservation must keep the unit QUEUED, got %q", st)
 	}
 
-	// StartWork flips QUEUED -> ASSIGNED and writes the active history row.
+	// StartWork run-starts THIS volunteer's copy (RESERVED -> RUNNING). Per-copy model:
+	// the WORK UNIT stays QUEUED (a pure aggregate) so its other redundancy copies keep
+	// dispatching in parallel; only the copy gains started_at. assigned_at on the unit
+	// is still updated best-effort for observability.
 	if _, err := env.grpc.StartWork(signFor(t, ctx, pubKey), &lettucev1.StartWorkRequest{
 		WorkUnitId: wuID, VolunteerId: volID,
 	}); err != nil {
@@ -127,18 +136,20 @@ func TestDispatchCache_ServeFlushStartSubmit(t *testing.T) {
 		"SELECT state, assigned_at FROM work_units WHERE id = $1", wuID).Scan(&state, &assignedAt); err != nil {
 		t.Fatalf("query post-StartWork: %v", err)
 	}
-	if state != "ASSIGNED" {
-		t.Fatalf("post-StartWork state = %q, want ASSIGNED", state)
+	if state != "QUEUED" {
+		t.Fatalf("post-StartWork unit state = %q, want QUEUED (per-copy: the unit stays QUEUED, only the copy runs)", state)
 	}
 	if assignedAt == nil {
 		t.Fatal("expected assigned_at set at run start")
 	}
+	// The flushed RESERVED copy is now a RUNNING copy (started_at set), still the one
+	// live (outcome IS NULL) copy for this volunteer.
 	var historyRows int
 	env.pool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL",
+		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL AND started_at IS NOT NULL",
 		wuID, volID).Scan(&historyRows)
 	if historyRows != 1 {
-		t.Fatalf("expected 1 active history row after StartWork, got %d", historyRows)
+		t.Fatalf("expected 1 running history row after StartWork, got %d", historyRows)
 	}
 
 	// SubmitResult completes the unit.
@@ -155,38 +166,28 @@ func TestDispatchCache_ServeFlushStartSubmit(t *testing.T) {
 	}
 }
 
-// TestDispatchCache_RedundancyTwoFirstHandedSingleHolderSecondViaRedundantAssignment
-// is the regression guard for the redundancy single-hold invariant. It does NOT
-// assert that the dispatch cache drives concurrent redundant validation — it cannot,
-// and that is a documented, pre-existing limitation (see the NOTE below).
+// TestDispatchCache_RedundancyTwoDispatchesParallelCopiesToDistinctVolunteers
+// asserts the per-copy parallel-dispatch invariant (migration 00006): a NORMAL
+// redundancy-2 unit is dispatched as TWO copies IN PARALLEL to two DISTINCT
+// volunteers, both held concurrently while the unit STAYS QUEUED.
 //
-// What this test DOES prove:
-//   - The cache stages a NORMAL redundancy-2 unit to exactly ONE in-memory holder at
-//     a time (mirroring the single live reserved_volunteer_id column the DB enforces)
-//     and routes its flush as a single reservation, so the flush-conflict void-check
-//     is unambiguous and no phantom in-memory holder leaks. A concurrent second
-//     RequestWorkUnit for the same NORMAL unit gets nothing (asserted on respB).
-//   - The cache does not hide, double-hand, or strand the unit: once the first holder
-//     run-starts and submits, a second corroborating result still lands and validates.
+// What this test proves:
+//   - The cache stages the redundancy-2 unit to vol A AND, concurrently, hands a
+//     SECOND distinct copy of the SAME unit to vol B (the parallel-copy case). Each
+//     lands as its own RESERVED copy row (distinct volunteer_id, outcome IS NULL); the
+//     unit never leaves QUEUED while the copies run.
+//   - Both copies run-start and submit agreeing results, and the unit validates with
+//     no phantom hold leaked and no copy stranded.
 //
-// NOTE — redundancy>1 is NOT served concurrently through dispatch (pre-existing):
-// StartWork's Assign flips the unit QUEUED->ASSIGNED, and BOTH the cache refill
-// (FindDispatchableBatch) and the Layer-1 DB path (FindNextAssignable) gate on
-// state='QUEUED'. So once the FIRST holder run-starts, the unit leaves the
-// dispatchable universe and the SECOND distinct holder can never be reached by the
-// cache OR the DB find concurrently. Concurrent dispatch of one unit to two
-// volunteers is therefore unsupported until a per-volunteer dispatch table (out of
-// scope, Layer 3). To exercise the second corroborating result here we inject it via
-// createRedundantAssignment (a direct history-row INSERT that bypasses dispatch),
-// exactly as the alpha_e2e redundancy tests do. This test asserts the cache does not
-// break that existing non-dispatch redundancy flow; it is NOT proof of cache-driven
-// redundant dispatch. See guides/head-setup.md "Redundancy and the dispatch cache".
-//
-// Before the fix the cache double-staged the same unit to two in-memory holders from
-// one snapshot, both flushed into the single column, and the WorkUnitID-keyed
-// void-check voided NEITHER — leaking a phantom holder that reconcile never cleared
-// and (per the second holder's column miss) blocking the second result.
-func TestDispatchCache_RedundancyTwoFirstHandedSingleHolderSecondViaRedundantAssignment(t *testing.T) {
+// INVERTED from the previous per-unit model: that earlier test asserted a concurrent
+// second RequestWorkUnit got ZERO assignments (redundancy was a single live
+// reserved_volunteer_id column, served to one holder; the second corroborator had to
+// be injected via a direct history-row INSERT because StartWork flipped the unit
+// QUEUED->ASSIGNED, removing it from the dispatchable universe). Under the per-copy
+// model the redundancy guard counts LIVE COPIES (outcome IS NULL) against the leaf's
+// redundancy_factor and the unit stays QUEUED, so the second distinct volunteer is
+// served a parallel copy directly by dispatch.
+func TestDispatchCache_RedundancyTwoDispatchesParallelCopiesToDistinctVolunteers(t *testing.T) {
 	env, cleanup := setupHeadsLeafsServerWithCache(t)
 	defer cleanup()
 
@@ -208,7 +209,6 @@ func TestDispatchCache_RedundancyTwoFirstHandedSingleHolderSecondViaRedundantAss
 	pubB := genVolunteerKey(t)
 	volA := registerHLVolunteer(t, env, ctx, pubA, "cache-red-A")
 	volB := registerHLVolunteer(t, env, ctx, pubB, "cache-red-B")
-	volBParsed := types.MustParseID(volB)
 
 	// reserveOne requests one unit from the cache for the given volunteer, retrying so
 	// the refiller has time to stage the unit.
@@ -239,44 +239,57 @@ func TestDispatchCache_RedundancyTwoFirstHandedSingleHolderSecondViaRedundantAss
 		}
 	}
 
-	// Vol A reserves the unit from the cache. The cache must serve it to exactly ONE
-	// in-memory holder (volA): a single concurrent RequestWorkUnit by volB must NOT get
-	// a second concurrent in-memory hold of the same NORMAL unit (that is the
-	// double-stage the blocker described).
+	// Vol A reserves a copy of the redundancy-2 unit from the cache.
 	wuA := reserveOne(pubA, volA)
 	if wuA == "" {
 		t.Fatal("vol A never got the redundancy-2 unit from the cache")
 	}
-	respB, err := env.grpc.RequestWorkUnit(signFor(t, ctx, pubB), &lettucev1.RequestWorkUnitRequest{
-		VolunteerId: volB, PublicKey: pubB, LeafIds: []string{lf.ID.String()}, MaxAssignments: 1,
-	})
-	if err != nil {
-		t.Fatalf("vol B concurrent request: %v", err)
+
+	// Per-copy parallel dispatch: a concurrent RequestWorkUnit by the DISTINCT vol B
+	// must get a SECOND copy of the SAME unit — the unit stays QUEUED with one live copy,
+	// still below redundancy_factor=2, so the redundancy guard keeps it dispatchable to a
+	// second distinct volunteer. reserveOne retries so vol A's in-memory hold has time to
+	// flush its RESERVED copy row before the guard re-evaluates.
+	wuB := reserveOne(pubB, volB)
+	if wuB == "" {
+		t.Fatal("vol B was not served a parallel copy of the redundancy-2 unit (per-copy parallel dispatch broken)")
 	}
-	if len(respB.Assignments) != 0 {
-		t.Fatalf("a NORMAL redundancy-2 unit must not be double-staged to a 2nd concurrent in-memory holder, vol B got %d", len(respB.Assignments))
+	if wuB != wuA {
+		t.Fatalf("vol B got a different unit %s, want the same unit %s dispatched in parallel", wuB, wuA)
 	}
 
-	// Vol A run-starts + submits its result (the flush must have landed its reservation).
-	if got := pollReservedVolunteer(t, ctx, env, wuA, 5*time.Second); got != volA {
-		t.Fatalf("flushed reserved_volunteer_id = %q, want %s", got, volA)
+	// Two distinct live copies of the one unit now exist concurrently (the parallel-copy
+	// case), and the unit is still QUEUED.
+	if got := pollReservedVolunteer(t, ctx, env, wuA, 5*time.Second); got == "" {
+		t.Fatal("no flushed RESERVED copy landed for the redundancy-2 unit")
 	}
-	if _, err := env.grpc.StartWork(signFor(t, ctx, pubA), &lettucev1.StartWorkRequest{
-		WorkUnitId: wuA, VolunteerId: volA,
-	}); err != nil {
-		t.Fatalf("StartWork(A): %v", err)
+	var liveCopies int
+	if err := env.pool.QueryRow(ctx,
+		"SELECT COUNT(DISTINCT volunteer_id) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND outcome IS NULL",
+		wuA).Scan(&liveCopies); err != nil {
+		t.Fatalf("count live copies: %v", err)
 	}
+	if liveCopies != 2 {
+		t.Fatalf("expected 2 distinct live copies of the unit (parallel dispatch), got %d", liveCopies)
+	}
+	if st := pollWorkUnitState(t, ctx, env, wuA, "QUEUED", time.Second); st != "QUEUED" {
+		t.Fatalf("unit must stay QUEUED while its two copies run, got %q", st)
+	}
+
+	// Both volunteers run-start their copy (RESERVED -> RUNNING; the unit stays QUEUED)
+	// and submit agreeing results.
 	agreed := []byte(`{"result":"agree"}`)
-	submit(pubA, volA, wuA, agreed)
-
-	// The second corroborating volunteer is NOT reachable through dispatch: wuA is now
-	// ASSIGNED (vol A run-started), and both the cache refill and the DB find gate on
-	// QUEUED, so neither can hand it to vol B concurrently. We inject vol B's distinct
-	// active history row directly, bypassing dispatch — the only way redundancy>1 lands
-	// today (see the NOTE on this test and head-setup.md). This asserts the cache does
-	// not break that existing non-dispatch redundancy flow.
-	createRedundantAssignment(t, env.pool, ctx, wuA, volBParsed)
-	submit(pubB, volB, wuA, agreed)
+	for _, h := range []struct {
+		pub []byte
+		vol string
+	}{{pubA, volA}, {pubB, volB}} {
+		if _, err := env.grpc.StartWork(signFor(t, ctx, h.pub), &lettucev1.StartWorkRequest{
+			WorkUnitId: wuA, VolunteerId: h.vol,
+		}); err != nil {
+			t.Fatalf("StartWork(%s): %v", h.vol, err)
+		}
+		submit(h.pub, h.vol, wuA, agreed)
+	}
 
 	// Two agreeing results -> the unit validates. (If the cache had leaked a phantom
 	// hold or stranded the unit, the second result could not have completed it.)
@@ -333,15 +346,19 @@ func TestDispatchCache_StartWorkBeforeFlush(t *testing.T) {
 		t.Fatal("cache never served a work unit")
 	}
 
-	// The reservation is in-memory-only: the long flush interval means the DB column is
-	// still NULL. (Sanity check; not strictly required, but documents the window.)
+	// The reservation is in-memory-only: the long flush interval means NO RESERVED copy
+	// row has landed yet. (Sanity check; not strictly required, but documents the
+	// window.) Per-copy model: the hold would land as a work_unit_assignment_history row,
+	// not a work_units column.
 	var reservedVol *string
 	if err := env.pool.QueryRow(ctx,
-		"SELECT reserved_volunteer_id::text FROM work_units WHERE id = $1", wuID).Scan(&reservedVol); err != nil {
-		t.Fatalf("query reserved_volunteer_id: %v", err)
+		`SELECT (SELECT volunteer_id::text FROM work_unit_assignment_history
+		         WHERE work_unit_id = $1 AND outcome IS NULL AND started_at IS NULL
+		         ORDER BY assigned_at DESC LIMIT 1)`, wuID).Scan(&reservedVol); err != nil {
+		t.Fatalf("query reserved copy: %v", err)
 	}
 	if reservedVol != nil && *reservedVol != "" {
-		t.Logf("note: flush landed early (reserved_volunteer_id=%q); race window not exercised, but StartWork must still succeed", *reservedVol)
+		t.Logf("note: flush landed early (reserved copy volunteer=%q); race window not exercised, but StartWork must still succeed", *reservedVol)
 	}
 
 	// StartWork immediately after hand-out, inside the flush window, must succeed: it
@@ -356,15 +373,16 @@ func TestDispatchCache_StartWorkBeforeFlush(t *testing.T) {
 		t.Fatalf("StartWork in flush window returned ok=false (%q): the flush-race drop bug is not fixed", resp.Message)
 	}
 
-	if st := pollWorkUnitState(t, ctx, env, wuID, "ASSIGNED", 5*time.Second); st != "ASSIGNED" {
-		t.Fatalf("post-StartWork state = %q, want ASSIGNED", st)
+	// Per-copy model: run-start flips the copy to RUNNING but the unit stays QUEUED.
+	if st := pollWorkUnitState(t, ctx, env, wuID, "QUEUED", 5*time.Second); st != "QUEUED" {
+		t.Fatalf("post-StartWork unit state = %q, want QUEUED (only the copy runs)", st)
 	}
 	var historyRows int
 	env.pool.QueryRow(ctx,
-		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL",
+		"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL AND started_at IS NOT NULL",
 		wuID, volID).Scan(&historyRows)
 	if historyRows != 1 {
-		t.Fatalf("expected 1 active history row after StartWork in flush window, got %d", historyRows)
+		t.Fatalf("expected 1 running history row after StartWork in flush window, got %d", historyRows)
 	}
 
 	// And the unit can be submitted (the volunteer no longer drops it).

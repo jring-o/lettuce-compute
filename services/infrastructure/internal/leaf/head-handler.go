@@ -80,11 +80,14 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
 		LEFT JOIN (
-			SELECT leaf_id, COUNT(DISTINCT assigned_volunteer_id) AS cnt
-			FROM work_units
-			WHERE state IN ('ASSIGNED', 'RUNNING')
-			AND assigned_volunteer_id IS NOT NULL
-			GROUP BY leaf_id
+			-- Per-copy dispatch: active volunteers are those holding a LIVE copy
+			-- (RESERVED or RUNNING), derived from work_unit_assignment_history rather
+			-- than the unit's (now aggregate) state.
+			SELECT wu.leaf_id, COUNT(DISTINCT h.volunteer_id) AS cnt
+			FROM work_unit_assignment_history h
+			JOIN work_units wu ON wu.id = h.work_unit_id
+			WHERE h.outcome IS NULL AND h.volunteer_id IS NOT NULL
+			GROUP BY wu.leaf_id
 		) a ON a.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
 		ORDER BY l.name ASC

@@ -122,11 +122,11 @@ func (r *claimRepo) ClaimDispatchableBatch(_ context.Context, headID types.ID, l
 	return out, nil
 }
 
-func (r *claimRepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
+func (r *claimRepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]workunit.FlushedCopy, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.now()
-	landed := make([]types.ID, 0, len(recs))
+	landed := make([]workunit.FlushedCopy, 0, len(recs))
 	for _, rec := range recs {
 		for _, u := range r.units {
 			if u.id == rec.WorkUnitID {
@@ -134,7 +134,7 @@ func (r *claimRepo) FlushReservations(_ context.Context, recs []workunit.FlushRe
 				if u.claimedBy == headID {
 					u.expiresAt = now.Add(claimLease)
 				}
-				landed = append(landed, rec.WorkUnitID)
+				landed = append(landed, workunit.FlushedCopy{WorkUnitID: rec.WorkUnitID, VolunteerID: rec.VolunteerID})
 			}
 		}
 	}

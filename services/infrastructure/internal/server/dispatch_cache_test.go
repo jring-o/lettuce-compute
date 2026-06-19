@@ -28,19 +28,22 @@ type fakeWURepo struct {
 	workunit.WorkUnitRepository
 
 	mu sync.Mutex
-	// flushFn lets a test control which reservations land (return value = landed
-	// ids) and observe/stall the flush.
-	flushFn func(recs []workunit.FlushReservation) ([]types.ID, error)
-	// markSpotCheckFn / stampFn back the deferred spot-check write path.
+	// flushFn lets a test control which copies land (return value = the landed
+	// (work_unit, volunteer) pairs) and observe/stall the flush. Per-copy dispatch:
+	// two records for the SAME unit but DISTINCT volunteers can both land.
+	flushFn func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error)
+	// markSpotCheckFn / reserveCopyFn back the deferred spot-check write path (a
+	// spot-check copy now lands as a RESERVED copy row via ReserveCopy).
 	markSpotCheckFn func(id types.ID) error
-	stampFn         func(id, vol types.ID, lease time.Duration) (*workunit.WorkUnit, error)
+	reserveCopyFn   func(wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error)
 	// countFn backs the reconcile.
 	countFn func() (map[types.ID]int, error)
 	// dispatchFn backs FindDispatchableBatch AND ClaimDispatchableBatch (the refill);
 	// it observes the leaf scope.
 	dispatchFn func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error)
 
-	flushedBatches int
+	flushedBatches   int
+	reserveCopyCalls int
 
 	// --- Layer 3 (claim-on-refill) observation fields ---
 	claimCalls          int
@@ -84,7 +87,7 @@ func (f *fakeWURepo) ClearExpiredDispatchClaims(_ context.Context) (int64, error
 	return 0, nil
 }
 
-func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]types.ID, error) {
+func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushReservation, headID types.ID, claimLease time.Duration) ([]workunit.FlushedCopy, error) {
 	f.mu.Lock()
 	f.flushedBatches++
 	f.lastFlushHeadID = headID
@@ -94,12 +97,12 @@ func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushR
 	if fn != nil {
 		return fn(recs)
 	}
-	// Default: every reservation lands.
-	ids := make([]types.ID, len(recs))
+	// Default: every copy lands (one FlushedCopy per input rec).
+	out := make([]workunit.FlushedCopy, len(recs))
 	for i, r := range recs {
-		ids[i] = r.WorkUnitID
+		out[i] = workunit.FlushedCopy{WorkUnitID: r.WorkUnitID, VolunteerID: r.VolunteerID}
 	}
-	return ids, nil
+	return out, nil
 }
 
 func (f *fakeWURepo) MarkSpotCheck(_ context.Context, id types.ID) error {
@@ -109,11 +112,18 @@ func (f *fakeWURepo) MarkSpotCheck(_ context.Context, id types.ID) error {
 	return nil
 }
 
-func (f *fakeWURepo) StampReservation(_ context.Context, id, vol types.ID, lease time.Duration) (*workunit.WorkUnit, error) {
-	if f.stampFn != nil {
-		return f.stampFn(id, vol, lease)
+// ReserveCopy backs the deferred spot-check landing (a spot-check hold lands as a
+// RESERVED copy row). It counts calls so the spot-check tests can assert the copy
+// was written.
+func (f *fakeWURepo) ReserveCopy(_ context.Context, wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error) {
+	f.mu.Lock()
+	f.reserveCopyCalls++
+	fn := f.reserveCopyFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(wuID, vol, reservedUntil, deadlineSeconds)
 	}
-	return &workunit.WorkUnit{ID: id}, nil
+	return &workunit.Copy{ID: types.NewID(), WorkUnitID: wuID, VolunteerID: vol, DeadlineSeconds: deadlineSeconds}, nil
 }
 
 func (f *fakeWURepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
@@ -316,7 +326,7 @@ func TestNoDoubleReserveConcurrent(t *testing.T) {
 	wuRepo := &fakeWURepo{
 		// Stall the flush entirely: in-memory bookkeeping alone must prevent
 		// double-reserve.
-		flushFn: func(recs []workunit.FlushReservation) ([]types.ID, error) {
+		flushFn: func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error) {
 			return nil, context.DeadlineExceeded
 		},
 	}
@@ -366,17 +376,16 @@ func TestNoDoubleReserveConcurrent(t *testing.T) {
 	}
 }
 
-// TestRedundancyTwoDistinctHolders: a redundancy-2 NORMAL unit is handed to TWO
-// distinct volunteers, but — mirroring the DB's columns-only "one live NORMAL
-// reservation at a time" model (reservation_test.go) — only ONE holder is staged
-// in memory at a time. The SECOND distinct holder is reached the Layer-1 way: after
-// the first holder run-starts (onRunStart, which corresponds to Assign freeing the
-// reserved_volunteer_id column in the DB), the unit re-enters the ready pool with one
-// active history row and headroom for the second volunteer. Staging both holders from
-// one snapshot would make BOTH flush into the single column and the WorkUnitID-keyed
-// void-check could not tell which lost, leaking a phantom in-memory holder (the
-// blocker this corrects).
-func TestRedundancyTwoDistinctHolders(t *testing.T) {
+// TestRedundancyTwoParallelHolders: per-copy dispatch (migration 00006) makes a
+// redundancy-2 NORMAL unit dispatch its TWO copies IN PARALLEL to TWO DISTINCT
+// volunteers from the SAME ready snapshot (property 7). Each copy lands as its own
+// work_unit_assignment_history row, so the cache stages up to effectiveRedundancy
+// concurrent in-memory holders — it no longer caps a NORMAL unit at one holder and no
+// longer needs the first holder to run-start before the second can be dispatched. The
+// unit stays QUEUED while both copies run; it leaves the ready pool only once its
+// redundancy headroom is fully covered. (This INVERTS the old serial-redundancy
+// assertion that a second concurrent distinct volunteer got nothing.)
+func TestRedundancyTwoParallelHolders(t *testing.T) {
 	wuRepo := &fakeWURepo{}
 	leafRepo := &fakeLeafRepo{}
 	assignRepo := &fakeAssignRepo{}
@@ -392,42 +401,42 @@ func TestRedundancyTwoDistinctHolders(t *testing.T) {
 
 	rA, _ := c.HandOut(volA, capableOpts(volA, 0), 1)
 	if len(rA) != 1 {
-		t.Fatalf("volA should get the unit, got %d", len(rA))
+		t.Fatalf("volA should get a copy, got %d", len(rA))
 	}
-	// A NORMAL unit is capped at ONE concurrent in-memory holder: after volA reserves
-	// it, it leaves the ready pool (the DB column is now volA's; a second concurrent
-	// NORMAL reservation could not land).
-	if c.readyLen() != 0 {
-		t.Fatalf("NORMAL redundancy-2 unit must leave ready after 1 holder, ready=%d", c.readyLen())
+	// The unit STAYS staged: it still has redundancy headroom for a 2nd parallel copy
+	// to a distinct volunteer (0 active + 1 holder < redundancy 2).
+	if c.readyLen() != 1 {
+		t.Fatalf("redundancy-2 unit must stay staged for its 2nd parallel copy, ready=%d", c.readyLen())
 	}
-	// volB cannot get it from the cache while volA's reservation is live.
-	rBearly, _ := c.HandOut(volB, capableOpts(volB, 0), 1)
-	if len(rBearly) != 0 {
-		t.Fatalf("volB must NOT get a concurrent 2nd in-memory hold of a NORMAL unit, got %d", len(rBearly))
-	}
-	// Same volunteer cannot take it again (self-exclusion).
+	// Same volunteer cannot take it again (self-exclusion) even though headroom exists.
 	rAdup, _ := c.HandOut(volA, capableOpts(volA, 0), 1)
 	if len(rAdup) != 0 {
-		t.Fatalf("self-exclusion violated: volA got the unit twice")
+		t.Fatalf("self-exclusion violated: volA got the same unit twice")
 	}
-
-	// volA run-starts: the in-memory reservation becomes an active history row and the
-	// DB column is freed. The refiller now legitimately re-stages the still-under-
-	// redundancy unit (1 active history row < redundancy 2) for the next volunteer.
-	c.onRunStart(unitID, volA)
-	c.stageUnit(unitID, leafID, 2, 1) // dbActiveCount=1 (volA's run-started row)
-
+	if c.readyLen() != 1 {
+		t.Fatalf("self-excluded hand-out must leave the unit staged, ready=%d", c.readyLen())
+	}
+	// volB (a DISTINCT volunteer) gets the 2nd copy IN PARALLEL from the same snapshot —
+	// no run-start of volA's copy required.
 	rB, _ := c.HandOut(volB, capableOpts(volB, 0), 1)
 	if len(rB) != 1 {
-		t.Fatalf("volB (2nd distinct holder) should get the re-staged unit, got %d", len(rB))
+		t.Fatalf("volB should get the 2nd parallel copy, got %d", len(rB))
 	}
-	// Now redundancy is exhausted: 1 active row + 1 in-memory holder == 2.
+	// Redundancy is now covered (2 distinct live copies): the unit leaves the ready pool.
 	if c.readyLen() != 0 {
-		t.Fatalf("redundancy-2 unit should be exhausted after 2 holders, ready=%d", c.readyLen())
+		t.Fatalf("redundancy-2 unit should leave ready after both copies are out, ready=%d", c.readyLen())
 	}
+	// A third distinct volunteer gets nothing: redundancy exhausted.
 	rC, _ := c.HandOut(volC, capableOpts(volC, 0), 1)
 	if len(rC) != 0 {
-		t.Fatalf("redundancy exceeded: volC got a 3rd hand-out")
+		t.Fatalf("redundancy exceeded: volC got a 3rd copy")
+	}
+	// Both distinct holders are tracked in memory (the parallel-copy invariant).
+	c.mu.Lock()
+	holders := c.reservedInMem[unitID]
+	c.mu.Unlock()
+	if len(holders) != 2 {
+		t.Fatalf("expected 2 distinct in-memory holders (parallel copies), got %d", len(holders))
 	}
 }
 
@@ -546,10 +555,14 @@ func TestSpotCheckDeferredKeepsEligible(t *testing.T) {
 		t.Fatalf("2nd corroborating volunteer should get the spot-checked unit")
 	}
 
-	// Flushing the spot-check queue marks it + stamps a reservation + writes a row.
+	// Flushing the spot-check queue marks it + lands its RESERVED copy row(s) via
+	// ReserveCopy (the per-copy spot-check landing).
 	c.flushSpotChecksOnce(context.Background())
-	if assignRepo.createdCount() == 0 {
-		t.Fatalf("spot-check flush should write an assignment_history row")
+	wuRepo.mu.Lock()
+	reserveCalls := wuRepo.reserveCopyCalls
+	wuRepo.mu.Unlock()
+	if reserveCalls == 0 {
+		t.Fatalf("spot-check flush should reserve a copy row")
 	}
 }
 
@@ -559,12 +572,12 @@ func TestSpotCheckDeferredKeepsEligible(t *testing.T) {
 func TestFlushConflictVoidsHandOut(t *testing.T) {
 	var conflictID types.ID
 	wuRepo := &fakeWURepo{
-		flushFn: func(recs []workunit.FlushReservation) ([]types.ID, error) {
-			// Land everything EXCEPT conflictID.
-			var landed []types.ID
+		flushFn: func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error) {
+			// Land every (unit, volunteer) copy EXCEPT conflictID's.
+			var landed []workunit.FlushedCopy
 			for _, r := range recs {
 				if r.WorkUnitID != conflictID {
-					landed = append(landed, r.WorkUnitID)
+					landed = append(landed, workunit.FlushedCopy{WorkUnitID: r.WorkUnitID, VolunteerID: r.VolunteerID})
 				}
 			}
 			return landed, nil
@@ -611,20 +624,21 @@ func TestFlushConflictVoidsHandOut(t *testing.T) {
 	}
 }
 
-// TestFlushSameUnitOnlyFirstLands guards the void-by-occurrence accounting: if a
-// single flush batch ever carried TWO records for the SAME work_unit_id (distinct
-// volunteers) — which the staging cap now prevents for NORMAL units, but which the
-// multi-row UPDATE's single reserved_volunteer_id column can only ever satisfy for
-// ONE of — the cache must credit the single landed RETURNING id to exactly ONE record
-// and VOID the other, never leaving a phantom in-memory holder + inflight that
-// reconcile cannot clear (the leak the redundancy blocker described).
-func TestFlushSameUnitOnlyFirstLands(t *testing.T) {
+// TestFlushVoidsPerCopyConflict guards the pair-keyed void accounting under per-copy
+// dispatch (migration 00006). A flush batch CAN legitimately carry two records for the
+// SAME work_unit_id with DISTINCT volunteers (the parallel-copy case), and each lands
+// as its OWN copy row — so the void check is keyed on the exact (work_unit, volunteer)
+// pair, NOT the unit id. Here volA's copy lands but volB's conflicts (e.g. volB already
+// held a live copy, or redundancy was already met): the cache must VOID exactly volB's
+// hold and KEEP volA's, never leaving a phantom holder + inflight that reconcile cannot
+// clear.
+func TestFlushVoidsPerCopyConflict(t *testing.T) {
 	sharedID := types.NewID()
+	volA, volB := types.NewID(), types.NewID()
 	wuRepo := &fakeWURepo{
-		flushFn: func(recs []workunit.FlushReservation) ([]types.ID, error) {
-			// The real multi-row UPDATE on a single column returns the unit id ONCE
-			// even if two records target it: simulate exactly one landed occurrence.
-			return []types.ID{sharedID}, nil
+		flushFn: func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error) {
+			// Only volA's copy lands; volB's is a per-copy conflict (not returned).
+			return []workunit.FlushedCopy{{WorkUnitID: sharedID, VolunteerID: volA}}, nil
 		},
 	}
 	leafRepo := &fakeLeafRepo{}
@@ -635,10 +649,8 @@ func TestFlushSameUnitOnlyFirstLands(t *testing.T) {
 	lf := nativeLeaf(leafID, 2, false, 0)
 	c.warm(lf, leafRepo)
 
-	volA, volB := types.NewID(), types.NewID()
-	// Force the adversarial state directly: two distinct in-memory holders of the same
-	// unit, both queued for the NORMAL flush. (HandOut's cap prevents producing this,
-	// so we construct it to prove the void path is robust regardless.)
+	// Two distinct in-memory holders of the same unit, both queued for the NORMAL flush
+	// (the parallel-copy staging the cache now legitimately produces).
 	until := c.now().UTC().Add(time.Hour)
 	c.mu.Lock()
 	c.reservedInMem[sharedID] = map[types.ID]time.Time{volA: until, volB: until}
@@ -654,16 +666,22 @@ func TestFlushSameUnitOnlyFirstLands(t *testing.T) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Exactly ONE holder survives (the one credited with the landed row); the other is
-	// voided. We do not care which, only that the count collapsed from 2 to 1 and the
-	// voided volunteer's inflight was released.
+	// volA's copy survives; volB's is voided (pair-keyed).
 	holders := c.reservedInMem[sharedID]
 	if len(holders) != 1 {
-		t.Fatalf("exactly one holder should survive a single landed row, got %d", len(holders))
+		t.Fatalf("exactly volA's holder should survive the conflict, got %d holders", len(holders))
 	}
-	total := c.inflight[volA] + c.inflight[volB]
-	if total != 1 {
-		t.Fatalf("voided holder's inflight should be released (total inflight want 1, got %d)", total)
+	if _, ok := holders[volA]; !ok {
+		t.Fatalf("the landed copy (volA) should remain held")
+	}
+	if _, ok := holders[volB]; ok {
+		t.Fatalf("the conflicted copy (volB) should be voided")
+	}
+	if c.inflight[volA] != 1 {
+		t.Fatalf("volA's inflight should remain 1, got %d", c.inflight[volA])
+	}
+	if c.inflight[volB] != 0 {
+		t.Fatalf("voided volB's inflight should be released to 0, got %d", c.inflight[volB])
 	}
 }
 
@@ -976,7 +994,7 @@ func (c *dispatchCache) readyContainsLockedTest(id types.ID) bool {
 func TestHasInMemReservationFlushRace(t *testing.T) {
 	wuRepo := &fakeWURepo{
 		// Stall the flush so the reservation stays in-memory-only.
-		flushFn: func(recs []workunit.FlushReservation) ([]types.ID, error) {
+		flushFn: func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error) {
 			return nil, context.DeadlineExceeded
 		},
 	}
@@ -1017,15 +1035,15 @@ func TestFlushAllPendingHeldDoesNotAcquireAdmission(t *testing.T) {
 	landed := map[types.ID]bool{}
 	var mu sync.Mutex
 	wuRepo := &fakeWURepo{
-		flushFn: func(recs []workunit.FlushReservation) ([]types.ID, error) {
+		flushFn: func(recs []workunit.FlushReservation) ([]workunit.FlushedCopy, error) {
 			mu.Lock()
 			defer mu.Unlock()
-			ids := make([]types.ID, 0, len(recs))
+			out := make([]workunit.FlushedCopy, 0, len(recs))
 			for _, r := range recs {
 				landed[r.WorkUnitID] = true
-				ids = append(ids, r.WorkUnitID)
+				out = append(out, workunit.FlushedCopy{WorkUnitID: r.WorkUnitID, VolunteerID: r.VolunteerID})
 			}
-			return ids, nil
+			return out, nil
 		},
 	}
 	leafRepo := &fakeLeafRepo{}
@@ -1311,7 +1329,10 @@ func TestSpotCheckFlushUsesMaintenanceBudget(t *testing.T) {
 		c.admission <- struct{}{}
 	}
 	c.flushSpotChecksOnce(context.Background())
-	if assignRepo.createdCount() == 0 {
+	wuRepo.mu.Lock()
+	reserveCalls := wuRepo.reserveCopyCalls
+	wuRepo.mu.Unlock()
+	if reserveCalls == 0 {
 		t.Fatalf("FIX 4: spot-check flush must land via the maintenance budget even with client admission full")
 	}
 }

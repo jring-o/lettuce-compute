@@ -214,7 +214,8 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		}
 		wuID1 := wuRespA.Assignments[0].WorkUnitId
 
-		// Volunteer A run-starts the reserved unit (StartWork: QUEUED -> ASSIGNED).
+		// Volunteer A run-starts its reserved copy (StartWork: RESERVED -> RUNNING). Per-copy
+		// model: the WORK UNIT stays QUEUED so its other redundancy copies keep dispatching.
 		swResp, err := grpcClient.StartWork(keyA.sign(ctx), &lettucev1.StartWorkRequest{
 			WorkUnitId:  wuID1,
 			VolunteerId: volAID,
@@ -226,15 +227,25 @@ func TestE2EV03Lifecycle(t *testing.T) {
 			t.Errorf("StartWork should return ok = true (%s)", swResp.Message)
 		}
 
-		// Verify ASSIGNED state (no separate RUNNING step without heartbeats).
+		// Verify the unit stays QUEUED and vol A's copy is now RUNNING (started_at set).
 		var wuState string
 		err = pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1",
 			types.MustParseID(wuID1)).Scan(&wuState)
 		if err != nil {
 			t.Fatalf("query state: %v", err)
 		}
-		if wuState != "ASSIGNED" {
-			t.Errorf("work unit state = %q, want ASSIGNED", wuState)
+		if wuState != "QUEUED" {
+			t.Errorf("work unit state = %q, want QUEUED (per-copy: only the copy runs)", wuState)
+		}
+		var runningCopies int
+		err = pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL AND started_at IS NOT NULL",
+			types.MustParseID(wuID1), volAIDParsed).Scan(&runningCopies)
+		if err != nil {
+			t.Fatalf("count running copies: %v", err)
+		}
+		if runningCopies != 1 {
+			t.Errorf("running copies for vol A = %d, want 1", runningCopies)
 		}
 
 		// Create redundant assignment for vol B (redundancy_factor=2).
@@ -532,7 +543,8 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		}
 		wuID3 := wuRespA.Assignments[0].WorkUnitId
 
-		// Vol A run-starts (StartWork: QUEUED -> ASSIGNED, sets assigned_at).
+		// Vol A run-starts: its RESERVED copy flips to RUNNING (started_at set). Per-copy
+		// model: the WORK UNIT stays QUEUED; only the copy runs.
 		_, err = grpcClient.StartWork(keyA.sign(ctx), &lettucev1.StartWorkRequest{
 			WorkUnitId:  wuID3,
 			VolunteerId: volAID,
@@ -541,14 +553,17 @@ func TestE2EV03Lifecycle(t *testing.T) {
 			t.Fatalf("vol A StartWork: %v", err)
 		}
 
-		// Simulate a vanished volunteer past its deadline: backdate assigned_at and
-		// force a short deadline so the deadline-based reclaim (FindExpiredWorkUnits)
-		// reassigns it. (Per-task heartbeat timeouts are gone; liveness is the deadline.)
+		// Simulate a vanished volunteer past its deadline: backdate vol A's RUNNING COPY's
+		// started_at and force a short per-copy deadline so the deadline-based copy sweep
+		// (FindExpiredCopies) reclaims it. (Per-task heartbeat timeouts are gone; liveness
+		// is the per-copy deadline — property 5.)
 		_, err = pool.Exec(ctx,
-			"UPDATE work_units SET assigned_at = NOW() - INTERVAL '1 hour', deadline_seconds = 1 WHERE id = $1",
-			types.MustParseID(wuID3))
+			`UPDATE work_unit_assignment_history
+			 SET started_at = NOW() - INTERVAL '1 hour', deadline_seconds = 1
+			 WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
+			types.MustParseID(wuID3), volAIDParsed)
 		if err != nil {
-			t.Fatalf("backdate assigned_at: %v", err)
+			t.Fatalf("backdate running copy: %v", err)
 		}
 
 		// Run fault monitor ScanOnce.
@@ -559,29 +574,34 @@ func TestE2EV03Lifecycle(t *testing.T) {
 			t.Fatalf("ScanOnce: %v", err)
 		}
 
-		// Verify: work unit re-queued (QUEUED, HIGH priority, reassignment_count=1).
-		var wuState, priority string
-		var reassignCount int
+		// Verify: the timed-out copy is closed and the unit stays QUEUED with no live copy
+		// left — it immediately redispatches a fresh copy (uncapped, property 6). Per-copy
+		// model: the deadline sweep does NOT bump reassignment_count or escalate priority;
+		// it closes the copy and leaves the unit dispatchable.
+		var wuState string
 		err = pool.QueryRow(ctx,
-			"SELECT state, priority, reassignment_count FROM work_units WHERE id = $1",
-			types.MustParseID(wuID3)).Scan(&wuState, &priority, &reassignCount)
+			"SELECT state FROM work_units WHERE id = $1",
+			types.MustParseID(wuID3)).Scan(&wuState)
 		if err != nil {
 			t.Fatalf("query state: %v", err)
 		}
 		if wuState != "QUEUED" {
 			t.Errorf("state = %q, want QUEUED", wuState)
 		}
-		if priority != "HIGH" {
-			t.Errorf("priority = %q, want HIGH", priority)
+		var liveCopies int
+		err = pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1 AND outcome IS NULL",
+			types.MustParseID(wuID3)).Scan(&liveCopies)
+		if err != nil {
+			t.Fatalf("count live copies: %v", err)
 		}
-		if reassignCount != 1 {
-			t.Errorf("reassignment_count = %d, want 1", reassignCount)
+		if liveCopies != 0 {
+			t.Errorf("live copies = %d, want 0 (the timed-out copy was closed)", liveCopies)
 		}
 
-		// Verify assignment outcome = EXPIRED. With per-task heartbeats removed,
-		// liveness is deadline-based: a vanished volunteer's unit is reclaimed by the
-		// deadline sweep (FindExpiredWorkUnits), which records the EXPIRED outcome. The
-		// old heartbeat-abandonment path (outcome ABANDONED) no longer exists.
+		// Verify the copy outcome = EXPIRED: a run-started copy that missed its deadline.
+		// (The old heartbeat-abandonment ABANDONED path for a RUNNING copy no longer exists;
+		// ABANDONED is now reserved for a buffered copy whose holder vanished pre-start.)
 		var outcome string
 		err = pool.QueryRow(ctx,
 			"SELECT outcome FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NOT NULL ORDER BY outcome_at DESC LIMIT 1",
@@ -658,82 +678,81 @@ func TestE2EV03Lifecycle(t *testing.T) {
 	})
 
 	// =====================================================
-	// Scenario 4: Max reassignments exceeded → FAILED
+	// Scenario 4: Dead-letter at max_total_copies (requeue is UNCAPPED)
 	// =====================================================
-	t.Run("Scenario4_MaxReassignments", func(t *testing.T) {
-		// Create a work unit with max_reassignments=1 directly in DB.
+	// Per-copy model (migration 00006): there is NO per-reassignment cap. A timed-out
+	// copy is closed EXPIRED and the unit redispatches freely while it stays QUEUED;
+	// the unit only dead-letters (FAILED + flagged) once the TOTAL copies ever created
+	// reaches max_total_copies with redundancy still unmet and no live copy. Probe that
+	// ceiling with max_total_copies=2 (was: assert FAILED after max_reassignments).
+	t.Run("Scenario4_DeadLetterAtMaxTotalCopies", func(t *testing.T) {
 		wuID4 := types.NewID()
 		_, err := pool.Exec(ctx, `
 			INSERT INTO work_units (
 				id, leaf_id, state, priority, input_data, code_artifact_ref,
-				parameters, deadline_seconds, max_reassignments, reassignment_count
+				parameters, deadline_seconds, max_total_copies, reassignment_count
 			) VALUES ($1, $2, 'QUEUED', 'NORMAL', '{"x": 99}', 'ref://test',
-				'{"iter": 1}', 3600, 1, 0)`,
+				'{"iter": 1}', 3600, 2, 0)`,
 			wuID4, proj.ID)
 		if err != nil {
 			t.Fatalf("create wu4: %v", err)
 		}
 
 		wuRepo := workunit.NewPgxWorkUnitRepository(pool)
+		reservedUntil := time.Now().UTC().Add(time.Hour)
 
-		// Assign, then expire.
-		_, err = pool.Exec(ctx, `
-			UPDATE work_units SET state = 'ASSIGNED',
-				assigned_volunteer_id = $2, assigned_at = NOW(), last_heartbeat_at = NOW()
-			WHERE id = $1`, wuID4, volAIDParsed)
+		// Copy 1: reserve a copy for vol A, then time it out (close EXPIRED). The unit
+		// stays QUEUED — there is no per-unit ASSIGNED/EXPIRED in the per-copy model.
+		cp1, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, reservedUntil, 3600)
 		if err != nil {
-			t.Fatalf("assign wu4: %v", err)
+			t.Fatalf("reserve copy 1: %v", err)
 		}
-		_, err = wuRepo.TransitionToExpired(ctx, wuID4)
-		if err != nil {
-			t.Fatalf("expire wu4: %v", err)
+		if err := wuRepo.CloseCopy(ctx, cp1.ID, "EXPIRED"); err != nil {
+			t.Fatalf("close copy 1: %v", err)
 		}
 
-		// First reassign → count goes to 1 = max.
-		_, requeued, err := wuRepo.Reassign(ctx, wuID4)
+		// One timed-out copy must NOT dead-letter — requeue is uncapped (total=1 < 2).
+		failed, err := wuRepo.DeadLetterIfExhausted(ctx, wuID4)
 		if err != nil {
-			t.Fatalf("first reassign: %v", err)
+			t.Fatalf("dead-letter probe after copy 1: %v", err)
 		}
-		if !requeued {
-			t.Error("first reassign should re-queue")
+		if failed {
+			t.Error("should NOT dead-letter after a single timed-out copy (requeue is uncapped)")
 		}
 
-		// Assign and expire again.
-		_, err = pool.Exec(ctx, `
-			UPDATE work_units SET state = 'ASSIGNED',
-				assigned_volunteer_id = $2, assigned_at = NOW(), last_heartbeat_at = NOW()
-			WHERE id = $1`, wuID4, volAIDParsed)
+		// Copy 2: reserve + time out again. Total copies now reaches max_total_copies=2.
+		cp2, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, reservedUntil, 3600)
 		if err != nil {
-			t.Fatalf("assign wu4 again: %v", err)
+			t.Fatalf("reserve copy 2: %v", err)
 		}
-		_, err = wuRepo.TransitionToExpired(ctx, wuID4)
-		if err != nil {
-			t.Fatalf("expire wu4 again: %v", err)
+		if err := wuRepo.CloseCopy(ctx, cp2.ID, "EXPIRED"); err != nil {
+			t.Fatalf("close copy 2: %v", err)
 		}
 
-		// Second reassign → FAIL (count=1 >= max=1).
-		updated, requeued, err := wuRepo.Reassign(ctx, wuID4)
+		// Total copies (2) >= max_total_copies (2), redundancy unmet, no live copy →
+		// the unit dead-letters FAILED + flagged_for_review.
+		failed, err = wuRepo.DeadLetterIfExhausted(ctx, wuID4)
 		if err != nil {
-			t.Fatalf("second reassign: %v", err)
+			t.Fatalf("dead-letter probe after copy 2: %v", err)
 		}
-		if requeued {
-			t.Error("should NOT re-queue")
-		}
-		if updated.State != workunit.WorkUnitStateFailed {
-			t.Errorf("state = %s, want FAILED", updated.State)
-		}
-		if !updated.FlaggedForReview {
-			t.Error("flagged_for_review should be true")
+		if !failed {
+			t.Fatal("should dead-letter once total copies reaches max_total_copies")
 		}
 
-		// Verify it stays FAILED in DB.
+		// Verify it is FAILED + flagged in DB.
 		var finalState string
-		err = pool.QueryRow(ctx, "SELECT state FROM work_units WHERE id = $1", wuID4).Scan(&finalState)
+		var flagged bool
+		err = pool.QueryRow(ctx,
+			"SELECT state, flagged_for_review FROM work_units WHERE id = $1", wuID4).
+			Scan(&finalState, &flagged)
 		if err != nil {
 			t.Fatalf("query final state: %v", err)
 		}
 		if finalState != "FAILED" {
 			t.Errorf("state = %q, want FAILED", finalState)
+		}
+		if !flagged {
+			t.Error("flagged_for_review should be true")
 		}
 	})
 
