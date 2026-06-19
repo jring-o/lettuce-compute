@@ -1585,6 +1585,35 @@ func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
 	}
 }
 
+// TestReconcileBuffers_CutoffBoundedByReportTime verifies the reap cutoff is bounded by
+// the volunteer's last report time, not just now-grace. A full client that stopped
+// requesting goes quiet; the batch that filled its buffer was created AFTER its last
+// report, so it must never be reaped even once it ages past the grace window.
+func TestReconcileBuffers_CutoffBoundedByReportTime(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	c := newTestCache(wuRepo, &fakeLeafRepo{}, &fakeAssignRepo{})
+
+	base := time.Now()
+	// Report recorded 70s ago (still fresh: < heldReportFreshness), then the client went
+	// quiet (buffer full). now-grace would be base-60s, but the report is older than that.
+	c.now = func() time.Time { return base.Add(-70 * time.Second) }
+	vol := types.NewID()
+	c.NoteVolunteerHeld(vol, []types.ID{types.NewID()})
+	c.now = func() time.Time { return base }
+
+	var gotCutoff time.Time
+	wuRepo.releaseFn = func(_ types.ID, _ []types.ID, olderThan time.Time) ([]types.ID, error) {
+		gotCutoff = olderThan
+		return nil, nil
+	}
+	c.reconcileBuffers(context.Background())
+
+	want := base.Add(-70 * time.Second) // bounded by the report time, not now-grace (base-60s)
+	if !gotCutoff.Equal(want) {
+		t.Fatalf("cutoff = %v, want report time %v (must not reap copies created after the last report)", gotCutoff, want)
+	}
+}
+
 // TestReconcileBuffers_SkipsStaleReports verifies a volunteer whose last held-set
 // report is older than the freshness window is NOT reconciled (its buffered copies
 // ride the deadline instead), and its stale report is pruned.

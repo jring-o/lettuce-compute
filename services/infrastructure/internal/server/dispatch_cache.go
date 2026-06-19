@@ -1529,15 +1529,17 @@ func (c *dispatchCache) NoteVolunteerHeld(volunteerID types.ID, held []types.ID)
 // closed, its work unit redispatches at once, and it stops counting against the
 // volunteer's inflight cap. Only reports fresh enough to trust are acted on (a
 // volunteer that stopped polling has its copies reclaimed by the deadline instead), and
-// only copies older than the grace window are released (so a just-handed copy is never
-// reaped before the volunteer's next report includes it). Running copies are untouched.
+// a copy is released only if it was created before BOTH the volunteer's last report and
+// the grace window — so the batch that filled a now-quiet client's buffer (created after
+// its last report) and a just-handed copy are never wrongly reaped. Running copies are untouched.
 func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 	now := c.now()
 
 	// Snapshot fresh reports and prune stale ones (a returning volunteer re-reports).
 	type pending struct {
-		vol  types.ID
-		held []types.ID
+		vol      types.ID
+		held     []types.ID
+		reported time.Time
 	}
 	var todo []pending
 	c.heldMu.Lock()
@@ -1550,16 +1552,26 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 		for u := range r.units {
 			held = append(held, u)
 		}
-		todo = append(todo, pending{vol: vol, held: held})
+		todo = append(todo, pending{vol: vol, held: held, reported: r.at})
 	}
 	c.heldMu.Unlock()
 	if len(todo) == 0 {
 		return
 	}
 
-	cutoff := now.Add(-reconcileGracePeriod)
+	graceCutoff := now.Add(-reconcileGracePeriod)
 	releasedAny := false
 	for _, p := range todo {
+		// Reap only copies created BEFORE the volunteer's last held report: a copy newer
+		// than the report could not have been in it (the volunteer had not received it when
+		// it built the request), so reaping it would drop work the volunteer holds but has
+		// not yet had the chance to report — e.g. the batch that filled its buffer, after
+		// which a full client stops requesting and goes quiet. The grace window further
+		// guards a just-handed copy. So reap iff created < min(report time, now - grace).
+		cutoff := graceCutoff
+		if p.reported.Before(cutoff) {
+			cutoff = p.reported
+		}
 		relCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 		release, ok := c.acquireMaintenance(relCtx)
 		if !ok {
