@@ -391,6 +391,7 @@ func (s *volunteerService) GetServerStatus(ctx context.Context, _ *lettucev1.Get
 
 	return &lettucev1.GetServerStatusResponse{
 		Status:         st,
+		Version:        s.version,
 		UptimeSeconds:  int64(time.Since(s.startTime).Seconds()),
 		DatabaseStatus: dbStatus,
 	}, nil
