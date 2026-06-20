@@ -581,3 +581,159 @@ func TestFindNextAssignable_PlanUsesIndexNoSort(t *testing.T) {
 		t.Fatalf("assignment query plan does not use idx_work_units_queue_order:\n%s", planText)
 	}
 }
+
+// --- per-volunteer distinctness + cooldown (authoritative copy-creation gates) ---
+
+// insertPendingResult inserts a minimal PENDING result row for (wuID, vol) — the
+// durable marker that this volunteer has already contributed a result to the unit.
+func insertPendingResult(t *testing.T, pool *pgxpool.Pool, wuID, vol types.ID) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO results
+			(work_unit_id, volunteer_id, output_data, output_checksum, execution_metadata, validation_status)
+		VALUES ($1, $2, '{"x":1}'::jsonb, $3, '{}'::jsonb, 'PENDING')`,
+		wuID, vol, strings.Repeat("a", 64),
+	)
+	if err != nil {
+		t.Fatalf("insert pending result: %v", err)
+	}
+}
+
+func containsFlushedPair(landed []FlushedCopy, wuID, vol types.ID) bool {
+	for _, fc := range landed {
+		if fc.WorkUnitID == wuID && fc.VolunteerID == vol {
+			return true
+		}
+	}
+	return false
+}
+
+// ReserveCopy is the authoritative copy-creation gate: it must refuse a volunteer that
+// already authored a PENDING result for the unit (so each of the N redundant results
+// comes from a DISTINCT volunteer), while still letting a fresh volunteer reserve the
+// corroborating copy. This is the durable backstop behind the in-memory hand-out filter.
+func TestReserveCopy_RefusesPriorResultAuthor(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "reserve-distinct")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "") // default redundancy 2
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+	insertPendingResult(t, pool, wu.ID, volA)
+
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+		t.Fatalf("ReserveCopy must refuse a volunteer that already submitted a result for this unit")
+	}
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+		t.Fatalf("ReserveCopy must allow a distinct corroborator: %v", err)
+	}
+}
+
+// ReserveCopy must bench a volunteer whose recent copy of the unit EXPIRED/was abandoned
+// (post-failure cooldown ~one deadline) so a fresh volunteer gets first crack, while
+// still allowing that fresh volunteer.
+func TestReserveCopy_RefusesBenchedVolunteer(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "reserve-cooldown")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+
+	// volA reserves, then its copy expires — benching it for ~one deadline window.
+	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
+		t.Fatalf("reserve volA: %v", err)
+	}
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil); err != nil {
+		t.Fatalf("close volA copy EXPIRED: %v", err)
+	}
+
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+		t.Fatalf("ReserveCopy must bench a volunteer whose copy just expired")
+	}
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+		t.Fatalf("ReserveCopy must allow a fresh volunteer during another's cooldown: %v", err)
+	}
+}
+
+// FlushReservations is the production hand-out landing path. It must SKIP (not land) a
+// reservation for a volunteer that already authored a PENDING result for the unit while
+// landing a DISTINCT corroborator — so a unit re-queued for corroboration is never
+// re-dispatched to its own prior submitter (the live regression). A skipped record is
+// absent from the returned landed set, so the cache voids that hold before any run-start.
+func TestFlushReservations_SkipsPriorResultAuthor(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "flush-distinct")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "") // default redundancy 2
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+	insertPendingResult(t, pool, wu.ID, volA)
+
+	until := time.Now().UTC().Add(time.Hour)
+	landed, err := repo.FlushReservations(ctx, []FlushReservation{
+		{WorkUnitID: wu.ID, VolunteerID: volA, ReservedUntil: until, DeadlineSeconds: wu.DeadlineSeconds},
+		{WorkUnitID: wu.ID, VolunteerID: volB, ReservedUntil: until, DeadlineSeconds: wu.DeadlineSeconds},
+	}, types.ID{}, 0)
+	if err != nil {
+		t.Fatalf("FlushReservations: %v", err)
+	}
+	if containsFlushedPair(landed, wu.ID, volA) {
+		t.Fatalf("prior result author volA must NOT land a copy")
+	}
+	if !containsFlushedPair(landed, wu.ID, volB) {
+		t.Fatalf("distinct corroborator volB must land a copy")
+	}
+}
+
+// FlushReservations must also SKIP a volunteer benched by a recent EXPIRED/abandoned copy
+// of the unit, while landing a fresh volunteer.
+func TestFlushReservations_SkipsBenchedVolunteer(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "flush-cooldown")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", "")
+	volA := createTestVolunteer(t, pool)
+	volB := createTestVolunteer(t, pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
+		t.Fatalf("reserve volA: %v", err)
+	}
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil); err != nil {
+		t.Fatalf("close volA copy EXPIRED: %v", err)
+	}
+
+	until := time.Now().UTC().Add(time.Hour)
+	landed, err := repo.FlushReservations(ctx, []FlushReservation{
+		{WorkUnitID: wu.ID, VolunteerID: volA, ReservedUntil: until, DeadlineSeconds: wu.DeadlineSeconds},
+		{WorkUnitID: wu.ID, VolunteerID: volB, ReservedUntil: until, DeadlineSeconds: wu.DeadlineSeconds},
+	}, types.ID{}, 0)
+	if err != nil {
+		t.Fatalf("FlushReservations: %v", err)
+	}
+	if containsFlushedPair(landed, wu.ID, volA) {
+		t.Fatalf("benched volA must NOT land a copy during cooldown")
+	}
+	if !containsFlushedPair(landed, wu.ID, volB) {
+		t.Fatalf("fresh volB must land a copy")
+	}
+}

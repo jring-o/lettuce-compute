@@ -549,6 +549,19 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 // to the head. Returns the count actually buffered.
 func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, assignments []*lettucev1.WorkUnitAssignment) int {
 	pushed := 0
+	// Dedup against what this volunteer already holds (prefetch buffer + active slots)
+	// and against earlier units in this same batch. A head should never hand a unit a
+	// volunteer already holds, but if one slips through (e.g. a re-stage that raced the
+	// volunteer's held-set report), running the duplicate is pure waste — its result is
+	// rejected as a duplicate from the same volunteer. Skip it WITHOUT abandoning: an
+	// abandon is keyed on (unit, volunteer) and would close the legitimate copy we
+	// already hold; the redundant reservation instead lapses and the head reclaims it.
+	held := make(map[string]struct{})
+	if f.heldWorkUnitIDsFn != nil {
+		for _, id := range f.heldWorkUnitIDsFn() {
+			held[id] = struct{}{}
+		}
+	}
 	for _, asg := range assignments {
 		wu := runtime.WorkUnitFromProto(asg)
 		f.logger.Info("fetcher: received work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime)
@@ -561,6 +574,13 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			f.abandonWorkUnit(ctx, head, wu, idErr.Error())
 			continue
 		}
+
+		// Skip a unit already held (buffered, running, or seen earlier in this batch).
+		if _, dup := held[wu.ID]; dup {
+			f.logger.Debug("fetcher: skipping duplicate work unit already held", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug)
+			continue
+		}
+		held[wu.ID] = struct{}{}
 
 		rt, selErr := f.registry.SelectRuntime(wu)
 		if selErr != nil {

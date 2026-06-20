@@ -435,6 +435,105 @@ func TestHandOutBasic(t *testing.T) {
 	}
 }
 
+// stageUnitSets appends a ready candidate carrying explicit contributor / benched
+// volunteer sets, so the distinctness + cooldown hand-out filters can be exercised
+// without a DB.
+func (c *dispatchCache) stageUnitSets(unitID, leafID types.ID, redundancy, dbActive int, contributors, benched []types.ID) {
+	c.mu.Lock()
+	c.ready = append(c.ready, candidate{
+		unit:                &workunit.WorkUnit{ID: unitID, LeafID: leafID, State: workunit.WorkUnitStateQueued},
+		effectiveRedundancy: redundancy,
+		dbActiveCount:       dbActive,
+		contributors:        idSet(contributors),
+		benched:             idSet(benched),
+	})
+	c.mu.Unlock()
+}
+
+// TestHandOut_ExcludesPriorContributor: a redundancy-2 unit that already carries one
+// PENDING result from volA (dbActive 1, volA a contributor) must never be re-handed to
+// volA — each redundant result must come from a DISTINCT volunteer — while volB, the
+// needed corroborator, gets it.
+func TestHandOut_ExcludesPriorContributor(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 2, false, 0), leafRepo)
+
+	unitID := types.NewID()
+	volA := types.NewID()
+	volB := types.NewID()
+	c.stageUnitSets(unitID, leafID, 2, 1, []types.ID{volA}, nil)
+
+	if res, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(res) != 0 {
+		t.Fatalf("prior contributor volA was re-handed its own unit (%d results); want 0", len(res))
+	}
+	if res, _ := c.HandOut(volB, capableOpts(volB, 0), 1); len(res) != 1 {
+		t.Fatalf("distinct corroborator volB got %d results; want 1", len(res))
+	}
+}
+
+// TestHandOut_ExcludesBenchedVolunteer: a volunteer benched by a recent timeout /
+// abandon of this unit is given last refusal; a fresh volunteer gets it.
+func TestHandOut_ExcludesBenchedVolunteer(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+
+	unitID := types.NewID()
+	volA := types.NewID()
+	volB := types.NewID()
+	c.stageUnitSets(unitID, leafID, 1, 0, nil, []types.ID{volA})
+
+	if res, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(res) != 0 {
+		t.Fatalf("benched volA was handed the unit (%d results); want 0", len(res))
+	}
+	if res, _ := c.HandOut(volB, capableOpts(volB, 0), 1); len(res) != 1 {
+		t.Fatalf("fresh volB got %d results; want 1", len(res))
+	}
+}
+
+// TestOnRunStart_ExcludesContributorAfterRunStart reproduces the live regression: a
+// redundancy-2 unit stays staged in the ready pool while its first copy runs and after
+// that volunteer submits (one result does not meet redundancy, so the unit is not
+// evicted). The volunteer that already ran a copy must not be re-handed the same unit
+// once its in-memory hold is released — onRunStart records it as a contributor so it
+// stays excluded — while a DISTINCT volunteer still gets the corroborating copy.
+func TestOnRunStart_ExcludesContributorAfterRunStart(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 2, false, 0), leafRepo)
+
+	unitID := types.NewID()
+	volA := types.NewID()
+	volB := types.NewID()
+	c.stageUnit(unitID, leafID, 2, 0)
+
+	// volA takes the first copy, then run-starts it (releasing its in-memory hold).
+	if res, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(res) != 1 {
+		t.Fatalf("volA first hand-out = %d, want 1", len(res))
+	}
+	c.onRunStart(unitID, volA)
+
+	// The unit is still staged (redundancy 2, one copy covered). volA must NOT get it
+	// again — that is exactly the wasted re-run the live head exhibited.
+	if res, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(res) != 0 {
+		t.Fatalf("volA was re-handed a unit it already run-started (%d results); want 0", len(res))
+	}
+	// The distinct corroborator still gets the second copy.
+	if res, _ := c.HandOut(volB, capableOpts(volB, 0), 1); len(res) != 1 {
+		t.Fatalf("distinct corroborator volB got %d results; want 1", len(res))
+	}
+}
+
 // TestNoDoubleReserveConcurrent: many goroutines hammer HandOut for distinct
 // volunteers against a pool of redundancy-1 units WITH THE FLUSHER STALLED. No unit
 // may be handed to two volunteers. This is the core no-double-hand property.

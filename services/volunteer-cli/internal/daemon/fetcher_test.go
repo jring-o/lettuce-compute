@@ -136,6 +136,44 @@ func TestFetcher_FillsQueue(t *testing.T) {
 	}
 }
 
+// TestBufferBatch_SkipsAlreadyHeldUnits verifies the client never re-buffers (and so
+// never re-runs) a work unit it already holds in its prefetch buffer or active slots,
+// nor a duplicate appearing twice within one batch. Running a duplicate is pure waste:
+// its result is rejected by the head as a duplicate from the same volunteer.
+func TestBufferBatch_SkipsAlreadyHeldUnits(t *testing.T) {
+	servers := []*ServerConnection{
+		{Client: &mockClient{}, VolunteerID: "vol-1", Name: "server-a", Available: true},
+	}
+	d := newFetcherTestDaemon(servers)
+	queue := NewPreFetchQueue(8, d.logger)
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+
+	const heldID = "00000000-0000-4000-8000-000000000001"
+	const freshID = "00000000-0000-4000-8000-000000000002"
+	fetcher.heldWorkUnitIDsFn = func() []string { return []string{heldID} }
+
+	leaf := CachedLeafInfo{ID: "leaf-1", Slug: "leaf-1", Name: "Leaf One", State: "ACTIVE"}
+	mkAsg := func(id string) *lettucev1.WorkUnitAssignment {
+		return &lettucev1.WorkUnitAssignment{
+			WorkUnitId:    id,
+			LeafId:        "leaf-1",
+			Runtime:       "native",
+			InputData:     []byte("input"),
+			ExecutionSpec: &lettucev1.ExecutionSpec{},
+		}
+	}
+	// heldID is already held; freshID appears twice (an intra-batch duplicate).
+	pushed := fetcher.bufferBatch(context.Background(), servers[0], leaf,
+		[]*lettucev1.WorkUnitAssignment{mkAsg(heldID), mkAsg(freshID), mkAsg(freshID)})
+
+	if pushed != 1 {
+		t.Fatalf("bufferBatch pushed %d units, want 1 (held unit + intra-batch duplicate skipped)", pushed)
+	}
+	if queue.Len() != 1 {
+		t.Fatalf("queue length = %d, want 1", queue.Len())
+	}
+}
+
 func TestFetcher_BacksOffWhenNoWork(t *testing.T) {
 	callCount := 0
 	mc := &mockClient{
