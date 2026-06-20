@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // Client wraps a gRPC connection to the Lettuce infrastructure server.
@@ -81,7 +82,10 @@ func New(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 
 	conn, err := grpc.NewClient(cfg.ServerURL,
 		grpc.WithTransportCredentials(creds),
-		grpc.WithChainUnaryInterceptor(signingClientInterceptor(cfg.Identity)),
+		grpc.WithChainUnaryInterceptor(
+			loggingClientInterceptor(logger, cfg.ServerURL),
+			signingClientInterceptor(cfg.Identity),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating gRPC client: %w", err)
@@ -93,6 +97,31 @@ func New(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 		logger:         logger,
 		requestTimeout: cfg.RequestTimeout,
 	}, nil
+}
+
+// loggingClientInterceptor returns a UnaryClientInterceptor that emits a Debug
+// line per RPC (method, wire address, duration_ms) and, on failure, the gRPC
+// status code alongside the error. It is the outermost interceptor so its timing
+// covers signing too. Kept at Debug so the gRPC client is observable on demand
+// without adding noise by default. A nil logger makes it a pass-through.
+func loggingClientInterceptor(logger *slog.Logger, address string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if logger == nil {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		start := time.Now()
+		err := invoker(ctx, method, req, reply, cc, opts...)
+		durationMs := time.Since(start).Milliseconds()
+		if err != nil {
+			logger.Debug("client: rpc failed",
+				"method", method, "address", address, "duration_ms", durationMs,
+				"code", status.Code(err).String(), "error", err)
+		} else {
+			logger.Debug("client: rpc ok",
+				"method", method, "address", address, "duration_ms", durationMs)
+		}
+		return err
+	}
 }
 
 // Close closes the gRPC connection.

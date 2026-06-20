@@ -39,7 +39,7 @@ func runProjects(cmd *cobra.Command, args []string) error {
 		}
 		leafs, err := mgr.ListLeafs(cmd.Context(), srv.HTTPAddress)
 		if err != nil {
-			logger.Warn("failed to list leafs from server", "server", srv.HTTPAddress, "error", err)
+			logger.Warn("failed to list leafs from server", "server", srv.Name, "address", srv.HTTPAddress, "error", err)
 			continue
 		}
 		for _, p := range leafs {

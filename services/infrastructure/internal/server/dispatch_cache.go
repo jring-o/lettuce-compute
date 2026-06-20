@@ -472,6 +472,10 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	c.mu.Lock()
 	kept := c.ready[:0]
 	taken := 0
+	// D-1: per-reason tally of why candidates were refused, so a hand-out that returns
+	// nothing can explain itself ("why did this volunteer get zero work"). Stack-allocated
+	// fixed array — incremented per rejected candidate only, never allocates.
+	var rejects [numRejectReasons]int
 	// FIX 1: scan front-to-back, but STOP scanning once n reservations are taken and
 	// splice the unscanned tail back in one append (below), instead of copying every
 	// trailing element tail-into-kept under the global lock (the O(pool) latency
@@ -488,7 +492,8 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			break
 		}
 		c.scanCount++ // TEST-ONLY: count candidates actually visited (FIX-1 early-exit probe).
-		if !c.eligibleLocked(volunteerID, opts, cand) {
+		if ok, reason := c.eligibleLocked(volunteerID, opts, cand); !ok {
+			rejects[reason]++
 			kept = append(kept, cand)
 			continue
 		}
@@ -578,8 +583,9 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// full-compaction result. kept aliases c.ready's backing array and len(kept) <= i,
 	// so this forward-overlapping append never reallocates and Go's copy handles it.
 	c.ready = append(kept, c.ready[i:]...)
-	readyNonEmpty := len(c.ready) > 0
-	drained = len(c.ready) < c.cfg.lowWatermark
+	readyLen := len(c.ready)
+	readyNonEmpty := readyLen > 0
+	drained = readyLen < c.cfg.lowWatermark
 	c.mu.Unlock()
 
 	// Blocker 2 (leaf-filtered starvation): a requester filtered to specific leafs that
@@ -604,7 +610,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			// in-memory holder we release it.
 			c.releaseInMem(r.unit.ID, volunteerID)
 			c.logger.Warn("dispatch cache: failed to load leaf for hand-out; voiding",
-				"work_unit_id", r.unit.ID, "leaf_id", r.unit.LeafID, "error", err)
+				"work_unit_id", r.unit.ID, "leaf_id", r.unit.LeafID, "volunteer_id", volunteerID, "error", err)
 			continue
 		}
 		r.leaf = lf
@@ -630,12 +636,91 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	if drained {
 		c.signalRefill()
 	}
+	// D-2 / D-1: per-call hand-out summary, and (when nothing was handed out) the reject
+	// tally that explains it. Guarded behind a single Enabled check so the steady-state
+	// hot path allocates nothing when Debug is disabled (the production default).
+	if c.logger.Enabled(context.Background(), slog.LevelDebug) {
+		c.logger.Debug("hand-out",
+			"volunteer_id", volunteerID,
+			"requested", n,
+			"handed", len(final),
+			"ready_len", readyLen,
+			"drained", drained)
+		if taken == 0 {
+			attrs := make([]any, 0, 4+2*numRejectReasons)
+			attrs = append(attrs, "volunteer_id", volunteerID, "ready_len", readyLen)
+			for r := rejectReason(1); r < numRejectReasons; r++ {
+				if rejects[r] > 0 {
+					attrs = append(attrs, r.String(), rejects[r])
+				}
+			}
+			c.logger.Debug("hand-out empty: reject tally", attrs...)
+		}
+	}
 	return final, drained
+}
+
+// rejectReason explains why eligibleLocked refused a candidate for a volunteer. It
+// is the per-candidate answer to "why did this volunteer get zero work": HandOut
+// tallies these across the ready-pool scan and, when nothing was handed out, logs the
+// non-zero counts. The iota order has no meaning beyond being a stable array index.
+type rejectReason int
+
+const (
+	rejectNone               rejectReason = iota // eligible (handed out)
+	rejectRedundancyFull                         // redundancy headroom exhausted (db active + in-mem holders)
+	rejectHolderCap                              // concurrent in-mem holder cap reached
+	rejectSelfHeld                               // volunteer already holds an in-mem copy of this unit
+	rejectAlreadyContributed                     // volunteer already contributed (distinctness)
+	rejectBenched                                // volunteer benched (post-failure cooldown)
+	rejectInflightCap                            // per-volunteer inflight cap reached
+	rejectLeafFilter                             // unit's leaf not in the requested LeafIDs
+	rejectBlockedLeaf                            // unit's leaf is blocked for this volunteer
+	rejectHRClassMismatch                        // unit pinned to a different hardware class
+	rejectLeafNotCached                          // leaf metadata not yet warmed
+	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
+	numRejectReasons                             // sentinel: count of reasons (tally array size)
+)
+
+// String returns the canonical field-key form for a reject reason, used as the slog
+// key in HandOut's "reject tally" line.
+func (r rejectReason) String() string {
+	switch r {
+	case rejectNone:
+		return "eligible"
+	case rejectRedundancyFull:
+		return "redundancy_full"
+	case rejectHolderCap:
+		return "holder_cap"
+	case rejectSelfHeld:
+		return "self_held"
+	case rejectAlreadyContributed:
+		return "already_contributed"
+	case rejectBenched:
+		return "benched_cooldown"
+	case rejectInflightCap:
+		return "inflight_cap"
+	case rejectLeafFilter:
+		return "leaf_filter"
+	case rejectBlockedLeaf:
+		return "blocked_leaf"
+	case rejectHRClassMismatch:
+		return "hr_class_mismatch"
+	case rejectLeafNotCached:
+		return "leaf_not_cached"
+	case rejectCapabilityMismatch:
+		return "capability_mismatch"
+	default:
+		return "unknown"
+	}
 }
 
 // eligibleLocked re-checks every per-requester predicate in memory against the
 // cached candidate. Ported verbatim from FindNextAssignable's SQL. Caller holds mu.
-func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.AssignmentOptions, cand candidate) bool {
+// It returns whether the candidate is eligible and, when not, the specific
+// rejectReason so HandOut can tally why a volunteer was handed nothing. Callers that
+// do not need the reason discard the second value.
+func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.AssignmentOptions, cand candidate) (bool, rejectReason) {
 	uid := cand.unit.ID
 	leafID := cand.unit.LeafID
 
@@ -648,14 +733,14 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 	//       one copy keeps the unit QUEUED so the others still dispatch.
 	holders := c.reservedInMem[uid]
 	if cand.dbActiveCount+len(holders) >= cand.effectiveRedundancy {
-		return false
+		return false, rejectRedundancyFull
 	}
 	if len(holders) >= cand.inMemHolderCap() {
-		return false
+		return false, rejectHolderCap
 	}
 	// Self-exclusion: never hand this volunteer a unit it already holds in memory.
 	if _, held := holders[volunteerID]; held {
-		return false
+		return false, rejectSelfHeld
 	}
 	// Distinctness: never hand this volunteer a unit it already contributed to — it
 	// holds a live copy elsewhere or already submitted a (still-PENDING) result for it.
@@ -664,29 +749,29 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 	// who can only run it and have the duplicate result rejected. The DB reservation is
 	// the authoritative gate; this avoids the wasted hand-out entirely.
 	if _, did := cand.contributors[volunteerID]; did {
-		return false
+		return false, rejectAlreadyContributed
 	}
 	// Post-failure cooldown: a volunteer whose recent copy of this unit timed out or was
 	// abandoned is benched for ~one deadline so a fresh volunteer gets first crack.
 	if _, benched := cand.benched[volunteerID]; benched {
-		return false
+		return false, rejectBenched
 	}
 	// Per-volunteer inflight cap.
 	if opts.MaxInflightPerVolunteer > 0 && c.inflight[volunteerID] >= opts.MaxInflightPerVolunteer {
-		return false
+		return false, rejectInflightCap
 	}
 	// Leaf-id filter (preferred leafs) and blocked-leaf filter.
 	if len(opts.LeafIDs) > 0 && !containsID(opts.LeafIDs, leafID) {
-		return false
+		return false, rejectLeafFilter
 	}
 	if containsID(opts.BlockedLeafIDs, leafID) {
-		return false
+		return false, rejectBlockedLeaf
 	}
 	// Homogeneous Redundancy: once a unit is pinned to a hardware class, only volunteers
 	// of that SAME class may take a copy (so redundant results are bit-comparable).
 	// Unpinned units (hr_class == nil, incl. every non-HR leaf) are unconstrained.
 	if cand.unit.HRClass != nil && *cand.unit.HRClass != "" && *cand.unit.HRClass != opts.HRClass {
-		return false
+		return false, rejectHRClassMismatch
 	}
 	// Capability fit against the cached leaf metadata.
 	lf := c.peekLeaf(leafID)
@@ -694,9 +779,12 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 		// Leaf not yet cached: be conservative and skip; the next refill / a warmed
 		// cache lets it through. (getLeaf is not called under mu to avoid a DB touch
 		// while locked.)
-		return false
+		return false, rejectLeafNotCached
 	}
-	return leafMatchesCapabilities(lf, opts)
+	if !leafMatchesCapabilities(lf, opts) {
+		return false, rejectCapabilityMismatch
+	}
+	return true, rejectNone
 }
 
 // releaseInMem drops a single in-memory reservation (one holder) and decrements the
@@ -1250,6 +1338,11 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 		return
 	}
 	if len(cands) == 0 {
+		// D-3: nothing came back from the dispatchable query — the operator's signal that
+		// the refiller is healthy but the QUEUED/eligible universe is empty (vs. a DB error,
+		// which logs separately above).
+		c.logger.Debug("refill: nothing dispatchable",
+			"want", want, "excluded_count", len(excluded), "leaf_scoped", len(leafIDs) > 0)
 		return
 	}
 
@@ -1272,6 +1365,7 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	}
 
 	c.mu.Lock()
+	stagedCount := 0
 	// Skip any id that became in-memory-held between the snapshot and now (a hand-out
 	// raced the refill); SKIP LOCKED + excluded make this rare, but guard anyway.
 	for _, cd := range staged {
@@ -1286,8 +1380,13 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			break
 		}
 		c.ready = append(c.ready, cd)
+		stagedCount++
 	}
 	c.mu.Unlock()
+	// D-3: confirm a successful restock and how much of the returned batch actually
+	// landed (the remainder was already held/staged or hit the pool ceiling).
+	c.logger.Debug("refill: staged",
+		"returned", len(cands), "staged", stagedCount, "leaf_scoped", len(leafIDs) > 0)
 }
 
 // excludedIDsLocked returns the set of ids the cache currently holds (ready units +
@@ -1432,6 +1531,10 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 			continue
 		}
 		c.releaseInMem(rec.WorkUnitID, rec.VolunteerID)
+		// D-5: a non-landed copy silently revokes a hand-out (the unit is no longer
+		// QUEUED, redundancy was met, or this volunteer already holds a live copy).
+		c.logger.Debug("voided non-landed copy (flush conflict)",
+			"work_unit_id", rec.WorkUnitID, "volunteer_id", rec.VolunteerID)
 	}
 }
 
@@ -1533,11 +1636,13 @@ func (c *dispatchCache) runReconciler(ctx context.Context, interval time.Duratio
 	if interval <= 0 {
 		interval = defaultReconcileInterval
 	}
+	c.logger.Info("dispatch cache reconciler starting", "interval", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			c.logger.Info("dispatch cache reconciler stopping")
 			return
 		case <-ticker.C:
 			c.reconcileOnce(ctx)
@@ -1684,6 +1789,31 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 	}
 	for vol, n := range pending {
 		next[vol] += n
+	}
+	// D-4: report the drift the reconcile is about to correct, but only when the
+	// authoritative recount actually differs from the in-memory counters (a steady-state
+	// tick stays silent). Guarded by Enabled so the comparison loops run only when Debug
+	// is on.
+	if c.logger.Enabled(context.Background(), slog.LevelDebug) {
+		changed := 0
+		oldTotal := 0
+		newTotal := 0
+		for vol, n := range c.inflight {
+			oldTotal += n
+			if next[vol] != n {
+				changed++
+			}
+		}
+		for vol, n := range next {
+			newTotal += n
+			if _, ok := c.inflight[vol]; !ok && n != 0 {
+				changed++
+			}
+		}
+		if changed > 0 {
+			c.logger.Debug("dispatch cache: inflight reconcile corrected drift",
+				"volunteers_changed", changed, "old_total", oldTotal, "new_total", newTotal)
+		}
 	}
 	c.inflight = next
 }

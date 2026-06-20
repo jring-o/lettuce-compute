@@ -190,7 +190,7 @@ func TestGRPCPerPubkeyRateLimit_IndependentBuckets(t *testing.T) {
 	defer func() { grpcPerPubkeyRateLimit = old }()
 
 	store := newRateLimitStore()
-	interceptor := grpcPerPubkeyRateLimitInterceptor(store)
+	interceptor := grpcPerPubkeyRateLimitInterceptor(store, nil)
 	info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"}
 
 	pkA := newPubkey(t)
@@ -236,7 +236,7 @@ func TestGRPCPerPubkeyRateLimit_PublicMethodNeverThrottled(t *testing.T) {
 	defer func() { grpcPerPubkeyRateLimit = old }()
 
 	store := newRateLimitStore()
-	interceptor := grpcPerPubkeyRateLimitInterceptor(store)
+	interceptor := grpcPerPubkeyRateLimitInterceptor(store, nil)
 	info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.volunteer.v1.VolunteerService/GetServerStatus"}
 
 	for i := 0; i < 10; i++ {
@@ -263,7 +263,7 @@ func TestGRPCPerPubkeyRateLimit_RejectsOverBudget(t *testing.T) {
 	defer func() { grpcPerPubkeyRateLimit = old }()
 
 	store := newRateLimitStore()
-	interceptor := grpcPerPubkeyRateLimitInterceptor(store)
+	interceptor := grpcPerPubkeyRateLimitInterceptor(store, nil)
 	info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"}
 	pk := newPubkey(t)
 
@@ -334,7 +334,7 @@ func TestGRPCRateLimitInterceptor_PerIPThrottles(t *testing.T) {
 	defer func() { grpcRateLimit = old }()
 
 	store := newRateLimitStore()
-	interceptor := grpcRateLimitInterceptor(store, nil)
+	interceptor := grpcRateLimitInterceptor(store, nil, nil)
 	info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"}
 
 	for i := 0; i < grpcRateLimit; i++ {
@@ -370,7 +370,7 @@ func TestGRPCRateLimitInterceptor_TrustedProxyBucketsPerClient(t *testing.T) {
 
 	trusted := []*net.IPNet{mustCIDR(t, "10.0.0.0/8")}
 	store := newRateLimitStore()
-	interceptor := grpcRateLimitInterceptor(store, trusted)
+	interceptor := grpcRateLimitInterceptor(store, trusted, nil)
 	info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"}
 
 	clientA := func() error {
@@ -438,7 +438,7 @@ func TestGRPCRateLimit_LifecycleMethodsExempt(t *testing.T) {
 	// Per-IP interceptor: StartWork/SubmitResult from one IP, far past the limit.
 	t.Run("per-IP exempt", func(t *testing.T) {
 		store := newRateLimitStore()
-		ic := grpcRateLimitInterceptor(store, nil)
+		ic := grpcRateLimitInterceptor(store, nil, nil)
 		for _, m := range []string{"StartWork", "SubmitResult", "AbandonWorkUnit", "SaveCheckpoint", "GetCheckpoint"} {
 			info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/" + m}
 			for i := 0; i < 10; i++ {
@@ -468,7 +468,7 @@ func TestGRPCRateLimit_LifecycleMethodsExempt(t *testing.T) {
 	// Per-pubkey interceptor: SubmitResult from one pubkey, far past the limit.
 	t.Run("per-pubkey exempt", func(t *testing.T) {
 		store := newRateLimitStore()
-		ic := grpcPerPubkeyRateLimitInterceptor(store)
+		ic := grpcPerPubkeyRateLimitInterceptor(store, nil)
 		pk := newPubkey(t)
 		for _, m := range []string{"StartWork", "SubmitResult", "AbandonWorkUnit", "SaveCheckpoint", "GetCheckpoint"} {
 			info := &grpc.UnaryServerInfo{FullMethod: "/lettuce.v1.VolunteerService/" + m}

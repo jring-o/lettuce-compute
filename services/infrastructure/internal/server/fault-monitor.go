@@ -142,7 +142,9 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 // cleanupCheckpointByID deletes checkpoint data for a work unit (best effort).
 func (m *FaultMonitor) cleanupCheckpointByID(ctx context.Context, workUnitID types.ID) {
 	if err := m.checkpointRepo.Delete(ctx, workUnitID); err != nil {
-		m.logger.Debug("failed to clean up checkpoint", "work_unit_id", workUnitID, "error", err)
+		// H-8: a failed checkpoint cleanup is a real failure (leaked checkpoint storage),
+		// not Debug noise — promote so it is visible.
+		m.logger.Warn("failed to clean up checkpoint", "work_unit_id", workUnitID, "error", err)
 	}
 }
 
