@@ -49,7 +49,7 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 	// Wire up gRPC server.
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := server.NewVolunteerService(nil, version, startTime, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	volunteerSvc := server.NewVolunteerService(nil, version, startTime, nil, nil, nil, nil, nil, nil, nil, nil, logger)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")

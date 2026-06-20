@@ -171,6 +171,8 @@ func (n *NativeRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResu
 
 // Execute runs the binary as a subprocess and collects output and metrics.
 func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	n.logger.Info("executing work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "runtime", wu.Runtime)
+
 	// Apply deadline timeout.
 	if wu.DeadlineSeconds > 0 {
 		var cancel context.CancelFunc
@@ -307,6 +309,8 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 		outputData, _ = os.ReadFile(logPath)
 	}
 
+	n.logger.Info("execution finished", "work_unit_id", wu.ID, "exit_code", exitCode, "wall_clock_s", wallClock.Seconds())
+
 	return &ExecutionResult{
 		OutputData:     outputData,
 		OutputChecksum: checksumSHA256(outputData),
@@ -354,7 +358,7 @@ func (n *NativeRuntime) ensureBinary(ctx context.Context, url, expectedChecksum 
 	// Check cache. A hit means the bytes already match the expected digest
 	// (that is how the key was derived when the file was written).
 	if _, err := os.Stat(cachePath); err == nil {
-		n.logger.Debug("binary cache hit", "url", url, "path", cachePath, "sha256", expectedChecksum)
+		n.logger.Debug("binary cache hit", "url", url, "path", cachePath, "expected_sha256", expectedChecksum)
 		return cachePath, nil
 	}
 
@@ -379,10 +383,11 @@ func (n *NativeRuntime) ensureBinary(ctx context.Context, url, expectedChecksum 
 		return "", fmt.Errorf("checksum downloaded binary: %w", err)
 	}
 	if actual != expectedChecksum {
-		n.logger.Warn("native binary checksum mismatch, rejecting", "url", url,
+		n.logger.Error("native binary checksum mismatch, rejecting", "url", url,
 			"expected_sha256", expectedChecksum, "actual_sha256", actual)
 		return "", fmt.Errorf("binary checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 	}
+	n.logger.Debug("checksum verified", "expected_sha256", expectedChecksum, "url", url)
 
 	// Commit the verified bytes to the checksum-keyed cache path.
 	if err := os.Rename(tmpPath, cachePath); err != nil {

@@ -78,6 +78,9 @@ Thumbs.db
 # Operator notes (cross-project blockers/follow-ups, not for the public repo)
 /TODO.md
 /TODO.md.bak-*
+/STATE.md
+/DEVLOG.md
+/LOGGING.md
 /layer2-hardening-handoff-prompt.md
 /lbry-science head instructions/
 

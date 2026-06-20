@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	stdruntime "runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -82,7 +83,35 @@ func runStart(cmd *cobra.Command, args []string) error {
 	logger, closeLogger := newLogger(cfg)
 	defer closeLogger()
 
+	// Run-start banner: the first line in every daemon log, so a pasted log is
+	// self-identifying. version is the single most diagnostic field given the
+	// head<->volunteer protocol-version coupling (an out-of-date build is
+	// rejected fleet-wide with "volunteer too old for this head"); os/arch is
+	// load-bearing for the Hackintosh/OCLP population whose runtime quirks track
+	// the patched platform they report.
+	logger.Info("volunteer starting",
+		"version", version,
+		"os", stdruntime.GOOS,
+		"arch", stdruntime.GOARCH,
+		"data_dir", cfg.DataDir,
+		"log_level", cfg.LogLevel,
+	)
+
 	logger.Info("logging to file", "path", cfg.LogFilePath(), "enabled", cfg.LogToFile)
+
+	// Record which identity + config this daemon is running under: a SHORT public-key
+	// fingerprint (first 8 hex chars of the Ed25519 PUBLIC key — never the private
+	// key), the config path, and the data dir. Makes "which volunteer is this log
+	// from" answerable from the log alone.
+	pubFP := "unknown"
+	if len(pub) >= 4 {
+		pubFP = fmt.Sprintf("%x", pub[:4])
+	}
+	logger.Info("identity loaded",
+		"pubkey_fp", pubFP,
+		"config_path", cfgPath,
+		"data_dir", cfg.DataDir,
+	)
 
 	// Ensure WASM is in AvailableRuntimes (handles existing configs that predate
 	// WASM support); the WASM runtime is always available.
@@ -152,8 +181,26 @@ func runStart(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		// Read the head's build version over the unauthenticated GetServerStatus RPC.
+		// It is stamped on the registration log below and drives the version-mismatch
+		// warning: head and volunteers are protocol-version coupled (an out-of-date
+		// build is rejected fleet-wide with "volunteer too old for this head"), so a
+		// mismatch is the single most useful thing to spot at startup. A status error
+		// must never block startup — fall back to an unknown head version.
+		var headVersion string
+		if statusResp, statusErr := grpcClient.GetServerStatus(cmd.Context()); statusErr != nil {
+			logger.Debug("could not read head version (GetServerStatus failed)",
+				"server", name, "error", statusErr)
+		} else {
+			headVersion = statusResp.Version
+		}
+
 		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, cfg, cfgPath, advertised...)
 		if err != nil {
+			if client.IsVolunteerTooOldError(err) {
+				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
+					"server", name, "error", err)
+			}
 			logger.Warn("failed to register with server, skipping",
 				"server", name, "error", err)
 			grpcClient.Close()
@@ -181,9 +228,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 		})
 
 		if isNew {
-			logger.Info("registered as new volunteer", "server", name, "volunteer_id", volID)
+			logger.Info("registered as new volunteer", "server", name, "volunteer_id", volID, "head_version", headVersion)
 		} else {
-			logger.Info("re-registered with server", "server", name, "volunteer_id", volID)
+			logger.Info("re-registered with server", "server", name, "volunteer_id", volID, "head_version", headVersion)
+		}
+
+		// Protocol-version coupling: warn loudly when the head and this volunteer are
+		// on different non-dev builds, since that is exactly the condition that gets a
+		// volunteer rejected ("too old for this head"). "dev" builds are local and
+		// never coupled, so they are excluded to avoid crying wolf during development.
+		if headVersion != "" && version != "" && headVersion != "dev" && version != "dev" && headVersion != version {
+			logger.Warn("volunteer/head version mismatch; head and volunteers must run matching builds (protocol-version coupling)",
+				"server", name, "head_version", headVersion, "volunteer_version", version)
 		}
 	}
 

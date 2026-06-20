@@ -497,7 +497,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if !ok {
 				break
 			}
-			d.logger.Info("daemon: slot completed", "work_unit_id", result.WU.ID, "success", result.Err == nil)
+			d.logger.Info("daemon: slot completed", "work_unit_id", result.WU.ID, "leaf_id", result.WU.LeafID, "server", result.Conn.Name, "volunteer_id", result.Conn.VolunteerID, "success", result.Err == nil)
 			d.handleSlotResult(ctx, result)
 			d.persistActiveTasks()
 		}
@@ -607,9 +607,11 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 
 	d.logger.Info("result submitted",
 		"work_unit_id", wu.ID,
+		"leaf_id", wu.LeafID,
 		"result_id", submitResp.ResultId,
 		"accepted", submitResp.Accepted,
 		"server", conn.Name,
+		"volunteer_id", conn.VolunteerID,
 		"slot", result.SlotID,
 	)
 
@@ -794,7 +796,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
 		activeMemoryMB := d.slotManager.TotalActiveMemoryMB()
 		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
-			d.logger.Debug("canAccommodateWU: exceeds configured memory budget",
+			d.logger.Info("canAccommodateWU: exceeds configured memory budget; buffered work waiting for capacity",
 				"work_unit_id", wu.ID, "active_mb", activeMemoryMB, "wu_mb", wuMemoryMB, "max_mb", maxMemoryMB)
 			return false
 		}
@@ -803,7 +805,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 	// 2. Real free system RAM (already reflects memory used by active containers).
 	if freeMB, ok := freeSystemMemoryMB(); ok {
 		if freeMB < wuMemoryMB+freeMemoryHeadroomMB {
-			d.logger.Debug("canAccommodateWU: insufficient free system RAM",
+			d.logger.Info("canAccommodateWU: insufficient free system RAM; buffered work waiting for capacity",
 				"work_unit_id", wu.ID, "free_mb", freeMB, "wu_mb", wuMemoryMB, "headroom_mb", freeMemoryHeadroomMB)
 			return false
 		}
@@ -816,7 +818,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 			gpuCount = len(d.cachedHW.GetGpus())
 		}
 		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
-			d.logger.Debug("canAccommodateWU: all GPUs busy",
+			d.logger.Info("canAccommodateWU: all GPUs busy; buffered work waiting for capacity",
 				"work_unit_id", wu.ID, "gpu_count", gpuCount, "active_gpu_units", d.slotManager.ActiveGPUCount())
 			return false
 		}

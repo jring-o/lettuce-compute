@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -106,9 +107,9 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*ne
 		grpc.ChainUnaryInterceptor(
 			loggingInterceptor(logger),
 			recoveryInterceptor(logger),
-			grpcRateLimitInterceptor(ipStore, trustedProxies),
+			grpcRateLimitInterceptor(ipStore, trustedProxies, logger),
 			authIntercept,
-			grpcPerPubkeyRateLimitInterceptor(pubkeyStore),
+			grpcPerPubkeyRateLimitInterceptor(pubkeyStore, logger),
 		),
 	}
 
@@ -122,6 +123,35 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*ne
 		authCleanup()
 	}
 	return grpc.NewServer(opts...), cleanup
+}
+
+// highFrequencyMethods are the read-mostly / hot-poll RPCs whose per-call access log
+// is demoted to Debug. RequestWorkUnit alone is 200+/min/volunteer; the status/info
+// probes and the checkpoint pair are also high-rate and low-value at Info. The
+// state-mutating lifecycle RPCs (RegisterVolunteer, StartWork, SubmitResult,
+// AbandonWorkUnit) are deliberately absent so they stay at Info. Keyed by trailing
+// method name so it is independent of the proto package path.
+var highFrequencyMethods = map[string]struct{}{
+	"RequestWorkUnit": {},
+	"GetServerStatus": {},
+	"GetHeadInfo":     {},
+	"SaveCheckpoint":  {},
+	"GetCheckpoint":   {},
+}
+
+// grpcAccessLogLevel returns the access-log level for a gRPC full method: Debug for
+// the high-frequency poll/read methods above, Info for everything else (so the
+// per-WU-lifecycle state-mutating RPCs remain visible at Info while the hot poll does
+// not flood the log).
+func grpcAccessLogLevel(fullMethod string) slog.Level {
+	name := fullMethod
+	if i := strings.LastIndex(fullMethod, "/"); i >= 0 {
+		name = fullMethod[i+1:]
+	}
+	if _, ok := highFrequencyMethods[name]; ok {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
 }
 
 // loggingInterceptor logs gRPC method, duration, and status code.
@@ -151,7 +181,9 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 		if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
 			attrs = append(attrs, "peer_addr", p.Addr.String())
 		}
-		logging.LoggerFromContext(ctx, logger).Info("grpc request", attrs...)
+		// H-6: hot-poll/read methods (RequestWorkUnit and the status/info/checkpoint
+		// reads) log at Debug; state-mutating lifecycle RPCs stay at Info.
+		logging.LoggerFromContext(ctx, logger).Log(ctx, grpcAccessLogLevel(info.FullMethod), "grpc request", attrs...)
 		return resp, err
 	}
 }

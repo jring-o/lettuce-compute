@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -63,6 +64,12 @@ type volunteerService struct {
 	// dispatchCfg holds the Layer-2 dispatch-cache knobs captured from SetHeadConfig
 	// so StartDispatchCache can build the cache later.
 	dispatchCfg HeadDispatchConfig
+
+	// Load-shed log sampling counters (H-5). Each shed site logs the first shed and
+	// every shedLogSampleN-th thereafter (first-then-every-N), so a sustained overload
+	// stays visible without one Warn per shed on the hot path. Atomic, zero-valued.
+	cacheShedLogN    uint64
+	identityShedLogN uint64
 }
 
 // referenceBenchmarkFPOPS is the head's fixed reference-host throughput (FP ops /
@@ -498,6 +505,10 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			s.dispatchCache.putIdentity(v)
 		}
 
+		// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
+		// now that the generic gRPC access log is demoted to Debug.
+		s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true)
+
 		return &lettucev1.RegisterVolunteerResponse{
 			VolunteerId: v.ID.String(),
 			Registered:  true,
@@ -522,6 +533,8 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 	if s.dispatchCache != nil {
 		s.dispatchCache.putIdentity(existing)
 	}
+
+	s.logger.Info("volunteer registered", "volunteer_id", existing.ID, "is_new", false)
 
 	return &lettucev1.RegisterVolunteerResponse{
 		VolunteerId: existing.ID.String(),
@@ -569,6 +582,12 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 	if s.dispatchCache != nil {
 		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
 		if shed {
+			// H-5: identity-resolve shed (DB-admission saturated on a cold miss) was
+			// emitted at no level. Sampled Warn so the overload is visible.
+			if n := atomic.AddUint64(&s.identityShedLogN, 1); n%shedLogSampleN == 1 {
+				s.logger.Warn("shedding work request: overloaded",
+					"volunteer_id", volunteerID, "ready_len", s.dispatchCache.readyLen(), "shed_count", n)
+			}
 			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
 		}
 		if notFound {
@@ -700,6 +719,12 @@ func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts w
 	// against the DB-pool congestion collapse.
 	if cache.readyLen() == 0 && cache.admissionSaturated() {
 		cache.signalRefill()
+		// H-5: hard-backstop cache shed (empty pool + saturated admission) was emitted at
+		// no level. Sampled Warn so a sustained overload is visible without per-request spam.
+		if n := atomic.AddUint64(&s.cacheShedLogN, 1); n%shedLogSampleN == 1 {
+			s.logger.Warn("shedding work request: overloaded",
+				"volunteer_id", volunteerID, "ready_len", 0, "shed_count", n)
+		}
 		return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
 	}
 
@@ -1168,13 +1193,19 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		}
 	}
 
-	// Try validation — runs if enough results have been submitted.
+	// Try validation — runs if enough results have been submitted. Capture the outcome
+	// (if any) so the per-WU "result accepted" Info below can report VALIDATED/REJECTED/
+	// PENDING; the result is otherwise discarded as before.
+	validationOutcome := ""
 	if s.validationEngine != nil {
-		if _, valErr := s.validationEngine.TryValidate(ctx, workUnitID); valErr != nil {
+		valRes, valErr := s.validationEngine.TryValidate(ctx, workUnitID)
+		if valErr != nil {
 			s.logger.Error("validation failed after result submission",
 				"work_unit_id", workUnitID,
 				"error", valErr,
 			)
+		} else if valRes != nil {
+			validationOutcome = valRes.Outcome
 		}
 	}
 
@@ -1193,6 +1224,16 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 			}
 		}
 	}
+
+	// Per-WU-lifecycle Info (one per accepted result): restores per-WU visibility now
+	// that the generic gRPC access log is demoted to Debug. `completed` reports whether
+	// this submit met redundancy and transitioned the unit to COMPLETED.
+	s.logger.Info("result accepted",
+		"work_unit_id", workUnitID,
+		"result_id", r.ID,
+		"volunteer_id", volunteerID,
+		"completed", existingCount+1 >= effectiveRedundancy,
+		"validation_outcome", validationOutcome)
 
 	return &lettucev1.SubmitResultResponse{
 		ResultId: r.ID.String(),
@@ -1295,6 +1336,10 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 		"UPDATE volunteers SET last_seen_at = NOW(), is_active = true WHERE id = $1", volunteerID); uerr != nil {
 		s.logger.Warn("failed to update volunteer liveness on StartWork", "volunteer_id", volunteerID, "error", uerr)
 	}
+
+	// Per-WU-lifecycle Info (one per run-start): restores per-WU visibility now that the
+	// generic gRPC access log is demoted to Debug.
+	s.logger.Info("run-start", "work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", wu.LeafID)
 
 	return &lettucev1.StartWorkResponse{Ok: true}, nil
 }

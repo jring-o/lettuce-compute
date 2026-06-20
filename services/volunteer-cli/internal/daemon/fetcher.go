@@ -10,6 +10,7 @@ import (
 	"time"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
+	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -510,9 +511,17 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 			head.Backoff = 0
 			return 0, false
 		}
-		// Connection error (Unavailable/Internal/etc.): no delay to obey, so fall
-		// back to the per-head exponential reconnect backoff.
-		f.logger.Warn("fetcher: gRPC error requesting work", "server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+		// "Volunteer too old": the head's version-coupling rejection. Surface a
+		// distinct, actionable WARN rather than burying it in the generic transport
+		// error, so the (fleet-wide) "update your build" fix is obvious at a glance.
+		if client.IsVolunteerTooOldError(err) {
+			f.logger.Warn("fetcher: this volunteer build is too old for the head; run 'lettuce-volunteer update'",
+				"server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+		} else {
+			// Connection error (Unavailable/Internal/etc.): no delay to obey, so fall
+			// back to the per-head exponential reconnect backoff.
+			f.logger.Warn("fetcher: gRPC error requesting work", "server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+		}
 		head.Available = false
 		head.LastError = f.now()
 		if head.Backoff == 0 {
@@ -591,7 +600,7 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			f.abandonWorkUnit(ctx, head, wu, selErr.Error())
 			continue
 		}
-		f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_name", fmt.Sprintf("%T", rt))
+		f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_type", fmt.Sprintf("%T", rt))
 
 		f.logger.Debug("fetcher: preparing work unit", "work_unit_id", wu.ID)
 		// A buffered (reserved) unit is leased purely via its reservation window
@@ -630,6 +639,8 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			}
 			break
 		}
+
+		f.logger.Debug("fetcher: buffered work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID)
 
 		// RecordAssignment is called once per buffered unit.
 		f.selector.RecordAssignment(head.Name, leaf.Slug)
@@ -771,10 +782,15 @@ func (f *Fetcher) recordRuntimeAbandon(name string, err error) {
 }
 
 // resetRuntimeAbandon clears the abandon counter and any pause for a runtime
-// after a successful Prepare for it.
+// after a successful Prepare for it. When this clears an active pause it emits a
+// single Info marking the recovery (the trip is logged loudly in
+// recordRuntimeAbandon; without this the un-pause was silent).
 func (f *Fetcher) resetRuntimeAbandon(name string) {
 	delete(f.runtimeAbandons, name)
-	delete(f.pausedRuntimes, name)
+	if _, wasPaused := f.pausedRuntimes[name]; wasPaused {
+		delete(f.pausedRuntimes, name)
+		f.logger.Info("fetcher: runtime recovered, resuming requests", "runtime", name)
+	}
 }
 
 // runtimePaused reports whether the named runtime is currently paused, clearing

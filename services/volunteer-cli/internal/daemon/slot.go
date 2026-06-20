@@ -294,7 +294,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			execErr = errStartWorkDropped
 			return
 		}
-		sm.logger.Debug("run-start StartWork ok", "work_unit_id", wu.ID, "slot", slot.ID)
+		sm.logger.Info("run-start StartWork ok", "work_unit_id", wu.ID, "slot", slot.ID, "server", conn.Name, "leaf_id", wu.LeafID)
 	}
 
 	// Wire process handle callbacks for suspend/resume.

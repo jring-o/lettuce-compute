@@ -269,6 +269,8 @@ func isDiskExhaustionError(err error) bool {
 
 // Execute runs the work unit in a Docker container and returns results.
 func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	c.logger.Info("executing work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "runtime", wu.Runtime)
+
 	inputDir := filepath.Join(prep.WorkDir, "input")
 	outputDir := filepath.Join(prep.WorkDir, "output")
 
@@ -377,6 +379,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// Create container.
 	containerID, err := c.dockerClient.ContainerCreate(ctx, cfg)
 	if err != nil {
+		c.logger.Error("container create failed", "work_unit_id", wu.ID, "image", cfg.Image, "backend", c.backend, "error", err)
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 
@@ -390,6 +393,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 
 	// Start container.
 	if err := c.dockerClient.ContainerStart(ctx, containerID); err != nil {
+		c.logger.Error("container start failed", "work_unit_id", wu.ID, "container", containerID, "image", cfg.Image, "backend", c.backend, "error", err)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 
@@ -468,6 +472,8 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		metrics.GPUModel = gpuExecMetrics.GPUModel
 		metrics.GPUVRAMUsedMB = int32(gpuExecMetrics.PeakVRAMMB)
 	}
+
+	c.logger.Info("execution finished", "work_unit_id", wu.ID, "exit_code", int(exitCode), "wall_clock_s", wallClock.Seconds())
 
 	return &ExecutionResult{
 		OutputData:     outputData,

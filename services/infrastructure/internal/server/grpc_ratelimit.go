@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/hex"
+	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -13,6 +15,12 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
+
+// shedLogSampleN controls load-shed log sampling (H-5): the FIRST shed and every Nth
+// shed thereafter are logged at Warn (first-then-every-N), so a sustained shed storm
+// stays visible without flooding the log. Shared by the rate-limit interceptors and
+// the dispatch-cache shed sites in volunteer-service.go.
+const shedLogSampleN = 100
 
 // grpcRateLimit is the pre-auth per-IP request budget (requests per minute). It
 // is the global/unauthenticated ceiling and is the ONLY limiter that sheds
@@ -106,7 +114,11 @@ func isRateLimitExempt(fullMethod string) bool {
 //
 // In-flight work-lifecycle RPCs are skipped (see rateLimitExemptMethods): a
 // volunteer must never be shed while finishing work it already holds.
-func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet) grpc.UnaryServerInterceptor {
+func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet, logger *slog.Logger) grpc.UnaryServerInterceptor {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	var shedCount uint64
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if isRateLimitExempt(info.FullMethod) {
 			return handler(ctx, req)
@@ -118,6 +130,12 @@ func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet
 		allowed, _, _ := bucket.allow(time.Now())
 
 		if !allowed {
+			// H-5: load shedding was previously emitted at no level. Sampled Warn so a
+			// per-IP flood is visible without one line per dropped request.
+			if n := atomic.AddUint64(&shedCount, 1); n%shedLogSampleN == 1 {
+				logger.Warn("shedding request: rate limited",
+					"method", info.FullMethod, "ip", ip, "shed_count", n)
+			}
 			return nil, status.Errorf(codes.ResourceExhausted, "rate limit exceeded")
 		}
 
@@ -135,7 +153,11 @@ func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet
 // No trailer/server-directed delay is stamped: ResourceExhausted is a pure
 // load-shedding signal the caller treats as a fixed local backoff (the single
 // server-directed-delay mechanism is the RequestWorkUnit response body field).
-func grpcPerPubkeyRateLimitInterceptor(store *rateLimitStore) grpc.UnaryServerInterceptor {
+func grpcPerPubkeyRateLimitInterceptor(store *rateLimitStore, logger *slog.Logger) grpc.UnaryServerInterceptor {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	var shedCount uint64
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if isRateLimitExempt(info.FullMethod) {
 			return handler(ctx, req)
@@ -151,6 +173,12 @@ func grpcPerPubkeyRateLimitInterceptor(store *rateLimitStore) grpc.UnaryServerIn
 		allowed, _, _ := bucket.allow(time.Now())
 
 		if !allowed {
+			// H-5: sampled Warn so a single misbehaving volunteer flooding past its
+			// per-pubkey budget is visible. SHORT pubkey prefix (8 hex chars), not the key.
+			if n := atomic.AddUint64(&shedCount, 1); n%shedLogSampleN == 1 {
+				logger.Warn("shedding request: rate limited",
+					"method", info.FullMethod, "pubkey_prefix", hex.EncodeToString(pk[:4]), "shed_count", n)
+			}
 			return nil, status.Errorf(codes.ResourceExhausted, "per-volunteer rate limit exceeded")
 		}
 

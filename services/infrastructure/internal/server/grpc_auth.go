@@ -269,6 +269,10 @@ func verifyGRPCAuth(ctx context.Context, fullMethod string, req any, replay repl
 				"replay store error; admitting request (fail-open)",
 				"method", fullMethod, "error", serr)
 		} else if alreadySeen {
+			// H-4: a genuine replay must be visible (only the fail-open store error
+			// logged before). Short pubkey prefix (8 hex chars) — never the full key.
+			logging.LoggerFromContext(ctx, slog.Default()).Warn("rejected replayed signature",
+				"method", fullMethod, "pubkey_prefix", hex.EncodeToString(pubKeyBytes[:4]))
 			return nil, status.Error(codes.Unauthenticated, "replayed signature")
 		}
 	}

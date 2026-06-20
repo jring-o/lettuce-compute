@@ -129,6 +129,8 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 
 // Execute runs the WASM module via wazero and returns the result.
 func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	w.logger.Info("executing work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "runtime", wu.Runtime)
+
 	// Apply deadline timeout.
 	if wu.DeadlineSeconds > 0 {
 		var cancel context.CancelFunc
@@ -249,6 +251,8 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 		w.logger.Debug("wasm stderr", "output", stderrBuf.String())
 	}
 
+	w.logger.Info("execution finished", "work_unit_id", wu.ID, "exit_code", exitCode, "wall_clock_s", wallClock.Seconds())
+
 	return &ExecutionResult{
 		OutputData:     outputData,
 		OutputChecksum: checksumSHA256(outputData),
@@ -320,10 +324,11 @@ func (w *WasmRuntime) ensureModule(ctx context.Context, url, expectedChecksum st
 			return "", fmt.Errorf("checksum wasm module: %w", err)
 		}
 		if actual != expectedChecksum {
-			w.logger.Warn("wasm module checksum mismatch, rejecting", "url", url,
+			w.logger.Error("wasm module checksum mismatch, rejecting", "url", url,
 				"expected_sha256", expectedChecksum, "actual_sha256", actual)
 			return "", fmt.Errorf("wasm module checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 		}
+		w.logger.Debug("checksum verified", "expected_sha256", expectedChecksum, "url", url)
 	}
 
 	// Verify WASM magic bytes before committing.

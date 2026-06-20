@@ -126,6 +126,10 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 	}
 
 	if len(pending) < effectiveRedundancy {
+		// H-1: the #1 reason a work unit appears "stuck at PENDING" — not enough
+		// corroborating results have arrived yet for the configured redundancy.
+		e.logger.Debug("validation deferred: insufficient results",
+			"work_unit_id", workUnitID, "pending", len(pending), "required", effectiveRedundancy)
 		return nil, nil
 	}
 
@@ -277,6 +281,15 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	}
 
 	if activeCount > 0 {
+		// H-3: the majority did not reach the agreement threshold, but copies are still
+		// running — defer rather than reject, and say so (otherwise this PENDING hold is
+		// silent).
+		e.logger.Debug("validation pending: threshold unmet, assignments active",
+			"work_unit_id", wu.ID,
+			"majority", majorityCount,
+			"total", total,
+			"threshold", threshold,
+			"active", activeCount)
 		return &ValidationResult{
 			WorkUnitID: wu.ID,
 			Outcome:    OutcomePending,
@@ -343,11 +356,12 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 		if err := e.creditRepo.Create(ctx, entry); err != nil {
 			return nil, fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
 		}
-		// Update RAC for this volunteer+project.
+		// Update RAC for this volunteer+project. H-7: best-effort — a failure does not
+		// fail validation (credit is already granted), so log at Warn, not Error.
 		if e.racRepo != nil {
 			if err := e.racRepo.Upsert(ctx, r.VolunteerID, wu.LeafID, creditAmount); err != nil {
-				e.logger.Error("failed to update RAC",
-					"volunteer_id", r.VolunteerID, "leaf_id", wu.LeafID, "error", err)
+				e.logger.Warn("failed to update RAC",
+					"volunteer_id", r.VolunteerID, "leaf_id", wu.LeafID, "result_id", r.ID, "error", err)
 			}
 		}
 		creditEntries = append(creditEntries, entry)
@@ -359,20 +373,29 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	// Create attestations for disagreed results (credit_amount = 0).
 	e.createAttestations(ctx, wu, rejectedResults, attestation.OutcomeDisagreed, 0)
 
-	// Update volunteer counters.
+	// Update volunteer counters. H-7: best-effort counter bumps — a failure does not
+	// fail validation, so log at Warn, not Error.
 	for _, r := range agreedResults {
 		if err := e.volunteerRepo.IncrementWorkUnitsCompleted(ctx, r.VolunteerID); err != nil {
-			e.logger.Error("failed to increment work units completed",
-				"volunteer_id", r.VolunteerID, "error", err)
+			e.logger.Warn("failed to increment work units completed",
+				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
 	}
 	for _, r := range rejectedResults {
 		if err := e.volunteerRepo.IncrementWorkUnitsRejected(ctx, r.VolunteerID); err != nil {
-			e.logger.Error("failed to increment work units rejected",
-				"volunteer_id", r.VolunteerID, "error", err)
+			e.logger.Warn("failed to increment work units rejected",
+				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
 		e.checkRejectionRate(ctx, r.VolunteerID)
 	}
+
+	// H-2: a successful VALIDATED + credit-grant was previously silent — restore the
+	// per-WU "this validated" signal now that the generic access log is demoted.
+	e.logger.Info("work unit validated",
+		"work_unit_id", wu.ID,
+		"agreed", len(agreedIDs),
+		"disagreed", len(rejectedIDs),
+		"credit_amount", creditAmount)
 
 	return &ValidationResult{
 		WorkUnitID:      wu.ID,
@@ -403,11 +426,12 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 	// Create attestations for all rejected results (credit_amount = 0).
 	e.createAttestations(ctx, wu, pending, attestation.OutcomeDisagreed, 0)
 
-	// Update volunteer counters.
+	// Update volunteer counters. H-7: best-effort — a failure does not fail the
+	// rejection, so log at Warn, not Error.
 	for _, r := range pending {
 		if err := e.volunteerRepo.IncrementWorkUnitsRejected(ctx, r.VolunteerID); err != nil {
-			e.logger.Error("failed to increment work units rejected",
-				"volunteer_id", r.VolunteerID, "error", err)
+			e.logger.Warn("failed to increment work units rejected",
+				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
 		e.checkRejectionRate(ctx, r.VolunteerID)
 	}
@@ -420,7 +444,7 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 		}
 		e.logger.Warn("spot-check mismatch: volunteers disagreed",
 			"work_unit_id", wu.ID,
-			"volunteers", volIDs,
+			"volunteer_ids", volIDs,
 		)
 	}
 
@@ -453,7 +477,7 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 		vol, err := e.volunteerRepo.GetByID(ctx, r.VolunteerID)
 		if err != nil {
 			e.logger.Error("failed to get volunteer for attestation",
-				"volunteer_id", r.VolunteerID, "error", err)
+				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 			continue
 		}
 
@@ -473,14 +497,14 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 		sig, err := e.signer.Sign(att)
 		if err != nil {
 			e.logger.Error("failed to sign attestation",
-				"work_unit_id", wu.ID, "volunteer_id", r.VolunteerID, "error", err)
+				"work_unit_id", wu.ID, "volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 			continue
 		}
 		att.Signature = sig
 
 		if err := e.attestationRepo.Create(ctx, att); err != nil {
 			e.logger.Error("failed to create attestation",
-				"work_unit_id", wu.ID, "volunteer_id", r.VolunteerID, "error", err)
+				"work_unit_id", wu.ID, "volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
 	}
 }

@@ -182,6 +182,10 @@ func verifyEd25519Auth(r *http.Request, replay replayStore) (ed25519.PublicKey, 
 				"replay store error; admitting request (fail-open)",
 				"path", r.URL.Path, "error", serr)
 		} else if alreadySeen {
+			// H-4: a genuine replay must be visible (only the fail-open store error
+			// logged before). Short pubkey prefix (8 hex chars) — never the full key.
+			logging.LoggerFromContext(r.Context(), slog.Default()).Warn("rejected replayed signature",
+				"path", r.URL.Path, "pubkey_prefix", hex.EncodeToString(pubKeyBytes[:4]))
 			return nil, fmt.Errorf("replayed request")
 		}
 	}

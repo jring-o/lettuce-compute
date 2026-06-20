@@ -77,10 +77,11 @@ func EnsureVizBundle(ctx context.Context, dataDir string, vizURL string, expecte
 			return "", fmt.Errorf("checksum viz bundle: %w", err)
 		}
 		if actual != expectedChecksum {
-			logger.Warn("viz bundle checksum mismatch, rejecting", "url", vizURL,
+			logger.Error("viz bundle checksum mismatch, rejecting", "url", vizURL,
 				"expected_sha256", expectedChecksum, "actual_sha256", actual)
 			return "", fmt.Errorf("viz bundle checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 		}
+		logger.Debug("checksum verified", "expected_sha256", expectedChecksum, "url", vizURL)
 	}
 
 	// Commit the verified bytes to the cache path.
