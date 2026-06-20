@@ -88,6 +88,20 @@ type HeadConfig struct {
 	// before the lease lapses and the unit becomes re-reservable. Must stay below
 	// the 30-min stale threshold. Default 900 (15 min).
 	LeaseSeconds int `yaml:"lease_seconds"`
+	// MinSendIntervalSeconds is the minimum number of seconds between successful work
+	// hand-outs to a SINGLE volunteer (keyed on its verified Ed25519 identity). It is a
+	// server-side HARD FLOOR on a volunteer's work-acquisition cadence that does NOT
+	// depend on the client honoring the advisory server-directed retry delay: a
+	// self-compiled volunteer that ignores RetryAfterSeconds and polls at the per-pubkey
+	// rate-limit ceiling still receives at most one batch per this interval, so it cannot
+	// grab a disproportionate share of a scarce queue. ENABLED BY DEFAULT: unset (0)
+	// resolves to defaultMinSendIntervalSeconds (30, ~= MinRetryDelaySeconds, so honest
+	// clients that wait out the retry delay never trip it). Set NEGATIVE (e.g. -1) to
+	// DISABLE (only the advisory retry delay, the per-pubkey/per-IP rate limits, and the
+	// inflight cap then apply). A positive value is used verbatim and must be <=
+	// MaxRetryDelaySeconds. See EffectiveMinSendIntervalSeconds. Override via
+	// LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS.
+	MinSendIntervalSeconds int `yaml:"min_send_interval_seconds"`
 
 	// --- Layer 2: in-process dispatch cache (per-replica, claim-coordinated) ---
 	//
@@ -143,6 +157,13 @@ const (
 	defaultRetryDelayJitterPct     = 0.20
 	defaultTargetRequestRatePerSec = 500.0
 	defaultLeaseSeconds            = 900
+	// defaultMinSendIntervalSeconds is the per-volunteer minimum work-send interval
+	// applied when MinSendIntervalSeconds is left unset (0). It is ENABLED by default
+	// (a fairness/anti-abuse floor): it matches defaultMinRetryDelaySeconds so a
+	// volunteer that honors the advisory retry delay never trips it, while a client
+	// that ignores the delay is still capped to this cadence. Set the field negative to
+	// disable. Clamped down to the effective max retry delay so it can never exceed it.
+	defaultMinSendIntervalSeconds  = 30
 	// staleVolunteerThresholdSeconds mirrors StaleVolunteerMonitor's 30-min
 	// inactivity threshold; retry delay and lease must stay strictly below it so a
 	// throttled-but-healthy volunteer is never marked inactive.
@@ -214,6 +235,15 @@ func (h HeadConfig) Validate() error {
 	}
 	if h.LeaseSeconds < 0 {
 		return fmt.Errorf("head.lease_seconds must be >= 0, got %d", h.LeaseSeconds)
+	}
+	// A negative value is the explicit "disable" sentinel (see
+	// EffectiveMinSendIntervalSeconds); only an EXPLICIT positive value is range-checked.
+	// A positive send floor above the full-load advisory delay would throttle even
+	// retry-delay-honoring clients, so cap it at the max retry delay (raw, guarded by >0
+	// so the unset default is resolved/clamped by Effective, not rejected here).
+	if h.MinSendIntervalSeconds > 0 && h.MaxRetryDelaySeconds > 0 && h.MinSendIntervalSeconds > h.MaxRetryDelaySeconds {
+		return fmt.Errorf("head.min_send_interval_seconds (%d) must be <= max_retry_delay_seconds (%d); set it negative to disable",
+			h.MinSendIntervalSeconds, h.MaxRetryDelaySeconds)
 	}
 	// lease_seconds is only a fallback reservation window for a unit that has no
 	// positive deadline. The buffered hold is the unit's head-owned deadline, so it
@@ -364,6 +394,28 @@ func (h HeadConfig) EffectiveLeaseSeconds() int {
 		return defaultLeaseSeconds
 	}
 	return h.LeaseSeconds
+}
+
+// EffectiveMinSendIntervalSeconds returns the per-volunteer minimum work-send
+// interval in seconds. It is ENABLED BY DEFAULT:
+//   - unset (0)      -> defaultMinSendIntervalSeconds (30), clamped to never exceed the
+//                       effective max retry delay (so an unusually low max_retry_delay
+//                       can never make the default floor nonsensical / block boot).
+//   - negative       -> 0 = explicitly DISABLED (only the advisory retry delay, the
+//                       per-pubkey/per-IP rate limits, and the inflight cap then apply).
+//   - positive       -> that value verbatim (validated <= max_retry_delay_seconds).
+func (h HeadConfig) EffectiveMinSendIntervalSeconds() int {
+	if h.MinSendIntervalSeconds < 0 {
+		return 0 // explicitly disabled via negative sentinel
+	}
+	if h.MinSendIntervalSeconds == 0 {
+		d := defaultMinSendIntervalSeconds
+		if m := h.EffectiveMaxRetryDelaySeconds(); d > m {
+			d = m
+		}
+		return d
+	}
+	return h.MinSendIntervalSeconds
 }
 
 // EffectiveReadyPoolSize returns the dispatch-cache ready-pool cap, default 2000.

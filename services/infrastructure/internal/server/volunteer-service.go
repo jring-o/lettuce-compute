@@ -145,6 +145,11 @@ func NewVolunteerService(
 type HeadDispatchConfig struct {
 	MaxBatchPerRequest      int
 	LeaseSeconds            int
+	// MinSendIntervalSeconds is the per-volunteer minimum interval (seconds) between
+	// successful work hand-outs — the server-side enforced floor on work-acquisition
+	// cadence, keyed on the verified Ed25519 identity. 0 disables it (only the advisory
+	// retry delay + rate limits + inflight cap apply).
+	MinSendIntervalSeconds  int
 	MinRetryDelaySeconds    int
 	MaxRetryDelaySeconds    int
 	RetryDelayJitterPct     float64
@@ -275,6 +280,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		flushBatchSize:          s.dispatchCfg.FlushBatchSize,
 		leaseSeconds:            s.leaseSeconds,
 		maxInflightPerVolunteer: s.maxInflightPerVolunteer,
+		minSendInterval:         time.Duration(s.dispatchCfg.MinSendIntervalSeconds) * time.Second,
 		headID:                  s.dispatchCfg.HeadInstanceID,
 		claimLease:              time.Duration(claimLeaseSeconds) * time.Second,
 	}
@@ -297,6 +303,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	s.logger.Info("dispatch cache started",
 		"admission_cap", admissionCap,
 		"maintenance_admission_cap", maintCap,
+		"min_send_interval_seconds", s.dispatchCfg.MinSendIntervalSeconds,
 		"scale_out", cfg.scaleOutEnabled(),
 		"head_instance_id", cfg.headID,
 		"claim_lease_seconds", claimLeaseSeconds)

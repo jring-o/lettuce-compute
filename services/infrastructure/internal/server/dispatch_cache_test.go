@@ -435,6 +435,84 @@ func TestHandOutBasic(t *testing.T) {
 	}
 }
 
+// TestHandOut_MinSendInterval verifies the per-volunteer minimum send interval: once
+// a volunteer receives work it is handed NO new work within the interval — regardless
+// of how fast it re-requests (the "get more than others by ignoring backoff" attack) —
+// while a DIFFERENT volunteer has an independent clock and the floor lifts once the
+// interval elapses.
+func TestHandOut_MinSendInterval(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+	c.cfg.minSendInterval = 30 * time.Second
+
+	base := time.Unix(1_700_000_000, 0).UTC()
+	now := base
+	c.now = func() time.Time { return now }
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+
+	// Stage several redundancy-1 units so the pool is never the limiter — only the
+	// send interval can be the reason a request gets nothing.
+	for i := 0; i < 5; i++ {
+		c.stageUnit(types.NewID(), leafID, 1, 0)
+	}
+
+	volA := types.NewID()
+	volB := types.NewID()
+
+	// First request: volA gets work and its send clock starts.
+	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 1 {
+		t.Fatalf("first hand-out = %d, want 1", len(r))
+	}
+	// Immediate re-request within the interval: throttled, even though units remain.
+	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 0 {
+		t.Fatalf("re-request within interval = %d, want 0 (throttled)", len(r))
+	}
+	// A DIFFERENT volunteer is unaffected by volA's clock.
+	if r, _ := c.HandOut(volB, capableOpts(volB, 0), 1); len(r) != 1 {
+		t.Fatalf("volB hand-out = %d, want 1 (independent clock)", len(r))
+	}
+	// Just before the interval elapses: still throttled.
+	now = base.Add(29 * time.Second)
+	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 0 {
+		t.Fatalf("hand-out at +29s = %d, want 0 (still throttled)", len(r))
+	}
+	// At the interval boundary: volA may receive work again.
+	now = base.Add(30 * time.Second)
+	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 1 {
+		t.Fatalf("hand-out at +30s = %d, want 1 (interval elapsed)", len(r))
+	}
+}
+
+// TestHandOut_MinSendInterval_NoWorkDoesNotStartClock verifies a request that gets no
+// work (empty pool) does NOT start the send clock — so a volunteer that polled while
+// idle can receive work immediately once the pool refills, and is not penalized for
+// asking when there was nothing to give.
+func TestHandOut_MinSendInterval_NoWorkDoesNotStartClock(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+	c.cfg.minSendInterval = 30 * time.Second
+	now := time.Unix(1_700_000_000, 0).UTC()
+	c.now = func() time.Time { return now }
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	vol := types.NewID()
+
+	// Empty pool: no work, so the clock must not start.
+	if r, _ := c.HandOut(vol, capableOpts(vol, 0), 1); len(r) != 0 {
+		t.Fatalf("empty-pool hand-out = %d, want 0", len(r))
+	}
+	// Stage a unit; an immediate request must succeed (the clock was never started).
+	c.stageUnit(types.NewID(), leafID, 1, 0)
+	if r, _ := c.HandOut(vol, capableOpts(vol, 0), 1); len(r) != 1 {
+		t.Fatalf("hand-out after staging = %d, want 1 (clock not started by empty request)", len(r))
+	}
+}
+
 // stageUnitSets appends a ready candidate carrying explicit contributor / benched
 // volunteer sets, so the distinctness + cooldown hand-out filters can be exercised
 // without a DB.
