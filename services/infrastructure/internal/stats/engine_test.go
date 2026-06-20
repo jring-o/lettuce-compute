@@ -30,11 +30,13 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 
 	cleanup := func() {
 		_, _ = pool.Exec(ctx, "DELETE FROM leaf_stats_snapshots")
+		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_units")
 		_, _ = pool.Exec(ctx, "DELETE FROM batches")
 		_, _ = pool.Exec(ctx, "DELETE FROM leafs")
+		_, _ = pool.Exec(ctx, "DELETE FROM volunteers")
 		_, _ = pool.Exec(ctx, "DELETE FROM users")
 		pool.Close()
 	}
@@ -77,22 +79,86 @@ func createTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID types.ID, name s
 	return id
 }
 
-// createTestWorkUnits inserts work units with the given states.
+// createTestWorkUnits inserts work units for a leaf. Most states map directly to
+// work_units.state. ASSIGNED/RUNNING are special: under the per-copy dispatch model
+// (migration 00006) a unit stays QUEUED while its copies run, and the stats engine
+// derives "assigned"/"running" from live work_unit_assignment_history copies, NOT from
+// work_units.state. So those two insert a QUEUED unit plus the matching live copy:
+//
+//	ASSIGNED -> RESERVED copy (outcome NULL, started_at NULL, reserved_until future)
+//	RUNNING  -> RUNNING  copy (outcome NULL, started_at set)
 func createTestWorkUnits(t *testing.T, pool *pgxpool.Pool, leafID types.ID, states []string) {
 	t.Helper()
 	for _, state := range states {
-		id := types.NewID()
-		params, _ := json.Marshal(map[string]interface{}{"x": 1})
-		_, err := pool.Exec(t.Context(), `
-			INSERT INTO work_units (id, leaf_id, state, priority, code_artifact_ref,
-				parameters, deadline_seconds)
-			VALUES ($1, $2, $3, 'NORMAL', 'ref://test', $4, 3600)`,
-			id, leafID, state, params,
-		)
-		if err != nil {
-			t.Fatalf("failed to create work unit in state %s: %v", state, err)
+		switch state {
+		case "ASSIGNED":
+			createQueuedUnitWithCopy(t, pool, leafID, false /* started */)
+		case "RUNNING":
+			createQueuedUnitWithCopy(t, pool, leafID, true /* started */)
+		default:
+			insertWorkUnit(t, pool, leafID, state)
 		}
 	}
+}
+
+// insertWorkUnit inserts a single work_units row in the given state and returns its id.
+func insertWorkUnit(t *testing.T, pool *pgxpool.Pool, leafID types.ID, state string) types.ID {
+	t.Helper()
+	id := types.NewID()
+	params, _ := json.Marshal(map[string]interface{}{"x": 1})
+	_, err := pool.Exec(t.Context(), `
+		INSERT INTO work_units (id, leaf_id, state, priority, code_artifact_ref,
+			parameters, deadline_seconds)
+		VALUES ($1, $2, $3, 'NORMAL', 'ref://test', $4, 3600)`,
+		id, leafID, state, params,
+	)
+	if err != nil {
+		t.Fatalf("failed to create work unit in state %s: %v", state, err)
+	}
+	return id
+}
+
+// createQueuedUnitWithCopy inserts a QUEUED unit plus one live assignment-history copy,
+// mirroring real per-copy dispatch (a unit stays QUEUED while its copies run).
+// started=false -> RESERVED copy (counts as "assigned"); started=true -> RUNNING copy
+// (counts as "running").
+func createQueuedUnitWithCopy(t *testing.T, pool *pgxpool.Pool, leafID types.ID, started bool) {
+	t.Helper()
+	unitID := insertWorkUnit(t, pool, leafID, "QUEUED")
+	volID := createTestVolunteer(t, pool)
+	var startedAt any // nil -> RESERVED copy; time -> RUNNING copy
+	if started {
+		startedAt = time.Now().UTC()
+	}
+	_, err := pool.Exec(t.Context(), `
+		INSERT INTO work_unit_assignment_history
+			(work_unit_id, volunteer_id, assigned_at, reserved_until, started_at, deadline_seconds)
+		VALUES ($1, $2, NOW(), NOW() + INTERVAL '5 minutes', $3, 3600)`,
+		unitID, volID, startedAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to create assignment-history copy (started=%v): %v", started, err)
+	}
+}
+
+// createTestVolunteer inserts a minimal volunteer for the copy FK
+// (work_unit_assignment_history.volunteer_id -> volunteers.id). public_key is
+// bytea NOT NULL + UNIQUE, so derive a unique 32-byte key from the volunteer's own
+// UUID. numeric_id is covered by a sequence default.
+func createTestVolunteer(t *testing.T, pool *pgxpool.Pool) types.ID {
+	t.Helper()
+	id := types.NewID()
+	pk := make([]byte, 32)
+	copy(pk, id[:])
+	copy(pk[16:], id[:])
+	_, err := pool.Exec(t.Context(), `
+		INSERT INTO volunteers (id, public_key, is_active) VALUES ($1, $2, true)`,
+		id, pk,
+	)
+	if err != nil {
+		t.Fatalf("failed to create test volunteer: %v", err)
+	}
+	return id
 }
 
 func TestComputeSnapshotWithWorkUnits(t *testing.T) {
