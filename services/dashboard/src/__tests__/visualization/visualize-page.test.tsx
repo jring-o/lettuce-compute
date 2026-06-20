@@ -353,7 +353,6 @@ describe("VisualizePage (server component)", () => {
 
     expect(mockListResults).toHaveBeenCalledWith("leaf-123", {
       work_unit_id: "wu-001",
-      validation_status: "AGREED",
       limit: 1,
       volunteer_id: "vol-xyz789",
     });
@@ -376,7 +375,6 @@ describe("VisualizePage (server component)", () => {
 
     expect(mockListResults).toHaveBeenCalledWith("leaf-123", {
       work_unit_id: "wu-001",
-      validation_status: "AGREED",
       limit: 1,
     });
   });
