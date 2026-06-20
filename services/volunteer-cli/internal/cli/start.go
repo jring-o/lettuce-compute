@@ -237,7 +237,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		// on different non-dev builds, since that is exactly the condition that gets a
 		// volunteer rejected ("too old for this head"). "dev" builds are local and
 		// never coupled, so they are excluded to avoid crying wolf during development.
-		if headVersion != "" && version != "" && headVersion != "dev" && version != "dev" && headVersion != version {
+		// Compare NORMALIZED versions: the volunteer release stamps a bare "0.5.2"
+		// (release.yml strips the leading v) while the head, built from
+		// `git describe --tags`, stamps "v0.5.2" — without normalizing, a correctly
+		// matched pair would false-positive purely over the "v" prefix.
+		if headVersion != "" && version != "" && headVersion != "dev" && version != "dev" &&
+			normalizeVersion(headVersion) != normalizeVersion(version) {
 			logger.Warn("volunteer/head version mismatch; head and volunteers must run matching builds (protocol-version coupling)",
 				"server", name, "head_version", headVersion, "volunteer_version", version)
 		}
@@ -424,4 +429,12 @@ func parseSlogLevel(level string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// normalizeVersion strips surrounding whitespace and a single leading "v" so the
+// volunteer's release stamp ("0.5.2", v-less per release.yml) compares equal to the
+// head's stamp ("v0.5.2" when built from `git describe --tags`). Used only for the
+// version-mismatch check, not for display.
+func normalizeVersion(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
 }
