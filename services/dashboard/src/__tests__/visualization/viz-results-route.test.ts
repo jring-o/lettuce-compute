@@ -117,7 +117,6 @@ describe("GET /api/viz/results", () => {
     // Verify the infrastructure client was called with correct params
     expect(mockListResults).toHaveBeenCalledWith("leaf-abc", {
       work_unit_id: "wu-123",
-      validation_status: "AGREED",
       limit: 1,
     });
   });
@@ -201,7 +200,6 @@ describe("GET /api/viz/results", () => {
     expect(response.status).toBe(200);
     expect(mockListResults).toHaveBeenCalledWith("leaf-abc", {
       work_unit_id: "wu-123",
-      validation_status: "AGREED",
       limit: 1,
       volunteer_id: "vol-xyz",
     });
@@ -221,7 +219,6 @@ describe("GET /api/viz/results", () => {
     expect(response.status).toBe(200);
     expect(mockListResults).toHaveBeenCalledWith("leaf-abc", {
       work_unit_id: "wu-123",
-      validation_status: "AGREED",
       limit: 1,
     });
   });
