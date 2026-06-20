@@ -593,6 +593,20 @@ type DispatchCandidate struct {
 	// Runtime is the leaf's execution_config.runtime (used to assert the WASM
 	// partition and for capability matching at hand-out).
 	Runtime string
+	// ContributorVolunteerIDs is the set of volunteers that ALREADY count toward
+	// this unit's redundancy at refill time: every holder of a live copy (history
+	// row, outcome IS NULL) plus every author of an already-submitted PENDING
+	// result. Each of the unit's redundant results must come from a DISTINCT
+	// volunteer, so the hand-out path excludes any volunteer in this set — the
+	// in-memory mirror of the volunteer-specific distinctness FindNextAssignable
+	// enforces in SQL but FindDispatchableBatch (volunteer-agnostic) cannot.
+	ContributorVolunteerIDs []types.ID
+	// BenchedVolunteerIDs is the set of volunteers whose recent copy of this unit
+	// TIMED OUT or was ABANDONED within roughly one deadline window. They are
+	// benched (given last refusal) so a fresh volunteer gets first crack on a
+	// requeue; after the cooldown elapses they are eligible again, so a small
+	// volunteer pool never strands the work.
+	BenchedVolunteerIDs []types.ID
 }
 
 // FindDispatchableBatch bulk-selects up to `limit` QUEUED, dispatch-eligible work
@@ -634,7 +648,28 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 				+ (SELECT COUNT(*) FROM results res2
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
-			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime
+			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
+			-- Volunteers already counting toward redundancy (distinct): live-copy holders
+			-- + PENDING-result authors. The hand-out excludes these so each redundant
+			-- result comes from a DISTINCT volunteer (the volunteer-specific guard the
+			-- volunteer-agnostic refill cannot express, re-checked in memory).
+			ARRAY(
+				SELECT DISTINCT v::text FROM (
+					SELECT wuah_c.volunteer_id AS v FROM work_unit_assignment_history wuah_c
+					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL AND wuah_c.volunteer_id IS NOT NULL
+					UNION
+					SELECT res_c.volunteer_id AS v FROM results res_c
+					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
+				) contribs
+			) AS contributor_ids,
+			-- Volunteers whose recent copy of this unit timed out / was abandoned within
+			-- ~one deadline: benched (last refusal) until the cooldown elapses.
+			ARRAY(
+				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
+				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
+				   AND wuah_b.outcome IN ('EXPIRED', 'ABANDONED') AND wuah_b.outcome_at IS NOT NULL
+				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+			) AS benched_ids
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
 		WHERE wu.state = 'QUEUED'
@@ -684,22 +719,41 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime); err != nil {
+		var contributorTexts, benchedTexts []string
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts); err != nil {
 			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:          &cand,
-			LeafID:            wu.LeafID,
-			RedundancyFactor:  redundancy,
-			ActiveAssignments: active,
-			Runtime:           runtime,
+			WorkUnit:                &cand,
+			LeafID:                  wu.LeafID,
+			RedundancyFactor:        redundancy,
+			ActiveAssignments:       active,
+			Runtime:                 runtime,
+			ContributorVolunteerIDs: parseIDTexts(contributorTexts),
+			BenchedVolunteerIDs:     parseIDTexts(benchedTexts),
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, apierror.Internal("failed to iterate dispatchable work units", err)
 	}
 	return out, nil
+}
+
+// parseIDTexts converts a slice of uuid text values (as scanned from a Postgres
+// text[] column) into types.ID, skipping any that fail to parse. Defensive: a
+// malformed id is dropped rather than failing the whole refill.
+func parseIDTexts(texts []string) []types.ID {
+	if len(texts) == 0 {
+		return nil
+	}
+	ids := make([]types.ID, 0, len(texts))
+	for _, t := range texts {
+		if id, err := types.ParseID(t); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // ClaimDispatchableBatch is the horizontal-scale-out (Layer 3) claim-on-refill
@@ -789,7 +843,25 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 				+ (SELECT COUNT(*) FROM results res2
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
-			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime`,
+			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
+			-- Distinct volunteers already covering redundancy (live copies + PENDING
+			-- results): excluded at hand-out so each result comes from a distinct volunteer.
+			ARRAY(
+				SELECT DISTINCT v::text FROM (
+					SELECT wuah_c.volunteer_id AS v FROM work_unit_assignment_history wuah_c
+					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL AND wuah_c.volunteer_id IS NOT NULL
+					UNION
+					SELECT res_c.volunteer_id AS v FROM results res_c
+					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
+				) contribs
+			) AS contributor_ids,
+			-- Volunteers benched by a recent timeout/abandon of this unit (cooldown ~1 deadline).
+			ARRAY(
+				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
+				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
+				   AND wuah_b.outcome IN ('EXPIRED', 'ABANDONED') AND wuah_b.outcome_at IS NOT NULL
+				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+			) AS benched_ids`,
 		limit, excludeIDs, leafIDs, headID, leaseSecs,
 	)
 	if err != nil {
@@ -802,16 +874,19 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime); err != nil {
+		var contributorTexts, benchedTexts []string
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts); err != nil {
 			return nil, apierror.Internal("failed to scan claimed work unit", err)
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:          &cand,
-			LeafID:            wu.LeafID,
-			RedundancyFactor:  redundancy,
-			ActiveAssignments: active,
-			Runtime:           runtime,
+			WorkUnit:                &cand,
+			LeafID:                  wu.LeafID,
+			RedundancyFactor:        redundancy,
+			ActiveAssignments:       active,
+			Runtime:                 runtime,
+			ContributorVolunteerIDs: parseIDTexts(contributorTexts),
+			BenchedVolunteerIDs:     parseIDTexts(benchedTexts),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -893,13 +968,23 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		untils[i] = rec.ReservedUntil
 		deadlines[i] = rec.DeadlineSeconds
 	}
-	// Land each in-memory hold as a RESERVED copy row. Guards:
+	// Land each in-memory hold as a RESERVED copy row. This is the authoritative
+	// per-volunteer eligibility gate for the normal (non-spot-check) hand-out path —
+	// the single place those reservations come into existence — so every distinctness
+	// rule is enforced here regardless of what the in-memory hand-out decided to offer.
+	// Guards:
 	//   * the unit is still QUEUED (the aggregate accepts copies),
-	//   * redundancy headroom remains (live copies + PENDING results < redundancy) —
-	//     defense-in-depth; the cache already capped concurrent holders,
+	//   * redundancy headroom remains (live copies + PENDING results < redundancy),
+	//   * the volunteer has NOT already authored a PENDING result for the unit (so each
+	//     of the N redundant results comes from a DISTINCT volunteer) — the guard whose
+	//     absence let a re-queued unit be re-handed to its own prior submitter,
+	//   * the volunteer is NOT in post-failure cooldown (a recent EXPIRED/ABANDONED copy
+	//     of this unit benches it for ~one deadline so a fresh volunteer gets first crack),
 	//   * ON CONFLICT on the live-copy partial unique enforces "one live copy per
 	//     volunteer" (a duplicate hold for the same volunteer is silently dropped and
 	//     thus voided by the caller).
+	// A reservation the guard rejects is simply absent from RETURNING, so the caller
+	// voids that in-memory hold and the volunteer never run-starts it — no wasted compute.
 	// Two rows for the SAME unit but DISTINCT volunteers both land when redundancy
 	// allows — that is exactly the parallel-copy case (property 7).
 	rows, err := r.db.Query(ctx, `
@@ -922,6 +1007,17 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		      ) < CASE WHEN wu.spot_check THEN 2
 		           ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
 		          END
+		  AND NOT EXISTS (
+		    SELECT 1 FROM results res2
+		    WHERE res2.work_unit_id = v.id AND res2.volunteer_id = v.vol
+		      AND res2.validation_status = 'PENDING'
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history hb
+		    WHERE hb.work_unit_id = v.id AND hb.volunteer_id = v.vol
+		      AND hb.outcome IN ('EXPIRED', 'ABANDONED') AND hb.outcome_at IS NOT NULL
+		      AND hb.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING work_unit_id, volunteer_id`,
 		ids, vols, untils, deadlines,
@@ -1085,14 +1181,41 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 // ReserveCopy inserts a RESERVED copy (a buffered work_unit_assignment_history row,
 // outcome NULL / started_at NULL) for (workUnitID, volunteerID), held until
 // reservedUntil. deadlineSeconds is snapshotted onto the copy so the expiry sweep
-// needs no join. Returns apierror.Conflict if the volunteer already holds a live copy
-// of the unit (the live-copy partial unique) or the unit is not QUEUED.
+// needs no join.
+//
+// This is the AUTHORITATIVE per-volunteer eligibility gate: it is the single point
+// where a copy comes into existence, so it enforces every distinctness rule
+// regardless of any optimization that decided to offer the unit. It returns
+// apierror.Conflict (no copy created) when the unit is not QUEUED, OR the volunteer
+// already holds a live copy (the live-copy partial unique), OR the volunteer already
+// authored a PENDING result for this unit (each redundant result must come from a
+// DISTINCT volunteer), OR the volunteer's recent copy of this unit timed out / was
+// abandoned within the cooldown window (benched until a fresh volunteer gets first
+// refusal). Enforcing these here means a hand-out raced by a concurrent submit is
+// rejected BEFORE the volunteer ever run-starts, so no compute is wasted on a copy
+// that could never be accepted.
 func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error) {
 	row := r.db.QueryRow(ctx, `
 		INSERT INTO work_unit_assignment_history
 			(work_unit_id, volunteer_id, assigned_at, reserved_until, deadline_seconds)
 		SELECT $1, $2, NOW(), $3, $4
 		WHERE EXISTS (SELECT 1 FROM work_units wu WHERE wu.id = $1 AND wu.state = 'QUEUED')
+		  -- Distinctness: never reserve a unit this volunteer already produced a result
+		  -- for (so each of the N redundant results comes from a distinct volunteer).
+		  AND NOT EXISTS (
+		    SELECT 1 FROM results res
+		    WHERE res.work_unit_id = $1 AND res.volunteer_id = $2 AND res.validation_status = 'PENDING'
+		  )
+		  -- Cooldown: a volunteer whose recent copy of this unit timed out / was abandoned
+		  -- is benched for ~one deadline so a fresh volunteer gets first crack on the requeue.
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history h
+		    WHERE h.work_unit_id = $1 AND h.volunteer_id = $2
+		      AND h.outcome IN ('EXPIRED', 'ABANDONED') AND h.outcome_at IS NOT NULL
+		      AND h.outcome_at > NOW() - GREATEST(
+		            (SELECT deadline_seconds FROM work_units WHERE id = $1), 1
+		          ) * INTERVAL '1 second'
+		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING `+copyColumns,
 		workUnitID, volunteerID, reservedUntil, deadlineSeconds,
@@ -1101,7 +1224,7 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.Conflict(
-				"work unit not QUEUED or volunteer already holds a live copy",
+				"work unit not dispatchable for this volunteer (not QUEUED, live copy held, result already submitted, or in post-failure cooldown)",
 				map[string]string{"code": "RESERVATION_CONFLICT"},
 			)
 		}

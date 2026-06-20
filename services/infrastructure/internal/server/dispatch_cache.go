@@ -88,6 +88,19 @@ type candidate struct {
 	// dbActiveCount is the active-history-row count of this unit at refill time,
 	// the authoritative floor on its redundancy headroom.
 	dbActiveCount int
+	// contributors is the set of volunteers that already count toward this unit's
+	// redundancy: live-copy holders + PENDING-result authors at refill time, kept
+	// current as copies run-start (onRunStart). eligibleLocked excludes them so each
+	// of the N redundant results comes from a DISTINCT volunteer — the in-memory
+	// mirror of the volunteer-specific distinctness the DB reservation also enforces.
+	// A volunteer is never removed once added (a result/copy is monotonic coverage),
+	// so a candidate that lingers staged across the submitter's submit still excludes it.
+	contributors map[types.ID]struct{}
+	// benched is the set of volunteers whose recent copy of this unit timed out / was
+	// abandoned within ~one deadline window (a refill-time snapshot). They are given
+	// last refusal so a fresh volunteer gets first crack on a requeue; the DB
+	// reservation is the authoritative cooldown gate, this is the hand-out optimization.
+	benched map[types.ID]struct{}
 }
 
 // inMemHolderCap is the maximum number of DISTINCT in-memory reservation holders the
@@ -644,6 +657,20 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 	if _, held := holders[volunteerID]; held {
 		return false
 	}
+	// Distinctness: never hand this volunteer a unit it already contributed to — it
+	// holds a live copy elsewhere or already submitted a (still-PENDING) result for it.
+	// Each of a unit's N redundant results must come from a DISTINCT volunteer; without
+	// this a unit re-queued for corroboration is re-handed to its own prior submitter,
+	// who can only run it and have the duplicate result rejected. The DB reservation is
+	// the authoritative gate; this avoids the wasted hand-out entirely.
+	if _, did := cand.contributors[volunteerID]; did {
+		return false
+	}
+	// Post-failure cooldown: a volunteer whose recent copy of this unit timed out or was
+	// abandoned is benched for ~one deadline so a fresh volunteer gets first crack.
+	if _, benched := cand.benched[volunteerID]; benched {
+		return false
+	}
 	// Per-volunteer inflight cap.
 	if opts.MaxInflightPerVolunteer > 0 && c.inflight[volunteerID] >= opts.MaxInflightPerVolunteer {
 		return false
@@ -824,6 +851,17 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 			// The run-started copy is now a live DB row: move it from the holder set
 			// into dbActiveCount so eligibleLocked still sees the correct coverage.
 			c.ready[i].dbActiveCount++
+			// Record this volunteer as a contributor on the STAGED candidate. The unit
+			// stays QUEUED while a redundancy>1 copy runs, so the candidate lingers in the
+			// ready pool across this volunteer's submit (which does not meet redundancy and
+			// so does not evict it). Its refill-time contributor snapshot predates this
+			// run-start, so without recording it here the same volunteer would become
+			// eligible again the moment its in-memory hold is released — re-handed its own
+			// unit. Adding it now keeps the staged candidate's distinctness correct.
+			if c.ready[i].contributors == nil {
+				c.ready[i].contributors = make(map[types.ID]struct{})
+			}
+			c.ready[i].contributors[volunteerID] = struct{}{}
 			remainingHolders := len(c.reservedInMem[unitID])
 			if c.ready[i].dbActiveCount+remainingHolders >= c.ready[i].effectiveRedundancy {
 				// Redundancy fully covered: drop it from ready (the refiller re-stages it
@@ -1228,6 +1266,8 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			unit:                dc.WorkUnit,
 			effectiveRedundancy: dc.RedundancyFactor,
 			dbActiveCount:       dc.ActiveAssignments,
+			contributors:        idSet(dc.ContributorVolunteerIDs),
+			benched:             idSet(dc.BenchedVolunteerIDs),
 		})
 	}
 
@@ -1702,6 +1742,20 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 		}
 	}
 	return true
+}
+
+// idSet builds a set from a slice of ids (nil for an empty/absent slice, so an
+// unstaged candidate carries a nil — not empty — map, which membership checks read
+// as "no members" at no allocation cost).
+func idSet(ids []types.ID) map[types.ID]struct{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	s := make(map[types.ID]struct{}, len(ids))
+	for _, id := range ids {
+		s[id] = struct{}{}
+	}
+	return s
 }
 
 func containsID(ids []types.ID, target types.ID) bool {
