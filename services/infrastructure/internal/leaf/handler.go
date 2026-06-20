@@ -373,7 +373,16 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// whole-block-REPLACED each config (zeroing omitted fields) and skipped re-validation,
 	// so a one-field change required resending the whole block and an invalid config (e.g.
 	// redundancy_factor: 0) was accepted silently on an ACTIVE leaf.
-	if raw, ok := rawReq["execution_config"]; ok {
+	//
+	// Gate each block on the TYPED pointer (req.X != nil), matching the metadata fields
+	// above — nil means "not provided (no change)" per the UpdateLeafRequest contract,
+	// covering both an absent key AND an explicit JSON null. (Gating on rawReq-key
+	// presence instead treated a null block — which is what a nil pointer marshals to
+	// without omitempty — as "supplied", so a name-only partial update on a not-yet-
+	// configured leaf wrongly re-ran full execution-config validation: "runtime is
+	// required".) rawReq is still used for the field-by-field merge payload.
+	if req.ExecutionConfig != nil {
+		raw := rawReq["execution_config"]
 		merged := p.ExecutionConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid execution_config", nil))
@@ -392,7 +401,8 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		p.ExecutionConfig = merged
 	}
-	if raw, ok := rawReq["validation_config"]; ok {
+	if req.ValidationConfig != nil {
+		raw := rawReq["validation_config"]
 		merged := p.ValidationConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid validation_config", nil))
@@ -405,7 +415,8 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		p.ValidationConfig = merged
 	}
-	if raw, ok := rawReq["fault_tolerance_config"]; ok {
+	if req.FaultToleranceConfig != nil {
+		raw := rawReq["fault_tolerance_config"]
 		merged := p.FaultToleranceConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid fault_tolerance_config", nil))
@@ -418,7 +429,8 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		p.FaultToleranceConfig = merged
 	}
-	if raw, ok := rawReq["data_config"]; ok {
+	if req.DataConfig != nil {
+		raw := rawReq["data_config"]
 		merged := p.DataConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid data_config", nil))
@@ -431,7 +443,8 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		p.DataConfig = merged
 	}
-	if raw, ok := rawReq["credit_config"]; ok {
+	if req.CreditConfig != nil {
+		raw := rawReq["credit_config"]
 		merged := p.CreditConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid credit_config", nil))
@@ -444,7 +457,8 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		p.CreditConfig = merged
 	}
-	if raw, ok := rawReq["resource_requirements"]; ok {
+	if req.ResourceRequirements != nil {
+		raw := rawReq["resource_requirements"]
 		merged := p.ResourceRequirements
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid resource_requirements", nil))
