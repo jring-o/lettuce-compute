@@ -312,6 +312,13 @@ func TestGRPCGetServerStatus(t *testing.T) {
 	if resp.UptimeSeconds < 0 {
 		t.Errorf("expected non-negative uptime, got %d", resp.UptimeSeconds)
 	}
+
+	// Version must be the build version the service was constructed with — the
+	// volunteer's head-version pairing depends on GetServerStatus returning it
+	// (it was silently omitted before, so a populated check guards the regression).
+	if resp.Version != "0.1.0-test" {
+		t.Errorf("expected version '0.1.0-test', got '%s'", resp.Version)
+	}
 }
 
 // --- TLS config tests ---
