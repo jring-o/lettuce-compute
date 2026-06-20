@@ -130,6 +130,18 @@ head:
   # Adds reservation columns to work_units (migration 00002, auto-applied on boot).
   lease_seconds: 900                 # env: LETTUCE_HEAD_LEASE_SECONDS
 
+  # Minimum seconds between SUCCESSFUL work hand-outs to one volunteer (keyed on its
+  # verified identity). The retry delay above is ADVISORY — a self-compiled client can
+  # ignore it; this is a SERVER-SIDE HARD FLOOR the head enforces itself, so a volunteer
+  # that polls aggressively still gets at most one batch per interval and cannot grab a
+  # disproportionate share of a scarce queue. An early request is still served (it just
+  # returns no work). ENABLED BY DEFAULT: unset (0) -> 30 (~= min_retry_delay_seconds, so
+  # honest clients never trip it; clamped to never exceed max_retry_delay_seconds). Set
+  # NEGATIVE (e.g. -1) to DISABLE — the rate limits + max_inflight_per_volunteer still
+  # apply. A positive value must be <= max_retry_delay_seconds. Enforced per replica
+  # (in-memory).
+  min_send_interval_seconds: 30      # env: LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS (-1 disables)
+
   # --- Dispatch cache (Layer 2) ---
   # The head serves work requests from an in-memory pool of queued units (no database
   # round-trip on the hot path) and flushes the resulting reservations to Postgres

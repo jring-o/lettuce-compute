@@ -130,6 +130,12 @@ type dispatchCacheConfig struct {
 	flushBatchSize          int
 	leaseSeconds            int
 	maxInflightPerVolunteer int
+	// minSendInterval is the per-volunteer minimum interval between successful work
+	// hand-outs. When > 0, HandOut refuses
+	// to hand any new work to a volunteer within this window of its last hand-out — a
+	// server-side hard floor on work-acquisition cadence that holds even when a client
+	// ignores the advisory server-directed retry delay. 0 disables it.
+	minSendInterval time.Duration
 	// leafSnapshotTTL bounds staleness of the cached leaf snapshot used to build
 	// assignments, so a published/rolled-back artifact version (or a direct
 	// execution_config change) propagates to RUNNING volunteers within the TTL with
@@ -210,6 +216,14 @@ type dispatchCache struct {
 	reservedInMem map[types.ID]map[types.ID]time.Time
 	// inflight is the per-volunteer (live reservations + active history rows) count.
 	inflight map[types.ID]int
+	// lastHandOut records, per volunteer, the wall-clock time of its most recent
+	// SUCCESSFUL work hand-out (taken > 0). When cfg.minSendInterval > 0, HandOut
+	// refuses any new work to a volunteer within that interval of its last hand-out —
+	// a server-side, per-volunteer minimum send interval that does NOT depend on the
+	// client honoring the advisory retry delay.
+	// Pruned of entries older than the interval on the reconcile tick so it cannot grow
+	// unbounded with the lifetime volunteer set. Empty/unused when minSendInterval == 0.
+	lastHandOut map[types.ID]time.Time
 	// pendingWrites is the async copy-reservation write queue (each lands as a
 	// RESERVED copy row via FlushReservations).
 	pendingWrites []workunit.FlushReservation
@@ -327,6 +341,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		now:                  time.Now,
 		reservedInMem:        make(map[types.ID]map[types.ID]time.Time),
 		inflight:             make(map[types.ID]int),
+		lastHandOut:          make(map[types.ID]time.Time),
 		leafCache:            make(map[types.ID]*cachedLeaf),
 		versionCache:         make(map[types.ID]*leaf.ArtifactVersion),
 		identityCache:        make(map[types.ID]*volunteerIdentity),
@@ -470,6 +485,24 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	leaseFallback := time.Duration(c.cfg.leaseSeconds) * time.Second
 
 	c.mu.Lock()
+	// Per-volunteer minimum send interval: refuse to hand any new work to a volunteer
+	// within cfg.minSendInterval of its last successful hand-out. This is a server-side
+	// hard floor on per-volunteer work-acquisition cadence that holds even when a
+	// (self-compiled) volunteer ignores the advisory RetryAfterSeconds — the request is
+	// still served (it simply returns no work), and the per-pubkey rate limit backstops
+	// the polling itself. A zero interval disables the floor; the resolved interval comes
+	// from config.EffectiveMinSendIntervalSeconds, which is ENABLED by default.
+	if c.cfg.minSendInterval > 0 {
+		if last, ok := c.lastHandOut[volunteerID]; ok && c.now().Sub(last) < c.cfg.minSendInterval {
+			c.mu.Unlock()
+			if c.logger.Enabled(context.Background(), slog.LevelDebug) {
+				c.logger.Debug("hand-out throttled: min send interval not elapsed",
+					"volunteer_id", volunteerID,
+					"min_send_interval", c.cfg.minSendInterval)
+			}
+			return nil, false
+		}
+	}
 	kept := c.ready[:0]
 	taken := 0
 	// D-1: per-reason tally of why candidates were refused, so a hand-out that returns
@@ -586,6 +619,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	readyLen := len(c.ready)
 	readyNonEmpty := readyLen > 0
 	drained = readyLen < c.cfg.lowWatermark
+	// Stamp the per-volunteer send clock ONLY when work was actually handed out, so a
+	// volunteer that got nothing (no eligible work) may retry immediately and the
+	// interval governs only the spacing between real hand-outs.
+	if taken > 0 && c.cfg.minSendInterval > 0 {
+		c.lastHandOut[volunteerID] = c.now()
+	}
 	c.mu.Unlock()
 
 	// Blocker 2 (leaf-filtered starvation): a requester filtered to specific leafs that
@@ -1816,6 +1855,18 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 		}
 	}
 	c.inflight = next
+
+	// Prune per-volunteer send-clock entries older than the min-send interval: such an
+	// entry can never throttle again, so dropping it keeps lastHandOut bounded by the
+	// volunteers seen within one interval rather than the lifetime set.
+	if c.cfg.minSendInterval > 0 {
+		cutoff := c.now().Add(-c.cfg.minSendInterval)
+		for vol, at := range c.lastHandOut {
+			if at.Before(cutoff) {
+				delete(c.lastHandOut, vol)
+			}
+		}
+	}
 }
 
 // --- capability matching -----------------------------------------------------

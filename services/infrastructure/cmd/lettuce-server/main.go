@@ -248,6 +248,7 @@ func main() {
 		server.HeadDispatchConfig{
 			MaxBatchPerRequest:      cfg.Head.EffectiveMaxBatch(),
 			LeaseSeconds:            cfg.Head.EffectiveLeaseSeconds(),
+			MinSendIntervalSeconds:  cfg.Head.EffectiveMinSendIntervalSeconds(),
 			MinRetryDelaySeconds:    cfg.Head.EffectiveMinRetryDelaySeconds(),
 			MaxRetryDelaySeconds:    cfg.Head.EffectiveMaxRetryDelaySeconds(),
 			RetryDelayJitterPct:     cfg.Head.EffectiveRetryDelayJitterPct(),

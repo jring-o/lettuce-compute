@@ -126,6 +126,9 @@ services:
       LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS: ${LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS:-}
       LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT: ${LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT:-}
       LETTUCE_HEAD_LEASE_SECONDS: ${LETTUCE_HEAD_LEASE_SECONDS:-}
+      # Per-volunteer minimum work-send interval (fairness/anti-abuse floor). ENABLED
+      # by default (~30s); leave unset to keep the default, or set negative to disable.
+      LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS: ${LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS:-}
       LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER:-}
     volumes:
       - ./keys:/keys:ro

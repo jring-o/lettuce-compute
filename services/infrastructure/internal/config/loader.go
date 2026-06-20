@@ -241,6 +241,13 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.LeaseSeconds = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.MinSendIntervalSeconds = n
+	}
 	if v := os.Getenv("LETTUCE_HEAD_READY_POOL_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

@@ -555,6 +555,33 @@ func TestHeadConfigValidate(t *testing.T) {
 			errMsg:  "min_retry_delay_seconds",
 		},
 		{
+			name: "valid min_send_interval below max retry delay",
+			cfg: HeadConfig{
+				Name:                   "Send Floor Head",
+				MinSendIntervalSeconds: 30,
+				MaxRetryDelaySeconds:   900,
+			},
+			wantErr: false,
+		},
+		{
+			name: "negative min_send_interval is the disable sentinel (valid)",
+			cfg: HeadConfig{
+				Name:                   "Disabled Send Floor Head",
+				MinSendIntervalSeconds: -1,
+			},
+			wantErr: false,
+		},
+		{
+			name: "min_send_interval above max retry delay rejected",
+			cfg: HeadConfig{
+				Name:                   "Excessive Send Floor Head",
+				MinSendIntervalSeconds: 1000,
+				MaxRetryDelaySeconds:   900,
+			},
+			wantErr: true,
+			errMsg:  "must be <= max_retry_delay_seconds",
+		},
+		{
 			name: "jitter pct >= 1 rejected",
 			cfg: HeadConfig{
 				Name:                "Bad Jitter Head",
@@ -616,6 +643,17 @@ func TestHeadEffectiveDispatchDefaults(t *testing.T) {
 	if got := h.EffectiveLeaseSeconds(); got != 900 {
 		t.Errorf("EffectiveLeaseSeconds() = %d, want 900", got)
 	}
+	if got := h.EffectiveMinSendIntervalSeconds(); got != 30 {
+		t.Errorf("EffectiveMinSendIntervalSeconds() = %d, want 30 (enabled by default)", got)
+	}
+	// A negative value is the explicit disable sentinel.
+	if got := (HeadConfig{MinSendIntervalSeconds: -1}).EffectiveMinSendIntervalSeconds(); got != 0 {
+		t.Errorf("EffectiveMinSendIntervalSeconds(-1) = %d, want 0 (disabled)", got)
+	}
+	// The default floor is clamped to never exceed the effective max retry delay.
+	if got := (HeadConfig{MaxRetryDelaySeconds: 20}).EffectiveMinSendIntervalSeconds(); got != 20 {
+		t.Errorf("EffectiveMinSendIntervalSeconds() with max_retry=20 = %d, want 20 (clamped)", got)
+	}
 
 	// Non-zero values are returned verbatim.
 	h2 := HeadConfig{
@@ -625,6 +663,10 @@ func TestHeadEffectiveDispatchDefaults(t *testing.T) {
 		RetryDelayJitterPct:     0.1,
 		TargetRequestRatePerSec: 250,
 		LeaseSeconds:            300,
+		MinSendIntervalSeconds:  15,
+	}
+	if got := h2.EffectiveMinSendIntervalSeconds(); got != 15 {
+		t.Errorf("EffectiveMinSendIntervalSeconds() = %d, want 15", got)
 	}
 	if got := h2.EffectiveMaxBatch(); got != 4 {
 		t.Errorf("EffectiveMaxBatch() = %d, want 4", got)
