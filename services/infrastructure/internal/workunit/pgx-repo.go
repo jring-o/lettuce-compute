@@ -38,7 +38,8 @@ const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 	reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
-	created_at, updated_at, hr_class`
+	created_at, updated_at, hr_class,
+	target_copies, min_quorum, max_error_copies, max_success_copies`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
 // The column order must match workUnitColumns.
@@ -73,6 +74,10 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.CreatedAt,
 		&wu.UpdatedAt,
 		&wu.HRClass,
+		&wu.TargetCopies,
+		&wu.MinQuorum,
+		&wu.MaxErrorCopies,
+		&wu.MaxSuccessCopies,
 	)
 	return &wu, err
 }
@@ -119,14 +124,16 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 			estimated_duration_seconds, deadline_seconds, output_spec,
 			assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 			reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
-			flagged_for_review, spot_check
+			flagged_for_review, spot_check,
+			target_copies, min_quorum, max_error_copies, max_success_copies
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8,
 			$9, $10, $11,
 			$12, $13, $14, $15, $16,
 			$17, $18, $19, $20,
-			$21, $22
+			$21, $22,
+			$23, $24, $25, $26
 		) RETURNING `+workUnitColumns,
 		wu.LeafID, wu.BatchID, wu.State, wu.Priority,
 		wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
@@ -134,6 +141,7 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 		wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 		wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 		wu.FlaggedForReview, wu.SpotCheck,
+		wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
 	)
 
 	result, err := scanWorkUnit(row)
@@ -369,6 +377,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 		"assigned_volunteer_id", "assigned_at", "started_at", "completed_at", "validated_at",
 		"reassignment_count", "max_reassignments", "max_total_copies", "last_heartbeat_at",
 		"flagged_for_review", "spot_check",
+		"target_copies", "min_quorum", "max_error_copies", "max_success_copies",
 	}
 
 	rows := make([][]any, len(wus))
@@ -380,6 +389,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 			wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 			wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 			wu.FlaggedForReview, wu.SpotCheck,
+			wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
 		}
 	}
 
@@ -433,7 +443,8 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.assigned_volunteer_id, wu.assigned_at, wu.started_at, wu.completed_at, wu.validated_at,
 	wu.reassignment_count, wu.max_reassignments, wu.max_total_copies, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
-	wu.created_at, wu.updated_at, wu.hr_class`
+	wu.created_at, wu.updated_at, wu.hr_class,
+	wu.target_copies, wu.min_quorum, wu.max_error_copies, wu.max_success_copies`
 
 // scanDispatchCandidate scans the prefixedWorkUnitColumns set (column order matching
 // the const above) into a WorkUnit. Shared by FindDispatchableBatch /
@@ -447,6 +458,7 @@ func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
 		&wu.ReassignmentCount, &wu.MaxReassignments, &wu.MaxTotalCopies, &wu.LastHeartbeatAt,
 		&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
 		&wu.CreatedAt, &wu.UpdatedAt, &wu.HRClass,
+		&wu.TargetCopies, &wu.MinQuorum, &wu.MaxErrorCopies, &wu.MaxSuccessCopies,
 	}
 	dst = append(dst, extra...)
 	return rows.Scan(dst...)

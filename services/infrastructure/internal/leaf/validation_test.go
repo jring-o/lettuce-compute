@@ -721,6 +721,62 @@ func TestValidateValidationConfig(t *testing.T) {
 			wantErr: true,
 			errMsg:  "max_retries",
 		},
+		// Target/quorum split + caps (TODO #50)
+		{
+			name:    "target_copies set alone (quorum derives from redundancy_factor) ok",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.TargetCopies = 3 },
+			wantErr: false,
+		},
+		{
+			name:    "target_copies > min_quorum ok (over-dispatch, validate at quorum)",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 2 },
+			wantErr: false,
+		},
+		{
+			name:    "min_quorum equals target_copies ok",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 2; c.MinQuorum = 2 },
+			wantErr: false,
+		},
+		{
+			name:    "min_quorum greater than target_copies rejected",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 2; c.MinQuorum = 3 },
+			wantErr: true,
+			errMsg:  "min_quorum must be less than or equal to target_copies",
+		},
+		{
+			name:    "min_quorum greater than derived target (redundancy_factor) rejected",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.MinQuorum = 3 },
+			wantErr: true,
+			errMsg:  "min_quorum must be less than or equal to target_copies",
+		},
+		{
+			name:    "max_total_copies below target rejected",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MaxTotalCopies = 2 },
+			wantErr: true,
+			errMsg:  "max_total_copies must be at least target_copies",
+		},
+		{
+			name:    "max_total_copies at/above target ok",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MaxTotalCopies = 10 },
+			wantErr: false,
+		},
+		{
+			name:    "max_success_copies below quorum rejected",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 3; c.MaxSuccessCopies = 2 },
+			wantErr: true,
+			errMsg:  "max_success_copies must be at least min_quorum",
+		},
+		{
+			name:    "caps unset (0) ok — defaults",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 0; c.MinQuorum = 0; c.MaxTotalCopies = 0 },
+			wantErr: false,
+		},
+		{
+			name:    "spot_check rejected when target_copies > 1 (explicit)",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 2; c.SpotCheckEnabled = true; c.SpotCheckPercentage = 5.0 },
+			wantErr: true,
+			errMsg:  "spot-check validation is only for single-copy leafs",
+		},
 		{
 			name:    "max_retries too high",
 			modify:  func(c *ValidationConfig) { c.MaxRetries = 11 },
@@ -745,7 +801,7 @@ func TestValidateValidationConfig(t *testing.T) {
 				c.SpotCheckPercentage = 5.0
 			},
 			wantErr: true,
-			errMsg:  "spot-check validation is only for redundancy_factor=1",
+			errMsg:  "spot-check validation is only for single-copy leafs",
 		},
 		{
 			name: "spot_check_percentage too low",
