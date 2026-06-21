@@ -35,7 +35,7 @@ Head operator                        Volunteers
    ./lettuce-volunteer start
    ```
 
-You can attach to multiple heads run by different operators. The CLI distributes work across all of them.
+You can attach to multiple heads run by different operators. The CLI distributes work across all of them — and you can steer the split with `./lettuce-volunteer heads weight` (per head) and `./lettuce-volunteer leafs weight/enable/disable` (per leaf); see [Choosing what you work on](guides/volunteer-setup.md#choosing-what-you-work-on).
 
 Not getting work, or setting up a container runtime? Run `./lettuce-volunteer doctor`
 for a pass/fail diagnosis, and see the [volunteer setup guide](guides/volunteer-setup.md)

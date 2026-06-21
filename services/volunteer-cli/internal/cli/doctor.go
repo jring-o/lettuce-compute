@@ -16,6 +16,8 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -252,7 +254,7 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		TLSCertFile:   srv.CACertPath,
 		TLSClientCert: srv.CertPath,
 		TLSClientKey:  srv.KeyPath,
-		ConnTimeout:   6 * time.Second,
+		ConnTimeout:   15 * time.Second,
 		// Identity omitted: GetServerStatus/GetHeadInfo are public RPCs.
 	}, logger)
 	if err != nil {
@@ -262,17 +264,35 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 	}
 	defer gc.Close()
 
-	rpcCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-	defer cancel()
+	// Each probe dials a FRESH connection and pays full cold-start cost (DNS +
+	// TLS handshake + HTTP/2 setup) before the RPC, so give each public RPC its
+	// own generous deadline rather than sharing one tight budget. A busy head or
+	// a cold connection can take several seconds even while the daemon's warm,
+	// long-lived connection is submitting work fine.
+	const probeTimeout = 15 * time.Second
 
-	st, err := gc.GetServerStatus(rpcCtx)
+	statusCtx, cancelStatus := context.WithTimeout(ctx, probeTimeout)
+	defer cancelStatus()
+
+	st, err := gc.GetServerStatus(statusCtx)
 	if err != nil {
-		rep.add(docWarn, name, fmt.Sprintf("unreachable (%v)", err),
-			"verify the host/port and that the head is running")
+		// A deadline here usually means "slow/cold connection," not "down" — the
+		// daemon's warm connection may be working fine. Don't cry "unreachable".
+		if status.Code(err) == codes.DeadlineExceeded {
+			rep.add(docWarn, name,
+				fmt.Sprintf("slow to respond (no reply within %s)", probeTimeout),
+				"the head is reachable but slow — a busy head or a cold connection can exceed this; if work is still flowing, this is usually benign")
+		} else {
+			rep.add(docWarn, name, fmt.Sprintf("unreachable (%v)", err),
+				"verify the host/port and that the head is running")
+		}
 		return false
 	}
 
-	resp, err := gc.GetHeadInfo(rpcCtx, &lettucev1.GetHeadInfoRequest{})
+	headCtx, cancelHead := context.WithTimeout(ctx, probeTimeout)
+	defer cancelHead()
+
+	resp, err := gc.GetHeadInfo(headCtx, &lettucev1.GetHeadInfoRequest{})
 	if err != nil {
 		rep.add(docWarn, name,
 			fmt.Sprintf("reachable (server %s) but leaf list failed (%v)", st.GetVersion(), err), "")

@@ -298,6 +298,47 @@ thermal:
 > volunteer⇄head work protocol. **A volunteer older than this release cannot talk
 > to the new head.** Run `lettuce-volunteer update`, then restart the daemon.
 
+## Choosing what you work on
+
+By default your volunteer spreads work across every head you've attached and
+every leaf each head offers, in proportion to how far behind each one is. You
+can nudge those proportions — or opt out of specific leafs — with two command
+groups. Both write to `~/.lettuce/config.yaml` and take effect on the **next
+daemon start**.
+
+### Prioritize a head
+
+If you're attached to several heads and want more of your machine's time on one
+of them:
+
+```bash
+./lettuce-volunteer heads list                  # names, addresses, current weights
+./lettuce-volunteer heads weight lbry.science 200
+```
+
+Heads are picked by how far each is below its target share, so a head at weight
+`200` receives roughly twice the share of one at the default `100`. Weight is a
+*ratio*, not a cap — a higher number just means "send more of my work here."
+
+### Prioritize, enable, or disable leafs
+
+Within a head you can do the same per leaf, and opt a leaf in or out entirely:
+
+```bash
+./lettuce-volunteer leafs list                  # leafs across your heads + their state
+./lettuce-volunteer leafs weight beyblade-arena 200   # more of this leaf
+./lettuce-volunteer leafs disable some-leaf     # never run this one
+./lettuce-volunteer leafs enable some-leaf      # run it again
+./lettuce-volunteer leafs reset                 # back to the head's defaults
+```
+
+Add `--server <name>` to any `leafs` command to scope it to one head; omit it to
+apply across all of them.
+
+> **Capability still wins.** These preferences only re-rank work you can already
+> run — they can't make you eligible for a leaf your machine can't handle (e.g. a
+> GPU leaf on a GPU-less box). Use `doctor` to see what you're eligible for.
+
 ## Updating
 
 ```bash
