@@ -125,7 +125,7 @@ func fmNewMonitor(t *testing.T, pool *pgxpool.Pool) *server.FaultMonitor {
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 	assignRepo := assignment.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, t.TempDir())
-	return server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, nil, logger)
+	return server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, nil, nil, logger)
 }
 
 // fmInsertQueuedWU inserts a QUEUED work unit. Per-copy dispatch (migration 00006)

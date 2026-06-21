@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
@@ -36,7 +37,12 @@ type volunteerService struct {
 	// hostRepo upserts per-MACHINE host rows (TODO #19). Constructed from the pool, so it
 	// is nil only in gRPC-plumbing unit tests that pass a nil pool (which never send a
 	// host_id); RegisterVolunteer guards on it.
-	hostRepo                volunteer.HostRepository
+	hostRepo volunteer.HostRepository
+	// reliabilityRepo backs the per-host adaptive work quota (TODO #54): the budget
+	// refresher reads measured-reliability scores from it off the hot path. Constructed from
+	// the pool, so it is nil only in gRPC-plumbing unit tests with a nil pool (the budget
+	// refresher is then a no-op and the flat in-flight cap applies).
+	reliabilityRepo         reliability.Repository
 	wuRepo                  workunit.WorkUnitRepository
 	leafRepo                leaf.Repository
 	artifactVersionRepo     leaf.ArtifactVersionRepository
@@ -139,6 +145,9 @@ func NewVolunteerService(
 	// unit tests that pass a nil pool and never send a host_id.
 	if pool != nil {
 		s.hostRepo = volunteer.NewPgxHostRepository(pool)
+		// Per-host reliability store for the adaptive quota (TODO #54); same nil-only-in-
+		// plumbing-tests treatment as hostRepo.
+		s.reliabilityRepo = reliability.NewPgxRepository(pool)
 	}
 	// Default load estimator until SetHeadConfig overrides the tunables. The pool
 	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
@@ -179,6 +188,15 @@ type HeadDispatchConfig struct {
 	HeadInstanceID types.ID
 	// ClaimLeaseSeconds is the per-head dispatch-claim lease (seconds). Default 120.
 	ClaimLeaseSeconds int
+
+	// --- TODO #54: reliability-weighted adaptive in-flight quota ---
+	// ReliabilityQuotaEnabled turns a host's in-flight cap into a function of its measured
+	// reliability instead of the flat MaxInflightPerVolunteer. Disabled -> today's flat cap
+	// for everyone. main.go fills it from HeadConfig.EffectiveReliabilityQuotaEnabled().
+	ReliabilityQuotaEnabled bool
+	// ReliabilityQuotaFloor is the cold-start / fully-throttled in-flight buffer a host with
+	// no measured signal gets. main.go fills it from HeadConfig.EffectiveReliabilityQuotaFloor().
+	ReliabilityQuotaFloor int
 }
 
 // SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
@@ -292,6 +310,8 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		minSendInterval:         time.Duration(s.dispatchCfg.MinSendIntervalSeconds) * time.Second,
 		headID:                  s.dispatchCfg.HeadInstanceID,
 		claimLease:              time.Duration(claimLeaseSeconds) * time.Second,
+		reliabilityQuotaEnabled: s.dispatchCfg.ReliabilityQuotaEnabled,
+		reliabilityFloor:        s.dispatchCfg.ReliabilityQuotaFloor,
 	}
 	// artifactVersionRepo (the same *leaf.PgxRepository) lets the cache resolve the
 	// current/pinned artifact version per assignment and pin units for homogeneous
@@ -304,16 +324,22 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		volunteerRepo:       s.volunteerRepo,
 		hostRepo:            s.hostRepo,
 		artifactVersionRepo: s.artifactVersionRepo,
+		reliabilityRepo:     s.reliabilityRepo,
 	}, s.logger)
 	s.dispatchCache = cache
 
 	go cache.runRefiller(ctx, defaultRefillTickInterval)
 	go cache.runFlusher(ctx)
 	go cache.runReconciler(ctx, defaultReconcileInterval)
+	// TODO #54: the adaptive in-flight budget refresher (a no-op when the quota is disabled
+	// or no reliability repo is wired). Per-replica, like the rest of the cache.
+	go cache.runBudgetRefresher(ctx, defaultBudgetRefreshInterval)
 	s.logger.Info("dispatch cache started",
 		"admission_cap", admissionCap,
 		"maintenance_admission_cap", maintCap,
 		"min_send_interval_seconds", s.dispatchCfg.MinSendIntervalSeconds,
+		"reliability_quota_enabled", cfg.reliabilityQuotaEnabled,
+		"reliability_quota_floor", cfg.reliabilityFloor,
 		"scale_out", cfg.scaleOutEnabled(),
 		"head_instance_id", cfg.headID,
 		"claim_lease_seconds", claimLeaseSeconds)

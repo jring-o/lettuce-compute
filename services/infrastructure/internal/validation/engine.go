@@ -15,6 +15,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -42,12 +43,16 @@ type ValidationResult struct {
 type Engine struct {
 	resultRepo      result.Repository
 	workUnitRepo    workunit.WorkUnitRepository
-	leafRepo     leaf.Repository
+	leafRepo        leaf.Repository
 	creditRepo      credit.Repository
 	racRepo         credit.RACRepository
 	volunteerRepo   volunteer.Repository
 	assignmentRepo  assignment.Repository
 	attestationRepo attestation.Repository
+	// reliabilityRepo feeds the per-host measured-reliability signal (TODO #54): an AGREED
+	// result is a good outcome for the host that produced it, a DISAGREED result a bad one.
+	// May be nil (tests / pre-#54) -> the signal is simply not recorded (best-effort).
+	reliabilityRepo reliability.Repository
 	signer          *attestation.Signer
 	logger          *slog.Logger
 }
@@ -62,18 +67,20 @@ func NewEngine(
 	volunteerRepo volunteer.Repository,
 	assignmentRepo assignment.Repository,
 	attestationRepo attestation.Repository,
+	reliabilityRepo reliability.Repository,
 	signer *attestation.Signer,
 	logger *slog.Logger,
 ) *Engine {
 	return &Engine{
 		resultRepo:      resultRepo,
 		workUnitRepo:    workUnitRepo,
-		leafRepo:     leafRepo,
+		leafRepo:        leafRepo,
 		creditRepo:      creditRepo,
 		racRepo:         racRepo,
 		volunteerRepo:   volunteerRepo,
 		assignmentRepo:  assignmentRepo,
 		attestationRepo: attestationRepo,
+		reliabilityRepo: reliabilityRepo,
 		signer:          signer,
 		logger:          logger,
 	}
@@ -348,7 +355,7 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	for _, r := range agreedResults {
 		entry := &credit.LedgerEntry{
 			VolunteerID:  r.VolunteerID,
-			LeafID:    wu.LeafID,
+			LeafID:       wu.LeafID,
 			WorkUnitID:   wu.ID,
 			ResultID:     r.ID,
 			CreditAmount: creditAmount,
@@ -388,6 +395,12 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 		}
 		e.checkRejectionRate(ctx, r.VolunteerID)
 	}
+
+	// TODO #54: feed the per-host reliability signal — an AGREED result is a good outcome
+	// for the machine that produced it (grows its buffer), a DISAGREED one is wasted work
+	// (shrinks it). Best-effort, after credit is already granted (never fails validation).
+	e.recordReliability(ctx, agreedResults, true)
+	e.recordReliability(ctx, rejectedResults, false)
 
 	// H-2: a successful VALIDATED + credit-grant was previously silent — restore the
 	// per-WU "this validated" signal now that the generic access log is demoted.
@@ -435,6 +448,10 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 		}
 		e.checkRejectionRate(ctx, r.VolunteerID)
 	}
+
+	// TODO #54: every result on a fully-rejected unit is wasted work — a bad reliability
+	// signal for the machine that produced it. Best-effort (never fails the rejection).
+	e.recordReliability(ctx, pending, false)
 
 	// Log spot-check mismatch.
 	if wu.SpotCheck {
@@ -485,12 +502,12 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 		rawMetrics := executionMetadataToMap(r.ExecutionMetadata)
 
 		att := &attestation.Attestation{
-			LeafID:           wu.LeafID,
-			VolunteerPublicKey:  vol.PublicKey,
-			WorkUnitID:          wu.ID,
-			RawMetrics:          rawMetrics,
-			ValidationOutcome:   outcome,
-			CreditAmount:        creditAmount,
+			LeafID:               wu.LeafID,
+			VolunteerPublicKey:   vol.PublicKey,
+			WorkUnitID:           wu.ID,
+			RawMetrics:           rawMetrics,
+			ValidationOutcome:    outcome,
+			CreditAmount:         creditAmount,
 			AttestationTimestamp: now,
 		}
 
@@ -528,6 +545,28 @@ func executionMetadataToMap(em result.ExecutionMetadata) map[string]any {
 		m["gpu_model"] = em.GPUModel
 	}
 	return m
+}
+
+// recordReliability folds a batch of results' outcomes into the per-host reliability
+// signal (TODO #54): good=true for AGREED results (the host delivered validated work),
+// good=false for DISAGREED / rejected ones (it wasted a unit). Keyed on the MACHINE that
+// produced each result (host_id, folding onto the account id when the volunteer reported no
+// host — the per-account fallback). Best-effort: a write failure is logged and skipped, it
+// never affects validation (credit is already granted; this is pure dispatch shaping).
+func (e *Engine) recordReliability(ctx context.Context, results []*result.Result, good bool) {
+	if e.reliabilityRepo == nil {
+		return
+	}
+	for _, r := range results {
+		hostKey := r.VolunteerID
+		if r.HostID != nil {
+			hostKey = *r.HostID
+		}
+		if err := e.reliabilityRepo.RecordOutcome(ctx, hostKey, good); err != nil {
+			e.logger.Warn("failed to record host reliability signal",
+				"host_id", hostKey, "good", good, "result_id", r.ID, "error", err)
+		}
+	}
 }
 
 // checkRejectionRate logs a warning if a volunteer's rejection rate exceeds 20%.

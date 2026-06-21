@@ -30,6 +30,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/mapreduce"
 	"github.com/lettuce-compute/infrastructure/internal/montecarlo"
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
+	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
@@ -146,6 +147,7 @@ func main() {
 	batchRepo := workunit.NewPgxBatchRepository(pool)
 	creditRepo := credit.NewPgxRepository(pool)
 	racRepo := credit.NewPgxRACRepository(pool)
+	reliabilityRepo := reliability.NewPgxRepository(pool)
 	attestationRepo := attestation.NewPgxRepository(pool)
 
 	// Create checkpoint repository.
@@ -156,7 +158,7 @@ func main() {
 	checkpointRepo := checkpoint.NewPgxRepository(pool, checkpointDir)
 
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, attestationSigner, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger)
 
 	// Parse trusted reverse-proxy networks for trust-aware client-IP extraction.
 	// (Config validation already verified these parse; this cannot fail here.)
@@ -266,6 +268,9 @@ func main() {
 			// single-replica deploy is correct too (it simply reclaims its own claims).
 			HeadInstanceID:    instanceID,
 			ClaimLeaseSeconds: cfg.Head.EffectiveClaimLeaseSeconds(),
+			// TODO #54: reliability-weighted adaptive in-flight quota.
+			ReliabilityQuotaEnabled: cfg.Head.EffectiveReliabilityQuotaEnabled(),
+			ReliabilityQuotaFloor:   cfg.Head.EffectiveReliabilityQuotaFloor(),
 		})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
@@ -329,7 +334,7 @@ func main() {
 	//     scans/logs AND keeps the hygiene sweep single-acting.
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
-	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, logger)
+	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, logger)
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)

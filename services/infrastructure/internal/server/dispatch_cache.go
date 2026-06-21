@@ -10,6 +10,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -161,6 +162,21 @@ type dispatchCacheConfig struct {
 	// no head restart (TODO #38). 0 -> defaultLeafSnapshotTTL.
 	leafSnapshotTTL time.Duration
 
+	// --- TODO #54: reliability-weighted adaptive in-flight quota ---
+	//
+	// reliabilityQuotaEnabled turns the per-MACHINE in-flight cap into a function of the
+	// host's MEASURED reliability (the adaptive "buffer size") instead of the flat
+	// maxInflightPerVolunteer. When false, HandOut uses the flat cap exactly as today
+	// (byte-for-byte) and the budget cache / refresher are inert. It is also inert when
+	// maxInflightPerVolunteer <= 0 (an unbounded cap cannot be shaped).
+	reliabilityQuotaEnabled bool
+	// reliabilityFloor is the cold-start / fully-throttled in-flight buffer a host with no
+	// measured signal gets (a brand-new host, or one not yet warmed after a restart). Small
+	// but non-zero (never starves an honest new host) and below the cap (a fresh key never
+	// gets the full quota). An honest host ramps from here to maxInflightPerVolunteer over
+	// reliability.DefaultRampUnits validated units.
+	reliabilityFloor int
+
 	// --- Layer 3: horizontal scale-out (claim-on-refill) ---
 	//
 	// headID is this replica's stable instance id, stamped as the dispatch-claim
@@ -198,6 +214,11 @@ type dispatchDeps struct {
 	// the cache then builds assignments from the leaf's denormalized current
 	// execution_config only, with no pinning.
 	artifactVersionRepo leaf.ArtifactVersionRepository
+	// reliabilityRepo provides the per-host measured-reliability score (TODO #54). The
+	// budget refresher reads it OFF the hot path to recompute each host's adaptive in-flight
+	// budget; the hand-out path never touches it. May be nil (tests / reliability disabled):
+	// the budget refresher is then a no-op and the flat in-flight cap applies.
+	reliabilityRepo reliability.Repository
 }
 
 // volunteerIdentity is the in-process snapshot of a volunteer's identity +
@@ -297,6 +318,17 @@ type dispatchCache struct {
 	// gates capability. Guarded by its own mutex so a read never blocks hand-outs.
 	hostRuntimeMu    sync.Mutex
 	hostRuntimeCache map[types.ID][]string
+
+	// hostBudgetCache maps a machine's effective host id -> its current adaptive in-flight
+	// budget (TODO #54), recomputed OFF the hot path by runBudgetRefresher from the
+	// reliability store. The hand-out hot path reads ONE entry here under budgetMu (mirrors
+	// hostRuntimeCache) with no DB touch. A MISS means a host with no measured signal yet
+	// (brand new, or before the first refresh tick) -> the cold-start floor, so a fresh key
+	// is throttled until it earns more. Empty / unread when reliabilityQuotaEnabled is false.
+	// The whole map is swapped (not mutated in place) on each refresh, so a reader holds a
+	// consistent snapshot.
+	budgetMu        sync.Mutex
+	hostBudgetCache map[types.ID]int
 
 	// admission bounds concurrent CLIENT write-path dispatch-cache DB operations
 	// (StartWork / SubmitResult / AbandonWorkUnit gates, the RequestWorkUnit
@@ -398,6 +430,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		versionCache:         make(map[types.ID]*leaf.ArtifactVersion),
 		identityCache:        make(map[types.ID]*volunteerIdentity),
 		hostRuntimeCache:     make(map[types.ID][]string),
+		hostBudgetCache:      make(map[types.ID]int),
 		admission:            make(chan struct{}, cfg.admissionCap),
 		maintenanceAdmission: make(chan struct{}, cfg.maintenanceAdmissionCap),
 		refillSignal:         make(chan struct{}, 1),
@@ -541,6 +574,14 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// volunteer reported no host, so the metering transparently falls back to per-account.
 	// Distinctness still keys on volunteerID (the account), never on hostKey.
 	hostKey := meterID(volunteerID, opts.HostID)
+
+	// TODO #54: when the reliability quota is on, the per-machine in-flight cap becomes the
+	// host's ADAPTIVE budget (grounded in measured throughput), not the flat configured cap.
+	// Resolved once per hand-out from the in-memory budget cache (no DB touch); eligibleLocked
+	// then enforces it per candidate exactly as it enforces the flat cap. opts is a value
+	// copy, so overriding the field here is scoped to this hand-out. A no-op when the quota
+	// is disabled or the flat cap is unbounded.
+	opts.MaxInflightPerVolunteer = c.effectiveInflightCap(hostKey, opts.MaxInflightPerVolunteer)
 
 	c.mu.Lock()
 	// Per-machine minimum send interval: refuse to hand any new work to a machine within
@@ -1368,6 +1409,96 @@ func (c *dispatchCache) resolveIdentity(id types.ID) (ident *volunteerIdentity, 
 	}
 	c.putIdentity(v)
 	return c.peekIdentity(id), false, false
+}
+
+// --- reliability-weighted adaptive in-flight budget (TODO #54) ----------------
+
+// defaultBudgetRefreshInterval is how often runBudgetRefresher recomputes per-host
+// adaptive in-flight budgets from the reliability store. Off the hot path; a budget only
+// needs to track the slowly-decaying reliability signal within tens of seconds (it grows
+// as a host's units validate, which is itself paced by real throughput).
+const defaultBudgetRefreshInterval = 30 * time.Second
+
+// effectiveInflightCap returns the per-machine in-flight cap to enforce for hostKey: the
+// host's ADAPTIVE budget when the reliability quota is enabled, else the flat configured
+// cap (today's behavior, byte-for-byte). A host with no warmed budget (brand new, or before
+// the first refresher tick after a restart) gets the cold-start floor — never the full cap
+// (a fresh key does not get the full quota) and never zero (the floor keeps an honest new
+// host busy while it proves itself). One map read under budgetMu, off the hand-out lock; no
+// DB touch. Inert (returns flatCap) when the quota is off or the flat cap is unbounded.
+func (c *dispatchCache) effectiveInflightCap(hostKey types.ID, flatCap int) int {
+	if !c.cfg.reliabilityQuotaEnabled || flatCap <= 0 {
+		return flatCap
+	}
+	c.budgetMu.Lock()
+	b, ok := c.hostBudgetCache[hostKey]
+	c.budgetMu.Unlock()
+	if ok {
+		return b
+	}
+	// No measured signal yet: cold-start at the floor, bounded by the flat cap (a floor
+	// configured above the cap can never exceed it).
+	if c.cfg.reliabilityFloor < flatCap {
+		return c.cfg.reliabilityFloor
+	}
+	return flatCap
+}
+
+// runBudgetRefresher periodically recomputes the per-host adaptive in-flight budgets (#54)
+// from the reliability store and SWAPS them into hostBudgetCache, so the hand-out hot path
+// reads a fresh budget with no DB touch. It primes ONCE at start (so an established host
+// keeps the budget it EARNED across a head restart — the score is persisted and barely
+// decays over a restart, so this avoids re-throttling proven hosts to the floor on deploy)
+// then runs on a ticker. A no-op when the reliability quota is disabled or no reliability
+// repo is wired. Returns when ctx is done.
+func (c *dispatchCache) runBudgetRefresher(ctx context.Context, interval time.Duration) {
+	if !c.cfg.reliabilityQuotaEnabled || c.deps.reliabilityRepo == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = defaultBudgetRefreshInterval
+	}
+	c.logger.Info("dispatch cache budget refresher starting",
+		"interval", interval, "floor", c.cfg.reliabilityFloor, "cap", c.cfg.maxInflightPerVolunteer)
+	c.refreshBudgetsOnce(ctx) // prime so warmed hosts keep their earned budget from the first hand-out
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Info("dispatch cache budget refresher stopping")
+			return
+		case <-ticker.C:
+			c.refreshBudgetsOnce(ctx)
+		}
+	}
+}
+
+// refreshBudgetsOnce reads the active hosts' decayed reliability scores and rebuilds the
+// in-memory per-host budget map. Bounded by the maintenance admission semaphore + a short
+// timeout so it sheds under DB pressure (the existing budget map keeps serving, slightly
+// stale). The whole map is swapped atomically so the hot path never sees a half-built one.
+func (c *dispatchCache) refreshBudgetsOnce(ctx context.Context) {
+	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquireMaintenance(dbCtx)
+	if !ok {
+		return // admission/ctx pressure: keep the current (stale) budgets, retry next tick
+	}
+	inputs, err := c.deps.reliabilityRepo.ListBudgetInputs(dbCtx)
+	release()
+	if err != nil {
+		c.logger.Warn("dispatch cache: reliability budget refresh failed", "error", err)
+		return
+	}
+	next := make(map[types.ID]int, len(inputs))
+	for _, in := range inputs {
+		next[in.HostID] = reliability.Budget(in.Score, c.cfg.reliabilityFloor, c.cfg.maxInflightPerVolunteer, reliability.DefaultRampUnits)
+	}
+	c.budgetMu.Lock()
+	c.hostBudgetCache = next
+	c.budgetMu.Unlock()
+	c.logger.Debug("dispatch cache: reliability budgets refreshed", "hosts", len(next))
 }
 
 // --- refiller ----------------------------------------------------------------

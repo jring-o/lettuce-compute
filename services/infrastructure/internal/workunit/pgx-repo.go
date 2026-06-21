@@ -1337,7 +1337,7 @@ func (r *PgxWorkUnitRepository) CountByLeafAndState(ctx context.Context, project
 func scanCopy(row pgx.Row) (*Copy, error) {
 	var c Copy
 	err := row.Scan(
-		&c.ID, &c.WorkUnitID, &c.VolunteerID, &c.AssignedAt,
+		&c.ID, &c.WorkUnitID, &c.VolunteerID, &c.HostID, &c.AssignedAt,
 		&c.ReservedUntil, &c.StartedAt, &c.DeadlineSeconds, &c.Outcome, &c.OutcomeAt, &c.ResultID,
 	)
 	return &c, err

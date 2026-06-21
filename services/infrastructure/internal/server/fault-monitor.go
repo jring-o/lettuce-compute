@@ -8,6 +8,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
@@ -18,9 +19,13 @@ type FaultMonitor struct {
 	assignRepo     assignment.Repository
 	checkpointRepo checkpoint.Repository
 	leafRepo       leaf.Repository
-	logger         *slog.Logger
-	scanInterval   time.Duration
-	batchSize      int
+	// reliabilityRepo feeds the per-host measured-reliability signal (TODO #54): a timed-out
+	// (EXPIRED) or abandoned (ABANDONED) copy is wasted work for the machine that held it.
+	// May be nil (tests / pre-#54) -> the signal is simply not recorded (best-effort).
+	reliabilityRepo reliability.Repository
+	logger          *slog.Logger
+	scanInterval    time.Duration
+	batchSize       int
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings.
@@ -29,16 +34,18 @@ func NewFaultMonitor(
 	assignRepo assignment.Repository,
 	checkpointRepo checkpoint.Repository,
 	leafRepo leaf.Repository,
+	reliabilityRepo reliability.Repository,
 	logger *slog.Logger,
 ) *FaultMonitor {
 	return &FaultMonitor{
-		workUnitRepo:   workUnitRepo,
-		assignRepo:     assignRepo,
-		checkpointRepo: checkpointRepo,
-		leafRepo:       leafRepo,
-		logger:         logger,
-		scanInterval:   30 * time.Second,
-		batchSize:      100,
+		workUnitRepo:    workUnitRepo,
+		assignRepo:      assignRepo,
+		checkpointRepo:  checkpointRepo,
+		leafRepo:        leafRepo,
+		reliabilityRepo: reliabilityRepo,
+		logger:          logger,
+		scanInterval:    30 * time.Second,
+		batchSize:       100,
 	}
 }
 
@@ -88,6 +95,21 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 		m.logger.Warn("work unit copy timed out",
 			"copy_id", cp.ID, "work_unit_id", cp.WorkUnitID, "volunteer_id", cp.VolunteerID,
 			"outcome", outcome, "deadline_seconds", cp.DeadlineSeconds)
+
+		// TODO #54: a timed-out (EXPIRED) or abandoned (ABANDONED) copy is wasted work — a
+		// bad reliability signal for the machine that held it (host_id, folding onto the
+		// account id when no host was reported). Best-effort: a failure is logged and the
+		// scan continues (the signal is pure dispatch shaping, never correctness-bearing).
+		if m.reliabilityRepo != nil {
+			hostKey := cp.VolunteerID
+			if cp.HostID != nil {
+				hostKey = *cp.HostID
+			}
+			if err := m.reliabilityRepo.RecordOutcome(ctx, hostKey, false); err != nil {
+				m.logger.Warn("failed to record host reliability for timed-out copy",
+					"host_id", hostKey, "copy_id", cp.ID, "error", err)
+			}
+		}
 
 		// Dead-letter only if the unit has exhausted its retry ceiling with redundancy
 		// unmet and no live copy left; otherwise it stays QUEUED and redispatches.

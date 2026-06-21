@@ -248,6 +248,20 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.MinSendIntervalSeconds = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED must be a boolean: %w", err)
+		}
+		cfg.Head.ReliabilityQuotaEnabled = &b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR must be an integer: %w", err)
+		}
+		cfg.Head.ReliabilityQuotaFloor = n
+	}
 	if v := os.Getenv("LETTUCE_HEAD_READY_POOL_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
