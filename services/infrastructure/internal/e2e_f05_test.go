@@ -111,7 +111,7 @@ func setupF05Server(t *testing.T) (
 	attestationRepo := attestation.NewPgxRepository(pool)
 	_, signKey, _ := ed25519.GenerateKey(rand.Reader)
 	signer := attestation.NewSigner(signKey)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
 	volunteerSvc := server.NewVolunteerService(pool, "0.3.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 

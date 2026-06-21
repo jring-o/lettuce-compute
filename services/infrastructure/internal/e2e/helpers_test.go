@@ -92,7 +92,7 @@ func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
 
 	// Validation engine with signer.
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
 
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)

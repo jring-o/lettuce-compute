@@ -569,7 +569,7 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		// Run fault monitor ScanOnce.
 		wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 		assignRepo := assignment.NewPgxRepository(pool)
-		monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, testLogger())
+		monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, nil, testLogger())
 		if err := monitor.ScanOnce(ctx); err != nil {
 			t.Fatalf("ScanOnce: %v", err)
 		}

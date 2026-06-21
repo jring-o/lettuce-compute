@@ -142,6 +142,27 @@ type HeadConfig struct {
 	// gone). This is the DEADLINE, not a lease, so it is NOT bound by the 30-min
 	// stale threshold. Default 21600 (6h), operator-tunable.
 	NoDeadlineCeilingSeconds int `yaml:"no_deadline_ceiling_seconds"`
+
+	// --- TODO #54: reliability-weighted ADAPTIVE work quota ---
+	//
+	// ReliabilityQuotaEnabled gates the per-MACHINE adaptive in-flight buffer: with it on,
+	// a host's in-flight cap is a function of its MEASURED reliability (validated units grow
+	// it, timeouts/abandons/disagreements shrink it) instead of the flat
+	// MaxInflightPerVolunteer — the "earn your buffer" generalization of the flat #53 floor,
+	// keyed on the #19 host id. ENABLED BY DEFAULT (nil): set false (env
+	// LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED=false) to revert to today's flat per-host cap
+	// for everyone (byte-for-byte). A warmed reliable host reaches exactly the flat cap, so
+	// established well-behaved volunteers are unaffected in steady state; only brand-new or
+	// flaky hosts are throttled toward the floor. Inert when MaxInflightPerVolunteer <= 0
+	// (an unbounded cap cannot be shaped).
+	ReliabilityQuotaEnabled *bool `yaml:"reliability_quota_enabled"`
+	// ReliabilityQuotaFloor is the COLD-START / fully-throttled in-flight buffer a brand-new
+	// or unknown host gets: small but non-zero (it never STARVES an honest new contributor —
+	// it still runs a couple units while it proves itself), and never the full cap (a fresh
+	// key does not get the full quota). An honest host ramps from this floor to the flat cap
+	// over a few validated units. Unset (<= 0) -> defaultReliabilityQuotaFloor (2). Override
+	// via LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR.
+	ReliabilityQuotaFloor int `yaml:"reliability_quota_floor"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -163,7 +184,15 @@ const (
 	// volunteer that honors the advisory retry delay never trips it, while a client
 	// that ignores the delay is still capped to this cadence. Set the field negative to
 	// disable. Clamped down to the effective max retry delay so it can never exceed it.
-	defaultMinSendIntervalSeconds  = 30
+	defaultMinSendIntervalSeconds = 30
+	// defaultReliabilityQuotaEnabled is the #54 default: the adaptive per-host quota is ON
+	// unless explicitly disabled, consistent with the #53 send-interval floor. Persistence
+	// of the score + a refresher prime at start keep established hosts at their earned
+	// budget across a head restart, so "on by default" does not disrupt them.
+	defaultReliabilityQuotaEnabled = true
+	// defaultReliabilityQuotaFloor is the cold-start in-flight buffer for a host with no
+	// measured signal yet (#54). Small but non-zero so an honest new host is never starved.
+	defaultReliabilityQuotaFloor = 2
 	// staleVolunteerThresholdSeconds mirrors StaleVolunteerMonitor's 30-min
 	// inactivity threshold; retry delay and lease must stay strictly below it so a
 	// throttled-but-healthy volunteer is never marked inactive.
@@ -416,6 +445,25 @@ func (h HeadConfig) EffectiveMinSendIntervalSeconds() int {
 		return d
 	}
 	return h.MinSendIntervalSeconds
+}
+
+// EffectiveReliabilityQuotaEnabled reports whether the adaptive per-host work quota (#54)
+// is on. ENABLED BY DEFAULT: nil (unset) -> defaultReliabilityQuotaEnabled (true); an
+// explicit false disables it (today's flat per-host cap for everyone).
+func (h HeadConfig) EffectiveReliabilityQuotaEnabled() bool {
+	if h.ReliabilityQuotaEnabled == nil {
+		return defaultReliabilityQuotaEnabled
+	}
+	return *h.ReliabilityQuotaEnabled
+}
+
+// EffectiveReliabilityQuotaFloor returns the cold-start in-flight buffer for a host with no
+// measured signal yet (#54): unset (<= 0) -> defaultReliabilityQuotaFloor (2).
+func (h HeadConfig) EffectiveReliabilityQuotaFloor() int {
+	if h.ReliabilityQuotaFloor <= 0 {
+		return defaultReliabilityQuotaFloor
+	}
+	return h.ReliabilityQuotaFloor
 }
 
 // EffectiveReadyPoolSize returns the dispatch-cache ready-pool cap, default 2000.

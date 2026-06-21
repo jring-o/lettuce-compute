@@ -88,7 +88,7 @@ func setupCheckpointServer(t *testing.T) (
 	batchRepo := workunit.NewPgxBatchRepository(pool)
 	creditRepo := credit.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger)
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 

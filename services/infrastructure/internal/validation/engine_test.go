@@ -476,7 +476,7 @@ func TestExactMatch_TwoIdentical_BothAgreed(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -538,7 +538,7 @@ func TestExactMatch_TwoDifferent_BothRejected(t *testing.T) {
 	assignRepo := newMockAssignmentRepo()
 	// No active assignments = all done.
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -593,7 +593,7 @@ func TestNumericTolerance_WithinEpsilon_BothAgreed(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -642,7 +642,7 @@ func TestNumericTolerance_OutsideEpsilon_BothRejected(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -690,7 +690,7 @@ func TestQuorum_Redundancy3_TwoMatch_OneNot(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -749,7 +749,7 @@ func TestQuorum_Redundancy3_AllDifferent_AllRejected(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -784,7 +784,7 @@ func TestNotEnoughResults_ReturnsNil(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -804,7 +804,7 @@ func TestWorkUnitNotCompleted_ReturnsNil(t *testing.T) {
 	wuRepo := newMockWorkUnitRepo()
 	wuRepo.addWorkUnit(wu)
 
-	engine := NewEngine(newMockResultRepo(), wuRepo, newMockLeafRepo(), newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(newMockResultRepo(), wuRepo, newMockLeafRepo(), newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -841,7 +841,7 @@ func TestPending_ActiveAssignmentsRemaining(t *testing.T) {
 	assignRepo := newMockAssignmentRepo()
 	assignRepo.activeCount[wuID] = 1 // one more assignment pending (re-try)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -891,7 +891,7 @@ func TestRejectionRateWarning(t *testing.T) {
 	var buf logBuffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, logger)
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, logger)
 
 	_, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -926,7 +926,7 @@ func TestCustomMode_ReturnsError(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	_, err := engine.TryValidate(context.Background(), wuID)
 	if err == nil {
@@ -961,7 +961,7 @@ func TestCreditAmount_UsesProjectConfig(t *testing.T) {
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -997,7 +997,7 @@ func TestNumericTolerance_EmptyOutputData_ReturnsError(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	_, err := engine.TryValidate(context.Background(), wuID)
 	if err == nil {
@@ -1027,7 +1027,7 @@ func TestNumericTolerance_MalformedJSON_ReturnsError(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	_, err := engine.TryValidate(context.Background(), wuID)
 	if err == nil {
@@ -1063,7 +1063,7 @@ func runNumericTwoResults(t *testing.T, epsilon float64, dataA, dataB json.RawMe
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 	return engine.TryValidate(context.Background(), wuID)
 }
 
@@ -1225,7 +1225,7 @@ func TestExactMatch_Tie_DeterministicBreaking(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	// Run multiple times to confirm determinism.
 	for i := 0; i < 20; i++ {
@@ -1295,7 +1295,7 @@ func TestExactMatch_RedundancyOne_SingleResult_Validated(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1387,7 +1387,7 @@ func TestRACUpsertCalledOnValidation(t *testing.T) {
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1443,7 +1443,7 @@ func TestRACUpsertErrorIsNonFatal(t *testing.T) {
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1545,7 +1545,7 @@ func TestAttestationsCreatedOnValidation(t *testing.T) {
 	signer := attestation.NewSigner(priv)
 	attRepo := newMockAttestationRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, signer, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, signer, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1629,7 +1629,7 @@ func TestAttestationsCreatedForRejectedResults(t *testing.T) {
 	signer := attestation.NewSigner(priv)
 	attRepo := newMockAttestationRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, signer, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, signer, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1703,7 +1703,7 @@ func TestAttestationsCreatedOnRejectAll(t *testing.T) {
 	signer := attestation.NewSigner(priv)
 	attRepo := newMockAttestationRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), attRepo, signer, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), attRepo, nil, signer, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1761,7 +1761,7 @@ func TestNilAttestationRepoIsNonFatal(t *testing.T) {
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
 	// Pass nil for both attestationRepo and signer.
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1857,7 +1857,7 @@ func TestAttestationSkippedWhenVolunteerNotFound(t *testing.T) {
 	signer := attestation.NewSigner(priv)
 	attRepo := newMockAttestationRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, signer, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, signer, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1919,7 +1919,7 @@ func TestAttestationCreateErrorIsNonFatal(t *testing.T) {
 	signer := attestation.NewSigner(priv)
 	attRepo := &errorCreateAttRepo{createErr: fmt.Errorf("database write failed")}
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, signer, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, signer, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -1965,7 +1965,7 @@ func TestNilSignerWithNonNilAttestationRepo(t *testing.T) {
 	attRepo := newMockAttestationRepo()
 
 	// signer is nil, attestation repo is not nil.
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, newMockAssignmentRepo(), attRepo, nil, nil, testLogger())
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {

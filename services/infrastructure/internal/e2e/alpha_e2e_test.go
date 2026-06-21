@@ -93,7 +93,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	attestationRepo := attestation.NewPgxRepository(pool)
 
 	// Validation engine with signer.
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
 
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)

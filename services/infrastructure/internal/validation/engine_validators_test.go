@@ -40,7 +40,7 @@ func runTwoResultsCfg(t *testing.T, mode string, tol *float64, configure func(*l
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
 	return engine.TryValidate(context.Background(), wuID)
 }
 

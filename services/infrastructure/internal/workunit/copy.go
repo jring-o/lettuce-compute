@@ -19,9 +19,14 @@ import (
 //              StartedAt + DeadlineSeconds)
 //   closed   : Outcome != nil  (COMPLETED / EXPIRED / ABANDONED / REJECTED)
 type Copy struct {
-	ID              types.ID
-	WorkUnitID      types.ID
-	VolunteerID     types.ID
+	ID          types.ID
+	WorkUnitID  types.ID
+	VolunteerID types.ID
+	// HostID attributes the copy to the MACHINE that holds it (TODO #19); nil = a volunteer
+	// that reported no host (the per-account fallback). Carried so the per-host reliability
+	// signal (TODO #54) can charge a timed-out / abandoned copy to the machine that wasted
+	// it (keyed on COALESCE(host_id, volunteer_id)).
+	HostID          *types.ID
 	AssignedAt      time.Time
 	ReservedUntil   *time.Time
 	StartedAt       *time.Time
@@ -52,5 +57,5 @@ func (c *Copy) State() CopyState {
 }
 
 // copyColumns is the column list for SELECTs over copy rows.
-const copyColumns = `id, work_unit_id, volunteer_id, assigned_at,
+const copyColumns = `id, work_unit_id, volunteer_id, host_id, assigned_at,
 	reserved_until, started_at, deadline_seconds, outcome, outcome_at, result_id`

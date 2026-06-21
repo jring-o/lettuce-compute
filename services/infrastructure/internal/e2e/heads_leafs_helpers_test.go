@@ -114,7 +114,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	attestationRepo := attestation.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
 
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
 
 	// Head configuration.
 	headCfg := &config.HeadConfig{
