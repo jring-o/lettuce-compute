@@ -19,7 +19,7 @@ type DBTX interface {
 }
 
 const assignmentColumns = `id, work_unit_id, volunteer_id, assigned_at,
-	outcome, outcome_at, result_id, created_at`
+	outcome, outcome_at, result_id, host_id, created_at`
 
 func scanAssignment(row pgx.Row) (*AssignmentHistoryEntry, error) {
 	var e AssignmentHistoryEntry
@@ -31,6 +31,7 @@ func scanAssignment(row pgx.Row) (*AssignmentHistoryEntry, error) {
 		&e.Outcome,
 		&e.OutcomeAt,
 		&e.ResultID,
+		&e.HostID,
 		&e.CreatedAt,
 	)
 	return &e, err

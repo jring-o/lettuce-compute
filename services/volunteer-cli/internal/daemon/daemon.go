@@ -43,6 +43,10 @@ type Daemon struct {
 	cfg             *config.Config
 	pubKey          ed25519.PublicKey
 	privKey         ed25519.PrivateKey
+	// hostID is this machine's stable host key (TODO #19), reported on each work
+	// request so the head meters in-flight work + the work-send floor per machine.
+	// Empty => the head falls back to per-account behavior.
+	hostID          string
 	multiClient     *MultiServerClient
 	runtimeRegistry *RuntimeRegistry
 	logger          *slog.Logger
@@ -117,6 +121,9 @@ type DaemonConfig struct {
 	Config  *config.Config
 	PubKey  ed25519.PublicKey
 	PrivKey ed25519.PrivateKey
+	// HostID is this machine's stable host key (TODO #19). Empty is valid (the head
+	// then treats the volunteer as a single per-account host).
+	HostID  string
 
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
@@ -248,6 +255,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cfg:              cfg.Config,
 		pubKey:           cfg.PubKey,
 		privKey:          cfg.PrivKey,
+		hostID:           cfg.HostID,
 		multiClient:      multiClient,
 		runtimeRegistry:  registry,
 		machineManager:   cfg.MachineManager,

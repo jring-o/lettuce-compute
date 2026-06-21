@@ -29,10 +29,14 @@ import (
 
 type volunteerService struct {
 	lettucev1.UnimplementedVolunteerServiceServer
-	pool                    *pgxpool.Pool
-	version                 string
-	startTime               time.Time
-	volunteerRepo           volunteer.Repository
+	pool          *pgxpool.Pool
+	version       string
+	startTime     time.Time
+	volunteerRepo volunteer.Repository
+	// hostRepo upserts per-MACHINE host rows (TODO #19). Constructed from the pool, so it
+	// is nil only in gRPC-plumbing unit tests that pass a nil pool (which never send a
+	// host_id); RegisterVolunteer guards on it.
+	hostRepo                volunteer.HostRepository
 	wuRepo                  workunit.WorkUnitRepository
 	leafRepo                leaf.Repository
 	artifactVersionRepo     leaf.ArtifactVersionRepository
@@ -115,21 +119,26 @@ func NewVolunteerService(
 	logger *slog.Logger,
 ) lettucev1.VolunteerServiceServer {
 	s := &volunteerService{
-		pool:               pool,
-		version:            version,
-		startTime:          startTime,
-		volunteerRepo:      volunteerRepo,
+		pool:                pool,
+		version:             version,
+		startTime:           startTime,
+		volunteerRepo:       volunteerRepo,
 		wuRepo:              wuRepo,
 		leafRepo:            leafRepo,
 		artifactVersionRepo: asArtifactVersionRepo(leafRepo),
 		assignRepo:          assignRepo,
 		resultRepo:          resultRepo,
-		batchRepo:          batchRepo,
-		checkpointRepo:     checkpointRepo,
-		validationEngine:   validationEngine,
-		logger:             logger,
-		maxBatchPerRequest: defaultMaxBatchPerRequest,
-		leaseSeconds:       defaultLeaseSeconds,
+		batchRepo:           batchRepo,
+		checkpointRepo:      checkpointRepo,
+		validationEngine:    validationEngine,
+		logger:              logger,
+		maxBatchPerRequest:  defaultMaxBatchPerRequest,
+		leaseSeconds:        defaultLeaseSeconds,
+	}
+	// Per-machine host upserts (TODO #19) need the pool; nil only in the gRPC-plumbing
+	// unit tests that pass a nil pool and never send a host_id.
+	if pool != nil {
+		s.hostRepo = volunteer.NewPgxHostRepository(pool)
 	}
 	// Default load estimator until SetHeadConfig overrides the tunables. The pool
 	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
@@ -143,8 +152,8 @@ func NewVolunteerService(
 // It is a plain struct (no config-package dependency) so SetHeadConfig stays
 // decoupled from internal/config; main.go fills it from HeadConfig.Effective*.
 type HeadDispatchConfig struct {
-	MaxBatchPerRequest      int
-	LeaseSeconds            int
+	MaxBatchPerRequest int
+	LeaseSeconds       int
 	// MinSendIntervalSeconds is the per-volunteer minimum interval (seconds) between
 	// successful work hand-outs — the server-side enforced floor on work-acquisition
 	// cadence, keyed on the verified Ed25519 identity. 0 disables it (only the advisory
@@ -293,6 +302,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		leafRepo:            s.leafRepo,
 		assignRepo:          s.assignRepo,
 		volunteerRepo:       s.volunteerRepo,
+		hostRepo:            s.hostRepo,
 		artifactVersionRepo: s.artifactVersionRepo,
 	}, s.logger)
 	s.dispatchCache = cache
@@ -513,6 +523,11 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			s.dispatchCache.putIdentity(v)
 		}
 
+		// Per-machine host (TODO #19): record this machine's advertised runtimes/hardware
+		// against its own host row, so two machines under one key no longer overwrite each
+		// other on the single account row.
+		s.registerHost(ctx, v.ID, req, hw, now)
+
 		// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
 		// now that the generic gRPC access log is demoted to Debug.
 		s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true)
@@ -542,12 +557,52 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 		s.dispatchCache.putIdentity(existing)
 	}
 
+	// Per-machine host (TODO #19): refresh this machine's host row + warmed runtimes.
+	s.registerHost(ctx, existing.ID, req, hw, now)
+
 	s.logger.Info("volunteer registered", "volunteer_id", existing.ID, "is_new", false)
 
 	return &lettucev1.RegisterVolunteerResponse{
 		VolunteerId: existing.ID.String(),
 		Registered:  false,
 	}, nil
+}
+
+// registerHost upserts the per-MACHINE host row for a registration that reported a host
+// id (TODO #19): one row per (account, machine), keyed by the deterministic effective
+// host id, carrying THIS machine's advertised runtimes/hardware/last-seen. It also warms
+// the dispatch cache's per-host runtime snapshot so the machine's first work request
+// resolves its own runtimes in memory (the flapping-row fix). A no-op when the volunteer
+// reported no host id (per-account fallback) or in unit tests with no pool. Best-effort:
+// a host-upsert failure is logged and swallowed so registration still succeeds (the
+// account row carries the fallback facts).
+func (s *volunteerService) registerHost(ctx context.Context, volunteerID types.ID, req *lettucev1.RegisterVolunteerRequest, hw volunteer.HardwareCapabilities, now time.Time) {
+	if s.hostRepo == nil || req.GetHostId() == "" {
+		return
+	}
+	hostID := effectiveHostID(volunteerID, req.GetHostId())
+	var displayName *string
+	if req.DisplayName != "" {
+		displayName = &req.DisplayName
+	}
+	h := &volunteer.Host{
+		ID:                   hostID,
+		VolunteerID:          volunteerID,
+		HostKey:              req.GetHostId(),
+		DisplayName:          displayName,
+		HardwareCapabilities: hw,
+		AvailableRuntimes:    req.AvailableRuntimes,
+		IsActive:             true,
+		LastSeenAt:           &now,
+	}
+	if err := s.hostRepo.Upsert(ctx, h); err != nil {
+		s.logger.Warn("failed to upsert host; falling back to per-account",
+			"volunteer_id", volunteerID, "error", err)
+		return
+	}
+	if s.dispatchCache != nil {
+		s.dispatchCache.putHostRuntimes(hostID, req.AvailableRuntimes)
+	}
 }
 
 func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
@@ -621,6 +676,32 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		return nil, status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
 	}
 
+	// Per-machine host id (TODO #19): a stable id the volunteer self-generates so the head
+	// meters in-flight work + the work-send floor per machine and attributes copies/results
+	// to it, while credit + distinctness stay per account. hostID == nil means the volunteer
+	// reported no host -> the copy row's host_id is NULL and everything falls back to
+	// per-account behavior. The effective host id (= volunteer id in that fallback) is what
+	// the dispatch metering keys on; opts.HostID (the nullable pointer) is what the copy row
+	// records, so a no-host copy stays NULL and queryable as "no machine reported".
+	var hostID *types.ID
+	if req.GetHostId() != "" {
+		h := effectiveHostID(volunteerID, req.GetHostId())
+		hostID = &h
+	}
+
+	// Resolve the REQUESTING host's advertised runtimes (the flapping-row fix): two
+	// machines under one key advertise different runtimes, so a NATIVE-only box must not
+	// inherit the account row's CONTAINER set. Warmed at register; on a cold miss (e.g.
+	// just after a head restart, before the volunteer re-registers) the resolver reads the
+	// authoritative hosts row once under the admission semaphore and warms the cache, so
+	// the fix survives a restart without relying on re-registration. Only if that also
+	// fails (shed / unknown host) does it fall back to the account's stored runtimes.
+	if hostID != nil && s.dispatchCache != nil {
+		if rts, ok := s.dispatchCache.resolveHostRuntimes(*hostID); ok {
+			identRuntime = rts
+		}
+	}
+
 	// Determine capabilities: use current_available if provided, else registered.
 	hw := identHW
 	if req.CurrentAvailable != nil {
@@ -670,7 +751,11 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		// Homogeneous Redundancy: the requester's hardware class. Always populated; it only
 		// filters units that are actually pinned (HR-enabled leaves), so non-HR leaves are
 		// unaffected (their hr_class stays NULL).
-		HRClass:                 hw.HRClass(),
+		HRClass: hw.HRClass(),
+		// Per-machine host id (TODO #19): stamped on the copy row for attribution. nil when
+		// no host reported (the copy stays NULL → counts under the account). Stage-B metering
+		// (inflight cap / send floor) keys on the effective host id derived from this.
+		HostID: hostID,
 	}
 
 	// Server-directed retry delay: computed once from the current load and
@@ -690,12 +775,13 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		n = s.maxBatchPerRequest
 	}
 
-	// Record the volunteer's reported client-buffer contents (the work units it
-	// currently holds) so the head can reconcile its per-volunteer reservations
-	// against what the volunteer actually has — releasing buffered reservations it no
-	// longer holds (e.g. dropped across a client restart) so they stop counting
-	// against its inflight cap and the units redispatch. Parsed leniently: a malformed
-	// id is skipped rather than failing the work request.
+	// Record the requesting MACHINE's reported client-buffer contents (the work units it
+	// currently holds) so the head can reconcile its per-machine reservations against what
+	// that machine actually has — releasing buffered reservations it no longer holds (e.g.
+	// dropped across a client restart) so they stop counting against its inflight cap and
+	// the units redispatch. Keyed per host (TODO #19) so a user's two machines never evict
+	// each other's buffers. Parsed leniently: a malformed id is skipped rather than failing
+	// the work request.
 	if s.dispatchCache != nil {
 		held := make([]types.ID, 0, len(req.GetHeldWorkUnitIds()))
 		for _, raw := range req.GetHeldWorkUnitIds() {
@@ -703,7 +789,7 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 				held = append(held, id)
 			}
 		}
-		s.dispatchCache.NoteVolunteerHeld(volunteerID, held)
+		s.dispatchCache.NoteVolunteerHeld(volunteerID, meterID(volunteerID, hostID), held)
 	}
 
 	// Layer 2: serve from the in-process dispatch cache when it is running (the
@@ -1112,6 +1198,11 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		ExecutionMetadata: result.ExecutionMetadataFromProto(req.Metadata),
 		ValidationStatus:  result.ValidationPending,
 		ArtifactVersionID: artifactVersionID,
+		// Attribute the result to the MACHINE that produced it by copying the host id off
+		// the live copy row (TODO #19), rather than trusting a separately-sent field — so
+		// the result's host is exactly the host the work was reserved/run under. nil for a
+		// volunteer that reported no host (per-account fallback).
+		HostID: activeAssignment.HostID,
 	}
 
 	// Insert result.

@@ -16,6 +16,12 @@ type Config struct {
 	DataDir    string `yaml:"data_dir"`
 	KeyFile    string `yaml:"key_file"`
 	PubKeyFile string `yaml:"pubkey_file"`
+	// HostIDFile holds this MACHINE's stable host key (default <DataDir>/host.id). The
+	// keypair is the ACCOUNT — run the same key everywhere — and the host key
+	// distinguishes this machine under it so the head meters in-flight work and the
+	// work-send floor per machine while credit pools per account (TODO #19). Empty =>
+	// <DataDir>/host.id.
+	HostIDFile string `yaml:"host_id_file,omitempty"`
 
 	VolunteerID string `yaml:"volunteer_id,omitempty"`
 
@@ -164,6 +170,7 @@ func Defaults() *Config {
 		DataDir:    dataDir,
 		KeyFile:    filepath.Join(dataDir, "identity.key"),
 		PubKeyFile: filepath.Join(dataDir, "identity.pub"),
+		HostIDFile: filepath.Join(dataDir, "host.id"),
 		ResourceLimits: ResourceLimits{
 			MaxCPUCores:      defaultCores,
 			MaxMemoryMB:      2048,
@@ -213,6 +220,15 @@ func (c *Config) LogFilePath() string {
 		return c.LogFile
 	}
 	return filepath.Join(c.DataDir, "logs", "volunteer.log")
+}
+
+// HostIDPath returns the resolved host-id file path: the explicit HostIDFile when set,
+// otherwise <DataDir>/host.id.
+func (c *Config) HostIDPath() string {
+	if c.HostIDFile != "" {
+		return c.HostIDFile
+	}
+	return filepath.Join(c.DataDir, "host.id")
 }
 
 // Load reads and parses a YAML config file. Returns defaults if the file doesn't exist.
@@ -474,6 +490,8 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 		c.KeyFile = value
 	case "pubkey_file":
 		c.PubKeyFile = value
+	case "host_id_file":
+		c.HostIDFile = value
 	case "volunteer_id":
 		c.VolunteerID = value
 	case "log_level":
@@ -617,6 +635,8 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return c.KeyFile, nil
 	case "pubkey_file":
 		return c.PubKeyFile, nil
+	case "host_id_file":
+		return c.HostIDFile, nil
 	case "volunteer_id":
 		return c.VolunteerID, nil
 	case "log_level":

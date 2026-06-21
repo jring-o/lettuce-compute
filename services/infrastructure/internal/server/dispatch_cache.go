@@ -103,6 +103,25 @@ type candidate struct {
 	benched map[types.ID]struct{}
 }
 
+// heldCopy is one account's in-memory reservation on a unit: when it expires (the lease)
+// and which MACHINE holds it. The reservedInMem inner map keys on the ACCOUNT (per-WU
+// distinctness is per-account), but a release must decrement the right host's in-flight
+// count, so the host id rides along here (TODO #19).
+type heldCopy struct {
+	reservedUntil time.Time
+	hostID        types.ID
+}
+
+// meterID returns the effective host id the per-machine metering (in-flight cap, send
+// floor) keys on: the reported host id when present, else the account id (the per-account
+// fallback). It equals effectiveHostID and matches COALESCE(host_id, volunteer_id) in SQL.
+func meterID(volunteerID types.ID, hostID *types.ID) types.ID {
+	if hostID != nil {
+		return *hostID
+	}
+	return volunteerID
+}
+
 // inMemHolderCap is the maximum number of DISTINCT in-memory reservation holders the
 // cache may stage for this candidate concurrently, before the flush has landed.
 //
@@ -168,6 +187,12 @@ type dispatchDeps struct {
 	leafRepo      leaf.Repository
 	assignRepo    assignment.Repository
 	volunteerRepo volunteer.Repository
+	// hostRepo resolves per-MACHINE host rows for the per-host runtime cold miss (TODO
+	// #19): when a host's advertised runtimes are not warmed in memory (e.g. just after a
+	// head restart, before the volunteer re-registers), the hot path reads the
+	// authoritative runtimes from the hosts table once and warms them. May be nil
+	// (tests / no-pool): the cache then falls back to the account's stored runtimes.
+	hostRepo volunteer.HostRepository
 	// artifactVersionRepo resolves immutable artifact version rows and pins a unit to
 	// a version for homogeneous redundancy (TODO #38). May be nil (legacy / tests):
 	// the cache then builds assignments from the leaf's denormalized current
@@ -193,8 +218,11 @@ type volunteerIdentity struct {
 // land the spot-check copy row), flushed asynchronously like a normal reservation but
 // via a distinct DB shape.
 type spotCheckWrite struct {
-	workUnitID    types.ID
-	volunteerID   types.ID
+	workUnitID  types.ID
+	volunteerID types.ID
+	// hostID attributes the spot-check copy to the requesting machine (TODO #19); nil =
+	// no host reported.
+	hostID        *types.ID
 	reservedUntil time.Time
 }
 
@@ -210,19 +238,25 @@ type dispatchCache struct {
 	mu sync.Mutex
 	// ready is the bounded pool of stageable units (front = highest priority).
 	ready []candidate
-	// reservedInMem maps a handed-out unit id -> the set of distinct volunteers that
-	// currently hold an in-memory reservation on it (the in-process no-double-reserve
-	// guard and the redundancy>1 multi-holder tracker).
-	reservedInMem map[types.ID]map[types.ID]time.Time
-	// inflight is the per-volunteer (live reservations + active history rows) count.
+	// reservedInMem maps a handed-out unit id -> the set of distinct ACCOUNTS (volunteer
+	// ids) that currently hold an in-memory reservation on it: the in-process
+	// no-double-reserve guard and the redundancy>1 multi-holder tracker. The KEY stays the
+	// ACCOUNT (per-WU distinctness is per-account — a user's own machines must not
+	// corroborate each other); the VALUE records which MACHINE (host id) holds it so a
+	// release decrements that host's in-flight count, not the account's (TODO #19).
+	reservedInMem map[types.ID]map[types.ID]heldCopy
+	// inflight is the per-MACHINE (effective host id) count of live reservations + active
+	// history rows. Re-keyed off the account onto the host (TODO #19) so a user's beefy rig
+	// and laptop each get their OWN in-flight budget instead of sharing one account cap.
 	inflight map[types.ID]int
-	// lastHandOut records, per volunteer, the wall-clock time of its most recent
-	// SUCCESSFUL work hand-out (taken > 0). When cfg.minSendInterval > 0, HandOut
-	// refuses any new work to a volunteer within that interval of its last hand-out —
-	// a server-side, per-volunteer minimum send interval that does NOT depend on the
-	// client honoring the advisory retry delay.
+	// lastHandOut records, per MACHINE (effective host id), the wall-clock time of its most
+	// recent SUCCESSFUL work hand-out (taken > 0). When cfg.minSendInterval > 0, HandOut
+	// refuses any new work to a machine within that interval of its last hand-out — a
+	// server-side, per-machine minimum send interval that does NOT depend on the client
+	// honoring the advisory retry delay. Re-keyed off the account onto the host (TODO #19)
+	// so each of a user's machines has its own send clock.
 	// Pruned of entries older than the interval on the reconcile tick so it cannot grow
-	// unbounded with the lifetime volunteer set. Empty/unused when minSendInterval == 0.
+	// unbounded with the lifetime host set. Empty/unused when minSendInterval == 0.
 	lastHandOut map[types.ID]time.Time
 	// pendingWrites is the async copy-reservation write queue (each lands as a
 	// RESERVED copy row via FlushReservations).
@@ -251,6 +285,18 @@ type dispatchCache struct {
 	// block hand-outs).
 	identityMu    sync.Mutex
 	identityCache map[types.ID]*volunteerIdentity
+
+	// hostRuntimeCache caches per-MACHINE advertised runtimes keyed by effective host id
+	// (TODO #19). RequestWorkUnit resolves the REQUESTING host's runtimes from here so
+	// two machines under one account no longer overwrite each other's runtime set on the
+	// single volunteers row (the flapping-row bug): a NATIVE-only laptop is never handed
+	// container work just because the account's beefy box registered CONTAINER last.
+	// Warmed at RegisterVolunteer (the natural write point); a cold miss (e.g. after a
+	// head restart, before the volunteer re-registers) falls back to the account's stored
+	// runtimes — self-correcting on the next register, and the per-request hardware still
+	// gates capability. Guarded by its own mutex so a read never blocks hand-outs.
+	hostRuntimeMu    sync.Mutex
+	hostRuntimeCache map[types.ID][]string
 
 	// admission bounds concurrent CLIENT write-path dispatch-cache DB operations
 	// (StartWork / SubmitResult / AbandonWorkUnit gates, the RequestWorkUnit
@@ -285,22 +331,28 @@ type dispatchCache struct {
 	leafRefillMu       sync.Mutex
 	pendingLeafRefills map[types.ID]struct{}
 
-	// heldReports records, per volunteer, the set of work units it last reported
-	// holding in its client buffer (NoteVolunteerHeld, set on every RequestWorkUnit).
-	// The buffer reconcile (reconcileBuffers) releases buffered reservations a
-	// volunteer no longer holds, so a client that drops its buffer (e.g. across a
-	// restart) stops being charged for reservations it forgot. Guarded by heldMu,
-	// separate from mu so recording a report on the hot path never blocks hand-outs.
+	// heldReports records, per MACHINE (effective host id), the set of work units that
+	// host last reported holding in its client buffer (NoteVolunteerHeld, set on every
+	// RequestWorkUnit). The buffer reconcile (reconcileBuffers) releases buffered
+	// reservations a host no longer holds, so a client that drops its buffer (e.g. across
+	// a restart) stops being charged for reservations it forgot. Keyed per HOST (TODO #19)
+	// because the held set is per-machine: two machines under one key report DIFFERENT
+	// buffers, so account-keying would make one machine's report evict the other's copies.
+	// Guarded by heldMu, separate from mu so recording a report on the hot path never
+	// blocks hand-outs.
 	heldMu      sync.Mutex
 	heldReports map[types.ID]heldReport
 }
 
-// heldReport is a volunteer's most recently reported client-buffer contents (the work
-// units it currently holds) plus when it reported them. `at` gates staleness so the
-// reconcile only trusts a recent report.
+// heldReport is a MACHINE's most recently reported client-buffer contents (the work units
+// it currently holds) plus when it reported them. `at` gates staleness so the reconcile
+// only trusts a recent report. account carries the owning account id so the reconcile can
+// drop the released unit from the in-memory ledger, whose holders key on the ACCOUNT
+// (distinctness is per-account) even though the buffer report keys on the host.
 type heldReport struct {
-	units map[types.ID]struct{}
-	at    time.Time
+	units   map[types.ID]struct{}
+	account types.ID
+	at      time.Time
 }
 
 // newDispatchCache builds a cache. admissionCap <= 0 is treated as 1.
@@ -339,12 +391,13 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		deps:                 deps,
 		logger:               logger,
 		now:                  time.Now,
-		reservedInMem:        make(map[types.ID]map[types.ID]time.Time),
+		reservedInMem:        make(map[types.ID]map[types.ID]heldCopy),
 		inflight:             make(map[types.ID]int),
 		lastHandOut:          make(map[types.ID]time.Time),
 		leafCache:            make(map[types.ID]*cachedLeaf),
 		versionCache:         make(map[types.ID]*leaf.ArtifactVersion),
 		identityCache:        make(map[types.ID]*volunteerIdentity),
+		hostRuntimeCache:     make(map[types.ID][]string),
 		admission:            make(chan struct{}, cfg.admissionCap),
 		maintenanceAdmission: make(chan struct{}, cfg.maintenanceAdmissionCap),
 		refillSignal:         make(chan struct{}, 1),
@@ -483,21 +536,28 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		n = 1
 	}
 	leaseFallback := time.Duration(c.cfg.leaseSeconds) * time.Second
+	// hostKey is the requesting MACHINE's effective host id — the key for the per-machine
+	// in-flight cap and send-interval floor (TODO #19). It is the account id when the
+	// volunteer reported no host, so the metering transparently falls back to per-account.
+	// Distinctness still keys on volunteerID (the account), never on hostKey.
+	hostKey := meterID(volunteerID, opts.HostID)
 
 	c.mu.Lock()
-	// Per-volunteer minimum send interval: refuse to hand any new work to a volunteer
-	// within cfg.minSendInterval of its last successful hand-out. This is a server-side
-	// hard floor on per-volunteer work-acquisition cadence that holds even when a
-	// (self-compiled) volunteer ignores the advisory RetryAfterSeconds — the request is
-	// still served (it simply returns no work), and the per-pubkey rate limit backstops
-	// the polling itself. A zero interval disables the floor; the resolved interval comes
-	// from config.EffectiveMinSendIntervalSeconds, which is ENABLED by default.
+	// Per-machine minimum send interval: refuse to hand any new work to a machine within
+	// cfg.minSendInterval of ITS last successful hand-out. This is a server-side hard floor
+	// on per-machine work-acquisition cadence that holds even when a (self-compiled)
+	// volunteer ignores the advisory RetryAfterSeconds — the request is still served (it
+	// simply returns no work), and the per-pubkey rate limit backstops the polling itself.
+	// Keyed per host so a user's rig and laptop each have their own send clock. A zero
+	// interval disables the floor; the resolved interval comes from
+	// config.EffectiveMinSendIntervalSeconds, which is ENABLED by default.
 	if c.cfg.minSendInterval > 0 {
-		if last, ok := c.lastHandOut[volunteerID]; ok && c.now().Sub(last) < c.cfg.minSendInterval {
+		if last, ok := c.lastHandOut[hostKey]; ok && c.now().Sub(last) < c.cfg.minSendInterval {
 			c.mu.Unlock()
 			if c.logger.Enabled(context.Background(), slog.LevelDebug) {
 				c.logger.Debug("hand-out throttled: min send interval not elapsed",
 					"volunteer_id", volunteerID,
+					"host_id", hostKey,
 					"min_send_interval", c.cfg.minSendInterval)
 			}
 			return nil, false
@@ -525,7 +585,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			break
 		}
 		c.scanCount++ // TEST-ONLY: count candidates actually visited (FIX-1 early-exit probe).
-		if ok, reason := c.eligibleLocked(volunteerID, opts, cand); !ok {
+		if ok, reason := c.eligibleLocked(volunteerID, hostKey, opts, cand); !ok {
 			rejects[reason]++
 			kept = append(kept, cand)
 			continue
@@ -536,15 +596,16 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		if cand.unit.DeadlineSeconds > 0 {
 			reservedUntil = c.now().UTC().Add(time.Duration(cand.unit.DeadlineSeconds) * time.Second)
 		}
-		// Accept this candidate as a reservation for volunteerID.
+		// Accept this candidate as a reservation for volunteerID (the ACCOUNT — distinctness
+		// keys here) held by hostKey (the MACHINE — in-flight metering keys there).
 		uid := cand.unit.ID
 		holders := c.reservedInMem[uid]
 		if holders == nil {
-			holders = make(map[types.ID]time.Time)
+			holders = make(map[types.ID]heldCopy)
 			c.reservedInMem[uid] = holders
 		}
-		holders[volunteerID] = reservedUntil
-		c.inflight[volunteerID]++
+		holders[volunteerID] = heldCopy{reservedUntil: reservedUntil, hostID: hostKey}
+		c.inflight[hostKey]++
 
 		// HR pin (in-memory, first-writer-wins): the first holder of an unpinned unit on
 		// an HR-enabled leaf pins it to that holder's class HERE, under c.mu, so the very
@@ -581,12 +642,17 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			c.pendingSpotChecks = append(c.pendingSpotChecks, spotCheckWrite{
 				workUnitID:    uid,
 				volunteerID:   volunteerID,
+				hostID:        opts.HostID,
 				reservedUntil: reservedUntil,
 			})
 		} else {
 			c.pendingWrites = append(c.pendingWrites, workunit.FlushReservation{
-				WorkUnitID:      uid,
-				VolunteerID:     volunteerID,
+				WorkUnitID:  uid,
+				VolunteerID: volunteerID,
+				// Per-machine attribution (TODO #19): the copy row records which machine
+				// reserved it. Metering (inflight / send floor) is re-keyed onto the host
+				// separately; this is the durable attribution half.
+				HostID:          opts.HostID,
 				ReservedUntil:   reservedUntil,
 				DeadlineSeconds: cand.unit.DeadlineSeconds,
 			})
@@ -619,11 +685,11 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	readyLen := len(c.ready)
 	readyNonEmpty := readyLen > 0
 	drained = readyLen < c.cfg.lowWatermark
-	// Stamp the per-volunteer send clock ONLY when work was actually handed out, so a
-	// volunteer that got nothing (no eligible work) may retry immediately and the
-	// interval governs only the spacing between real hand-outs.
+	// Stamp the per-MACHINE send clock ONLY when work was actually handed out, so a
+	// machine that got nothing (no eligible work) may retry immediately and the interval
+	// governs only the spacing between real hand-outs.
 	if taken > 0 && c.cfg.minSendInterval > 0 {
-		c.lastHandOut[volunteerID] = c.now()
+		c.lastHandOut[hostKey] = c.now()
 	}
 	c.mu.Unlock()
 
@@ -759,7 +825,12 @@ func (r rejectReason) String() string {
 // It returns whether the candidate is eligible and, when not, the specific
 // rejectReason so HandOut can tally why a volunteer was handed nothing. Callers that
 // do not need the reason discard the second value.
-func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.AssignmentOptions, cand candidate) (bool, rejectReason) {
+//
+// volunteerID is the ACCOUNT (the key for redundancy headroom, self-exclusion,
+// distinctness, and the post-failure cooldown — all per-account by decision). hostKey is
+// the requesting MACHINE's effective host id (the key for the in-flight cap, per-machine
+// by TODO #19) — distinct so a user's rig and laptop get independent in-flight budgets.
+func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts workunit.AssignmentOptions, cand candidate) (bool, rejectReason) {
 	uid := cand.unit.ID
 	leafID := cand.unit.LeafID
 
@@ -795,8 +866,11 @@ func (c *dispatchCache) eligibleLocked(volunteerID types.ID, opts workunit.Assig
 	if _, benched := cand.benched[volunteerID]; benched {
 		return false, rejectBenched
 	}
-	// Per-volunteer inflight cap.
-	if opts.MaxInflightPerVolunteer > 0 && c.inflight[volunteerID] >= opts.MaxInflightPerVolunteer {
+	// Per-MACHINE inflight cap (TODO #19): a user's beefy rig is not throttled to its
+	// laptop's share — each host has its own live-copy budget. Keyed on hostKey, which is
+	// the account id in the per-account fallback (so the cap is unchanged for a volunteer
+	// that reports no host).
+	if opts.MaxInflightPerVolunteer > 0 && c.inflight[hostKey] >= opts.MaxInflightPerVolunteer {
 		return false, rejectInflightCap
 	}
 	// Leaf-id filter (preferred leafs) and blocked-leaf filter.
@@ -840,17 +914,19 @@ func (c *dispatchCache) releaseInMemLocked(unitID, volunteerID types.ID) {
 	if holders == nil {
 		return
 	}
-	if _, ok := holders[volunteerID]; !ok {
+	hc, ok := holders[volunteerID]
+	if !ok {
 		return
 	}
 	delete(holders, volunteerID)
 	if len(holders) == 0 {
 		delete(c.reservedInMem, unitID)
 	}
-	if c.inflight[volunteerID] > 0 {
-		c.inflight[volunteerID]--
-		if c.inflight[volunteerID] == 0 {
-			delete(c.inflight, volunteerID)
+	// Decrement the count of the MACHINE that held this copy, not the account (TODO #19).
+	if c.inflight[hc.hostID] > 0 {
+		c.inflight[hc.hostID]--
+		if c.inflight[hc.hostID] == 0 {
+			delete(c.inflight, hc.hostID)
 		}
 	}
 	// MINOR: when an in-memory hold is VOIDED (flush conflict, un-buildable leaf, or
@@ -933,11 +1009,12 @@ func (c *dispatchCache) onUnitDone(unitID types.ID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if holders := c.reservedInMem[unitID]; holders != nil {
-		for vol := range holders {
-			if c.inflight[vol] > 0 {
-				c.inflight[vol]--
-				if c.inflight[vol] == 0 {
-					delete(c.inflight, vol)
+		for _, hc := range holders {
+			// Decrement the MACHINE that held the copy, not the account (TODO #19).
+			if c.inflight[hc.hostID] > 0 {
+				c.inflight[hc.hostID]--
+				if c.inflight[hc.hostID] == 0 {
+					delete(c.inflight, hc.hostID)
 				}
 			}
 		}
@@ -1198,6 +1275,64 @@ func (c *dispatchCache) putIdentity(v *volunteer.Volunteer) {
 		availableRuntimes: rts,
 	}
 	c.identityMu.Unlock()
+}
+
+// putHostRuntimes warms (or refreshes) the advertised-runtimes snapshot for a machine,
+// keyed by effective host id (TODO #19). Called at RegisterVolunteer when the volunteer
+// reports a host, so the first RequestWorkUnit from that machine resolves its own
+// runtimes in memory.
+func (c *dispatchCache) putHostRuntimes(hostID types.ID, runtimes []string) {
+	rts := make([]string, len(runtimes))
+	copy(rts, runtimes)
+	c.hostRuntimeMu.Lock()
+	c.hostRuntimeCache[hostID] = rts
+	c.hostRuntimeMu.Unlock()
+}
+
+// peekHostRuntimes returns a machine's advertised runtimes without a DB fetch (nil,false
+// on a miss). The hot path uses it to resolve the REQUESTING host's runtimes; a miss
+// falls back to resolveHostRuntimes (a bounded DB read) and then the account's runtimes.
+func (c *dispatchCache) peekHostRuntimes(hostID types.ID) ([]string, bool) {
+	c.hostRuntimeMu.Lock()
+	defer c.hostRuntimeMu.Unlock()
+	rts, ok := c.hostRuntimeCache[hostID]
+	return rts, ok
+}
+
+// resolveHostRuntimes returns the host's advertised runtimes, reading the authoritative
+// hosts row on a cache miss and warming the cache (TODO #19). It exists for the cold-miss
+// case that the warm-at-register path does not cover: after a head restart the new
+// instance's hostRuntimeCache is empty and a volunteer reconnects WITHOUT re-registering
+// (registration happens only at volunteer start), so without this the per-host runtimes
+// would fall back to the account's (flapping) stored set for the rest of the session,
+// undermining the flapping-row fix — and a head restart is exactly what deploying this
+// change does. The miss read is bounded by the dispatch admission semaphore + a short
+// timeout, mirroring resolveIdentity, so a reconnect storm sheds instead of collapsing the
+// pool; on shed / not-found / no host repo it returns ok=false and the caller falls back
+// to the account runtimes. The steady state (warm cache) never reaches here.
+func (c *dispatchCache) resolveHostRuntimes(hostID types.ID) ([]string, bool) {
+	if rts, ok := c.peekHostRuntimes(hostID); ok {
+		return rts, true
+	}
+	if c.deps.hostRepo == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquire(ctx)
+	if !ok {
+		return nil, false // admission saturated: fall back to account runtimes this request
+	}
+	defer release()
+	h, err := c.deps.hostRepo.GetByID(ctx, hostID)
+	if err != nil {
+		if !isNotFound(err) {
+			c.logger.Warn("dispatch cache: host runtimes resolve failed", "host_id", hostID, "error", err)
+		}
+		return nil, false
+	}
+	c.putHostRuntimes(hostID, h.AvailableRuntimes)
+	return c.peekHostRuntimes(hostID)
 }
 
 // resolveIdentity returns the volunteer-identity snapshot for id, fetching+caching
@@ -1637,7 +1772,7 @@ func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 		if deadline < 0 {
 			deadline = 0
 		}
-		if _, err := c.deps.wuRepo.ReserveCopy(dbCtx, sc.workUnitID, sc.volunteerID, sc.reservedUntil, deadline); err != nil {
+		if _, err := c.deps.wuRepo.ReserveCopy(dbCtx, sc.workUnitID, sc.volunteerID, sc.hostID, sc.reservedUntil, deadline); err != nil {
 			release()
 			cancel()
 			c.releaseInMem(sc.workUnitID, sc.volunteerID)
@@ -1689,19 +1824,20 @@ func (c *dispatchCache) runReconciler(ctx context.Context, interval time.Duratio
 	}
 }
 
-// NoteVolunteerHeld records the set of work units a volunteer reports holding in its
-// client buffer on a RequestWorkUnit (every buffered and running unit it currently
-// has). The buffer reconcile uses the latest report to release reservations the
-// volunteer no longer holds. Cheap and purely in-memory — it does NOT touch Postgres,
-// so it stays off the request hot path; the DB reconciliation happens on the reconciler
-// tick.
-func (c *dispatchCache) NoteVolunteerHeld(volunteerID types.ID, held []types.ID) {
+// NoteVolunteerHeld records the set of work units a MACHINE reports holding in its client
+// buffer on a RequestWorkUnit (every buffered and running unit it currently has), keyed by
+// the requesting host's effective id (TODO #19) so two machines under one key never evict
+// each other's buffers. volunteerID (the account) is kept so the reconcile can drop the
+// released unit from the account-keyed in-memory ledger. Cheap and purely in-memory — it
+// does NOT touch Postgres, so it stays off the request hot path; the DB reconciliation
+// happens on the reconciler tick.
+func (c *dispatchCache) NoteVolunteerHeld(volunteerID, hostID types.ID, held []types.ID) {
 	set := make(map[types.ID]struct{}, len(held))
 	for _, id := range held {
 		set[id] = struct{}{}
 	}
 	c.heldMu.Lock()
-	c.heldReports[volunteerID] = heldReport{units: set, at: c.now()}
+	c.heldReports[hostID] = heldReport{units: set, account: volunteerID, at: c.now()}
 	c.heldMu.Unlock()
 }
 
@@ -1719,24 +1855,26 @@ func (c *dispatchCache) NoteVolunteerHeld(volunteerID types.ID, held []types.ID)
 func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 	now := c.now()
 
-	// Snapshot fresh reports and prune stale ones (a returning volunteer re-reports).
+	// Snapshot fresh reports and prune stale ones (a returning machine re-reports). Keyed
+	// per host; account carried for the in-memory release.
 	type pending struct {
-		vol      types.ID
+		host     types.ID
+		account  types.ID
 		held     []types.ID
 		reported time.Time
 	}
 	var todo []pending
 	c.heldMu.Lock()
-	for vol, r := range c.heldReports {
+	for host, r := range c.heldReports {
 		if now.Sub(r.at) > heldReportFreshness {
-			delete(c.heldReports, vol)
+			delete(c.heldReports, host)
 			continue
 		}
 		held := make([]types.ID, 0, len(r.units))
 		for u := range r.units {
 			held = append(held, u)
 		}
-		todo = append(todo, pending{vol: vol, held: held, reported: r.at})
+		todo = append(todo, pending{host: host, account: r.account, held: held, reported: r.at})
 	}
 	c.heldMu.Unlock()
 	if len(todo) == 0 {
@@ -1762,11 +1900,13 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 			cancel()
 			continue // admission/ctx pressure: retry on the next tick
 		}
-		released, err := c.deps.wuRepo.ReleaseStaleBufferedCopies(relCtx, p.vol, p.held, cutoff)
+		// Release by HOST (TODO #19): only THIS machine's buffered copies it no longer
+		// holds, so host A's report never reaps host B's buffer.
+		released, err := c.deps.wuRepo.ReleaseStaleBufferedCopies(relCtx, p.host, p.held, cutoff)
 		release()
 		cancel()
 		if err != nil {
-			c.logger.Warn("dispatch cache: buffer reconcile failed", "volunteer_id", p.vol, "error", err)
+			c.logger.Warn("dispatch cache: buffer reconcile failed", "host_id", p.host, "error", err)
 			continue
 		}
 		if len(released) == 0 {
@@ -1774,27 +1914,31 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 		}
 		releasedAny = true
 		// Drop the released units from this replica's in-memory ledger so they stop
-		// counting as held and can be re-staged. A no-op for copies this replica never
-		// held in memory (e.g. recovered from the DB after a head restart).
+		// counting as held and can be re-staged. The in-memory holders key on the ACCOUNT,
+		// so release by account (the host's owner); releaseInMemLocked then decrements the
+		// host's inflight via the holder's stored host id. A no-op for copies this replica
+		// never held in memory (e.g. recovered from the DB after a head restart).
 		c.mu.Lock()
 		for _, uid := range released {
-			c.releaseInMemLocked(uid, p.vol)
+			c.releaseInMemLocked(uid, p.account)
 		}
 		c.mu.Unlock()
 		c.logger.Info("dispatch cache: released stale buffered reservations",
-			"volunteer_id", p.vol, "released", len(released))
+			"host_id", p.host, "volunteer_id", p.account, "released", len(released))
 	}
 	if releasedAny {
 		c.signalRefill()
 	}
 }
 
-// reconcileOnce reconciles the in-memory inflight counters with the authoritative
-// DB per-volunteer count. The DB count (active history rows + live reservations) is
-// authoritative; the in-memory deltas for not-yet-flushed reservations are layered
-// on top so a freshly handed-out (still-unflushed) reservation is not under-counted.
+// reconcileOnce reconciles the in-memory inflight counters with the authoritative DB
+// per-MACHINE count (TODO #19). The DB count (active history rows + live reservations,
+// keyed by COALESCE(host_id, volunteer_id)) is authoritative; the in-memory deltas for
+// not-yet-flushed reservations are layered on top so a freshly handed-out (still-
+// unflushed) reservation is not under-counted. Both are keyed on the effective host id,
+// which equals the account id for a copy with no host — so the keys agree everywhere.
 func (c *dispatchCache) reconcileOnce(ctx context.Context) {
-	// First release any buffered reservations volunteers no longer hold, so the freed
+	// First release any buffered reservations machines no longer hold, so the freed
 	// copies are reflected in the authoritative inflight counts recomputed below.
 	c.reconcileBuffers(ctx)
 
@@ -1805,7 +1949,7 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 		return
 	}
 	defer release()
-	dbCounts, err := c.deps.wuRepo.CountActiveByVolunteer(dbCtx)
+	dbCounts, err := c.deps.wuRepo.CountActiveByHost(dbCtx)
 	if err != nil {
 		c.logger.Warn("dispatch cache: inflight reconcile failed", "error", err)
 		return
@@ -1813,21 +1957,22 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Count not-yet-flushed in-memory reservations per volunteer (these may not yet
-	// be reflected in dbCounts).
+	// Count not-yet-flushed in-memory reservations per MACHINE (these may not yet be
+	// reflected in dbCounts). The pending write carries a nullable host id; meterID folds
+	// a no-host write onto the account id, matching CountActiveByHost's COALESCE.
 	pending := make(map[types.ID]int)
 	for _, rec := range c.pendingWrites {
-		pending[rec.VolunteerID]++
+		pending[meterID(rec.VolunteerID, rec.HostID)]++
 	}
 	for _, rec := range c.pendingSpotChecks {
-		pending[rec.volunteerID]++
+		pending[meterID(rec.volunteerID, rec.hostID)]++
 	}
 	next := make(map[types.ID]int)
-	for vol, n := range dbCounts {
-		next[vol] = n
+	for host, n := range dbCounts {
+		next[host] = n
 	}
-	for vol, n := range pending {
-		next[vol] += n
+	for host, n := range pending {
+		next[host] += n
 	}
 	// D-4: report the drift the reconcile is about to correct, but only when the
 	// authoritative recount actually differs from the in-memory counters (a steady-state

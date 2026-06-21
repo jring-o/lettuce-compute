@@ -85,7 +85,10 @@ func (r *mockWorkUnitRepo) ClearSpotCheck(_ context.Context, _ types.ID) error {
 func (r *mockWorkUnitRepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
 }
-func (r *mockWorkUnitRepo) ReserveCopy(context.Context, types.ID, types.ID, time.Time, int) (*workunit.Copy, error) {
+func (r *mockWorkUnitRepo) ReserveCopy(context.Context, types.ID, types.ID, *types.ID, time.Time, int) (*workunit.Copy, error) {
+	return nil, nil
+}
+func (r *mockWorkUnitRepo) CountActiveByHost(context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (r *mockWorkUnitRepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {

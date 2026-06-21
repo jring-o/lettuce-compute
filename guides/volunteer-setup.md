@@ -97,14 +97,30 @@ start a Podman machine for you on first `start`.
 ## Disk and the data directory
 
 The data dir defaults to `~/.lettuce` (override with `--data-dir <path>`). It
-holds your **identity keypair** (`identity.key`/`.pub`), config, logs, and
-per-unit work files.
+holds your **identity keypair** (`identity.key`/`.pub`), a per-machine
+`host.id`, config, logs, and per-unit work files.
 
 - Before fetching any work, the daemon requires `max_disk_gb` free **on the
   data-dir volume**. If your home volume is small, point `--data-dir` at a
   roomier disk.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
+
+### Running one identity on several machines
+
+Your keypair **is your account** — credit pools to it, so running the **same**
+`identity.key`/`.pub` on every machine you own is the intended setup, not a
+trick. Each machine separately generates a stable `host.id` (kept in its own data
+dir) the first time it runs, so the head tracks your machines independently: a
+beefy rig and a laptop on one key each get their **own** work budget and pace
+(the rig is never throttled to the laptop's share), and each advertises its own
+runtimes — so a native-only box is never handed container work just because
+another of your machines runs containers. You don't manage `host.id`; it's
+created automatically and you can leave it alone. (Don't copy `host.id` between
+machines — let each generate its own; copying just makes two machines look like
+one.) For honest verification, your own machines are still treated as one account
+for redundancy, so they won't corroborate each other's results — that needs
+genuinely different contributors.
 
 ### Where container images actually live (VM/LXC users, read this)
 

@@ -72,6 +72,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading identity: %w (run 'lettuce-volunteer init' first)", err)
 	}
 
+	// Load (or create, for installs predating the host split) this machine's stable
+	// host id. The keypair is the account; the host id distinguishes this machine under
+	// it so the head meters work per machine while credit pools per account (TODO #19).
+	hostID, err := identity.LoadOrCreateHostID(cfg.HostIDPath())
+	if err != nil {
+		return fmt.Errorf("loading host id: %w", err)
+	}
+
 	// Verify at least one server is configured.
 	if len(cfg.Servers) == 0 {
 		return fmt.Errorf("no servers configured. Run `lettuce-volunteer attach --server <host>` first")
@@ -195,7 +203,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			headVersion = statusResp.Version
 		}
 
-		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, cfg, cfgPath, advertised...)
+		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, hostID, cfg, cfgPath, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
@@ -281,6 +289,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		Config:          cfg,
 		PubKey:          pub,
 		PrivKey:         priv,
+		HostID:          hostID,
 		Servers:         connections,
 		RuntimeRegistry: registry,
 		MachineManager:  machineManager,

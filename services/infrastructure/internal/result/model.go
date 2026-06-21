@@ -56,21 +56,25 @@ func ExecutionMetadataFromProto(pb *lettucev1.ExecutionMetadata) ExecutionMetada
 
 // Result is the output of a completed work unit submitted by a volunteer.
 type Result struct {
-	ID                types.ID         `json:"id"`
-	WorkUnitID        types.ID         `json:"work_unit_id"`
-	VolunteerID       types.ID         `json:"volunteer_id"`
-	OutputData        json.RawMessage  `json:"output_data,omitempty"`
-	OutputDataRef     *string          `json:"output_data_ref,omitempty"`
-	OutputChecksum    string           `json:"output_checksum"`
+	ID                types.ID          `json:"id"`
+	WorkUnitID        types.ID          `json:"work_unit_id"`
+	VolunteerID       types.ID          `json:"volunteer_id"`
+	OutputData        json.RawMessage   `json:"output_data,omitempty"`
+	OutputDataRef     *string           `json:"output_data_ref,omitempty"`
+	OutputChecksum    string            `json:"output_checksum"`
 	ExecutionMetadata ExecutionMetadata `json:"execution_metadata"`
-	ValidationStatus  ValidationStatus `json:"validation_status"`
+	ValidationStatus  ValidationStatus  `json:"validation_status"`
 	// ArtifactVersionID records which leaf_artifact_versions row produced this result
 	// (TODO #38): the unit's pinned version, else the leaf's current version at submit.
 	// nil = legacy / unversioned leaf. Lets validation refuse to compare results from
 	// different artifact versions and gives per-result version provenance.
-	ArtifactVersionID *types.ID        `json:"artifact_version_id,omitempty"`
-	SubmittedAt       time.Time        `json:"submitted_at"`
-	ValidatedAt       *time.Time       `json:"validated_at,omitempty"`
-	CreatedAt         time.Time        `json:"created_at"`
-	UpdatedAt         time.Time        `json:"updated_at"`
+	ArtifactVersionID *types.ID `json:"artifact_version_id,omitempty"`
+	// HostID attributes the result to the MACHINE that produced it (TODO #19), copied
+	// from the volunteer's live copy row at submit. nil = a volunteer that reported no
+	// host (per-account fallback).
+	HostID      *types.ID  `json:"host_id,omitempty"`
+	SubmittedAt time.Time  `json:"submitted_at"`
+	ValidatedAt *time.Time `json:"validated_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }

@@ -21,14 +21,14 @@ type DBTX interface {
 
 const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_ref,
 	output_checksum, execution_metadata, validation_status,
-	submitted_at, validated_at, created_at, updated_at, artifact_version_id`
+	submitted_at, validated_at, created_at, updated_at, artifact_version_id, host_id`
 
 // prefixedResultColumns is resultColumns with an r. table alias prefix, for
 // queries that JOIN results against another table (e.g. ListByLeaf). Keep it in
 // lockstep with resultColumns — TestResultColumnsParity enforces that.
 const prefixedResultColumns = `r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
 	r.output_checksum, r.execution_metadata, r.validation_status,
-	r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id`
+	r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id, r.host_id`
 
 func scanResult(row pgx.Row) (*Result, error) {
 	var r Result
@@ -47,6 +47,7 @@ func scanResult(row pgx.Row) (*Result, error) {
 		&r.CreatedAt,
 		&r.UpdatedAt,
 		&r.ArtifactVersionID,
+		&r.HostID,
 	)
 	if err != nil {
 		return nil, err
@@ -77,11 +78,11 @@ func (repo *PgxRepository) Create(ctx context.Context, r *Result) error {
 	row := repo.db.QueryRow(ctx, `
 		INSERT INTO results (
 			work_unit_id, volunteer_id, output_data, output_data_ref,
-			output_checksum, execution_metadata, validation_status, artifact_version_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			output_checksum, execution_metadata, validation_status, artifact_version_id, host_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING `+resultColumns,
 		r.WorkUnitID, r.VolunteerID, r.OutputData, r.OutputDataRef,
-		r.OutputChecksum, metadataJSON, r.ValidationStatus, r.ArtifactVersionID,
+		r.OutputChecksum, metadataJSON, r.ValidationStatus, r.ArtifactVersionID, r.HostID,
 	)
 
 	created, err := scanResult(row)

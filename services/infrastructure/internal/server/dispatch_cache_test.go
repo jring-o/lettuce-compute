@@ -136,7 +136,7 @@ func (f *fakeWURepo) MarkSpotCheck(_ context.Context, id types.ID) error {
 // ReserveCopy backs the deferred spot-check landing (a spot-check hold lands as a
 // RESERVED copy row). It counts calls so the spot-check tests can assert the copy
 // was written.
-func (f *fakeWURepo) ReserveCopy(_ context.Context, wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error) {
+func (f *fakeWURepo) ReserveCopy(_ context.Context, wuID, vol types.ID, _ *types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error) {
 	f.mu.Lock()
 	f.reserveCopyCalls++
 	fn := f.reserveCopyFn
@@ -148,6 +148,16 @@ func (f *fakeWURepo) ReserveCopy(_ context.Context, wuID, vol types.ID, reserved
 }
 
 func (f *fakeWURepo) CountActiveByVolunteer(_ context.Context) (map[types.ID]int, error) {
+	if f.countFn != nil {
+		return f.countFn()
+	}
+	return map[types.ID]int{}, nil
+}
+
+// CountActiveByHost backs the per-machine inflight reconcile (TODO #19). Tests key
+// countFn by the effective host id, which equals the account id in the no-host fallback,
+// so the same fixture drives both counts.
+func (f *fakeWURepo) CountActiveByHost(_ context.Context) (map[types.ID]int, error) {
 	if f.countFn != nil {
 		return f.countFn()
 	}
@@ -946,7 +956,10 @@ func TestFlushVoidsPerCopyConflict(t *testing.T) {
 	// (the parallel-copy staging the cache now legitimately produces).
 	until := c.now().UTC().Add(time.Hour)
 	c.mu.Lock()
-	c.reservedInMem[sharedID] = map[types.ID]time.Time{volA: until, volB: until}
+	c.reservedInMem[sharedID] = map[types.ID]heldCopy{
+		volA: {reservedUntil: until, hostID: volA},
+		volB: {reservedUntil: until, hostID: volB},
+	}
 	c.inflight[volA] = 1
 	c.inflight[volB] = 1
 	c.pendingWrites = []workunit.FlushReservation{
@@ -1691,7 +1704,7 @@ func TestReleaseInMemPurgesPending(t *testing.T) {
 		workunit.FlushReservation{WorkUnitID: unitID, VolunteerID: otherVol, ReservedUntil: until},
 		workunit.FlushReservation{WorkUnitID: types.NewID(), VolunteerID: vol, ReservedUntil: until},
 	)
-	c.reservedInMem[unitID] = map[types.ID]time.Time{otherVol: until}
+	c.reservedInMem[unitID] = map[types.ID]heldCopy{otherVol: {reservedUntil: until, hostID: otherVol}}
 	c.inflight[otherVol] = 1
 	c.mu.Unlock()
 	c.releaseInMem(unitID, otherVol) // purges only (unitID, otherVol)
@@ -1728,7 +1741,7 @@ func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
 	}
 
 	// vol reports holding only `kept` — it dropped `dropped` from its buffer.
-	c.NoteVolunteerHeld(vol, []types.ID{kept})
+	c.NoteVolunteerHeld(vol, vol, []types.ID{kept})
 
 	var gotVol types.ID
 	var gotHeld []types.ID
@@ -1775,7 +1788,7 @@ func TestReconcileBuffers_CutoffBoundedByReportTime(t *testing.T) {
 	// quiet (buffer full). now-grace would be base-60s, but the report is older than that.
 	c.now = func() time.Time { return base.Add(-70 * time.Second) }
 	vol := types.NewID()
-	c.NoteVolunteerHeld(vol, []types.ID{types.NewID()})
+	c.NoteVolunteerHeld(vol, vol, []types.ID{types.NewID()})
 	c.now = func() time.Time { return base }
 
 	var gotCutoff time.Time
@@ -1803,7 +1816,7 @@ func TestReconcileBuffers_SkipsStaleReports(t *testing.T) {
 
 	vol := types.NewID()
 	// Record a report and then advance the clock past the freshness window.
-	c.NoteVolunteerHeld(vol, []types.ID{types.NewID()})
+	c.NoteVolunteerHeld(vol, vol, []types.ID{types.NewID()})
 	c.now = func() time.Time { return now.Add(heldReportFreshness + time.Second) }
 
 	c.reconcileBuffers(context.Background())
@@ -1816,5 +1829,233 @@ func TestReconcileBuffers_SkipsStaleReports(t *testing.T) {
 	c.heldMu.Unlock()
 	if present {
 		t.Errorf("stale report must be pruned")
+	}
+}
+
+// --- TODO #19: account <-> host split (Stage B metering re-key) ----------------
+
+// hostOpts returns capable AssignmentOptions for an ACCOUNT (vol) running on a specific
+// MACHINE (host), with the given per-machine inflight cap. opts.HostID drives the per-host
+// metering re-key.
+func hostOpts(vol, host types.ID, maxInflight int) workunit.AssignmentOptions {
+	o := capableOpts(vol, maxInflight)
+	h := host
+	o.HostID = &h
+	return o
+}
+
+// Two machines under ONE account get INDEPENDENT in-flight budgets: a beefy rig is not
+// throttled to its laptop's share. With a per-account cap this second hand-out would be
+// blocked; keyed per host it is allowed.
+func TestHandOut_PerHostInflightCap_IndependentBudgets(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	unit1, unit2 := types.NewID(), types.NewID()
+	c.stageUnit(unit1, leafID, 1, 0)
+	c.stageUnit(unit2, leafID, 1, 0)
+
+	account := types.NewID()
+	hostA, hostB := types.NewID(), types.NewID()
+
+	// Host A fills its (cap=1) budget.
+	if r, _ := c.HandOut(account, hostOpts(account, hostA, 1), 1); len(r) != 1 {
+		t.Fatalf("host A hand-out = %d, want 1", len(r))
+	}
+	// Host B (same account, cap=1) still gets work — its budget is its OWN. A per-account
+	// cap would block this (the account already holds one).
+	if r, _ := c.HandOut(account, hostOpts(account, hostB, 1), 1); len(r) != 1 {
+		t.Fatalf("host B hand-out = %d, want 1 (per-host budget is independent of host A)", len(r))
+	}
+
+	c.mu.Lock()
+	ia, ib := c.inflight[hostA], c.inflight[hostB]
+	iacct := c.inflight[account]
+	c.mu.Unlock()
+	if ia != 1 || ib != 1 {
+		t.Errorf("inflight host A=%d host B=%d, want 1/1 (keyed per machine)", ia, ib)
+	}
+	if iacct != 0 {
+		t.Errorf("inflight keyed on the account = %d, want 0 (metering is per host, not per account)", iacct)
+	}
+}
+
+// Two machines under one account get INDEPENDENT send-interval clocks: host B is not
+// throttled by host A's recent hand-out, but host A re-polling within the interval is.
+func TestHandOut_PerHostSendInterval_IndependentClocks(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+	c.cfg.minSendInterval = time.Minute
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
+	unit1, unit2 := types.NewID(), types.NewID()
+	c.stageUnit(unit1, leafID, 1, 0)
+	c.stageUnit(unit2, leafID, 1, 0)
+
+	account := types.NewID()
+	hostA, hostB := types.NewID(), types.NewID()
+
+	if r, _ := c.HandOut(account, hostOpts(account, hostA, 0), 1); len(r) != 1 {
+		t.Fatalf("host A first hand-out = %d, want 1", len(r))
+	}
+	// Same instant, DIFFERENT machine, same account: its send clock is independent, so it
+	// is NOT throttled. A per-account clock would (wrongly) throttle it here.
+	if r, _ := c.HandOut(account, hostOpts(account, hostB, 0), 1); len(r) != 1 {
+		t.Fatalf("host B hand-out = %d, want 1 (independent send clock)", len(r))
+	}
+	// Host A re-polling within the interval IS throttled (its own clock).
+	if r, _ := c.HandOut(account, hostOpts(account, hostA, 0), 1); len(r) != 0 {
+		t.Fatalf("host A re-poll within interval = %d, want 0 (throttled by its own clock)", len(r))
+	}
+}
+
+// Per-WU distinctness stays PER-ACCOUNT across machines: a user's own two machines must
+// never both hold a copy of (and thus corroborate) the same redundancy>=2 unit. A DISTINCT
+// account does get the second copy.
+func TestHandOut_DistinctnessStaysPerAccount_AcrossHosts(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 2, false, 0), leafRepo)
+	unit := types.NewID()
+	c.stageUnit(unit, leafID, 2, 0)
+
+	account := types.NewID()
+	hostA, hostB := types.NewID(), types.NewID()
+	other := types.NewID()
+	hostC := types.NewID()
+
+	// Account takes the first copy on host A.
+	if r, _ := c.HandOut(account, hostOpts(account, hostA, 0), 1); len(r) != 1 {
+		t.Fatalf("account/host A hand-out = %d, want 1", len(r))
+	}
+	// SAME account, different machine, SAME unit: refused — distinctness is per account, so
+	// the rig and the laptop cannot corroborate each other.
+	if r, _ := c.HandOut(account, hostOpts(account, hostB, 0), 1); len(r) != 0 {
+		t.Fatalf("same account on host B got %d copies of the same unit, want 0 (per-account distinctness)", len(r))
+	}
+	// A DISTINCT account gets the second redundant copy.
+	if r, _ := c.HandOut(other, hostOpts(other, hostC, 0), 1); len(r) != 1 {
+		t.Fatalf("distinct account hand-out = %d, want 1 (a different person CAN corroborate)", len(r))
+	}
+}
+
+// The buffer reconcile keys on the MACHINE: host A's held-report drives a release scoped to
+// host A and carrying only host A's held set, so it can never reap host B's buffered copies
+// (the account-keyed bug this fixes).
+func TestReconcileBuffers_PerHost_DoesNotEvictOtherHost(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	account := types.NewID()
+	hostA, hostB := types.NewID(), types.NewID()
+	unitA, unitB := types.NewID(), types.NewID()
+
+	var mu sync.Mutex
+	seen := map[types.ID][]types.ID{}
+	wuRepo.releaseFn = func(host types.ID, held []types.ID, _ time.Time) ([]types.ID, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		cp := append([]types.ID(nil), held...)
+		seen[host] = cp
+		return nil, nil
+	}
+
+	// Each machine reports holding ONLY its own unit (under one account).
+	c.NoteVolunteerHeld(account, hostA, []types.ID{unitA})
+	c.NoteVolunteerHeld(account, hostB, []types.ID{unitB})
+
+	c.reconcileBuffers(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("expected one reconcile call per host (2), got %d (reports must be keyed per machine, not merged on the account)", len(seen))
+	}
+	if got, ok := seen[hostA]; !ok || len(got) != 1 || got[0] != unitA {
+		t.Errorf("host A reconcile held = %v, want [unitA]; host A's report must not carry host B's units", got)
+	}
+	if got, ok := seen[hostB]; !ok || len(got) != 1 || got[0] != unitB {
+		t.Errorf("host B reconcile held = %v, want [unitB]", got)
+	}
+	if _, leaked := seen[account]; leaked {
+		t.Errorf("reconcile was keyed on the account id — must be keyed per host")
+	}
+}
+
+// fakeHostRepo backs the per-host runtime cold-miss read (TODO #19).
+type fakeHostRepo struct {
+	volunteer.HostRepository
+	mu       sync.Mutex
+	hosts    map[types.ID]*volunteer.Host
+	getCalls int
+}
+
+func (f *fakeHostRepo) GetByID(_ context.Context, id types.ID) (*volunteer.Host, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCalls++
+	h, ok := f.hosts[id]
+	if !ok {
+		return nil, apierror.NotFound("host", id.String())
+	}
+	return h, nil
+}
+
+func (f *fakeHostRepo) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCalls
+}
+
+// On a cold miss (e.g. just after a head restart, before the volunteer re-registers) the
+// per-host runtimes are read from the hosts row ONCE and warmed; the unknown-host / no-repo
+// cases fall back (ok=false) so the caller uses the account's runtimes.
+func TestResolveHostRuntimes_ColdMissReadsHostRowThenWarm(t *testing.T) {
+	c := newTestCache(&fakeWURepo{}, &fakeLeafRepo{}, &fakeAssignRepo{})
+	hostID := types.NewID()
+	hr := &fakeHostRepo{hosts: map[types.ID]*volunteer.Host{
+		hostID: {ID: hostID, AvailableRuntimes: []string{leaf.RuntimeNative}},
+	}}
+	c.deps.hostRepo = hr
+
+	// Cold miss: reads the host row and warms the cache.
+	rts, ok := c.resolveHostRuntimes(hostID)
+	if !ok || len(rts) != 1 || rts[0] != leaf.RuntimeNative {
+		t.Fatalf("cold-miss resolve = %v,%v; want [NATIVE],true", rts, ok)
+	}
+	if hr.calls() != 1 {
+		t.Errorf("cold miss should read the DB once, got %d", hr.calls())
+	}
+
+	// Warm: a second resolve is served from memory with NO further DB read.
+	if rts2, ok := c.resolveHostRuntimes(hostID); !ok || len(rts2) != 1 {
+		t.Fatalf("warm resolve = %v,%v; want [NATIVE],true", rts2, ok)
+	}
+	if hr.calls() != 1 {
+		t.Errorf("warm resolve must not re-read the DB, got %d calls", hr.calls())
+	}
+
+	// Unknown host → ok=false (caller falls back to account runtimes).
+	if _, ok := c.resolveHostRuntimes(types.NewID()); ok {
+		t.Errorf("unknown host should resolve ok=false")
+	}
+
+	// No host repo → ok=false.
+	c.deps.hostRepo = nil
+	if _, ok := c.resolveHostRuntimes(types.NewID()); ok {
+		t.Errorf("nil hostRepo should resolve ok=false")
 	}
 }

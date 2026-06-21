@@ -703,7 +703,7 @@ func TestE2EV03Lifecycle(t *testing.T) {
 
 		// Copy 1: reserve a copy for vol A, then time it out (close EXPIRED). The unit
 		// stays QUEUED — there is no per-unit ASSIGNED/EXPIRED in the per-copy model.
-		cp1, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, reservedUntil, 3600)
+		cp1, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, nil, reservedUntil, 3600)
 		if err != nil {
 			t.Fatalf("reserve copy 1: %v", err)
 		}
@@ -721,7 +721,7 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		}
 
 		// Copy 2: reserve + time out again. Total copies now reaches max_total_copies=2.
-		cp2, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, reservedUntil, 3600)
+		cp2, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, nil, reservedUntil, 3600)
 		if err != nil {
 			t.Fatalf("reserve copy 2: %v", err)
 		}

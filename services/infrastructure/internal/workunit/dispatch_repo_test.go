@@ -157,7 +157,7 @@ func TestFlushReservations_LandsAndConflicts(t *testing.T) {
 	volB := createTestVolunteer(t, pool)
 
 	// Pre-reserve `taken` to volA via a per-copy RESERVED row (redundancy-1 met).
-	if _, err := repo.ReserveCopy(ctx, taken.ID, volA, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, taken.ID, volA, nil, time.Now().UTC().Add(time.Hour), 3600); err != nil {
 		t.Fatalf("ReserveCopy(taken): %v", err)
 	}
 
@@ -206,7 +206,7 @@ func TestFlushReservations_ParallelCopiesUpToRedundancy(t *testing.T) {
 	third := createTestVolunteer(t, pool)
 
 	// `first` already holds a live copy.
-	if _, err := repo.ReserveCopy(ctx, unit.ID, first, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, unit.ID, first, nil, time.Now().UTC().Add(time.Hour), 3600); err != nil {
 		t.Fatalf("ReserveCopy(first): %v", err)
 	}
 
@@ -258,17 +258,17 @@ func TestCountActiveByVolunteer(t *testing.T) {
 	// Two live copies for vol.
 	r1 := mustQueuedWU(t, ctx, repo, leafID)
 	r2 := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, r1.ID, vol, until, 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, r1.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(r1): %v", err)
 	}
-	if _, err := repo.ReserveCopy(ctx, r2.ID, vol, until, 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, r2.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(r2): %v", err)
 	}
 
 	// One CLOSED copy must NOT be counted (a lapsed reserved_until alone keeps the
 	// copy live — only a set outcome retires it from the inflight count).
 	rc := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, rc.ID, vol, until, 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, rc.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(rc): %v", err)
 	}
 	if err := repo.CloseCopyByVolunteer(ctx, rc.ID, vol, "ABANDONED", nil); err != nil {
@@ -421,7 +421,7 @@ func TestClaimPersistsThroughRunStart(t *testing.T) {
 		t.Fatalf("claim(a): %v", err)
 	}
 	// Buffer a copy, then run-start it. The unit stays QUEUED.
-	if _, err := repo.ReserveCopy(ctx, a.ID, vol, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, a.ID, vol, nil, time.Now().UTC().Add(time.Hour), 3600); err != nil {
 		t.Fatalf("ReserveCopy: %v", err)
 	}
 	if _, err := repo.Assign(ctx, a.ID, vol); err != nil {
@@ -593,7 +593,7 @@ func TestReleaseStaleBufferedCopies(t *testing.T) {
 	runningUnit := mustQueuedWU(t, ctx, repo, leafID)
 
 	for _, wu := range []*WorkUnit{heldUnit, droppedUnit, runningUnit} {
-		if _, err := repo.ReserveCopy(ctx, wu.ID, vol, until, 3600); err != nil {
+		if _, err := repo.ReserveCopy(ctx, wu.ID, vol, nil, until, 3600); err != nil {
 			t.Fatalf("ReserveCopy(%s): %v", wu.ID, err)
 		}
 	}
@@ -624,7 +624,7 @@ func TestReleaseStaleBufferedCopies(t *testing.T) {
 	// Grace window: a buffered copy newer than the cutoff is NOT released even when not
 	// held (empty held set = volunteer holds nothing).
 	graceUnit := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, graceUnit.ID, vol, until, 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, graceUnit.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(grace): %v", err)
 	}
 	releasedGrace, err := repo.ReleaseStaleBufferedCopies(ctx, vol, nil, time.Now().UTC().Add(-time.Hour))

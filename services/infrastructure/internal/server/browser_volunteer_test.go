@@ -115,7 +115,7 @@ func (m *bvMockWURepo) ReserveNextAssignable(context.Context, workunit.Assignmen
 	}
 	return m.wus[0], nil
 }
-func (m *bvMockWURepo) ReserveCopy(_ context.Context, _, _ types.ID, _ time.Time, _ int) (*workunit.Copy, error) {
+func (m *bvMockWURepo) ReserveCopy(_ context.Context, _, _ types.ID, _ *types.ID, _ time.Time, _ int) (*workunit.Copy, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) Assign(_ context.Context, wuID types.ID, volID types.ID) (*workunit.WorkUnit, error) {
@@ -153,6 +153,9 @@ func (m *bvMockWURepo) FlushReservations(context.Context, []workunit.FlushReserv
 	return nil, nil
 }
 func (m *bvMockWURepo) CountActiveByVolunteer(context.Context) (map[types.ID]int, error) {
+	return nil, nil
+}
+func (m *bvMockWURepo) CountActiveByHost(context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *bvMockWURepo) CloseCopy(context.Context, types.ID, string) error { return nil }

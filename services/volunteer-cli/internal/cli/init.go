@@ -92,6 +92,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Host id — a stable per-MACHINE identifier persisted next to the keypair. The
+	// keypair is the account (run the same key everywhere); the host id distinguishes
+	// this machine so the head meters work per machine while credit pools per account
+	// (TODO #19). LoadOrCreate so a re-init keeps the existing machine id.
+	hostIDFile := filepath.Join(dataDir, "host.id")
+	c.HostIDFile = hostIDFile
+	if _, err := identity.LoadOrCreateHostID(hostIDFile); err != nil {
+		return fmt.Errorf("initializing host id: %w", err)
+	}
+
 	if nonInteractive {
 		// Apply flags directly — skip all interactive prompts.
 		if v, _ := cmd.Flags().GetInt("cpu-cores"); v > 0 {

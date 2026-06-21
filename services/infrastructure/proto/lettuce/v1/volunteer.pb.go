@@ -132,8 +132,18 @@ type RegisterVolunteerRequest struct {
 	Hardware          *HardwareCapabilities  `protobuf:"bytes,3,opt,name=hardware,proto3" json:"hardware,omitempty"`
 	AvailableRuntimes []string               `protobuf:"bytes,4,rep,name=available_runtimes,json=availableRuntimes,proto3" json:"available_runtimes,omitempty"` // ["NATIVE", "CONTAINER"]
 	SchedulingMode    string                 `protobuf:"bytes,5,opt,name=scheduling_mode,json=schedulingMode,proto3" json:"scheduling_mode,omitempty"`          // ALWAYS, WHEN_IDLE, SCHEDULED
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Stable per-MACHINE host identifier the volunteer self-generates and persists in
+	// its data dir (alongside the keypair). The keypair is the ACCOUNT — one user runs
+	// the SAME key on every machine — and this distinguishes the machines under it so
+	// per-machine facts (advertised runtimes/hardware, in-flight cap, work-send floor,
+	// last-seen, work attribution) are tracked per host while credit/distinctness stay
+	// per account. ADDITIVE: an empty host_id falls back to per-account behavior (host
+	// == account), so a volunteer that sends none is not a breaking cutover. It is
+	// signed under the identity key for free — the per-request signature covers the
+	// whole request — so nobody else can claim your machine.
+	HostId        string `protobuf:"bytes,6,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RegisterVolunteerRequest) Reset() {
@@ -197,6 +207,13 @@ func (x *RegisterVolunteerRequest) GetAvailableRuntimes() []string {
 func (x *RegisterVolunteerRequest) GetSchedulingMode() string {
 	if x != nil {
 		return x.SchedulingMode
+	}
+	return ""
+}
+
+func (x *RegisterVolunteerRequest) GetHostId() string {
+	if x != nil {
+		return x.HostId
 	}
 	return ""
 }
@@ -269,8 +286,16 @@ type RequestWorkUnitRequest struct {
 	// and the unit redispatches immediately. An empty list means the volunteer
 	// holds nothing. Sent on every request; the head treats it as authoritative.
 	HeldWorkUnitIds []string `protobuf:"bytes,7,rep,name=held_work_unit_ids,json=heldWorkUnitIds,proto3" json:"held_work_unit_ids,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Stable per-MACHINE host id (see RegisterVolunteerRequest.host_id). The head keys
+	// the per-machine in-flight cap and work-send-interval floor on this, attributes the
+	// copy rows this request reserves to it, and reconciles the held_work_unit_ids buffer
+	// per host — so a user's beefy rig and laptop each get an independent work budget and
+	// never evict each other's buffers. Per-WU distinctness still keys on the ACCOUNT, so
+	// a user's own machines never corroborate the same unit. ADDITIVE: empty = per-account
+	// behavior (host == account). Signed under the identity key via the request signature.
+	HostId        string `protobuf:"bytes,8,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RequestWorkUnitRequest) Reset() {
@@ -350,6 +375,13 @@ func (x *RequestWorkUnitRequest) GetHeldWorkUnitIds() []string {
 		return x.HeldWorkUnitIds
 	}
 	return nil
+}
+
+func (x *RequestWorkUnitRequest) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
 }
 
 type RequestWorkUnitResponse struct {
@@ -2007,19 +2039,20 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
 	"\x0euptime_seconds\x18\x03 \x01(\x03R\ruptimeSeconds\x12'\n" +
-	"\x0fdatabase_status\x18\x04 \x01(\tR\x0edatabaseStatus\"\xfc\x01\n" +
+	"\x0fdatabase_status\x18\x04 \x01(\tR\x0edatabaseStatus\"\x95\x02\n" +
 	"\x18RegisterVolunteerRequest\x12\x1d\n" +
 	"\n" +
 	"public_key\x18\x01 \x01(\fR\tpublicKey\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12F\n" +
 	"\bhardware\x18\x03 \x01(\v2*.lettuce.volunteer.v1.HardwareCapabilitiesR\bhardware\x12-\n" +
 	"\x12available_runtimes\x18\x04 \x03(\tR\x11availableRuntimes\x12'\n" +
-	"\x0fscheduling_mode\x18\x05 \x01(\tR\x0eschedulingMode\"^\n" +
+	"\x0fscheduling_mode\x18\x05 \x01(\tR\x0eschedulingMode\x12\x17\n" +
+	"\ahost_id\x18\x06 \x01(\tR\x06hostId\"^\n" +
 	"\x19RegisterVolunteerResponse\x12!\n" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1e\n" +
 	"\n" +
 	"registered\x18\x02 \x01(\bR\n" +
-	"registered\"\xce\x02\n" +
+	"registered\"\xe7\x02\n" +
 	"\x16RequestWorkUnitRequest\x12!\n" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1d\n" +
 	"\n" +
@@ -2028,7 +2061,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\bleaf_ids\x18\x04 \x03(\tR\aleafIds\x12(\n" +
 	"\x10blocked_leaf_ids\x18\x05 \x03(\tR\x0eblockedLeafIds\x12'\n" +
 	"\x0fmax_assignments\x18\x06 \x01(\x05R\x0emaxAssignments\x12+\n" +
-	"\x12held_work_unit_ids\x18\a \x03(\tR\x0fheldWorkUnitIds\"\x95\x01\n" +
+	"\x12held_work_unit_ids\x18\a \x03(\tR\x0fheldWorkUnitIds\x12\x17\n" +
+	"\ahost_id\x18\b \x01(\tR\x06hostId\"\x95\x01\n" +
 	"\x17RequestWorkUnitResponse\x12J\n" +
 	"\vassignments\x18\x01 \x03(\v2(.lettuce.volunteer.v1.WorkUnitAssignmentR\vassignments\x12.\n" +
 	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\"\xfa\x05\n" +
