@@ -412,6 +412,22 @@ func (sm *SlotManager) ActiveWorkUnits() []*runtime.WorkUnit {
 	return wus
 }
 
+// ActiveWorkDirs returns the per-unit work directories of all currently active slots.
+// Used by the startup orphaned-work-dir GC (#58) to know which dirs are owned by a
+// running slot (and so must NOT be reaped). A slot with no prep (not yet started) or an
+// empty WorkDir contributes nothing.
+func (sm *SlotManager) ActiveWorkDirs() []string {
+	var dirs []string
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.prep != nil && slot.prep.WorkDir != "" {
+			dirs = append(dirs, slot.prep.WorkDir)
+		}
+		slot.mu.Unlock()
+	}
+	return dirs
+}
+
 // GetCurrentTasks returns info about all active slots' work units.
 // benchmarkFPOPS is the volunteer's CPU benchmark score for time estimation.
 // dcfFunc returns the duration correction factor for a given leaf ID.
