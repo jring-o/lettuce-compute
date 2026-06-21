@@ -93,7 +93,15 @@ jobs:
           go-version-file: services/volunteer-cli/go.mod
           cache-dependency-path: services/volunteer-cli/go.sum
       - run: go vet ./...
-      - run: go test ./...
+      # The flaky #36 OOM (`fatal error: runtime: cannot allocate memory`, surfacing in
+      # internal/resource) was ROOT-CAUSED to a test that set RLIMIT_AS on the test process
+      # ITSELF and never restored it — fixed in internal/resource/limiter_test.go. It crashed
+      # even under -p 1 with no other package running, so cross-package parallelism was never
+      # the real cause. -p 1 is kept only as cheap defense-in-depth on the memory-tight runner:
+      # it serializes PACKAGE execution so the heavy binaries (internal/management ~214s,
+      # internal/daemon ~75s) can't co-spike RSS. Cost ~2min (tests WITHIN a package still
+      # parallelize); drop back to `go test ./...` if CI time matters more than the margin.
+      - run: go test -p 1 ./...
 
   dashboard:
     name: Dashboard (Next.js)
