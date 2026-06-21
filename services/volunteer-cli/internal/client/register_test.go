@@ -32,10 +32,13 @@ func TestBuildRegistrationRequest(t *testing.T) {
 		MaxMemoryMb:   8192,
 	}
 
-	req := BuildRegistrationRequest(pub, hw, cfg)
+	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg)
 
 	if len(req.PublicKey) != ed25519.PublicKeySize {
 		t.Errorf("PublicKey length = %d, want %d", len(req.PublicKey), ed25519.PublicKeySize)
+	}
+	if req.HostId != "host-abc" {
+		t.Errorf("HostId = %q, want %q", req.HostId, "host-abc")
 	}
 	if req.DisplayName == "" {
 		t.Error("DisplayName is empty (expected hostname)")
@@ -65,7 +68,7 @@ func TestBuildRegistrationRequest_ExplicitRuntimesOverrideConfig(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.AvailableRuntimes = []string{"NATIVE", "CONTAINER"} // config claims CONTAINER...
 
-	req := BuildRegistrationRequest(pub, nil, cfg, "NATIVE", "WASM") // ...but advertise reality
+	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg, "NATIVE", "WASM") // ...but advertise reality
 
 	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
 		t.Errorf("AvailableRuntimes = %v, want [NATIVE WASM] (explicit override wins over config)", req.AvailableRuntimes)
@@ -82,7 +85,7 @@ func TestBuildRegistrationRequest_EmptyRuntimesFallsBackToConfig(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.AvailableRuntimes = []string{"NATIVE", "WASM"}
 
-	req := BuildRegistrationRequest(pub, nil, cfg) // no explicit runtimes
+	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg) // no explicit runtimes
 
 	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
 		t.Errorf("AvailableRuntimes = %v, want config fallback [NATIVE WASM]", req.AvailableRuntimes)
@@ -111,7 +114,7 @@ func TestRegisterNewVolunteer(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, err := Register(context.Background(), client, pub, cfg, configPath)
+	volID, isNew, err := Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -157,7 +160,7 @@ func TestRegisterUpdateExisting(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, err := Register(context.Background(), client, pub, cfg, configPath)
+	volID, isNew, err := Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -186,7 +189,7 @@ func TestRegisterSendsPublicKey(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, err = Register(context.Background(), client, pub, cfg, configPath)
+	_, _, err = Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -223,7 +226,7 @@ func TestRegisterDetectsHardware(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, err = Register(context.Background(), client, pub, cfg, configPath)
+	_, _, err = Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -259,7 +262,7 @@ func TestRegisterRPCError(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, err = Register(context.Background(), client, pub, cfg, configPath)
+	_, _, err = Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err == nil {
 		t.Fatal("expected error from Register when RPC fails")
 	}
@@ -296,7 +299,7 @@ func TestRegisterConfigSaveError(t *testing.T) {
 	// Try to save config inside a file (not a directory) — should fail.
 	configPath := filepath.Join(tmpFile, "subdir", "config.yaml")
 
-	volID, _, err := Register(context.Background(), client, pub, cfg, configPath)
+	volID, _, err := Register(context.Background(), client, pub, "host-abc", cfg, configPath)
 	if err == nil {
 		t.Fatal("expected error when config save fails")
 	}
@@ -319,7 +322,7 @@ func TestBuildRegistrationRequestEmptyRuntimes(t *testing.T) {
 		CpuCores: 4,
 	}
 
-	req := BuildRegistrationRequest(pub, hw, cfg)
+	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg)
 
 	if len(req.AvailableRuntimes) != 0 {
 		t.Errorf("AvailableRuntimes length = %d, want 0", len(req.AvailableRuntimes))
@@ -335,7 +338,7 @@ func TestBuildRegistrationRequestNilHardware(t *testing.T) {
 	cfg := config.Defaults()
 
 	// Nil hardware should not panic — it's a valid proto field.
-	req := BuildRegistrationRequest(pub, nil, cfg)
+	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg)
 
 	if req.Hardware != nil {
 		t.Error("expected nil hardware when nil is passed")
@@ -365,7 +368,7 @@ func TestRegisterCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	_, _, err = Register(ctx, client, pub, cfg, configPath)
+	_, _, err = Register(ctx, client, pub, "host-abc", cfg, configPath)
 	if err == nil {
 		t.Fatal("expected error with cancelled context")
 	}

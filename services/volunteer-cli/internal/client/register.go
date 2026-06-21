@@ -18,7 +18,7 @@ import (
 // run (e.g. derived from the live runtime registry) so a box that lists
 // CONTAINER in config but has no working Docker/Podman doesn't get assigned
 // container work it can only abandon. When empty, falls back to config.
-func BuildRegistrationRequest(pub ed25519.PublicKey, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
+func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
 	runtimes := availableRuntimes
 	if len(runtimes) == 0 {
 		runtimes = cfg.AvailableRuntimes
@@ -30,6 +30,10 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hw *lettucev1.HardwareCapab
 		Hardware:          hw,
 		AvailableRuntimes: runtimes,
 		SchedulingMode:    cfg.Scheduling.Mode,
+		// Per-machine host id (TODO #19): the head records this machine's advertised
+		// runtimes/hardware against it (fixing the flapping-row bug) and keys per-machine
+		// metering on it. Empty => per-account fallback.
+		HostId: hostID,
 	}
 }
 
@@ -38,9 +42,9 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hw *lettucev1.HardwareCapab
 //
 // availableRuntimes (optional) advertises the runtimes actually available rather
 // than cfg.AvailableRuntimes — see BuildRegistrationRequest.
-func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, cfg *config.Config, configPath string, availableRuntimes ...string) (string, bool, error) {
+func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, hostID string, cfg *config.Config, configPath string, availableRuntimes ...string) (string, bool, error) {
 	hw := DetectHardware(cfg)
-	req := BuildRegistrationRequest(pub, hw, cfg, availableRuntimes...)
+	req := BuildRegistrationRequest(pub, hostID, hw, cfg, availableRuntimes...)
 
 	resp, err := client.RegisterVolunteer(ctx, req)
 	if err != nil {

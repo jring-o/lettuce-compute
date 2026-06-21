@@ -203,7 +203,10 @@ func (m *mockWorkUnitRepo) ClearSpotCheck(_ context.Context, id types.ID) error 
 func (m *mockWorkUnitRepo) FindRunningWithStaleCheckpoints(_ context.Context, _ int) ([]workunit.StaleCheckpointInfo, error) {
 	return nil, nil
 }
-func (m *mockWorkUnitRepo) ReserveCopy(context.Context, types.ID, types.ID, time.Time, int) (*workunit.Copy, error) {
+func (m *mockWorkUnitRepo) ReserveCopy(context.Context, types.ID, types.ID, *types.ID, time.Time, int) (*workunit.Copy, error) {
+	return nil, nil
+}
+func (m *mockWorkUnitRepo) CountActiveByHost(context.Context) (map[types.ID]int, error) {
 	return nil, nil
 }
 func (m *mockWorkUnitRepo) FindExpiredCopies(context.Context, int) ([]*workunit.Copy, error) {

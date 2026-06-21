@@ -359,7 +359,9 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 			hold = 3600
 		}
 		reservedUntil := now.Add(time.Duration(hold) * time.Second)
-		if _, rerr := txWURepo.ReserveCopy(r.Context(), wu.ID, vol.ID, reservedUntil, wu.DeadlineSeconds); rerr != nil {
+		// Browser volunteers run in a tab with no persistent per-machine host id, so the
+		// copy is attributed to the account only (host_id NULL) — TODO #19.
+		if _, rerr := txWURepo.ReserveCopy(r.Context(), wu.ID, vol.ID, nil, reservedUntil, wu.DeadlineSeconds); rerr != nil {
 			deps.logger.Error("failed to reserve copy", "error", rerr)
 			apierror.WriteError(w, apierror.Internal("internal server error", rerr))
 			return

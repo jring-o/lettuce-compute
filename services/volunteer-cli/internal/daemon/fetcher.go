@@ -30,6 +30,10 @@ type Fetcher struct {
 	maxBackoff  time.Duration
 	cachedHW    *lettucev1.HardwareCapabilities
 	pubKey      ed25519.PublicKey
+	// hostID is this machine's stable host key, sent on every work request so the head
+	// keys the per-machine in-flight cap + work-send floor on it (TODO #19). Empty =>
+	// per-account fallback.
+	hostID      string
 
 	// enabledLeafsFunc is called to get enabled leafs for a server.
 	// Injected from the daemon to reuse its filtering logic.
@@ -144,6 +148,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		maxBackoff:       d.maxBackoff,
 		cachedHW:         d.cachedHW,
 		pubKey:           d.pubKey,
+		hostID:           d.hostID,
 		enabledLeafsFunc: d.enabledLeafs,
 		leafPrefsFunc:    d.leafPreferences,
 		shouldFetchFunc:  d.shouldFetch,
@@ -484,6 +489,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 		VolunteerId:      head.VolunteerID,
 		PublicKey:        f.pubKey,
+		HostId:           f.hostID,
 		LeafIds:          leafIDs,
 		BlockedLeafIds:   blockedIDs,
 		MaxAssignments:   maxAssignments,

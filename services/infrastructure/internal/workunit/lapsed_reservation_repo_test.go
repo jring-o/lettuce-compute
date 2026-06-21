@@ -31,13 +31,13 @@ func TestFindExpiredCopies_LapsedReservedCopy(t *testing.T) {
 
 	// lapsed: a RESERVED copy whose reserved_until is already in the past.
 	lapsed := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, lapsed.ID, vol, time.Now().UTC().Add(-time.Minute), lapsed.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, lapsed.ID, vol, nil, time.Now().UTC().Add(-time.Minute), lapsed.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy(lapsed): %v", err)
 	}
 
 	// live: a RESERVED copy held into the future — must NOT be returned.
 	live := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, live.ID, vol, time.Now().UTC().Add(time.Hour), live.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, live.ID, vol, nil, time.Now().UTC().Add(time.Hour), live.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy(live): %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestFindExpiredCopies_CloseMakesReReservable(t *testing.T) {
 	freshVol := createTestVolunteer(t, pool)
 
 	wu := mustQueuedWU(t, ctx, repo, leafID)
-	if _, err := repo.ReserveCopy(ctx, wu.ID, deadVol, time.Now().UTC().Add(-time.Minute), wu.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, deadVol, nil, time.Now().UTC().Add(-time.Minute), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy: %v", err)
 	}
 

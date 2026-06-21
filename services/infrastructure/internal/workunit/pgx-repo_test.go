@@ -1680,7 +1680,7 @@ func TestAssign_RunStartsReservedCopy(t *testing.T) {
 	}
 
 	// Buffer a copy first; Assign run-starts it.
-	if _, err := repo.ReserveCopy(ctx, wu.ID, volunteerID, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volunteerID, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy: %v", err)
 	}
 
@@ -2139,7 +2139,7 @@ func TestDeadLetterIfExhausted(t *testing.T) {
 	// Live copy present: total >= ceiling but a copy is still live → NOT dead-lettered.
 	hasLive := mkQueued(2)
 	insertClosedCopy(t, pool, hasLive.ID, volA, "EXPIRED")
-	if _, err := repo.ReserveCopy(ctx, hasLive.ID, volB, time.Now().UTC().Add(time.Hour), 3600); err != nil {
+	if _, err := repo.ReserveCopy(ctx, hasLive.ID, volB, nil, time.Now().UTC().Add(time.Hour), 3600); err != nil {
 		t.Fatalf("ReserveCopy(hasLive): %v", err)
 	}
 	if failed, err := repo.DeadLetterIfExhausted(ctx, hasLive.ID); err != nil {

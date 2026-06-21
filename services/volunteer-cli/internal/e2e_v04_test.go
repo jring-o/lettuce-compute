@@ -168,7 +168,8 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 	}
 	defer grpcClient.Close()
 
-	volID, _, err := client.Register(ctx, grpcClient, pub, cfg, cfgPath)
+	const hostID = "host-e2e-v04"
+	volID, _, err := client.Register(ctx, grpcClient, pub, hostID, cfg, cfgPath)
 	if err != nil {
 		t.Fatalf("registering: %v", err)
 	}
@@ -181,6 +182,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 		wuResp, err := grpcClient.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 			VolunteerId: volID,
 			PublicKey:   pub,
+			HostId:      hostID,
 		})
 		if err != nil {
 			t.Fatalf("RequestWorkUnit: %v", err)
@@ -240,6 +242,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 		wuResp, err := grpcClient.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 			VolunteerId: volID,
 			PublicKey:   pub,
+			HostId:      hostID,
 		})
 		if err != nil {
 			t.Log("No remaining work units (all consumed)")

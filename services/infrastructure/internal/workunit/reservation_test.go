@@ -378,7 +378,7 @@ func TestReserveCopy_InsertsReservedRow(t *testing.T) {
 
 	wu := mustQueuedWU(t, ctx, repo, leafID)
 
-	cp, err := repo.ReserveCopy(ctx, wu.ID, vol, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds)
+	cp, err := repo.ReserveCopy(ctx, wu.ID, vol, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds)
 	if err != nil {
 		t.Fatalf("ReserveCopy: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestReserveCopy_InsertsReservedRow(t *testing.T) {
 
 	// A second ReserveCopy for the SAME volunteer conflicts (one live copy per
 	// volunteer per unit — the partial unique).
-	if _, err := repo.ReserveCopy(ctx, wu.ID, vol, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, vol, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
 		t.Fatalf("expected Conflict reserving a second live copy for the same volunteer")
 	}
 }
@@ -626,10 +626,10 @@ func TestReserveCopy_RefusesPriorResultAuthor(t *testing.T) {
 	wu := mustQueuedWU(t, ctx, repo, leafID)
 	insertPendingResult(t, pool, wu.ID, volA)
 
-	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
 		t.Fatalf("ReserveCopy must refuse a volunteer that already submitted a result for this unit")
 	}
-	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy must allow a distinct corroborator: %v", err)
 	}
 }
@@ -658,10 +658,10 @@ func TestReserveCopy_RefusesBenchedVolunteer(t *testing.T) {
 		t.Fatalf("close volA copy EXPIRED: %v", err)
 	}
 
-	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err == nil {
 		t.Fatalf("ReserveCopy must bench a volunteer whose copy just expired")
 	}
-	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
+	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("ReserveCopy must allow a fresh volunteer during another's cooldown: %v", err)
 	}
 }

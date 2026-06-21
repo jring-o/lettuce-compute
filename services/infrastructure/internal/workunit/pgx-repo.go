@@ -536,11 +536,17 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      AND wuah4.outcome_at IS NOT NULL
 		      AND wuah4.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 		  )
-		  -- Per-volunteer inflight cap: this volunteer's live copies across all units.
+		  -- Per-MACHINE inflight cap (TODO #19): this HOST's live copies across all units.
+		  -- Keyed on COALESCE(host_id, volunteer_id) = the requester's effective host id
+		  -- ($14, the account id when no host was reported) so a user's rig and laptop have
+		  -- independent budgets. This is DELIBERATELY separate from the per-account
+		  -- distinctness/redundancy predicates above (which stay keyed on volunteer_id $9):
+		  -- distinctness is per-account, the in-flight cap is per-machine.
 		  AND (
 		    $12::int <= 0
 		    OR (SELECT COUNT(*) FROM work_unit_assignment_history wuah5
-		        WHERE wuah5.volunteer_id = $9 AND wuah5.outcome IS NULL) < $12
+		        WHERE COALESCE(wuah5.host_id, wuah5.volunteer_id) = COALESCE($14::uuid, $9)
+		          AND wuah5.outcome IS NULL) < $12
 		  )
 		  -- Homogeneous Redundancy: a unit already pinned to a hardware class only goes to
 		  -- volunteers of that SAME class. Unpinned units (hr_class IS NULL, incl. all
@@ -562,6 +568,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		opts.GPUComputeCapabilities,
 		opts.MaxInflightPerVolunteer,
 		opts.HRClass,
+		opts.HostID,
 	)
 
 	wu, err := scanWorkUnit(row)
@@ -919,8 +926,11 @@ func (r *PgxWorkUnitRepository) ClearExpiredDispatchClaims(ctx context.Context) 
 // work_unit_assignment_history row with reserved_until set, started_at NULL,
 // outcome NULL).
 type FlushReservation struct {
-	WorkUnitID      types.ID
-	VolunteerID     types.ID
+	WorkUnitID  types.ID
+	VolunteerID types.ID
+	// HostID attributes the copy to the requesting machine (TODO #19); nil = no host
+	// reported (the copy row's host_id is left NULL → it counts under the account).
+	HostID          *types.ID
 	ReservedUntil   time.Time
 	DeadlineSeconds int
 }
@@ -960,11 +970,13 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 	}
 	ids := make([]types.ID, len(recs))
 	vols := make([]types.ID, len(recs))
+	hosts := make([]*types.ID, len(recs))
 	untils := make([]time.Time, len(recs))
 	deadlines := make([]int, len(recs))
 	for i, rec := range recs {
 		ids[i] = rec.WorkUnitID
 		vols[i] = rec.VolunteerID
+		hosts[i] = rec.HostID
 		untils[i] = rec.ReservedUntil
 		deadlines[i] = rec.DeadlineSeconds
 	}
@@ -989,11 +1001,12 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 	// allows — that is exactly the parallel-copy case (property 7).
 	rows, err := r.db.Query(ctx, `
 		INSERT INTO work_unit_assignment_history
-			(work_unit_id, volunteer_id, assigned_at, reserved_until, deadline_seconds)
-		SELECT v.id, v.vol, NOW(), v.reserved_until, v.deadline_seconds
+			(work_unit_id, volunteer_id, host_id, assigned_at, reserved_until, deadline_seconds)
+		SELECT v.id, v.vol, v.host_id, NOW(), v.reserved_until, v.deadline_seconds
 		FROM (
 			SELECT unnest($1::uuid[]) AS id,
 			       unnest($2::uuid[]) AS vol,
+			       unnest($5::uuid[]) AS host_id,
 			       unnest($3::timestamptz[]) AS reserved_until,
 			       unnest($4::int[]) AS deadline_seconds
 		) AS v
@@ -1020,7 +1033,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING work_unit_id, volunteer_id`,
-		ids, vols, untils, deadlines,
+		ids, vols, untils, deadlines, hosts,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to flush reservations", err)
@@ -1094,6 +1107,38 @@ func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map
 	return out, nil
 }
 
+// CountActiveByHost returns the authoritative per-MACHINE inflight count (live copies)
+// keyed by effective host id (TODO #19). It groups on COALESCE(host_id, volunteer_id)
+// so a copy from a volunteer that reported no host (NULL host_id) counts under its
+// account id — which is exactly effectiveHostID(volunteer, "") — so the keys match the
+// dispatch cache's per-host inflight map with no special-casing. Pre-migration copies
+// (NULL host_id) therefore fold into the account's key, identical to the fallback.
+func (r *PgxWorkUnitRepository) CountActiveByHost(ctx context.Context) (map[types.ID]int, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT COALESCE(host_id, volunteer_id) AS host, COUNT(*)::bigint
+		FROM work_unit_assignment_history
+		WHERE outcome IS NULL AND volunteer_id IS NOT NULL
+		GROUP BY COALESCE(host_id, volunteer_id)`)
+	if err != nil {
+		return nil, apierror.Internal("failed to count active by host", err)
+	}
+	defer rows.Close()
+
+	out := make(map[types.ID]int)
+	for rows.Next() {
+		var host types.ID
+		var cnt int64
+		if err := rows.Scan(&host, &cnt); err != nil {
+			return nil, apierror.Internal("failed to scan active-by-host row", err)
+		}
+		out[host] = int(cnt)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate active-by-host rows", err)
+	}
+	return out, nil
+}
+
 // ReleaseStaleBufferedCopies closes a volunteer's buffered (RESERVED, not-yet-run-
 // started) live copies that it no longer holds in its client buffer, per the held
 // set the volunteer reports on each request. See the WorkUnitRepository interface
@@ -1101,19 +1146,22 @@ func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map
 // RUNNING copies (started_at set) are never touched here — they ride their deadline.
 // The created_at < olderThan guard is the grace window that protects a copy handed
 // out moments ago from being reaped before the volunteer's next report includes it.
-func (r *PgxWorkUnitRepository) ReleaseStaleBufferedCopies(ctx context.Context, volunteerID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error) {
+func (r *PgxWorkUnitRepository) ReleaseStaleBufferedCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error) {
 	rows, err := r.db.Query(ctx, `
 		UPDATE work_unit_assignment_history
 		SET outcome = 'ABANDONED', outcome_at = NOW()
-		WHERE volunteer_id = $1
+		-- Match by MACHINE (TODO #19): COALESCE(host_id, volunteer_id) = the reporting
+		-- host's effective id, so only THIS machine's buffered copies are reaped and host
+		-- A's report never releases host B's buffer. Equals volunteer_id for a no-host copy.
+		WHERE COALESCE(host_id, volunteer_id) = $1
 		  AND outcome IS NULL
 		  AND started_at IS NULL
 		  AND created_at < $2
-		  -- Held-set guard: an empty/absent set (volunteer holds nothing) releases every
+		  -- Held-set guard: an empty/absent set (the machine holds nothing) releases every
 		  -- grace-aged buffered copy; otherwise release only those NOT in the held set.
 		  AND (array_length($3::uuid[], 1) IS NULL OR NOT (work_unit_id = ANY($3::uuid[])))
 		RETURNING work_unit_id`,
-		volunteerID, olderThan, heldWorkUnitIDs,
+		hostID, olderThan, heldWorkUnitIDs,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to release stale buffered copies", err)
@@ -1166,7 +1214,7 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 		hold = time.Duration(wu.DeadlineSeconds) * time.Second
 	}
 	reservedUntil := time.Now().UTC().Add(hold)
-	if _, err := r.ReserveCopy(ctx, wu.ID, opts.VolunteerID, reservedUntil, wu.DeadlineSeconds); err != nil {
+	if _, err := r.ReserveCopy(ctx, wu.ID, opts.VolunteerID, opts.HostID, reservedUntil, wu.DeadlineSeconds); err != nil {
 		return nil, err
 	}
 	// Echo the reservation window on the returned unit (transient, for the proto
@@ -1194,11 +1242,11 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 // refusal). Enforcing these here means a hand-out raced by a concurrent submit is
 // rejected BEFORE the volunteer ever run-starts, so no compute is wasted on a copy
 // that could never be accepted.
-func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error) {
+func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, hostID *types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error) {
 	row := r.db.QueryRow(ctx, `
 		INSERT INTO work_unit_assignment_history
-			(work_unit_id, volunteer_id, assigned_at, reserved_until, deadline_seconds)
-		SELECT $1, $2, NOW(), $3, $4
+			(work_unit_id, volunteer_id, host_id, assigned_at, reserved_until, deadline_seconds)
+		SELECT $1, $2, $5, NOW(), $3, $4
 		WHERE EXISTS (SELECT 1 FROM work_units wu WHERE wu.id = $1 AND wu.state = 'QUEUED')
 		  -- Distinctness: never reserve a unit this volunteer already produced a result
 		  -- for (so each of the N redundant results comes from a distinct volunteer).
@@ -1218,7 +1266,7 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING `+copyColumns,
-		workUnitID, volunteerID, reservedUntil, deadlineSeconds,
+		workUnitID, volunteerID, reservedUntil, deadlineSeconds, hostID,
 	)
 	cp, err := scanCopy(row)
 	if err != nil {

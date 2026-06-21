@@ -25,6 +25,12 @@ type AssignmentOptions struct {
 	// set, a unit already pinned to a DIFFERENT class (homogeneous redundancy) is excluded;
 	// an unpinned unit (hr_class IS NULL) is eligible regardless. Empty = no HR filtering.
 	HRClass string
+	// HostID is the requesting MACHINE's effective host id (TODO #19), nil when the
+	// volunteer reported no host (per-account fallback). It is stamped on the copy row
+	// for per-machine attribution; the per-machine in-flight cap is enforced on
+	// COALESCE(host_id, volunteer_id) so it equals this value (= VolunteerID when nil).
+	// Distinctness still keys on VolunteerID (the account), never on this.
+	HostID *types.ID
 }
 
 // WorkUnitRepository defines the data-access interface for work units.
@@ -83,18 +89,27 @@ type WorkUnitRepository interface {
 	// in-memory inflight counters.
 	CountActiveByVolunteer(ctx context.Context) (map[types.ID]int, error)
 
-	// ReleaseStaleBufferedCopies closes a volunteer's buffered (RESERVED, not-yet-
-	// run-started) live copies that the volunteer no longer holds in its client
-	// buffer. heldWorkUnitIDs is the set the volunteer reports it still has; any of
-	// its buffered copies for a unit NOT in that set, and older than olderThan (a
-	// grace window so a copy handed out moments ago is not reaped before the
-	// volunteer's next report includes it), is closed ABANDONED. The work unit stays
-	// QUEUED, so it redispatches immediately, and the freed copy stops counting
-	// against the volunteer's inflight cap. RUNNING copies (started_at set) are never
-	// touched here — they ride their deadline. An empty heldWorkUnitIDs means the
-	// volunteer holds nothing, so all its grace-aged buffered copies are released.
-	// Returns the work-unit ids whose copies were released so the cache can evict them.
-	ReleaseStaleBufferedCopies(ctx context.Context, volunteerID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error)
+	// CountActiveByHost returns the authoritative per-MACHINE inflight count (live
+	// copies) keyed by effective host id — COALESCE(host_id, volunteer_id), so a copy
+	// from a volunteer that reported no host (NULL host_id) counts under its account id,
+	// exactly matching the dispatch cache's effective-host-id keying (= volunteer id in
+	// the fallback). Used to reconcile the per-host in-flight counters (TODO #19).
+	CountActiveByHost(ctx context.Context) (map[types.ID]int, error)
+
+	// ReleaseStaleBufferedCopies closes a MACHINE's buffered (RESERVED, not-yet-
+	// run-started) live copies that the machine no longer holds in its client buffer
+	// (TODO #19): hostID is the reporting host's effective id, matched on
+	// COALESCE(host_id, volunteer_id) so only THAT machine's copies are reaped (host A's
+	// report never releases host B's buffer) — and = the account id for a no-host copy.
+	// heldWorkUnitIDs is the set the machine reports it still has; any of its buffered
+	// copies for a unit NOT in that set, and older than olderThan (a grace window so a copy
+	// handed out moments ago is not reaped before the machine's next report includes it),
+	// is closed ABANDONED. The work unit stays QUEUED, so it redispatches immediately, and
+	// the freed copy stops counting against the host's inflight cap. RUNNING copies
+	// (started_at set) are never touched here — they ride their deadline. An empty
+	// heldWorkUnitIDs means the machine holds nothing, so all its grace-aged buffered
+	// copies are released. Returns the work-unit ids whose copies were released.
+	ReleaseStaleBufferedCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error)
 
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
 	// predicates as FindNextAssignable) and inserts a RESERVED copy held until the
@@ -105,9 +120,10 @@ type WorkUnitRepository interface {
 	ReserveNextAssignable(ctx context.Context, opts AssignmentOptions, lease time.Duration) (*WorkUnit, error)
 
 	// ReserveCopy inserts a RESERVED copy for (workUnitID, volunteerID) held until
-	// reservedUntil, snapshotting deadlineSeconds. Returns apierror.Conflict if the
-	// volunteer already holds a live copy or the unit is not QUEUED.
-	ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error)
+	// reservedUntil, snapshotting deadlineSeconds. hostID attributes the copy to the
+	// machine (nil = no host reported). Returns apierror.Conflict if the volunteer
+	// already holds a live copy or the unit is not QUEUED.
+	ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, hostID *types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error)
 
 	// Assign run-starts a volunteer's reserved copy (started_at = NOW), starting the
 	// per-copy deadline clock. The WORK UNIT stays QUEUED so its other redundancy
