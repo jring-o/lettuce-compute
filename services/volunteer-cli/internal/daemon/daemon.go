@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
@@ -353,6 +354,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// keeps the matching reservations instead of stranding them.
 	d.resumePersistedTasks(ctx)
 	d.resumePrefetchBuffer(ctx)
+
+	// Reap orphaned per-unit work dirs left by a previous unclean exit (#58). MUST be
+	// after both resumers so a dir about to be re-attached is never deleted; the owned set
+	// is exactly the active slots' + restored buffer's work dirs at this point.
+	d.gcOrphanedWorkDirs()
 
 	// Start the pending-result retry worker. It sweeps once now (recovering any
 	// results stranded by a previous run's submission failure) then periodically.
@@ -2382,4 +2388,81 @@ func (d *Daemon) resumePrefetchBuffer(ctx context.Context) {
 	if restored > 0 {
 		d.logger.Info("prefetch buffer restoration complete", "restored", restored, "total", len(state.Tasks))
 	}
+}
+
+// workDirTrees are the per-runtime work-dir trees under the data dir, each holding one
+// `<work-unit-uuid>` subdir per prepared unit: native (work/), container (container-work/),
+// wasm (wasm-work/). See runtime/{native,container,wasm}.go.
+var workDirTrees = []string{"work", "container-work", "wasm-work"}
+
+// gcOrphanedWorkDirs reaps per-unit work directories left behind by an unclean exit and
+// never reclaimed by the resume loops (TODO #58): a SIGKILL / crash / power loss (cleanup
+// defers don't run), the tray-quit fast-exit path (SuspendAndQuit -> os.Exit, which skips
+// defers by design), a crash between Prepare creating the dir and the unit being persisted,
+// or more persisted tasks than slots on resume. Nothing else ever scans these trees, so such
+// dirs leak forever on the same volume shouldFetch measures and can silently trip the disk
+// gate.
+//
+// It MUST run AFTER resumePersistedTasks + resumePrefetchBuffer: at that point the ONLY
+// owned dirs are those of the active slots (resumed running tasks) and the prefetch queue
+// (restored buffered units), so any other `<uuid>` dir is an orphan. Running it before the
+// resumers would delete a dir that is about to be re-attached. Best-effort: read/remove
+// failures are logged, never fatal.
+func (d *Daemon) gcOrphanedWorkDirs() {
+	owned := make(map[string]struct{})
+	for _, dir := range d.slotManager.ActiveWorkDirs() {
+		if dir != "" {
+			owned[filepath.Clean(dir)] = struct{}{}
+		}
+	}
+	for _, it := range d.prefetchQueue.Items() {
+		if it != nil && it.Prep != nil && it.Prep.WorkDir != "" {
+			owned[filepath.Clean(it.Prep.WorkDir)] = struct{}{}
+		}
+	}
+	reapOrphanWorkDirs(d.cfg.DataDir, owned, d.logger)
+}
+
+// reapOrphanWorkDirs is the IO core of the startup work-dir GC (#58): it removes every
+// `<uuid>`-named child of the work-dir trees under dataDir that is not in owned. Returns the
+// number of dirs removed. A child whose name is not a valid UUID is left untouched (a
+// conservative guard so the sweep can never delete anything other than a per-unit work dir),
+// as is a missing tree. Split out so it can be tested against a real temp dir with no slot
+// manager.
+func reapOrphanWorkDirs(dataDir string, owned map[string]struct{}, logger *slog.Logger) int {
+	removed := 0
+	for _, tree := range workDirTrees {
+		treePath := filepath.Join(dataDir, tree)
+		entries, err := os.ReadDir(treePath)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				logger.Warn("work-dir GC: failed to read tree", "tree", treePath, "error", err)
+			}
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			// Only ever touch `<uuid>` dirs — the exact shape the runtimes create. Anything
+			// else (a stray file-as-dir, an operator's manual dir) is left alone.
+			if _, perr := uuid.Parse(e.Name()); perr != nil {
+				continue
+			}
+			dirPath := filepath.Clean(filepath.Join(treePath, e.Name()))
+			if _, ok := owned[dirPath]; ok {
+				continue
+			}
+			if err := os.RemoveAll(dirPath); err != nil {
+				logger.Warn("work-dir GC: failed to remove orphan work dir", "dir", dirPath, "error", err)
+				continue
+			}
+			removed++
+			logger.Debug("work-dir GC: removed orphan work dir", "dir", dirPath)
+		}
+	}
+	if removed > 0 {
+		logger.Info("work-dir GC: removed orphaned work directories", "removed", removed)
+	}
+	return removed
 }
