@@ -6,9 +6,54 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 )
+
+// startLimiterTestChild spawns a short-lived child process for the Enforce tests
+// to target, and returns its PID.
+//
+// Enforcing limits against the test process ITSELF is unsafe and was the real
+// (mis-diagnosed) cause of the flaky #36 CI OOM. On Linux the fallback path sets
+// RLIMIT_AS — a virtual-address-space cap — via prlimit64. Lowering your own
+// limit needs no privilege, so `Enforce(os.Getpid(), {MaxMemoryMB: 256})`
+// actually SUCCEEDS in capping the test binary at 256 MB, and enforceFallback's
+// cleanup is a no-op that never restores it. The Go runtime then can't mmap past
+// that cap and the package dies with "fatal error: runtime: cannot allocate
+// memory" — nondeterministically, depending on the process's virtual footprint
+// at that moment (hence the flakiness; it crashed even under `go test -p 1`,
+// with no parallel package binaries to blame).
+//
+// Enforce is only ever meant to constrain a CHILD compute process (see
+// daemon.SetProcessNotifier), so the tests do the same. The child is the test
+// binary re-exec'd to run TestLimiterHelperProcess, which just blocks; it is
+// killed on cleanup. If the limiter caps the child's address space and the child
+// crashes, that's fine — its stdio is discarded and we never inspect its exit.
+func startLimiterTestChild(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=TestLimiterHelperProcess")
+	cmd.Env = append(os.Environ(), "GO_LIMITER_HELPER=1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start limiter helper child: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
+}
+
+// TestLimiterHelperProcess is not a real test: it is the body of the disposable
+// child spawned by startLimiterTestChild. It blocks so the parent can apply (and
+// tear down) limits against a live PID, then exits. Under a normal `go test` run
+// GO_LIMITER_HELPER is unset, so it returns immediately and is a harmless no-op.
+func TestLimiterHelperProcess(t *testing.T) {
+	if os.Getenv("GO_LIMITER_HELPER") != "1" {
+		return
+	}
+	time.Sleep(5 * time.Second)
+}
 
 func TestCheckDiskSpace_SufficientSpace(t *testing.T) {
 	l := NewLimiter(slog.Default())
@@ -46,13 +91,12 @@ func TestEnforce_ReturnsCleanup(t *testing.T) {
 		MaxCPUCores: 1,
 		MaxMemoryMB: 256,
 	}
-	// Use our own PID — Enforce may not fully apply limits to self,
-	// but it should return a non-nil cleanup function without error
-	// on the current platform (Windows: Job Object, macOS: setpriority).
-	// On Linux without cgroups, prlimit on self is also valid.
-	cleanup, err := l.Enforce(1, limits)
+	// Enforce against a disposable child, never the test process itself (see
+	// startLimiterTestChild). It should return a non-nil cleanup without error
+	// on every platform (Linux: prlimit/affinity, Windows: Job Object, macOS:
+	// setpriority).
+	cleanup, err := l.Enforce(startLimiterTestChild(t), limits)
 	if err != nil {
-		// Some platforms may fail with PID 1 (init process). Skip rather than fail.
 		t.Skipf("Enforce returned error (may be expected on this platform): %v", err)
 	}
 	if cleanup == nil {
@@ -62,17 +106,18 @@ func TestEnforce_ReturnsCleanup(t *testing.T) {
 	}
 }
 
-func TestEnforce_OwnProcess(t *testing.T) {
+func TestEnforce_ChildProcess(t *testing.T) {
 	l := NewLimiter(slog.Default())
 	limits := &config.ResourceLimits{
 		MaxCPUCores: 1,
 		MaxMemoryMB: 256,
 	}
-	// Use our own PID for a more reliable test.
-	pid := os.Getpid()
-	cleanup, err := l.Enforce(pid, limits)
+	// A live, non-self PID exercises the real enforce path (prlimit64 +
+	// sched_setaffinity on Linux) without capping the test binary's own
+	// address space — capping our own RLIMIT_AS is the #36 footgun.
+	cleanup, err := l.Enforce(startLimiterTestChild(t), limits)
 	if err != nil {
-		t.Skipf("Enforce on own PID returned error (may be expected): %v", err)
+		t.Skipf("Enforce on child PID returned error (may be expected): %v", err)
 	}
 	if cleanup == nil {
 		t.Error("Enforce should return a non-nil cleanup function")
