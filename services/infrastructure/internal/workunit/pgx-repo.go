@@ -308,6 +308,8 @@ func (r *PgxWorkUnitRepository) UpdateState(ctx context.Context, id types.ID, fr
 		}
 	} else if to == WorkUnitStateFailed {
 		TransitionToFailed(wu)
+	} else if to == WorkUnitStateValidated {
+		TransitionToValidated(wu)
 	} else {
 		wu.State = to
 	}

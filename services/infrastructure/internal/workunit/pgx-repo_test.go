@@ -525,6 +525,62 @@ func TestWorkUnitUpdateStateValidTransitions(t *testing.T) {
 	}
 }
 
+// TestWorkUnitUpdateStateStampsValidatedAt asserts the COMPLETED → VALIDATED
+// transition stamps validated_at. Before this fix it was never set, so every
+// validated unit carried validated_at = NULL (the stats/health columns read it).
+func TestWorkUnitUpdateStateStampsValidatedAt(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "wuvalidatedat")
+	leafID := createTestLeaf(t, pool, &userID)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := newTestWorkUnit(leafID, nil)
+	if err := repo.Create(ctx, wu); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Walk CREATED → QUEUED → ASSIGNED → RUNNING → COMPLETED; validated_at stays nil.
+	for _, tr := range []struct{ from, to WorkUnitState }{
+		{WorkUnitStateCreated, WorkUnitStateQueued},
+		{WorkUnitStateQueued, WorkUnitStateAssigned},
+		{WorkUnitStateAssigned, WorkUnitStateRunning},
+		{WorkUnitStateRunning, WorkUnitStateCompleted},
+	} {
+		updated, err := repo.UpdateState(ctx, wu.ID, tr.from, tr.to)
+		if err != nil {
+			t.Fatalf("UpdateState %s → %s: %v", tr.from, tr.to, err)
+		}
+		wu = updated
+	}
+	if wu.ValidatedAt != nil {
+		t.Fatalf("ValidatedAt = %v at COMPLETED, want nil", wu.ValidatedAt)
+	}
+
+	before := time.Now().Add(-time.Minute)
+	validated, err := repo.UpdateState(ctx, wu.ID, WorkUnitStateCompleted, WorkUnitStateValidated)
+	if err != nil {
+		t.Fatalf("UpdateState COMPLETED → VALIDATED: %v", err)
+	}
+	if validated.ValidatedAt == nil {
+		t.Fatal("ValidatedAt is nil after VALIDATED transition, want it stamped")
+	}
+	if validated.ValidatedAt.Before(before) {
+		t.Errorf("ValidatedAt = %v, want a recent timestamp (after %v)", validated.ValidatedAt, before)
+	}
+
+	// Confirm it is persisted, not just set on the returned struct.
+	reread, err := repo.GetByID(ctx, wu.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if reread.ValidatedAt == nil {
+		t.Error("ValidatedAt is nil on re-read from DB, want it persisted")
+	}
+}
+
 func TestWorkUnitUpdateStateInvalidTransition(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
