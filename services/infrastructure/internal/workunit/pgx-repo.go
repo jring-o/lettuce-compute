@@ -517,9 +517,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effTargetWuL+`
 		  -- Hard distinctness: never hand this volunteer a unit it already holds a LIVE
 		  -- copy of (no two concurrent copies to one volunteer).
 		  AND NOT EXISTS (
@@ -658,9 +656,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 	}
 	rows, err := r.db.Query(ctx, `
 		SELECT `+prefixedWorkUnitColumns+`,
-			CASE WHEN wu.spot_check THEN 2
-			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-			END AS effective_redundancy,
+			`+effTargetWuL+` AS effective_redundancy,
 			(
 				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
 				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
@@ -720,9 +716,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effTargetWuL+`
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -844,18 +838,14 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			      SELECT COUNT(*) FROM results res
 			      WHERE res.work_unit_id = wu2.id AND res.validation_status = 'PENDING'
 			    )
-			  ) < CASE WHEN wu2.spot_check THEN 2
-			       ELSE COALESCE((l2.validation_config->>'redundancy_factor')::int, 2)
-			      END
+			  ) < `+effTargetSQL("wu2", "l2")+`
 			ORDER BY wu2.priority DESC, wu2.created_at ASC
 			LIMIT $1
 			FOR UPDATE OF wu2 SKIP LOCKED
 		)
 		  AND l.id = wu.leaf_id
 		RETURNING `+prefixedWorkUnitColumns+`,
-			CASE WHEN wu.spot_check THEN 2
-			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-			END AS effective_redundancy,
+			`+effTargetWuL+` AS effective_redundancy,
 			(
 				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
 				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
@@ -1029,9 +1019,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		         WHERE h.work_unit_id = v.id AND h.outcome IS NULL)
 		        + (SELECT COUNT(*) FROM results res
 		           WHERE res.work_unit_id = v.id AND res.validation_status = 'PENDING')
-		      ) < CASE WHEN wu.spot_check THEN 2
-		           ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		          END
+		      ) < `+effTargetWuL+`
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res2
 		    WHERE res2.work_unit_id = v.id AND res2.volunteer_id = v.vol
@@ -1519,16 +1507,11 @@ func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workU
 		  AND (
 		    SELECT COUNT(*) FROM results res
 		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effQuorumWuL+`
 		  AND (
 		    SELECT COUNT(*) FROM work_unit_assignment_history h2
 		    WHERE h2.work_unit_id = wu.id
-		  ) >= CASE
-		         WHEN wu.max_total_copies > 0 THEN wu.max_total_copies
-		         ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2) + `+fmt.Sprintf("%d", defaultCopyRetryMargin)+`
-		       END`,
+		  ) >= `+effMaxTotalWuL+``,
 		workUnitID,
 	)
 	if err != nil {
