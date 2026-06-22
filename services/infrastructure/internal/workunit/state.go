@@ -2,6 +2,7 @@ package workunit
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 )
@@ -74,4 +75,15 @@ func TransitionToQueued(wu *WorkUnit) error {
 func TransitionToFailed(wu *WorkUnit) {
 	wu.State = WorkUnitStateFailed
 	wu.FlaggedForReview = true
+}
+
+// TransitionToValidated marks the unit VALIDATED (terminal) and stamps
+// validated_at. completed_at is stamped earlier by MarkCompleted at the
+// COMPLETED transition; this is the only place validated_at is set, so stats/
+// health that read it (and the credit-ledger join) get a real timestamp rather
+// than NULL.
+func TransitionToValidated(wu *WorkUnit) {
+	wu.State = WorkUnitStateValidated
+	now := time.Now().UTC()
+	wu.ValidatedAt = &now
 }
