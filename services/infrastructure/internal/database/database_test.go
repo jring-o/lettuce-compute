@@ -280,7 +280,7 @@ func TestRunMigrations_VerifySchema(t *testing.T) {
 		{"runtime_type", []string{"NATIVE", "CONTAINER", "WASM", "SCRIPT"}},
 		{"leaf_visibility", []string{"PUBLIC", "UNLISTED", "PRIVATE"}},
 		{"validation_status", []string{"PENDING", "AGREED", "DISAGREED"}},
-		{"assignment_outcome", []string{"COMPLETED", "EXPIRED", "ABANDONED", "REJECTED"}},
+		{"assignment_outcome", []string{"COMPLETED", "EXPIRED", "ABANDONED", "REJECTED", "SUPERSEDED"}},
 	}
 
 	for _, et := range enumTests {
