@@ -14,6 +14,11 @@ const (
 	OutcomeExpired   AssignmentOutcome = "EXPIRED"
 	OutcomeAbandoned AssignmentOutcome = "ABANDONED"
 	OutcomeRejected  AssignmentOutcome = "REJECTED"
+	// OutcomeSuperseded closes an extra in-flight copy NON-PUNITIVELY when the unit validated
+	// at quorum before the copy finished (target_copies > min_quorum, TODO #50). Unlike
+	// EXPIRED/ABANDONED it carries no bad reliability signal — the work was superseded, not
+	// failed. Never written for a target == quorum leaf (no extras exist at validation).
+	OutcomeSuperseded AssignmentOutcome = "SUPERSEDED"
 )
 
 // AssignmentHistoryEntry records a single assignment of a work unit to a volunteer.

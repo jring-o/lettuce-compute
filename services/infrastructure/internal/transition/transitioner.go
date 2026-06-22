@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -48,6 +49,9 @@ type WorkUnitStore interface {
 	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error)
+	// ExpireLiveCopies closes ALL live copies of a unit with the given outcome (used to
+	// SUPERSEDE the over-dispatch extras left running when a target>quorum unit validates).
+	ExpireLiveCopies(ctx context.Context, workUnitID types.ID, outcome string) (int, error)
 }
 
 // LeafStore is the narrow leaf repo surface the transitioner needs.
@@ -182,6 +186,15 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		}
 		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority); err != nil {
 			return OutcomeNoop, err
+		}
+		// Over-dispatch hygiene (TODO #50): validate-at-quorum can leave extra copies still
+		// running when target_copies > min_quorum. Close them SUPERSEDED so they are not later
+		// reaped EXPIRED (which would charge the holding host a bad reliability signal for work
+		// that was merely superseded). Best-effort + inert for target == quorum (no extras).
+		if n, serr := t.wus.ExpireLiveCopies(ctx, id, string(assignment.OutcomeSuperseded)); serr != nil {
+			t.logger.Warn("failed to supersede extra live copies after validation", "work_unit_id", id, "error", serr)
+		} else if n > 0 {
+			t.logger.Info("superseded extra in-flight copies after validate-at-quorum", "work_unit_id", id, "count", n)
 		}
 		return OutcomeValidated, nil
 
