@@ -176,6 +176,8 @@ func (m *mockWURepo) CountLiveCopies(context.Context, types.ID) (int, error) {
 func (m *mockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }
+func (m *mockWURepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (m *mockWURepo) MarkCompleted(context.Context, types.ID) error           { return nil }
 func (m *mockWURepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
 	return false, nil
 }

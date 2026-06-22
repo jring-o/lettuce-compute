@@ -19,6 +19,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -51,6 +52,11 @@ type volunteerService struct {
 	batchRepo               workunit.BatchRepository
 	checkpointRepo          checkpoint.Repository
 	validationEngine        *validation.Engine
+	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
+	// SubmitResult delegates the validate/reject/wait/dead-letter decision to it. Built in
+	// the constructor from the validation engine + repos; nil only when validationEngine is
+	// nil (gRPC-plumbing unit tests), where SubmitResult simply skips the evaluation.
+	transitioner            *transition.Transitioner
 	logger                  *slog.Logger
 	headName                string
 	headDescription         string
@@ -153,6 +159,19 @@ func NewVolunteerService(
 	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
 	// gRPC-plumbing unit tests).
 	s.loadEstimator = newLoadEstimator(defaultLoadEstimatorConfig(), poolSaturation(pool))
+
+	// Wire the single transitioner (TODO #50). It owns the redundancy decision; the
+	// validation engine is its comparator + accept/reject implementation. Built only when an
+	// engine is present (the gRPC-plumbing tests pass nil and skip evaluation). The lock is
+	// the cross-replica per-unit advisory lock when a pool is available, else a no-op (the
+	// optimistic state guards remain the correctness backstop either way).
+	if validationEngine != nil {
+		var locker transition.Locker = transition.NoopLocker{}
+		if pool != nil {
+			locker = transition.NewPgxLocker(pool, logger)
+		}
+		s.transitioner = transition.NewTransitioner(locker, wuRepo, leafRepo, resultRepo, validationEngine, logger)
+	}
 	return s
 }
 
@@ -1260,16 +1279,18 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	effectiveRedundancy := 1
+	// The COMPLETED threshold is the unit's effective QUORUM (TODO #50) — how many results
+	// are needed to attempt validation. Resolved through the single source (ResolvePolicy):
+	// for any leaf that only sets redundancy_factor this equals redundancy_factor (2 for a
+	// spot-check unit), identical to before. The actual validate/reject/wait/dead-letter
+	// decision is delegated to the transitioner below.
+	quorum := 1
 	completionLeaf, clErr := s.leafRepo.GetByID(ctx, currentWU.LeafID)
 	if clErr == nil {
-		effectiveRedundancy = completionLeaf.ValidationConfig.RedundancyFactor
-	}
-	if currentWU.SpotCheck && effectiveRedundancy < 2 {
-		effectiveRedundancy = 2
+		quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
 	}
 
-	if existingCount+1 >= effectiveRedundancy {
+	if existingCount+1 >= quorum {
 		// Redundancy met: this submit completed the last needed copy. Mark the unit
 		// COMPLETED (a submitted result implies the work ran). The unit was QUEUED
 		// throughout (its copies ran in parallel); the ASSIGNED/RUNNING values are
@@ -1303,7 +1324,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// ready pool. Evicting on full completion clears any stale snapshot/holder; a
 	// partial (redundancy>1) submit converted its hold to a history row at run-start,
 	// so there is nothing to release here for that case (the reconcile owns it).
-	if s.dispatchCache != nil && existingCount+1 >= effectiveRedundancy {
+	if s.dispatchCache != nil && existingCount+1 >= quorum {
 		s.dispatchCache.onUnitDone(workUnitID)
 	}
 
@@ -1312,25 +1333,26 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 
 	// Increment batch completed counter when the work unit transitioned to COMPLETED.
 	// Reuse currentWU from the transaction — no need for a second DB fetch.
-	if existingCount+1 >= effectiveRedundancy && s.batchRepo != nil {
+	if existingCount+1 >= quorum && s.batchRepo != nil {
 		if currentWU.BatchID != nil {
 			_ = s.batchRepo.IncrementCompleted(ctx, *currentWU.BatchID)
 		}
 	}
 
-	// Try validation — runs if enough results have been submitted. Capture the outcome
-	// (if any) so the per-WU "result accepted" Info below can report VALIDATED/REJECTED/
-	// PENDING; the result is otherwise discarded as before.
+	// Delegate the redundancy decision to the SINGLE transitioner (TODO #50): it loads the
+	// unit + copies + results + policy, runs the pure Decide, and applies the one outcome
+	// (validate / reject / wait / dead-letter) under a per-unit lock. This replaces the inline
+	// TryValidate call — the transitioner is now the sole decider of work-unit state.
 	validationOutcome := ""
-	if s.validationEngine != nil {
-		valRes, valErr := s.validationEngine.TryValidate(ctx, workUnitID)
-		if valErr != nil {
-			s.logger.Error("validation failed after result submission",
+	if s.transitioner != nil {
+		outcome, tErr := s.transitioner.Evaluate(ctx, workUnitID)
+		if tErr != nil {
+			s.logger.Error("transition evaluation failed after result submission",
 				"work_unit_id", workUnitID,
-				"error", valErr,
+				"error", tErr,
 			)
-		} else if valRes != nil {
-			validationOutcome = valRes.Outcome
+		} else {
+			validationOutcome = string(outcome)
 		}
 	}
 
@@ -1357,7 +1379,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		"work_unit_id", workUnitID,
 		"result_id", r.ID,
 		"volunteer_id", volunteerID,
-		"completed", existingCount+1 >= effectiveRedundancy,
+		"completed", existingCount+1 >= quorum,
 		"validation_outcome", validationOutcome)
 
 	return &lettucev1.SubmitResultResponse{
@@ -1680,9 +1702,15 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		s.dispatchCache.releaseInMem(workUnitID, volunteerID)
 	}
 
-	// Dead-letter only if the unit has exhausted its retry ceiling (property 6).
+	// Delegate the post-close decision to the single transitioner (TODO #50): requeue (stay
+	// QUEUED) vs dead-letter (retry ceiling exhausted). Falls back to the direct
+	// DeadLetterIfExhausted when no transitioner is wired (gRPC-plumbing tests).
 	requeued := true
-	if failed, derr := s.wuRepo.DeadLetterIfExhausted(ctx, workUnitID); derr == nil && failed {
+	if s.transitioner != nil {
+		if outcome, terr := s.transitioner.Evaluate(ctx, workUnitID); terr == nil && outcome == transition.OutcomeDeadLettered {
+			requeued = false
+		}
+	} else if failed, derr := s.wuRepo.DeadLetterIfExhausted(ctx, workUnitID); derr == nil && failed {
 		requeued = false
 	}
 

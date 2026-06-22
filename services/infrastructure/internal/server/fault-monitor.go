@@ -9,6 +9,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
@@ -23,18 +24,25 @@ type FaultMonitor struct {
 	// (EXPIRED) or abandoned (ABANDONED) copy is wasted work for the machine that held it.
 	// May be nil (tests / pre-#54) -> the signal is simply not recorded (best-effort).
 	reliabilityRepo reliability.Repository
-	logger          *slog.Logger
-	scanInterval    time.Duration
-	batchSize       int
+	// transitioner is the SINGLE owner of the post-copy-close redundancy decision (TODO #50):
+	// after a timed-out copy is closed, the fault monitor delegates "requeue vs dead-letter
+	// vs (now) validate-at-quorum" to it. May be nil (tests) -> the legacy direct
+	// DeadLetterIfExhausted path is used, which is behavior-identical for the dead-letter case.
+	transitioner *transition.Transitioner
+	logger       *slog.Logger
+	scanInterval time.Duration
+	batchSize    int
 }
 
-// NewFaultMonitor creates a new FaultMonitor with default settings.
+// NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
+// (tests / no validation engine) -> the monitor falls back to direct DeadLetterIfExhausted.
 func NewFaultMonitor(
 	workUnitRepo workunit.WorkUnitRepository,
 	assignRepo assignment.Repository,
 	checkpointRepo checkpoint.Repository,
 	leafRepo leaf.Repository,
 	reliabilityRepo reliability.Repository,
+	transitioner *transition.Transitioner,
 	logger *slog.Logger,
 ) *FaultMonitor {
 	return &FaultMonitor{
@@ -43,6 +51,7 @@ func NewFaultMonitor(
 		checkpointRepo:  checkpointRepo,
 		leafRepo:        leafRepo,
 		reliabilityRepo: reliabilityRepo,
+		transitioner:    transitioner,
 		logger:          logger,
 		scanInterval:    30 * time.Second,
 		batchSize:       100,
@@ -111,17 +120,32 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 			}
 		}
 
-		// Dead-letter only if the unit has exhausted its retry ceiling with redundancy
-		// unmet and no live copy left; otherwise it stays QUEUED and redispatches.
-		failed, err := m.workUnitRepo.DeadLetterIfExhausted(ctx, cp.WorkUnitID)
-		if err != nil {
-			m.logger.Error("dead-letter check failed", "work_unit_id", cp.WorkUnitID, "error", err)
-			continue
-		}
-		if failed {
-			m.logger.Warn("work unit dead-lettered after exhausting retry ceiling",
-				"work_unit_id", cp.WorkUnitID)
-			m.cleanupCheckpointByID(ctx, cp.WorkUnitID)
+		// Delegate the post-close decision to the single transitioner (TODO #50): with the
+		// copy now closed, it decides requeue (stay QUEUED, redispatch) vs dead-letter (FAILED
+		// when the copy budget is exhausted with redundancy unmet and no live copy) vs — for a
+		// target>quorum leaf — validate/reject from the remaining results. Behavior-identical
+		// to the old direct DeadLetterIfExhausted for the dead-letter case. Falls back to the
+		// direct call when no transitioner is wired (tests).
+		if m.transitioner != nil {
+			outcome, terr := m.transitioner.Evaluate(ctx, cp.WorkUnitID)
+			if terr != nil {
+				m.logger.Error("transition evaluation failed after copy close", "work_unit_id", cp.WorkUnitID, "error", terr)
+				continue
+			}
+			if outcome == transition.OutcomeDeadLettered {
+				m.cleanupCheckpointByID(ctx, cp.WorkUnitID)
+			}
+		} else {
+			failed, err := m.workUnitRepo.DeadLetterIfExhausted(ctx, cp.WorkUnitID)
+			if err != nil {
+				m.logger.Error("dead-letter check failed", "work_unit_id", cp.WorkUnitID, "error", err)
+				continue
+			}
+			if failed {
+				m.logger.Warn("work unit dead-lettered after exhausting retry ceiling",
+					"work_unit_id", cp.WorkUnitID)
+				m.cleanupCheckpointByID(ctx, cp.WorkUnitID)
+			}
 		}
 	}
 

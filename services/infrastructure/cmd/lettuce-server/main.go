@@ -34,6 +34,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -159,6 +160,14 @@ func main() {
 
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
 	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger)
+
+	// The single transitioner (TODO #50): the sole decider of work-unit redundancy state.
+	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
+	// dead-letter" decision to it. The validation engine is its comparator + accept/reject
+	// implementation; the per-unit lock is the cross-replica Postgres advisory lock.
+	transitioner := transition.NewTransitioner(
+		transition.NewPgxLocker(pool, logger),
+		wuRepo, leafRepo, resultRepo, validationEngine, logger)
 
 	// Parse trusted reverse-proxy networks for trust-aware client-IP extraction.
 	// (Config validation already verified these parse; this cannot fail here.)
@@ -334,7 +343,7 @@ func main() {
 	//     scans/logs AND keeps the hygiene sweep single-acting.
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
-	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, logger)
+	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger)
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)

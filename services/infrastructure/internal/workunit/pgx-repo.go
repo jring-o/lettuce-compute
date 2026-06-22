@@ -1488,6 +1488,40 @@ func (r *PgxWorkUnitRepository) CountTotalCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
+// MarkCompleted transitions a unit QUEUED/ASSIGNED/RUNNING -> COMPLETED — the pre-validation
+// state once a quorum's worth of results is in. Idempotent: an already-COMPLETED or terminal
+// unit is untouched (0 rows). This is the inline UPDATE SubmitResult used before the
+// transitioner, extracted so the transitioner is the sole caller of the COMPLETED mark.
+func (r *PgxWorkUnitRepository) MarkCompleted(ctx context.Context, id types.ID) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE work_units SET
+			state = 'COMPLETED',
+			started_at = COALESCE(started_at, NOW()),
+			completed_at = NOW()
+		WHERE id = $1 AND state IN ('QUEUED', 'ASSIGNED', 'RUNNING')`, id)
+	if err != nil {
+		return apierror.Internal("failed to mark work unit completed", err)
+	}
+	return nil
+}
+
+// CountErrorCopies returns the unit's wasted-work tally: copies that ended EXPIRED or ABANDONED
+// plus DISAGREED results — the max_error_copies cap probe (TODO #50).
+func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error) {
+	var n int
+	if err := r.db.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM work_unit_assignment_history
+		   WHERE work_unit_id = $1 AND outcome IN ('EXPIRED', 'ABANDONED'))
+		  + (SELECT COUNT(*) FROM results
+		     WHERE work_unit_id = $1 AND validation_status = 'DISAGREED')`,
+		workUnitID,
+	).Scan(&n); err != nil {
+		return 0, apierror.Internal("failed to count error copies", err)
+	}
+	return n, nil
+}
+
 // DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED,
 // has NO live copy outstanding, its redundancy is still unmet (PENDING results <
 // redundancy), AND the total copies ever created has reached its dead-letter ceiling
