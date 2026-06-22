@@ -38,7 +38,8 @@ const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 	reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
-	created_at, updated_at, hr_class`
+	created_at, updated_at, hr_class,
+	target_copies, min_quorum, max_error_copies, max_success_copies`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
 // The column order must match workUnitColumns.
@@ -73,6 +74,10 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.CreatedAt,
 		&wu.UpdatedAt,
 		&wu.HRClass,
+		&wu.TargetCopies,
+		&wu.MinQuorum,
+		&wu.MaxErrorCopies,
+		&wu.MaxSuccessCopies,
 	)
 	return &wu, err
 }
@@ -119,14 +124,16 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 			estimated_duration_seconds, deadline_seconds, output_spec,
 			assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 			reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
-			flagged_for_review, spot_check
+			flagged_for_review, spot_check,
+			target_copies, min_quorum, max_error_copies, max_success_copies
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8,
 			$9, $10, $11,
 			$12, $13, $14, $15, $16,
 			$17, $18, $19, $20,
-			$21, $22
+			$21, $22,
+			$23, $24, $25, $26
 		) RETURNING `+workUnitColumns,
 		wu.LeafID, wu.BatchID, wu.State, wu.Priority,
 		wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
@@ -134,6 +141,7 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 		wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 		wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 		wu.FlaggedForReview, wu.SpotCheck,
+		wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
 	)
 
 	result, err := scanWorkUnit(row)
@@ -369,6 +377,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 		"assigned_volunteer_id", "assigned_at", "started_at", "completed_at", "validated_at",
 		"reassignment_count", "max_reassignments", "max_total_copies", "last_heartbeat_at",
 		"flagged_for_review", "spot_check",
+		"target_copies", "min_quorum", "max_error_copies", "max_success_copies",
 	}
 
 	rows := make([][]any, len(wus))
@@ -380,6 +389,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 			wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 			wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 			wu.FlaggedForReview, wu.SpotCheck,
+			wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
 		}
 	}
 
@@ -433,7 +443,8 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.assigned_volunteer_id, wu.assigned_at, wu.started_at, wu.completed_at, wu.validated_at,
 	wu.reassignment_count, wu.max_reassignments, wu.max_total_copies, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
-	wu.created_at, wu.updated_at, wu.hr_class`
+	wu.created_at, wu.updated_at, wu.hr_class,
+	wu.target_copies, wu.min_quorum, wu.max_error_copies, wu.max_success_copies`
 
 // scanDispatchCandidate scans the prefixedWorkUnitColumns set (column order matching
 // the const above) into a WorkUnit. Shared by FindDispatchableBatch /
@@ -447,6 +458,7 @@ func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
 		&wu.ReassignmentCount, &wu.MaxReassignments, &wu.MaxTotalCopies, &wu.LastHeartbeatAt,
 		&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
 		&wu.CreatedAt, &wu.UpdatedAt, &wu.HRClass,
+		&wu.TargetCopies, &wu.MinQuorum, &wu.MaxErrorCopies, &wu.MaxSuccessCopies,
 	}
 	dst = append(dst, extra...)
 	return rows.Scan(dst...)
@@ -505,9 +517,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effTargetWuL+`
 		  -- Hard distinctness: never hand this volunteer a unit it already holds a LIVE
 		  -- copy of (no two concurrent copies to one volunteer).
 		  AND NOT EXISTS (
@@ -646,9 +656,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 	}
 	rows, err := r.db.Query(ctx, `
 		SELECT `+prefixedWorkUnitColumns+`,
-			CASE WHEN wu.spot_check THEN 2
-			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-			END AS effective_redundancy,
+			`+effTargetWuL+` AS effective_redundancy,
 			(
 				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
 				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
@@ -708,9 +716,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		      SELECT COUNT(*) FROM results res
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effTargetWuL+`
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -832,18 +838,14 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			      SELECT COUNT(*) FROM results res
 			      WHERE res.work_unit_id = wu2.id AND res.validation_status = 'PENDING'
 			    )
-			  ) < CASE WHEN wu2.spot_check THEN 2
-			       ELSE COALESCE((l2.validation_config->>'redundancy_factor')::int, 2)
-			      END
+			  ) < `+effTargetSQL("wu2", "l2")+`
 			ORDER BY wu2.priority DESC, wu2.created_at ASC
 			LIMIT $1
 			FOR UPDATE OF wu2 SKIP LOCKED
 		)
 		  AND l.id = wu.leaf_id
 		RETURNING `+prefixedWorkUnitColumns+`,
-			CASE WHEN wu.spot_check THEN 2
-			     ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-			END AS effective_redundancy,
+			`+effTargetWuL+` AS effective_redundancy,
 			(
 				(SELECT COUNT(*) FROM work_unit_assignment_history wuah
 				 WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL)
@@ -1017,9 +1019,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		         WHERE h.work_unit_id = v.id AND h.outcome IS NULL)
 		        + (SELECT COUNT(*) FROM results res
 		           WHERE res.work_unit_id = v.id AND res.validation_status = 'PENDING')
-		      ) < CASE WHEN wu.spot_check THEN 2
-		           ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		          END
+		      ) < `+effTargetWuL+`
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res2
 		    WHERE res2.work_unit_id = v.id AND res2.volunteer_id = v.vol
@@ -1488,6 +1488,40 @@ func (r *PgxWorkUnitRepository) CountTotalCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
+// MarkCompleted transitions a unit QUEUED/ASSIGNED/RUNNING -> COMPLETED — the pre-validation
+// state once a quorum's worth of results is in. Idempotent: an already-COMPLETED or terminal
+// unit is untouched (0 rows). This is the inline UPDATE SubmitResult used before the
+// transitioner, extracted so the transitioner is the sole caller of the COMPLETED mark.
+func (r *PgxWorkUnitRepository) MarkCompleted(ctx context.Context, id types.ID) error {
+	_, err := r.db.Exec(ctx, `
+		UPDATE work_units SET
+			state = 'COMPLETED',
+			started_at = COALESCE(started_at, NOW()),
+			completed_at = NOW()
+		WHERE id = $1 AND state IN ('QUEUED', 'ASSIGNED', 'RUNNING')`, id)
+	if err != nil {
+		return apierror.Internal("failed to mark work unit completed", err)
+	}
+	return nil
+}
+
+// CountErrorCopies returns the unit's wasted-work tally: copies that ended EXPIRED or ABANDONED
+// plus DISAGREED results — the max_error_copies cap probe (TODO #50).
+func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error) {
+	var n int
+	if err := r.db.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM work_unit_assignment_history
+		   WHERE work_unit_id = $1 AND outcome IN ('EXPIRED', 'ABANDONED'))
+		  + (SELECT COUNT(*) FROM results
+		     WHERE work_unit_id = $1 AND validation_status = 'DISAGREED')`,
+		workUnitID,
+	).Scan(&n); err != nil {
+		return 0, apierror.Internal("failed to count error copies", err)
+	}
+	return n, nil
+}
+
 // DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED,
 // has NO live copy outstanding, its redundancy is still unmet (PENDING results <
 // redundancy), AND the total copies ever created has reached its dead-letter ceiling
@@ -1507,16 +1541,11 @@ func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workU
 		  AND (
 		    SELECT COUNT(*) FROM results res
 		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		  ) < CASE WHEN wu.spot_check THEN 2
-		       ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2)
-		      END
+		  ) < `+effQuorumWuL+`
 		  AND (
 		    SELECT COUNT(*) FROM work_unit_assignment_history h2
 		    WHERE h2.work_unit_id = wu.id
-		  ) >= CASE
-		         WHEN wu.max_total_copies > 0 THEN wu.max_total_copies
-		         ELSE COALESCE((l.validation_config->>'redundancy_factor')::int, 2) + `+fmt.Sprintf("%d", defaultCopyRetryMargin)+`
-		       END`,
+		  ) >= `+effMaxTotalWuL+``,
 		workUnitID,
 	)
 	if err != nil {

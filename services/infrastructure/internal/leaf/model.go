@@ -118,6 +118,28 @@ type ValidationConfig struct {
 	SpotCheckEnabled    bool     `json:"spot_check_enabled"`
 	SpotCheckPercentage float64  `json:"spot_check_percentage"`
 
+	// TargetCopies / MinQuorum split the conflated redundancy_factor (TODO #50):
+	// target_copies is how many copies to dispatch concurrently; min_quorum is how many
+	// agreeing results validate the unit. Invariant: 1 <= min_quorum <= target_copies.
+	// Both omitempty with a 0 sentinel meaning "= redundancy_factor" — so a leaf that only
+	// sets redundancy_factor behaves byte-for-byte as before (target == quorum ==
+	// redundancy_factor). Setting target_copies > min_quorum lets a leaf over-dispatch and
+	// validate at quorum without waiting for stragglers (removes the serial-reassignment
+	// latency tail). redundancy_factor remains the back-compat alias for target == quorum.
+	TargetCopies int `json:"target_copies,omitempty"`
+	MinQuorum    int `json:"min_quorum,omitempty"`
+
+	// MaxTotalCopies / MaxErrorCopies / MaxSuccessCopies are the hard caps that bound a
+	// non-converging unit (TODO #50, reconciling #40). All 0 = the documented default:
+	//   MaxTotalCopies   0 -> target_copies + a retry margin (the dead-letter ceiling,
+	//                         previously only the inert per-WU column EffectiveMaxTotalCopies)
+	//   MaxErrorCopies   0 -> unlimited (only MaxTotalCopies bounds errors, as today)
+	//   MaxSuccessCopies 0 -> target_copies (dispatch already stops at target today)
+	// Stamped per-unit at generation; resolved through transition.RedundancyPolicy.
+	MaxTotalCopies   int `json:"max_total_copies,omitempty"`
+	MaxErrorCopies   int `json:"max_error_copies,omitempty"`
+	MaxSuccessCopies int `json:"max_success_copies,omitempty"`
+
 	// IgnoreFields lists output JSON field paths to EXCLUDE from result comparison —
 	// volatile provenance like a wall-clock "compute_time_ms" that legitimately differs
 	// run-to-run and would otherwise break agreement. A path matches a field iff it
@@ -138,6 +160,36 @@ type ValidationConfig struct {
 	// single hardware class (CPU vendor + OS + arch), so bit-for-bit agreement is
 	// achievable even for engines that are not portably deterministic. See dispatch.
 	HomogeneousRedundancy bool `json:"homogeneous_redundancy,omitempty"`
+}
+
+// EffectiveTargetCopies resolves the target_copies 0 sentinel (TODO #50): the configured
+// target_copies if set, else redundancy_factor (floored at 1). This is the leaf-config
+// layer of the resolution; transition.ResolvePolicy layers the per-unit stamp on top.
+func (c ValidationConfig) EffectiveTargetCopies() int {
+	if c.TargetCopies > 0 {
+		return c.TargetCopies
+	}
+	if c.RedundancyFactor < 1 {
+		return 1
+	}
+	return c.RedundancyFactor
+}
+
+// EffectiveMinQuorum resolves the min_quorum 0 sentinel (TODO #50): the configured
+// min_quorum if set, else redundancy_factor (floored at 1, and defensively clamped to not
+// exceed the effective target — the validator rejects min_quorum > target_copies up front).
+func (c ValidationConfig) EffectiveMinQuorum() int {
+	q := c.MinQuorum
+	if q <= 0 {
+		q = c.RedundancyFactor
+	}
+	if q < 1 {
+		q = 1
+	}
+	if t := c.EffectiveTargetCopies(); q > t {
+		q = t
+	}
+	return q
 }
 
 // FaultToleranceConfig defines deadline-based reassignment settings.

@@ -477,6 +477,55 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			validationDetail{Field: "redundancy_factor", Reason: "out_of_range"})
 	}
 
+	// Explicit target/quorum split (TODO #50). Each is optional (0 = derive from
+	// redundancy_factor); when set it must be >= 1, and the resolved min_quorum must not
+	// exceed the resolved target_copies. Validating the RESOLVED values (not the raw
+	// fields) means a leaf that sets only target_copies, or only min_quorum, or only
+	// redundancy_factor, is all checked consistently against the same effective numbers.
+	if c.TargetCopies < 0 {
+		return apierror.ValidationError("target_copies must be at least 1",
+			validationDetail{Field: "target_copies", Reason: "out_of_range"})
+	}
+	if c.MinQuorum < 0 {
+		return apierror.ValidationError("min_quorum must be at least 1",
+			validationDetail{Field: "min_quorum", Reason: "out_of_range"})
+	}
+	effTarget := c.EffectiveTargetCopies()
+	effQuorum := c.MinQuorum
+	if effQuorum <= 0 {
+		effQuorum = c.RedundancyFactor
+	}
+	if effQuorum > effTarget {
+		return apierror.ValidationError(
+			"min_quorum must be less than or equal to target_copies",
+			validationDetail{Field: "min_quorum", Reason: "exceeds_target"})
+	}
+
+	// Hard caps (TODO #50, reconciling #40). Each optional (0 = default); when set, a cap
+	// below the redundancy it bounds would make the unit un-validatable, so reject it.
+	if c.MaxTotalCopies < 0 {
+		return apierror.ValidationError("max_total_copies must be at least target_copies",
+			validationDetail{Field: "max_total_copies", Reason: "out_of_range"})
+	}
+	if c.MaxTotalCopies > 0 && c.MaxTotalCopies < effTarget {
+		return apierror.ValidationError(
+			"max_total_copies must be at least target_copies (a lower ceiling can never reach redundancy)",
+			validationDetail{Field: "max_total_copies", Reason: "below_target"})
+	}
+	if c.MaxSuccessCopies < 0 {
+		return apierror.ValidationError("max_success_copies must be at least min_quorum",
+			validationDetail{Field: "max_success_copies", Reason: "out_of_range"})
+	}
+	if c.MaxSuccessCopies > 0 && c.MaxSuccessCopies < effQuorum {
+		return apierror.ValidationError(
+			"max_success_copies must be at least min_quorum (fewer successes can never reach quorum)",
+			validationDetail{Field: "max_success_copies", Reason: "below_quorum"})
+	}
+	if c.MaxErrorCopies < 0 {
+		return apierror.ValidationError("max_error_copies must be at least 1",
+			validationDetail{Field: "max_error_copies", Reason: "out_of_range"})
+	}
+
 	// Agreement threshold: 0.0-1.0
 	if c.AgreementThreshold < 0 || c.AgreementThreshold > 1 {
 		return apierror.ValidationError("agreement_threshold must be between 0.0 and 1.0",
@@ -517,9 +566,12 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 
 	// Spot-check validation
 	if c.SpotCheckEnabled {
-		if c.RedundancyFactor > 1 {
+		// Spot-check forces a corroborator (effective target/quorum 2) only on a
+		// single-copy leaf, so it is valid only when the resolved target is 1 (== the old
+		// redundancy_factor==1 rule, now also rejecting an explicit target_copies > 1).
+		if c.EffectiveTargetCopies() > 1 {
 			return apierror.ValidationError(
-				"spot-check validation is only for redundancy_factor=1 leafs; use redundancy_factor >= 2 instead",
+				"spot-check validation is only for single-copy leafs (target_copies/redundancy_factor = 1); use target_copies >= 2 instead",
 				validationDetail{Field: "spot_check_enabled", Reason: "requires_redundancy_1"})
 		}
 		if c.SpotCheckPercentage < 1.0 || c.SpotCheckPercentage > 20.0 {

@@ -569,7 +569,7 @@ func TestE2EV03Lifecycle(t *testing.T) {
 		// Run fault monitor ScanOnce.
 		wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 		assignRepo := assignment.NewPgxRepository(pool)
-		monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, nil, testLogger())
+		monitor := server.NewFaultMonitor(wuRepo, assignRepo, nil, nil, nil, nil, testLogger())
 		if err := monitor.ScanOnce(ctx); err != nil {
 			t.Fatalf("ScanOnce: %v", err)
 		}
@@ -720,8 +720,10 @@ func TestE2EV03Lifecycle(t *testing.T) {
 			t.Error("should NOT dead-letter after a single timed-out copy (requeue is uncapped)")
 		}
 
-		// Copy 2: reserve + time out again. Total copies now reaches max_total_copies=2.
-		cp2, err := wuRepo.ReserveCopy(ctx, wuID4, volAIDParsed, nil, reservedUntil, 3600)
+		// Copy 2: reserve + time out again, with a DISTINCT volunteer (volA is in
+		// post-failure cooldown after its copy 1 expired — #49). Total copies now reaches
+		// max_total_copies=2.
+		cp2, err := wuRepo.ReserveCopy(ctx, wuID4, volBIDParsed, nil, reservedUntil, 3600)
 		if err != nil {
 			t.Fatalf("reserve copy 2: %v", err)
 		}

@@ -230,6 +230,8 @@ func (m *mockWorkUnitRepo) CountLiveCopies(context.Context, types.ID) (int, erro
 func (m *mockWorkUnitRepo) CountTotalCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }
+func (m *mockWorkUnitRepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (m *mockWorkUnitRepo) MarkCompleted(context.Context, types.ID) error           { return nil }
 func (m *mockWorkUnitRepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
 	return false, nil
 }

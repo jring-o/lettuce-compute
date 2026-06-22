@@ -1,0 +1,14 @@
+-- 00011_superseded_copy_outcome.up.sql
+-- Over-dispatch hygiene (TODO #50): a new copy outcome SUPERSEDED.
+--
+-- With target_copies > min_quorum a unit is dispatched to more volunteers than are needed to
+-- validate, and it validates as soon as a quorum agrees — WITHOUT waiting for the extra copies
+-- still in flight. Those extras must be closed NON-PUNITIVELY: if they were left to lapse they
+-- would be reaped EXPIRED by the fault monitor, which charges the holding host a bad
+-- reliability outcome (#54) for work that was simply superseded, not failed. SUPERSEDED closes
+-- the copy without that penalty (it is neither a wasted-work outcome nor a credited one).
+--
+-- ADDITIVE / non-breaking: a new enum value only. For a leaf at target == quorum (every leaf
+-- today) there are never extra in-flight copies at validation, so this value is never written —
+-- behavior is unchanged. ADD VALUE is transactional on PostgreSQL 12+ (the head runs 16).
+ALTER TYPE assignment_outcome ADD VALUE IF NOT EXISTS 'SUPERSEDED';

@@ -160,6 +160,14 @@ type WorkUnitRepository interface {
 	// CountTotalCopies returns the total copies ever created for a unit (dead-letter probe).
 	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
 
+	// CountErrorCopies returns the unit's wasted-work tally (EXPIRED/ABANDONED copies +
+	// DISAGREED results) — the max_error_copies cap probe (TODO #50).
+	CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error)
+
+	// MarkCompleted transitions a unit QUEUED/ASSIGNED/RUNNING -> COMPLETED (the pre-validation
+	// state once a quorum's worth of results is in). Idempotent. Owned by the transitioner.
+	MarkCompleted(ctx context.Context, id types.ID) error
+
 	// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review when it is QUEUED
 	// with no live copy, redundancy unmet, and total copies >= its dead-letter ceiling
 	// (max_total_copies / derived default). The only cap on requeue (property 6).

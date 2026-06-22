@@ -153,6 +153,53 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 	}
 }
 
+// --- Transitioner-facing API (TODO #50) ---
+//
+// These expose the comparator and the accept/reject EFFECTS to internal/transition, which owns
+// the decision (when to validate / reject / wait / dead-letter). The engine no longer decides
+// the outcome on its own — TryValidate remains only for legacy/test callers; the live
+// SubmitResult / fault-monitor paths route through the transitioner.
+
+// FilterPending returns the version-homogeneous subset of pending results (never compare across
+// artifact versions). The transitioner calls this before counting + comparing so its quorum
+// gate matches the legacy TryValidate gate.
+func (e *Engine) FilterPending(pending []*result.Result) []*result.Result {
+	return versionHomogeneousGroup(pending)
+}
+
+// Compare runs the leaf's comparator (READ-ONLY) over the pending results and returns the
+// largest agreeing group. No state is written — the transitioner decides the outcome from the
+// group + the resolved RedundancyPolicy. CUSTOM remains the Alpha stub (#47 out of scope).
+func (e *Engine) Compare(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) ([]*result.Result, error) {
+	switch proj.ValidationConfig.ComparisonMode {
+	case leaf.ComparisonExact:
+		return e.compareExact(proj, pending)
+	case leaf.ComparisonNumericTolerance:
+		return e.compareNumericTolerance(proj, pending)
+	case leaf.ComparisonCustom:
+		return nil, fmt.Errorf("custom comparison mode is not implemented in Alpha")
+	default:
+		return nil, fmt.Errorf("unknown comparison mode: %s", proj.ValidationConfig.ComparisonMode)
+	}
+}
+
+// ApplyAccept performs the validate effects for a unit whose results reached quorum agreement:
+// mark AGREED/DISAGREED, transition COMPLETED -> VALIDATED, grant credit/RAC, sign
+// attestations, update counters + reliability. The unit must already be COMPLETED (the
+// transitioner marks it so first). The engine half of the transitioner's ActionValidate.
+func (e *Engine) ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending, majority []*result.Result) error {
+	_, err := e.acceptResults(ctx, wu, proj, pending, majority)
+	return err
+}
+
+// ApplyReject performs the reject effects: mark all pending DISAGREED, transition
+// COMPLETED -> REJECTED, attest, and requeue (Reassign). The unit must already be COMPLETED.
+// The engine half of the transitioner's ActionReject.
+func (e *Engine) ApplyReject(ctx context.Context, wu *workunit.WorkUnit, pending []*result.Result) error {
+	_, err := e.rejectAll(ctx, wu, pending)
+	return err
+}
+
 // versionHomogeneousGroup returns the largest subset of pending results that all share
 // one artifact version (nil/legacy is its own group), so validation never compares
 // across artifact versions. Ties break deterministically by version key. With
@@ -185,12 +232,23 @@ func versionHomogeneousGroup(pending []*result.Result) []*result.Result {
 }
 
 // validateExact groups results by output checksum and applies quorum selection.
-//
-// When the leaf declares ignore_fields, the grouping key is recomputed canonically
-// from the stored output (volatile fields stripped + object keys sorted) so that a
-// wall-clock field like compute_time_ms no longer prevents agreement; otherwise the
-// raw submitted checksum is used (historical behavior, unchanged).
 func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) (*ValidationResult, error) {
+	majorityGroup, err := e.compareExact(proj, pending)
+	if err != nil {
+		return nil, err
+	}
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, len(majorityGroup))
+}
+
+// compareExact is the read-only EXACT comparator: it returns the largest agreeing group of
+// results WITHOUT writing any state. Shared by validateExact (legacy TryValidate path) and the
+// transitioner (which decides the outcome from the group via transition.Decide).
+//
+// When the leaf declares ignore_fields, the grouping key is recomputed canonically from the
+// stored output (volatile fields stripped + object keys sorted) so that a wall-clock field
+// like compute_time_ms no longer prevents agreement; otherwise the raw submitted checksum is
+// used (historical behavior, unchanged).
+func (e *Engine) compareExact(proj *leaf.Leaf, pending []*result.Result) ([]*result.Result, error) {
 	ignoreFields := proj.ValidationConfig.IgnoreFields
 
 	// Group results by (canonical) checksum.
@@ -203,9 +261,8 @@ func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj 
 		groups[key] = append(groups[key], r)
 	}
 
-	// Find the largest group (majority).
-	// When groups are tied in size, pick the one with the lexicographically
-	// smallest checksum so the outcome is deterministic regardless of map
+	// Find the largest group (majority). When groups are tied in size, pick the one with the
+	// lexicographically smallest checksum so the outcome is deterministic regardless of map
 	// iteration order.
 	var majorityChecksum string
 	var majorityCount int
@@ -216,12 +273,22 @@ func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj 
 			majorityChecksum = checksum
 		}
 	}
-
-	return e.applyThreshold(ctx, wu, proj, pending, groups[majorityChecksum], majorityCount)
+	return groups[majorityChecksum], nil
 }
 
 // validateNumericTolerance compares numeric output data within epsilon tolerance.
 func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) (*ValidationResult, error) {
+	majorityGroup, err := e.compareNumericTolerance(proj, pending)
+	if err != nil {
+		return nil, err
+	}
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, len(majorityGroup))
+}
+
+// compareNumericTolerance is the read-only NUMERIC_TOLERANCE comparator: it returns the
+// largest mutually-compatible clique of results WITHOUT writing state. Shared by
+// validateNumericTolerance (legacy path) and the transitioner.
+func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Result) ([]*result.Result, error) {
 	epsilon := float64(0)
 	if proj.ValidationConfig.NumericTolerance != nil {
 		epsilon = *proj.ValidationConfig.NumericTolerance
@@ -268,7 +335,7 @@ func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.Work
 		majorityGroup[i] = pending[idx]
 	}
 
-	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, len(clique))
+	return majorityGroup, nil
 }
 
 // applyThreshold applies the agreement threshold and performs the validation outcome.

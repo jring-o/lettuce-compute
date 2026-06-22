@@ -167,6 +167,8 @@ func (m *bvMockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int,
 }
 func (m *bvMockWURepo) CountLiveCopies(context.Context, types.ID) (int, error)  { return 0, nil }
 func (m *bvMockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (m *bvMockWURepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (m *bvMockWURepo) MarkCompleted(context.Context, types.ID) error           { return nil }
 func (m *bvMockWURepo) DeadLetterIfExhausted(context.Context, types.ID) (bool, error) {
 	return false, nil
 }

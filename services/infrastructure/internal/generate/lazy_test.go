@@ -100,6 +100,8 @@ func (r *mockWorkUnitRepo) FindStuckSpotCheckUnits(context.Context, int) ([]*wor
 func (r *mockWorkUnitRepo) CloseCopy(context.Context, types.ID, string) error {
 	return nil
 }
+func (r *mockWorkUnitRepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }
+func (r *mockWorkUnitRepo) MarkCompleted(context.Context, types.ID) error           { return nil }
 func (r *mockWorkUnitRepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
 	return nil
 }
