@@ -979,6 +979,39 @@ func (c *dispatchCache) releaseInMemLocked(unitID, volunteerID types.ID) {
 	c.purgePendingForLocked(unitID, volunteerID)
 }
 
+// voidNonLandedCopy reverses a hand-out the DB flush refused (FlushReservations returned the
+// copy un-landed) and benches the volunteer on the still-staged candidate so the cache stops
+// re-offering an un-reservable unit to the same volunteer.
+//
+// A flush conflict is usually the POST-FAILURE COOLDOWN — a recent EXPIRED/ABANDONED copy of
+// this unit benches the volunteer for ~one deadline (FlushReservations / ReserveCopy enforce it
+// authoritatively) — but can also be a live copy already held or redundancy already met. The
+// ready candidate keeps its REFILL-TIME benched/contributor snapshot, taken BEFORE this
+// rejection; eligibleLocked reads that snapshot, so without recording the rejection here HandOut
+// re-offers the same unit to the same volunteer every tick. That is a tight LIVELOCK when the
+// volunteer is the only one polling for the unit's leaf — e.g. a small (2-volunteer)
+// redundancy=2 pool where one volunteer is benched: the unit still needs that volunteer's copy,
+// the DB refuses it, and it is handed back, refused, and re-fetched forever (the volunteer burns
+// its whole buffer on run-start-denied units). Marking it benched in memory makes eligibleLocked
+// exclude the volunteer until the candidate is next re-staged with a fresh DB snapshot (which
+// re-benches it if the cooldown still holds, or admits it once the cooldown has lapsed).
+func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseInMemLocked(unitID, volunteerID)
+	// releaseInMemLocked drops the hold but keeps the candidate staged (for its remaining
+	// redundancy copies), so it is still here to bench.
+	for i := range c.ready {
+		if c.ready[i].unit.ID == unitID {
+			if c.ready[i].benched == nil {
+				c.ready[i].benched = make(map[types.ID]struct{})
+			}
+			c.ready[i].benched[volunteerID] = struct{}{}
+			return
+		}
+	}
+}
+
 // purgePendingForLocked drops any queued reservation / spot-check write for
 // (unitID, volunteerID) so a late flush cannot re-stamp a reservation onto a unit
 // whose in-memory hold was just voided. Caller holds mu. (Forward-overlapping
@@ -1835,10 +1868,12 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 		if landedPairs[[2]types.ID{rec.WorkUnitID, rec.VolunteerID}] {
 			continue
 		}
-		c.releaseInMem(rec.WorkUnitID, rec.VolunteerID)
+		c.voidNonLandedCopy(rec.WorkUnitID, rec.VolunteerID)
 		// D-5: a non-landed copy silently revokes a hand-out (the unit is no longer
-		// QUEUED, redundancy was met, or this volunteer already holds a live copy).
-		c.logger.Debug("voided non-landed copy (flush conflict)",
+		// QUEUED, redundancy was met, this volunteer already holds a live copy, or it is
+		// in post-failure cooldown). voidNonLandedCopy also benches the volunteer on the
+		// staged candidate so the same un-reservable unit is not re-offered to it next tick.
+		c.logger.Debug("voided non-landed copy (flush conflict); benched volunteer on candidate",
 			"work_unit_id", rec.WorkUnitID, "volunteer_id", rec.VolunteerID)
 	}
 }
