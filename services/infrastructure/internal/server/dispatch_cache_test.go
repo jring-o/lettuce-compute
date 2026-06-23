@@ -379,6 +379,52 @@ func TestHandOut_HomogeneousRedundancy_PinsAndFiltersByClass(t *testing.T) {
 	}
 }
 
+// TestFlush_NonLanded_BenchesVolunteer_BreaksRehandoutLivelock reproduces the dominant-volunteer
+// livelock: a unit staged with a stale (empty) benched snapshot is handed to volunteer A, but the
+// DB flush REFUSES A's copy (the post-failure cooldown — A recently abandoned/timed-out this unit).
+// Before the fix the candidate kept benched={}, so the very next request re-offered the same
+// un-reservable unit to A forever (A burns its whole buffer on run-start-denied units — the
+// "spoiled peaches" report). After the fix, the non-landed flush benches A on the staged candidate,
+// so A is no longer offered it — while a DISTINCT, non-benched volunteer B still gets it (the unit
+// is benched-for-A, not evicted).
+func TestFlush_NonLanded_BenchesVolunteer_BreaksRehandoutLivelock(t *testing.T) {
+	wuRepo := &fakeWURepo{}
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(nativeLeaf(leafID, 2, false, 0), leafRepo)
+
+	unitID := types.NewID()
+	c.stageUnit(unitID, leafID, 2, 0) // redundancy 2, no contributors, EMPTY (stale) benched snapshot
+
+	// The DB refuses every copy in the batch (A is in post-failure cooldown): nothing lands.
+	wuRepo.mu.Lock()
+	wuRepo.flushFn = func(_ []workunit.FlushReservation) ([]workunit.FlushedCopy, error) { return nil, nil }
+	wuRepo.mu.Unlock()
+
+	volA := types.NewID()
+
+	// 1) A IS offered the unit — the cache's refill-time snapshot predates A's benching.
+	if resA, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(resA) != 1 {
+		t.Fatalf("first hand-out to A = %d, want 1 (stale snapshot still offers it)", len(resA))
+	}
+
+	// 2) The async flush refuses A's copy; this must bench A on the staged candidate.
+	c.flushOnce(context.Background())
+
+	// 3) A must NOT be re-offered the same un-reservable unit (the livelock is broken).
+	if resA2, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(resA2) != 0 {
+		t.Fatalf("second hand-out to A = %d, want 0 (A benched after the flush rejection)", len(resA2))
+	}
+
+	// 4) A DISTINCT, non-benched volunteer B still gets the unit — we benched A, not evicted the unit.
+	volB := types.NewID()
+	if resB, _ := c.HandOut(volB, capableOpts(volB, 0), 1); len(resB) != 1 {
+		t.Fatalf("hand-out to B = %d, want 1 (unit still dispatchable to a fresh volunteer)", len(resB))
+	}
+}
+
 // TestHandOut_NonHR_NoClassFilter verifies a non-HR leaf is unaffected: copies go to
 // volunteers of any class (no pin, no filter).
 func TestHandOut_NonHR_NoClassFilter(t *testing.T) {
