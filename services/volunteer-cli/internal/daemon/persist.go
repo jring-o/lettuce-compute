@@ -31,6 +31,12 @@ type PersistedTask struct {
 	RscFpopsEst             float64           `json:"rsc_fpops_est,omitempty"`
 	VizBundlePath           string            `json:"viz_bundle_path,omitempty"`
 	StartedAt               time.Time         `json:"started_at"`
+	// ElapsedAccruedSeconds and PausedAccruedSeconds are the run/paused time the task
+	// had accumulated under previous daemon sessions, persisted so displayed elapsed/
+	// CPU time does not count the wall-clock gap while the daemon was stopped. Both are
+	// additive (a file written by an older client simply omits them → treated as 0).
+	ElapsedAccruedSeconds   int64             `json:"elapsed_accrued_seconds,omitempty"`
+	PausedAccruedSeconds    int64             `json:"paused_accrued_seconds,omitempty"`
 	PID                     int               `json:"pid,omitempty"` // OS PID for resuming suspended orphans
 	// ReservedUntilUnix and FetchedAt are used for buffered (not-yet-started) tasks
 	// persisted from the prefetch queue: the reservation window drives the on-resume
