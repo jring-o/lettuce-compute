@@ -45,9 +45,9 @@ type WorkClient interface {
 // Daemon manages the volunteer compute loop using concurrent execution slots
 // and a pre-fetch queue.
 type Daemon struct {
-	cfg             *config.Config
-	pubKey          ed25519.PublicKey
-	privKey         ed25519.PrivateKey
+	cfg     *config.Config
+	pubKey  ed25519.PublicKey
+	privKey ed25519.PrivateKey
 	// hostID is this machine's stable host key (TODO #19), reported on each work
 	// request so the head meters in-flight work + the work-send floor per machine.
 	// Empty => the head falls back to per-account behavior.
@@ -128,7 +128,7 @@ type DaemonConfig struct {
 	PrivKey ed25519.PrivateKey
 	// HostID is this machine's stable host key (TODO #19). Empty is valid (the head
 	// then treats the volunteer as a single per-account host).
-	HostID  string
+	HostID string
 
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
@@ -319,6 +319,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Initialize leaf cache from all servers.
 	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())
 	d.initializeWeights()
+
+	// Give the container runtime the keep-set for its stale-image reaper: every
+	// image an enabled leaf wants cached, so a re-pushed mutable tag's superseded
+	// copies are reclaimed without ever removing an image another active leaf
+	// still needs (#60).
+	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
+		cr.SetWantedImages(d.allEnabledImageRefs)
+	}
 
 	// Readiness banner: now that runtimes are registered and the leaf list is
 	// fetched, report what this volunteer can actually run and warn loudly about
@@ -1224,6 +1232,29 @@ func (d *Daemon) checkCachedRunnableImage() bool {
 		}
 	}
 	return false
+}
+
+// allEnabledImageRefs returns the container image references of every enabled
+// leaf across all attached heads — the set of images the volunteer wants cached.
+// It is the keep-set for the container runtime's stale-image reaper, so a leaf's
+// image is never reaped while another active leaf still needs it (e.g. grep-cpu
+// :1.2 and grep-gpu :1.3-gpu, which share one repository).
+func (d *Daemon) allEnabledImageRefs() []string {
+	if d.multiClient == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var refs []string
+	for _, srv := range d.multiClient.Servers() {
+		for _, lf := range d.enabledLeafs(srv.Name) {
+			if lf.ExecutionSpec == nil || lf.ExecutionSpec.Image == "" || seen[lf.ExecutionSpec.Image] {
+				continue
+			}
+			seen[lf.ExecutionSpec.Image] = true
+			refs = append(refs, lf.ExecutionSpec.Image)
+		}
+	}
+	return refs
 }
 
 // abandonItem returns an un-run prefetched unit to the head so it isn't orphaned
