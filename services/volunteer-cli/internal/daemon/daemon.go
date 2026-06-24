@@ -35,6 +35,10 @@ type WorkClient interface {
 	GetCheckpoint(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
 	GetHeadInfo(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
 	AbandonWorkUnit(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error)
+	// GetMyContribution returns the authenticated account's own credit (across all
+	// leaves and machines) from this head. Used by the management bridge to surface
+	// authoritative head credit instead of the local history.jsonl proxy.
+	GetMyContribution(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error)
 	Close() error
 }
 

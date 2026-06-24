@@ -1,13 +1,16 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 )
@@ -379,6 +382,95 @@ func TestBuildActiveTaskInfo_VizBundleAndCheckpoint(t *testing.T) {
 	}
 	if !info.ResumedFromCheckpoint {
 		t.Error("ResumedFromCheckpoint should be true")
+	}
+}
+
+func TestGetCreditFromHead(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := config.Defaults()
+	cfg.DataDir = dir
+	cfg.Servers = []config.ServerConfig{{GRPCAddress: "localhost:50051", Name: "head-alpha"}}
+
+	d := daemon.NewDaemon(daemon.DaemonConfig{Config: cfg, Logger: logger})
+
+	today := time.Now().UTC().Format("2006-01-02")
+	mockClient := &e2eMockWorkClient{
+		getMyContributionFn: func(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+			return &lettucev1.GetMyContributionResponse{
+				VolunteerId: "vol-aaa-111",
+				TotalCredit: 5.5,
+				ByLeaf: []*lettucev1.LeafContribution{
+					{LeafId: "leaf-a", LeafName: "Leaf A", Credit: 2.0},
+					{LeafId: "leaf-b", LeafName: "Leaf B", Credit: 3.5},
+				},
+				Daily: []*lettucev1.DailyContribution{{Date: today, Credit: 5.5}},
+			}, nil
+		},
+	}
+
+	mc := daemon.NewMultiServerClient([]*daemon.ServerConnection{
+		{Name: "head-alpha", VolunteerID: "vol-aaa-111", Available: true, Client: mockClient},
+	}, logger)
+	d.SetMultiClientForTest(mc)
+
+	bridge := NewDaemonBridge(d, filepath.Join(dir, "config.yaml"))
+	summary := bridge.GetCredit()
+
+	if summary.Source != "head" {
+		t.Errorf("source = %q, want head", summary.Source)
+	}
+	if summary.TotalCredit != 5.5 {
+		t.Errorf("total_credit = %v, want 5.5", summary.TotalCredit)
+	}
+	if summary.Today != 5.5 {
+		t.Errorf("today = %v, want 5.5", summary.Today)
+	}
+	if len(summary.ByLeaf) != 2 {
+		t.Fatalf("by_leaf len = %d, want 2", len(summary.ByLeaf))
+	}
+	if len(summary.ByHead) != 1 || !summary.ByHead[0].Available || summary.ByHead[0].TotalCredit != 5.5 {
+		t.Errorf("by_head = %+v, want one available head with 5.5", summary.ByHead)
+	}
+}
+
+// TestGetCreditFallsBackToHistory proves that when no head answers (e.g. an old
+// head returning Unimplemented, or an unreachable head), GetCredit falls back to
+// the local history.jsonl proxy instead of erroring.
+func TestGetCreditFallsBackToHistory(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	cfg := config.Defaults()
+	cfg.DataDir = dir
+	cfg.Servers = []config.ServerConfig{{GRPCAddress: "localhost:50051", Name: "head-alpha"}}
+
+	d := daemon.NewDaemon(daemon.DaemonConfig{Config: cfg, Logger: logger})
+
+	mockClient := &e2eMockWorkClient{
+		getMyContributionFn: func(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+			return nil, fmt.Errorf("rpc error: code = Unimplemented")
+		},
+	}
+	mc := daemon.NewMultiServerClient([]*daemon.ServerConnection{
+		{Name: "head-alpha", Available: true, Client: mockClient},
+	}, logger)
+	d.SetMultiClientForTest(mc)
+
+	daemon.AppendHistory(dir, daemon.HistoryEntry{
+		WorkUnitID: "wu-1", LeafID: "proj-a", CompletedAt: time.Now().UTC(), ResultAccepted: true,
+	})
+	daemon.AppendHistory(dir, daemon.HistoryEntry{
+		WorkUnitID: "wu-2", LeafID: "proj-a", CompletedAt: time.Now().UTC(), ResultAccepted: true,
+	})
+
+	bridge := NewDaemonBridge(d, filepath.Join(dir, "config.yaml"))
+	summary := bridge.GetCredit()
+
+	if summary.Source != "local" {
+		t.Errorf("source = %q, want local", summary.Source)
+	}
+	if summary.TotalCredit != 2 {
+		t.Errorf("total_credit = %v, want 2 (from history fallback)", summary.TotalCredit)
 	}
 }
 

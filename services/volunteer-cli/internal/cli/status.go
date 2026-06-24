@@ -50,9 +50,10 @@ type statusQueuedTask struct {
 
 // creditAPIResponse mirrors the fields of GET /api/v1/credit that this command renders.
 type creditAPIResponse struct {
-	TotalCredit int `json:"total_credit"`
-	Today       int `json:"today"`
-	ThisWeek    int `json:"this_week"`
+	TotalCredit float64 `json:"total_credit"`
+	Today       float64 `json:"today"`
+	ThisWeek    float64 `json:"this_week"`
+	Source      string  `json:"source"`
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
@@ -198,7 +199,13 @@ func printCredit(dataDir string) {
 	if err := managementGet(dataDir, "/api/v1/credit", &cr); err != nil {
 		return
 	}
-	fmt.Printf("Credit: %d total (%d today, %d this week)\n", cr.TotalCredit, cr.Today, cr.ThisWeek)
+	line := fmt.Sprintf("Credit: %s total (%s today, %s this week)",
+		formatCredit(cr.TotalCredit), formatCredit(cr.Today), formatCredit(cr.ThisWeek))
+	if cr.Source == "local" {
+		line += " [local estimate — head unreachable]"
+	}
+	line += "  (run `lettuce-volunteer credit` for the full breakdown)"
+	fmt.Println(line)
 }
 
 // formatDurationSeconds renders a whole-second count as a compact human string

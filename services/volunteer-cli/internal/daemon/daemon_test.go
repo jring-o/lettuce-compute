@@ -31,7 +31,8 @@ type mockClient struct {
 	getCheckpointFn   func(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error)
 	getHeadInfoFn     func(ctx context.Context, req *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error)
 
-	abandonFn func(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error)
+	abandonFn           func(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error)
+	getMyContributionFn func(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error)
 
 	mu             sync.Mutex
 	requestCalls   int
@@ -105,6 +106,13 @@ func (m *mockClient) AbandonWorkUnit(ctx context.Context, req *lettucev1.Abandon
 		return m.abandonFn(ctx, req)
 	}
 	return &lettucev1.AbandonWorkUnitResponse{Requeued: true, Message: "mock requeued"}, nil
+}
+
+func (m *mockClient) GetMyContribution(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+	if m.getMyContributionFn != nil {
+		return m.getMyContributionFn(ctx, req)
+	}
+	return &lettucev1.GetMyContributionResponse{}, nil
 }
 
 func (m *mockClient) getAbandonCalls() int {

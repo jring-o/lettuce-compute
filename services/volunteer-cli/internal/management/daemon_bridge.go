@@ -2,6 +2,7 @@ package management
 
 import (
 	"bufio"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon/procmetrics"
@@ -905,26 +907,142 @@ func (b *DaemonBridge) GetAvailableLeafs() []LeafDetail {
 	return leafs
 }
 
-// CreditSummary is the response for GET /api/v1/credit.
+// CreditSummary is the response for GET /api/v1/credit. Credit is reported by the
+// head(s) the volunteer is attached to — authoritative and account-wide, so it
+// already sums all of the volunteer's machines. It falls back to a local
+// history.jsonl proxy only when no head can be reached.
 type CreditSummary struct {
-	TotalCredit int              `json:"total_credit"`
-	Today       int              `json:"today"`
-	ThisWeek    int              `json:"this_week"`
-	ThisMonth   int              `json:"this_month"`
-	ByLeaf      []LeafCredit     `json:"by_leaf"`
+	TotalCredit float64      `json:"total_credit"`
+	Today       float64      `json:"today"`
+	ThisWeek    float64      `json:"this_week"`
+	ThisMonth   float64      `json:"this_month"`
+	ByLeaf      []LeafCredit `json:"by_leaf"`
+	ByHead      []HeadCredit `json:"by_head"`
+	// Source is "head" when at least one attached head answered (authoritative),
+	// or "local" when the summary was derived from the local history.jsonl proxy
+	// (no head reachable, or every head predates the GetMyContribution RPC).
+	Source string `json:"source"`
 }
 
 // LeafCredit holds credit for a single leaf.
 type LeafCredit struct {
-	LeafID   string `json:"leaf_id"`
-	LeafName string `json:"leaf_name"`
-	Credit   int    `json:"credit"`
+	LeafID   string  `json:"leaf_id"`
+	LeafName string  `json:"leaf_name"`
+	Credit   float64 `json:"credit"`
 }
 
-// GetCredit aggregates credit from history.
-// Currently uses accepted work unit count as credit proxy since the
-// credit system is not yet integrated with infrastructure.
+// HeadCredit holds the account's total credit on a single head.
+type HeadCredit struct {
+	HeadName    string  `json:"head_name"`
+	VolunteerID string  `json:"volunteer_id"`
+	TotalCredit float64 `json:"total_credit"`
+	Available   bool    `json:"available"` // false if the head was unreachable or predates GetMyContribution
+}
+
+// GetCredit returns the volunteer ACCOUNT's credit. It asks each attached head for
+// the account's own contribution (the authoritative GetMyContribution RPC, already
+// aggregated across the account's machines) and sums the results. If no head can be
+// reached — or every head predates that RPC — it falls back to the local
+// history.jsonl proxy so the number is still useful offline.
 func (b *DaemonBridge) GetCredit() CreditSummary {
+	if summary, ok := b.creditFromHeads(); ok {
+		return summary
+	}
+	return b.creditFromHistory()
+}
+
+// creditFromHeads queries every attached head's GetMyContribution and aggregates
+// the results. The bool is false (caller falls back to local history) when there is
+// no multi-client or no head answered.
+func (b *DaemonBridge) creditFromHeads() (CreditSummary, bool) {
+	mc := b.daemon.GetMultiClient()
+	if mc == nil {
+		return CreditSummary{}, false
+	}
+
+	now := time.Now().UTC()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+
+	summary := CreditSummary{Source: "head", ByLeaf: []LeafCredit{}, ByHead: []HeadCredit{}}
+	leafByID := make(map[string]*LeafCredit)
+	var leafOrder []string
+	anyAnswered := false
+
+	for _, s := range mc.Servers() {
+		if s == nil || s.Client == nil {
+			continue
+		}
+		hc := HeadCredit{HeadName: s.Name, VolunteerID: s.VolunteerID}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resp, err := s.Client.GetMyContribution(ctx, &lettucev1.GetMyContributionRequest{})
+		cancel()
+		if err != nil {
+			// Unreachable, or an old head that returns Unimplemented: record the
+			// head as unavailable and keep going — one head must not poison the rest.
+			summary.ByHead = append(summary.ByHead, hc)
+			continue
+		}
+
+		anyAnswered = true
+		hc.Available = true
+		hc.TotalCredit = resp.GetTotalCredit()
+		if hc.VolunteerID == "" {
+			hc.VolunteerID = resp.GetVolunteerId()
+		}
+		summary.ByHead = append(summary.ByHead, hc)
+		summary.TotalCredit += resp.GetTotalCredit()
+
+		for _, lc := range resp.GetByLeaf() {
+			if existing, ok := leafByID[lc.GetLeafId()]; ok {
+				existing.Credit += lc.GetCredit()
+				continue
+			}
+			leafOrder = append(leafOrder, lc.GetLeafId())
+			leafByID[lc.GetLeafId()] = &LeafCredit{
+				LeafID:   lc.GetLeafId(),
+				LeafName: lc.GetLeafName(),
+				Credit:   lc.GetCredit(),
+			}
+		}
+
+		// Derive today/this-week/this-month from the head's daily timeline (the
+		// finest granularity it returns). The daily series spans the last 30 days,
+		// so a calendar month can be undercounted by at most its first day or two —
+		// the per-head totals above are always exact.
+		for _, dc := range resp.GetDaily() {
+			day, perr := time.Parse("2006-01-02", dc.GetDate())
+			if perr != nil {
+				continue
+			}
+			if !day.Before(todayStart) {
+				summary.Today += dc.GetCredit()
+			}
+			if !day.Before(weekStart) {
+				summary.ThisWeek += dc.GetCredit()
+			}
+			if !day.Before(monthStart) {
+				summary.ThisMonth += dc.GetCredit()
+			}
+		}
+	}
+
+	if !anyAnswered {
+		return CreditSummary{}, false
+	}
+
+	for _, id := range leafOrder {
+		summary.ByLeaf = append(summary.ByLeaf, *leafByID[id])
+	}
+	return summary, true
+}
+
+// creditFromHistory is the offline fallback: it counts accepted work units in the
+// local history.jsonl as a credit proxy (one unit ~= one credit). It is used only
+// when no head answered, so the volunteer still sees a number while disconnected.
+func (b *DaemonBridge) creditFromHistory() CreditSummary {
 	cfg := b.daemon.GetConfig()
 	entries := readAllHistory(cfg.DataDir)
 
@@ -933,8 +1051,8 @@ func (b *DaemonBridge) GetCredit() CreditSummary {
 	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	var total, today, week, month int
-	byLeaf := make(map[string]int)
+	var total, today, week, month float64
+	byLeaf := make(map[string]float64)
 
 	for _, e := range entries {
 		if !e.ResultAccepted {
@@ -953,16 +1071,13 @@ func (b *DaemonBridge) GetCredit() CreditSummary {
 		byLeaf[e.LeafID]++
 	}
 
-	var leafCredits []LeafCredit
+	leafCredits := make([]LeafCredit, 0, len(byLeaf))
 	for pid, credit := range byLeaf {
 		leafCredits = append(leafCredits, LeafCredit{
 			LeafID:   pid,
 			LeafName: b.resolveLeafName(pid),
 			Credit:   credit,
 		})
-	}
-	if leafCredits == nil {
-		leafCredits = []LeafCredit{}
 	}
 
 	return CreditSummary{
@@ -971,6 +1086,8 @@ func (b *DaemonBridge) GetCredit() CreditSummary {
 		ThisWeek:    week,
 		ThisMonth:   month,
 		ByLeaf:      leafCredits,
+		ByHead:      []HeadCredit{},
+		Source:      "local",
 	}
 }
 
