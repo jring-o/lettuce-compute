@@ -1,4 +1,4 @@
-﻿package runtime
+package runtime
 
 import (
 	"bytes"
@@ -26,6 +26,9 @@ type MockDockerClient struct {
 	ContainerLogsFn    func(ctx context.Context, containerID string) (io.ReadCloser, error)
 	ContainerInspectFn func(ctx context.Context, containerID string) (*ContainerStats, error)
 	ContainerRemoveFn  func(ctx context.Context, containerID string) error
+	ImageIDFn          func(ctx context.Context, ref string) (string, error)
+	ImageListFn        func(ctx context.Context) ([]ImageSummary, error)
+	ImageRemoveFn      func(ctx context.Context, imageID string) error
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
@@ -50,6 +53,27 @@ func (m *MockDockerClient) ImageExists(ctx context.Context, ref string) (bool, e
 		return m.ImageExistsFn(ctx, ref)
 	}
 	return true, nil
+}
+
+func (m *MockDockerClient) ImageID(ctx context.Context, ref string) (string, error) {
+	if m.ImageIDFn != nil {
+		return m.ImageIDFn(ctx, ref)
+	}
+	return "", nil
+}
+
+func (m *MockDockerClient) ImageList(ctx context.Context) ([]ImageSummary, error) {
+	if m.ImageListFn != nil {
+		return m.ImageListFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *MockDockerClient) ImageRemove(ctx context.Context, imageID string) error {
+	if m.ImageRemoveFn != nil {
+		return m.ImageRemoveFn(ctx, imageID)
+	}
+	return nil
 }
 
 func (m *MockDockerClient) ContainerCreate(ctx context.Context, cfg *ContainerConfig) (string, error) {
@@ -154,7 +178,7 @@ func TestContainerRuntime_PrepareHappyPath(t *testing.T) {
 
 	wu := &WorkUnit{
 		ID:             "dc5ff9da-f084-4dd7-86b8-e829669814f8", // was wu-1
-		LeafID:      "proj-1",
+		LeafID:         "proj-1",
 		InputData:      []byte("test input"),
 		ParametersJSON: `{"seed": 42}`,
 		ExecutionSpec:  ExecutionSpec{Image: "alpine:latest"},
@@ -364,7 +388,7 @@ func TestContainerRuntime_ExecuteHappyPath(t *testing.T) {
 
 	wu := &WorkUnit{
 		ID:              "f42b7a90-69c3-43bb-8a5b-0a4b3c29d4eb", // was exec-1
-		LeafID:       "proj-1",
+		LeafID:          "proj-1",
 		DeadlineSeconds: 60,
 		ExecutionSpec:   ExecutionSpec{Image: "alpine:latest", MaxMemoryMB: 512},
 	}
@@ -515,8 +539,8 @@ func TestContainerRuntime_ExecuteWithEnvVars(t *testing.T) {
 	cr, _ := newTestContainerRuntime(t, mock)
 
 	wu := &WorkUnit{
-		ID:        "61ddabbf-f1eb-44c7-8498-5b3ff77ff0b7", // was env-1
-		EnvVars:   map[string]string{"MY_VAR": "my_value", "OTHER": "123"},
+		ID:            "61ddabbf-f1eb-44c7-8498-5b3ff77ff0b7", // was env-1
+		EnvVars:       map[string]string{"MY_VAR": "my_value", "OTHER": "123"},
 		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
 	}
 
@@ -625,7 +649,7 @@ func TestContainerRuntime_ExecuteLabels(t *testing.T) {
 
 	wu := &WorkUnit{
 		ID:            "f40389aa-e6a2-4145-8f5d-3181bf34a056", // was label-1
-		LeafID:     "proj-abc",
+		LeafID:        "proj-abc",
 		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
 	}
 
@@ -1207,8 +1231,8 @@ func TestContainerRuntime_PrepareExternalInputURL(t *testing.T) {
 	cr, _ := newTestContainerRuntime(t, mock)
 
 	wu := &WorkUnit{
-		ID:           "e6788bae-8467-46b1-81d0-d7aacbebc860", // was ext-input-1
-		InputDataURL: srv.URL + "/data.csv",
+		ID:            "e6788bae-8467-46b1-81d0-d7aacbebc860", // was ext-input-1
+		InputDataURL:  srv.URL + "/data.csv",
 		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
 	}
 
@@ -1239,8 +1263,8 @@ func TestContainerRuntime_PrepareExternalInputURL_Failure(t *testing.T) {
 	cr, _ := newTestContainerRuntime(t, mock)
 
 	wu := &WorkUnit{
-		ID:           "ed670f18-2d5b-41f1-8ea3-e3388ff21a68", // was ext-input-fail
-		InputDataURL: srv.URL + "/missing.csv",
+		ID:            "ed670f18-2d5b-41f1-8ea3-e3388ff21a68", // was ext-input-fail
+		InputDataURL:  srv.URL + "/missing.csv",
 		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
 	}
 
@@ -1265,9 +1289,9 @@ func TestContainerRuntime_PrepareInlineOverExternalURL(t *testing.T) {
 	cr, _ := newTestContainerRuntime(t, mock)
 
 	wu := &WorkUnit{
-		ID:           "600f80fe-95c1-4ecc-89fb-8df4ee80e36c", // was both-inputs
-		InputData:    []byte("inline wins"),
-		InputDataURL: srv.URL + "/data.csv",
+		ID:            "600f80fe-95c1-4ecc-89fb-8df4ee80e36c", // was both-inputs
+		InputData:     []byte("inline wins"),
+		InputDataURL:  srv.URL + "/data.csv",
 		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
 	}
 
@@ -1335,7 +1359,7 @@ func TestContainerRuntime_ExecuteGPUNVIDIA(t *testing.T) {
 
 	wu := &WorkUnit{
 		ID:              "aa316d61-b1ba-4541-88f5-94589bc137df", // was gpu-nvidia-1
-		LeafID:       "proj-gpu",
+		LeafID:          "proj-gpu",
 		DeadlineSeconds: 5,
 		ExecutionSpec:   ExecutionSpec{Image: "cuda:latest", GPURequired: true},
 	}
@@ -1687,7 +1711,7 @@ func TestContainerRuntime_VRAMLimitWarning(t *testing.T) {
 
 	wu := &WorkUnit{
 		ID:              "6660c272-e3a9-4874-8080-0ec7b5dcbf20", // was gpu-vram-warn-1
-		LeafID:       "proj-gpu",
+		LeafID:          "proj-gpu",
 		DeadlineSeconds: 5,
 		ExecutionSpec: ExecutionSpec{
 			Image:       "cuda:latest",

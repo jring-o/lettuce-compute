@@ -24,6 +24,11 @@ type ContainerRuntime struct {
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
 	httpClient    *http.Client // for viz bundle downloads
+
+	// wantedImages, when set, returns every image ref the volunteer currently
+	// wants cached (all enabled leaves across all heads). The stale-image reaper
+	// keeps these; see SetWantedImages / reapStaleImages.
+	wantedImages func() []string
 }
 
 // NewContainerRuntime creates a ContainerRuntime, connecting to the Docker daemon.
@@ -182,11 +187,13 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 	if err != nil {
 		return nil, fmt.Errorf("check image: %w", err)
 	}
+	pulled := false
 	if strings.Contains(image, "@sha256:") {
 		if !exists {
 			if err := c.dockerClient.ImagePull(ctx, image); err != nil {
 				return nil, interpretPullError(c.backend, image, err)
 			}
+			pulled = true
 		}
 	} else {
 		if err := c.dockerClient.ImagePull(ctx, image); err != nil {
@@ -195,7 +202,18 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 			}
 			c.logger.Warn("container.Prepare: image pull failed; using cached image",
 				"image", image, "error", err)
+		} else {
+			pulled = true
 		}
+	}
+
+	// After a fresh pull, reap superseded cached copies of the same repository so
+	// a re-pushed mutable tag (or a new digest) does not leave orphaned images
+	// consuming the volunteer's disk allowance until the disk gate trips (#60 —
+	// the disk-reclamation companion to #38's artifact-freshness work).
+	// Best-effort and runtime-only; never blocks compute.
+	if pulled {
+		c.reapStaleImages(ctx, image)
 	}
 
 	result := &PrepareResult{WorkDir: workDir}

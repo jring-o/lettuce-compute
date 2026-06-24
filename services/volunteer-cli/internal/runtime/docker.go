@@ -16,6 +16,13 @@ type DockerClient interface {
 	Ping(ctx context.Context) error
 	ImagePull(ctx context.Context, ref string) error
 	ImageExists(ctx context.Context, ref string) (bool, error)
+	// ImageID resolves a reference to its content image ID, or "" if not present.
+	ImageID(ctx context.Context, ref string) (string, error)
+	// ImageList returns every cached image (used by the stale-image reaper).
+	ImageList(ctx context.Context) ([]ImageSummary, error)
+	// ImageRemove deletes a cached image by ID. It is non-force, so the backend
+	// refuses to delete an image still referenced by any container.
+	ImageRemove(ctx context.Context, imageID string) error
 	ContainerCreate(ctx context.Context, cfg *ContainerConfig) (string, error)
 	ContainerStart(ctx context.Context, containerID string) error
 	ContainerWait(ctx context.Context, containerID string) (int64, error)
@@ -25,6 +32,18 @@ type DockerClient interface {
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
 	Close() error
+}
+
+// ImageSummary is a backend-agnostic view of a cached image, used by the
+// stale-image reaper. RepoTags entries look like "repo:tag" ("<none>:<none>"
+// when untagged); RepoDigests entries look like "repo@sha256:…". A superseded
+// copy left by a re-pushed mutable tag typically has no tag but keeps a repo
+// digest — exactly the copy plain `image prune` will not reclaim.
+type ImageSummary struct {
+	ID          string
+	RepoTags    []string
+	RepoDigests []string
+	Size        int64 // bytes
 }
 
 // ContainerConfig holds the configuration for creating a Docker container.
@@ -123,6 +142,46 @@ func (d *dockerClientWrapper) ImageExists(ctx context.Context, ref string) (bool
 		return false, fmt.Errorf("image inspect %s: %w", ref, err)
 	}
 	return true, nil
+}
+
+func (d *dockerClientWrapper) ImageID(ctx context.Context, ref string) (string, error) {
+	inspect, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("image inspect %s: %w", ref, err)
+	}
+	return inspect.ID, nil
+}
+
+func (d *dockerClientWrapper) ImageList(ctx context.Context) ([]ImageSummary, error) {
+	summaries, err := d.cli.ImageList(ctx, image.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("image list: %w", err)
+	}
+	out := make([]ImageSummary, 0, len(summaries))
+	for _, s := range summaries {
+		out = append(out, ImageSummary{
+			ID:          s.ID,
+			RepoTags:    s.RepoTags,
+			RepoDigests: s.RepoDigests,
+			Size:        s.Size,
+		})
+	}
+	return out, nil
+}
+
+func (d *dockerClientWrapper) ImageRemove(ctx context.Context, imageID string) error {
+	// Non-force: the backend refuses to delete an image still referenced by any
+	// container (running or stopped), so an in-use image is never pulled out from
+	// under a workload — the reaper just skips it. PruneChildren reclaims layers
+	// orphaned by the removal.
+	_, err := d.cli.ImageRemove(ctx, imageID, image.RemoveOptions{Force: false, PruneChildren: true})
+	if err != nil {
+		return fmt.Errorf("image remove %s: %w", imageID, err)
+	}
+	return nil
 }
 
 // buildGPUDeviceRequests translates a ContainerConfig's GPU settings into Docker

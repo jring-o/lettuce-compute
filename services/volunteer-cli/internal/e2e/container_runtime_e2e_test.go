@@ -57,6 +57,18 @@ func (m *mockDockerClient) ImageExists(ctx context.Context, ref string) (bool, e
 	return true, nil
 }
 
+func (m *mockDockerClient) ImageID(ctx context.Context, ref string) (string, error) {
+	return "", nil
+}
+
+func (m *mockDockerClient) ImageList(ctx context.Context) ([]runtime.ImageSummary, error) {
+	return nil, nil
+}
+
+func (m *mockDockerClient) ImageRemove(ctx context.Context, imageID string) error {
+	return nil
+}
+
 func (m *mockDockerClient) ContainerCreate(ctx context.Context, cfg *runtime.ContainerConfig) (string, error) {
 	m.lastCreateConfig = cfg
 	if m.containerCreateFn != nil {
@@ -152,7 +164,7 @@ func createContainerRuntimeWithMock(t *testing.T, mock *mockDockerClient) *runti
 
 func TestScenario1_PodmanCPUContainerLifecycle(t *testing.T) {
 	var (
-		pullCalled  bool
+		pullCalled   bool
 		createCalled bool
 		startCalled  bool
 		waitCalled   bool
