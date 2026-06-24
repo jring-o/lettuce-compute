@@ -1445,7 +1445,9 @@ func TestHandleGetTaskDetails_NotFound(t *testing.T) {
 // --- Mock types for task visibility E2E test ---
 
 // e2eMockWorkClient satisfies daemon.WorkClient for the management E2E test.
-type e2eMockWorkClient struct{}
+type e2eMockWorkClient struct {
+	getMyContributionFn func(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error)
+}
 
 func (m *e2eMockWorkClient) Close() error { return nil }
 func (m *e2eMockWorkClient) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
@@ -1468,6 +1470,12 @@ func (m *e2eMockWorkClient) GetHeadInfo(ctx context.Context, req *lettucev1.GetH
 }
 func (m *e2eMockWorkClient) AbandonWorkUnit(ctx context.Context, req *lettucev1.AbandonWorkUnitRequest) (*lettucev1.AbandonWorkUnitResponse, error) {
 	return &lettucev1.AbandonWorkUnitResponse{Requeued: true}, nil
+}
+func (m *e2eMockWorkClient) GetMyContribution(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+	if m.getMyContributionFn != nil {
+		return m.getMyContributionFn(ctx, req)
+	}
+	return &lettucev1.GetMyContributionResponse{}, nil
 }
 
 // e2eMockRuntime satisfies runtime.Runtime for the management E2E test.

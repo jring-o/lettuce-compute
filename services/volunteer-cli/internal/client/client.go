@@ -201,3 +201,13 @@ func (c *Client) AbandonWorkUnit(ctx context.Context, req *lettucev1.AbandonWork
 	defer cancel()
 	return c.svc.AbandonWorkUnit(ctx, req)
 }
+
+// GetMyContribution calls the GetMyContribution RPC. The head derives the caller's
+// identity from the signed request (this client's Ed25519 key), so the response is
+// the calling account's own credit across every leaf and machine. An old head that
+// predates this RPC returns codes.Unimplemented; callers handle that gracefully.
+func (c *Client) GetMyContribution(ctx context.Context, req *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+	ctx, cancel := c.rpcCtx(ctx)
+	defer cancel()
+	return c.svc.GetMyContribution(ctx, req)
+}
