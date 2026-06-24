@@ -310,6 +310,46 @@ thermal:
 > startup, not hot-reloaded). Watch the log for `thermal throttle activated` /
 > `thermal throttle released`.
 
+### Scheduling — run only at certain times
+
+By default the volunteer runs whenever the daemon is running (mode `ALWAYS`). If
+you'd rather it compute only at certain times — for example overnight, when the
+room is cool and you're not using the machine — use the `schedule` command.
+
+```bash
+# Run only overnight, every day ("dusk till dawn"): 20:00 to 06:00.
+lettuce-volunteer schedule set --from 20:00 --to 06:00
+
+# Weeknights only.
+lettuce-volunteer schedule set --from 19:00 --to 07:00 --days mon-fri
+
+# See the current schedule, or go back to running always.
+lettuce-volunteer schedule show
+lettuce-volunteer schedule clear
+```
+
+`--days` accepts single days and ranges (`mon-fri`, `sat,sun`, `mon,wed,fri`,
+`mon-sun`). Windows are **whole-hour** and **may wrap past midnight**, so
+`--from 20:00 --to 06:00` is one continuous overnight window. Pairs nicely with
+thermal protection above: schedule the heavy hours for when it's coolest.
+
+> **Restart the daemon after changing the schedule.** Like the rest of the
+> config, the schedule is read at startup, not hot-reloaded:
+> `lettuce-volunteer stop && lettuce-volunteer start`.
+
+> **Fixed clock hours, not true sunset/sunrise.** "Dusk till dawn" here means the
+> fixed window you give it; the volunteer does not track your location's actual
+> sunset/sunrise (which drift through the year). Pick hours that cover your
+> darkest/coolest stretch.
+
+Two other modes exist in `~/.lettuce/config.yaml` under `scheduling:`. Set
+`scheduling.mode` to `WHEN_IDLE` to run only after the machine has been idle for
+`scheduling.idle_threshold_mins` minutes. For finer control than whole-hour
+windows you can instead set a 5-field cron expression
+(`lettuce-volunteer config set scheduling.cron_expression "* 20-23,0-5 * * *"` is
+the cron equivalent of the overnight window above); when both a window and a cron
+expression are present, the window wins.
+
 > **Breaking release — update required.** This release changes the
 > volunteer⇄head work protocol. **A volunteer older than this release cannot talk
 > to the new head.** Run `lettuce-volunteer update`, then restart the daemon.

@@ -95,8 +95,9 @@ type GPUOverride struct {
 }
 
 // ScheduleRange represents an active time window for scheduled mode.
-// The desktop app's visual schedule builder writes these; the CLI writes cron expressions.
-// Both are valid representations for SCHEDULED mode.
+// The desktop app's visual schedule builder and the CLI's `schedule set` command
+// both write these; a cron expression is the third, equivalent representation for
+// SCHEDULED mode (ranges take precedence over cron when both are present).
 type ScheduleRange struct {
 	Days      []int `yaml:"days" json:"days"`             // 0=Mon, 6=Sun
 	StartHour int   `yaml:"start_hour" json:"start_hour"` // 0-23
