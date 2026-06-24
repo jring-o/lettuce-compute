@@ -501,12 +501,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Check scheduler before filling slots.
-		if !d.scheduler.ShouldRun() {
-			d.logger.Debug("scheduler says not active, waiting")
-			if err := d.scheduler.WaitUntilActive(ctx); err != nil {
-				return nil
-			}
+		// Check scheduler before filling slots. When inactive this also suspends any
+		// already-running tasks (e.g. ones resumed from a previous session) for the
+		// duration of the off-schedule window instead of letting them run through it.
+		if !d.waitForScheduleActive(ctx) {
+			return nil
 		}
 
 		// Process completed slots.
@@ -1365,6 +1364,47 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 			}
 		}
 	}
+}
+
+// waitForScheduleActive blocks until the scheduler says the daemon may run, and
+// returns false only if ctx is cancelled while waiting.
+//
+// Crucially, if the schedule is currently inactive it first SUSPENDS any active
+// slots before waiting, and RESUMES them once the schedule reopens. This matters
+// for tasks resumed from a previous session: such a task is adopted into a slot and
+// is already executing by the time the main loop reaches this gate. The plain
+// schedule gate only blocks NEW slot-filling — it does not freeze running slots, and
+// while the loop is parked here it cannot observe the resource monitor's pause
+// signal either. Without suspending here, a resumed task would run straight through
+// the entire off-schedule (or thermal/disk/user) window, silently violating the
+// schedule. The suspend/resume pair lives in this one block so it stays balanced
+// regardless of how the wait ends.
+func (d *Daemon) waitForScheduleActive(ctx context.Context) bool {
+	if d.scheduler == nil || d.scheduler.ShouldRun() {
+		return true
+	}
+
+	hadActive := d.slotManager != nil && d.slotManager.ActiveCount() > 0
+	if hadActive {
+		d.slotManager.SuspendAll()
+		d.logger.Info("schedule inactive: suspended active tasks until it reopens",
+			"active_slots", d.slotManager.ActiveCount())
+	} else {
+		d.logger.Debug("scheduler says not active, waiting")
+	}
+
+	err := d.scheduler.WaitUntilActive(ctx)
+
+	if hadActive {
+		// Resume even on cancellation so the suspended processes are unfrozen for the
+		// shutdown path to clean up; the SuspendAll above is otherwise unbalanced.
+		d.slotManager.ResumeAll()
+		if err == nil {
+			d.logger.Info("schedule active again: resumed previously suspended tasks")
+		}
+	}
+
+	return err == nil
 }
 
 // Stop signals the daemon to stop. Active work units are cancelled so the
