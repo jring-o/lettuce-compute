@@ -152,14 +152,31 @@ Ask, in plain terms, what they want to compute. Three cases:
 ### C — Make it honor the contract (the important part)
 The program must:
 - **NATIVE:** read params from `$LETTUCE_PARAMS_FILE` (JSON), write results to
-  `$LETTUCE_OUTPUT_FILE` (JSON), exit 0. Optional progress → `$LETTUCE_PROGRESS_FILE`.
+  `$LETTUCE_OUTPUT_FILE` (JSON), exit 0.
 - **CONTAINER:** read `$LETTUCE_PARAMETERS_FILE` (`/work/input/parameters.json`), write
   `$LETTUCE_OUTPUT_DIR/output.json`, exit 0.
 
+**Always add progress reporting (both runtimes — do this every time, not as an
+afterthought).** Whenever you write or wrap an entrypoint, make it periodically write a
+single number `0`–`100` (percent complete) to `$LETTUCE_PROGRESS_FILE`. The volunteer reads
+it so `lettuce-volunteer status` shows live progress + ETA; a leaf that skips it shows a
+flat `0%` until it finishes (this is exactly the gap that left the Beyblade container leaf
+progress-less while the native one worked). It's only a few lines — never drop it for being
+"optional polish." The runtime sets the env var for both runtimes (native default
+`<work-dir>/progress.txt`, container `/work/output/progress.txt`). Write it from the main
+loop (per iteration/step/item; throttle a high-iteration loop to ~every few seconds), make
+it **best-effort** (swallow any write error and never fail the unit), and ideally write
+**atomically** (temp file in the same dir, then rename) so a reader never sees a partial
+value.
+
 If the user's code doesn't do this, **wrap it**: add a thin entrypoint that reads the params
-file, calls their existing function, and writes the output JSON — leaving their actual
-computation intact. Mirror the patterns in `guides/examples/`.
-**Check:** it runs locally and produces a valid output JSON (Step D).
+file, calls their existing function, writes the output JSON, and writes progress as it goes —
+leaving their actual computation intact. Mirror the patterns in `guides/examples/` — both
+[`monte-carlo-pi/main.go`](../../../guides/examples/monte-carlo-pi/main.go) (Go/native) and
+[`nbody-gravity/simulate.py`](../../../guides/examples/nbody-gravity/simulate.py)
+(Python/container) read the params file, write output JSON, **and** report progress.
+**Check:** it runs locally and produces a valid output JSON, and writes a climbing
+`progress.txt` (Step D).
 
 ### D — Build + test locally
 - **NATIVE:** cross-compile for the volunteers' OSes. If Go (or the toolchain) isn't

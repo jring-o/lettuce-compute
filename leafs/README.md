@@ -10,7 +10,8 @@ A leaf needs:
 - An **entrypoint** that honors the Lettuce contract — reads parameters
   from `$LETTUCE_PARAMETERS_FILE` (container) or `$LETTUCE_PARAMS_FILE`
   (native), writes output to `$LETTUCE_OUTPUT_DIR` / `$LETTUCE_OUTPUT_FILE`,
-  exits 0 on success.
+  reports progress to `$LETTUCE_PROGRESS_FILE` (see **Report progress**
+  below), and exits 0 on success.
 - Any **leaf-specific glue** (sample inputs, helper scripts, dataset
   download steps).
 - A short **README** explaining what the leaf computes, what hardware it
@@ -37,6 +38,37 @@ leafs/
 For native-binary leafs, replace `Dockerfile` with a `build.{sh,ps1}` that
 produces the per-platform binaries and the SHA-256 manifest the head
 requires.
+
+## Report progress
+
+Both native and container leaves **should** report progress. Periodically
+write a single number `0`–`100` (the percent complete) to the file named by
+`$LETTUCE_PROGRESS_FILE`; the volunteer reads it and `lettuce-volunteer status`
+shows live progress and an ETA instead of a flat `0%`. A leaf that never writes
+the file always shows `0%` until it finishes — a real reporting gap, not a
+cosmetic one.
+
+The volunteer runtime sets `$LETTUCE_PROGRESS_FILE` for **both** runtimes:
+
+- **native** → `<work-dir>/progress.txt`
+- **container** → `/work/output/progress.txt`
+
+Guidance:
+
+- Write from the entrypoint's main loop (per iteration / step / item). For a
+  high-iteration loop, throttle to roughly every few seconds rather than every
+  iteration.
+- Make it **best-effort**: if the env var is unset or a write fails, swallow
+  the error — progress reporting must never fail the work unit.
+- Prefer an **atomic** write (write a temp file in the same directory, then
+  rename over the target) so the volunteer never reads a half-written value.
+
+Working reference implementations to copy:
+[`guides/examples/monte-carlo-pi/main.go`](../guides/examples/monte-carlo-pi/main.go)
+(Go, native) and
+[`guides/examples/nbody-gravity/simulate.py`](../guides/examples/nbody-gravity/simulate.py)
+(Python, container) both do exactly this. Deployed leaves such as the Beyblade
+Arena native engine follow the same per-iteration pattern.
 
 ## How a leaf gets created
 

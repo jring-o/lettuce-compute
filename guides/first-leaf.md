@@ -43,6 +43,44 @@ The flow you'll follow:
 
 ---
 
+## Reporting progress (recommended)
+
+Have your entrypoint report progress so contributors can see how far along a work
+unit is. Periodically write a single number `0`–`100` (the percent complete) to the
+file named by the `$LETTUCE_PROGRESS_FILE` environment variable. The volunteer reads
+it and `lettuce-volunteer status` shows live progress and an ETA — without it, a
+running unit shows a flat `0%` until it finishes.
+
+The volunteer sets `$LETTUCE_PROGRESS_FILE` for **both** runtimes:
+
+- **native** → `<work-dir>/progress.txt`
+- **container** → `/work/output/progress.txt`
+
+Both example programs in this guide already do it — write progress from the main loop,
+make it best-effort (swallow any error; never fail the unit), and ideally write
+atomically (temp file + rename) so a reader never sees a half-written value:
+
+```go
+// guides/examples/monte-carlo-pi/main.go (native, Go) — throttled to ~every 5s
+progressFile := os.Getenv("LETTUCE_PROGRESS_FILE")
+if progressFile != "" && time.Since(lastProgress) >= 5*time.Second {
+    pct := float64(i+1) / float64(dartsPerTrial) * 100
+    os.WriteFile(progressFile, []byte(fmt.Sprintf("%.1f", pct)), 0644)
+    lastProgress = time.Now()
+}
+```
+
+```python
+# guides/examples/nbody-gravity/simulate.py (container, Python) — throttled to ~every 5s
+progress_file = os.environ.get("LETTUCE_PROGRESS_FILE")
+if progress_file and time.time() - last_progress >= 5.0:
+    with open(progress_file, "w") as f:
+        f.write(f"{(step + 1) / num_steps * 100:.1f}")
+    last_progress = time.time()
+```
+
+---
+
 ## Updating a leaf's artifact — versions & rollback
 
 When you change a leaf's compute artifact (a new native binary, or a new container
@@ -117,11 +155,14 @@ GOOS=windows GOARCH=amd64 go build -o monte-carlo-pi.exe   .
 
 ```bash
 echo '{"seed": 42}' > params.json
-LETTUCE_PARAMS_FILE=params.json LETTUCE_OUTPUT_FILE=out.json ./monte-carlo-pi-linux
-cat out.json     # {"result": 3.14..., "seed": 42, ...}
+LETTUCE_PARAMS_FILE=params.json LETTUCE_OUTPUT_FILE=out.json \
+  LETTUCE_PROGRESS_FILE=progress.txt ./monte-carlo-pi-linux
+cat progress.txt   # a number 0-100 (100 when done) — what `status` displays
+cat out.json       # {"result": 3.14..., "seed": 42, ...}
 ```
 
-If `out.json` has a `result` near 3.14, the binary honors the contract.
+If `out.json` has a `result` near 3.14, the binary honors the contract, and
+`progress.txt` confirms it reports progress (see [Reporting progress](#reporting-progress-recommended)).
 
 ### Step 3 — Host the binary on your head
 
@@ -335,8 +376,10 @@ podman run --rm \
   -v /tmp/nbody/output:/work/output \
   -e LETTUCE_PARAMETERS_FILE=/work/input/parameters.json \
   -e LETTUCE_OUTPUT_DIR=/work/output \
+  -e LETTUCE_PROGRESS_FILE=/work/output/progress.txt \
   your-domain.com/nbody:latest
 
+cat /tmp/nbody/output/progress.txt   # a number 0-100 (100 when done) — what `status` displays
 cat /tmp/nbody/output/output.json
 ```
 
