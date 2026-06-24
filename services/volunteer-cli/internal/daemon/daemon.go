@@ -1541,7 +1541,8 @@ func (d *Daemon) PauseReason() string {
 type CurrentTask struct {
 	WorkUnitID            string
 	LeafID                string
-	StartedAt             time.Time
+	StartedAt             time.Time // original (first-ever) start, for reference
+	ElapsedSeconds        int       // run time accrued across sessions (excludes daemon-down gap)
 	WorkDir               string
 	VizBundlePath         string
 	CheckpointSequence    int32
@@ -2204,6 +2205,8 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 					VizBundlePath:     pt.VizBundlePath,
 					OrphanPID:         pt.PID, // Tell the slot to poll instead of executing
 					OriginalStartedAt: pt.StartedAt,
+					ElapsedAccrued:    time.Duration(pt.ElapsedAccruedSeconds) * time.Second,
+					PausedAccrued:     time.Duration(pt.PausedAccruedSeconds) * time.Second,
 				}
 
 				item := &PreFetchItem{
@@ -2286,6 +2289,8 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			InputPath:         pt.InputPath,
 			VizBundlePath:     pt.VizBundlePath,
 			OriginalStartedAt: pt.StartedAt,
+			ElapsedAccrued:    time.Duration(pt.ElapsedAccruedSeconds) * time.Second,
+			PausedAccrued:     time.Duration(pt.PausedAccruedSeconds) * time.Second,
 		}
 
 		// Get a slot.

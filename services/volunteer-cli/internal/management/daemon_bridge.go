@@ -25,6 +25,7 @@ import (
 type DaemonBridge struct {
 	daemon  *daemon.Daemon
 	cfgPath string
+	eta     *etaTracker
 }
 
 // NewDaemonBridge creates a bridge between the management API and the daemon.
@@ -32,6 +33,7 @@ func NewDaemonBridge(d *daemon.Daemon, cfgPath string) *DaemonBridge {
 	return &DaemonBridge{
 		daemon:  d,
 		cfgPath: cfgPath,
+		eta:     newETATracker(),
 	}
 }
 
@@ -149,9 +151,9 @@ func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason str
 	if t.WorkDir != "" {
 		info.ProgressPct = int(daemon.ReadProgressFile(t.WorkDir))
 	}
-	if !t.StartedAt.IsZero() {
-		info.ElapsedSeconds = int(time.Since(t.StartedAt).Seconds())
-	}
+	// Run time accrued only while actually executing under a live daemon — excludes the
+	// wall-clock gap during which the daemon was stopped (see CurrentTask.ElapsedSeconds).
+	info.ElapsedSeconds = t.ElapsedSeconds
 	if !t.LastCheckpointAt.IsZero() {
 		ts := t.LastCheckpointAt.UTC().Format(time.RFC3339)
 		info.LastCheckpointAt = &ts
@@ -165,18 +167,10 @@ func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason str
 	if t.DeadlineSeconds > 0 {
 		info.DeadlineSeconds = int(t.DeadlineSeconds) - info.ElapsedSeconds
 	}
-	// Compute estimated remaining time.
-	// Priority: progress-based estimate (dynamic) > benchmark-based estimate (static).
-	if info.ProgressPct > 0 && info.ProgressPct < 100 && info.ElapsedSeconds > 0 {
-		// Dynamic: extrapolate from progress and elapsed time.
-		remaining := int(float64(info.ElapsedSeconds) / float64(info.ProgressPct) * float64(100-info.ProgressPct))
-		info.EstimatedRemainingSec = &remaining
-	} else if t.EstimatedSeconds > 0 {
-		// Static: benchmark-based estimate minus elapsed.
-		remaining := int(t.EstimatedSeconds) - info.ElapsedSeconds
-		if remaining < 0 {
-			remaining = 0
-		}
+	// Estimated remaining time: a smoothed recent-progress-rate estimate blended with
+	// the benchmark estimate (see etaTracker), falling back to the benchmark estimate
+	// alone before there is live progress.
+	if remaining, ok := b.eta.estimate(t.WorkUnitID, info.ProgressPct, info.ElapsedSeconds, t.EstimatedSeconds); ok {
 		info.EstimatedRemainingSec = &remaining
 	}
 	return info
@@ -217,6 +211,12 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 	if activeTasks == nil {
 		activeTasks = []ActiveTaskInfo{}
 	}
+	// Drop ETA state for work units that are no longer active.
+	activeIDs := make(map[string]bool, len(activeTasks))
+	for _, at := range activeTasks {
+		activeIDs[at.WorkUnitID] = true
+	}
+	b.eta.retain(activeIDs)
 
 	var pausedReasonPtr *string
 	if pauseReason != "" {

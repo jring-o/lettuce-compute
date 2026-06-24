@@ -225,6 +225,7 @@ func TestBuildActiveTaskInfo_Running(t *testing.T) {
 		WorkUnitID:      "wu-test",
 		LeafID:          "leaf-1",
 		StartedAt:       time.Now().Add(-60 * time.Second),
+		ElapsedSeconds:  60,
 		ServerName:      "test-head",
 		RuntimeType:     "native",
 		ProcessID:       1234,
@@ -280,6 +281,7 @@ func TestBuildActiveTaskInfo_CPUSecondsClamped(t *testing.T) {
 		WorkUnitID:         "wu-clamped",
 		LeafID:             "leaf-1",
 		StartedAt:          time.Now().Add(-10 * time.Second),
+		ElapsedSeconds:     10,
 		TotalPausedSeconds: 999,
 	}
 
@@ -329,11 +331,12 @@ func TestBuildActiveTaskInfo_BenchmarkEstimate(t *testing.T) {
 	})
 	bridge := NewDaemonBridge(d, filepath.Join(dir, "config.yaml"))
 
-	// No progress, but benchmark-based estimate of 100s, started 30s ago.
+	// No progress, but benchmark-based estimate of 100s, 30s of run time accrued.
 	task := daemon.CurrentTask{
 		WorkUnitID:       "wu-bench-est",
 		LeafID:           "leaf-1",
 		StartedAt:        time.Now().Add(-30 * time.Second),
+		ElapsedSeconds:   30,
 		EstimatedSeconds: 100,
 	}
 

@@ -63,9 +63,17 @@ type PrepareResult struct {
 	// instead of calling rt.Execute() to start a new process.
 	OrphanPID int
 
-	// OriginalStartedAt preserves the original start time for resumed tasks
-	// so elapsed time displays correctly instead of resetting to zero.
+	// OriginalStartedAt preserves the original (first-ever) start time for resumed
+	// tasks. It is used as a stable reference timestamp, not to derive elapsed time.
 	OriginalStartedAt time.Time
+
+	// ElapsedAccrued and PausedAccrued carry the run/paused time a resumed task
+	// accumulated in previous daemon sessions. The slot starts a fresh wall-clock
+	// segment on resume and adds these bases, so displayed elapsed/CPU time advances
+	// only while the task is actually running under a live daemon — it does not count
+	// the wall-clock gap during which the daemon was stopped. Zero for fresh tasks.
+	ElapsedAccrued time.Duration
+	PausedAccrued  time.Duration
 }
 
 // ExecutionResult contains output and metrics from execution.

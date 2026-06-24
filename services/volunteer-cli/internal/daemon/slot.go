@@ -56,8 +56,34 @@ type ExecutionSlot struct {
 	processHandle     ProcessHandle  // for suspend/resume
 	suspended         bool
 	pausedAt          time.Time     // when current pause began (zero if not paused)
-	totalPausedDur    time.Duration // accumulated pause time across all pause/resume cycles
+	totalPausedDur    time.Duration // accumulated pause time during THIS daemon session
 	fetchedAt         time.Time     // when the WU was fetched from server (from prefetch queue)
+
+	// originalStartedAt is the first-ever start time of this work unit, carried across
+	// resumes for reference. startedAt above is the start of the CURRENT session's
+	// wall-clock segment (reset to now on every (re)start). elapsedBase/pausedBase hold
+	// the run/paused time accumulated under previous sessions, so displayed elapsed and
+	// CPU time advance only while the task actually runs and never count the time the
+	// daemon was stopped between sessions.
+	originalStartedAt time.Time
+	elapsedBase       time.Duration
+	pausedBase        time.Duration
+}
+
+// sessionElapsed returns the run time accumulated across all sessions: the bases
+// carried from previous sessions plus this session's wall-clock segment. Caller holds slot.mu.
+func (s *ExecutionSlot) sessionElapsed() time.Duration {
+	return s.elapsedBase + time.Since(s.startedAt)
+}
+
+// sessionPaused returns the total paused time across all sessions, including any
+// pause currently in progress. Caller holds slot.mu.
+func (s *ExecutionSlot) sessionPaused() time.Duration {
+	paused := s.pausedBase + s.totalPausedDur
+	if !s.pausedAt.IsZero() {
+		paused += time.Since(s.pausedAt)
+	}
+	return paused
 }
 
 // SlotResult is the outcome of a slot's execution.
@@ -110,10 +136,22 @@ func (sm *SlotManager) StartSlot(ctx context.Context, slotID int, item *PreFetch
 	slot.prep = item.Prep
 	slot.rt = item.Runtime
 	slot.conn = item.Conn
-	if item.Prep != nil && !item.Prep.OriginalStartedAt.IsZero() {
-		slot.startedAt = item.Prep.OriginalStartedAt
+	// Start a fresh wall-clock segment for this session; carry forward the original
+	// start time and the run/paused time accrued under previous sessions so elapsed/CPU
+	// time excludes any daemon-down gap (see ExecutionSlot.sessionElapsed/sessionPaused).
+	slot.startedAt = time.Now()
+	if item.Prep != nil {
+		slot.elapsedBase = item.Prep.ElapsedAccrued
+		slot.pausedBase = item.Prep.PausedAccrued
+		if !item.Prep.OriginalStartedAt.IsZero() {
+			slot.originalStartedAt = item.Prep.OriginalStartedAt
+		} else {
+			slot.originalStartedAt = slot.startedAt
+		}
 	} else {
-		slot.startedAt = time.Now()
+		slot.elapsedBase = 0
+		slot.pausedBase = 0
+		slot.originalStartedAt = slot.startedAt
 	}
 	slot.resumedFromCkp = false
 	slot.preserved = nil
@@ -166,7 +204,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 				VizBundlePath:          prep.VizBundlePath,
 				CheckpointSequence:     ckptSeq,
 				CheckpointIntervalSecs: wu.CheckpointIntervalSeconds,
-				StartedAt:              slot.startedAt,
+				StartedAt:              slot.originalStartedAt,
+				ElapsedAccruedSeconds:  int64(slot.sessionElapsed().Seconds()),
+				PausedAccruedSeconds:   int64(slot.sessionPaused().Seconds()),
 			}
 			slot.mu.Unlock()
 
@@ -198,6 +238,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		slot.pausedAt = time.Time{}
 		slot.totalPausedDur = 0
 		slot.fetchedAt = time.Time{}
+		slot.originalStartedAt = time.Time{}
+		slot.elapsedBase = 0
+		slot.pausedBase = 0
 		slot.mu.Unlock()
 
 		// Send result.
@@ -436,16 +479,15 @@ func (sm *SlotManager) GetCurrentTasks(benchmarkFPOPS float64, dcfFunc func(leaf
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
 		if slot.active && slot.wu != nil {
-			// Compute total paused seconds including any ongoing pause.
-			pausedDur := slot.totalPausedDur
-			if !slot.pausedAt.IsZero() {
-				pausedDur += time.Since(slot.pausedAt)
-			}
+			// Run/paused time accrued across all sessions (excludes any daemon-down gap).
+			elapsedDur := slot.sessionElapsed()
+			pausedDur := slot.sessionPaused()
 
 			task := CurrentTask{
 				WorkUnitID:            slot.wu.ID,
 				LeafID:                slot.wu.LeafID,
-				StartedAt:             slot.startedAt,
+				StartedAt:             slot.originalStartedAt,
+				ElapsedSeconds:        int(elapsedDur.Seconds()),
 				ResumedFromCheckpoint: slot.resumedFromCkp,
 				Suspended:             slot.suspended,
 				TotalPausedSeconds:    int(pausedDur.Seconds()),
@@ -619,7 +661,9 @@ func (sm *SlotManager) GetActivePersistableTasks() []PersistedTask {
 				ExecutionSpec:         slot.wu.ExecutionSpec,
 				RscFpopsEst:           slot.wu.RscFpopsEst,
 				VizBundlePath:         slot.prep.VizBundlePath,
-				StartedAt:             slot.startedAt,
+				StartedAt:             slot.originalStartedAt,
+				ElapsedAccruedSeconds: int64(slot.sessionElapsed().Seconds()),
+				PausedAccruedSeconds:  int64(slot.sessionPaused().Seconds()),
 			}
 			if slot.checkpoint != nil {
 				pt.CheckpointSequence = slot.checkpoint.Sequence()
