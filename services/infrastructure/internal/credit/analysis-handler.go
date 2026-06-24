@@ -311,48 +311,75 @@ func (h *AnalysisHandler) HandleVolunteerBreakdown(w http.ResponseWriter, r *htt
 		byLeaf = append(byLeaf, vpc)
 	}
 
-	// Daily credit timeline (last 30 days).
+	// Daily credit timeline (last 30 days). DATE(granted_at) is a Postgres date;
+	// cast it to text so it scans cleanly into the Go string field. pgx cannot scan
+	// a date straight into a *string, so without the cast every Scan here failed —
+	// and because the error was swallowed (only appending on scanErr == nil) the
+	// timeline came back silently empty. Surface query/scan errors instead.
 	dailyTimeline := make([]dailyCredit, 0)
 	dayRows, err := h.pool.Query(r.Context(), `
-		SELECT DATE(granted_at) as day, SUM(credit_amount)
+		SELECT DATE(granted_at)::text AS day, SUM(credit_amount)
 		FROM credit_ledger
 		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '30 days'
 		GROUP BY day ORDER BY day`,
 		volunteerID,
 	)
-	if err == nil {
-		defer dayRows.Close()
-		for dayRows.Next() {
-			var dc dailyCredit
-			var credit float64
-			if scanErr := dayRows.Scan(&dc.Date, &credit); scanErr == nil {
-				dc.Credit = credit
-				dailyTimeline = append(dailyTimeline, dc)
-			}
+	if err != nil {
+		l.Error("failed to query daily credit timeline", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
+		return
+	}
+	defer dayRows.Close()
+	for dayRows.Next() {
+		var dc dailyCredit
+		var credit float64
+		if scanErr := dayRows.Scan(&dc.Date, &credit); scanErr != nil {
+			l.Error("failed to scan daily credit row", "error", scanErr, "volunteer_id", volunteerID)
+			apierror.WriteError(w, apierror.Internal("failed to compute breakdown", scanErr))
+			return
 		}
+		dc.Credit = credit
+		dailyTimeline = append(dailyTimeline, dc)
+	}
+	if err := dayRows.Err(); err != nil {
+		l.Error("failed to iterate daily credit rows", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
+		return
 	}
 
-	// Weekly credit timeline (last 12 weeks).
+	// Weekly credit timeline (last 12 weeks). DATE_TRUNC returns a timestamptz;
+	// cast it to date then text (YYYY-MM-DD week start) for the same reason as the
+	// daily timeline above — pgx cannot scan a timestamptz into a *string, so the
+	// uncast query failed every Scan and the swallowed error left this empty.
 	weeklyTimeline := make([]weeklyCredit, 0)
 	weekRows, err := h.pool.Query(r.Context(), `
-		SELECT DATE_TRUNC('week', granted_at) as week_start, SUM(credit_amount)
+		SELECT DATE_TRUNC('week', granted_at)::date::text AS week_start, SUM(credit_amount)
 		FROM credit_ledger
 		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '12 weeks'
 		GROUP BY week_start ORDER BY week_start`,
 		volunteerID,
 	)
-	if err == nil {
-		defer weekRows.Close()
-		for weekRows.Next() {
-			var wc weeklyCredit
-			var credit float64
-			var weekStart string
-			if scanErr := weekRows.Scan(&weekStart, &credit); scanErr == nil {
-				wc.WeekStart = weekStart
-				wc.Credit = credit
-				weeklyTimeline = append(weeklyTimeline, wc)
-			}
+	if err != nil {
+		l.Error("failed to query weekly credit timeline", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
+		return
+	}
+	defer weekRows.Close()
+	for weekRows.Next() {
+		var wc weeklyCredit
+		var credit float64
+		if scanErr := weekRows.Scan(&wc.WeekStart, &credit); scanErr != nil {
+			l.Error("failed to scan weekly credit row", "error", scanErr, "volunteer_id", volunteerID)
+			apierror.WriteError(w, apierror.Internal("failed to compute breakdown", scanErr))
+			return
 		}
+		wc.Credit = credit
+		weeklyTimeline = append(weeklyTimeline, wc)
+	}
+	if err := weekRows.Err(); err != nil {
+		l.Error("failed to iterate weekly credit rows", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
+		return
 	}
 
 	resp := volunteerBreakdownResponse{
