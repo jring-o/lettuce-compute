@@ -125,8 +125,9 @@ func TestHandlerGetStats(t *testing.T) {
 	if snap.WorkUnitsRunning != 1 {
 		t.Errorf("work_units_running = %d, want 1", snap.WorkUnitsRunning)
 	}
-	if snap.ActiveVolunteers != 0 {
-		t.Errorf("active_volunteers = %d, want 0", snap.ActiveVolunteers)
+	// 1 ASSIGNED + 1 RUNNING live copy, each created with a distinct volunteer.
+	if snap.ActiveVolunteers != 2 {
+		t.Errorf("active_volunteers = %d, want 2 (distinct volunteers on live copies)", snap.ActiveVolunteers)
 	}
 }
 

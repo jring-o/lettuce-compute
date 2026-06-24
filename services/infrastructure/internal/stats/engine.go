@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
+	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -74,9 +75,18 @@ func (e *Engine) ComputeSnapshot(ctx context.Context, leafID types.ID) (*LeafSta
 	}
 	snap.SpotCheckPassRate = spotCheckPassRate(snap.SpotChecksPassed, snap.SpotChecksTotal)
 
-	// v0.2: ActiveVolunteers, TotalCreditGranted, and nullable metrics
-	// (AvgCompletionSeconds, AgreementRate, ThroughputPerHour) remain at
-	// zero values until volunteer/credit tracking is implemented.
+	// ActiveVolunteers is the same rolling-window count the head endpoints report
+	// (live copies plus volunteers active within the window), so every surface
+	// agrees on "active volunteers".
+	activeVolunteers, err := leaf.CountActiveVolunteersForLeaf(ctx, e.pool, leafID)
+	if err != nil {
+		return nil, apierror.Internal("failed to count active volunteers", err)
+	}
+	snap.ActiveVolunteers = activeVolunteers
+
+	// TotalCreditGranted and the nullable metrics (AvgCompletionSeconds,
+	// AgreementRate, ThroughputPerHour) remain at zero values until
+	// credit/throughput tracking is implemented.
 
 	// Insert snapshot and get back the generated id, snapshot_at, created_at.
 	err = e.pool.QueryRow(ctx, `

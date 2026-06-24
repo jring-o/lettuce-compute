@@ -2,6 +2,7 @@ package leaf
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -66,7 +67,7 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 	// Query active, public leafs with queued WU counts, active volunteer counts, and execution config.
 	// Uses LEFT JOINs with pre-aggregated subqueries instead of correlated subqueries to avoid
 	// O(N) sequential scans per leaf when work_units table is large.
-	rows, err := h.pool.Query(ctx, `
+	rows, err := h.pool.Query(ctx, fmt.Sprintf(`
 		SELECT
 			l.id, l.slug, l.name, l.description, l.research_area,
 			l.task_pattern, l.state, l.execution_config,
@@ -79,19 +80,10 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 			WHERE state IN ('QUEUED', 'CREATED')
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
-		LEFT JOIN (
-			-- Per-copy dispatch: active volunteers are those holding a LIVE copy
-			-- (RESERVED or RUNNING), derived from work_unit_assignment_history rather
-			-- than the unit's (now aggregate) state.
-			SELECT wu.leaf_id, COUNT(DISTINCT h.volunteer_id) AS cnt
-			FROM work_unit_assignment_history h
-			JOIN work_units wu ON wu.id = h.work_unit_id
-			WHERE h.outcome IS NULL AND h.volunteer_id IS NOT NULL
-			GROUP BY wu.leaf_id
-		) a ON a.leaf_id = l.id
+		LEFT JOIN (%s) a ON a.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
 		ORDER BY l.name ASC
-	`)
+	`, ActiveVolunteerSubquery()))
 	if err != nil {
 		l.Error("failed to query leafs for head info", "error", err)
 		apierror.WriteError(w, apierror.Internal("failed to get head info", err))
