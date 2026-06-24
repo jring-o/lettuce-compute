@@ -84,9 +84,22 @@ func (e *Engine) ComputeSnapshot(ctx context.Context, leafID types.ID) (*LeafSta
 	}
 	snap.ActiveVolunteers = activeVolunteers
 
-	// TotalCreditGranted and the nullable metrics (AvgCompletionSeconds,
-	// AgreementRate, ThroughputPerHour) remain at zero values until
-	// credit/throughput tracking is implemented.
+	// TotalCreditGranted is the sum of every credit_ledger row for this leaf (one
+	// row is written per agreed, validated result). The ledger is the authoritative
+	// source of granted credit, so the leaf-detail page and the per-leaf snapshot
+	// report the same total the operator credit-analysis endpoints do — instead of
+	// the hardcoded 0 that previously made the leaf page read "0 total credit".
+	// idx_credit_ledger_leaf_time (leaf_id, granted_at) covers this scan.
+	if err := e.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(credit_amount), 0)
+		FROM credit_ledger
+		WHERE leaf_id = $1
+	`, leafID).Scan(&snap.TotalCreditGranted); err != nil {
+		return nil, apierror.Internal("failed to sum credit granted", err)
+	}
+
+	// The nullable metrics (AvgCompletionSeconds, AgreementRate, ThroughputPerHour)
+	// remain at zero values until throughput tracking is implemented.
 
 	// Insert snapshot and get back the generated id, snapshot_at, created_at.
 	err = e.pool.QueryRow(ctx, `
@@ -174,6 +187,36 @@ func (e *Engine) ComputeLeafStatsBatch(ctx context.Context, leafIDs []types.ID) 
 	}
 	if err := rows.Err(); err != nil {
 		return nil, apierror.Internal("failed to iterate batch stats", err)
+	}
+
+	// TotalCreditGranted per leaf from the credit ledger, in one grouped scan, so
+	// the leaf-list endpoint reports the same granted-credit total as the leaf
+	// detail page (previously hardcoded 0). credit_ledger only references leaves
+	// that have work units, so every leaf with credit already has a (work-unit or
+	// pre-filled zero) entry in result; we just overlay the credit sum.
+	creditRows, err := e.pool.Query(ctx, `
+		SELECT leaf_id, COALESCE(SUM(credit_amount), 0)
+		FROM credit_ledger
+		WHERE leaf_id = ANY($1)
+		GROUP BY leaf_id
+	`, leafIDs)
+	if err != nil {
+		return nil, apierror.Internal("failed to compute batch credit", err)
+	}
+	defer creditRows.Close()
+
+	for creditRows.Next() {
+		var leafID types.ID
+		var credit float64
+		if err := creditRows.Scan(&leafID, &credit); err != nil {
+			return nil, apierror.Internal("failed to scan batch credit row", err)
+		}
+		if snap, ok := result[leafID]; ok {
+			snap.TotalCreditGranted = credit
+		}
+	}
+	if err := creditRows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate batch credit", err)
 	}
 
 	return result, nil

@@ -141,6 +141,45 @@ func createQueuedUnitWithCopy(t *testing.T, pool *pgxpool.Pool, leafID types.ID,
 	}
 }
 
+// insertCreditForLeaf attaches one AGREED result plus a credit_ledger row to an
+// EXISTING work unit of the leaf, so the leaf's work-unit-count assertions are
+// unchanged while its granted-credit total grows by `amount`. This mirrors how
+// the head writes one credit_ledger row per agreed, validated result.
+func insertCreditForLeaf(t *testing.T, pool *pgxpool.Pool, leafID types.ID, amount float64) {
+	t.Helper()
+	ctx := t.Context()
+
+	var wuID types.ID
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM work_units WHERE leaf_id = $1 LIMIT 1`, leafID).Scan(&wuID); err != nil {
+		t.Fatalf("insertCreditForLeaf: no work unit for leaf %v: %v", leafID, err)
+	}
+
+	volID := createTestVolunteer(t, pool)
+	resID := types.NewID()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO results (id, work_unit_id, volunteer_id, output_data, output_checksum,
+			execution_metadata, validation_status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'AGREED')`,
+		resID, wuID, volID,
+		json.RawMessage(`{"answer":42}`),
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		json.RawMessage(`{"wall_clock_seconds":1,"cpu_seconds_user":1}`),
+	)
+	if err != nil {
+		t.Fatalf("insertCreditForLeaf: insert result: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO credit_ledger (volunteer_id, leaf_id, work_unit_id, result_id, credit_amount)
+		VALUES ($1, $2, $3, $4, $5)`,
+		volID, leafID, wuID, resID, amount,
+	)
+	if err != nil {
+		t.Fatalf("insertCreditForLeaf: insert credit: %v", err)
+	}
+}
+
 // createTestVolunteer inserts a minimal volunteer for the copy FK
 // (work_unit_assignment_history.volunteer_id -> volunteers.id). public_key is
 // bytea NOT NULL + UNIQUE, so derive a unique 32-byte key from the volunteer's own
@@ -210,8 +249,9 @@ func TestComputeSnapshotWithWorkUnits(t *testing.T) {
 	if snap.ActiveVolunteers != 3 {
 		t.Errorf("active_volunteers = %d, want 3 (distinct volunteers on live copies)", snap.ActiveVolunteers)
 	}
+	// No credit_ledger rows in this fixture, so the granted-credit sum is 0.
 	if snap.TotalCreditGranted != 0 {
-		t.Errorf("total_credit_granted = %f, want 0 for v0.2", snap.TotalCreditGranted)
+		t.Errorf("total_credit_granted = %f, want 0 (no credit granted in fixture)", snap.TotalCreditGranted)
 	}
 	if snap.AvgCompletionSeconds != nil {
 		t.Errorf("avg_completion_seconds should be nil for v0.2")
@@ -230,6 +270,29 @@ func TestComputeSnapshotWithWorkUnits(t *testing.T) {
 	}
 	if snap.LeafID != leafID {
 		t.Errorf("leaf_id = %v, want %v", snap.LeafID, leafID)
+	}
+}
+
+func TestComputeSnapshotCreditGranted(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "eng-credit1")
+	leafID := createTestLeaf(t, pool, userID, "Stats Credit Test")
+
+	// One validated work unit with two credit_ledger rows against it (1.5 + 2.5).
+	createTestWorkUnits(t, pool, leafID, []string{"VALIDATED"})
+	insertCreditForLeaf(t, pool, leafID, 1.5)
+	insertCreditForLeaf(t, pool, leafID, 2.5)
+
+	engine := stats.NewEngine(pool)
+	snap, err := engine.ComputeSnapshot(t.Context(), leafID)
+	if err != nil {
+		t.Fatalf("ComputeSnapshot failed: %v", err)
+	}
+
+	if snap.TotalCreditGranted != 4.0 {
+		t.Errorf("total_credit_granted = %f, want 4.0 (1.5 + 2.5 from credit_ledger)", snap.TotalCreditGranted)
 	}
 }
 
@@ -426,6 +489,13 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	createTestWorkUnits(t, pool, leaf1ID, []string{"QUEUED", "QUEUED", "ASSIGNED", "RUNNING", "COMPLETED"})
 	createTestWorkUnits(t, pool, leaf2ID, []string{"QUEUED", "VALIDATED", "REJECTED"})
 
+	// Grant credit on each leaf (attached to existing work units, so the
+	// work-unit-count assertions below are unaffected): leaf1 = 2.5 + 1.0,
+	// leaf2 = 3.0, nonExistent = none.
+	insertCreditForLeaf(t, pool, leaf1ID, 2.5)
+	insertCreditForLeaf(t, pool, leaf1ID, 1.0)
+	insertCreditForLeaf(t, pool, leaf2ID, 3.0)
+
 	engine := stats.NewEngine(pool)
 	result, err := engine.ComputeLeafStatsBatch(t.Context(), []types.ID{leaf1ID, leaf2ID, nonExistentID})
 	if err != nil {
@@ -453,6 +523,9 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	if s1.WorkUnitsCompleted != 1 {
 		t.Errorf("project1 completed = %d, want 1", s1.WorkUnitsCompleted)
 	}
+	if s1.TotalCreditGranted != 3.5 {
+		t.Errorf("project1 credit = %f, want 3.5 (2.5 + 1.0)", s1.TotalCreditGranted)
+	}
 
 	// Project 2: 3 total, 1 queued, 1 validated, 1 failed (REJECTED)
 	s2 := result[leaf2ID]
@@ -465,11 +538,17 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	if s2.WorkUnitsFailed != 1 {
 		t.Errorf("project2 failed = %d, want 1", s2.WorkUnitsFailed)
 	}
+	if s2.TotalCreditGranted != 3.0 {
+		t.Errorf("project2 credit = %f, want 3.0", s2.TotalCreditGranted)
+	}
 
 	// Non-existent project: zero-value stats
 	s3 := result[nonExistentID]
 	if s3.TotalWorkUnits != 0 {
 		t.Errorf("non-existent project total = %d, want 0", s3.TotalWorkUnits)
+	}
+	if s3.TotalCreditGranted != 0 {
+		t.Errorf("non-existent project credit = %f, want 0", s3.TotalCreditGranted)
 	}
 }
 

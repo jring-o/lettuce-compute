@@ -1,0 +1,107 @@
+//go:build integration
+
+package credit
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/types"
+)
+
+// insertCreditAt creates a new work unit + AGREED result for the leaf and writes a
+// credit_ledger row of `amount` stamped at `grantedAt`, so a test can place credit
+// on specific days/weeks for the timeline.
+func insertCreditAt(t *testing.T, pool *pgxpool.Pool, leafID, volID types.ID, amount float64, grantedAt time.Time) {
+	t.Helper()
+	wuID := createTestWorkUnit(t, pool, leafID)
+	resID := createTestResult(t, pool, wuID, volID,
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO credit_ledger (volunteer_id, leaf_id, work_unit_id, result_id, credit_amount, granted_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		volID, leafID, wuID, resID, amount, grantedAt,
+	)
+	if err != nil {
+		t.Fatalf("insertCreditAt: %v", err)
+	}
+}
+
+// TestHandleVolunteerBreakdownTimeline is the regression test for the credit
+// breakdown timeline. Before the fix, the daily/weekly queries selected a Postgres
+// date / timestamptz into a Go string; pgx cannot scan that, every Scan errored,
+// and the loop swallowed the error (appending only on scanErr == nil) — so the
+// timeline always came back empty even when credit existed. The handler now casts
+// to text in SQL and surfaces scan errors, so the buckets populate.
+func TestHandleVolunteerBreakdownTimeline(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "breakdown-timeline")
+	leafID := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+
+	now := time.Now().UTC()
+	// Three credit rows on three distinct days, all within the last 30 days and
+	// 12 weeks: 1.0 today, 2.0 yesterday, 3.0 nine days ago.
+	insertCreditAt(t, pool, leafID, volID, 1.0, now)
+	insertCreditAt(t, pool, leafID, volID, 2.0, now.AddDate(0, 0, -1))
+	insertCreditAt(t, pool, leafID, volID, 3.0, now.AddDate(0, 0, -9))
+
+	h := NewAnalysisHandler(pool, nil, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", h.HandleVolunteerBreakdown)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/volunteers/"+volID.String()+"/credit/breakdown", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var resp volunteerBreakdownResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+
+	if resp.TotalCredit != 6.0 {
+		t.Errorf("total_credit = %v, want 6.0", resp.TotalCredit)
+	}
+
+	// The timeline is the regression target.
+	if len(resp.Timeline.Daily) != 3 {
+		t.Errorf("daily buckets = %d, want 3 (three distinct days)", len(resp.Timeline.Daily))
+	}
+	if len(resp.Timeline.Weekly) == 0 {
+		t.Error("timeline.weekly is empty; expected at least one weekly bucket")
+	}
+
+	var dailySum float64
+	for _, d := range resp.Timeline.Daily {
+		if d.Date == "" {
+			t.Error("daily bucket has empty date string")
+		}
+		dailySum += d.Credit
+	}
+	if dailySum != 6.0 {
+		t.Errorf("daily timeline sum = %v, want 6.0", dailySum)
+	}
+
+	var weeklySum float64
+	for _, w := range resp.Timeline.Weekly {
+		if w.WeekStart == "" {
+			t.Error("weekly bucket has empty week_start string")
+		}
+		weeklySum += w.Credit
+	}
+	if weeklySum != 6.0 {
+		t.Errorf("weekly timeline sum = %v, want 6.0", weeklySum)
+	}
+}
