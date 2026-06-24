@@ -48,6 +48,16 @@ service VolunteerService {
   // Abandon a work unit that the volunteer cannot execute (e.g., prepare failed).
   // Server marks the assignment as ABANDONED and requeues the work unit.
   rpc AbandonWorkUnit(AbandonWorkUnitRequest) returns (AbandonWorkUnitResponse);
+
+  // Return the CALLER's own credit contribution, aggregated across every leaf and
+  // every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
+  // identity key), not the host, so this already sums a volunteer's machines into
+  // one total. The caller's identity is derived from the VERIFIED per-request
+  // signature (the authenticated public key), NOT from any request field — so a
+  // volunteer can only ever see its own credit. Authenticated (not a public
+  // method). This is the self-service counterpart to the operator-only REST
+  // endpoint GET /api/v1/volunteers/{id}/credit/breakdown.
+  rpc GetMyContribution(GetMyContributionRequest) returns (GetMyContributionResponse);
 }
 
 // --- Existing v0.1 messages (unchanged) ---
@@ -306,4 +316,44 @@ message AbandonWorkUnitRequest {
 message AbandonWorkUnitResponse {
   bool requeued = 1;              // true if work unit was put back in the queue
   string message = 2;
+}
+
+// --- GetMyContribution (volunteer self-service credit) ---
+
+// GetMyContributionRequest carries no identity field on purpose: the head derives
+// the caller from the verified request signature, so the request body is empty.
+message GetMyContributionRequest {}
+
+message GetMyContributionResponse {
+  string volunteer_id = 1;                         // resolved ACCOUNT id (informational)
+  double total_credit = 2;                         // sum of all credit across every leaf/machine
+  repeated LeafContribution by_leaf = 3;           // per-leaf credit + resource usage
+  repeated ResourceTypeContribution by_resource_type = 4; // cpu_only / gpu split
+  repeated DailyContribution daily = 5;            // last 30 days
+  repeated WeeklyContribution weekly = 6;          // last 12 weeks
+}
+
+message LeafContribution {
+  string leaf_id = 1;
+  string leaf_name = 2;
+  double credit = 3;
+  int32 work_units = 4;
+  double cpu_seconds = 5;
+  double gpu_seconds = 6;
+}
+
+message ResourceTypeContribution {
+  string resource_type = 1;   // "cpu_only" or "gpu"
+  double credit = 2;
+  int32 work_units = 3;
+}
+
+message DailyContribution {
+  string date = 1;            // YYYY-MM-DD (UTC day)
+  double credit = 2;
+}
+
+message WeeklyContribution {
+  string week_start = 1;      // YYYY-MM-DD (week start, UTC)
+  double credit = 2;
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
+	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
@@ -1723,6 +1724,84 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		Requeued: requeued,
 		Message:  msg,
 	}, nil
+}
+
+// GetMyContribution returns the CALLER's own credit contribution, aggregated
+// across every leaf and every machine the account runs. The caller is identified
+// ONLY by the cryptographically verified public key set by the gRPC auth
+// interceptor (GetMyContribution is NOT in grpcPublicMethods, so the interceptor
+// has already verified the per-request signature); the request carries no identity
+// field. So a volunteer can only ever see its own credit. Credit is keyed to the
+// ACCOUNT (the Ed25519 identity key), not the host, so this already sums the
+// caller's machines into one account-wide total — the self-service counterpart to
+// the operator-only REST endpoint GET /api/v1/volunteers/{id}/credit/breakdown.
+func (s *volunteerService) GetMyContribution(ctx context.Context, _ *lettucev1.GetMyContributionRequest) (*lettucev1.GetMyContributionResponse, error) {
+	authedKey, ok := GRPCAuthPublicKeyFromContext(ctx)
+	if !ok {
+		return nil, status.Errorf(codes.Unauthenticated, "request is not authenticated")
+	}
+
+	vol, err := s.volunteerRepo.GetByPublicKey(ctx, []byte(authedKey))
+	if err != nil {
+		// An authenticated key with no volunteer row simply has no contribution
+		// yet (e.g. it has not registered on this head). Report an empty, zero
+		// breakdown rather than an error.
+		if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPStatus == 404 {
+			return &lettucev1.GetMyContributionResponse{}, nil
+		}
+		s.logger.Error("GetMyContribution: failed to resolve volunteer", "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
+	bd, err := credit.ComputeVolunteerBreakdown(ctx, s.pool, vol.ID)
+	if err != nil {
+		s.logger.Error("GetMyContribution: failed to compute breakdown", "volunteer_id", vol.ID, "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
+	return contributionResponseFromBreakdown(bd), nil
+}
+
+// contributionResponseFromBreakdown maps the shared credit.VolunteerBreakdown into
+// the GetMyContribution gRPC response.
+func contributionResponseFromBreakdown(bd *credit.VolunteerBreakdown) *lettucev1.GetMyContributionResponse {
+	resp := &lettucev1.GetMyContributionResponse{
+		VolunteerId:    bd.VolunteerID.String(),
+		TotalCredit:    bd.TotalCredit,
+		ByLeaf:         make([]*lettucev1.LeafContribution, 0, len(bd.ByLeaf)),
+		ByResourceType: make([]*lettucev1.ResourceTypeContribution, 0, len(bd.ByResourceType)),
+		Daily:          make([]*lettucev1.DailyContribution, 0, len(bd.Timeline.Daily)),
+		Weekly:         make([]*lettucev1.WeeklyContribution, 0, len(bd.Timeline.Weekly)),
+	}
+	for _, lc := range bd.ByLeaf {
+		resp.ByLeaf = append(resp.ByLeaf, &lettucev1.LeafContribution{
+			LeafId:     lc.LeafID.String(),
+			LeafName:   lc.LeafName,
+			Credit:     lc.Credit,
+			WorkUnits:  int32(lc.WorkUnits),
+			CpuSeconds: lc.CPUSeconds,
+			GpuSeconds: lc.GPUSeconds,
+		})
+	}
+	// Stable order for the resource-type split: cpu_only then gpu.
+	for _, rt := range []string{"cpu_only", "gpu"} {
+		v, ok := bd.ByResourceType[rt]
+		if !ok {
+			continue
+		}
+		resp.ByResourceType = append(resp.ByResourceType, &lettucev1.ResourceTypeContribution{
+			ResourceType: rt,
+			Credit:       v.Credit,
+			WorkUnits:    int32(v.WorkUnits),
+		})
+	}
+	for _, dc := range bd.Timeline.Daily {
+		resp.Daily = append(resp.Daily, &lettucev1.DailyContribution{Date: dc.Date, Credit: dc.Credit})
+	}
+	for _, wc := range bd.Timeline.Weekly {
+		resp.Weekly = append(resp.Weekly, &lettucev1.WeeklyContribution{WeekStart: wc.WeekStart, Credit: wc.Credit})
+	}
+	return resp
 }
 
 // resolveAuthedVolunteer verifies that the request was authenticated and that the

@@ -2029,6 +2029,376 @@ func (x *AbandonWorkUnitResponse) GetMessage() string {
 	return ""
 }
 
+// GetMyContributionRequest carries no identity field on purpose: the head derives
+// the caller from the verified request signature, so the request body is empty.
+type GetMyContributionRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetMyContributionRequest) Reset() {
+	*x = GetMyContributionRequest{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMyContributionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMyContributionRequest) ProtoMessage() {}
+
+func (x *GetMyContributionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMyContributionRequest.ProtoReflect.Descriptor instead.
+func (*GetMyContributionRequest) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{26}
+}
+
+type GetMyContributionResponse struct {
+	state          protoimpl.MessageState      `protogen:"open.v1"`
+	VolunteerId    string                      `protobuf:"bytes,1,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"`            // resolved ACCOUNT id (informational)
+	TotalCredit    float64                     `protobuf:"fixed64,2,opt,name=total_credit,json=totalCredit,proto3" json:"total_credit,omitempty"`          // sum of all credit across every leaf/machine
+	ByLeaf         []*LeafContribution         `protobuf:"bytes,3,rep,name=by_leaf,json=byLeaf,proto3" json:"by_leaf,omitempty"`                           // per-leaf credit + resource usage
+	ByResourceType []*ResourceTypeContribution `protobuf:"bytes,4,rep,name=by_resource_type,json=byResourceType,proto3" json:"by_resource_type,omitempty"` // cpu_only / gpu split
+	Daily          []*DailyContribution        `protobuf:"bytes,5,rep,name=daily,proto3" json:"daily,omitempty"`                                           // last 30 days
+	Weekly         []*WeeklyContribution       `protobuf:"bytes,6,rep,name=weekly,proto3" json:"weekly,omitempty"`                                         // last 12 weeks
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetMyContributionResponse) Reset() {
+	*x = GetMyContributionResponse{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMyContributionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMyContributionResponse) ProtoMessage() {}
+
+func (x *GetMyContributionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMyContributionResponse.ProtoReflect.Descriptor instead.
+func (*GetMyContributionResponse) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *GetMyContributionResponse) GetVolunteerId() string {
+	if x != nil {
+		return x.VolunteerId
+	}
+	return ""
+}
+
+func (x *GetMyContributionResponse) GetTotalCredit() float64 {
+	if x != nil {
+		return x.TotalCredit
+	}
+	return 0
+}
+
+func (x *GetMyContributionResponse) GetByLeaf() []*LeafContribution {
+	if x != nil {
+		return x.ByLeaf
+	}
+	return nil
+}
+
+func (x *GetMyContributionResponse) GetByResourceType() []*ResourceTypeContribution {
+	if x != nil {
+		return x.ByResourceType
+	}
+	return nil
+}
+
+func (x *GetMyContributionResponse) GetDaily() []*DailyContribution {
+	if x != nil {
+		return x.Daily
+	}
+	return nil
+}
+
+func (x *GetMyContributionResponse) GetWeekly() []*WeeklyContribution {
+	if x != nil {
+		return x.Weekly
+	}
+	return nil
+}
+
+type LeafContribution struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LeafId        string                 `protobuf:"bytes,1,opt,name=leaf_id,json=leafId,proto3" json:"leaf_id,omitempty"`
+	LeafName      string                 `protobuf:"bytes,2,opt,name=leaf_name,json=leafName,proto3" json:"leaf_name,omitempty"`
+	Credit        float64                `protobuf:"fixed64,3,opt,name=credit,proto3" json:"credit,omitempty"`
+	WorkUnits     int32                  `protobuf:"varint,4,opt,name=work_units,json=workUnits,proto3" json:"work_units,omitempty"`
+	CpuSeconds    float64                `protobuf:"fixed64,5,opt,name=cpu_seconds,json=cpuSeconds,proto3" json:"cpu_seconds,omitempty"`
+	GpuSeconds    float64                `protobuf:"fixed64,6,opt,name=gpu_seconds,json=gpuSeconds,proto3" json:"gpu_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeafContribution) Reset() {
+	*x = LeafContribution{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeafContribution) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeafContribution) ProtoMessage() {}
+
+func (x *LeafContribution) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeafContribution.ProtoReflect.Descriptor instead.
+func (*LeafContribution) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *LeafContribution) GetLeafId() string {
+	if x != nil {
+		return x.LeafId
+	}
+	return ""
+}
+
+func (x *LeafContribution) GetLeafName() string {
+	if x != nil {
+		return x.LeafName
+	}
+	return ""
+}
+
+func (x *LeafContribution) GetCredit() float64 {
+	if x != nil {
+		return x.Credit
+	}
+	return 0
+}
+
+func (x *LeafContribution) GetWorkUnits() int32 {
+	if x != nil {
+		return x.WorkUnits
+	}
+	return 0
+}
+
+func (x *LeafContribution) GetCpuSeconds() float64 {
+	if x != nil {
+		return x.CpuSeconds
+	}
+	return 0
+}
+
+func (x *LeafContribution) GetGpuSeconds() float64 {
+	if x != nil {
+		return x.GpuSeconds
+	}
+	return 0
+}
+
+type ResourceTypeContribution struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ResourceType  string                 `protobuf:"bytes,1,opt,name=resource_type,json=resourceType,proto3" json:"resource_type,omitempty"` // "cpu_only" or "gpu"
+	Credit        float64                `protobuf:"fixed64,2,opt,name=credit,proto3" json:"credit,omitempty"`
+	WorkUnits     int32                  `protobuf:"varint,3,opt,name=work_units,json=workUnits,proto3" json:"work_units,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResourceTypeContribution) Reset() {
+	*x = ResourceTypeContribution{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResourceTypeContribution) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResourceTypeContribution) ProtoMessage() {}
+
+func (x *ResourceTypeContribution) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResourceTypeContribution.ProtoReflect.Descriptor instead.
+func (*ResourceTypeContribution) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *ResourceTypeContribution) GetResourceType() string {
+	if x != nil {
+		return x.ResourceType
+	}
+	return ""
+}
+
+func (x *ResourceTypeContribution) GetCredit() float64 {
+	if x != nil {
+		return x.Credit
+	}
+	return 0
+}
+
+func (x *ResourceTypeContribution) GetWorkUnits() int32 {
+	if x != nil {
+		return x.WorkUnits
+	}
+	return 0
+}
+
+type DailyContribution struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Date          string                 `protobuf:"bytes,1,opt,name=date,proto3" json:"date,omitempty"` // YYYY-MM-DD (UTC day)
+	Credit        float64                `protobuf:"fixed64,2,opt,name=credit,proto3" json:"credit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DailyContribution) Reset() {
+	*x = DailyContribution{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DailyContribution) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DailyContribution) ProtoMessage() {}
+
+func (x *DailyContribution) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DailyContribution.ProtoReflect.Descriptor instead.
+func (*DailyContribution) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *DailyContribution) GetDate() string {
+	if x != nil {
+		return x.Date
+	}
+	return ""
+}
+
+func (x *DailyContribution) GetCredit() float64 {
+	if x != nil {
+		return x.Credit
+	}
+	return 0
+}
+
+type WeeklyContribution struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WeekStart     string                 `protobuf:"bytes,1,opt,name=week_start,json=weekStart,proto3" json:"week_start,omitempty"` // YYYY-MM-DD (week start, UTC)
+	Credit        float64                `protobuf:"fixed64,2,opt,name=credit,proto3" json:"credit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WeeklyContribution) Reset() {
+	*x = WeeklyContribution{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WeeklyContribution) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WeeklyContribution) ProtoMessage() {}
+
+func (x *WeeklyContribution) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WeeklyContribution.ProtoReflect.Descriptor instead.
+func (*WeeklyContribution) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *WeeklyContribution) GetWeekStart() string {
+	if x != nil {
+		return x.WeekStart
+	}
+	return ""
+}
+
+func (x *WeeklyContribution) GetCredit() float64 {
+	if x != nil {
+		return x.Credit
+	}
+	return 0
+}
+
 var File_proto_lettuce_v1_volunteer_proto protoreflect.FileDescriptor
 
 const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
@@ -2227,7 +2597,37 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x06reason\x18\x04 \x01(\tR\x06reason\"O\n" +
 	"\x17AbandonWorkUnitResponse\x12\x1a\n" +
 	"\brequeued\x18\x01 \x01(\bR\brequeued\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\xce\b\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\x1a\n" +
+	"\x18GetMyContributionRequest\"\xfd\x02\n" +
+	"\x19GetMyContributionResponse\x12!\n" +
+	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12!\n" +
+	"\ftotal_credit\x18\x02 \x01(\x01R\vtotalCredit\x12?\n" +
+	"\aby_leaf\x18\x03 \x03(\v2&.lettuce.volunteer.v1.LeafContributionR\x06byLeaf\x12X\n" +
+	"\x10by_resource_type\x18\x04 \x03(\v2..lettuce.volunteer.v1.ResourceTypeContributionR\x0ebyResourceType\x12=\n" +
+	"\x05daily\x18\x05 \x03(\v2'.lettuce.volunteer.v1.DailyContributionR\x05daily\x12@\n" +
+	"\x06weekly\x18\x06 \x03(\v2(.lettuce.volunteer.v1.WeeklyContributionR\x06weekly\"\xc1\x01\n" +
+	"\x10LeafContribution\x12\x17\n" +
+	"\aleaf_id\x18\x01 \x01(\tR\x06leafId\x12\x1b\n" +
+	"\tleaf_name\x18\x02 \x01(\tR\bleafName\x12\x16\n" +
+	"\x06credit\x18\x03 \x01(\x01R\x06credit\x12\x1d\n" +
+	"\n" +
+	"work_units\x18\x04 \x01(\x05R\tworkUnits\x12\x1f\n" +
+	"\vcpu_seconds\x18\x05 \x01(\x01R\n" +
+	"cpuSeconds\x12\x1f\n" +
+	"\vgpu_seconds\x18\x06 \x01(\x01R\n" +
+	"gpuSeconds\"v\n" +
+	"\x18ResourceTypeContribution\x12#\n" +
+	"\rresource_type\x18\x01 \x01(\tR\fresourceType\x12\x16\n" +
+	"\x06credit\x18\x02 \x01(\x01R\x06credit\x12\x1d\n" +
+	"\n" +
+	"work_units\x18\x03 \x01(\x05R\tworkUnits\"?\n" +
+	"\x11DailyContribution\x12\x12\n" +
+	"\x04date\x18\x01 \x01(\tR\x04date\x12\x16\n" +
+	"\x06credit\x18\x02 \x01(\x01R\x06credit\"K\n" +
+	"\x12WeeklyContribution\x12\x1d\n" +
+	"\n" +
+	"week_start\x18\x01 \x01(\tR\tweekStart\x12\x16\n" +
+	"\x06credit\x18\x02 \x01(\x01R\x06credit2\xc4\t\n" +
 	"\x10VolunteerService\x12n\n" +
 	"\x0fGetServerStatus\x12,.lettuce.volunteer.v1.GetServerStatusRequest\x1a-.lettuce.volunteer.v1.GetServerStatusResponse\x12t\n" +
 	"\x11RegisterVolunteer\x12..lettuce.volunteer.v1.RegisterVolunteerRequest\x1a/.lettuce.volunteer.v1.RegisterVolunteerResponse\x12n\n" +
@@ -2238,7 +2638,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\vGetHeadInfo\x12(.lettuce.volunteer.v1.GetHeadInfoRequest\x1a).lettuce.volunteer.v1.GetHeadInfoResponse\x12k\n" +
 	"\x0eSaveCheckpoint\x12+.lettuce.volunteer.v1.SaveCheckpointRequest\x1a,.lettuce.volunteer.v1.SaveCheckpointResponse\x12h\n" +
 	"\rGetCheckpoint\x12*.lettuce.volunteer.v1.GetCheckpointRequest\x1a+.lettuce.volunteer.v1.GetCheckpointResponse\x12n\n" +
-	"\x0fAbandonWorkUnit\x12,.lettuce.volunteer.v1.AbandonWorkUnitRequest\x1a-.lettuce.volunteer.v1.AbandonWorkUnitResponseBFZDgithub.com/lettuce-compute/infrastructure/proto/lettuce/v1;lettucev1b\x06proto3"
+	"\x0fAbandonWorkUnit\x12,.lettuce.volunteer.v1.AbandonWorkUnitRequest\x1a-.lettuce.volunteer.v1.AbandonWorkUnitResponse\x12t\n" +
+	"\x11GetMyContribution\x12..lettuce.volunteer.v1.GetMyContributionRequest\x1a/.lettuce.volunteer.v1.GetMyContributionResponseBFZDgithub.com/lettuce-compute/infrastructure/proto/lettuce/v1;lettucev1b\x06proto3"
 
 var (
 	file_proto_lettuce_v1_volunteer_proto_rawDescOnce sync.Once
@@ -2252,7 +2653,7 @@ func file_proto_lettuce_v1_volunteer_proto_rawDescGZIP() []byte {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescData
 }
 
-var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*GetServerStatusRequest)(nil),    // 0: lettuce.volunteer.v1.GetServerStatusRequest
 	(*GetServerStatusResponse)(nil),   // 1: lettuce.volunteer.v1.GetServerStatusResponse
@@ -2280,49 +2681,61 @@ var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*LeafInfo)(nil),                  // 23: lettuce.volunteer.v1.LeafInfo
 	(*AbandonWorkUnitRequest)(nil),    // 24: lettuce.volunteer.v1.AbandonWorkUnitRequest
 	(*AbandonWorkUnitResponse)(nil),   // 25: lettuce.volunteer.v1.AbandonWorkUnitResponse
-	nil,                               // 26: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
-	nil,                               // 27: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	nil,                               // 28: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	nil,                               // 29: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	(*GetMyContributionRequest)(nil),  // 26: lettuce.volunteer.v1.GetMyContributionRequest
+	(*GetMyContributionResponse)(nil), // 27: lettuce.volunteer.v1.GetMyContributionResponse
+	(*LeafContribution)(nil),          // 28: lettuce.volunteer.v1.LeafContribution
+	(*ResourceTypeContribution)(nil),  // 29: lettuce.volunteer.v1.ResourceTypeContribution
+	(*DailyContribution)(nil),         // 30: lettuce.volunteer.v1.DailyContribution
+	(*WeeklyContribution)(nil),        // 31: lettuce.volunteer.v1.WeeklyContribution
+	nil,                               // 32: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	nil,                               // 33: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	nil,                               // 34: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	nil,                               // 35: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 }
 var file_proto_lettuce_v1_volunteer_proto_depIdxs = []int32{
 	17, // 0: lettuce.volunteer.v1.RegisterVolunteerRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	17, // 1: lettuce.volunteer.v1.RequestWorkUnitRequest.current_available:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	6,  // 2: lettuce.volunteer.v1.RequestWorkUnitResponse.assignments:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	26, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	32, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
 	20, // 4: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
 	19, // 5: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
 	18, // 6: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
-	27, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	28, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	33, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	34, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
 	23, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
-	29, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	35, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 	20, // 11: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
-	0,  // 12: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
-	2,  // 13: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
-	4,  // 14: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
-	7,  // 15: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
-	9,  // 16: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
-	11, // 17: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
-	21, // 18: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
-	13, // 19: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
-	15, // 20: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
-	24, // 21: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
-	1,  // 22: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
-	3,  // 23: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
-	5,  // 24: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
-	8,  // 25: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
-	10, // 26: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
-	12, // 27: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
-	22, // 28: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
-	14, // 29: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
-	16, // 30: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
-	25, // 31: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
-	22, // [22:32] is the sub-list for method output_type
-	12, // [12:22] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	28, // 12: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
+	29, // 13: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
+	30, // 14: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
+	31, // 15: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
+	0,  // 16: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
+	2,  // 17: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
+	4,  // 18: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
+	7,  // 19: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
+	9,  // 20: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
+	11, // 21: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
+	21, // 22: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
+	13, // 23: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
+	15, // 24: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
+	24, // 25: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
+	26, // 26: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
+	1,  // 27: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
+	3,  // 28: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
+	5,  // 29: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
+	8,  // 30: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
+	10, // 31: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
+	12, // 32: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
+	22, // 33: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
+	14, // 34: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
+	16, // 35: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
+	25, // 36: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
+	27, // 37: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
+	27, // [27:38] is the sub-list for method output_type
+	16, // [16:27] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_proto_lettuce_v1_volunteer_proto_init() }
@@ -2336,7 +2749,7 @@ func file_proto_lettuce_v1_volunteer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_lettuce_v1_volunteer_proto_rawDesc), len(file_proto_lettuce_v1_volunteer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   30,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

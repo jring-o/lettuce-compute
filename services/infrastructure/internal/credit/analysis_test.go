@@ -44,8 +44,8 @@ func TestNormalizationFactors_Ratio(t *testing.T) {
 }
 
 func TestResourceTypeBreakdown_Structure(t *testing.T) {
-	cpuOnly := resourceTypeBreakdown{Credit: 1000, WorkUnits: 1000}
-	gpu := resourceTypeBreakdown{Credit: 234, WorkUnits: 234}
+	cpuOnly := ResourceTypeCredit{Credit: 1000, WorkUnits: 1000}
+	gpu := ResourceTypeCredit{Credit: 234, WorkUnits: 234}
 
 	total := cpuOnly.Credit + gpu.Credit
 	if total != 1234 {
@@ -113,13 +113,13 @@ func TestCrossLeafResponse_Structure(t *testing.T) {
 }
 
 func TestVolunteerBreakdownResponse_Structure(t *testing.T) {
-	resp := volunteerBreakdownResponse{
+	resp := VolunteerBreakdown{
 		TotalCredit: 1500,
-		ByLeaf: []volunteerLeafCredit{
+		ByLeaf: []LeafCredit{
 			{LeafName: "proj-a", Credit: 1000, WorkUnits: 100, CPUSeconds: 5000},
 			{LeafName: "proj-b", Credit: 500, WorkUnits: 50, GPUSeconds: 2000},
 		},
-		ByResourceType: map[string]resourceTypeBreakdown{
+		ByResourceType: map[string]ResourceTypeCredit{
 			"cpu_only": {Credit: 1000, WorkUnits: 100},
 			"gpu":      {Credit: 500, WorkUnits: 50},
 		},
@@ -140,8 +140,8 @@ func TestVolunteerBreakdownResponse_Structure(t *testing.T) {
 }
 
 func TestDailyWeeklyTimeline_Structure(t *testing.T) {
-	daily := dailyCredit{Date: "2026-03-22", Credit: 42}
-	weekly := weeklyCredit{WeekStart: "2026-03-16", Credit: 200}
+	daily := DailyCredit{Date: "2026-03-22", Credit: 42}
+	weekly := WeeklyCredit{WeekStart: "2026-03-16", Credit: 200}
 
 	if daily.Date != "2026-03-22" {
 		t.Errorf("expected date '2026-03-22', got %q", daily.Date)
