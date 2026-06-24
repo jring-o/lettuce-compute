@@ -301,6 +301,21 @@ func (h *LeafHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = ToLeafSummary(p)
 	}
 
+	// Populate active_volunteers from the live count. ToLeafSummary leaves it at
+	// zero because the DTO conversion has no DB access; the count is the same
+	// rolling-window metric the head endpoints report, so all surfaces agree.
+	// A failure here is non-fatal — the list is still useful without the counts.
+	if h.pool != nil && len(leafs) > 0 {
+		counts, err := CountActiveVolunteersByLeaf(r.Context(), h.pool)
+		if err != nil {
+			l.Warn("failed to count active volunteers for leaf list", "error", err)
+		} else {
+			for i, p := range leafs {
+				summaries[i].ActiveVolunteers = counts[p.ID]
+			}
+		}
+	}
+
 	resp := types.NewListResponse(summaries, pagination)
 	writeJSON(w, http.StatusOK, resp)
 }

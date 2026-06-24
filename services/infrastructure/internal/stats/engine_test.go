@@ -206,8 +206,9 @@ func TestComputeSnapshotWithWorkUnits(t *testing.T) {
 	if snap.WorkUnitsFailed != 2 {
 		t.Errorf("work_units_failed = %d, want 2 (REJECTED + EXPIRED)", snap.WorkUnitsFailed)
 	}
-	if snap.ActiveVolunteers != 0 {
-		t.Errorf("active_volunteers = %d, want 0 for v0.2", snap.ActiveVolunteers)
+	// 1 ASSIGNED + 2 RUNNING live copies, each created with a distinct volunteer.
+	if snap.ActiveVolunteers != 3 {
+		t.Errorf("active_volunteers = %d, want 3 (distinct volunteers on live copies)", snap.ActiveVolunteers)
 	}
 	if snap.TotalCreditGranted != 0 {
 		t.Errorf("total_credit_granted = %f, want 0 for v0.2", snap.TotalCreditGranted)

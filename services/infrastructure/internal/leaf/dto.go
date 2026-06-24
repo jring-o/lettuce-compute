@@ -95,8 +95,10 @@ func ToLeafSummary(p *Leaf) LeafSummary {
 		},
 		Runtime:           p.ExecutionConfig.Runtime,
 		StatsCacheSeconds: p.StatsCacheSeconds,
-		ActiveVolunteers:  0,   // v0.2: always 0
-		ProgressPct:       nil, // v0.2: always null
-		CreatedAt:         p.CreatedAt,
+		// ActiveVolunteers is populated by the list handler (handleList) from the
+		// live rolling-window count; the pure DTO conversion has no DB access.
+		ActiveVolunteers: 0,
+		ProgressPct:      nil, // per-leaf aggregate progress not yet implemented
+		CreatedAt:        p.CreatedAt,
 	}
 }

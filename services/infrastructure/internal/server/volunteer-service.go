@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -367,7 +368,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
 	// Uses LEFT JOINs with pre-aggregated subqueries instead of correlated subqueries to avoid
 	// O(N) sequential scans per leaf when work_units table is large.
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
 		SELECT l.id, l.slug, l.name, l.description, l.research_area, l.task_pattern, l.state,
 			COALESCE(q.cnt, 0),
 			COALESCE(a.cnt, 0),
@@ -379,16 +380,9 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			WHERE state IN ('QUEUED', 'CREATED')
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
-		LEFT JOIN (
-			-- Per-copy dispatch: active volunteers = those holding a LIVE copy.
-			SELECT wu.leaf_id, COUNT(DISTINCT h.volunteer_id) AS cnt
-			FROM work_unit_assignment_history h
-			JOIN work_units wu ON wu.id = h.work_unit_id
-			WHERE h.outcome IS NULL AND h.volunteer_id IS NOT NULL
-			GROUP BY wu.leaf_id
-		) a ON a.leaf_id = l.id
+		LEFT JOIN (%s) a ON a.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
-		ORDER BY l.name ASC`)
+		ORDER BY l.name ASC`, leaf.ActiveVolunteerSubquery()))
 	if err != nil {
 		s.logger.Error("query leafs", "method", "GetHeadInfo", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
