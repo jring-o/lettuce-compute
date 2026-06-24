@@ -211,6 +211,17 @@ to `VALIDATED`, use `redundancy_factor: 2` until that's resolved.
   going to be big.
 - WASM has a hard 4 GB memory ceiling and no network.
 
+**Progress reporting (design it in now).** Every leaf should emit progress so
+`lettuce-volunteer status` shows live progress and an ETA instead of a flat
+`0%`: the entrypoint periodically writes a single number `0`–`100` to
+`$LETTUCE_PROGRESS_FILE` (the runtime sets it for every runtime — native
+default `<work-dir>/progress.txt`, container `/work/output/progress.txt`).
+Decide the **progress signal** now — the loop the entrypoint will count
+(seeds, time-steps, items, rows) — and record it in the spec so the next skill
+writes it in from the start rather than bolting it on (the gap that shipped the
+Beyblade container leaf with no progress). If a work unit is a single
+indivisible step with no natural loop, say so and it's fine to skip.
+
 ### 7. Cost shape (per-unit duration, total count, deadline strategy)
 
 Three things:
@@ -286,6 +297,8 @@ from there. Use this template:
 - Choice: <NATIVE / CONTAINER / WASM>
 - Why: <one sentence>
 - Estimated artifact size: <MB or GB if large>
+- Progress signal: <the loop/iteration the entrypoint reports 0-100 from —
+  seeds / time-steps / items; or "none — single indivisible step">
 
 ## Cost
 - Per-unit estimate: <seconds / minutes>  (→ estimated_duration_seconds)
