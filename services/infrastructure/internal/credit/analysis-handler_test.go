@@ -33,6 +33,51 @@ func insertCreditAt(t *testing.T, pool *pgxpool.Pool, leafID, volID types.ID, am
 	}
 }
 
+// TestComputeVolunteerBreakdown exercises the shared breakdown function directly:
+// total credit, per-leaf rows, the resource-type split, and timeline buckets.
+func TestComputeVolunteerBreakdown(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "breakdown-fn")
+	leafA := createTestLeaf(t, pool, &userID)
+	leafB := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+
+	now := time.Now().UTC()
+	insertCreditAt(t, pool, leafA, volID, 2.0, now)
+	insertCreditAt(t, pool, leafB, volID, 3.0, now)
+
+	bd, err := ComputeVolunteerBreakdown(context.Background(), pool, volID)
+	if err != nil {
+		t.Fatalf("ComputeVolunteerBreakdown: %v", err)
+	}
+
+	if bd.VolunteerID != volID {
+		t.Errorf("volunteer_id = %v, want %v", bd.VolunteerID, volID)
+	}
+	if bd.TotalCredit != 5.0 {
+		t.Errorf("total_credit = %v, want 5.0", bd.TotalCredit)
+	}
+	if len(bd.ByLeaf) != 2 {
+		t.Errorf("by_leaf len = %d, want 2", len(bd.ByLeaf))
+	}
+	// createTestResult records cpu_seconds_user but no gpu_seconds, so all credit
+	// lands in the cpu_only bucket.
+	if got := bd.ByResourceType["cpu_only"].Credit; got != 5.0 {
+		t.Errorf("cpu_only credit = %v, want 5.0", got)
+	}
+	if got := bd.ByResourceType["gpu"].Credit; got != 0 {
+		t.Errorf("gpu credit = %v, want 0", got)
+	}
+	if len(bd.Timeline.Daily) == 0 {
+		t.Error("daily timeline empty")
+	}
+	if len(bd.Timeline.Weekly) == 0 {
+		t.Error("weekly timeline empty")
+	}
+}
+
 // TestHandleVolunteerBreakdownTimeline is the regression test for the credit
 // breakdown timeline. Before the fix, the daily/weekly queries selected a Postgres
 // date / timestamptz into a Go string; pgx cannot scan that, every Scan errored,
@@ -66,7 +111,7 @@ func TestHandleVolunteerBreakdownTimeline(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	var resp volunteerBreakdownResponse
+	var resp VolunteerBreakdown
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
 	}

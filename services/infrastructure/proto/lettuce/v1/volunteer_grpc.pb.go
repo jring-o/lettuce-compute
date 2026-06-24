@@ -29,6 +29,7 @@ const (
 	VolunteerService_SaveCheckpoint_FullMethodName    = "/lettuce.volunteer.v1.VolunteerService/SaveCheckpoint"
 	VolunteerService_GetCheckpoint_FullMethodName     = "/lettuce.volunteer.v1.VolunteerService/GetCheckpoint"
 	VolunteerService_AbandonWorkUnit_FullMethodName   = "/lettuce.volunteer.v1.VolunteerService/AbandonWorkUnit"
+	VolunteerService_GetMyContribution_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/GetMyContribution"
 )
 
 // VolunteerServiceClient is the client API for VolunteerService service.
@@ -69,6 +70,15 @@ type VolunteerServiceClient interface {
 	// Abandon a work unit that the volunteer cannot execute (e.g., prepare failed).
 	// Server marks the assignment as ABANDONED and requeues the work unit.
 	AbandonWorkUnit(ctx context.Context, in *AbandonWorkUnitRequest, opts ...grpc.CallOption) (*AbandonWorkUnitResponse, error)
+	// Return the CALLER's own credit contribution, aggregated across every leaf and
+	// every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
+	// identity key), not the host, so this already sums a volunteer's machines into
+	// one total. The caller's identity is derived from the VERIFIED per-request
+	// signature (the authenticated public key), NOT from any request field — so a
+	// volunteer can only ever see its own credit. Authenticated (not a public
+	// method). This is the self-service counterpart to the operator-only REST
+	// endpoint GET /api/v1/volunteers/{id}/credit/breakdown.
+	GetMyContribution(ctx context.Context, in *GetMyContributionRequest, opts ...grpc.CallOption) (*GetMyContributionResponse, error)
 }
 
 type volunteerServiceClient struct {
@@ -179,6 +189,16 @@ func (c *volunteerServiceClient) AbandonWorkUnit(ctx context.Context, in *Abando
 	return out, nil
 }
 
+func (c *volunteerServiceClient) GetMyContribution(ctx context.Context, in *GetMyContributionRequest, opts ...grpc.CallOption) (*GetMyContributionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetMyContributionResponse)
+	err := c.cc.Invoke(ctx, VolunteerService_GetMyContribution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VolunteerServiceServer is the server API for VolunteerService service.
 // All implementations must embed UnimplementedVolunteerServiceServer
 // for forward compatibility.
@@ -217,6 +237,15 @@ type VolunteerServiceServer interface {
 	// Abandon a work unit that the volunteer cannot execute (e.g., prepare failed).
 	// Server marks the assignment as ABANDONED and requeues the work unit.
 	AbandonWorkUnit(context.Context, *AbandonWorkUnitRequest) (*AbandonWorkUnitResponse, error)
+	// Return the CALLER's own credit contribution, aggregated across every leaf and
+	// every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
+	// identity key), not the host, so this already sums a volunteer's machines into
+	// one total. The caller's identity is derived from the VERIFIED per-request
+	// signature (the authenticated public key), NOT from any request field — so a
+	// volunteer can only ever see its own credit. Authenticated (not a public
+	// method). This is the self-service counterpart to the operator-only REST
+	// endpoint GET /api/v1/volunteers/{id}/credit/breakdown.
+	GetMyContribution(context.Context, *GetMyContributionRequest) (*GetMyContributionResponse, error)
 	mustEmbedUnimplementedVolunteerServiceServer()
 }
 
@@ -256,6 +285,9 @@ func (UnimplementedVolunteerServiceServer) GetCheckpoint(context.Context, *GetCh
 }
 func (UnimplementedVolunteerServiceServer) AbandonWorkUnit(context.Context, *AbandonWorkUnitRequest) (*AbandonWorkUnitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbandonWorkUnit not implemented")
+}
+func (UnimplementedVolunteerServiceServer) GetMyContribution(context.Context, *GetMyContributionRequest) (*GetMyContributionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMyContribution not implemented")
 }
 func (UnimplementedVolunteerServiceServer) mustEmbedUnimplementedVolunteerServiceServer() {}
 func (UnimplementedVolunteerServiceServer) testEmbeddedByValue()                          {}
@@ -458,6 +490,24 @@ func _VolunteerService_AbandonWorkUnit_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VolunteerService_GetMyContribution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMyContributionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VolunteerServiceServer).GetMyContribution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VolunteerService_GetMyContribution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VolunteerServiceServer).GetMyContribution(ctx, req.(*GetMyContributionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VolunteerService_ServiceDesc is the grpc.ServiceDesc for VolunteerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -504,6 +554,10 @@ var VolunteerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbandonWorkUnit",
 			Handler:    _VolunteerService_AbandonWorkUnit_Handler,
+		},
+		{
+			MethodName: "GetMyContribution",
+			Handler:    _VolunteerService_GetMyContribution_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

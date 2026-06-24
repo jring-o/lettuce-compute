@@ -54,40 +54,10 @@ type crossLeafResponse struct {
 	NormalizationFactors normalizationFactors `json:"normalization_factors"`
 }
 
-type volunteerLeafCredit struct {
-	LeafID   types.ID `json:"leaf_id"`
-	LeafName string   `json:"leaf_name"`
-	Credit      float64  `json:"credit"`
-	WorkUnits   int      `json:"work_units"`
-	CPUSeconds  float64  `json:"cpu_seconds"`
-	GPUSeconds  float64  `json:"gpu_seconds"`
-}
-
-type resourceTypeBreakdown struct {
-	Credit    float64 `json:"credit"`
-	WorkUnits int     `json:"work_units"`
-}
-
-type dailyCredit struct {
-	Date   string  `json:"date"`
-	Credit float64 `json:"credit"`
-}
-
-type weeklyCredit struct {
-	WeekStart string  `json:"week_start"`
-	Credit    float64 `json:"credit"`
-}
-
-type volunteerBreakdownResponse struct {
-	VolunteerID    types.ID                          `json:"volunteer_id"`
-	TotalCredit    float64                           `json:"total_credit"`
-	ByLeaf      []volunteerLeafCredit          `json:"by_leaf"`
-	ByResourceType map[string]resourceTypeBreakdown  `json:"by_resource_type"`
-	Timeline       struct {
-		Daily  []dailyCredit  `json:"daily"`
-		Weekly []weeklyCredit `json:"weekly"`
-	} `json:"timeline"`
-}
+// The per-volunteer credit breakdown response types live in breakdown.go
+// (VolunteerBreakdown, LeafCredit, ResourceTypeCredit, DailyCredit, WeeklyCredit,
+// CreditTimeline) so the operator REST handler below and the volunteer
+// self-service gRPC RPC share one definition.
 
 // --- Handler ---
 
@@ -266,134 +236,13 @@ func (h *AnalysisHandler) HandleVolunteerBreakdown(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// Per-leaf credit + resource usage.
-	rows, err := h.pool.Query(r.Context(), `
-		SELECT
-			l.id, l.name,
-			COALESCE(SUM(cl.credit_amount), 0),
-			COUNT(cl.id),
-			COALESCE(SUM((r.execution_metadata->>'cpu_seconds_user')::float), 0),
-			COALESCE(SUM((r.execution_metadata->>'gpu_seconds')::float), 0)
-		FROM credit_ledger cl
-		JOIN leafs l ON l.id = cl.leaf_id
-		LEFT JOIN results r ON r.id = cl.result_id AND r.validation_status = 'AGREED'
-		WHERE cl.volunteer_id = $1
-		GROUP BY l.id, l.name`,
-		volunteerID,
-	)
+	bd, err := ComputeVolunteerBreakdown(r.Context(), h.pool, volunteerID)
 	if err != nil {
-		l.Error("failed to get volunteer credit breakdown", "error", err)
-		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
-		return
-	}
-	defer rows.Close()
-
-	var totalCredit float64
-	byLeaf := make([]volunteerLeafCredit, 0)
-	cpuOnlyCredit, cpuOnlyWU := 0.0, 0
-	gpuCredit, gpuWU := 0.0, 0
-
-	for rows.Next() {
-		var vpc volunteerLeafCredit
-		if scanErr := rows.Scan(&vpc.LeafID, &vpc.LeafName, &vpc.Credit, &vpc.WorkUnits, &vpc.CPUSeconds, &vpc.GPUSeconds); scanErr != nil {
-			continue
-		}
-		totalCredit += vpc.Credit
-
-		if vpc.GPUSeconds > 0 {
-			gpuCredit += vpc.Credit
-			gpuWU += vpc.WorkUnits
-		} else {
-			cpuOnlyCredit += vpc.Credit
-			cpuOnlyWU += vpc.WorkUnits
-		}
-
-		byLeaf = append(byLeaf, vpc)
-	}
-
-	// Daily credit timeline (last 30 days). DATE(granted_at) is a Postgres date;
-	// cast it to text so it scans cleanly into the Go string field. pgx cannot scan
-	// a date straight into a *string, so without the cast every Scan here failed —
-	// and because the error was swallowed (only appending on scanErr == nil) the
-	// timeline came back silently empty. Surface query/scan errors instead.
-	dailyTimeline := make([]dailyCredit, 0)
-	dayRows, err := h.pool.Query(r.Context(), `
-		SELECT DATE(granted_at)::text AS day, SUM(credit_amount)
-		FROM credit_ledger
-		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '30 days'
-		GROUP BY day ORDER BY day`,
-		volunteerID,
-	)
-	if err != nil {
-		l.Error("failed to query daily credit timeline", "error", err, "volunteer_id", volunteerID)
-		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
-		return
-	}
-	defer dayRows.Close()
-	for dayRows.Next() {
-		var dc dailyCredit
-		var credit float64
-		if scanErr := dayRows.Scan(&dc.Date, &credit); scanErr != nil {
-			l.Error("failed to scan daily credit row", "error", scanErr, "volunteer_id", volunteerID)
-			apierror.WriteError(w, apierror.Internal("failed to compute breakdown", scanErr))
-			return
-		}
-		dc.Credit = credit
-		dailyTimeline = append(dailyTimeline, dc)
-	}
-	if err := dayRows.Err(); err != nil {
-		l.Error("failed to iterate daily credit rows", "error", err, "volunteer_id", volunteerID)
+		l.Error("failed to compute volunteer credit breakdown", "error", err, "volunteer_id", volunteerID)
 		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
 		return
 	}
 
-	// Weekly credit timeline (last 12 weeks). DATE_TRUNC returns a timestamptz;
-	// cast it to date then text (YYYY-MM-DD week start) for the same reason as the
-	// daily timeline above — pgx cannot scan a timestamptz into a *string, so the
-	// uncast query failed every Scan and the swallowed error left this empty.
-	weeklyTimeline := make([]weeklyCredit, 0)
-	weekRows, err := h.pool.Query(r.Context(), `
-		SELECT DATE_TRUNC('week', granted_at)::date::text AS week_start, SUM(credit_amount)
-		FROM credit_ledger
-		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '12 weeks'
-		GROUP BY week_start ORDER BY week_start`,
-		volunteerID,
-	)
-	if err != nil {
-		l.Error("failed to query weekly credit timeline", "error", err, "volunteer_id", volunteerID)
-		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
-		return
-	}
-	defer weekRows.Close()
-	for weekRows.Next() {
-		var wc weeklyCredit
-		var credit float64
-		if scanErr := weekRows.Scan(&wc.WeekStart, &credit); scanErr != nil {
-			l.Error("failed to scan weekly credit row", "error", scanErr, "volunteer_id", volunteerID)
-			apierror.WriteError(w, apierror.Internal("failed to compute breakdown", scanErr))
-			return
-		}
-		wc.Credit = credit
-		weeklyTimeline = append(weeklyTimeline, wc)
-	}
-	if err := weekRows.Err(); err != nil {
-		l.Error("failed to iterate weekly credit rows", "error", err, "volunteer_id", volunteerID)
-		apierror.WriteError(w, apierror.Internal("failed to compute breakdown", err))
-		return
-	}
-
-	resp := volunteerBreakdownResponse{
-		VolunteerID: volunteerID,
-		TotalCredit: totalCredit,
-		ByLeaf:   byLeaf,
-		ByResourceType: map[string]resourceTypeBreakdown{
-			"cpu_only": {Credit: cpuOnlyCredit, WorkUnits: cpuOnlyWU},
-			"gpu":      {Credit: gpuCredit, WorkUnits: gpuWU},
-		},
-	}
-	resp.Timeline.Daily = dailyTimeline
-	resp.Timeline.Weekly = weeklyTimeline
-
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, bd)
 }
 
