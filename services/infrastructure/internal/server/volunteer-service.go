@@ -1178,6 +1178,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 
 	txAssignRepo := assignment.NewPgxRepository(tx)
 	txResultRepo := result.NewPgxRepository(tx)
+	txWURepo := workunit.NewPgxWorkUnitRepository(tx)
 
 	// Per-copy dispatch: with N copies of a unit running in PARALLEL, several results
 	// can land concurrently. Serialize submits for the SAME unit by locking its row, so
@@ -1188,15 +1189,52 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Verify active assignment exists.
+	// Verify an OPEN copy exists for this volunteer.
 	activeAssignment, err := txAssignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
 	if err != nil {
 		apiErr, ok := err.(*apierror.APIError)
-		if ok && apiErr.HTTPStatus == 404 {
+		if !ok || apiErr.HTTPStatus != 404 {
+			s.logger.Error("failed to check assignment", "error", err)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+
+		// LATE-RESULT GRACE: there is no open copy for this volunteer. The common
+		// cause is a copy whose deadline lapsed and was closed by the fault monitor
+		// while the volunteer was still finishing the unit (for example across a
+		// scheduled pause). Rather than discard finished work, accept it under grace
+		// when BOTH hold:
+		//   (1) the unit is not yet finalized (not VALIDATED/FAILED) — a finalized
+		//       unit was already credited/assimilated, so a late result is useless; and
+		//   (2) this volunteer's most recent copy was closed by timeout or
+		//       abandonment (EXPIRED/ABANDONED), not by a prior COMPLETED submission.
+		// The result then corroborates like any other; uq_results_work_unit_volunteer
+		// prevents a double count. The unit row is already locked FOR UPDATE above, so
+		// this races safely against a concurrent finalize.
+		graceWU, wuErr := txWURepo.GetByID(ctx, workUnitID)
+		if wuErr != nil {
+			if wuAPIErr, ok := wuErr.(*apierror.APIError); ok && wuAPIErr.HTTPStatus == 404 {
+				return nil, status.Errorf(codes.NotFound, "work unit not found")
+			}
+			s.logger.Error("failed to load work unit for late-result grace", "error", wuErr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		if graceWU.State == workunit.WorkUnitStateValidated || graceWU.State == workunit.WorkUnitStateFailed {
+			return nil, status.Errorf(codes.FailedPrecondition, "work unit already finalized; result is too late to accept")
+		}
+
+		latest, latestErr := txAssignRepo.FindLatestByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
+		if latestErr != nil || latest.Outcome == nil ||
+			(*latest.Outcome != assignment.OutcomeExpired && *latest.Outcome != assignment.OutcomeAbandoned) {
 			return nil, status.Errorf(codes.FailedPrecondition, "no active assignment for this volunteer and work unit")
 		}
-		s.logger.Error("failed to check assignment", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
+
+		activeAssignment = latest
+		s.logger.Info("late result accepted under grace (copy deadline had lapsed)",
+			"work_unit_id", workUnitID,
+			"volunteer_id", volunteerID,
+			"copy_id", latest.ID,
+			"prior_outcome", string(*latest.Outcome),
+		)
 	}
 
 	// Count existing PENDING results to determine if work unit should transition to COMPLETED.
@@ -1267,7 +1305,6 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// Determine when to transition to COMPLETED.
 	// Read the leaf's redundancy_factor so WUs with redundancy > 1 wait for all results.
 	// For spot-check WUs, always require at least 2 results.
-	txWURepo := workunit.NewPgxWorkUnitRepository(tx)
 	currentWU, err := txWURepo.GetByID(ctx, workUnitID)
 	if err != nil {
 		s.logger.Error("failed to load work unit", "error", err)

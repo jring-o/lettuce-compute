@@ -586,6 +586,23 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 
+	// On going live, surface the work-unit deadline this leaf's units will carry
+	// (otherwise invisible to operators) and warn if it is too short for the work.
+	if target == StateActive {
+		if p.FaultToleranceConfig.NoDeadline {
+			l.Info("leaf activated", "leaf_id", id, "no_deadline", true)
+		} else {
+			l.Info("leaf activated",
+				"leaf_id", id,
+				"work_unit_deadline_seconds", p.FaultToleranceConfig.ResolveDeadlineSeconds(),
+				"max_cpu_seconds", p.ExecutionConfig.MaxCPUSeconds,
+			)
+			for _, warning := range DeadlineAdequacyWarnings(p) {
+				l.Warn("leaf deadline may be too short for its work", "leaf_id", id, "warning", warning)
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, p)
 }
 

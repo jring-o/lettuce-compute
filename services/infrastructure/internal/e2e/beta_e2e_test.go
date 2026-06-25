@@ -982,11 +982,11 @@ func TestBetaE2E_V3ProofOfOwnership(t *testing.T) {
 	resp = httpReq(t, "GET", env.httpURL+"/api/v1/identity/"+pubKeyB64, nil)
 	requireStatus(t, resp, http.StatusOK, "identity lookup")
 	var infoResp struct {
-		PublicKey            string `json:"public_key"`
-		VolunteerID          string `json:"volunteer_id"`
-		Verified             bool   `json:"verified"`
-		TotalCredit          int    `json:"total_credit"`
-		ProjectsContributing int    `json:"projects_contributing"`
+		PublicKey            string  `json:"public_key"`
+		VolunteerID          string  `json:"volunteer_id"`
+		Verified             bool    `json:"verified"`
+		TotalCredit          float64 `json:"total_credit"`
+		ProjectsContributing int     `json:"projects_contributing"`
 	}
 	decodeJSON(t, resp, &infoResp)
 

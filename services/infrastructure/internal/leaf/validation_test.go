@@ -923,6 +923,23 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "explicit deadline_seconds positive accepted",
+			modify:  func(c *FaultToleranceConfig) { d := 7200; c.DeadlineSeconds = &d },
+			wantErr: false,
+		},
+		{
+			name:    "explicit deadline_seconds zero rejected",
+			modify:  func(c *FaultToleranceConfig) { d := 0; c.DeadlineSeconds = &d },
+			wantErr: true,
+			errMsg:  "deadline_seconds",
+		},
+		{
+			name:    "explicit deadline_seconds negative rejected",
+			modify:  func(c *FaultToleranceConfig) { d := -5; c.DeadlineSeconds = &d },
+			wantErr: true,
+			errMsg:  "deadline_seconds",
+		},
+		{
 			name:    "max_reassignments too low",
 			modify:  func(c *FaultToleranceConfig) { c.MaxReassignments = 0 },
 			wantErr: true,

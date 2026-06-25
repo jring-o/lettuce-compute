@@ -243,6 +243,18 @@ func (m *bvMockAssignRepo) FindActiveByWorkUnitAndVolunteer(_ context.Context, w
 	}
 	return nil, apierror.NotFound("assignment", wuID.String())
 }
+func (m *bvMockAssignRepo) FindLatestByWorkUnitAndVolunteer(_ context.Context, wuID, volID types.ID) (*assignment.AssignmentHistoryEntry, error) {
+	var latest *assignment.AssignmentHistoryEntry
+	for _, e := range m.entries {
+		if e.WorkUnitID == wuID && e.VolunteerID == volID {
+			latest = e
+		}
+	}
+	if latest == nil {
+		return nil, apierror.NotFound("assignment", wuID.String())
+	}
+	return latest, nil
+}
 
 type bvMockResultRepo struct {
 	results []*result.Result

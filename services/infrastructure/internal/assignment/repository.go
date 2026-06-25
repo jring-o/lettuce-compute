@@ -15,4 +15,5 @@ type Repository interface {
 	CountActiveByWorkUnit(ctx context.Context, workUnitID types.ID) (int, error)
 	UpdateOutcome(ctx context.Context, id types.ID, outcome AssignmentOutcome, resultID *types.ID) error
 	FindActiveByWorkUnitAndVolunteer(ctx context.Context, workUnitID, volunteerID types.ID) (*AssignmentHistoryEntry, error)
+	FindLatestByWorkUnitAndVolunteer(ctx context.Context, workUnitID, volunteerID types.ID) (*AssignmentHistoryEntry, error)
 }

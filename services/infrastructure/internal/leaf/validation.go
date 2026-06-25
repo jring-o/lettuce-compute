@@ -638,6 +638,13 @@ func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
 			validationDetail{Field: "deadline_multiplier", Reason: "out_of_range"})
 	}
 
+	// Explicit absolute deadline, when provided, must be positive. Use no_deadline
+	// for "no hard deadline" rather than a zero/negative deadline_seconds.
+	if c.DeadlineSeconds != nil && *c.DeadlineSeconds <= 0 {
+		return apierror.ValidationError("deadline_seconds must be greater than 0 when set; use no_deadline for no hard deadline",
+			validationDetail{Field: "deadline_seconds", Reason: "must_be_positive"})
+	}
+
 	// Max reassignments: head-owned, no upper bound. Must be at least 1.
 	if c.MaxReassignments < 1 {
 		return apierror.ValidationError("max_reassignments must be at least 1",
@@ -659,6 +666,30 @@ func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
 	}
 
 	return nil
+}
+
+// DeadlineAdequacyWarnings reports non-fatal concerns about a leaf's work-unit
+// deadline relative to how long a unit is allowed to run. It returns
+// human-readable warnings (empty when the deadline is adequate). These are
+// advisory only — they never block activation — but they surface the most common
+// footgun: a deadline shorter than the unit's own CPU budget, which guarantees a
+// slow or paused volunteer loses its finished work to deadline reassignment.
+//
+// A no_deadline leaf has no hard deadline (its units run under the head reclaim
+// ceiling), so it is never flagged.
+func DeadlineAdequacyWarnings(p *Leaf) []string {
+	if p.FaultToleranceConfig.NoDeadline {
+		return nil
+	}
+	var warnings []string
+	deadline := p.FaultToleranceConfig.ResolveDeadlineSeconds()
+	maxRun := p.ExecutionConfig.MaxCPUSeconds
+	if maxRun > 0 && deadline < maxRun {
+		warnings = append(warnings, fmt.Sprintf(
+			"work-unit deadline (%ds) is shorter than max_cpu_seconds (%ds): a unit that uses its full CPU budget cannot be returned before the deadline and will be reassigned. Set a longer fault_tolerance_config.deadline_seconds (or deadline_multiplier), or a smaller execution_config.max_cpu_seconds.",
+			deadline, maxRun))
+	}
+	return warnings
 }
 
 // ValidateDataConfig validates data transfer and splitting configuration.

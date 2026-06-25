@@ -216,7 +216,7 @@ type infoResponse struct {
 	VolunteerID          string  `json:"volunteer_id"`
 	Verified             bool    `json:"verified"`
 	DisplayName          *string `json:"display_name"`
-	TotalCredit          int     `json:"total_credit"`
+	TotalCredit          float64 `json:"total_credit"`
 	ProjectsContributing int     `json:"projects_contributing"`
 }
 
@@ -244,16 +244,15 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 	// Check for verified challenge.
 	verified := h.hasVerifiedChallenge(r.Context(), pubKeyBytes)
 
-	// Get credit stats.
-	projectCredits, err := h.creditRepo.CountByVolunteerPerProject(r.Context(), vol.ID)
+	// Credit stats are sourced from the authoritative append-only credit ledger
+	// (the same ComputeVolunteerBreakdown that backs GetMyContribution and the
+	// volunteer stats endpoint), so every credit surface reports one consistent
+	// number that reflects the configured credit-per-work-unit rather than a raw
+	// row count.
+	bd, err := credit.ComputeVolunteerBreakdown(r.Context(), h.pool, vol.ID)
 	if err != nil {
-		l.Error("failed to get credit counts", "error", err)
-		projectCredits = map[types.ID]int{}
-	}
-
-	totalCredit := 0
-	for _, c := range projectCredits {
-		totalCredit += c
+		l.Error("failed to compute credit breakdown", "error", err)
+		bd = &credit.VolunteerBreakdown{}
 	}
 
 	resp := infoResponse{
@@ -261,8 +260,8 @@ func (h *Handler) handleInfo(w http.ResponseWriter, r *http.Request) {
 		VolunteerID:          vol.ID.String(),
 		Verified:             verified,
 		DisplayName:          vol.DisplayName,
-		TotalCredit:          totalCredit,
-		ProjectsContributing: len(projectCredits),
+		TotalCredit:          bd.TotalCredit,
+		ProjectsContributing: len(bd.ByLeaf),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

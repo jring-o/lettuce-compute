@@ -203,6 +203,13 @@ type FaultToleranceConfig struct {
 	HeartbeatIntervalSeconds  int     `json:"heartbeat_interval_seconds"`
 	MissedHeartbeatsThreshold int     `json:"missed_heartbeats_threshold"`
 	DeadlineMultiplier        float64 `json:"deadline_multiplier"`
+	// DeadlineSeconds, when set (> 0), is the absolute per-work-unit hard deadline
+	// in seconds and takes precedence over deadline_multiplier. It lets an operator
+	// state a real deadline directly instead of relying on a multiplier applied to a
+	// fixed baseline runtime estimate, so the resulting deadline can be matched to
+	// how long a unit actually takes (and to how long volunteers may pause). Omitted
+	// or <= 0 means "derive from deadline_multiplier". Ignored when NoDeadline.
+	DeadlineSeconds *int `json:"deadline_seconds,omitempty"`
 	// NoDeadline disables the hard wall-clock deadline for this leaf's work units
 	// at the execution level: ResolveDeadlineSeconds stamps a large synthetic
 	// reclaim ceiling (NoDeadlineCeilingSeconds, default 6h, operator-tunable via
@@ -217,6 +224,27 @@ type FaultToleranceConfig struct {
 	CheckpointingEnabled      bool  `json:"checkpointing_enabled"`
 	CheckpointIntervalSeconds *int  `json:"checkpoint_interval_seconds"`
 	MaxCheckpointSizeBytes    int64 `json:"max_checkpoint_size_bytes"`
+}
+
+// DefaultWorkUnitDurationSeconds is the baseline per-unit runtime (in seconds)
+// that deadline_multiplier scales to derive a work-unit deadline when no explicit
+// deadline_seconds is configured.
+const DefaultWorkUnitDurationSeconds = 3600
+
+// ResolveDeadlineSeconds returns the per-work-unit hard deadline implied by this
+// fault-tolerance config, NOT accounting for NoDeadline (callers apply the
+// NoDeadline reclaim ceiling separately). An explicit deadline_seconds (> 0) wins;
+// otherwise the deadline is DefaultWorkUnitDurationSeconds * deadline_multiplier
+// (multiplier floored at 1.0).
+func (c FaultToleranceConfig) ResolveDeadlineSeconds() int {
+	if c.DeadlineSeconds != nil && *c.DeadlineSeconds > 0 {
+		return *c.DeadlineSeconds
+	}
+	multiplier := c.DeadlineMultiplier
+	if multiplier <= 0 {
+		multiplier = 1.0
+	}
+	return int(float64(DefaultWorkUnitDurationSeconds) * multiplier)
 }
 
 // Generation mode constants.

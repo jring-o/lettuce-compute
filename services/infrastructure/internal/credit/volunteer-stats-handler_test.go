@@ -80,9 +80,12 @@ func TestVolunteerStats_WithProjectBreakdown(t *testing.T) {
 	proj2 := createTestLeaf(t, pool, &userID)
 	volID := createTestVolunteer(t, pool)
 
-	// Increment completed work units on the volunteer record.
+	// Seed the per-volunteer running counters with DELIBERATELY WRONG values. The
+	// stats endpoint must IGNORE these stale caches and report ledger-derived
+	// numbers instead — this is the regression guard for the counter-vs-ledger
+	// drift that surfaced as total_work_units_completed >> the per-leaf sum.
 	_, err := pool.Exec(ctx,
-		"UPDATE volunteers SET total_work_units_completed = 3, total_work_units_rejected = 1 WHERE id = $1", volID)
+		"UPDATE volunteers SET total_work_units_completed = 999, total_work_units_rejected = 7 WHERE id = $1", volID)
 	if err != nil {
 		t.Fatalf("update volunteer counters: %v", err)
 	}
@@ -122,6 +125,14 @@ func TestVolunteerStats_WithProjectBreakdown(t *testing.T) {
 		t.Fatalf("Create credit 3: %v", err)
 	}
 
+	// One DISAGREED result (no credit_ledger row): the endpoint must report exactly
+	// one rejected work unit from the results table, not the stale "7" counter.
+	wu4 := createTestWorkUnit(t, pool, proj1)
+	res4 := createTestResult(t, pool, wu4, volID, "dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444dddd4444")
+	if _, err := pool.Exec(ctx, "UPDATE results SET validation_status = 'DISAGREED' WHERE id = $1", res4); err != nil {
+		t.Fatalf("mark result DISAGREED: %v", err)
+	}
+
 	// Create the handler and serve the request.
 	volunteerRepo := volunteer.NewPgxRepository(pool)
 	leafRepo := leaf.NewPgxRepository(pool)
@@ -147,14 +158,15 @@ func TestVolunteerStats_WithProjectBreakdown(t *testing.T) {
 	if resp.VolunteerID != volID {
 		t.Errorf("VolunteerID = %v, want %v", resp.VolunteerID, volID)
 	}
+	// Ledger-derived totals, NOT the stale 999/7 counters.
 	if resp.TotalWorkUnitsCompleted != 3 {
-		t.Errorf("TotalWorkUnitsCompleted = %d, want 3", resp.TotalWorkUnitsCompleted)
+		t.Errorf("TotalWorkUnitsCompleted = %d, want 3 (ledger row count, not the stale 999 counter)", resp.TotalWorkUnitsCompleted)
 	}
 	if resp.TotalWorkUnitsRejected != 1 {
-		t.Errorf("TotalWorkUnitsRejected = %d, want 1", resp.TotalWorkUnitsRejected)
+		t.Errorf("TotalWorkUnitsRejected = %d, want 1 (DISAGREED results, not the stale 7 counter)", resp.TotalWorkUnitsRejected)
 	}
-	if resp.TotalCredit != 30.0 {
-		t.Errorf("TotalCredit = %v, want 30.0", resp.TotalCredit)
+	if resp.TotalCredit != 50.0 {
+		t.Errorf("TotalCredit = %v, want 50.0 (ledger sum 10+20+20, not the volunteer_rac accumulator)", resp.TotalCredit)
 	}
 	if len(resp.Leafs) != 2 {
 		t.Fatalf("Projects count = %d, want 2", len(resp.Leafs))
@@ -163,13 +175,21 @@ func TestVolunteerStats_WithProjectBreakdown(t *testing.T) {
 		t.Error("PublicKey should not be empty")
 	}
 
-	// Verify per-leaf breakdown.
+	// Per-leaf credit and work-unit counts must also come from the ledger.
+	byLeaf := make(map[types.ID]LeafStatsEntry, len(resp.Leafs))
 	for _, p := range resp.Leafs {
+		byLeaf[p.LeafID] = p
 		if p.LeafName == "" {
 			t.Error("LeafName should not be empty")
 		}
 		if p.RAC <= 0 {
 			t.Errorf("RAC for project %v should be > 0, got %v", p.LeafID, p.RAC)
 		}
+	}
+	if got := byLeaf[proj1]; got.WorkUnitsCompleted != 1 || got.TotalCredit != 10.0 {
+		t.Errorf("proj1 breakdown = {wu:%d credit:%v}, want {wu:1 credit:10}", got.WorkUnitsCompleted, got.TotalCredit)
+	}
+	if got := byLeaf[proj2]; got.WorkUnitsCompleted != 2 || got.TotalCredit != 40.0 {
+		t.Errorf("proj2 breakdown = {wu:%d credit:%v}, want {wu:2 credit:40}", got.WorkUnitsCompleted, got.TotalCredit)
 	}
 }

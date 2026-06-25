@@ -393,6 +393,9 @@ func (m *mockAssignmentRepo) UpdateOutcome(_ context.Context, _ types.ID, _ assi
 func (m *mockAssignmentRepo) FindActiveByWorkUnitAndVolunteer(_ context.Context, _, _ types.ID) (*assignment.AssignmentHistoryEntry, error) {
 	return nil, nil
 }
+func (m *mockAssignmentRepo) FindLatestByWorkUnitAndVolunteer(_ context.Context, _, _ types.ID) (*assignment.AssignmentHistoryEntry, error) {
+	return nil, nil
+}
 
 // --- Test Helpers ---
 
