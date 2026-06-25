@@ -93,11 +93,10 @@ func ResolveDeadlineSeconds(proj *leaf.Leaf) int {
 	if proj.FaultToleranceConfig.NoDeadline {
 		return noDeadlineCeilingSeconds
 	}
-	multiplier := proj.FaultToleranceConfig.DeadlineMultiplier
-	if multiplier <= 0 {
-		multiplier = 1.0
-	}
-	return int(float64(DefaultDurationSeconds) * multiplier)
+	// Delegate to the leaf config so an explicit deadline_seconds and the
+	// multiplier fallback are resolved in exactly one place (shared with the
+	// activation-time adequacy check).
+	return proj.FaultToleranceConfig.ResolveDeadlineSeconds()
 }
 
 // ResolveNextSequenceNumber queries existing batches and returns the next

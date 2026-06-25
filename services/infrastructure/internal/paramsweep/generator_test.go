@@ -390,6 +390,19 @@ func TestResolveDeadlineSeconds_ZeroMultiplier(t *testing.T) {
 	}
 }
 
+func TestResolveDeadlineSeconds_ExplicitOverridesMultiplier(t *testing.T) {
+	explicit := 86400
+	proj := &leaf.Leaf{
+		FaultToleranceConfig: leaf.FaultToleranceConfig{
+			DeadlineMultiplier: 3.0, // would give 10800; the explicit value must win
+			DeadlineSeconds:    &explicit,
+		},
+	}
+	if deadline := generate.ResolveDeadlineSeconds(proj); deadline != explicit {
+		t.Errorf("expected explicit deadline %d, got %d", explicit, deadline)
+	}
+}
+
 func TestResolveDeadlineSeconds_NoDeadline(t *testing.T) {
 	proj := &leaf.Leaf{
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
