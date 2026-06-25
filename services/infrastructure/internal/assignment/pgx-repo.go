@@ -198,6 +198,28 @@ func (r *PgxRepository) FindActiveByWorkUnitAndVolunteer(ctx context.Context, wo
 	return entry, nil
 }
 
+// FindLatestByWorkUnitAndVolunteer returns the most recent copy (assignment
+// history row) for a (work unit, volunteer) pair regardless of outcome, or a
+// NotFound error if the volunteer never held a copy. It backs the late-result
+// grace path: when a volunteer submits after its copy's deadline lapsed (so no
+// open copy remains), the head inspects the latest copy's outcome to decide
+// whether the finished work can still be accepted.
+func (r *PgxRepository) FindLatestByWorkUnitAndVolunteer(ctx context.Context, workUnitID, volunteerID types.ID) (*AssignmentHistoryEntry, error) {
+	row := r.db.QueryRow(ctx,
+		"SELECT "+assignmentColumns+" FROM work_unit_assignment_history WHERE work_unit_id = $1 AND volunteer_id = $2 ORDER BY assigned_at DESC, created_at DESC LIMIT 1",
+		workUnitID, volunteerID,
+	)
+
+	entry, err := scanAssignment(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.NotFound("assignment", fmt.Sprintf("work_unit=%s volunteer=%s", workUnitID, volunteerID))
+		}
+		return nil, apierror.Internal("failed to find latest assignment", err)
+	}
+	return entry, nil
+}
+
 // UpdateOutcome sets the outcome, outcome_at, and optionally result_id for an
 // assignment history entry. outcome_at is set to NOW().
 func (r *PgxRepository) UpdateOutcome(ctx context.Context, id types.ID, outcome AssignmentOutcome, resultID *types.ID) error {
