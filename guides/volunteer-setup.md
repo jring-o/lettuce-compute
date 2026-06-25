@@ -258,6 +258,10 @@ Two things make this volunteer-friendly:
   re-offered once its reservation window passes; a started-but-never-finished unit
   is reassigned once its deadline passes. At worst a unit is re-dispatched, never
   permanently stranded.
+- **Finishing slightly late still counts.** If a slot paused mid-unit (say on a
+  scheduled pause) and you submit just after the deadline, the head still accepts
+  the finished result as long as the unit hasn't already been validated by someone
+  else — so you keep the credit instead of losing work you already did.
 
 ### Tuning the buffer
 
