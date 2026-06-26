@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+// gracefulShutdownGrace bounds how long a compute process is given to exit after it
+// is asked to terminate on cancellation (a graceful stop or a deadline). It is long
+// enough for a cooperating leaf to flush a final checkpoint, after which the process
+// is killed. Leaves that ignore termination simply exit when killed, as before.
+const gracefulShutdownGrace = 15 * time.Second
+
 // WorkUnit contains all info needed to execute a unit of work.
 type WorkUnit struct {
 	ID              string            // work unit UUID

@@ -160,6 +160,16 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	// Instantiate WASI.
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
+	// Checkpoint state lives in a per-unit directory under the work dir (mounted at
+	// /work), exposed to the module via LETTUCE_CHECKPOINT_DIR and archived/restored
+	// as a unit by the checkpoint manager. LETTUCE_CHECKPOINT_FILE is kept for
+	// single-file leaves and points INSIDE that directory so either convention is
+	// captured. Create it up front so it exists on a fresh and a resumed run.
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
+	if err := os.MkdirAll(checkpointDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create checkpoint dir: %w", err)
+	}
+
 	// Build environment variables.
 	envVars := make(map[string]string)
 	for k, v := range wu.EnvVars {
@@ -168,7 +178,8 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	envVars["LETTUCE_WORK_DIR"] = "/work"
 	envVars["LETTUCE_OUTPUT_FILE"] = "/work/output.dat"
 	envVars["LETTUCE_PROGRESS_FILE"] = "/work/progress.txt"
-	envVars["LETTUCE_CHECKPOINT_FILE"] = "/work/checkpoint.dat"
+	envVars["LETTUCE_CHECKPOINT_DIR"] = "/work/checkpoint"
+	envVars["LETTUCE_CHECKPOINT_FILE"] = "/work/checkpoint/checkpoint.dat"
 	if prep.InputPath != "" {
 		envVars["LETTUCE_INPUT_FILE"] = "/work/input.dat"
 	}

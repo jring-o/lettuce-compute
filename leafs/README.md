@@ -70,6 +70,65 @@ Working reference implementations to copy:
 (Python, container) both do exactly this. Deployed leaves such as the Beyblade
 Arena native engine follow the same per-iteration pattern.
 
+## Checkpointing (optional, for long work units)
+
+Without checkpointing, a work unit that is interrupted — the volunteer is
+stopped or updated, the machine reboots, or the unit is reassigned to a
+different volunteer — **restarts from the beginning** and redoes all the work it
+had already done. For short units that is fine. For long ones (tens of minutes
+or more) it wastes the volunteer's compute and resets the progress bar. A leaf
+that checkpoints resumes from roughly where it left off instead.
+
+Checkpointing is **opt-in** and requires the leaf to cooperate — the
+infrastructure cannot snapshot arbitrary in-progress computation for you. Two
+parts:
+
+1. **Enable it in the leaf's `fault_tolerance_config`:** set
+   `checkpointing_enabled: true` and `checkpoint_interval_seconds` (minimum
+   `60`). This is how much work is at risk: the volunteer archives the
+   checkpoint on this interval, so at most one interval is ever lost.
+2. **Honor the checkpoint contract in the entrypoint** (below).
+
+### The contract
+
+The runtime gives every runtime a per-unit checkpoint **directory** and creates
+it before the leaf starts:
+
+- `$LETTUCE_CHECKPOINT_DIR` — a directory the leaf reads from and writes its
+  resumable state into. native → `<work-dir>/checkpoint`; container →
+  `/work/checkpoint` (bind-mounted); wasm → `/work/checkpoint`.
+- `$LETTUCE_CHECKPOINT_FILE` — a convenience path **inside** that directory
+  (`.../checkpoint.dat`) for leaves whose state is a single file. Either way the
+  whole directory is what gets captured and restored, so use whichever you like.
+
+The leaf is responsible for two things:
+
+- **Save** its resumable state into the directory periodically (e.g. "completed
+  N of M items" plus any partial results). On the next interval the volunteer
+  archives the directory to the head.
+- **Resume on startup**: when the directory already contains a checkpoint, load
+  it, continue from there instead of from zero, and immediately re-emit the
+  matching `$LETTUCE_PROGRESS_FILE` value so progress does not reset. The same
+  directory is populated whether the unit resumed on the same volunteer (the
+  work dir is preserved across a restart) or was reassigned to a new one (the
+  head's latest checkpoint is restored into it before the leaf starts), so a
+  single resume path handles both.
+
+Guidance:
+
+- Write checkpoints **atomically** — write a temp file in the checkpoint
+  directory and rename it over the target. A checkpoint can be captured (or the
+  process killed) at any moment, so a half-written file must never be left
+  behind for the next run to load.
+- Keep it **best-effort**: a failed checkpoint write must never fail the work
+  unit; the unit just falls back to restarting from the last good checkpoint.
+- Stay within `max_checkpoint_size_bytes` (default 100 MB) — the head rejects a
+  larger checkpoint.
+- On a graceful stop the leaf is sent `SIGTERM` with a short grace window before
+  it is killed. Trapping `SIGTERM` to flush one final checkpoint before exiting
+  reduces the work lost on a clean stop to nearly zero; it is optional, since
+  the interval already bounds the loss.
+
 ## How a leaf gets created
 
 The agent-guided flow:

@@ -25,6 +25,7 @@ type MockDockerClient struct {
 	ContainerWaitFn    func(ctx context.Context, containerID string) (int64, error)
 	ContainerLogsFn    func(ctx context.Context, containerID string) (io.ReadCloser, error)
 	ContainerInspectFn func(ctx context.Context, containerID string) (*ContainerStats, error)
+	ContainerStopFn    func(ctx context.Context, containerID string, timeout time.Duration) error
 	ContainerRemoveFn  func(ctx context.Context, containerID string) error
 	ImageIDFn          func(ctx context.Context, ref string) (string, error)
 	ImageListFn        func(ctx context.Context) ([]ImageSummary, error)
@@ -110,6 +111,13 @@ func (m *MockDockerClient) ContainerInspect(ctx context.Context, containerID str
 		return m.ContainerInspectFn(ctx, containerID)
 	}
 	return &ContainerStats{}, nil
+}
+
+func (m *MockDockerClient) ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error {
+	if m.ContainerStopFn != nil {
+		return m.ContainerStopFn(ctx, containerID, timeout)
+	}
+	return nil
 }
 
 func (m *MockDockerClient) ContainerRemove(ctx context.Context, containerID string) error {
@@ -698,13 +706,14 @@ func TestContainerRuntime_ExecuteVolumeMounts(t *testing.T) {
 	}
 
 	binds := mock.LastCreateConfig.Binds
-	if len(binds) != 2 {
-		t.Fatalf("expected 2 binds, got %d", len(binds))
+	if len(binds) != 3 {
+		t.Fatalf("expected 3 binds, got %d", len(binds))
 	}
 
-	// Input should be read-only.
+	// Input is read-only; output and checkpoint are read-write.
 	foundInputRO := false
 	foundOutputRW := false
+	foundCheckpointRW := false
 	for _, bind := range binds {
 		if strings.HasSuffix(bind, ":/work/input:ro") {
 			foundInputRO = true
@@ -712,12 +721,68 @@ func TestContainerRuntime_ExecuteVolumeMounts(t *testing.T) {
 		if strings.HasSuffix(bind, ":/work/output") {
 			foundOutputRW = true
 		}
+		if strings.HasSuffix(bind, ":/work/checkpoint") {
+			foundCheckpointRW = true
+		}
 	}
 	if !foundInputRO {
 		t.Errorf("expected input bind with :ro, got %v", binds)
 	}
 	if !foundOutputRW {
 		t.Errorf("expected output bind without :ro, got %v", binds)
+	}
+	if !foundCheckpointRW {
+		t.Errorf("expected checkpoint bind without :ro, got %v", binds)
+	}
+}
+
+func TestContainerRuntime_GracefulStopOnCancel(t *testing.T) {
+	stopTimeout := make(chan time.Duration, 1)
+	mock := &MockDockerClient{
+		ContainerWaitFn: func(ctx context.Context, containerID string) (int64, error) {
+			<-ctx.Done() // block until the work is cancelled
+			return 0, ctx.Err()
+		},
+		ContainerStopFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			stopTimeout <- timeout
+			return nil
+		},
+	}
+	cr, _ := newTestContainerRuntime(t, mock)
+
+	wu := &WorkUnit{
+		ID:            "a1b2c3d4-1111-2222-3333-444455556666",
+		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
+	}
+	prep, err := cr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer cr.Cleanup(prep)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = cr.Execute(ctx, wu, prep)
+	if err == nil {
+		t.Fatal("expected cancellation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "cancel") {
+		t.Errorf("error = %q, want it to mention cancellation", err.Error())
+	}
+
+	// On cancellation the container must be stopped with a grace period (so its
+	// entrypoint can flush a final checkpoint) rather than only force-removed.
+	select {
+	case got := <-stopTimeout:
+		if got != gracefulShutdownGrace {
+			t.Errorf("ContainerStop grace = %v, want %v", got, gracefulShutdownGrace)
+		}
+	default:
+		t.Error("ContainerStop was not called on cancellation")
 	}
 }
 

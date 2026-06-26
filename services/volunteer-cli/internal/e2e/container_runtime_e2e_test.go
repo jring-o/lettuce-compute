@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
@@ -103,6 +104,10 @@ func (m *mockDockerClient) ContainerInspect(ctx context.Context, containerID str
 		return m.containerInspectFn(ctx, containerID)
 	}
 	return &runtime.ContainerStats{}, nil
+}
+
+func (m *mockDockerClient) ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error {
+	return nil
 }
 
 func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID string) error {
