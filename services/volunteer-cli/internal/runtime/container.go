@@ -139,11 +139,13 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 		return nil, fmt.Errorf("docker is not available: %w", err)
 	}
 
-	// Create work directory structure.
+	// Create work directory structure. The checkpoint dir is bind-mounted rw into the
+	// container at /work/checkpoint and archived/restored by the checkpoint manager.
 	workDir := filepath.Join(c.dataDir, "container-work", wu.ID)
 	inputDir := filepath.Join(workDir, "input")
 	outputDir := filepath.Join(workDir, "output")
-	for _, dir := range []string{inputDir, outputDir} {
+	checkpointDir := filepath.Join(workDir, "checkpoint")
+	for _, dir := range []string{inputDir, outputDir, checkpointDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create work dir: %w", err)
 		}
@@ -291,9 +293,16 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 
 	inputDir := filepath.Join(prep.WorkDir, "input")
 	outputDir := filepath.Join(prep.WorkDir, "output")
+	// Checkpoint dir, bind-mounted rw at /work/checkpoint. Recreated here (not just in
+	// Prepare) so it exists for a resumed unit, where Execute runs without Prepare but
+	// the work dir was preserved.
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
+	if err := os.MkdirAll(checkpointDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create checkpoint dir: %w", err)
+	}
 
 	// Build environment variables.
-	env := make([]string, 0, len(wu.EnvVars)+4)
+	env := make([]string, 0, len(wu.EnvVars)+8)
 	for k, v := range wu.EnvVars {
 		env = append(env, k+"="+v)
 	}
@@ -303,6 +312,8 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		"LETTUCE_OUTPUT_DIR=/work/output",
 		"LETTUCE_PARAMETERS_FILE=/work/input/parameters.json",
 		"LETTUCE_PROGRESS_FILE=/work/output/progress.txt",
+		"LETTUCE_CHECKPOINT_DIR=/work/checkpoint",
+		"LETTUCE_CHECKPOINT_FILE=/work/checkpoint/checkpoint.dat",
 	)
 
 	// GPU passthrough.
@@ -365,6 +376,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		Binds: []string{
 			inputDir + ":/work/input:ro",
 			outputDir + ":/work/output",
+			checkpointDir + ":/work/checkpoint",
 		},
 		MemoryBytes: memoryBytes,
 		CPUQuota:    cpuQuota,
@@ -460,6 +472,17 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 
 	if err != nil {
 		if waitCtx.Err() != nil {
+			// Cancelled (graceful stop) or deadline: stop the container with a grace
+			// period so its entrypoint receives a termination signal and can flush a
+			// final checkpoint before being killed. Detached context — waitCtx is done.
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), gracefulShutdownGrace+5*time.Second)
+			if stopErr := c.dockerClient.ContainerStop(stopCtx, containerID, gracefulShutdownGrace); stopErr != nil {
+				c.logger.Warn("graceful container stop failed", "work_unit_id", wu.ID, "container", containerID, "error", stopErr)
+			}
+			stopCancel()
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("execution cancelled: %w", ctx.Err())
+			}
 			return nil, fmt.Errorf("execution deadline exceeded: %w", waitCtx.Err())
 		}
 		return nil, fmt.Errorf("container wait: %w", err)

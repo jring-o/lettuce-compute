@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -28,6 +29,10 @@ type DockerClient interface {
 	ContainerWait(ctx context.Context, containerID string) (int64, error)
 	ContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error)
 	ContainerInspect(ctx context.Context, containerID string) (*ContainerStats, error)
+	// ContainerStop requests a graceful stop: the backend sends the entrypoint a
+	// termination signal and kills it only if it does not exit within timeout. Used
+	// on cancellation so a leaf can flush a final checkpoint before it is killed.
+	ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error
 	ContainerRemove(ctx context.Context, containerID string) error
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
@@ -321,6 +326,14 @@ func (d *dockerClientWrapper) ContainerInspect(ctx context.Context, containerID 
 		stats.MemoryPeak = inspect.HostConfig.Memory
 	}
 	return stats, nil
+}
+
+func (d *dockerClientWrapper) ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error {
+	secs := int(timeout.Seconds())
+	if err := d.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &secs}); err != nil {
+		return fmt.Errorf("container stop: %w", err)
+	}
+	return nil
 }
 
 func (d *dockerClientWrapper) ContainerRemove(ctx context.Context, containerID string) error {

@@ -2310,8 +2310,10 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			RscFpopsEst:               pt.RscFpopsEst,
 			CheckpointSequence:        pt.CheckpointSequence,
 			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
-			// Don't set HasCheckpoint — we already have checkpoint files locally
-			// in the work dir. The binary will find them via LETTUCE_CHECKPOINT_DIR.
+			// Don't set HasCheckpoint: the work dir was preserved on shutdown, so the
+			// leaf's checkpoint state is still local in {workDir}/checkpoint and the
+			// re-executed binary picks it up via LETTUCE_CHECKPOINT_DIR — no download
+			// from the head is needed (that path is for cross-volunteer reassignment).
 		}
 
 		prep := &runtime.PrepareResult{

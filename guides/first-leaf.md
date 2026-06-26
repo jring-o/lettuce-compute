@@ -81,6 +81,44 @@ if progress_file and time.time() - last_progress >= 5.0:
 
 ---
 
+## Checkpointing (optional, for long work units)
+
+By default an interrupted work unit — the volunteer is stopped or updated, the
+machine reboots, or the unit is reassigned to another volunteer — **starts over
+from the beginning** and redoes all the work it had already done. For short
+units that is fine. For long ones it wastes the contributor's compute and resets
+the progress bar. A leaf that checkpoints resumes from roughly where it left off.
+
+Checkpointing is **opt-in** and needs the leaf to cooperate; the infrastructure
+cannot snapshot arbitrary in-progress computation for you. Enable it in the
+leaf's `fault_tolerance_config` with `checkpointing_enabled: true` and
+`checkpoint_interval_seconds` (minimum `60`) — that interval bounds how much work
+is ever at risk — then honor the contract in the entrypoint:
+
+- The runtime creates a per-unit checkpoint **directory** and names it in
+  `$LETTUCE_CHECKPOINT_DIR` (native → `<work-dir>/checkpoint`; container →
+  `/work/checkpoint`; wasm → `/work/checkpoint`). `$LETTUCE_CHECKPOINT_FILE` is a
+  convenience path inside it for single-file state — the whole directory is what
+  gets archived and restored.
+- **Save** resumable state into that directory periodically (e.g. "completed N of
+  M items" plus partial results). Write it **atomically** (temp file in the same
+  directory, then rename over the target) so a checkpoint captured — or the
+  process killed — mid-write never leaves a torn file for the next run.
+- **Resume on startup**: if the directory already holds a checkpoint, load it,
+  continue from there, and re-emit the matching `$LETTUCE_PROGRESS_FILE` value so
+  progress does not reset. The same directory is populated whether the unit
+  resumed on the same volunteer (its work dir is preserved) or was reassigned to
+  a new one (the head's latest checkpoint is restored into it first), so one
+  resume path covers both.
+
+On a graceful stop the leaf is sent `SIGTERM` with a short grace window before it
+is killed; trapping it to flush one final checkpoint reduces the work lost on a
+clean stop to nearly zero (optional — the interval already bounds the loss).
+Keep checkpoint writes best-effort (never fail the unit on a write error) and
+within `max_checkpoint_size_bytes` (default 100 MB).
+
+---
+
 ## Updating a leaf's artifact — versions & rollback
 
 When you change a leaf's compute artifact (a new native binary, or a new container

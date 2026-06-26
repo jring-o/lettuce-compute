@@ -182,6 +182,10 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 
 	cmd := exec.CommandContext(ctx, prep.BinaryPath)
 	cmd.Dir = prep.WorkDir
+	// On cancellation (graceful stop or deadline) ask the process to terminate and
+	// give it a short grace window to flush a final checkpoint before it is killed,
+	// rather than killing it outright. setGracefulShutdown is platform-specific.
+	setGracefulShutdown(cmd, gracefulShutdownGrace)
 
 	// Build environment.
 	env := os.Environ()
@@ -192,7 +196,18 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	outputPath := filepath.Join(prep.WorkDir, "output.dat")
 	env = append(env, "LETTUCE_OUTPUT_FILE="+outputPath)
 	env = append(env, "LETTUCE_PROGRESS_FILE="+filepath.Join(prep.WorkDir, "progress.txt"))
-	env = append(env, "LETTUCE_CHECKPOINT_FILE="+filepath.Join(prep.WorkDir, "checkpoint.dat"))
+	// Checkpoint state lives in a per-unit directory that the leaf writes into
+	// (LETTUCE_CHECKPOINT_DIR) and the checkpoint manager archives/restores as a unit.
+	// LETTUCE_CHECKPOINT_FILE is kept for single-file leaves and points INSIDE that
+	// directory, so whichever convention a leaf uses is captured and restored together.
+	// The directory is created up front so it exists for a fresh run and for a resumed
+	// one (where Prepare is skipped but the work dir was preserved).
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
+	if err := os.MkdirAll(checkpointDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create checkpoint dir: %w", err)
+	}
+	env = append(env, "LETTUCE_CHECKPOINT_DIR="+checkpointDir)
+	env = append(env, "LETTUCE_CHECKPOINT_FILE="+filepath.Join(checkpointDir, "checkpoint.dat"))
 	if prep.InputPath != "" {
 		env = append(env, "LETTUCE_INPUT_FILE="+prep.InputPath)
 	}

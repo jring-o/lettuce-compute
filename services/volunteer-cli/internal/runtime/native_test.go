@@ -60,6 +60,53 @@ func main() {
 }
 `
 
+// checkpointWriterSource reports the checkpoint env vars to the output file and
+// writes a marker file into the checkpoint directory, so a test can verify the
+// unified checkpoint contract (LETTUCE_CHECKPOINT_DIR plus LETTUCE_CHECKPOINT_FILE
+// inside it) and that what a leaf writes there lands in the work dir.
+const checkpointWriterSource = `package main
+
+import (
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	dir := os.Getenv("LETTUCE_CHECKPOINT_DIR")
+	file := os.Getenv("LETTUCE_CHECKPOINT_FILE")
+	if dir != "" {
+		os.WriteFile(filepath.Join(dir, "state.bin"), []byte("seed=500"), 0644)
+	}
+	os.WriteFile(os.Getenv("LETTUCE_OUTPUT_FILE"), []byte(dir+"\n"+file+"\n"), 0644)
+}
+`
+
+// checkpointOnTermSource installs a SIGTERM handler, signals readiness via the
+// progress file, then blocks. On SIGTERM it writes a final checkpoint and exits 0.
+// Used to verify the graceful-shutdown grace window lets a leaf flush a final
+// checkpoint instead of being killed outright.
+const checkpointOnTermSource = `package main
+
+import (
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+)
+
+func main() {
+	dir := os.Getenv("LETTUCE_CHECKPOINT_DIR")
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM)
+	// Signal readiness only after the handler is installed, so the test cancels
+	// without racing the registration.
+	os.WriteFile(os.Getenv("LETTUCE_PROGRESS_FILE"), []byte("ready"), 0644)
+	<-ch
+	os.WriteFile(filepath.Join(dir, "final.bin"), []byte("done"), 0644)
+	os.Exit(0)
+}
+`
+
 // sleepSource is a Go program that sleeps for 30 seconds.
 const sleepSource = `package main
 
@@ -416,6 +463,142 @@ func TestExecuteWithParams(t *testing.T) {
 	// Binary reads params file and writes content to output.
 	if string(result.OutputData) != params {
 		t.Errorf("OutputData = %q, want %q", result.OutputData, params)
+	}
+}
+
+func TestExecuteCheckpointContract(t *testing.T) {
+	ckptBin := buildTestBinary(t, "checkpointwriter", checkpointWriterSource)
+	ckptBinData, _ := os.ReadFile(ckptBin)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(ckptBinData)
+	}))
+	defer ts.Close()
+
+	dataDir := t.TempDir()
+	nr := NewNativeRuntime(dataDir, newTestLogger())
+	nr.httpClient = ts.Client()
+
+	wu := &WorkUnit{
+		ID:              "c1d2e3f4-1111-2222-3333-444455556666",
+		Runtime:         "native",
+		DeadlineSeconds: 30,
+		ExecutionSpec:   nativeSpec(ts.URL+"/binary", ckptBinData),
+	}
+
+	prep, err := nr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer nr.Cleanup(prep)
+
+	result, err := nr.Execute(context.Background(), wu, prep)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(string(result.OutputData), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 reported env lines, got %d: %q", len(lines), result.OutputData)
+	}
+	gotDir, gotFile := lines[0], lines[1]
+
+	wantDir := filepath.Join(prep.WorkDir, "checkpoint")
+	if gotDir != wantDir {
+		t.Errorf("LETTUCE_CHECKPOINT_DIR = %q, want %q", gotDir, wantDir)
+	}
+	// LETTUCE_CHECKPOINT_FILE must live inside LETTUCE_CHECKPOINT_DIR so that whichever
+	// convention a leaf uses is captured together by the checkpoint archive.
+	if filepath.Dir(gotFile) != gotDir {
+		t.Errorf("LETTUCE_CHECKPOINT_FILE %q is not inside LETTUCE_CHECKPOINT_DIR %q", gotFile, gotDir)
+	}
+	if gotFile != filepath.Join(wantDir, "checkpoint.dat") {
+		t.Errorf("LETTUCE_CHECKPOINT_FILE = %q, want %q", gotFile, filepath.Join(wantDir, "checkpoint.dat"))
+	}
+
+	// What the leaf wrote into the checkpoint dir must persist in the work dir, where
+	// the checkpoint manager archives it and a resumed run picks it back up.
+	marker, err := os.ReadFile(filepath.Join(wantDir, "state.bin"))
+	if err != nil {
+		t.Fatalf("checkpoint marker not written to work dir: %v", err)
+	}
+	if string(marker) != "seed=500" {
+		t.Errorf("checkpoint marker = %q, want %q", marker, "seed=500")
+	}
+}
+
+func TestExecuteGracefulShutdownFlushesCheckpoint(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("graceful SIGTERM grace window is POSIX-only; Windows kills on cancel")
+	}
+
+	ckptBin := buildTestBinary(t, "checkpointonterm", checkpointOnTermSource)
+	ckptBinData, _ := os.ReadFile(ckptBin)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(ckptBinData)
+	}))
+	defer ts.Close()
+
+	dataDir := t.TempDir()
+	nr := NewNativeRuntime(dataDir, newTestLogger())
+	nr.httpClient = ts.Client()
+
+	wu := &WorkUnit{
+		ID:              "d4d3d2d1-9999-8888-7777-666655554444",
+		Runtime:         "native",
+		DeadlineSeconds: 30,
+		ExecutionSpec:   nativeSpec(ts.URL+"/binary", ckptBinData),
+	}
+
+	prep, err := nr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer nr.Cleanup(prep)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	type execOutcome struct{ err error }
+	done := make(chan execOutcome, 1)
+	go func() {
+		_, execErr := nr.Execute(ctx, wu, prep)
+		done <- execOutcome{err: execErr}
+	}()
+
+	// Wait until the binary has installed its SIGTERM handler (it writes the progress
+	// file once ready), then cancel — so SIGTERM cannot arrive before the handler.
+	progressPath := filepath.Join(prep.WorkDir, "progress.txt")
+	deadline := time.After(20 * time.Second)
+	for {
+		if data, _ := os.ReadFile(progressPath); string(data) == "ready" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("test binary never signaled readiness")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+		// Execute returns a cancellation error by design; we only care that the leaf
+		// got its grace window.
+	case <-time.After(20 * time.Second):
+		t.Fatal("Execute did not return after cancellation")
+	}
+
+	// The SIGTERM grace window must have let the leaf flush a final checkpoint into
+	// the (preserved) work dir, instead of the process being killed outright.
+	final, err := os.ReadFile(filepath.Join(prep.WorkDir, "checkpoint", "final.bin"))
+	if err != nil {
+		t.Fatalf("final checkpoint not flushed on graceful stop: %v", err)
+	}
+	if string(final) != "done" {
+		t.Errorf("final checkpoint = %q, want %q", final, "done")
 	}
 }
 
