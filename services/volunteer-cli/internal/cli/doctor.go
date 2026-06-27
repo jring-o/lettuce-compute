@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
@@ -92,6 +94,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	rep := &doctorReport{w: out}
 
 	fmt.Fprintln(out, "Local:")
+	checkAccountInfo(rep)
 	checkDataDir(rep, cfg.DataDir)
 	checkIdentity(rep, cfg.KeyFile, cfg.PubKeyFile)
 	checkDisk(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB)
@@ -119,6 +122,60 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(out, "Summary: all checks passed.")
 	}
 	return nil
+}
+
+// checkAccountInfo surfaces the identity and runtime context an operator would
+// otherwise have to gather from three separate commands: the build version, the
+// account (the Ed25519 key + head-assigned volunteer id), this machine's host id,
+// and the schedule. All informational — these never fail the report.
+func checkAccountInfo(rep *doctorReport) {
+	rep.add(docInfo, "version", version, "")
+
+	if pub, _, err := identity.LoadKeyPair(cfg.KeyFile, cfg.PubKeyFile); err == nil {
+		rep.add(docInfo, "account key", base64.RawURLEncoding.EncodeToString(pub)+" (Ed25519 identity; same key = same account on every machine)", "")
+	}
+	if cfg.VolunteerID != "" {
+		rep.add(docInfo, "volunteer id", cfg.VolunteerID+" (account)", "")
+	} else {
+		rep.add(docInfo, "volunteer id", "not yet assigned — registers on first start", "")
+	}
+
+	if hostID, err := identity.LoadHostID(cfg.HostIDPath()); err == nil && hostID != "" {
+		rep.add(docInfo, "host id", hostID+" (this machine, under the account)", "")
+	} else {
+		rep.add(docInfo, "host id", "not created yet — created on first start", "")
+	}
+
+	rep.add(docInfo, "schedule", describeSchedule(cfg.Scheduling), "")
+}
+
+// describeSchedule renders the scheduling config as a one-line human summary.
+func describeSchedule(s config.Scheduling) string {
+	mode := s.Mode
+	if mode == "" {
+		mode = "ALWAYS"
+	}
+	switch mode {
+	case "ALWAYS":
+		return "ALWAYS (runs whenever the daemon is started)"
+	case "WHEN_IDLE":
+		return fmt.Sprintf("WHEN_IDLE (after %d min of machine idle)", s.IdleThresholdMins)
+	case "SCHEDULED":
+		switch {
+		case len(s.ScheduleRanges) > 0:
+			parts := make([]string, 0, len(s.ScheduleRanges))
+			for _, r := range s.ScheduleRanges {
+				parts = append(parts, describeRange(r))
+			}
+			return "SCHEDULED: " + strings.Join(parts, "; ")
+		case s.CronExpression != "":
+			return "SCHEDULED (cron: " + s.CronExpression + ")"
+		default:
+			return "SCHEDULED but no window configured — the volunteer will never run (set one with `schedule set`)"
+		}
+	default:
+		return mode
+	}
 }
 
 func checkDataDir(rep *doctorReport, dataDir string) {
