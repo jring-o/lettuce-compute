@@ -318,6 +318,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for _, warning := range d.cfg.LeafConfigWarnings() {
 		d.logger.Warn("leaf-filter config", "warning", warning)
 	}
+	for _, warning := range d.cfg.DeprecatedKeyWarnings() {
+		d.logger.Warn("config", "warning", warning)
+	}
 
 	// Initialize leaf cache from all servers.
 	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())

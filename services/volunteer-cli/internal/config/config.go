@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +59,13 @@ type Config struct {
 	LogMaxSizeMB  int    `yaml:"log_max_size_mb"`    // rotate after the file reaches this size (default 10)
 	LogMaxBackups int    `yaml:"log_max_backups"`    // number of rotated files to retain (default 5)
 	LogMaxAgeDays int    `yaml:"log_max_age_days"`   // max age of rotated files in days (default 0 = no limit)
+
+	// deprecatedKeyWarnings holds advisories about keys present in the on-disk
+	// config file that this version does not recognize (e.g. left over from an
+	// older release whose syntax has since changed). It is populated by Load and
+	// surfaced via DeprecatedKeyWarnings; it is never read from or written to the
+	// file (no yaml tag, unexported), so an unknown key is reported, not applied.
+	deprecatedKeyWarnings []string
 }
 
 // ThermalConfig controls thermal monitoring thresholds.
@@ -246,7 +255,88 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
+	// Lenient Unmarshal above silently ignores keys this version no longer knows,
+	// so an upgraded config can leave a stale setting that quietly does nothing
+	// (issue #51). Re-scan strictly to collect those keys and surface them as
+	// non-fatal advisories — the config still loads with the recognized keys.
+	cfg.deprecatedKeyWarnings = detectUnknownKeys(data)
 	return cfg, nil
+}
+
+// DeprecatedKeyWarnings returns non-fatal advisories about keys found in the
+// loaded config file that this version does not recognize. Returns nil when the
+// file used only known keys (or no file was loaded).
+func (c *Config) DeprecatedKeyWarnings() []string {
+	return c.deprecatedKeyWarnings
+}
+
+// deprecatedKeyHints maps a known-renamed/removed key name to a short hint about
+// its current replacement, so the advisory can point the user at the new key.
+// Unmapped unknown keys still get a generic "unrecognized / being ignored"
+// warning. Extend this as keys are renamed across releases.
+//
+// Entries are keyed by the bare key name (the last path segment), matching how the
+// strict decoder reports an unknown field.
+var deprecatedKeyHints = map[string]string{
+	// Renamed AND re-semanticized: the old key sized the client work buffer as a
+	// unit COUNT; the current key sizes it in HOURS. The value cannot be carried
+	// over safely, so point the user at the new key rather than copying the number.
+	"work_buffer_size": `renamed to "work_buffer_hours", which now sizes the buffer in HOURS of work per task (not a unit count) — set work_buffer_hours to the number of hours you want buffered.`,
+}
+
+// detectUnknownKeys re-decodes the raw config bytes with strict field checking
+// and returns one advisory per key that does not map to the current schema. The
+// strict decode is used only to enumerate unknown keys; the authoritative values
+// come from the lenient Unmarshal in Load, so an unknown key never breaks loading.
+func detectUnknownKeys(data []byte) []string {
+	var probe Config
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&probe); err != nil {
+		var typeErr *yaml.TypeError
+		if errors.As(err, &typeErr) {
+			var warnings []string
+			for _, msg := range typeErr.Errors {
+				// KnownFields reports an unknown key as
+				// "line N: field X not found in type T".
+				if strings.Contains(msg, "not found in type") {
+					warnings = append(warnings, formatUnknownKeyWarning(msg))
+				}
+			}
+			return warnings
+		}
+		// A non-type error means malformed YAML, which the lenient Unmarshal in
+		// Load already rejected; nothing to add here.
+	}
+	return nil
+}
+
+// formatUnknownKeyWarning turns a strict-decode "field X not found in type T"
+// message into a user-facing advisory, appending a replacement hint when the key
+// is a known rename.
+func formatUnknownKeyWarning(msg string) string {
+	field := msg
+	if i := strings.Index(msg, "field "); i >= 0 {
+		rest := msg[i+len("field "):]
+		if j := strings.Index(rest, " not found"); j >= 0 {
+			field = strings.TrimSpace(rest[:j])
+		}
+	}
+	line := ""
+	if strings.HasPrefix(msg, "line ") {
+		if j := strings.Index(msg, ":"); j >= 0 {
+			line = msg[:j] // e.g. "line 12"
+		}
+	}
+	warning := fmt.Sprintf("unrecognized config key %q", field)
+	if line != "" {
+		warning += " (" + line + ")"
+	}
+	warning += " is being ignored; it may be deprecated or renamed in this version."
+	if hint := deprecatedKeyHints[field]; hint != "" {
+		warning += " " + hint
+	}
+	return warning
 }
 
 // Save writes the config to a YAML file, creating parent directories if needed.
