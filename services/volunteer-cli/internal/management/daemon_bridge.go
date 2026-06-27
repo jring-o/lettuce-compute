@@ -771,6 +771,7 @@ type LeafDetail struct {
 	State            string             `json:"state"`
 	QueuedWorkUnits  int                `json:"queued_work_units"`
 	ActiveVolunteers int                `json:"active_volunteers"`
+	ActiveHosts      int                `json:"active_hosts"`
 	Enabled          bool               `json:"enabled"`
 	EffectiveWeight  int                `json:"effective_weight"`
 	ExecutionSpec    *LeafExecutionSpec `json:"execution_spec,omitempty"`
@@ -862,6 +863,7 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 					State:            leaf.State,
 					QueuedWorkUnits:  leaf.QueuedWorkUnits,
 					ActiveVolunteers: leaf.ActiveVolunteers,
+					ActiveHosts:      leaf.ActiveHosts,
 					Enabled:          enabled,
 					EffectiveWeight:  ew,
 				}

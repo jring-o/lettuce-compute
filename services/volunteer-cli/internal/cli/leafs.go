@@ -58,6 +58,7 @@ type leafsAPILeaf struct {
 	State            string `json:"state"`
 	QueuedWorkUnits  int    `json:"queued_work_units"`
 	ActiveVolunteers int    `json:"active_volunteers"`
+	ActiveHosts      int    `json:"active_hosts"`
 	EffectiveWeight  int    `json:"effective_weight"`
 	Enabled          bool   `json:"enabled"`
 }
@@ -78,7 +79,7 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tSTATE\tQUEUED\tVOLUNTEERS\tWEIGHT\tENABLED\n")
+	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tSTATE\tQUEUED\tVOLUNTEERS\tHOSTS\tWEIGHT\tENABLED\n")
 
 	for _, h := range heads {
 		for _, l := range h.Leafs {
@@ -86,9 +87,9 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 			if !l.Enabled {
 				enabled = "✗"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
 				h.Name, l.Slug, l.Name, l.State,
-				l.QueuedWorkUnits, l.ActiveVolunteers,
+				l.QueuedWorkUnits, l.ActiveVolunteers, l.ActiveHosts,
 				l.EffectiveWeight, enabled,
 			)
 		}
