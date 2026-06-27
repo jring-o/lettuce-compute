@@ -825,6 +825,7 @@ const (
 	rejectHRClassMismatch                        // unit pinned to a different hardware class
 	rejectLeafNotCached                          // leaf metadata not yet warmed
 	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
+	rejectInfeasibleDeadline                     // host too slow to finish this unit before its deadline
 	numRejectReasons                             // sentinel: count of reasons (tally array size)
 )
 
@@ -856,6 +857,8 @@ func (r rejectReason) String() string {
 		return "leaf_not_cached"
 	case rejectCapabilityMismatch:
 		return "capability_mismatch"
+	case rejectInfeasibleDeadline:
+		return "infeasible_deadline"
 	default:
 		return "unknown"
 	}
@@ -937,6 +940,14 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	}
 	if !leafMatchesCapabilities(lf, opts) {
 		return false, rejectCapabilityMismatch
+	}
+	// Feasibility-at-dispatch: don't hand this host a unit its measured benchmark says
+	// it can't finish before the deadline — the head re-offers it to a faster volunteer
+	// instead of this host burning the whole deadline window on a run that the runtime
+	// would kill at the timeout. Skipped (feasible) when any input is unknown. Mirrors
+	// the SQL gate in FlushReservations/ReserveCopy/FindNextAssignable.
+	if !workunit.FeasibleByDeadline(lf.ExecutionConfig.RscFpopsEst, opts.BenchmarkFPOPS, cand.unit.DeadlineSeconds) {
+		return false, rejectInfeasibleDeadline
 	}
 	return true, rejectNone
 }

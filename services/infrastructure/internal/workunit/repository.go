@@ -31,6 +31,33 @@ type AssignmentOptions struct {
 	// COALESCE(host_id, volunteer_id) so it equals this value (= VolunteerID when nil).
 	// Distinctness still keys on VolunteerID (the account), never on this.
 	HostID *types.ID
+	// BenchmarkFPOPS is the requesting host's measured CPU throughput (floating-point
+	// ops per second), reported at registration and stored in hardware_capabilities.
+	// It drives the feasibility-at-dispatch check: a unit whose estimated runtime
+	// (leaf rsc_fpops_est / BenchmarkFPOPS) exceeds its deadline is not handed to this
+	// host, so a too-slow machine never burns the whole deadline window on a run that
+	// would be killed at the timeout. 0 = no benchmark reported -> the check is skipped
+	// for this requester (cannot estimate, so never refuse work on a guess).
+	BenchmarkFPOPS float64
+}
+
+// FeasibleByDeadline reports whether a host with benchmark FP-ops/sec can be
+// expected to finish a unit of a leaf whose per-unit estimate is rscFpopsEst
+// before deadlineSeconds. It is the single source of truth for the
+// feasibility-at-dispatch rule, mirrored verbatim in the dispatch SQL
+// (FindNextAssignable / FlushReservations / ReserveCopy):
+//
+//	estimated_seconds = rscFpopsEst / benchmark   (no host-specific correction yet)
+//	feasible          = estimated_seconds <= deadlineSeconds
+//
+// It returns true (feasible) whenever it cannot estimate — no benchmark, no leaf
+// estimate, or no deadline — so an un-benchmarked host or an un-estimated leaf is
+// never refused work on a guess; only a definite over-run is excluded.
+func FeasibleByDeadline(rscFpopsEst, benchmarkFPOPS float64, deadlineSeconds int) bool {
+	if rscFpopsEst <= 0 || benchmarkFPOPS <= 0 || deadlineSeconds <= 0 {
+		return true
+	}
+	return rscFpopsEst/benchmarkFPOPS <= float64(deadlineSeconds)
 }
 
 // WorkUnitRepository defines the data-access interface for work units.
