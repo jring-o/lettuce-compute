@@ -482,6 +482,28 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// LeafConfigWarnings returns non-fatal advisories about the leaf-filtering
+// configuration. The volunteer has two independent leaf filters — the global
+// `leafs:` filter (by leaf ID) and each server's `leaf_preferences:` (by slug).
+// Both are honored, but configuring both restrictively at once is a common
+// source of confusion (especially after upgrading an older config), so surface
+// the overlap rather than silently applying both. Returns nil when there is
+// nothing worth flagging.
+func (c *Config) LeafConfigWarnings() []string {
+	var warnings []string
+	globalRestrictive := c.Leafs.Mode == "SPECIFIC" || c.Leafs.Mode == "BLOCKLIST"
+	for _, srv := range c.Servers {
+		m := srv.LeafPreferences.Mode
+		if (m == "SPECIFIC" || m == "BLOCKLIST") && globalRestrictive {
+			warnings = append(warnings, fmt.Sprintf(
+				"server %q sets leaf_preferences.mode=%s while the global leafs.mode=%s is also restrictive; "+
+					"both filters apply (global by leaf ID, per-server by slug). If a leaf you expect is missing, check both.",
+				srv.DisplayName(), m, c.Leafs.Mode))
+		}
+	}
+	return warnings
+}
+
 // SetByPath sets a config value by dot-delimited path (e.g., "resource_limits.max_cpu_cores").
 func (c *Config) SetByPath(dotPath string, value string) error {
 	switch dotPath {

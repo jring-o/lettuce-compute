@@ -315,6 +315,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"runtimes", d.runtimeRegistry.AvailableRuntimes(),
 		"scheduling_mode", d.cfg.Scheduling.Mode,
 	)
+	for _, warning := range d.cfg.LeafConfigWarnings() {
+		d.logger.Warn("leaf-filter config", "warning", warning)
+	}
 
 	// Initialize leaf cache from all servers.
 	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())
@@ -1911,6 +1914,32 @@ func (d *Daemon) enabledLeafs(serverName string) []CachedLeafInfo {
 	default:
 		return leafs
 	}
+}
+
+// serverBlockedLeafIDs returns the leaf IDs that a server's leaf_preferences
+// exclude — every cached leaf for the server that enabledLeafs filters out
+// (under SPECIFIC or BLOCKLIST mode). The steady-state fetch path already only
+// requests enabled leaves by id, but the any-leaf fallback (used before the leaf
+// cache is populated, or for heads that don't surface a catalog) would otherwise
+// let the head dispatch a blocked leaf. Passing these as BlockedLeafIds makes the
+// per-server preference authoritative at dispatch on every path. Returns nil when
+// the cache is empty (nothing to translate slugs against yet).
+func (d *Daemon) serverBlockedLeafIDs(serverName string) []string {
+	all := d.leafCache.GetLeafs(serverName)
+	if len(all) == 0 {
+		return nil
+	}
+	enabled := make(map[string]bool, len(all))
+	for _, lf := range d.enabledLeafs(serverName) {
+		enabled[lf.ID] = true
+	}
+	var blocked []string
+	for _, lf := range all {
+		if lf.ID != "" && !enabled[lf.ID] {
+			blocked = append(blocked, lf.ID)
+		}
+	}
+	return blocked
 }
 
 // filterOut returns servers not in the excluded set.
