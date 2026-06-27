@@ -27,9 +27,18 @@ type Repository interface {
 	// last_checkpoint_sequence.
 	Save(ctx context.Context, cp *Checkpoint, data []byte) error
 
-	// GetLatest returns the latest checkpoint and its data for a work unit.
-	// Returns nil, nil, nil if no checkpoint exists.
+	// GetLatest returns the latest checkpoint and its data for a work unit,
+	// across all volunteers. Returns nil, nil, nil if no checkpoint exists.
 	GetLatest(ctx context.Context, workUnitID types.ID) (*Checkpoint, []byte, error)
+
+	// LatestSequenceForVolunteer returns the highest checkpoint sequence the given
+	// volunteer has stored for the work unit (0 if none). Sequences are scoped per
+	// (work_unit, volunteer) so concurrent redundancy copies never collide.
+	LatestSequenceForVolunteer(ctx context.Context, workUnitID, volunteerID types.ID) (int, error)
+
+	// GetLatestForVolunteer returns the given volunteer's own latest checkpoint and
+	// data for a work unit. Returns nil, nil, nil if that volunteer has none.
+	GetLatestForVolunteer(ctx context.Context, workUnitID, volunteerID types.ID) (*Checkpoint, []byte, error)
 
 	// Delete removes all checkpoints for a work unit (called on completion/failure).
 	Delete(ctx context.Context, workUnitID types.ID) error

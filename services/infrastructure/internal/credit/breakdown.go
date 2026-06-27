@@ -25,6 +25,21 @@ type ResourceTypeCredit struct {
 	WorkUnits int     `json:"work_units"`
 }
 
+// HostCredit is a volunteer ACCOUNT's credit and resource usage attributed to one
+// of its MACHINES (host). Credit pools to the account, but each agreed result
+// records the host that produced it (the account<->host split, TODO #19), so this
+// shows which machine earned what. HostID is nil for results recorded before the
+// split or by clients that don't report a host key (the per-account fallback).
+type HostCredit struct {
+	HostID     *types.ID `json:"host_id"`
+	Hostname   string    `json:"hostname,omitempty"`
+	Credit     float64   `json:"credit"`
+	WorkUnits  int       `json:"work_units"`
+	CPUSeconds float64   `json:"cpu_seconds"`
+	GPUSeconds float64   `json:"gpu_seconds"`
+	LastSeen   *string   `json:"last_seen,omitempty"`
+}
+
 // DailyCredit is one calendar day's credit total.
 type DailyCredit struct {
 	Date   string  `json:"date"`
@@ -57,6 +72,7 @@ type VolunteerBreakdown struct {
 	VolunteerID    types.ID                      `json:"volunteer_id"`
 	TotalCredit    float64                       `json:"total_credit"`
 	ByLeaf         []LeafCredit                  `json:"by_leaf"`
+	ByHost         []HostCredit                  `json:"by_host"`
 	ByResourceType map[string]ResourceTypeCredit `json:"by_resource_type"`
 	Timeline       CreditTimeline                `json:"timeline"`
 }
@@ -123,6 +139,42 @@ func ComputeVolunteerBreakdown(ctx context.Context, pool *pgxpool.Pool, voluntee
 	bd.ByResourceType = map[string]ResourceTypeCredit{
 		"cpu_only": {Credit: cpuOnlyCredit, WorkUnits: cpuOnlyWU},
 		"gpu":      {Credit: gpuCredit, WorkUnits: gpuWU},
+	}
+
+	// Per-host (per-machine) credit + resource usage. Each agreed result records
+	// the host that produced it; the optional hosts join resolves a friendly name
+	// and last-seen. host_id / last_seen are nil where unattributed.
+	bd.ByHost = make([]HostCredit, 0)
+	hostRows, err := pool.Query(ctx, `
+		SELECT
+			r.host_id,
+			COALESCE(h.display_name, ''),
+			COALESCE(SUM(cl.credit_amount), 0),
+			COUNT(cl.id),
+			COALESCE(SUM((r.execution_metadata->>'cpu_seconds_user')::float), 0),
+			COALESCE(SUM((r.execution_metadata->>'gpu_seconds')::float), 0),
+			to_char(MAX(h.last_seen_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM credit_ledger cl
+		JOIN results r ON r.id = cl.result_id
+		LEFT JOIN hosts h ON h.id = r.host_id
+		WHERE cl.volunteer_id = $1
+		GROUP BY r.host_id, h.display_name
+		ORDER BY 3 DESC`,
+		volunteerID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query per-host credit: %w", err)
+	}
+	defer hostRows.Close()
+	for hostRows.Next() {
+		var hc HostCredit
+		if scanErr := hostRows.Scan(&hc.HostID, &hc.Hostname, &hc.Credit, &hc.WorkUnits, &hc.CPUSeconds, &hc.GPUSeconds, &hc.LastSeen); scanErr != nil {
+			return nil, fmt.Errorf("scan per-host credit: %w", scanErr)
+		}
+		bd.ByHost = append(bd.ByHost, hc)
+	}
+	if err := hostRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate per-host credit: %w", err)
 	}
 
 	// Daily timeline (last 30 days).

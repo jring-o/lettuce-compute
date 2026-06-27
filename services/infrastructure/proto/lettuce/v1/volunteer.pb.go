@@ -1798,8 +1798,11 @@ type LeafInfo struct {
 	// volunteer for duration-aware work batching: it sizes the first batch request
 	// to fill work_buffer_hours instead of idling at the flat per-request ceiling.
 	EstimatedDurationSeconds float64 `protobuf:"fixed64,11,opt,name=estimated_duration_seconds,json=estimatedDurationSeconds,proto3" json:"estimated_duration_seconds,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// Distinct active MACHINES on the leaf. A volunteer running one identity key on
+	// N machines is 1 active_volunteer but N active_hosts (account<->host split).
+	ActiveHosts   int32 `protobuf:"varint,12,opt,name=active_hosts,json=activeHosts,proto3" json:"active_hosts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LeafInfo) Reset() {
@@ -1905,6 +1908,13 @@ func (x *LeafInfo) GetExecutionSpec() *ExecutionSpec {
 func (x *LeafInfo) GetEstimatedDurationSeconds() float64 {
 	if x != nil {
 		return x.EstimatedDurationSeconds
+	}
+	return 0
+}
+
+func (x *LeafInfo) GetActiveHosts() int32 {
+	if x != nil {
+		return x.ActiveHosts
 	}
 	return 0
 }
@@ -2574,7 +2584,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x14default_leaf_weights\x18\x05 \x03(\v2A.lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntryR\x12defaultLeafWeights\x1aE\n" +
 	"\x17DefaultLeafWeightsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xa5\x03\n" +
+	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xc8\x03\n" +
 	"\bLeafInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04slug\x18\x02 \x01(\tR\x04slug\x12\x12\n" +
@@ -2587,7 +2597,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x11active_volunteers\x18\t \x01(\x05R\x10activeVolunteers\x12J\n" +
 	"\x0eexecution_spec\x18\n" +
 	" \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\x12<\n" +
-	"\x1aestimated_duration_seconds\x18\v \x01(\x01R\x18estimatedDurationSeconds\"\x94\x01\n" +
+	"\x1aestimated_duration_seconds\x18\v \x01(\x01R\x18estimatedDurationSeconds\x12!\n" +
+	"\factive_hosts\x18\f \x01(\x05R\vactiveHosts\"\x94\x01\n" +
 	"\x16AbandonWorkUnitRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +

@@ -373,6 +373,7 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 		SELECT l.id, l.slug, l.name, l.description, l.research_area, l.task_pattern, l.state,
 			COALESCE(q.cnt, 0),
 			COALESCE(a.cnt, 0),
+			COALESCE(hh.cnt, 0),
 			l.execution_config
 		FROM leafs l
 		LEFT JOIN (
@@ -382,8 +383,9 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
 		LEFT JOIN (%s) a ON a.leaf_id = l.id
+		LEFT JOIN (%s) hh ON hh.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
-		ORDER BY l.name ASC`, leaf.ActiveVolunteerSubquery()))
+		ORDER BY l.name ASC`, leaf.ActiveVolunteerSubquery(), leaf.ActiveHostSubquery()))
 	if err != nil {
 		s.logger.Error("query leafs", "method", "GetHeadInfo", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
@@ -396,7 +398,7 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 		var researchArea []string
 		var execConfig leaf.ExecutionConfig
 		if err := rows.Scan(&li.Id, &li.Slug, &li.Name, &li.Description, &researchArea,
-			&li.TaskPattern, &li.State, &li.QueuedWorkUnits, &li.ActiveVolunteers, &execConfig); err != nil {
+			&li.TaskPattern, &li.State, &li.QueuedWorkUnits, &li.ActiveVolunteers, &li.ActiveHosts, &execConfig); err != nil {
 			s.logger.Error("scan leaf", "method", "GetHeadInfo", "error", err)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
@@ -1552,8 +1554,20 @@ func (s *volunteerService) SaveCheckpoint(ctx context.Context, req *lettucev1.Sa
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Verify volunteer is assigned.
-	if wu.AssignedVolunteerID == nil || *wu.AssignedVolunteerID != volunteerID {
+	// Authorize against the volunteer's OPEN copy, not the single
+	// work_units.assigned_volunteer_id. Dispatch is per-copy parallel (a
+	// redundancy>1 unit has multiple distinct concurrent holders) and the lease
+	// lifecycle rewrites assigned_volunteer_id, so a volunteer running a perfectly
+	// valid copy must not be refused just because it does not hold that one slot.
+	activeCopy, err := s.assignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
+	if err != nil {
+		if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPStatus == 404 {
+			return nil, status.Errorf(codes.PermissionDenied, "volunteer is not assigned to this work unit")
+		}
+		s.logger.Error("failed to look up active assignment", "method", "SaveCheckpoint", "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	if activeCopy == nil {
 		return nil, status.Errorf(codes.PermissionDenied, "volunteer is not assigned to this work unit")
 	}
 
@@ -1567,10 +1581,18 @@ func (s *volunteerService) SaveCheckpoint(ctx context.Context, req *lettucev1.Sa
 		return nil, status.Errorf(codes.FailedPrecondition, "checkpointing is not enabled for this leaf")
 	}
 
-	// Validate sequence is advancing.
-	if int(req.CheckpointSequence) <= wu.LastCheckpointSequence {
+	// Validate sequence is advancing within THIS volunteer's own checkpoint chain.
+	// Checkpoints are scoped per (work_unit, volunteer): each redundancy copy is an
+	// independent computation with its own sequence, so two copies saving sequence 1
+	// no longer collide on a single shared per-WU counter.
+	volunteerLastSeq, err := s.checkpointRepo.LatestSequenceForVolunteer(ctx, workUnitID, volunteerID)
+	if err != nil {
+		s.logger.Error("failed to load volunteer checkpoint sequence", "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	if int(req.CheckpointSequence) <= volunteerLastSeq {
 		return nil, status.Errorf(codes.AlreadyExists,
-			"checkpoint sequence must be greater than %d", wu.LastCheckpointSequence)
+			"checkpoint sequence must be greater than %d", volunteerLastSeq)
 	}
 
 	// Validate data size.
@@ -1658,10 +1680,31 @@ func (s *volunteerService) GetCheckpoint(ctx context.Context, req *lettucev1.Get
 		return nil, status.Errorf(codes.PermissionDenied, "volunteer is not assigned to this work unit")
 	}
 
-	cp, data, err := s.checkpointRepo.GetLatest(ctx, workUnitID)
+	// Prefer the caller's OWN latest checkpoint (its own resumable chain). Only
+	// when it has none do we consider another volunteer's checkpoint, and only for
+	// non-redundant leaves: handing one corroborator another's in-progress state
+	// would defeat the independence that redundancy>1 validation relies on.
+	cp, data, err := s.checkpointRepo.GetLatestForVolunteer(ctx, workUnitID, caller.ID)
 	if err != nil {
 		s.logger.Error("failed to get checkpoint", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	if cp == nil {
+		// Resolve redundancy from the leaf; default to corroborated (>1) on any
+		// lookup failure so we never leak a checkpoint across volunteers by mistake.
+		redundancy := 2
+		if wu, wuErr := s.wuRepo.GetByID(ctx, workUnitID); wuErr == nil {
+			if lf, lfErr := s.leafRepo.GetByID(ctx, wu.LeafID); lfErr == nil && lf != nil {
+				redundancy = lf.ValidationConfig.RedundancyFactor
+			}
+		}
+		if redundancy <= 1 {
+			cp, data, err = s.checkpointRepo.GetLatest(ctx, workUnitID)
+			if err != nil {
+				s.logger.Error("failed to get checkpoint", "error", err)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+		}
 	}
 
 	if cp == nil {

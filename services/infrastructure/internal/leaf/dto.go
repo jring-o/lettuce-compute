@@ -53,8 +53,11 @@ type LeafSummary struct {
 	Runtime              string            `json:"runtime"`
 	StatsCacheSeconds    int               `json:"stats_cache_seconds"`
 	ActiveVolunteers     int               `json:"active_volunteers"`
-	ProgressPct          *float64          `json:"progress_pct"`
-	CreatedAt            time.Time         `json:"created_at"`
+	// ActiveHosts counts distinct active MACHINES (a volunteer on N machines under
+	// one identity key is 1 active volunteer but N active hosts).
+	ActiveHosts int      `json:"active_hosts"`
+	ProgressPct *float64 `json:"progress_pct"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // resourceSubset is the abbreviated resource requirements for list responses.

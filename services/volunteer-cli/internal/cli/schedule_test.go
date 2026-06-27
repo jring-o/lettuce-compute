@@ -53,6 +53,22 @@ func TestParseScheduleDays(t *testing.T) {
 	}
 }
 
+func TestBuildScheduleRange(t *testing.T) {
+	r, err := buildScheduleRange("19:00", "07:00", "mon-fri")
+	if err != nil {
+		t.Fatalf("buildScheduleRange: %v", err)
+	}
+	if r.StartHour != 19 || r.EndHour != 7 {
+		t.Errorf("hours = %d-%d, want 19-7", r.StartHour, r.EndHour)
+	}
+	if !reflect.DeepEqual(r.Days, []int{0, 1, 2, 3, 4}) {
+		t.Errorf("days = %v, want [0 1 2 3 4]", r.Days)
+	}
+	if _, err := buildScheduleRange("", "07:00", "mon-fri"); err == nil {
+		t.Error("expected error for missing --from")
+	}
+}
+
 func TestDescribeRange(t *testing.T) {
 	cases := []struct {
 		r    config.ScheduleRange

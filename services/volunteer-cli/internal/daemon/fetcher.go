@@ -42,6 +42,11 @@ type Fetcher struct {
 	// leafPrefsFunc returns leaf ID filter and block list from config.
 	leafPrefsFunc func() (leafIDs, blockedIDs []string)
 
+	// serverBlockedLeafIDsFunc returns the leaf IDs a server's per-server
+	// leaf_preferences exclude, so the any-leaf fallback can tell the head not to
+	// dispatch them. Injected from the daemon.
+	serverBlockedLeafIDsFunc func(serverName string) []string
+
 	// shouldFetchFunc checks whether fetching is allowed (disk space, scheduler, etc.).
 	// Returns true if fetching should proceed, false to wait.
 	shouldFetchFunc func() bool
@@ -149,9 +154,10 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		cachedHW:         d.cachedHW,
 		pubKey:           d.pubKey,
 		hostID:           d.hostID,
-		enabledLeafsFunc: d.enabledLeafs,
-		leafPrefsFunc:    d.leafPreferences,
-		shouldFetchFunc:  d.shouldFetch,
+		enabledLeafsFunc:         d.enabledLeafs,
+		leafPrefsFunc:            d.leafPreferences,
+		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
+		shouldFetchFunc:          d.shouldFetch,
 		workBufferFullFn:  d.workBufferFull,
 		batchSizeFn:       d.requestBatchSize,
 		leafEstSecondsFn:  d.leafEstSeconds,
@@ -416,6 +422,12 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			if f.leafPrefsFunc != nil {
 				leafIDs, blockedIDs = f.leafPrefsFunc()
 			}
+			// Merge the per-server leaf_preferences blocklist so an any-leaf request
+			// can't be served a leaf the user disabled for this head (the bug where a
+			// per-server BLOCKLIST was respected in steady state but ignored here).
+			if f.serverBlockedLeafIDsFunc != nil {
+				blockedIDs = mergeUnique(blockedIDs, f.serverBlockedLeafIDsFunc(head.Name))
+			}
 			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
 			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs)
 			if pushed > 0 {
@@ -455,6 +467,20 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 // anyLeafInfo is the placeholder leaf descriptor used for the no-cached-leafs
 // any-leaf request path. Its slug labels the assignment-recording bucket.
 var anyLeafInfo = CachedLeafInfo{ID: "", Slug: "any"}
+
+// mergeUnique returns a∪b preserving order and dropping duplicates and empties.
+func mergeUnique(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range append(append([]string{}, a...), b...) {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
 
 // requestAndBuffer issues one RequestWorkUnit to head for the given leaf filter,
 // stamps the server-directed retry delay, and buffers every assignment in the

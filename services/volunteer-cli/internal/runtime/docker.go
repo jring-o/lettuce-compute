@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -132,10 +134,43 @@ func (d *dockerClientWrapper) ImagePull(ctx context.Context, ref string) error {
 		return fmt.Errorf("image pull %s: %w", ref, err)
 	}
 	defer reader.Close()
-	// Consume the pull progress output (required for pull to complete).
-	_, _ = io.Copy(io.Discard, reader)
+	// The Docker/Podman API reports pull failures (e.g. a manifest-unknown for a
+	// superseded/removed digest) INSIDE the progress stream — the call above only
+	// surfaces request-level failures. Discarding the stream would treat a failed
+	// pull as success, and the failure would resurface much later as a confusing
+	// "no such image" at container-create. Scan the stream and surface any error.
+	if err := checkPullStream(reader); err != nil {
+		return fmt.Errorf("image pull %s: %w", ref, err)
+	}
 	d.logger.Debug("image pull complete", "image", ref)
 	return nil
+}
+
+// checkPullStream drains a docker/podman image-pull progress stream and returns
+// the first in-stream error it reports (the `error`/`errorDetail` JSON fields),
+// or nil once the stream ends cleanly.
+func checkPullStream(r io.Reader) error {
+	dec := json.NewDecoder(r)
+	for {
+		var msg struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if decErr := dec.Decode(&msg); decErr != nil {
+			if errors.Is(decErr, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("decode pull progress stream: %w", decErr)
+		}
+		if detail := msg.ErrorDetail.Message; detail != "" {
+			return errors.New(detail)
+		}
+		if msg.Error != "" {
+			return errors.New(msg.Error)
+		}
+	}
 }
 
 func (d *dockerClientWrapper) ImageExists(ctx context.Context, ref string) (bool, error) {

@@ -51,6 +51,7 @@ type CachedLeafInfo struct {
 	State            string // "ACTIVE", "PAUSED", etc.
 	QueuedWorkUnits  int
 	ActiveVolunteers int
+	ActiveHosts      int // distinct active machines (a volunteer on N machines = N hosts)
 	ExecutionSpec    *CachedExecutionSpec
 
 	// EstimatedDurationSeconds is a per-leaf, benchmark-INDEPENDENT estimate of
@@ -97,6 +98,7 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 			State:                    l.State,
 			QueuedWorkUnits:          int(l.QueuedWorkUnits),
 			ActiveVolunteers:         int(l.ActiveVolunteers),
+			ActiveHosts:              int(l.GetActiveHosts()),
 			EstimatedDurationSeconds: l.GetEstimatedDurationSeconds(),
 		}
 		if es := l.GetExecutionSpec(); es != nil {

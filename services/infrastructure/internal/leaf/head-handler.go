@@ -56,7 +56,10 @@ type LeafInfo struct {
 	State            string             `json:"state"`
 	QueuedWorkUnits  int                `json:"queued_work_units"`
 	ActiveVolunteers int                `json:"active_volunteers"`
-	ExecutionSpec    *LeafExecutionSpec `json:"execution_spec,omitempty"`
+	// ActiveHosts counts distinct active MACHINES (a volunteer running the same
+	// identity key on N machines is 1 active volunteer but N active hosts).
+	ActiveHosts   int                `json:"active_hosts"`
+	ExecutionSpec *LeafExecutionSpec `json:"execution_spec,omitempty"`
 }
 
 // HandleGetHeadInfo handles GET /api/v1/head. No authentication required.
@@ -72,7 +75,8 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 			l.id, l.slug, l.name, l.description, l.research_area,
 			l.task_pattern, l.state, l.execution_config,
 			COALESCE(q.cnt, 0) AS queued_work_units,
-			COALESCE(a.cnt, 0) AS active_volunteers
+			COALESCE(a.cnt, 0) AS active_volunteers,
+			COALESCE(hh.cnt, 0) AS active_hosts
 		FROM leafs l
 		LEFT JOIN (
 			SELECT leaf_id, COUNT(*) AS cnt
@@ -81,9 +85,10 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 			GROUP BY leaf_id
 		) q ON q.leaf_id = l.id
 		LEFT JOIN (%s) a ON a.leaf_id = l.id
+		LEFT JOIN (%s) hh ON hh.leaf_id = l.id
 		WHERE l.state = 'ACTIVE' AND l.visibility = 'PUBLIC'
 		ORDER BY l.name ASC
-	`, ActiveVolunteerSubquery()))
+	`, ActiveVolunteerSubquery(), ActiveHostSubquery()))
 	if err != nil {
 		l.Error("failed to query leafs for head info", "error", err)
 		apierror.WriteError(w, apierror.Internal("failed to get head info", err))
@@ -99,7 +104,7 @@ func (h *HeadHandler) HandleGetHeadInfo(w http.ResponseWriter, r *http.Request) 
 		if err := rows.Scan(
 			&li.ID, &li.Slug, &li.Name, &li.Description, &researchArea,
 			&li.TaskPattern, &li.State, &execConfig,
-			&li.QueuedWorkUnits, &li.ActiveVolunteers,
+			&li.QueuedWorkUnits, &li.ActiveVolunteers, &li.ActiveHosts,
 		); err != nil {
 			l.Error("failed to scan leaf info", "error", err)
 			apierror.WriteError(w, apierror.Internal("failed to get head info", err))
