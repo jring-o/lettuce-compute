@@ -17,14 +17,27 @@ func newScheduleCmd() *cobra.Command {
 
 With no arguments, prints the current schedule. Use "schedule set" to run only
 within a daily time window — for example overnight, when the machine is cool and
-idle — and "schedule clear" to go back to running always.
+idle — "schedule add" to layer additional windows (e.g. a different weekend
+window), and "schedule clear" to go back to running always.
 
 Windows are whole-hour and may wrap past midnight, so a "dusk till dawn" window
-is simply: schedule set --from 20:00 --to 06:00`,
+is simply: schedule set --from 20:00 --to 06:00
+
+The volunteer runs whenever the current time falls in ANY configured window, so
+weekday/weekend splits are just two windows:
+  schedule set --from 19:00 --to 07:00 --days mon-fri
+  schedule add --from 00:00 --to 00:00 --days sat,sun   # all day Sat & Sun
+
+Advanced: the same windows can be hand-edited in config.yaml under
+scheduling.schedule_ranges, each entry being:
+  - days: [0,1,2,3,4]   # 0=Mon … 6=Sun
+    start_hour: 19       # 0-23
+    end_hour: 7          # 0-23; end <= start means the window wraps past midnight`,
 		RunE: runScheduleShow,
 	}
 	cmd.AddCommand(
 		newScheduleSetCmd(),
+		newScheduleAddCmd(),
 		newScheduleClearCmd(),
 		&cobra.Command{
 			Use:   "show",
@@ -34,6 +47,26 @@ is simply: schedule set --from 20:00 --to 06:00`,
 		},
 	)
 	return cmd
+}
+
+// buildScheduleRange parses the --from/--to/--days flag trio into a ScheduleRange.
+func buildScheduleRange(from, to, days string) (config.ScheduleRange, error) {
+	if from == "" || to == "" {
+		return config.ScheduleRange{}, fmt.Errorf("--from and --to are required (e.g. --from 20:00 --to 06:00)")
+	}
+	start, err := parseScheduleHour(from)
+	if err != nil {
+		return config.ScheduleRange{}, fmt.Errorf("--from: %w", err)
+	}
+	end, err := parseScheduleHour(to)
+	if err != nil {
+		return config.ScheduleRange{}, fmt.Errorf("--to: %w", err)
+	}
+	dayList, err := parseScheduleDays(days)
+	if err != nil {
+		return config.ScheduleRange{}, fmt.Errorf("--days: %w", err)
+	}
+	return config.ScheduleRange{Days: dayList, StartHour: start, EndHour: end}, nil
 }
 
 func newScheduleSetCmd() *cobra.Command {
@@ -54,29 +87,14 @@ Hours are whole-hour (minutes, if given, must be :00) and the window may wrap
 past midnight. This replaces any existing schedule window.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if from == "" || to == "" {
-				return fmt.Errorf("--from and --to are required (e.g. --from 20:00 --to 06:00)")
-			}
-			start, err := parseScheduleHour(from)
+			r, err := buildScheduleRange(from, to, days)
 			if err != nil {
-				return fmt.Errorf("--from: %w", err)
-			}
-			end, err := parseScheduleHour(to)
-			if err != nil {
-				return fmt.Errorf("--to: %w", err)
-			}
-			dayList, err := parseScheduleDays(days)
-			if err != nil {
-				return fmt.Errorf("--days: %w", err)
+				return err
 			}
 
 			cfg.Scheduling.Mode = "SCHEDULED"
 			cfg.Scheduling.CronExpression = ""
-			cfg.Scheduling.ScheduleRanges = []config.ScheduleRange{{
-				Days:      dayList,
-				StartHour: start,
-				EndHour:   end,
-			}}
+			cfg.Scheduling.ScheduleRanges = []config.ScheduleRange{r}
 
 			if err := cfg.Validate(); err != nil {
 				return fmt.Errorf("validation failed: %w", err)
@@ -85,12 +103,61 @@ past midnight. This replaces any existing schedule window.`,
 				return fmt.Errorf("saving config: %w", err)
 			}
 
-			fmt.Printf("Schedule set: %s\n", describeRange(cfg.Scheduling.ScheduleRanges[0]))
+			fmt.Printf("Schedule set: %s\n", describeRange(r))
 			switch {
-			case start == end:
+			case r.StartHour == r.EndHour:
 				fmt.Println("Note: --from equals --to, so this runs the full 24 hours on those days.")
-			case start > end:
+			case r.StartHour > r.EndHour:
 				fmt.Println("(This window wraps past midnight.)")
+			}
+			fmt.Println("Tip: use `schedule add` to layer a second window (e.g. a different weekend window).")
+			fmt.Println("Restart the daemon for the change to take effect: lettuce-volunteer stop && lettuce-volunteer start")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&from, "from", "", "start of the daily window, whole hour, e.g. 20:00")
+	cmd.Flags().StringVar(&to, "to", "", "end of the daily window, whole hour, e.g. 06:00")
+	cmd.Flags().StringVar(&days, "days", "mon-sun", "days the window applies, e.g. mon-fri, sat,sun, mon-sun")
+	return cmd
+}
+
+func newScheduleAddCmd() *cobra.Command {
+	var from, to, days string
+	cmd := &cobra.Command{
+		Use:   "add",
+		Short: "Add another daily window (layer on top of existing windows)",
+		Long: `Append a window to the schedule instead of replacing it, so you can run
+on different hours on different days.
+
+Examples:
+  # Weeknights overnight, plus all day on weekends:
+  lettuce-volunteer schedule set --from 19:00 --to 07:00 --days mon-fri
+  lettuce-volunteer schedule add --from 00:00 --to 00:00 --days sat,sun
+
+The volunteer runs whenever the current time falls in ANY configured window.
+Hours are whole-hour and a window may wrap past midnight.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, err := buildScheduleRange(from, to, days)
+			if err != nil {
+				return err
+			}
+
+			cfg.Scheduling.Mode = "SCHEDULED"
+			cfg.Scheduling.CronExpression = ""
+			cfg.Scheduling.ScheduleRanges = append(cfg.Scheduling.ScheduleRanges, r)
+
+			if err := cfg.Validate(); err != nil {
+				return fmt.Errorf("validation failed: %w", err)
+			}
+			if err := cfg.Save(cfgPath); err != nil {
+				return fmt.Errorf("saving config: %w", err)
+			}
+
+			fmt.Printf("Window added: %s\n", describeRange(r))
+			fmt.Println("Active windows now:")
+			for _, w := range cfg.Scheduling.ScheduleRanges {
+				fmt.Printf("  - %s\n", describeRange(w))
 			}
 			fmt.Println("Restart the daemon for the change to take effect: lettuce-volunteer stop && lettuce-volunteer start")
 			return nil
