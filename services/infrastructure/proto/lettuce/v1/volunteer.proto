@@ -302,6 +302,9 @@ message LeafInfo {
   // volunteer for duration-aware work batching: it sizes the first batch request
   // to fill work_buffer_hours instead of idling at the flat per-request ceiling.
   double estimated_duration_seconds = 11;
+  // Distinct active MACHINES on the leaf. A volunteer running one identity key on
+  // N machines is 1 active_volunteer but N active_hosts (account<->host split).
+  int32 active_hosts = 12;
 }
 
 // --- AbandonWorkUnit ---

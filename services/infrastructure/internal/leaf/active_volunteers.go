@@ -95,3 +95,47 @@ func CountActiveVolunteersForLeaf(ctx context.Context, pool *pgxpool.Pool, leafI
 	}
 	return cnt, nil
 }
+
+// activeHostCountExpr is the COUNT expression for distinct active HOSTS (machines)
+// on a leaf, over a work_unit_assignment_history row aliased as `alias`. A host is
+// a single machine under an account (the account<->host split, TODO #19): two
+// machines sharing one identity key count as two hosts but one volunteer, which is
+// why a one-account/many-machine contributor reads "1 active volunteer" but is
+// usefully shown as N hosts. A NULL host_id (a client that doesn't report a host
+// key, or pre-#19 data) falls back to the account so it still counts as one host.
+func activeHostCountExpr(alias string) string {
+	return fmt.Sprintf("COUNT(DISTINCT COALESCE(%[1]s.host_id::text, %[1]s.volunteer_id::text))", alias)
+}
+
+// ActiveHostSubquery mirrors ActiveVolunteerSubquery but counts distinct active
+// hosts (machines) per leaf, using the same active predicate.
+func ActiveHostSubquery() string {
+	return fmt.Sprintf(`
+		SELECT wu.leaf_id, %s AS cnt
+		FROM work_unit_assignment_history h
+		JOIN work_units wu ON wu.id = h.work_unit_id
+		WHERE %s
+		GROUP BY wu.leaf_id`, activeHostCountExpr("h"), activeVolunteerPredicate("h"))
+}
+
+// CountActiveHostsByLeaf returns the number of distinct active hosts (machines)
+// for every leaf that currently has any. Leaves with none are absent; treat a
+// missing key as zero.
+func CountActiveHostsByLeaf(ctx context.Context, pool *pgxpool.Pool) (map[types.ID]int, error) {
+	rows, err := pool.Query(ctx, ActiveHostSubquery())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[types.ID]int)
+	for rows.Next() {
+		var id types.ID
+		var cnt int
+		if err := rows.Scan(&id, &cnt); err != nil {
+			return nil, err
+		}
+		counts[id] = cnt
+	}
+	return counts, rows.Err()
+}

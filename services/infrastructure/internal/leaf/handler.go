@@ -314,6 +314,14 @@ func (h *LeafHandler) handleList(w http.ResponseWriter, r *http.Request) {
 				summaries[i].ActiveVolunteers = counts[p.ID]
 			}
 		}
+		hostCounts, err := CountActiveHostsByLeaf(r.Context(), h.pool)
+		if err != nil {
+			l.Warn("failed to count active hosts for leaf list", "error", err)
+		} else {
+			for i, p := range leafs {
+				summaries[i].ActiveHosts = hostCounts[p.ID]
+			}
+		}
 	}
 
 	resp := types.NewListResponse(summaries, pagination)

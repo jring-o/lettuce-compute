@@ -44,6 +44,22 @@ func (m *mockRepository) GetLatest(_ context.Context, workUnitID types.ID) (*Che
 	return stored.cp, stored.data, nil
 }
 
+func (m *mockRepository) LatestSequenceForVolunteer(_ context.Context, workUnitID, volunteerID types.ID) (int, error) {
+	stored, ok := m.checkpoints[workUnitID]
+	if !ok || stored.cp.VolunteerID != volunteerID {
+		return 0, nil
+	}
+	return stored.cp.CheckpointSequence, nil
+}
+
+func (m *mockRepository) GetLatestForVolunteer(_ context.Context, workUnitID, volunteerID types.ID) (*Checkpoint, []byte, error) {
+	stored, ok := m.checkpoints[workUnitID]
+	if !ok || stored.cp.VolunteerID != volunteerID {
+		return nil, nil, nil
+	}
+	return stored.cp, stored.data, nil
+}
+
 func (m *mockRepository) Delete(_ context.Context, workUnitID types.ID) error {
 	delete(m.checkpoints, workUnitID)
 	return nil
