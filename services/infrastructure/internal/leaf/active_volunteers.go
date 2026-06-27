@@ -80,6 +80,36 @@ func CountActiveVolunteersByLeaf(ctx context.Context, pool *pgxpool.Pool) (map[t
 	return counts, rows.Err()
 }
 
+// CountActiveVolunteersByLeafIDs returns the number of distinct active volunteers
+// for each of the given leaves that currently has any. Leaves with none are
+// absent from the map; callers should treat a missing key as zero. Unlike
+// CountActiveVolunteersByLeaf it scopes the scan to the requested leaves, which
+// the batch stats endpoint uses so it pays only for the page of leaves it
+// reports rather than aggregating history for every leaf on the head.
+func CountActiveVolunteersByLeafIDs(ctx context.Context, pool *pgxpool.Pool, leafIDs []types.ID) (map[types.ID]int, error) {
+	rows, err := pool.Query(ctx, fmt.Sprintf(`
+		SELECT wu.leaf_id, COUNT(DISTINCT h.volunteer_id) AS cnt
+		FROM work_unit_assignment_history h
+		JOIN work_units wu ON wu.id = h.work_unit_id
+		WHERE wu.leaf_id = ANY($1) AND %s
+		GROUP BY wu.leaf_id`, activeVolunteerPredicate("h")), leafIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[types.ID]int)
+	for rows.Next() {
+		var id types.ID
+		var cnt int
+		if err := rows.Scan(&id, &cnt); err != nil {
+			return nil, err
+		}
+		counts[id] = cnt
+	}
+	return counts, rows.Err()
+}
+
 // CountActiveVolunteersForLeaf returns the number of distinct active volunteers
 // for a single leaf. It is used by the stats snapshot, which is computed per
 // leaf by a low-frequency background job, so a dedicated query is fine.

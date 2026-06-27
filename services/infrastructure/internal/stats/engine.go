@@ -219,6 +219,21 @@ func (e *Engine) ComputeLeafStatsBatch(ctx context.Context, leafIDs []types.ID) 
 		return nil, apierror.Internal("failed to iterate batch credit", err)
 	}
 
+	// ActiveVolunteers per leaf, from the same rolling-window predicate every
+	// other surface uses (so the leaf-list/overview page agrees with the per-leaf
+	// detail page). Without this overlay the batch path left active_volunteers at
+	// its zero value, so the /leafs overview reported 0 volunteers for every leaf
+	// even while the per-leaf page (ComputeSnapshot) showed the real count.
+	activeByLeaf, err := leaf.CountActiveVolunteersByLeafIDs(ctx, e.pool, leafIDs)
+	if err != nil {
+		return nil, apierror.Internal("failed to count active volunteers", err)
+	}
+	for leafID, cnt := range activeByLeaf {
+		if snap, ok := result[leafID]; ok {
+			snap.ActiveVolunteers = cnt
+		}
+	}
+
 	return result, nil
 }
 
