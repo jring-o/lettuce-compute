@@ -564,6 +564,18 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- volunteers of that SAME class. Unpinned units (hr_class IS NULL, incl. all
 		  -- non-HR leafs) and an empty requester class are unconstrained.
 		  AND (wu.hr_class IS NULL OR $13::text = '' OR wu.hr_class = $13)
+		  -- Feasibility-at-dispatch: exclude a unit this host's measured benchmark ($15,
+		  -- FP-ops/sec) says it cannot finish before its deadline. Skipped (no exclusion)
+		  -- when any input is unknown -- benchmark, leaf rsc_fpops_est, or deadline <= 0 --
+		  -- so an un-benchmarked host or un-estimated leaf is never refused on a guess.
+		  -- Mirrors workunit.FeasibleByDeadline and the FlushReservations/ReserveCopy gates.
+		  AND (
+		    $15::float8 <= 0
+		    OR COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0) <= 0
+		    OR wu.deadline_seconds <= 0
+		    OR (COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0)
+		        / NULLIF($15::float8, 0)) <= wu.deadline_seconds
+		  )
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT 1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -581,6 +593,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		opts.MaxInflightPerVolunteer,
 		opts.HRClass,
 		opts.HostID,
+		opts.BenchmarkFPOPS,
 	)
 
 	wu, err := scanWorkUnit(row)
@@ -1016,6 +1029,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		) AS v
 		JOIN work_units wu ON wu.id = v.id AND wu.state = 'QUEUED'
 		JOIN leafs l ON l.id = wu.leaf_id
+		JOIN volunteers vv ON vv.id = v.vol
 		WHERE (
 		        (SELECT COUNT(*) FROM work_unit_assignment_history h
 		         WHERE h.work_unit_id = v.id AND h.outcome IS NULL)
@@ -1032,6 +1046,18 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		    WHERE hb.work_unit_id = v.id AND hb.volunteer_id = v.vol
 		      AND hb.outcome IN ('EXPIRED', 'ABANDONED') AND hb.outcome_at IS NOT NULL
 		      AND hb.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+		  )
+		  -- Feasibility-at-dispatch (authoritative landing): refuse to create a copy this
+		  -- volunteer's stored benchmark says it cannot finish before the unit's deadline,
+		  -- so even a stale/raced in-memory hand-out never run-starts an over-deadline copy.
+		  -- Skipped when benchmark / rsc_fpops_est / deadline is unknown. Mirrors
+		  -- workunit.FeasibleByDeadline and the FindNextAssignable / ReserveCopy gates.
+		  AND (
+		    COALESCE((vv.hardware_capabilities->>'benchmark_fpops')::float8, 0) <= 0
+		    OR COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0) <= 0
+		    OR wu.deadline_seconds <= 0
+		    OR (COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0)
+		        / NULLIF((vv.hardware_capabilities->>'benchmark_fpops')::float8, 0)) <= wu.deadline_seconds
 		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING work_unit_id, volunteer_id`,
@@ -1249,7 +1275,10 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		INSERT INTO work_unit_assignment_history
 			(work_unit_id, volunteer_id, host_id, assigned_at, reserved_until, deadline_seconds)
 		SELECT $1, $2, $5, NOW(), $3, $4
-		WHERE EXISTS (SELECT 1 FROM work_units wu WHERE wu.id = $1 AND wu.state = 'QUEUED')
+		FROM work_units wu
+		JOIN leafs l ON l.id = wu.leaf_id
+		JOIN volunteers vv ON vv.id = $2
+		WHERE wu.id = $1 AND wu.state = 'QUEUED'
 		  -- Distinctness: never reserve a unit this volunteer already produced a result
 		  -- for (so each of the N redundant results comes from a distinct volunteer).
 		  AND NOT EXISTS (
@@ -1262,9 +1291,17 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		    SELECT 1 FROM work_unit_assignment_history h
 		    WHERE h.work_unit_id = $1 AND h.volunteer_id = $2
 		      AND h.outcome IN ('EXPIRED', 'ABANDONED') AND h.outcome_at IS NOT NULL
-		      AND h.outcome_at > NOW() - GREATEST(
-		            (SELECT deadline_seconds FROM work_units WHERE id = $1), 1
-		          ) * INTERVAL '1 second'
+		      AND h.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
+		  )
+		  -- Feasibility-at-dispatch (spot-check landing): refuse a copy this volunteer's
+		  -- stored benchmark says it cannot finish before the unit's deadline. Skipped when
+		  -- benchmark / rsc_fpops_est / deadline is unknown. Mirrors workunit.FeasibleByDeadline.
+		  AND (
+		    COALESCE((vv.hardware_capabilities->>'benchmark_fpops')::float8, 0) <= 0
+		    OR COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0) <= 0
+		    OR wu.deadline_seconds <= 0
+		    OR (COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0)
+		        / NULLIF((vv.hardware_capabilities->>'benchmark_fpops')::float8, 0)) <= wu.deadline_seconds
 		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING `+copyColumns,

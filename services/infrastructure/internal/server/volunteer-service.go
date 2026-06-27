@@ -798,6 +798,11 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		// no host reported (the copy stays NULL → counts under the account). Stage-B metering
 		// (inflight cap / send floor) keys on the effective host id derived from this.
 		HostID: hostID,
+		// Feasibility-at-dispatch: the requester's measured benchmark. Sourced from the
+		// STORED hardware (identHW) so it matches what the SQL gates read from
+		// volunteers.hardware_capabilities; a unit whose estimated runtime on this host
+		// exceeds its deadline is excluded (see FeasibleByDeadline).
+		BenchmarkFPOPS: identHW.BenchmarkFPOPS,
 	}
 
 	// Server-directed retry delay: computed once from the current load and
