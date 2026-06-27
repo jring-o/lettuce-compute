@@ -526,6 +526,11 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	if s1.TotalCreditGranted != 3.5 {
 		t.Errorf("project1 credit = %f, want 3.5 (2.5 + 1.0)", s1.TotalCreditGranted)
 	}
+	// ASSIGNED + RUNNING each created a live copy with a distinct volunteer; the
+	// credit fixture's volunteers have no live copy, so they don't count.
+	if s1.ActiveVolunteers != 2 {
+		t.Errorf("project1 active_volunteers = %d, want 2 (distinct volunteers on live copies)", s1.ActiveVolunteers)
+	}
 
 	// Project 2: 3 total, 1 queued, 1 validated, 1 failed (REJECTED)
 	s2 := result[leaf2ID]
@@ -541,6 +546,10 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	if s2.TotalCreditGranted != 3.0 {
 		t.Errorf("project2 credit = %f, want 3.0", s2.TotalCreditGranted)
 	}
+	// No ASSIGNED/RUNNING units on leaf2, so no live copies and no active volunteers.
+	if s2.ActiveVolunteers != 0 {
+		t.Errorf("project2 active_volunteers = %d, want 0 (no live copies)", s2.ActiveVolunteers)
+	}
 
 	// Non-existent project: zero-value stats
 	s3 := result[nonExistentID]
@@ -549,6 +558,9 @@ func TestComputeLeafStatsBatch(t *testing.T) {
 	}
 	if s3.TotalCreditGranted != 0 {
 		t.Errorf("non-existent project credit = %f, want 0", s3.TotalCreditGranted)
+	}
+	if s3.ActiveVolunteers != 0 {
+		t.Errorf("non-existent project active_volunteers = %d, want 0", s3.ActiveVolunteers)
 	}
 }
 
