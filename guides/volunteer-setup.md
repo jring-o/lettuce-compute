@@ -79,10 +79,18 @@ systemctl --user enable --now podman.socket   # start the user socket
 loginctl enable-linger "$USER"                # keep it alive when logged out
 ```
 
-- **Run lettuce as your normal user — never `sudo`.** Lettuce uses the rootless
-  socket at `$XDG_RUNTIME_DIR/podman/podman.sock` (i.e.
-  `/run/user/<uid>/podman/podman.sock`), **not** the root socket at
-  `/run/podman/podman.sock`. The socket's owner must be the user running lettuce.
+- **Rootless is recommended — run lettuce as your normal user, not `sudo`.**
+  Lettuce prefers the rootless socket at `$XDG_RUNTIME_DIR/podman/podman.sock`
+  (i.e. `/run/user/<uid>/podman/podman.sock`); its owner must be the user running
+  lettuce.
+- **Rootful Podman also works, no symlink needed.** When no rootless socket is
+  present, lettuce now probes the system socket `/run/podman/podman.sock`
+  (root-owned) and uses it automatically, so a host running only rootful Podman is
+  auto-detected. The process must be able to read that socket — run lettuce as
+  root or as a user granted access to it.
+- **Point lettuce at any socket with `CONTAINER_HOST`.** Set
+  `CONTAINER_HOST=unix:///path/to/podman.sock` (or `DOCKER_HOST`) to override the
+  auto-detected socket — for a non-standard location, with no symlink hack.
 - `cgroups v2 not available, falling back to prlimit/affinity` is **benign** —
   resource caps are still applied; it isn't a fault.
 
@@ -145,8 +153,11 @@ the container runtime's store:
   volume, and Docker 29 puts images under `/var/lib/containerd`.
 - **Easiest path in LXC: Docker with your user in the `docker` group.** Rootless
   Podman in LXC works but is fiddlier (user-namespace mapping, nesting, and
-  socket ownership all have to line up). Pick Docker unless you specifically want
-  rootless.
+  socket ownership all have to line up — see the walkthrough below). Pick Docker
+  unless you specifically want rootless. **Rootful Podman** is a third option:
+  lettuce auto-detects its system socket (`/run/podman/podman.sock`), which
+  sidesteps the rootless user-namespace plumbing entirely — run the volunteer as
+  root (or a user with access to that socket).
 - A full container runtime needs to be **VM-only** on some setups: in an
   unprivileged LXC guest, rootless engines must write user-namespace id-maps
   through the container → guest → host, which not every host permits. If LXC
