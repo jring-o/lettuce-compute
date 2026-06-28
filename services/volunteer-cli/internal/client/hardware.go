@@ -21,9 +21,13 @@ const SkipHardwareDetectionEnv = gpudetect.SkipHardwareDetectionEnv
 // Platform detection functions — overridable for testing.
 // Defaults are set to platform-specific implementations in hardware_{linux,darwin,windows}.go.
 var (
-	detectCPUModel      = defaultDetectCPUModel
-	detectTotalMemoryMB = defaultDetectTotalMemoryMB
+	detectCPUModel        = defaultDetectCPUModel
+	detectTotalMemoryMB   = defaultDetectTotalMemoryMB
 	detectDiskAvailableMB = defaultDetectDiskAvailableMB
+	// cpuidVendor reads the CPU vendor ID from CPUID leaf 0 on x86, or "" on
+	// architectures without CPUID (see cpuid_{amd64,other}.go). Overridable so
+	// detectCPUVendor's fallback chain can be exercised deterministically in tests.
+	cpuidVendor = cpuidVendorString
 )
 
 // DiskAvailableMB returns the disk space (in MB) available to the current user
@@ -118,17 +122,35 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 		MaxBandwidthMbps: int32(cfg.ResourceLimits.MaxBandwidthMbps),
 		Gpus:             gpus,
 		// Hardware-class inputs for Homogeneous Redundancy. OS/arch come straight from the
-		// Go runtime; vendor is derived from the detected CPU model string (Intel/AMD/Apple)
-		// — coarse but reliable, since /proc/cpuinfo, WMI, and sysctl all embed the vendor in
-		// the brand string. (A CPUID-based vendor probe could tighten this later.)
+		// Go runtime; vendor is read from CPUID on x86 (exact, even for renamed/virtualized
+		// parts whose brand string omits the vendor) and falls back to the CPU model string
+		// on architectures without CPUID — which is how Apple Silicon (arm64) is classified.
 		Os:        runtime.GOOS,
 		CpuArch:   runtime.GOARCH,
-		CpuVendor: cpuVendorFromModel(cpuModel),
+		CpuVendor: detectCPUVendor(cpuModel),
 	}
 }
 
+// detectCPUVendor returns the CPU vendor token used by the head's HRClass
+// ("GenuineIntel", "AuthenticAMD", "Apple", ...; "" if unknown). On x86 it reads
+// the vendor directly from CPUID leaf 0 — the canonical, exact source — and only
+// falls back to the model-string heuristic when CPUID yields nothing (non-x86
+// arches, where cpuidVendor returns ""). This makes the HR fingerprint exact for
+// CPUs whose brand string doesn't name the vendor (common under hypervisors and
+// for odd/renamed parts), which the heuristic alone could not classify.
+func detectCPUVendor(model string) string {
+	// Trim the NUL/space padding some emulated vendors leave in the CPUID field
+	// (the real probe trims too; this keeps the seam clean for any source).
+	if v := strings.Trim(cpuidVendor(), " \x00"); v != "" {
+		return v
+	}
+	return cpuVendorFromModel(model)
+}
+
 // cpuVendorFromModel derives a coarse CPU vendor token from the detected CPU model/brand
-// string (and the runtime arch for Apple Silicon). Returns "" when unknown; the head's
+// string (and the runtime arch for Apple Silicon). It is the fallback used by
+// detectCPUVendor on architectures without CPUID (notably arm64 / Apple Silicon);
+// on x86 the exact CPUID vendor is preferred. Returns "" when unknown; the head's
 // HRClass() then collapses that to "unknown" so the class stays well-formed.
 func cpuVendorFromModel(model string) string {
 	m := strings.ToLower(model)

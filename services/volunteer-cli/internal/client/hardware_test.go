@@ -349,6 +349,112 @@ func TestDetectHardwareGPUSlowExecutorTimesOut(t *testing.T) {
 	}
 }
 
+// TestCPUVendor_UninformativeModelResolvedViaCPUID reproduces the Homogeneous-
+// Redundancy fingerprint gap fixed in ROADMAP #65a: when the OS reports a CPU
+// brand string that does not name the vendor (common under hypervisors and for
+// odd/renamed parts), the old model-string heuristic could not classify it, so
+// the volunteer reported an empty CPU vendor and its HR class collapsed to
+// "unknown" — even though the silicon has a definite CPUID vendor. After the fix
+// the vendor is read straight from CPUID, so it is populated regardless of the
+// brand string.
+//
+// x86-only: CPUID exists only on amd64; on other arches the vendor still derives
+// from the model string (that is how Apple Silicon is classified), so we skip.
+func TestCPUVendor_UninformativeModelResolvedViaCPUID(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skipf("CPUID probe is x86-only; GOARCH=%s falls back to the model string", runtime.GOARCH)
+	}
+	withMockHardware(t)
+	// A real-world brand string that embeds neither "intel" nor "amd".
+	const brand = "Common KVM processor"
+	detectCPUModel = func() string { return brand }
+
+	hw := DetectHardware(config.Defaults())
+
+	if hw.CpuVendor == "" {
+		t.Fatalf("CpuVendor is empty for an x86 CPU whose brand string is %q — "+
+			"the HR class collapses to \"unknown\"; CPUID should have resolved the vendor", brand)
+	}
+	t.Logf("resolved CpuVendor=%q from CPUID despite uninformative brand string %q", hw.CpuVendor, brand)
+}
+
+// TestDetectCPUVendor_PrefersCPUID verifies the fallback chain deterministically
+// (independent of the host arch) by stubbing the CPUID seam: when CPUID returns a
+// vendor it wins outright, even over a model string the heuristic could classify
+// differently or not at all. Covers a couple of known vendor strings per the DoD.
+func TestDetectCPUVendor_PrefersCPUID(t *testing.T) {
+	orig := cpuidVendor
+	t.Cleanup(func() { cpuidVendor = orig })
+
+	cases := []struct {
+		name  string
+		cpuid string
+		model string
+		want  string
+	}{
+		{"intel from cpuid, uninformative model", "GenuineIntel", "Common KVM processor", "GenuineIntel"},
+		{"amd from cpuid, uninformative model", "AuthenticAMD", "QEMU Virtual CPU version 2.5+", "AuthenticAMD"},
+		{"cpuid overrides a misleading model", "AuthenticAMD", "Intel(R) Xeon(R) CPU", "AuthenticAMD"},
+		{"cpuid padding is trimmed", "  GenuineIntel\x00", "whatever", "GenuineIntel"},
+		{"uncommon vendor passes through", "HygonGenuine", "whatever", "HygonGenuine"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cpuidVendor = func() string { return tc.cpuid }
+			if got := detectCPUVendor(tc.model); got != tc.want {
+				t.Errorf("detectCPUVendor(%q) with CPUID %q = %q, want %q", tc.model, tc.cpuid, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDetectCPUVendor_FallsBackToModelWithoutCPUID verifies that on a platform
+// where CPUID yields nothing (non-x86: cpuidVendor returns ""), the model-string
+// heuristic is used — the path that classifies Apple Silicon.
+func TestDetectCPUVendor_FallsBackToModelWithoutCPUID(t *testing.T) {
+	orig := cpuidVendor
+	t.Cleanup(func() { cpuidVendor = orig })
+	cpuidVendor = func() string { return "" }
+
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"Apple M2", "Apple"},
+		{"Intel(R) Core(TM) i7-9750H", "GenuineIntel"},
+		{"AMD Ryzen 9 5900X", "AuthenticAMD"},
+		{"Common KVM processor", ""}, // heuristic genuinely can't classify this
+	}
+	for _, tc := range cases {
+		if got := detectCPUVendor(tc.model); got != tc.want {
+			t.Errorf("detectCPUVendor(%q) with no CPUID = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+}
+
+// TestCpuidVendorStringRealHardware exercises the actual CPUID probe against the
+// silicon this test runs on. Every real x86 CPU returns a non-empty vendor ID
+// from leaf 0, so on amd64 we assert it is populated and well-formed; on other
+// arches the probe is intentionally a no-op ("").
+func TestCpuidVendorStringRealHardware(t *testing.T) {
+	v := cpuidVendorString()
+	if runtime.GOARCH != "amd64" {
+		if v != "" {
+			t.Errorf("cpuidVendorString() = %q on GOARCH=%s, want \"\" (no CPUID)", v, runtime.GOARCH)
+		}
+		return
+	}
+	if v == "" {
+		t.Fatal("cpuidVendorString() returned empty on amd64; CPUID leaf 0 always reports a vendor")
+	}
+	for _, r := range v {
+		if r < 0x20 || r > 0x7e {
+			t.Fatalf("cpuidVendorString() = %q contains a non-printable byte %q", v, r)
+		}
+	}
+	t.Logf("real-hardware CPUID vendor = %q", v)
+}
+
 // TestDetectHardwareCPUSlowDegrades verifies that a hung CPU-model detector
 // does NOT block the whole DetectHardware call — the field falls back to its
 // zero value while the other sub-detections complete normally.
