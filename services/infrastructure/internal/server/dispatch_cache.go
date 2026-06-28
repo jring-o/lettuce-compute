@@ -2213,17 +2213,22 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 	if int64(rr.MinDiskMB) > opts.MaxDiskMB {
 		return false
 	}
-	// GPU requirement (resource_requirements.gpu_required): the volunteer must have a
-	// GPU with sufficient VRAM.
-	if rr.GPURequired {
+	// GPU presence: a leaf needs a GPU if EITHER flag is set.
+	// execution_config.gpu_required is the natural place a leaf author declares it;
+	// resource_requirements.gpu_required is the parallel matching field. The two were
+	// historically unsynced, so a leaf that set only the execution_config flag (with
+	// gpu_type left at the default ANY) slipped past the presence gate and reached
+	// GPU-less volunteers, which then failed at runtime (#30). Gate presence + VRAM on
+	// either flag; min_gpu_vram_mb lives in resource_requirements.
+	if rr.GPURequired || ec.GPURequired {
 		if !opts.HasGPU || rr.MinGPUVRAMMB > opts.MaxGPUVRAMMB {
 			return false
 		}
-		// Compute capability, when required.
-		if rr.GPUComputeCapability != nil && *rr.GPUComputeCapability != "" {
-			if !containsString(opts.GPUComputeCapabilities, *rr.GPUComputeCapability) {
-				return false
-			}
+	}
+	// GPU compute capability (resource_requirements.gpu_compute_capability), when required.
+	if rr.GPURequired && rr.GPUComputeCapability != nil && *rr.GPUComputeCapability != "" {
+		if !containsString(opts.GPUComputeCapabilities, *rr.GPUComputeCapability) {
+			return false
 		}
 	}
 	// Runtime: leaf runtime must be one the volunteer can run.
@@ -2234,8 +2239,8 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 	if !containsString(opts.AvailableRuntimes, runtime) {
 		return false
 	}
-	// GPU vendor/type (execution_config.gpu_required + gpu_type): if the exec config
-	// requires a GPU and pins a specific vendor/type, the volunteer must have it.
+	// GPU vendor/type (execution_config.gpu_type): if the exec config requires a GPU and
+	// pins a specific vendor/type, the volunteer must have it.
 	if ec.GPURequired {
 		gpuType := strings.ToUpper(strings.TrimSpace(ec.GPUType))
 		if gpuType != "" && gpuType != "ANY" {

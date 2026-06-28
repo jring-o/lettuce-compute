@@ -1634,6 +1634,68 @@ func TestFindNextAssignable_CapabilityMismatch(t *testing.T) {
 	}
 }
 
+// TestFindNextAssignable_GPURequiredViaExecutionConfig reproduces the #30 GPU
+// field-split sub-bug in the SQL dispatch path (used by the browser/WASM immediate
+// assign): a leaf that declares its GPU need only via execution_config.gpu_required
+// (leaving the parallel resource_requirements.gpu_required unset, gpu_type at the
+// default ANY) must not be handed to a GPU-less volunteer. Before the fix the
+// presence gate keyed only on resource_requirements.gpu_required, so such a unit was
+// assigned and would fail at runtime.
+func TestFindNextAssignable_GPURequiredViaExecutionConfig(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "assign-gpu-split")
+	// GPU required ONLY via execution_config; resource_requirements leaves it false.
+	leafID := createActiveTestLeaf(t, pool, &userID,
+		`{"min_cpu_cores":1,"min_memory_mb":512,"min_disk_mb":1024,"gpu_required":false,"min_gpu_vram_mb":0}`,
+		`{"runtime":"NATIVE","gpu_required":true,"max_memory_mb":4096}`, "")
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	wu := newTestWorkUnit(leafID, nil)
+	wu.State = WorkUnitStateQueued
+	if err := repo.Create(ctx, wu); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// A GPU-less volunteer must NOT be handed this GPU-required unit.
+	gpuless := AssignmentOptions{
+		VolunteerID:       createTestVolunteer(t, pool),
+		MaxCPUCores:       4,
+		MaxMemoryMB:       16384,
+		MaxDiskMB:         10240,
+		HasGPU:            false,
+		AvailableRuntimes: []string{"NATIVE"},
+	}
+	found, err := repo.FindNextAssignable(ctx, gpuless)
+	if err != nil {
+		t.Fatalf("FindNextAssignable(gpuless): %v", err)
+	}
+	if found != nil {
+		t.Errorf("a GPU-required leaf (execution_config.gpu_required) was assigned to a GPU-less volunteer (%v)", found.ID)
+	}
+
+	// A GPU volunteer with ample VRAM is still served.
+	gpuful := AssignmentOptions{
+		VolunteerID:       createTestVolunteer(t, pool),
+		MaxCPUCores:       4,
+		MaxMemoryMB:       16384,
+		MaxDiskMB:         10240,
+		HasGPU:            true,
+		MaxGPUVRAMMB:      24000,
+		AvailableRuntimes: []string{"NATIVE"},
+		GPUVendors:        []string{"NVIDIA"},
+	}
+	found, err = repo.FindNextAssignable(ctx, gpuful)
+	if err != nil {
+		t.Fatalf("FindNextAssignable(gpuful): %v", err)
+	}
+	if found == nil {
+		t.Errorf("a GPU-required leaf must still be assignable to a volunteer with a GPU")
+	}
+}
+
 func TestFindNextAssignable_RuntimeMismatch(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()

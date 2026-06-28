@@ -486,8 +486,14 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- on a separate min_memory_mb let the two drift (matched-but-can't-run).
 		  AND COALESCE((l.execution_config->>'max_memory_mb')::int, 0) <= $4
 		  AND COALESCE((l.resource_requirements->>'min_disk_mb')::bigint, 0) <= $5
+		  -- GPU presence: a leaf needs a GPU if EITHER gpu_required flag is set
+		  -- (execution_config.gpu_required is the natural author-set flag;
+		  -- resource_requirements.gpu_required is the parallel matching field). The two were
+		  -- historically unsynced, so gating presence on resource_requirements alone let a
+		  -- leaf that set only the execution_config flag reach GPU-less volunteers (#30).
 		  AND (
-		    NOT COALESCE((l.resource_requirements->>'gpu_required')::boolean, false)
+		    (NOT COALESCE((l.resource_requirements->>'gpu_required')::boolean, false)
+		     AND NOT COALESCE((l.execution_config->>'gpu_required')::boolean, false))
 		    OR ($6::boolean AND COALESCE((l.resource_requirements->>'min_gpu_vram_mb')::int, 0) <= $7)
 		  )
 		  AND (l.execution_config->>'runtime') = ANY($8::text[])
