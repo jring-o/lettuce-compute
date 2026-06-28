@@ -47,6 +47,57 @@ func TestCheckIdentity_MissingKeypairFails(t *testing.T) {
 	}
 }
 
+// TestCheckDisk_MatchesFetchGate pins doctor's disk verdict to the daemon's live
+// shouldFetch gate (TODO #24): a host the gate would still fetch on must not be
+// reported as a blocking failure, and a host the gate would actually block must
+// fail with the gate's own numbers.
+func TestCheckDisk_MatchesFetchGate(t *testing.T) {
+	const dataDir = "/data"
+	cases := []struct {
+		name        string
+		availableMB int64
+		maxDiskGB   int
+		wantFails   int
+		wantWarns   int
+	}{
+		{
+			// Ample: above the full allowance — gate always fetches.
+			name: "ample", availableMB: 25 * 1024, maxDiskGB: 20, wantFails: 0, wantWarns: 0,
+		},
+		{
+			// The reported false positive: max_disk_gb (20 GB) exceeds the 10 GB
+			// cached-image headroom, and free space (15 GB) sits between them. The
+			// gate still fetches work for any already-cached image, so doctor must
+			// NOT report a blocking failure — at most a warning.
+			name: "cached_only_region", availableMB: 15 * 1024, maxDiskGB: 20, wantFails: 0, wantWarns: 1,
+		},
+		{
+			// Below even the cached-image headroom — the gate blocks all work, so
+			// doctor correctly fails.
+			name: "blocked", availableMB: 5 * 1024, maxDiskGB: 20, wantFails: 1, wantWarns: 0,
+		},
+		{
+			// With max_disk_gb <= the headroom there is no cached-only band: the
+			// gate is a single threshold, so a reading below it is a hard failure.
+			name: "small_allowance_blocked", availableMB: 5 * 1024, maxDiskGB: 10, wantFails: 1, wantWarns: 0,
+		},
+		{
+			name: "small_allowance_ample", availableMB: 12 * 1024, maxDiskGB: 10, wantFails: 0, wantWarns: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			rep := &doctorReport{w: &buf}
+			checkDisk(rep, dataDir, tc.availableMB, tc.maxDiskGB)
+			if rep.fails != tc.wantFails || rep.warns != tc.wantWarns {
+				t.Errorf("checkDisk(avail=%d, maxGB=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
+					tc.availableMB, tc.maxDiskGB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
+			}
+		})
+	}
+}
+
 func TestDoctorReport_CountsLevels(t *testing.T) {
 	var buf bytes.Buffer
 	rep := &doctorReport{w: &buf}

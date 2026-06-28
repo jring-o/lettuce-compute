@@ -97,7 +97,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	checkAccountInfo(rep)
 	checkDataDir(rep, cfg.DataDir)
 	checkIdentity(rep, cfg.KeyFile, cfg.PubKeyFile)
-	checkDisk(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB)
+	checkDisk(rep, cfg.DataDir, client.DiskAvailableMB(cfg.DataDir), cfg.ResourceLimits.MaxDiskGB)
 	containerUsable := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
 
@@ -208,19 +208,47 @@ func checkIdentity(rep *doctorReport, keyFile, pubKeyFile string) {
 	rep.add(docOK, "identity", "keypair present and valid", "")
 }
 
-func checkDisk(rep *doctorReport, dataDir string, maxDiskGB int) {
-	requiredMB := maxDiskGB * 1024
-	if requiredMB <= 0 {
-		requiredMB = 1024
-	}
-	availableMB := client.DiskAvailableMB(dataDir)
-	detail := fmt.Sprintf("%d MB free on %s (work needs %d MB free)", availableMB, dataDir, requiredMB)
-	if availableMB > 0 && availableMB < int64(requiredMB) {
-		rep.add(docFail, "disk space", detail,
-			"free space, lower resource_limits.max_disk_gb, or use --data-dir on a roomier volume")
+// checkDisk reports the disk-space verdict the daemon's live fetch gate
+// (daemon.shouldFetch) would reach for this volume, derived from the SAME
+// thresholds via daemon.ClassifyDiskGate so the diagnostic and the gate can
+// never disagree (TODO #24). The earlier check demanded the full max_disk_gb
+// allowance free and flagged a hard failure below it, which was a false positive
+// on hosts where the gate still fetched work for already-cached images.
+func checkDisk(rep *doctorReport, dataDir string, availableMB int64, maxDiskGB int) {
+	fullRequiredMB, cachedHeadroomMB := daemon.DiskGateThresholds(maxDiskGB)
+
+	// A non-positive reading means the free-space probe failed (e.g. statfs
+	// error). The live gate's CheckDiskSpace would error and block, but doctor
+	// has no useful number to show, so surface it as a warning rather than a
+	// confident pass or fail.
+	if availableMB <= 0 {
+		rep.add(docWarn, "disk space",
+			fmt.Sprintf("could not determine free space on %s", dataDir),
+			"check that the data dir is on a mounted, readable volume")
 		return
 	}
-	rep.add(docOK, "disk space", detail, "")
+
+	switch daemon.ClassifyDiskGate(availableMB, maxDiskGB) {
+	case daemon.DiskAmple:
+		rep.add(docOK, "disk space",
+			fmt.Sprintf("%d MB free on %s (allowance %d MB)", availableMB, dataDir, fullRequiredMB), "")
+	case daemon.DiskCachedOnly:
+		// Between the cached-image headroom and the full allowance: the gate
+		// still runs work for any leaf whose image is already pulled, but a
+		// fresh image pull is gated. A warning, not a blocking failure.
+		rep.add(docWarn, "disk space",
+			fmt.Sprintf("%d MB free on %s — below the %d MB max_disk_gb allowance; work still runs for leafs whose image is already cached (needs %d MB), but pulling a fresh image is gated",
+				availableMB, dataDir, fullRequiredMB, cachedHeadroomMB),
+			"free disk space or lower resource_limits.max_disk_gb if you need fresh image pulls")
+	default: // daemon.DiskBlocked
+		floorMB := fullRequiredMB
+		if cachedHeadroomMB < floorMB {
+			floorMB = cachedHeadroomMB
+		}
+		rep.add(docFail, "disk space",
+			fmt.Sprintf("%d MB free on %s — below the %d MB the fetch gate needs to run any work", availableMB, dataDir, floorMB),
+			"free space, lower resource_limits.max_disk_gb, or use --data-dir on a roomier volume")
+	}
 }
 
 // checkContainer reports whether the container runtime is genuinely usable, and
