@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
@@ -243,9 +244,11 @@ func (h *LeafHandler) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Parse order.
+	// Parse order. Accept case-insensitively: the SortOrder constants are
+	// uppercase ("ASC"/"DESC") and the proto mirrors them, so a client that
+	// copies the canonical form would otherwise be rejected (TODO #5).
 	if v := q.Get("order"); v != "" {
-		switch v {
+		switch strings.ToLower(v) {
 		case "asc":
 			filters.Order = OrderAsc
 		case "desc":

@@ -512,6 +512,59 @@ func TestHandlerListSortOrder(t *testing.T) {
 	}
 }
 
+// TestHandlerListOrderCaseInsensitive verifies the ?order param is parsed
+// case-insensitively. The SortOrder constants (and the proto) are uppercase
+// ("ASC"/"DESC"), so a client copying the canonical form sends order=DESC;
+// before TODO #5 that was rejected with 400 "invalid order". Uppercase and
+// mixed case must now be accepted and sort identically to lowercase.
+func TestHandlerListOrderCaseInsensitive(t *testing.T) {
+	ts, pool, cleanup := setupHandlerServer(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "hlistorder")
+
+	names := []string{"Zeta", "Alpha", "Mu"}
+	for _, name := range names {
+		req := validCreateRequest(&userID)
+		req.Name = name + " Order Leaf"
+		resp := doRequest(t, "POST", ts.URL+"/api/v1/leafs", req)
+		resp.Body.Close()
+	}
+
+	// Uppercase DESC (the canonical constant form) must be accepted and sort
+	// descending; uppercase/mixed-case ASC must sort ascending — same as the
+	// lowercase forms exercised by TestHandlerListSortOrder.
+	cases := []struct {
+		order      string
+		descending bool
+	}{
+		{"DESC", true},
+		{"Desc", true},
+		{"ASC", false},
+		{"asc", false},
+	}
+	for _, tc := range cases {
+		url := fmt.Sprintf("%s/api/v1/leafs?sort=name&order=%s&creator_id=%s", ts.URL, tc.order, userID.String())
+		resp := doRequest(t, "GET", url, nil)
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("order=%s: expected 200, got %d", tc.order, resp.StatusCode)
+		}
+
+		var listResp types.ListResponse[LeafSummary]
+		decodeJSON(t, resp, &listResp)
+		if len(listResp.Data) < 3 {
+			t.Fatalf("order=%s: expected at least 3 leafs, got %d", tc.order, len(listResp.Data))
+		}
+		if tc.descending && listResp.Data[0].Name < listResp.Data[1].Name {
+			t.Errorf("order=%s: not descending: %q < %q", tc.order, listResp.Data[0].Name, listResp.Data[1].Name)
+		}
+		if !tc.descending && listResp.Data[0].Name > listResp.Data[1].Name {
+			t.Errorf("order=%s: not ascending: %q > %q", tc.order, listResp.Data[0].Name, listResp.Data[1].Name)
+		}
+	}
+}
+
 func TestHandlerListInvalidSort(t *testing.T) {
 	ts, _, cleanup := setupHandlerServer(t)
 	defer cleanup()
