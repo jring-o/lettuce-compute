@@ -9,23 +9,48 @@ import (
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
-func TestCountEligibleLeafs(t *testing.T) {
+func TestEvaluateLeafEligibility_RuntimeGate(t *testing.T) {
 	leafs := []*lettucev1.LeafInfo{
 		{Id: "native", ExecutionSpec: &lettucev1.ExecutionSpec{Binaries: map[string]string{"linux-amd64": "url"}}},
 		{Id: "container", ExecutionSpec: &lettucev1.ExecutionSpec{Image: "ghcr.io/x/y:1"}},
 		{Id: "nospec"}, // no execution spec → runs on native/wasm
 	}
 
-	// Without a usable container runtime, the image leaf is blocked.
-	total, eligible, blocked := countEligibleLeafs(leafs, false)
-	if total != 3 || eligible != 2 || blocked != 1 {
-		t.Errorf("no container: total=%d eligible=%d blocked=%d, want 3/2/1", total, eligible, blocked)
+	// Without a usable container runtime, the image leaf is blocked (ample memory).
+	res := evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: false})
+	if res.total != 3 || res.eligible != 2 || res.containerBlocked != 1 {
+		t.Errorf("no container: total=%d eligible=%d containerBlocked=%d, want 3/2/1", res.total, res.eligible, res.containerBlocked)
 	}
 
 	// With a usable container runtime, everything is runnable.
-	total, eligible, blocked = countEligibleLeafs(leafs, true)
-	if total != 3 || eligible != 3 || blocked != 0 {
-		t.Errorf("with container: total=%d eligible=%d blocked=%d, want 3/3/0", total, eligible, blocked)
+	res = evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: true})
+	if res.total != 3 || res.eligible != 3 || res.containerBlocked != 0 {
+		t.Errorf("with container: total=%d eligible=%d containerBlocked=%d, want 3/3/0", res.total, res.eligible, res.containerBlocked)
+	}
+}
+
+// TestCountEligibleLeafs_MemoryGate reproduces the #30 memory-gate blind spot:
+// doctor counted a leaf eligible purely on runtime (container vs native), ignoring
+// the execution_config.max_memory_mb requirement — which is the gate that actually
+// fires for a default-configured volunteer (2048 MB) against a standard leaf
+// (4096 MB). A leaf whose per-unit memory exceeds the volunteer's limit must be
+// reported ineligible, with memory named as the blocker.
+func TestCountEligibleLeafs_MemoryGate(t *testing.T) {
+	leafs := []*lettucev1.LeafInfo{
+		{Id: "fits", Slug: "fits", ExecutionSpec: &lettucev1.ExecutionSpec{MaxMemoryMb: 2048}},
+		{Id: "toobig", Slug: "toobig", ExecutionSpec: &lettucev1.ExecutionSpec{MaxMemoryMb: 4096}},
+	}
+
+	// Volunteer limit 2048 MB, has a usable container runtime, no GPU.
+	caps := volunteerCaps{maxMemoryMB: 2048, containerUsable: true, hasGPU: false}
+	res := evaluateLeafEligibility(leafs, caps)
+
+	if res.total != 2 || res.eligible != 1 {
+		t.Fatalf("total=%d eligible=%d, want 2/1 (the 4096 MB leaf gated by memory)", res.total, res.eligible)
+	}
+	// The blocked leaf must be attributed to memory so doctor can print the remedy.
+	if res.memoryBlocked != 1 {
+		t.Errorf("memoryBlocked=%d, want 1", res.memoryBlocked)
 	}
 }
 

@@ -107,9 +107,16 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 	rep.add(docInfo, "runtimes", fmt.Sprintf("this volunteer can run: %v", advertised), "")
 
+	caps := volunteerCaps{
+		maxMemoryMB:     cfg.ResourceLimits.MaxMemoryMB,
+		containerUsable: containerUsable,
+		hasGPU:          volunteerHasGPU(),
+	}
+	rep.add(docInfo, "memory limit", fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this", caps.maxMemoryMB), "")
+
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
-	checkHeads(cmd.Context(), rep, logger, containerUsable)
+	checkHeads(cmd.Context(), rep, logger, caps)
 
 	fmt.Fprintln(out)
 	switch {
@@ -308,7 +315,7 @@ func checkDaemon(rep *doctorReport, dataDir string) {
 	rep.add(docInfo, "daemon", "not running", "")
 }
 
-func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, containerUsable bool) {
+func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, caps volunteerCaps) {
 	if len(cfg.Servers) == 0 {
 		rep.add(docFail, "(none)", "no heads configured",
 			"run: lettuce-volunteer attach --server <host>")
@@ -317,7 +324,7 @@ func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, con
 
 	reachable := 0
 	for _, srv := range cfg.Servers {
-		if checkOneHead(ctx, rep, logger, srv, containerUsable) {
+		if checkOneHead(ctx, rep, logger, srv, caps) {
 			reachable++
 		}
 	}
@@ -331,7 +338,7 @@ func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, con
 // checkOneHead connects to a single head using the public discovery RPCs (no
 // identity needed), reports reachability + eligibility, and returns whether it
 // was reachable.
-func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, srv config.ServerConfig, containerUsable bool) bool {
+func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, srv config.ServerConfig, caps volunteerCaps) bool {
 	name := srv.DisplayName()
 	gc, err := client.New(client.ClientConfig{
 		ServerURL:     srv.GRPCAddress,
@@ -384,37 +391,118 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		return true
 	}
 
-	total, eligible, containerBlocked := countEligibleLeafs(resp.GetLeafs(), containerUsable)
+	res := evaluateLeafEligibility(resp.GetLeafs(), caps)
 	detail := fmt.Sprintf("reachable — server %s, db %s; eligible for %d of %d leafs",
-		st.GetVersion(), statusOrUnknown(st.GetDatabaseStatus()), eligible, total)
+		st.GetVersion(), statusOrUnknown(st.GetDatabaseStatus()), res.eligible, res.total)
 
-	if total > 0 && eligible == 0 {
-		remedy := "this head has no leafs this volunteer can run"
-		if containerBlocked == total && !containerUsable {
+	level := docOK
+	remedy := ""
+	if res.total > 0 && res.eligible == 0 {
+		level = docWarn
+		switch {
+		case res.containerBlocked == res.total && !caps.containerUsable:
 			remedy = "every leaf here needs a container runtime — fix the container check above, or attach a head with native leafs"
+		case res.memoryBlocked > 0:
+			remedy = fmt.Sprintf("raise resource_limits.max_memory_mb (currently %d MB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxMemoryMB)
+		case res.gpuBlocked == res.total:
+			remedy = "every leaf here needs a GPU; none is detected/enabled (set resource_limits.max_gpu_vram_pct > 0 if you have one)"
+		default:
+			remedy = "this head has no leafs this volunteer can run — see the per-leaf reasons below"
 		}
-		rep.add(docWarn, name, detail, remedy)
-		return true
 	}
-	rep.add(docOK, name, detail, "")
+	rep.add(level, name, detail, remedy)
+
+	// Per-leaf requirement breakdown (#30): show exactly which leafs this volunteer
+	// can't run and why (memory/GPU/runtime), so the operator can act even when some
+	// leafs are still eligible (which keeps the head line a pass).
+	for _, le := range res.leaves {
+		if !le.eligible {
+			fmt.Fprintf(rep.w, "                       - %s: %s\n", le.name, le.reason)
+		}
+	}
 	return true
 }
 
-// countEligibleLeafs counts how many leafs the volunteer can run. A leaf needs
-// the container runtime iff its execution spec carries an image; everything else
-// runs on the always-present native/wasm runtimes.
-func countEligibleLeafs(leafs []*lettucev1.LeafInfo, containerUsable bool) (total, eligible, containerBlocked int) {
+// volunteerCaps is the subset of this volunteer's advertised capabilities that gate
+// leaf eligibility in doctor's per-head report.
+type volunteerCaps struct {
+	maxMemoryMB     int
+	containerUsable bool
+	hasGPU          bool
+}
+
+// leafEligibility is the per-leaf verdict doctor prints under a head.
+type leafEligibility struct {
+	name     string
+	eligible bool
+	reason   string // why it's ineligible; empty when eligible
+}
+
+// eligibilityResult aggregates the per-leaf verdicts for one head.
+type eligibilityResult struct {
+	total            int
+	eligible         int
+	containerBlocked int
+	memoryBlocked    int
+	gpuBlocked       int
+	leaves           []leafEligibility
+}
+
+// evaluateLeafEligibility decides, for each leaf the head offers, whether this
+// volunteer can actually run it — applying the same gates the head's dispatcher uses:
+// runtime (a leaf needs the container runtime iff its execution spec carries an
+// image; everything else runs on the always-present native/wasm runtimes), the
+// execution_config.max_memory_mb ceiling (the gate that silently fires for a
+// default-configured volunteer, #30), and GPU presence
+// (execution_config.gpu_required). A leaf may be blocked by more than one gate; the
+// first that bites is reported (container, then memory, then GPU) and each blocking
+// dimension is tallied so the caller can print the right remedy.
+func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps) eligibilityResult {
+	var res eligibilityResult
 	for _, lf := range leafs {
-		total++
-		es := lf.GetExecutionSpec()
-		needsContainer := es != nil && es.GetImage() != ""
-		if needsContainer && !containerUsable {
-			containerBlocked++
-			continue
+		res.total++
+		es := lf.GetExecutionSpec() // nil-safe getters below
+		name := lf.GetSlug()
+		if name == "" {
+			name = lf.GetName()
 		}
-		eligible++
+		if name == "" {
+			name = lf.GetId()
+		}
+
+		needsContainer := es.GetImage() != ""
+		leafMemMB := int(es.GetMaxMemoryMb())
+		needsGPU := es.GetGpuRequired()
+
+		switch {
+		case needsContainer && !caps.containerUsable:
+			res.containerBlocked++
+			res.leaves = append(res.leaves, leafEligibility{name, false, "needs a container runtime"})
+		case leafMemMB > caps.maxMemoryMB:
+			res.memoryBlocked++
+			res.leaves = append(res.leaves, leafEligibility{name, false,
+				fmt.Sprintf("needs %d MB memory > your limit %d MB", leafMemMB, caps.maxMemoryMB)})
+		case needsGPU && !caps.hasGPU:
+			res.gpuBlocked++
+			res.leaves = append(res.leaves, leafEligibility{name, false, "needs a GPU; none detected/enabled"})
+		default:
+			res.eligible++
+			res.leaves = append(res.leaves, leafEligibility{name, true, ""})
+		}
 	}
-	return total, eligible, containerBlocked
+	return res
+}
+
+// detectGPUsFunc is overridable in tests; defaults to real GPU detection.
+var detectGPUsFunc = runtime.DetectGPUs
+
+// volunteerHasGPU reports whether this volunteer can run GPU work: GPU tasks must be
+// enabled in config (max_gpu_vram_pct != 0) AND a GPU must actually be present.
+func volunteerHasGPU() bool {
+	if cfg.ResourceLimits.MaxGPUVRAMPct == 0 {
+		return false
+	}
+	return len(detectGPUsFunc()) > 0
 }
 
 func statusOrUnknown(s string) string {

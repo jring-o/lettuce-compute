@@ -35,6 +35,14 @@ func DiskAvailableMB(path string) int64 {
 	return detectDiskAvailableMB(path)
 }
 
+// TotalMemoryMB returns the machine's total physical RAM in MB, or 0 if it can't
+// be determined. It reuses the same platform detection as hardware registration, so
+// callers (init's resource-limit proposal) can size defaults from real hardware
+// without duplicating the per-OS syscalls.
+func TotalMemoryMB() int64 {
+	return int64(detectTotalMemoryMB())
+}
+
 // DetectHardware detects system hardware and builds a HardwareCapabilities proto.
 // Config-specified limits override detected hardware maximums.
 // Platform-specific detection is in hardware_{linux,darwin,windows}.go.

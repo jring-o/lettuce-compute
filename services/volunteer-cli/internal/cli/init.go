@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	rtdetect "github.com/lettuce-compute/volunteer-cli/internal/runtime"
@@ -41,7 +42,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	// Check if config already exists.
+	configExists := false
 	if _, err := os.Stat(cfgPath); err == nil {
+		configExists = true
 		if nonInteractive {
 			// Desktop app re-init: overwrite silently.
 		} else {
@@ -53,7 +56,21 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Base a RE-init on the existing file so prompts show [current] values and
+	// unspecified fields (tuned limits, servers, leaf preferences) are preserved
+	// instead of being silently reset to factory defaults (#30). A fresh init starts
+	// from defaults and derives resource proposals from this machine's hardware below.
 	c := config.Defaults()
+	deriveFresh := true
+	if configExists {
+		loaded, err := config.Load(cfgPath)
+		if err != nil {
+			fmt.Printf("Warning: could not read existing config (%v); starting from defaults.\n", err)
+		} else {
+			c = loaded
+			deriveFresh = false
+		}
+	}
 	c.DataDir = dataDir
 
 	keyFile := filepath.Join(dataDir, "identity.key")
@@ -100,6 +117,16 @@ func runInit(cmd *cobra.Command, args []string) error {
 	c.HostIDFile = hostIDFile
 	if _, err := identity.LoadOrCreateHostID(hostIDFile); err != nil {
 		return fmt.Errorf("initializing host id: %w", err)
+	}
+
+	// Fresh init: size the resource ceilings to this machine so a default volunteer is
+	// eligible for standard leafs. The prior static defaults (2048 MB / 10 GB) left
+	// max_memory_mb below the 4096 MB standard leaf cap, so a freshly-configured
+	// volunteer silently matched no work (#30). Done after the data dir exists (above)
+	// so free-disk detection reads the real volume. A re-init keeps the loaded values.
+	if deriveFresh {
+		c.ResourceLimits.MaxMemoryMB = proposeMemoryMB(int(client.TotalMemoryMB()))
+		c.ResourceLimits.MaxDiskGB = proposeDiskGB(client.DiskAvailableMB(dataDir))
 	}
 
 	if nonInteractive {
@@ -180,8 +207,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		// Step 2: Resource Limits
 		fmt.Println("\n=== Step 2: Resource Limits ===")
 		c.ResourceLimits.MaxCPUCores = promptInt(scanner, fmt.Sprintf("Max CPU cores [%d]", c.ResourceLimits.MaxCPUCores), c.ResourceLimits.MaxCPUCores)
-		c.ResourceLimits.MaxMemoryMB = promptInt(scanner, "Max memory MB [2048]", 2048)
-		c.ResourceLimits.MaxDiskGB = promptInt(scanner, "Max disk GB [10]", 10)
+		c.ResourceLimits.MaxMemoryMB = promptInt(scanner, fmt.Sprintf("Max memory MB [%d]", c.ResourceLimits.MaxMemoryMB), c.ResourceLimits.MaxMemoryMB)
+		c.ResourceLimits.MaxDiskGB = promptInt(scanner, fmt.Sprintf("Max disk GB [%d]", c.ResourceLimits.MaxDiskGB), c.ResourceLimits.MaxDiskGB)
 
 		// Step 2b: GPU
 		fmt.Println("\n=== GPU Detection ===")
