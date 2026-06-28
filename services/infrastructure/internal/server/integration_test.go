@@ -93,10 +93,13 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 		if body["status"] != "degraded" {
 			t.Errorf("expected status 'degraded' (no DB), got %q", body["status"])
 		}
-		// Public health endpoint must not expose database or uptime fields.
-		if _, ok := body["database"]; ok {
-			t.Error("public health response must not expose 'database' field")
+		// Public health endpoint exposes "database" (documented operator
+		// contract in guides/head-setup.md); with no DB it is "disconnected".
+		if body["database"] != "disconnected" {
+			t.Errorf("expected database 'disconnected' (no DB), got %q", body["database"])
 		}
+		// Uptime is internal detail not derivable from "status"; it stays
+		// behind auth on /health/detailed and must not appear on the public path.
 		if _, ok := body["uptime_seconds"]; ok {
 			t.Error("public health response must not expose 'uptime_seconds' field")
 		}
