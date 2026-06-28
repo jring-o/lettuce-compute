@@ -4,7 +4,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -69,6 +71,32 @@ func PublicKeyFromBase64URL(encoded string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("invalid public key size: got %d, want %d", len(b), ed25519.PublicKeySize)
 	}
 	return ed25519.PublicKey(b), nil
+}
+
+// LoadFailureRemedy returns a one-line, actionable remedy for a LoadKeyPair
+// failure when the key files are PRESENT on disk but won't load — the data-dir
+// relocation failure mode (TODO #25), e.g. a data dir copied to another user with
+// the wrong ownership, or a partial/corrupt copy. It distinguishes a
+// permission/ownership problem from a corrupt copy and, critically, NEVER tells
+// the caller to run `init`: the files exist, so the account already has an
+// identity, and re-running init would mint a NEW key and abandon the account's
+// accrued credit. Callers should use this only after KeyPairExists is true; if
+// the files are simply absent, `init` is the correct remedy.
+//
+// privPath/pubPath are named verbatim so the message points at the exact files.
+func LoadFailureRemedy(loadErr error, privPath, pubPath string) string {
+	if errors.Is(loadErr, fs.ErrPermission) {
+		return fmt.Sprintf(
+			"the key files exist but the current user cannot read them — the data dir was likely moved to another user "+
+				"without fixing ownership. Give the running user ownership and lock down the private key: "+
+				"`chown $(id -un) %s %s && chmod 600 %s` (the daemon must run as the owner of these files). "+
+				"Do NOT run `init` — it creates a new identity and abandons this account's credit.",
+			privPath, pubPath, privPath)
+	}
+	return fmt.Sprintf(
+		"the key files exist but won't load (likely a partial or corrupt copy) — re-copy %s and %s from the original "+
+			"data dir, then `chmod 600 %s`. Do NOT run `init` — it creates a new identity and abandons this account's credit.",
+		privPath, pubPath, privPath)
 }
 
 // KeyPairExists returns true if both key files exist.

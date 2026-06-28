@@ -208,8 +208,11 @@ func checkIdentity(rep *doctorReport, keyFile, pubKeyFile string) {
 		return
 	}
 	if _, _, err := identity.LoadKeyPair(keyFile, pubKeyFile); err != nil {
+		// The keypair is present but won't load — the data-dir-relocation failure
+		// mode (TODO #25). Give an actionable ownership/re-copy remedy; never advise
+		// `init` here, which would mint a new identity and abandon this account.
 		rep.add(docFail, "identity", fmt.Sprintf("keypair present but unreadable (%v)", err),
-			"re-run: lettuce-volunteer init")
+			identity.LoadFailureRemedy(err, keyFile, pubKeyFile))
 		return
 	}
 	rep.add(docOK, "identity", "keypair present and valid", "")

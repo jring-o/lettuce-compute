@@ -2,11 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
+	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 )
 
 func TestEvaluateLeafEligibility_RuntimeGate(t *testing.T) {
@@ -69,6 +72,86 @@ func TestCheckIdentity_MissingKeypairFails(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "lettuce-volunteer init") {
 		t.Errorf("expected the init remedy; got: %s", buf.String())
+	}
+}
+
+// TestCheckIdentity_PresentButUnreadable_DoesNotAdviseInit reproduces TODO #25:
+// when the keypair is PRESENT but won't load — the shape a data-dir relocation to
+// another user produces (a partial/corrupt copy, or a private key the running user
+// can't read) — doctor reported "keypair present but unreadable" with the remedy
+// "re-run: lettuce-volunteer init". That advice is actively harmful: `init` mints a
+// NEW identity and abandons the account's accrued credit. The remedy must instead
+// be an actionable relocation fix (re-copy / fix ownership) and must NOT tell the
+// user to run init.
+func TestCheckIdentity_PresentButUnreadable_DoesNotAdviseInit(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "identity.key")
+	pubFile := filepath.Join(dir, "identity.pub")
+
+	// Both files exist (KeyPairExists is true) but the private key is the wrong
+	// size — the same "present but won't load" shape a partial copy produces.
+	if err := os.WriteFile(keyFile, []byte("truncated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pubFile, []byte("truncated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	rep := &doctorReport{w: &buf}
+	checkIdentity(rep, keyFile, pubFile)
+	out := buf.String()
+
+	if rep.fails != 1 {
+		t.Fatalf("fails = %d, want 1 for an unreadable keypair; report:\n%s", rep.fails, out)
+	}
+	if strings.Contains(out, "lettuce-volunteer init") {
+		t.Errorf("remedy must NOT advise running init (it mints a new identity, abandoning the account); got:\n%s", out)
+	}
+	if !strings.Contains(out, "re-copy") {
+		t.Errorf("remedy should tell the user to re-copy the key files from the original data dir; got:\n%s", out)
+	}
+}
+
+// TestCheckIdentity_PermissionDenied_GivesOwnershipRemedy reproduces the headline
+// TODO #25 case on POSIX: the keypair was carried to another user but the running
+// user can't read the private key (wrong owner/mode after chown). doctor must name
+// the ownership fix (chown/chmod) and still must not advise init.
+func TestCheckIdentity_PermissionDenied_GivesOwnershipRemedy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file-permission denial is not enforced on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode 0000 is still readable, can't simulate denial")
+	}
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "identity.key")
+	pubFile := filepath.Join(dir, "identity.pub")
+	pub, priv, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.SaveKeyPair(keyFile, pubFile, priv, pub); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(keyFile, 0o600) })
+
+	var buf bytes.Buffer
+	rep := &doctorReport{w: &buf}
+	checkIdentity(rep, keyFile, pubFile)
+	out := buf.String()
+
+	if rep.fails != 1 {
+		t.Fatalf("fails = %d, want 1; report:\n%s", rep.fails, out)
+	}
+	if strings.Contains(out, "lettuce-volunteer init") {
+		t.Errorf("remedy must NOT advise init; got:\n%s", out)
+	}
+	if !strings.Contains(out, "chown") || !strings.Contains(out, "chmod") {
+		t.Errorf("remedy should name the ownership fix (chown/chmod); got:\n%s", out)
 	}
 }
 

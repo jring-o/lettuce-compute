@@ -69,6 +69,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Load identity keypair.
 	pub, priv, err := identity.LoadKeyPair(cfg.KeyFile, cfg.PubKeyFile)
 	if err != nil {
+		// If the key files are present but won't load (the data-dir-relocation
+		// failure mode — TODO #25: copied to another user without fixing ownership,
+		// or a partial copy), surface an actionable ownership/re-copy remedy. The
+		// generic "run init" advice is harmful here: it would mint a NEW identity
+		// and abandon this account's accrued credit.
+		if identity.KeyPairExists(cfg.KeyFile, cfg.PubKeyFile) {
+			return fmt.Errorf("loading identity: %w\n%s", err, identity.LoadFailureRemedy(err, cfg.KeyFile, cfg.PubKeyFile))
+		}
 		return fmt.Errorf("loading identity: %w (run 'lettuce-volunteer init' first)", err)
 	}
 

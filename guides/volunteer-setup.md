@@ -130,6 +130,27 @@ one.) For honest verification, your own machines are still treated as one accoun
 for redundancy, so they won't corroborate each other's results — that needs
 genuinely different contributors.
 
+### Moving the data dir to another user (keep the same identity)
+
+Your identity is just two files — `identity.key` (the private key) and
+`identity.pub` — so it is independent of the username or the path. Copying them to
+another account or machine keeps the **same** volunteer identity (and its accrued
+credit); the username change itself does **not** break anything. The only things
+that break a relocation are a private key the running user can't read, or a
+partial copy. Supported steps:
+
+1. Copy `identity.key` and `identity.pub` (and, if you want the same settings,
+   `config.yaml`) into the new data dir.
+2. Give the **running user** ownership: `chown $(id -un) identity.key identity.pub`.
+3. Lock down the private key: `chmod 600 identity.key`.
+
+Do **not** generate fresh files with `lettuce-volunteer init` to "fix" a key that
+won't load — `init` creates a **new** identity and abandons the credit on your old
+one. If the daemon or `doctor` reports the keypair is present but unreadable, it is
+a permission/ownership or partial-copy problem; the error now names the exact
+`chown`/`chmod` (or re-copy) fix. Let each machine create its own `host.id` — don't
+copy it across (see above).
+
 ### Where container images actually live (VM/LXC users, read this)
 
 Image layers — the multi-GB part — do **not** live in the data dir; they live in
