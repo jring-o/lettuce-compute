@@ -364,15 +364,19 @@ func (r *PgxWorkUnitRepository) UpdateState(ctx context.Context, id types.ID, fr
 	return r.GetByID(ctx, id)
 }
 
-// BulkCreate inserts multiple work units efficiently using pgx.CopyFrom.
-// Unlike Create, the input structs are NOT populated with DB-generated IDs or
-// timestamps after insertion. Use a follow-up List query if you need the IDs.
+// BulkCreate inserts multiple work units efficiently using pgx.CopyFrom. Each input
+// struct is stamped (in order) with a client-generated ID — pgx.CopyFrom returns no
+// DB-generated values, so the IDs are produced here (the work_units.id column otherwise
+// defaults to gen_random_uuid()) so callers can report the created work-unit IDs. Any
+// ID already set on an input is preserved. DB-generated timestamps (created_at/updated_at)
+// are NOT back-filled onto the structs — re-read with GetByID/List if you need them.
 func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit) error {
 	if len(wus) == 0 {
 		return nil
 	}
 
 	columns := []string{
+		"id",
 		"leaf_id", "batch_id", "state", "priority",
 		"input_data", "input_data_ref", "code_artifact_ref", "parameters",
 		"estimated_duration_seconds", "deadline_seconds", "output_spec",
@@ -384,7 +388,11 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 
 	rows := make([][]any, len(wus))
 	for i, wu := range wus {
+		if wu.ID == types.NilID() {
+			wu.ID = types.NewID()
+		}
 		rows[i] = []any{
+			wu.ID,
 			wu.LeafID, wu.BatchID, wu.State, wu.Priority,
 			wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
 			wu.EstimatedDurationSeconds, wu.DeadlineSeconds, wu.OutputSpec,

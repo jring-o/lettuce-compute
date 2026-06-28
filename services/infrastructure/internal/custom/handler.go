@@ -33,6 +33,7 @@ type WorkUnitInput struct {
 // BulkUploadResponse is the response body for POST /work-units/bulk.
 type BulkUploadResponse struct {
 	BatchIDs         []types.ID `json:"batch_ids"`
+	WorkUnitIDs      []types.ID `json:"work_unit_ids"`
 	WorkUnitsCreated int        `json:"work_units_created"`
 	Status           string     `json:"status"`
 }
@@ -189,8 +190,15 @@ func (h *BulkUploadHandler) HandleBulkUpload(w http.ResponseWriter, r *http.Requ
 		"work_units_created", len(req.WorkUnits),
 	)
 
+	// BulkCreate stamped each work unit with its ID, in submission order.
+	workUnitIDs := make([]types.ID, len(wus))
+	for i, wu := range wus {
+		workUnitIDs[i] = wu.ID
+	}
+
 	resp := BulkUploadResponse{
 		BatchIDs:         []types.ID{batch.ID},
+		WorkUnitIDs:      workUnitIDs,
 		WorkUnitsCreated: len(req.WorkUnits),
 		Status:           "complete",
 	}

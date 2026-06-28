@@ -822,6 +822,61 @@ func TestWorkUnitBulkCreate(t *testing.T) {
 	}
 }
 
+// TestWorkUnitBulkCreatePopulatesIDs is the regression for ROADMAP #3: BulkCreate
+// must stamp each input struct with the ID of the row it created, in order. Before
+// the fix it used pgx.CopyFrom, which returns no generated IDs, so the bulk-upload
+// endpoint could not report the created work-unit IDs (left as the zero UUID).
+func TestWorkUnitBulkCreatePopulatesIDs(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "wubulkids")
+	leafID := createTestLeaf(t, pool, &userID)
+	batchRepo := NewPgxBatchRepository(pool)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+
+	batch := newTestBatch(leafID, 1, 5)
+	if err := batchRepo.Create(ctx, batch); err != nil {
+		t.Fatalf("Create batch: %v", err)
+	}
+
+	const n = 5
+	wus := make([]*WorkUnit, n)
+	for i := range wus {
+		wus[i] = newTestWorkUnit(leafID, &batch.ID)
+		wus[i].Parameters = json.RawMessage(fmt.Sprintf(`{"index": %d}`, i))
+	}
+
+	if err := repo.BulkCreate(ctx, wus); err != nil {
+		t.Fatalf("BulkCreate: %v", err)
+	}
+
+	seen := make(map[types.ID]bool, n)
+	for i, wu := range wus {
+		if wu.ID == uuid.Nil {
+			t.Errorf("work unit %d: ID not populated after BulkCreate (got nil UUID)", i)
+			continue
+		}
+		if seen[wu.ID] {
+			t.Errorf("work unit %d: duplicate ID %s", i, wu.ID)
+		}
+		seen[wu.ID] = true
+
+		// The populated ID must point at the real persisted row, in input order.
+		got, err := repo.GetByID(ctx, wu.ID)
+		if err != nil {
+			t.Errorf("work unit %d: GetByID(%s) after BulkCreate: %v", i, wu.ID, err)
+			continue
+		}
+		want := fmt.Sprintf(`{"index": %d}`, i)
+		if string(got.Parameters) != want {
+			t.Errorf("work unit %d: ID %s maps to wrong row (params=%s, want %s) — order not preserved",
+				i, wu.ID, got.Parameters, want)
+		}
+	}
+}
+
 func TestWorkUnitBulkCreateEmpty(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
