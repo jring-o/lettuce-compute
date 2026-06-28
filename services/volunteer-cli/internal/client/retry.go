@@ -122,6 +122,40 @@ func ConnectWithRetry(ctx context.Context, cfg ClientConfig, retryCfg RetryConfi
 	}
 }
 
+// retryRPCOnRateLimit calls fn and, on codes.ResourceExhausted (the head's gRPC
+// rate limiter shedding load), backs off a full rate-limit window and retries —
+// WITHOUT any retry cap — until fn succeeds, returns a non-rate-limit error, or
+// ctx is cancelled. A rate limit is the head saying "slow down", not a fatal
+// condition, so an authenticated bootstrap RPC (RegisterVolunteer) must ride it
+// out rather than fail its single-head caller into exiting (TODO #33/#64): unlike
+// the connect probe in ConnectWithRetry, a register failure is fatal at the call
+// site, so a transiently rate-limited register would otherwise drop the daemon.
+// Any other error (or success) is returned to the caller on the first occurrence,
+// so a genuinely unreachable head is surfaced, never masked. It reuses the same
+// window-sized backoff (connectRateLimitBackoff + jitter) ConnectWithRetry uses.
+func retryRPCOnRateLimit(ctx context.Context, logger *slog.Logger, op string, fn func(context.Context) error) error {
+	for {
+		err := fn(ctx)
+		if status.Code(err) != codes.ResourceExhausted {
+			return err
+		}
+
+		sleepDur := connectRateLimitBackoff + jitter(connectRateLimitBackoff)
+		if logger != nil {
+			logger.Info("server rate-limited, backing off (will keep retrying)",
+				"op", op,
+				"backoff", sleepDur,
+			)
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled during %s retry: %w", op, ctx.Err())
+		case <-time.After(sleepDur):
+		}
+	}
+}
+
 // jitter returns a random 0-25% of d (0 if d is too small to jitter), used to
 // spread retry backoffs and prevent a thundering herd.
 func jitter(d time.Duration) time.Duration {

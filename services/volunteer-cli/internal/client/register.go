@@ -46,7 +46,17 @@ func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, hostID
 	hw := DetectHardware(cfg)
 	req := BuildRegistrationRequest(pub, hostID, hw, cfg, availableRuntimes...)
 
-	resp, err := client.RegisterVolunteer(ctx, req)
+	// Ride out a rate-limited head: RegisterVolunteer is authenticated, so it is
+	// subject to the head's post-auth per-pubkey limiter, and a register failure is
+	// fatal at the call site (a single-head daemon exits with "could not connect to
+	// any configured server"). Treat codes.ResourceExhausted as "slow down, keep
+	// trying" — like the connect probe already does — instead of fatal (TODO #64).
+	var resp *lettucev1.RegisterVolunteerResponse
+	err := retryRPCOnRateLimit(ctx, client.logger, "register volunteer", func(ctx context.Context) error {
+		var rpcErr error
+		resp, rpcErr = client.RegisterVolunteer(ctx, req)
+		return rpcErr
+	})
 	if err != nil {
 		return "", false, fmt.Errorf("registering volunteer: %w", err)
 	}
