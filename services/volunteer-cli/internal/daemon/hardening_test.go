@@ -105,6 +105,64 @@ func TestShouldFetch_NoCachedImageRequiresFullAllowance(t *testing.T) {
 	}
 }
 
+// TestDiskGateThresholds checks the shared threshold helper the live gate and
+// the doctor preflight both consume (TODO #24).
+func TestDiskGateThresholds(t *testing.T) {
+	cases := []struct {
+		maxDiskGB int
+		wantFull  int
+		wantCache int
+	}{
+		{maxDiskGB: 20, wantFull: 20 * 1024, wantCache: cachedImageWorkspaceHeadroomMB},
+		{maxDiskGB: 10, wantFull: 10 * 1024, wantCache: cachedImageWorkspaceHeadroomMB},
+		{maxDiskGB: 0, wantFull: 1024, wantCache: cachedImageWorkspaceHeadroomMB},  // unset → 1 GB floor
+		{maxDiskGB: -5, wantFull: 1024, wantCache: cachedImageWorkspaceHeadroomMB}, // negative → 1 GB floor
+	}
+	for _, tc := range cases {
+		full, cache := DiskGateThresholds(tc.maxDiskGB)
+		if full != tc.wantFull || cache != tc.wantCache {
+			t.Errorf("DiskGateThresholds(%d) = (%d, %d), want (%d, %d)",
+				tc.maxDiskGB, full, cache, tc.wantFull, tc.wantCache)
+		}
+	}
+}
+
+// TestClassifyDiskGate verifies the shared classifier reproduces shouldFetch's
+// three-region decision: ample (always fetch), cached-only (fetch iff an image
+// is cached), and blocked. The cached-only band exists only when max_disk_gb
+// exceeds the 10 GB cached-image headroom.
+func TestClassifyDiskGate(t *testing.T) {
+	cases := []struct {
+		name        string
+		availableMB int64
+		maxDiskGB   int
+		want        DiskGateVerdict
+	}{
+		// max_disk_gb=20 (full 20 GB, headroom 10 GB) → all three bands exist.
+		{"ample_above_full", 25 * 1024, 20, DiskAmple},
+		{"ample_at_full", 20 * 1024, 20, DiskAmple},
+		{"cached_only_mid", 15 * 1024, 20, DiskCachedOnly},
+		{"cached_only_at_headroom", 10 * 1024, 20, DiskCachedOnly},
+		{"blocked_below_headroom", 10*1024 - 1, 20, DiskBlocked},
+		// max_disk_gb=10 (full == headroom) → no cached-only band.
+		{"small_ample", 10 * 1024, 10, DiskAmple},
+		{"small_blocked", 10*1024 - 1, 10, DiskBlocked},
+		// max_disk_gb=5 (full 5 GB < headroom) → cached path can't help; floor is full.
+		{"tiny_ample", 5 * 1024, 5, DiskAmple},
+		{"tiny_blocked", 5*1024 - 1, 5, DiskBlocked},
+		// Unset allowance falls back to the 1 GB floor.
+		{"unset_ample", 2048, 0, DiskAmple},
+		{"unset_blocked", 512, 0, DiskBlocked},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyDiskGate(tc.availableMB, tc.maxDiskGB); got != tc.want {
+				t.Errorf("ClassifyDiskGate(%d, %d) = %d, want %d", tc.availableMB, tc.maxDiskGB, got, tc.want)
+			}
+		})
+	}
+}
+
 // --- Item 4: abandon un-run units back to the head ---
 
 func TestAbandonItem_ReturnsUnitToHead(t *testing.T) {

@@ -869,6 +869,63 @@ const cachedImageWorkspaceHeadroomMB = 10 * 1024 // 10 GB
 // call on every loop iteration.
 const imageCacheCheckTTL = 30 * time.Second
 
+// DiskGateThresholds returns the two disk-space thresholds (both in MB) the
+// fetch gate applies to the data-dir volume for a given max_disk_gb:
+//
+//   - fullRequiredMB is the allowance needed to pull a fresh image and run a
+//     unit — the configured max_disk_gb, or a 1 GB floor when it is unset.
+//   - cachedHeadroomMB is the smaller workspace headroom that suffices to rerun
+//     a unit whose container image is already cached.
+//
+// shouldFetch and the `doctor` preflight both derive their numbers from this one
+// function so the live gate and the diagnostic can never disagree (TODO #24).
+func DiskGateThresholds(maxDiskGB int) (fullRequiredMB, cachedHeadroomMB int) {
+	fullRequiredMB = maxDiskGB * 1024
+	if fullRequiredMB <= 0 {
+		fullRequiredMB = 1024
+	}
+	return fullRequiredMB, cachedImageWorkspaceHeadroomMB
+}
+
+// DiskGateVerdict classifies how a free-space reading sits relative to the fetch
+// gate's thresholds.
+type DiskGateVerdict int
+
+const (
+	// DiskAmple: at or above the full allowance — the gate always fetches.
+	DiskAmple DiskGateVerdict = iota
+	// DiskCachedOnly: below the full allowance but at or above the cached-image
+	// workspace headroom — the gate fetches only for leafs whose image is
+	// already cached; a fresh image pull is still gated. Only reachable when
+	// max_disk_gb exceeds the headroom.
+	DiskCachedOnly
+	// DiskBlocked: below even the cached-image workspace headroom — the gate
+	// blocks all fetching.
+	DiskBlocked
+)
+
+// ClassifyDiskGate maps a free-space reading (MB) on the data-dir volume to the
+// fetch gate's verdict for a given max_disk_gb. It is the shared, side-effect-
+// free core that the `doctor` preflight uses so its disk check can never
+// contradict the daemon's live shouldFetch gate. The DiskCachedOnly band exists
+// only when max_disk_gb exceeds the cached-image headroom; otherwise the gate is
+// a single threshold and a reading is either DiskAmple or DiskBlocked.
+func ClassifyDiskGate(availableMB int64, maxDiskGB int) DiskGateVerdict {
+	fullRequiredMB, cachedHeadroomMB := DiskGateThresholds(maxDiskGB)
+	floorMB := cachedHeadroomMB
+	if fullRequiredMB < floorMB {
+		floorMB = fullRequiredMB
+	}
+	switch {
+	case availableMB >= int64(fullRequiredMB):
+		return DiskAmple
+	case availableMB >= int64(floorMB):
+		return DiskCachedOnly
+	default:
+		return DiskBlocked
+	}
+}
+
 // shouldFetch checks whether the fetcher should request work.
 // Returns false if disk space is insufficient or the scheduler says not active.
 func (d *Daemon) shouldFetch() bool {
@@ -884,10 +941,7 @@ func (d *Daemon) shouldFetch() bool {
 
 	// Full allowance: enough headroom on the data-dir volume to pull a fresh
 	// image and run a unit.
-	fullRequiredMB := d.cfg.ResourceLimits.MaxDiskGB * 1024
-	if fullRequiredMB <= 0 {
-		fullRequiredMB = 1024
-	}
+	fullRequiredMB, cachedHeadroomMB := DiskGateThresholds(d.cfg.ResourceLimits.MaxDiskGB)
 	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, fullRequiredMB); err == nil {
 		d.clearDiskGateWarning()
 		return true
@@ -898,8 +952,8 @@ func (d *Daemon) shouldFetch() bool {
 	// min_disk_mb (which sizes max_disk_gb) bundles the image, so demanding the
 	// whole allowance free forever would block every cached-image rerun.
 	if d.hasCachedRunnableImage() {
-		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedImageWorkspaceHeadroomMB); err != nil {
-			d.warnDiskGateOnce(cachedImageWorkspaceHeadroomMB)
+		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedHeadroomMB); err != nil {
+			d.warnDiskGateOnce(cachedHeadroomMB)
 			return false
 		}
 		d.clearDiskGateWarning()
