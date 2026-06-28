@@ -551,14 +551,20 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      AND res3.validation_status = 'PENDING'
 		  )
 		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
-		  -- this unit TIMED OUT or was abandoned is benched for roughly one more
+		  -- this unit TIMED OUT or was abandoned mid-run is benched for roughly one more
 		  -- deadline so a fresh volunteer gets first refusal; after that cooldown it is
-		  -- eligible again, so a small volunteer pool never strands the work.
+		  -- eligible again, so a small volunteer pool never strands the work. The cooldown
+		  -- is a RELIABILITY signal, so it benches only a copy the volunteer actually
+		  -- STARTED (started_at set): a graceful return of UN-STARTED buffered work
+		  -- (AbandonWorkUnit on a never-run copy, or the buffer reconciler reaping a dropped
+		  -- prefetch — both close it ABANDONED with started_at NULL) is not unreliable and
+		  -- must not bench, else a dominated pool strands the work it returned (#59).
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history wuah4
 		    WHERE wuah4.work_unit_id = wu.id
 		      AND wuah4.volunteer_id = $9
-		      AND wuah4.outcome IN ('EXPIRED', 'ABANDONED')
+		      AND (wuah4.outcome = 'EXPIRED'
+		           OR (wuah4.outcome = 'ABANDONED' AND wuah4.started_at IS NOT NULL))
 		      AND wuah4.outcome_at IS NOT NULL
 		      AND wuah4.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 		  )
@@ -706,12 +712,15 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
 				) contribs
 			) AS contributor_ids,
-			-- Volunteers whose recent copy of this unit timed out / was abandoned within
-			-- ~one deadline: benched (last refusal) until the cooldown elapses.
+			-- Volunteers benched by a recent timeout / mid-run abandon of this unit
+			-- (~one deadline cooldown). Only a STARTED copy benches; a graceful return of
+			-- UN-STARTED buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
 			ARRAY(
 				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
 				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
-				   AND wuah_b.outcome IN ('EXPIRED', 'ABANDONED') AND wuah_b.outcome_at IS NOT NULL
+				   AND (wuah_b.outcome = 'EXPIRED'
+				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
+				   AND wuah_b.outcome_at IS NOT NULL
 				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 			) AS benched_ids
 		FROM work_units wu
@@ -893,11 +902,15 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
 				) contribs
 			) AS contributor_ids,
-			-- Volunteers benched by a recent timeout/abandon of this unit (cooldown ~1 deadline).
+			-- Volunteers benched by a recent timeout / mid-run abandon of this unit (cooldown
+			-- ~1 deadline). Only a STARTED copy benches; a graceful return of un-started
+			-- buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
 			ARRAY(
 				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
 				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
-				   AND wuah_b.outcome IN ('EXPIRED', 'ABANDONED') AND wuah_b.outcome_at IS NOT NULL
+				   AND (wuah_b.outcome = 'EXPIRED'
+				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
+				   AND wuah_b.outcome_at IS NOT NULL
 				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 			) AS benched_ids`,
 		limit, excludeIDs, leafIDs, headID, leaseSecs,
@@ -1021,8 +1034,10 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 	//   * the volunteer has NOT already authored a PENDING result for the unit (so each
 	//     of the N redundant results comes from a DISTINCT volunteer) — the guard whose
 	//     absence let a re-queued unit be re-handed to its own prior submitter,
-	//   * the volunteer is NOT in post-failure cooldown (a recent EXPIRED/ABANDONED copy
-	//     of this unit benches it for ~one deadline so a fresh volunteer gets first crack),
+	//   * the volunteer is NOT in post-failure cooldown (a recent copy of this unit it
+	//     STARTED but did not finish — EXPIRED, or ABANDONED mid-run — benches it for ~one
+	//     deadline so a fresh volunteer gets first crack; a graceful return of un-started
+	//     buffered work, ABANDONED with started_at NULL, is not unreliable and does not bench),
 	//   * ON CONFLICT on the live-copy partial unique enforces "one live copy per
 	//     volunteer" (a duplicate hold for the same volunteer is silently dropped and
 	//     thus voided by the caller).
@@ -1058,7 +1073,11 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history hb
 		    WHERE hb.work_unit_id = v.id AND hb.volunteer_id = v.vol
-		      AND hb.outcome IN ('EXPIRED', 'ABANDONED') AND hb.outcome_at IS NOT NULL
+		      -- Only a STARTED copy benches (reliability signal); a graceful return of
+		      -- un-started buffered work (ABANDONED, started_at NULL) does not (#59).
+		      AND (hb.outcome = 'EXPIRED'
+		           OR (hb.outcome = 'ABANDONED' AND hb.started_at IS NOT NULL))
+		      AND hb.outcome_at IS NOT NULL
 		      AND hb.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 		  )
 		  -- Feasibility-at-dispatch (authoritative landing): refuse to create a copy this
@@ -1299,12 +1318,16 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		    SELECT 1 FROM results res
 		    WHERE res.work_unit_id = $1 AND res.volunteer_id = $2 AND res.validation_status = 'PENDING'
 		  )
-		  -- Cooldown: a volunteer whose recent copy of this unit timed out / was abandoned
-		  -- is benched for ~one deadline so a fresh volunteer gets first crack on the requeue.
+		  -- Cooldown: a volunteer whose recent copy of this unit it STARTED timed out / was
+		  -- abandoned mid-run is benched for ~one deadline so a fresh volunteer gets first
+		  -- crack on the requeue. A graceful return of un-started buffered work (ABANDONED,
+		  -- started_at NULL) is not a reliability signal and does not bench (#59).
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history h
 		    WHERE h.work_unit_id = $1 AND h.volunteer_id = $2
-		      AND h.outcome IN ('EXPIRED', 'ABANDONED') AND h.outcome_at IS NOT NULL
+		      AND (h.outcome = 'EXPIRED'
+		           OR (h.outcome = 'ABANDONED' AND h.started_at IS NOT NULL))
+		      AND h.outcome_at IS NOT NULL
 		      AND h.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
 		  )
 		  -- Feasibility-at-dispatch (spot-check landing): refuse a copy this volunteer's
