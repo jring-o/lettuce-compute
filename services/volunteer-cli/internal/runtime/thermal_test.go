@@ -304,6 +304,98 @@ func TestThermalMonitor_StopIdempotent(t *testing.T) {
 	monitor.Stop()
 }
 
+// TestThermalMonitor_PauseNotDroppedWhenBusy reproduces #61 (pause half). The
+// channel mirrors the daemon's real size-1 thermalPauseCh, and the consumer is
+// momentarily busy (not reading) when the temperature crosses the pause
+// threshold. With the old non-blocking send the pause was dropped — and because
+// the monitor flips its throttled flag before sending, it never retried, so
+// thermal protection silently never engaged. The fix blocks until the daemon
+// receives the signal, so the pause lands once the busy consumer drains.
+func TestThermalMonitor_PauseNotDroppedWhenBusy(t *testing.T) {
+	withMockCPUTemp(t, 90)              // constantly above the 85C pause threshold
+	withMockExecutor(t, notFoundForAll) // no GPU
+
+	// Size-1 channel like daemon.thermalPauseCh, already holding a stale resume
+	// the busy daemon has not consumed yet — so the buffer is full when the
+	// monitor wants to send the pause.
+	pauseCh := make(chan bool, 1)
+	pauseCh <- false
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cfg := defaultThermalConfig()
+
+	monitor := NewThermalMonitor(cfg, pauseCh, logger)
+	monitor.SetPollIntervalForTest(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	monitor.Start(ctx)
+	defer monitor.Stop()
+
+	// Stay "busy" while the monitor ticks across the threshold several times.
+	time.Sleep(150 * time.Millisecond)
+
+	// Now drain. We must eventually observe the pause (true); with the bug the
+	// channel only ever yields the stale resume and then stays empty.
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case s := <-pauseCh:
+			if s {
+				return // pause delivered — fixed
+			}
+		case <-deadline:
+			t.Fatal("thermal pause was dropped: a momentarily-busy consumer never received pause=true")
+		}
+	}
+}
+
+// TestThermalMonitor_ResumeNotDroppedWhenBusy reproduces #61 (resume half). The
+// pause lands in the size-1 buffer and sits there while the consumer is busy; the
+// temperature then drops, but with the old non-blocking send the resume was
+// dropped against the still-full buffer — leaving the daemon paused forever.
+func TestThermalMonitor_ResumeNotDroppedWhenBusy(t *testing.T) {
+	callCount := 0
+	withMockCPUTempFunc(t, func() int {
+		callCount++
+		if callCount <= 2 {
+			return 90 // hot -> pause
+		}
+		return 60 // cool -> resume
+	})
+	withMockExecutor(t, notFoundForAll) // no GPU
+
+	pauseCh := make(chan bool, 1) // size-1, like daemon.thermalPauseCh
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cfg := defaultThermalConfig()
+
+	monitor := NewThermalMonitor(cfg, pauseCh, logger)
+	monitor.SetPollIntervalForTest(20 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	monitor.Start(ctx)
+	defer monitor.Stop()
+
+	// Busy while the monitor goes hot (pause buffered) then cool (resume would be
+	// dropped against the full buffer under the bug).
+	time.Sleep(200 * time.Millisecond)
+
+	deadline := time.After(time.Second)
+	var got []bool
+	for {
+		select {
+		case s := <-pauseCh:
+			got = append(got, s)
+			if !s {
+				return // resume delivered — fixed
+			}
+		case <-deadline:
+			t.Fatalf("thermal resume was dropped: consumer never received resume=false; got %v", got)
+		}
+	}
+}
+
 func TestThermalConfig_DisabledSkipsValidation(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Thermal.Enabled = false
