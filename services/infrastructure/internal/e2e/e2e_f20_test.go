@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,8 +154,17 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 	}
 }
 
-// TestF20_PlatformManagedRejected verifies that PLATFORM_MANAGED transfer strategy
-// is rejected for self-hosted infrastructure with a helpful error message.
+// TestF20_PlatformManagedRejected verifies that the PLATFORM_MANAGED transfer
+// strategy is rejected for self-hosted infrastructure with a helpful error
+// message. PLATFORM_MANAGED is only available on the hosted platform, so a
+// self-hosted head must refuse it.
+//
+// The rejection happens at config-store (PUT) time: the leaf-update handler
+// merges and re-validates each config block it is sent (ValidateDataConfig),
+// so an invalid transfer_strategy is refused the moment it is PUT — the config
+// is never stored and the leaf can never reach activation with it. (This is
+// stricter than the older behavior, which stored the config and only rejected
+// it at activation; the test was updated to match.)
 func TestF20_PlatformManagedRejected(t *testing.T) {
 	env, cleanup := setupAlphaServer(t)
 	defer cleanup()
@@ -164,9 +174,7 @@ func TestF20_PlatformManagedRejected(t *testing.T) {
 
 	userID := createTestUser(t, env.pool, ctx, "f20-pm")
 
-	// Create and configure a DRAFT leaf (do not activate yet); self-hosted servers
-	// enforce the PLATFORM_MANAGED rejection at activation (data-config validation),
-	// which is the security control under test.
+	// Create and configure a DRAFT leaf.
 	createReq := leaf.CreateLeafRequest{
 		Name:         "F20 Platform Managed Reject",
 		Description:  "Should reject PLATFORM_MANAGED",
@@ -186,8 +194,9 @@ func TestF20_PlatformManagedRejected(t *testing.T) {
 	requireStatus(t, resp, http.StatusOK, "configure")
 	resp.Body.Close()
 
-	// Update with valid exec config plus PLATFORM_MANAGED data config. The PUT only
-	// stores config; the strategy is validated (and rejected) at activation.
+	// PUT a valid exec config plus a PLATFORM_MANAGED data config. The update
+	// handler re-validates the data config and must reject PLATFORM_MANAGED on
+	// self-hosted infrastructure with a 400 VALIDATION_ERROR.
 	bucket := "my-bucket"
 	execCfg := leaf.ExecutionConfig{
 		Runtime:         "NATIVE",
@@ -205,28 +214,27 @@ func TestF20_PlatformManagedRejected(t *testing.T) {
 		MaxOutputSizeBytes: 104857600,
 	}
 	resp = httpReq(t, "PUT", leafURL, leaf.UpdateLeafRequest{ExecutionConfig: &execCfg, DataConfig: &dataCfg})
-	requireStatus(t, resp, http.StatusOK, "update configs")
-	resp.Body.Close()
+	requireStatus(t, resp, http.StatusBadRequest, "PUT PLATFORM_MANAGED must be rejected")
 
-	// Activation must reject PLATFORM_MANAGED on self-hosted infrastructure.
-	resp = httpReq(t, "POST", leafURL+"/activate", nil)
-	if resp.StatusCode == http.StatusOK {
-		resp.Body.Close()
-		t.Fatal("expected PLATFORM_MANAGED to be rejected at activation, but got 200 OK")
-	}
-
-	// Verify the error message mentions the hosted platform.
+	// Verify it is a validation error whose message names the hosted platform.
 	var errResp struct {
 		Error struct {
+			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
 	decodeJSON(t, resp, &errResp)
 
-	if errResp.Error.Message == "" {
-		t.Error("expected error message in response")
+	if errResp.Error.Code != "VALIDATION_ERROR" {
+		t.Errorf("expected error code VALIDATION_ERROR, got %q", errResp.Error.Code)
 	}
-	t.Logf("PLATFORM_MANAGED correctly rejected: %s", errResp.Error.Message)
+	if errResp.Error.Message == "" {
+		t.Fatal("expected error message in response")
+	}
+	if !strings.Contains(errResp.Error.Message, "hosted platform") {
+		t.Errorf("expected error message to mention the hosted platform, got: %s", errResp.Error.Message)
+	}
+	t.Logf("PLATFORM_MANAGED correctly rejected at config-store: %s", errResp.Error.Message)
 }
 
 // TestF20_InlineSubmitStillWorks verifies the inline data path is unaffected
