@@ -45,7 +45,8 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 
 | Log message / symptom | Cause | Fix |
 |---|---|---|
-| `not fetching work: not enough free disk space …` | Free space is below your `max_disk_gb` allowance, so the daemon won't fetch. | Free space, lower `resource_limits.max_disk_gb`, or `--data-dir` on a roomier volume. |
+| `not fetching work: not enough free disk space …` (`volume=data dir`) | Free space on the data-dir volume is below your `max_disk_gb` allowance. | Free space, lower `resource_limits.max_disk_gb`, or `--data-dir` on a roomier volume. |
+| `not fetching work: not enough free disk space …` (`volume=image store`) | The container image-store volume (the `path=…` in the log) can't hold a fresh image pull, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
 | `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
@@ -108,9 +109,14 @@ The data dir defaults to `~/.lettuce` (override with `--data-dir <path>`). It
 holds your **identity keypair** (`identity.key`/`.pub`), a per-machine
 `host.id`, config, logs, and per-unit work files.
 
-- Before fetching any work, the daemon requires `max_disk_gb` free **on the
-  data-dir volume**. If your home volume is small, point `--data-dir` at a
-  roomier disk.
+- Before fetching any work, the daemon requires `max_disk_gb` free on **both**
+  the data-dir volume **and** the container image-store volume (where the
+  multi-GB image layers land — see ["Where container images actually
+  live"](#where-container-images-actually-live-vmlxc-users-read-this) below).
+  Whichever is short, the daemon stays idle and logs a one-time WARN naming that
+  volume; `lettuce-volunteer doctor` reports the free space on each. If your home
+  volume is small, point `--data-dir` at a roomier disk; if the image store is
+  small, see the remedies below.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
 
@@ -166,12 +172,24 @@ the container runtime's store:
 - Set `max_disk_gb` **below the volume's *reported* free space** — a "64 GB"
   loopback/btrfs volume reports only ~60.6 GB free when empty, so a 60 GB setting
   can fail on an empty disk.
+- The daemon checks free space on **this store volume** before fetching a
+  container leaf — not just the data dir — so a roomy `~/.lettuce` no longer lets
+  a too-small image store sail through the gate and then fail mid-pull with "no
+  space left on device". `lettuce-volunteer doctor` prints the store path (from
+  `docker info` → "Docker Root Dir" / Podman's graphroot) and its free space.
+  Lettuce can only **detect** this path — it can't move it: relocate the store by
+  repointing the engine (Docker `data-root`, rootless Podman `graphroot`) or, on
+  Windows/macOS, enlarge the Podman-machine disk (`podman machine init
+  --disk-size`).
 
 ### Virtualized hosts (Proxmox, LXC, VMs)
 
 - Separate raw volumes for rootfs vs data vs the image store is the normal "data
-  separate from OS" pattern — just remember the disk gate checks the data-dir
-  volume, and Docker 29 puts images under `/var/lib/containerd`.
+  separate from OS" pattern — the disk gate checks **both** the data-dir volume
+  and the image-store volume, so a small `/var` no longer slips past a roomy
+  `$HOME`. Remember Docker 29 puts images under `/var/lib/containerd`; run
+  `lettuce-volunteer doctor` to see the exact store path it found and its free
+  space.
 - **Easiest path in LXC: Docker with your user in the `docker` group.** Rootless
   Podman in LXC works but is fiddlier (user-namespace mapping, nesting, and
   socket ownership all have to line up — see the walkthrough below). Pick Docker

@@ -299,7 +299,46 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 		desc += " " + info.Version
 	}
 	rep.add(docOK, "container", desc+" — socket reachable", "")
+
+	// Report the image-store filesystem (TODO #31): a container leaf's image is
+	// pulled into the engine's store (Docker DockerRootDir / Podman graphroot),
+	// NOT under the lettuce data dir, so a roomy data dir can hide a too-small
+	// image-store volume. Surface where it lands and whether it has pull headroom.
+	if einfo, ierr := cr.Client().Info(ctx); ierr == nil && einfo != nil && einfo.StoragePath != "" {
+		checkImageStore(rep, einfo.StoragePath, client.DiskAvailableMB(einfo.StoragePath), cfg.ResourceLimits.MaxDiskGB)
+	} else {
+		rep.add(docInfo, "image store", "could not determine the container image-store path from the engine",
+			"if a big-image pull fails with ENOSPC, check free space where the engine stores images (Docker data-root / Podman graphroot)")
+	}
 	return true
+}
+
+// checkImageStore reports free space on the filesystem where the container
+// backend stores and extracts images — Docker's DockerRootDir / Podman's
+// graphroot — which is NOT the lettuce data dir. A big-image leaf's pull lands
+// here, so a roomy data dir paired with a small image-store volume is exactly
+// the host the data-dir-only gate used to miss before failing mid-pull with
+// ENOSPC (TODO #31). Low space here is a warning, not a blocking failure: native
+// leafs and already-cached-image leafs still run.
+func checkImageStore(rep *doctorReport, storePath string, availableMB int64, maxDiskGB int) {
+	fullRequiredMB, _ := daemon.DiskGateThresholds(maxDiskGB)
+
+	if availableMB <= 0 {
+		rep.add(docWarn, "image store",
+			fmt.Sprintf("container images are stored at %s, but its free space could not be determined", storePath),
+			"check that the image-store volume is mounted and readable")
+		return
+	}
+	if availableMB >= int64(fullRequiredMB) {
+		rep.add(docOK, "image store",
+			fmt.Sprintf("%d MB free at %s (the engine's image store; a fresh big-image pull needs up to %d MB here)",
+				availableMB, storePath, fullRequiredMB), "")
+		return
+	}
+	rep.add(docWarn, "image store",
+		fmt.Sprintf("%d MB free at %s — below the %d MB allowance a fresh big-image pull can need; the pull would run out of space on this volume even if the data dir has room",
+			availableMB, storePath, fullRequiredMB),
+		"free space on the image-store volume, repoint the engine's storage (Docker data-root / Podman graphroot) to a roomier disk, or enlarge the Podman-machine disk")
 }
 
 func containerRemedy(backend runtime.ContainerBackend) string {

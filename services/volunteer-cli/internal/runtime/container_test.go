@@ -18,6 +18,7 @@ import (
 // MockDockerClient implements DockerClient for testing without a real Docker daemon.
 type MockDockerClient struct {
 	PingFn             func(ctx context.Context) error
+	InfoFn             func(ctx context.Context) (*EngineInfo, error)
 	ImagePullFn        func(ctx context.Context, ref string) error
 	ImageExistsFn      func(ctx context.Context, ref string) (bool, error)
 	ContainerCreateFn  func(ctx context.Context, cfg *ContainerConfig) (string, error)
@@ -40,6 +41,13 @@ func (m *MockDockerClient) Ping(ctx context.Context) error {
 		return m.PingFn(ctx)
 	}
 	return nil
+}
+
+func (m *MockDockerClient) Info(ctx context.Context) (*EngineInfo, error) {
+	if m.InfoFn != nil {
+		return m.InfoFn(ctx)
+	}
+	return &EngineInfo{}, nil
 }
 
 func (m *MockDockerClient) ImagePull(ctx context.Context, ref string) error {

@@ -114,6 +114,16 @@ type Daemon struct {
 	imgCacheChecked time.Time
 	imgCacheResult  bool
 
+	// Image-store path cache (TODO #31): the container backend's image/layer
+	// store filesystem (Docker DockerRootDir / Podman graphroot), which the disk
+	// gate checks in addition to the data dir because the image does not land
+	// under the data dir. Cached for imageCacheCheckTTL to avoid an /info probe on
+	// every fetch-loop iteration.
+	imgStoreMu      sync.Mutex
+	imgStoreChecked time.Time
+	imgStorePath    string
+	imgStoreKnown   bool
+
 	// Disk-gate warning state: surfaces the otherwise-silent "no free disk, so
 	// not fetching" stall as a one-time WARN, reset once the gate clears, so a
 	// volunteer that's idle on disk space says so instead of only at Debug.
@@ -939,31 +949,46 @@ func (d *Daemon) shouldFetch() bool {
 		return true
 	}
 
-	// Full allowance: enough headroom on the data-dir volume to pull a fresh
-	// image and run a unit.
 	fullRequiredMB, cachedHeadroomMB := DiskGateThresholds(d.cfg.ResourceLimits.MaxDiskGB)
-	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, fullRequiredMB); err == nil {
-		d.clearDiskGateWarning()
-		return true
-	}
+	cached := d.hasCachedRunnableImage()
 
-	// Below the full allowance. A repeat run on an already-cached image needs
-	// only workspace headroom, not room to pull the image again. The leaf's
-	// min_disk_mb (which sizes max_disk_gb) bundles the image, so demanding the
-	// whole allowance free forever would block every cached-image rerun.
-	if d.hasCachedRunnableImage() {
-		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedHeadroomMB); err != nil {
-			d.warnDiskGateOnce(cachedHeadroomMB)
+	// Gate 1 — the data-dir volume: holds per-unit work dirs (inputs/outputs) and
+	// checkpoints. The full allowance is needed to pull-and-run; a repeat run on
+	// an already-cached image needs only workspace headroom, not room to pull the
+	// image again (the leaf's min_disk_mb, which sizes max_disk_gb, bundles the
+	// image, so demanding the whole allowance free forever would block every
+	// cached-image rerun).
+	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, fullRequiredMB); err != nil {
+		if !cached {
+			d.warnDiskGateOnce("data dir", d.cfg.DataDir, fullRequiredMB)
 			return false
 		}
-		d.clearDiskGateWarning()
+		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, cachedHeadroomMB); err != nil {
+			d.warnDiskGateOnce("data dir", d.cfg.DataDir, cachedHeadroomMB)
+			return false
+		}
 		d.logger.Debug("shouldFetch: cached image present, requiring workspace headroom only",
 			"required_mb", cachedImageWorkspaceHeadroomMB)
-		return true
 	}
 
-	d.warnDiskGateOnce(fullRequiredMB)
-	return false
+	// Gate 2 — the container image-store volume: the image does NOT live under the
+	// data dir, it lands in the engine's store (Docker DockerRootDir / Podman
+	// graphroot), often a different filesystem. When a fresh pull is required (no
+	// enabled leaf's image is cached), gate that filesystem too — otherwise a
+	// roomy data dir lets the fetch pass and the pull then dies with ENOSPC on a
+	// volume Gate 1 never looked at (TODO #31). A cached image needs no pull, so
+	// the store gate is skipped then.
+	if !cached {
+		if path, ok := d.imageStorePath(); ok {
+			if err := d.limiter.CheckDiskSpace(path, fullRequiredMB); err != nil {
+				d.warnDiskGateOnce("image store", path, fullRequiredMB)
+				return false
+			}
+		}
+	}
+
+	d.clearDiskGateWarning()
+	return true
 }
 
 // workBufferQueueDepth is the hard ceiling on the number of un-run descriptors
@@ -1162,23 +1187,34 @@ func (d *Daemon) avgBufferedSecondsPerUnit() float64 {
 // available space, and the remedies); subsequent blocked polls stay at Debug so
 // the log isn't spammed. clearDiskGateWarning resets it so a later recovery and
 // re-stall warns again.
-func (d *Daemon) warnDiskGateOnce(requiredMB int) {
+func (d *Daemon) warnDiskGateOnce(volume, path string, requiredMB int) {
 	d.diskGateMu.Lock()
 	already := d.diskGateWarned
 	d.diskGateWarned = true
 	d.diskGateMu.Unlock()
 
 	if already {
-		d.logger.Debug("shouldFetch: still disk-gated", "required_mb", requiredMB)
+		d.logger.Debug("shouldFetch: still disk-gated", "volume", volume, "path", path, "required_mb", requiredMB)
 		return
 	}
 
-	availableMB := client.DiskAvailableMB(d.cfg.DataDir)
+	availableMB := client.DiskAvailableMB(path)
 	d.logger.Warn("not fetching work: not enough free disk space — this volunteer stays idle until it clears",
-		"data_dir", d.cfg.DataDir,
+		"volume", volume,
+		"path", path,
 		"required_mb", requiredMB,
 		"available_mb", availableMB,
-		"remedy", "free disk space, lower resource_limits.max_disk_gb, or restart with --data-dir on a roomier volume")
+		"remedy", diskGateRemedy(volume))
+}
+
+// diskGateRemedy returns the remedy text for the short volume — the image store
+// can't be moved from Lettuce's config (the engine owns it), so its advice is to
+// repoint the engine's storage or enlarge the Podman-machine disk (TODO #31).
+func diskGateRemedy(volume string) string {
+	if volume == "image store" {
+		return "free space on the container image-store filesystem, repoint the engine's storage (Docker data-root / Podman graphroot) to a roomier volume, or enlarge the Podman-machine disk"
+	}
+	return "free disk space, lower resource_limits.max_disk_gb, or restart with --data-dir on a roomier volume"
 }
 
 // clearDiskGateWarning re-arms the disk-gate WARN after the gate clears.
@@ -1188,7 +1224,7 @@ func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateWarned = false
 	d.diskGateMu.Unlock()
 	if wasWarned {
-		d.logger.Info("disk space recovered: resuming work fetching", "data_dir", d.cfg.DataDir)
+		d.logger.Info("disk space recovered: resuming work fetching")
 	}
 }
 
@@ -1292,6 +1328,49 @@ func (d *Daemon) checkCachedRunnableImage() bool {
 		}
 	}
 	return false
+}
+
+// imageStorePath returns the filesystem path where the container backend stores
+// images and extracts layers (Docker DockerRootDir / Podman graphroot). ok is
+// false when there is no container runtime, the backend can't be queried, or it
+// reports no path — callers then skip the image-store disk gate rather than
+// block, preserving the pre-#31 behavior for native-only volunteers or an
+// unreachable engine. The result is cached for imageCacheCheckTTL so the fetch
+// gate doesn't issue an /info call on every loop iteration. (TODO #31)
+func (d *Daemon) imageStorePath() (string, bool) {
+	d.imgStoreMu.Lock()
+	if !d.imgStoreChecked.IsZero() && time.Since(d.imgStoreChecked) < imageCacheCheckTTL {
+		path, known := d.imgStorePath, d.imgStoreKnown
+		d.imgStoreMu.Unlock()
+		return path, known
+	}
+	d.imgStoreMu.Unlock()
+
+	path, known := d.probeImageStorePath()
+
+	d.imgStoreMu.Lock()
+	d.imgStoreChecked = time.Now()
+	d.imgStorePath = path
+	d.imgStoreKnown = known
+	d.imgStoreMu.Unlock()
+	return path, known
+}
+
+func (d *Daemon) probeImageStorePath() (string, bool) {
+	if d.runtimeRegistry == nil {
+		return "", false
+	}
+	cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime)
+	if !ok || cr == nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := cr.Client().Info(ctx)
+	if err != nil || info == nil || info.StoragePath == "" {
+		return "", false
+	}
+	return info.StoragePath, true
 }
 
 // allEnabledImageRefs returns the container image references of every enabled

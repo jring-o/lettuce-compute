@@ -44,6 +44,10 @@ func (m *mockDockerClient) Ping(ctx context.Context) error {
 	return nil
 }
 
+func (m *mockDockerClient) Info(ctx context.Context) (*runtime.EngineInfo, error) {
+	return &runtime.EngineInfo{}, nil
+}
+
 func (m *mockDockerClient) ImagePull(ctx context.Context, ref string) error {
 	if m.imagePullFn != nil {
 		return m.imagePullFn(ctx, ref)
