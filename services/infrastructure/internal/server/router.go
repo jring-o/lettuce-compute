@@ -218,14 +218,18 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	}
 
 	bvDeps := &browserVolunteerDeps{
-		pool:                    deps.Pool,
-		volunteerRepo:           volunteerRepo,
-		wuRepo:                  wuRepo,
-		leafRepo:                leafRepo,
-		assignRepo:              assignRepo,
-		resultRepo:              resultRepo,
-		batchRepo:               batchRepo,
-		validationEngine:        deps.ValidationEngine,
+		pool:             deps.Pool,
+		volunteerRepo:    volunteerRepo,
+		wuRepo:           wuRepo,
+		leafRepo:         leafRepo,
+		assignRepo:       assignRepo,
+		resultRepo:       resultRepo,
+		batchRepo:        batchRepo,
+		validationEngine: deps.ValidationEngine,
+		// Route the browser/WASM submit path through the same single transitioner the gRPC
+		// volunteer service uses (TODO #66) so it no longer bypasses it with a raw COMPLETED
+		// write + legacy TryValidate.
+		transitioner:            newTransitioner(deps.Pool, wuRepo, leafRepo, resultRepo, deps.ValidationEngine, deps.Logger),
 		logger:                  deps.Logger,
 		headName:                headName,
 		defaultWeights:          defaultWeights,

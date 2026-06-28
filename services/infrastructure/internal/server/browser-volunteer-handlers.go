@@ -16,6 +16,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -26,14 +27,20 @@ import (
 
 // browserVolunteerDeps holds shared dependencies for browser volunteer REST handlers.
 type browserVolunteerDeps struct {
-	pool                    *pgxpool.Pool
-	volunteerRepo           volunteer.Repository
-	wuRepo                  workunit.WorkUnitRepository
-	leafRepo                leaf.Repository
-	assignRepo              assignment.Repository
-	resultRepo              result.Repository
-	batchRepo               workunit.BatchRepository
-	validationEngine        *validation.Engine
+	pool             *pgxpool.Pool
+	volunteerRepo    volunteer.Repository
+	wuRepo           workunit.WorkUnitRepository
+	leafRepo         leaf.Repository
+	assignRepo       assignment.Repository
+	resultRepo       result.Repository
+	batchRepo        workunit.BatchRepository
+	validationEngine *validation.Engine
+	// transitioner is the SINGLE owner of the work-unit redundancy decision (TODO #50/#66):
+	// the browser/WASM submit path routes through it (validate / reject / wait / dead-letter /
+	// supersede) exactly like the gRPC SubmitResult path, instead of writing COMPLETED via raw
+	// SQL + calling the legacy validationEngine.TryValidate. May be nil (tests without an
+	// engine), in which case the submit still records the result and the decision is deferred.
+	transitioner            *transition.Transitioner
 	logger                  *slog.Logger
 	headName                string
 	defaultWeights          map[string]int32
@@ -623,37 +630,23 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			return
 		}
 
-		// Determine effective redundancy from the leaf's validation config.
-		// For spot-check WUs, always require at least 2 results.
-		effectiveRedundancy := 1
+		// The COMPLETED threshold is the unit's effective QUORUM (TODO #50) — how many results
+		// are needed to attempt validation — resolved through the single source (ResolvePolicy);
+		// for any leaf that only sets redundancy_factor this equals redundancy_factor (2 for a
+		// spot-check unit), identical to before. It is used here ONLY to drive the batch-completed
+		// counter; the actual validate / reject / wait / dead-letter / supersede decision — and
+		// the COMPLETED state write itself — is delegated to the transitioner after commit.
+		quorum := 1
 		completionLeaf, clErr := deps.leafRepo.GetByID(r.Context(), currentWU.LeafID)
 		if clErr == nil {
-			effectiveRedundancy = completionLeaf.ValidationConfig.RedundancyFactor
+			quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
 		}
-		if currentWU.SpotCheck && effectiveRedundancy < 2 {
-			effectiveRedundancy = 2
-		}
+		quorumMet := existingCount+1 >= quorum
 
-		if existingCount+1 >= effectiveRedundancy {
-			// Redundancy met: mark COMPLETED (the unit was QUEUED while its copies ran
-			// in parallel; ASSIGNED/RUNNING tolerated only for legacy in-flight units).
-			_, err := tx.Exec(r.Context(), `
-				UPDATE work_units SET
-					state = 'COMPLETED',
-					started_at = COALESCE(started_at, NOW()),
-					completed_at = NOW()
-				WHERE id = $1 AND state IN ('QUEUED', 'ASSIGNED', 'RUNNING')`,
-				workUnitID,
-			)
-			if err != nil {
-				deps.logger.Error("failed to transition work unit", "error", err)
-				apierror.WriteError(w, apierror.Internal("internal server error", err))
-				return
-			}
-		}
-		// Redundancy not yet met: no unit-state change — this volunteer's copy is closed
-		// and its PENDING result holds a slot; the unit stays QUEUED so its remaining
-		// parallel copies continue (no requeue-on-partial).
+		// No raw work_units.state write here (TODO #66): the transitioner is the SOLE owner of
+		// work-unit state transitions. This volunteer's copy is closed (UpdateOutcome above) and
+		// its PENDING result holds a redundancy slot; the unit stays QUEUED until the transitioner
+		// (called after commit) marks it COMPLETED and validates/rejects/supersedes.
 
 		if err := tx.Commit(r.Context()); err != nil {
 			deps.logger.Error("failed to commit result", "error", err)
@@ -664,17 +657,23 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		// Best-effort post-commit work.
 		_ = deps.volunteerRepo.UpdateLastSeen(r.Context(), vol.ID)
 
-		if existingCount+1 >= effectiveRedundancy && deps.batchRepo != nil {
+		if quorumMet && deps.batchRepo != nil {
 			// Reuse currentWU from the transaction — no need for a second DB fetch.
 			if currentWU.BatchID != nil {
 				_ = deps.batchRepo.IncrementCompleted(r.Context(), *currentWU.BatchID)
 			}
 		}
 
-		if deps.validationEngine != nil {
-			if _, valErr := deps.validationEngine.TryValidate(r.Context(), workUnitID); valErr != nil {
-				deps.logger.Error("validation failed after result submission",
-					"work_unit_id", workUnitID, "error", valErr)
+		// Delegate the redundancy decision to the SINGLE transitioner (TODO #50/#66): it loads
+		// the unit + copies + results + resolved policy, runs the pure Decide, and applies the
+		// one outcome (validate-at-quorum / reject / wait / dead-letter) — including marking the
+		// unit COMPLETED and superseding any over-dispatch extras — under a per-unit lock. This
+		// is the SAME path the gRPC SubmitResult uses; it replaces the inline COMPLETED write +
+		// legacy TryValidate call so the browser/WASM path no longer bypasses the transitioner.
+		if deps.transitioner != nil {
+			if _, tErr := deps.transitioner.Evaluate(r.Context(), workUnitID); tErr != nil {
+				deps.logger.Error("transition evaluation failed after result submission",
+					"work_unit_id", workUnitID, "error", tErr)
 			}
 		}
 
@@ -690,14 +689,18 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 // This is used by E2E tests that build their own mux rather than going through NewRouter.
 func RegisterBrowserVolunteerRoutes(mux *http.ServeMux, pool *pgxpool.Pool, volunteerRepo volunteer.Repository, wuRepo workunit.WorkUnitRepository, leafRepo leaf.Repository, assignRepo assignment.Repository, resultRepo result.Repository, batchRepo workunit.BatchRepository, validationEngine *validation.Engine, logger *slog.Logger, maxInflight int) {
 	deps := &browserVolunteerDeps{
-		pool:                    pool,
-		volunteerRepo:           volunteerRepo,
-		wuRepo:                  wuRepo,
-		leafRepo:                leafRepo,
-		assignRepo:              assignRepo,
-		resultRepo:              resultRepo,
-		batchRepo:               batchRepo,
-		validationEngine:        validationEngine,
+		pool:             pool,
+		volunteerRepo:    volunteerRepo,
+		wuRepo:           wuRepo,
+		leafRepo:         leafRepo,
+		assignRepo:       assignRepo,
+		resultRepo:       resultRepo,
+		batchRepo:        batchRepo,
+		validationEngine: validationEngine,
+		// Build the same single transitioner the gRPC volunteer service uses so the browser/WASM
+		// submit path routes its redundancy decision through it (TODO #66). Built from the params
+		// already passed here, so this signature is unchanged.
+		transitioner:            newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, logger),
 		logger:                  logger,
 		maxInflightPerVolunteer: maxInflight,
 	}
