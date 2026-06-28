@@ -327,6 +327,9 @@ lettuce-volunteer schedule set --from 20:00 --to 06:00
 # Weeknights only.
 lettuce-volunteer schedule set --from 19:00 --to 07:00 --days mon-fri
 
+# Layer a SECOND window on top (e.g. weeknights overnight, plus all day on weekends).
+lettuce-volunteer schedule add --from 00:00 --to 00:00 --days sat,sun
+
 # See the current schedule, or go back to running always.
 lettuce-volunteer schedule show
 lettuce-volunteer schedule clear
@@ -334,8 +337,12 @@ lettuce-volunteer schedule clear
 
 `--days` accepts single days and ranges (`mon-fri`, `sat,sun`, `mon,wed,fri`,
 `mon-sun`). Windows are **whole-hour** and **may wrap past midnight**, so
-`--from 20:00 --to 06:00` is one continuous overnight window. Pairs nicely with
-thermal protection above: schedule the heavy hours for when it's coolest.
+`--from 20:00 --to 06:00` is one continuous overnight window. `schedule set`
+**replaces** the schedule with one window; `schedule add` **appends** another, so
+you can run different hours on different days (the volunteer runs whenever the
+current time falls in *any* window; `--from` equal to `--to` means all 24 hours).
+Pairs nicely with thermal protection above: schedule the heavy hours for when
+it's coolest.
 
 > **Restart the daemon after changing the schedule.** Like the rest of the
 > config, the schedule is read at startup, not hot-reloaded:

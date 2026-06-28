@@ -145,6 +145,15 @@ of one work unit always run the same version (homogeneous redundancy).
 - **Container leaves must be immutable:** publishing **rejects a `:latest` image** —
   pin a digest (`repo@sha256:…`) or an immutable tag (`:2.0`). A re-pushed `:latest` is
   never re-pulled by volunteers, the exact bug this versioning fixes.
+- **Don't garbage-collect a published image's blobs while units still reference it.**
+  Work units are pinned to the artifact version that was current when they were
+  generated. If you push a new image and a registry GC removes the **old version's
+  blobs**, its manifest may still resolve (200) while its layers 404 — volunteers
+  pinned to it can no longer pull, and the failure can surface only as a confusing
+  `container create: no such image` at run time. If you intend the old image to go
+  away, first move the affected QUEUED units onto the new version (regenerate them, or
+  re-point them and restart the head); otherwise keep the old blobs (disable registry
+  blob GC / `retention=all`). This bit a live head on 2026-06-27.
 
 ---
 
