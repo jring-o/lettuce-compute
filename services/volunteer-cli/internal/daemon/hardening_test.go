@@ -40,15 +40,40 @@ func (l *thresholdLimiter) CheckDiskSpace(_ string, requiredMB int) error {
 	return nil
 }
 
-// fakeDocker implements runtime.DockerClient but only answers ImageExists; any
-// other call panics (none should happen in these tests).
+// fakeDocker implements runtime.DockerClient but only answers ImageExists and
+// Info; any other call panics (none should happen in these tests).
 type fakeDocker struct {
 	runtime.DockerClient
-	exists bool
+	exists    bool
+	storePath string // image-store path reported by Info (TODO #31)
 }
 
 func (f *fakeDocker) ImageExists(_ context.Context, _ string) (bool, error) {
 	return f.exists, nil
+}
+
+func (f *fakeDocker) Info(_ context.Context) (*runtime.EngineInfo, error) {
+	return &runtime.EngineInfo{StoragePath: f.storePath}, nil
+}
+
+// pathLimiter reports per-path free space (MB) so a test can model a roomy data
+// dir on one filesystem and a small image store on another. A path not in the
+// map is treated as effectively unlimited.
+type pathLimiter struct{ availMB map[string]int }
+
+func (l *pathLimiter) Apply(_ *exec.Cmd, _ *config.ResourceLimits) error { return nil }
+func (l *pathLimiter) Enforce(_ int, _ *config.ResourceLimits) (func(), error) {
+	return func() {}, nil
+}
+func (l *pathLimiter) CheckDiskSpace(path string, requiredMB int) error {
+	avail, ok := l.availMB[path]
+	if !ok {
+		return nil // unmodeled path → ample
+	}
+	if requiredMB > avail {
+		return fmt.Errorf("insufficient on %s: need %d, have %d", path, requiredMB, avail)
+	}
+	return nil
 }
 
 // --- Item 5: disk gate accounts for the cached image ---
@@ -102,6 +127,97 @@ func TestShouldFetch_NoCachedImageRequiresFullAllowance(t *testing.T) {
 
 	if d.shouldFetch() {
 		t.Fatal("shouldFetch = true, want false (no cached image, below full allowance)")
+	}
+}
+
+// --- TODO #31: disk gate must check the container image-store filesystem ---
+
+// seedContainerLeaf registers a container runtime backed by dc and seeds the leaf
+// cache with one leaf that uses image, so the daemon knows it would pull that
+// image. Returns nothing; mutates d.
+func seedContainerLeaf(t *testing.T, d *Daemon, mc *mockClient, dc runtime.DockerClient, image string) {
+	t.Helper()
+	d.runtimeRegistry.Register(runtime.NewContainerRuntimeWithClient(t.TempDir(), quietLogger(), dc))
+	mc.getHeadInfoFn = func(_ context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
+		return &lettucev1.GetHeadInfoResponse{
+			Leafs: []*lettucev1.LeafInfo{{
+				Id:            "leaf-1",
+				Slug:          "big-image-leaf",
+				State:         "ACTIVE",
+				ExecutionSpec: &lettucev1.ExecutionSpec{Image: image},
+			}},
+		}, nil
+	}
+	if err := d.leafCache.Refresh(context.Background(), "default", mc); err != nil {
+		t.Fatalf("seed leaf cache: %v", err)
+	}
+}
+
+// TestShouldFetch_GatesImageStoreFilesystem reproduces TODO #31: the big image a
+// container leaf pulls lands in the engine's image store (Docker DockerRootDir /
+// Podman graphroot), NOT under the lettuce data dir. On a host with a roomy
+// data-dir volume but a small image-store volume, the old gate checked only the
+// data dir, passed, and the pull then died with ENOSPC on a filesystem it never
+// looked at. The gate must also reject when the image-store volume can't hold the
+// pull. (No cached image here, so a fresh pull is required.)
+func TestShouldFetch_GatesImageStoreFilesystem(t *testing.T) {
+	const dataDir = "/data"
+	const storePath = "/var/lib/containers/storage"
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	mc := &mockClient{}
+	// Data dir is roomy (200 GB) but the image store is on a small volume (20 GB),
+	// below the 100 GB allowance a fresh big-image pull needs.
+	lim := &pathLimiter{availMB: map[string]int{dataDir: 200 * 1024, storePath: 20 * 1024}}
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, lim, scheduler)
+	d.cfg.DataDir = dataDir
+	d.cfg.ResourceLimits.MaxDiskGB = 100
+
+	seedContainerLeaf(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1")
+
+	if d.shouldFetch() {
+		t.Fatal("shouldFetch = true, want false — the image-store volume is too small to pull the image (TODO #31)")
+	}
+}
+
+// TestShouldFetch_ImageStoreAmpleStillFetches guards against over-blocking: when
+// the image-store volume has room, a roomy data dir + ample store must still
+// fetch.
+func TestShouldFetch_ImageStoreAmpleStillFetches(t *testing.T) {
+	const dataDir = "/data"
+	const storePath = "/var/lib/containers/storage"
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	mc := &mockClient{}
+	lim := &pathLimiter{availMB: map[string]int{dataDir: 200 * 1024, storePath: 200 * 1024}}
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, lim, scheduler)
+	d.cfg.DataDir = dataDir
+	d.cfg.ResourceLimits.MaxDiskGB = 100
+
+	seedContainerLeaf(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1")
+
+	if !d.shouldFetch() {
+		t.Fatal("shouldFetch = false, want true — both the data dir and image store have ample space")
+	}
+}
+
+// TestShouldFetch_CachedImageSkipsImageStoreGate confirms the image-store gate is
+// skipped when an enabled leaf's image is already cached: no pull happens, so a
+// tight image-store volume must not block a cached-image rerun.
+func TestShouldFetch_CachedImageSkipsImageStoreGate(t *testing.T) {
+	const dataDir = "/data"
+	const storePath = "/var/lib/containers/storage"
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	mc := &mockClient{}
+	// Data dir has the 10 GB workspace headroom but not the 100 GB full allowance;
+	// the image store is tight (1 GB). With the image cached, fetch still proceeds.
+	lim := &pathLimiter{availMB: map[string]int{dataDir: 50 * 1024, storePath: 1 * 1024}}
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, lim, scheduler)
+	d.cfg.DataDir = dataDir
+	d.cfg.ResourceLimits.MaxDiskGB = 100
+
+	seedContainerLeaf(t, d, mc, &fakeDocker{exists: true, storePath: storePath}, "ghcr.io/example/big:1")
+
+	if !d.shouldFetch() {
+		t.Fatal("shouldFetch = false, want true — image is cached, so the image-store volume should not gate a rerun")
 	}
 }
 

@@ -206,6 +206,43 @@ func TestCheckDisk_MatchesFetchGate(t *testing.T) {
 	}
 }
 
+// TestCheckImageStore_FlagsShortVolume covers the TODO #31 doctor surface: the
+// image-store filesystem (engine DockerRootDir / Podman graphroot) is reported
+// separately from the data dir, and a volume too small to pull a big image is a
+// warning (native + cached-image leafs still run), not a hard failure.
+func TestCheckImageStore_FlagsShortVolume(t *testing.T) {
+	const storePath = "/var/lib/containers/storage"
+	cases := []struct {
+		name        string
+		availableMB int64
+		maxDiskGB   int
+		wantFails   int
+		wantWarns   int
+	}{
+		// Ample: at/above the full pull allowance → OK.
+		{name: "ample", availableMB: 120 * 1024, maxDiskGB: 100, wantFails: 0, wantWarns: 0},
+		// Short: data dir may be roomy, but the image store can't hold the pull →
+		// warn (not fail).
+		{name: "short", availableMB: 20 * 1024, maxDiskGB: 100, wantFails: 0, wantWarns: 1},
+		// Probe failed (non-positive reading) → warn, not a confident pass.
+		{name: "unreadable", availableMB: 0, maxDiskGB: 100, wantFails: 0, wantWarns: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			rep := &doctorReport{w: &buf}
+			checkImageStore(rep, storePath, tc.availableMB, tc.maxDiskGB)
+			if rep.fails != tc.wantFails || rep.warns != tc.wantWarns {
+				t.Errorf("checkImageStore(avail=%d, maxGB=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
+					tc.availableMB, tc.maxDiskGB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
+			}
+			if !strings.Contains(buf.String(), storePath) {
+				t.Errorf("report should name the image-store path %q; got:\n%s", storePath, buf.String())
+			}
+		})
+	}
+}
+
 func TestDoctorReport_CountsLevels(t *testing.T) {
 	var buf bytes.Buffer
 	rep := &doctorReport{w: &buf}

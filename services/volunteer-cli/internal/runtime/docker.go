@@ -14,9 +14,25 @@ import (
 	"github.com/docker/docker/client"
 )
 
+// EngineInfo carries the bits of the container backend's daemon info the
+// volunteer needs to gate disk space correctly. StoragePath is the filesystem
+// path where the engine stores images and extracts layers — Docker's
+// DockerRootDir (e.g. /var/lib/docker), which Podman's Docker-compatible /info
+// also reports (its graphroot, e.g. ~/.local/share/containers/storage or
+// /var/lib/containers/storage). The image does NOT live under the lettuce data
+// dir, so a disk gate that only checked the data dir would pass on a host with a
+// roomy data-dir volume but a small image-store volume — and the pull would then
+// die with ENOSPC on a filesystem the gate never looked at (TODO #31).
+type EngineInfo struct {
+	StoragePath string
+}
+
 // DockerClient abstracts the Docker Engine API operations needed by ContainerRuntime.
 type DockerClient interface {
 	Ping(ctx context.Context) error
+	// Info reports the backend's daemon info, including where it stores images
+	// (so the disk gate can check free space on the right filesystem).
+	Info(ctx context.Context) (*EngineInfo, error)
 	ImagePull(ctx context.Context, ref string) error
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	// ImageID resolves a reference to its content image ID, or "" if not present.
@@ -125,6 +141,14 @@ func (d *dockerClientWrapper) Ping(ctx context.Context) error {
 		return fmt.Errorf("docker ping: %w", err)
 	}
 	return nil
+}
+
+func (d *dockerClientWrapper) Info(ctx context.Context) (*EngineInfo, error) {
+	info, err := d.cli.Info(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("docker info: %w", err)
+	}
+	return &EngineInfo{StoragePath: info.DockerRootDir}, nil
 }
 
 func (d *dockerClientWrapper) ImagePull(ctx context.Context, ref string) error {
