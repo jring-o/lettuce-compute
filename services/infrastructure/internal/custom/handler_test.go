@@ -66,7 +66,16 @@ func (m *mockWURepo) UpdateState(ctx context.Context, id types.ID, from, to work
 }
 func (m *mockWURepo) BulkCreate(ctx context.Context, wus []*workunit.WorkUnit) error {
 	m.bulkCreated = wus
-	return m.bulkCreateErr
+	if m.bulkCreateErr != nil {
+		return m.bulkCreateErr
+	}
+	// Mirror the real repo: a successful BulkCreate stamps an ID onto every work unit.
+	for _, wu := range wus {
+		if wu.ID == types.NilID() {
+			wu.ID = types.NewID()
+		}
+	}
+	return nil
 }
 func (m *mockWURepo) BulkTransitionByBatch(ctx context.Context, batchID types.ID, from, to workunit.WorkUnitState) (int64, error) {
 	if m.transitionErr != nil {
@@ -446,6 +455,73 @@ func TestHandleBulkUpload(t *testing.T) {
 				tt.checkCreated(t, wuRepo.bulkCreated)
 			}
 		})
+	}
+}
+
+// TestHandleBulkUpload_ReturnsWorkUnitIDs is the regression for ROADMAP #3: the
+// bulk-upload response must echo the IDs of the created work units (work_unit_ids),
+// in the order they were submitted, so a caller can address / poll them. Before the
+// fix the response carried only batch_ids + a count.
+func TestHandleBulkUpload_ReturnsWorkUnitIDs(t *testing.T) {
+	proj := makeCustomProject()
+	wuRepo := &mockWURepo{transitionRows: 3}
+	batchRepo := &mockBatchRepo{}
+	leafRepo := &mockLeafRepo{proj: proj}
+	handler := NewBulkUploadHandler(wuRepo, batchRepo, leafRepo, slog.Default())
+
+	body := BulkUploadRequest{
+		WorkUnits: []WorkUnitInput{
+			{Parameters: json.RawMessage(`{"i":0}`)},
+			{Parameters: json.RawMessage(`{"i":1}`)},
+			{Parameters: json.RawMessage(`{"i":2}`)},
+		},
+	}
+	req := makeBulkRequest(t, body)
+	req = setPathValue(req, "leaf_id", proj.ID.String())
+
+	rr := httptest.NewRecorder()
+	handler.HandleBulkUpload(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d; body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		BatchIDs         []string `json:"batch_ids"`
+		WorkUnitIDs      []string `json:"work_unit_ids"`
+		WorkUnitsCreated int      `json:"work_units_created"`
+		Status           string   `json:"status"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v; body: %s", err, rr.Body.String())
+	}
+
+	if len(resp.WorkUnitIDs) != 3 {
+		t.Fatalf("expected 3 work_unit_ids, got %d; body: %s", len(resp.WorkUnitIDs), rr.Body.String())
+	}
+
+	// IDs must be non-empty, valid UUIDs, unique, and match the persisted units in order.
+	seen := make(map[string]bool, 3)
+	for i, idStr := range resp.WorkUnitIDs {
+		if idStr == "" {
+			t.Errorf("work_unit_ids[%d] is empty", i)
+			continue
+		}
+		id, err := types.ParseID(idStr)
+		if err != nil {
+			t.Errorf("work_unit_ids[%d] = %q is not a valid UUID: %v", i, idStr, err)
+			continue
+		}
+		if id == types.NilID() {
+			t.Errorf("work_unit_ids[%d] is the nil UUID", i)
+		}
+		if seen[idStr] {
+			t.Errorf("work_unit_ids[%d] = %q is a duplicate", i, idStr)
+		}
+		seen[idStr] = true
+		if got := wuRepo.bulkCreated[i].ID.String(); got != idStr {
+			t.Errorf("work_unit_ids[%d] = %q, want %q (must match created unit in order)", i, idStr, got)
+		}
 	}
 }
 
