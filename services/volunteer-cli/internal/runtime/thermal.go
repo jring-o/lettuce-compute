@@ -109,10 +109,7 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 						"gpu_temp", gpuTemp,
 						"gpu_threshold", t.config.GPUPauseThresholdC,
 					)
-					select {
-					case t.pauseCh <- true:
-					default:
-					}
+					t.signal(ctx, true)
 				}
 			} else {
 				cpuOK := cpuTemp == 0 || cpuTemp < t.config.CPUResumeThresholdC
@@ -124,13 +121,28 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 						"cpu_temp", cpuTemp,
 						"gpu_temp", gpuTemp,
 					)
-					select {
-					case t.pauseCh <- false:
-					default:
-					}
+					t.signal(ctx, false)
 				}
 			}
 		}
+	}
+}
+
+// signal delivers a throttle transition (true = pause, false = resume) to the
+// daemon, blocking until the daemon receives it or the monitor is shutting down
+// (ctx cancelled / Stop called). The send MUST block rather than drop: the
+// caller flips the throttled state on the transition and only signals once per
+// transition, so a dropped signal is never retried — a lost pause leaves work
+// running hot with thermal protection silently disengaged, and a lost resume
+// leaves the daemon paused indefinitely (#61). This mirrors the resource
+// monitor's ctx-guarded blocking send (see resource.Monitor.Run); the daemon's
+// thermalPauseCh is size-1, so a transient full buffer only delays delivery
+// until the daemon drains it.
+func (t *ThermalMonitor) signal(ctx context.Context, pause bool) {
+	select {
+	case t.pauseCh <- pause:
+	case <-ctx.Done():
+	case <-t.stopCh:
 	}
 }
 
