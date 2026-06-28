@@ -57,9 +57,12 @@ func TestHealthHandler_DegradedWithNilPool(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	// With nil pool, expect degraded
+	// With nil pool, expect degraded + disconnected.
 	if resp.Status != "degraded" {
 		t.Errorf("expected status 'degraded' with nil pool, got '%s'", resp.Status)
+	}
+	if resp.Database != "disconnected" {
+		t.Errorf("expected database 'disconnected' with nil pool, got '%s'", resp.Database)
 	}
 }
 
@@ -81,14 +84,17 @@ func TestHealthHandler_ResponseShape(t *testing.T) {
 		t.Fatalf("failed to decode JSON: %v", err)
 	}
 
-	// Public endpoint should only expose "status" — no uptime or database fields.
-	if _, ok := raw["status"]; !ok {
-		t.Error("missing required field: status")
-	}
-	for _, key := range []string{"uptime_seconds", "database"} {
-		if _, ok := raw[key]; ok {
-			t.Errorf("public health response must not expose %q", key)
+	// Public endpoint exposes "status" and "database" (the documented operator
+	// contract in guides/head-setup.md); "database" is already implied by
+	// "status" so it leaks nothing new. Uptime and other internal detail not
+	// derivable from "status" stay behind auth on /health/detailed.
+	for _, key := range []string{"status", "database"} {
+		if _, ok := raw[key]; !ok {
+			t.Errorf("missing required field: %q", key)
 		}
+	}
+	if _, ok := raw["uptime_seconds"]; ok {
+		t.Error(`public health response must not expose "uptime_seconds"`)
 	}
 }
 

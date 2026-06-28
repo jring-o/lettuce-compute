@@ -23,7 +23,8 @@ func checkDBHealth(ctx context.Context, pool *pgxpool.Pool) (status, dbStatus st
 }
 
 type healthResponse struct {
-	Status string `json:"status"`
+	Status   string `json:"status"`
+	Database string `json:"database"`
 }
 
 type healthDetailedResponse struct {
@@ -33,12 +34,16 @@ type healthDetailedResponse struct {
 }
 
 // HealthHandler handles GET /api/v1/health (public, no auth).
-// Returns only {"status":"ok"} to unauthenticated callers.
+// Returns {"status":...,"database":...}. This is the operator-facing liveness
+// contract documented in guides/head-setup.md. Exposing "database" discloses
+// nothing beyond "status", which already encodes pool connectivity ("degraded"
+// is returned iff the database is unreachable). Internal detail that is NOT
+// derivable from "status" — e.g. uptime — stays behind auth on /health/detailed.
 func HealthHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		status, _ := checkDBHealth(r.Context(), pool)
+		status, dbStatus := checkDBHealth(r.Context(), pool)
 
-		resp := healthResponse{Status: status}
+		resp := healthResponse{Status: status, Database: dbStatus}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
