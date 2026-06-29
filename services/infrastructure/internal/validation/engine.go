@@ -157,8 +157,9 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 //
 // These expose the comparator and the accept/reject EFFECTS to internal/transition, which owns
 // the decision (when to validate / reject / wait / dead-letter). The engine no longer decides
-// the outcome on its own — TryValidate remains only for legacy/test callers; the live
-// SubmitResult / fault-monitor paths route through the transitioner.
+// the outcome on its own — TryValidate remains only for legacy/test callers; every live submit
+// path routes through the transitioner: the gRPC SubmitResult, the browser/WASM REST submit
+// (handleBrowserSubmitResult, TODO #66), and the fault monitor's post-copy-close re-evaluation.
 
 // FilterPending returns the version-homogeneous subset of pending results (never compare across
 // artifact versions). The transitioner calls this before counting + comparing so its quorum

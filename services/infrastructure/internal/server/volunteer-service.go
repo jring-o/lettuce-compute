@@ -45,15 +45,15 @@ type volunteerService struct {
 	// refresher reads measured-reliability scores from it off the hot path. Constructed from
 	// the pool, so it is nil only in gRPC-plumbing unit tests with a nil pool (the budget
 	// refresher is then a no-op and the flat in-flight cap applies).
-	reliabilityRepo         reliability.Repository
-	wuRepo                  workunit.WorkUnitRepository
-	leafRepo                leaf.Repository
-	artifactVersionRepo     leaf.ArtifactVersionRepository
-	assignRepo              assignment.Repository
-	resultRepo              result.Repository
-	batchRepo               workunit.BatchRepository
-	checkpointRepo          checkpoint.Repository
-	validationEngine        *validation.Engine
+	reliabilityRepo     reliability.Repository
+	wuRepo              workunit.WorkUnitRepository
+	leafRepo            leaf.Repository
+	artifactVersionRepo leaf.ArtifactVersionRepository
+	assignRepo          assignment.Repository
+	resultRepo          result.Repository
+	batchRepo           workunit.BatchRepository
+	checkpointRepo      checkpoint.Repository
+	validationEngine    *validation.Engine
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
 	// SubmitResult delegates the validate/reject/wait/dead-letter decision to it. Built in
 	// the constructor from the validation engine + repos; nil only when validationEngine is
@@ -163,18 +163,29 @@ func NewVolunteerService(
 	s.loadEstimator = newLoadEstimator(defaultLoadEstimatorConfig(), poolSaturation(pool))
 
 	// Wire the single transitioner (TODO #50). It owns the redundancy decision; the
-	// validation engine is its comparator + accept/reject implementation. Built only when an
-	// engine is present (the gRPC-plumbing tests pass nil and skip evaluation). The lock is
-	// the cross-replica per-unit advisory lock when a pool is available, else a no-op (the
-	// optimistic state guards remain the correctness backstop either way).
-	if validationEngine != nil {
-		var locker transition.Locker = transition.NoopLocker{}
-		if pool != nil {
-			locker = transition.NewPgxLocker(pool, logger)
-		}
-		s.transitioner = transition.NewTransitioner(locker, wuRepo, leafRepo, resultRepo, validationEngine, logger)
-	}
+	// validation engine is its comparator + accept/reject implementation. nil when no engine
+	// is present (the gRPC-plumbing tests pass nil and skip evaluation).
+	s.transitioner = newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, logger)
 	return s
+}
+
+// newTransitioner wires the single redundancy transitioner (TODO #50) over the given repos +
+// comparator. The transitioner is the SOLE owner of work-unit state transitions, so EVERY live
+// submit path builds one and routes its redundancy decision through it: the gRPC volunteer
+// service (above) and the browser/WASM REST submit path (handleBrowserSubmitResult) — TODO #66.
+// Returns nil when validationEngine is nil (the gRPC-plumbing unit tests that skip evaluation).
+// The per-unit lock is the cross-replica Postgres advisory lock when a pool is available, else a
+// no-op; the optimistic state guards + unique constraints remain the correctness backstop either
+// way, so two transitioner instances over the same pool still serialize per unit via the DB lock.
+func newTransitioner(pool *pgxpool.Pool, wuRepo workunit.WorkUnitRepository, leafRepo leaf.Repository, resultRepo result.Repository, validationEngine *validation.Engine, logger *slog.Logger) *transition.Transitioner {
+	if validationEngine == nil {
+		return nil
+	}
+	var locker transition.Locker = transition.NoopLocker{}
+	if pool != nil {
+		locker = transition.NewPgxLocker(pool, logger)
+	}
+	return transition.NewTransitioner(locker, wuRepo, leafRepo, resultRepo, validationEngine, logger)
 }
 
 // HeadDispatchConfig carries the Layer-1 dispatch tunables (work batching,
