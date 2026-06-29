@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -15,16 +18,37 @@ import (
 )
 
 // EngineInfo carries the bits of the container backend's daemon info the
-// volunteer needs to gate disk space correctly. StoragePath is the filesystem
-// path where the engine stores images and extracts layers — Docker's
+// volunteer needs to gate disk space correctly.
+//
+// StoragePath is the engine's primary reported data-root — Docker's
 // DockerRootDir (e.g. /var/lib/docker), which Podman's Docker-compatible /info
 // also reports (its graphroot, e.g. ~/.local/share/containers/storage or
 // /var/lib/containers/storage). The image does NOT live under the lettuce data
 // dir, so a disk gate that only checked the data dir would pass on a host with a
 // roomy data-dir volume but a small image-store volume — and the pull would then
 // die with ENOSPC on a filesystem the gate never looked at (TODO #31).
+//
+// CAVEAT — the Docker containerd snapshotter: when Docker uses the containerd
+// image store (default on fresh Docker 29; `docker info` shows
+// `driver-type: io.containerd.snapshotter.v1`), the image content store AND the
+// extracted overlayfs snapshots live under the containerd root (e.g.
+// /var/lib/containerd), NOT under DockerRootDir — confirmed in the field, where
+// /var/lib/docker held ~1 MB while /var/lib/containerd held the multi-GB blobs +
+// snapshots. DockerRootDir alone is therefore the wrong filesystem to gate on.
+// ImageStorePaths captures every filesystem the engine may actually write image
+// data to (always StoragePath, plus the containerd root under the snapshotter);
+// the disk gate checks them all so it never under-protects.
 type EngineInfo struct {
 	StoragePath string
+	// ImageStorePaths is the set of filesystem paths the disk gate should check
+	// for pull headroom. It always includes StoragePath and, under the Docker
+	// containerd snapshotter, the containerd content root. Only paths that exist
+	// on disk are included, so a wrong default guess degrades to the prior
+	// DockerRootDir-only behavior rather than falsely blocking the gate.
+	ImageStorePaths []string
+	// Snapshotter is true when the engine reports the containerd snapshotter image
+	// store, where StoragePath (DockerRootDir) is not the image-store filesystem.
+	Snapshotter bool
 }
 
 // DockerClient abstracts the Docker Engine API operations needed by ContainerRuntime.
@@ -148,7 +172,78 @@ func (d *dockerClientWrapper) Info(ctx context.Context) (*EngineInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker info: %w", err)
 	}
-	return &EngineInfo{StoragePath: info.DockerRootDir}, nil
+	return buildEngineInfo(info.DockerRootDir, info.DriverStatus), nil
+}
+
+// pathExistsFunc reports whether a filesystem path exists. A package-level seam
+// so buildEngineInfo's candidate-path probing can be unit-tested without
+// touching the real filesystem.
+var pathExistsFunc = func(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// buildEngineInfo assembles an EngineInfo from the engine's reported data-root
+// and storage-driver status. It is split out from Info so the image-store path
+// resolution — including the Docker containerd-snapshotter special case — is
+// testable without a live daemon.
+//
+// Under the containerd snapshotter the image content store and snapshots do NOT
+// live under DockerRootDir; the daemon reports `driver-type:
+// io.containerd.snapshotter.v1` in DriverStatus but exposes no path for the
+// containerd root. We therefore probe the known defaults — the system containerd
+// root (/var/lib/containerd) and the daemon's bundled <data-root>/containerd —
+// and include whichever exist, so the disk gate checks the filesystem the blobs
+// actually land on. Including only existing paths means a wrong guess degrades
+// to the prior DockerRootDir-only behavior rather than falsely blocking.
+func buildEngineInfo(dockerRootDir string, driverStatus [][2]string) *EngineInfo {
+	ei := &EngineInfo{StoragePath: dockerRootDir}
+	seen := make(map[string]bool)
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		ei.ImageStorePaths = append(ei.ImageStorePaths, p)
+	}
+	add(dockerRootDir)
+	if usesContainerdSnapshotter(driverStatus) {
+		ei.Snapshotter = true
+		for _, cand := range containerdRootCandidates(dockerRootDir) {
+			if pathExistsFunc(cand) {
+				add(cand)
+			}
+		}
+	}
+	return ei
+}
+
+// usesContainerdSnapshotter reports whether the engine's storage-driver status
+// indicates the containerd snapshotter image store (Docker `docker info` shows
+// `driver-type: io.containerd.snapshotter.v1`). Matched on the substring so a
+// future driver-type spelling still trips it.
+func usesContainerdSnapshotter(driverStatus [][2]string) bool {
+	for _, kv := range driverStatus {
+		for _, field := range kv {
+			if strings.Contains(field, "containerd.snapshotter") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// containerdRootCandidates returns the default filesystem locations the
+// containerd image store may use, most-common first: the system containerd root
+// and the Docker daemon's bundled containerd root under its data-root. A
+// non-default `root` set in /etc/containerd/config.toml is not discoverable via
+// the Docker API and is not covered.
+func containerdRootCandidates(dockerRootDir string) []string {
+	cands := []string{"/var/lib/containerd"}
+	if dockerRootDir != "" {
+		cands = append(cands, filepath.Join(dockerRootDir, "containerd"))
+	}
+	return cands
 }
 
 func (d *dockerClientWrapper) ImagePull(ctx context.Context, ref string) error {

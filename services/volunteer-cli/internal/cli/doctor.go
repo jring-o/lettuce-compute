@@ -304,13 +304,49 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 	// pulled into the engine's store (Docker DockerRootDir / Podman graphroot),
 	// NOT under the lettuce data dir, so a roomy data dir can hide a too-small
 	// image-store volume. Surface where it lands and whether it has pull headroom.
-	if einfo, ierr := cr.Client().Info(ctx); ierr == nil && einfo != nil && einfo.StoragePath != "" {
-		checkImageStore(rep, einfo.StoragePath, client.DiskAvailableMB(einfo.StoragePath), cfg.ResourceLimits.MaxDiskGB)
+	if einfo, ierr := cr.Client().Info(ctx); ierr == nil && einfo != nil {
+		checkImageStorePaths(rep, einfo, cfg.ResourceLimits.MaxDiskGB)
 	} else {
 		rep.add(docInfo, "image store", "could not determine the container image-store path from the engine",
 			"if a big-image pull fails with ENOSPC, check free space where the engine stores images (Docker data-root / Podman graphroot)")
 	}
 	return true
+}
+
+// checkImageStorePaths reports free space on the filesystem(s) where the
+// container backend actually stores images. Normally that is a single path
+// (Docker DockerRootDir / Podman graphroot), but under Docker's containerd
+// snapshotter the image content lives under the containerd root (e.g.
+// /var/lib/containerd) — a different directory DockerRootDir does not name — so
+// we surface that and gate on whichever candidate filesystem has the least room
+// (the one a pull would run out of space on first), matching the live disk gate.
+func checkImageStorePaths(rep *doctorReport, einfo *runtime.EngineInfo, maxDiskGB int) {
+	paths := einfo.ImageStorePaths
+	if len(paths) == 0 {
+		if einfo.StoragePath == "" {
+			rep.add(docInfo, "image store", "could not determine the container image-store path from the engine",
+				"if a big-image pull fails with ENOSPC, check free space where the engine stores images (Docker data-root / Podman graphroot)")
+			return
+		}
+		paths = []string{einfo.StoragePath}
+	}
+
+	if einfo.Snapshotter {
+		rep.add(docInfo, "image store",
+			fmt.Sprintf("Docker is using the containerd snapshotter — image content lives under the containerd root, not just %s (checking: %s)",
+				einfo.StoragePath, strings.Join(paths, ", ")),
+			"to free image-store space or move it to a bigger disk, target the containerd root (default /var/lib/containerd), not /var/lib/docker")
+	}
+
+	// Report the binding (least-free) path — the one the disk gate trips on first.
+	bindPath, bindFree := paths[0], client.DiskAvailableMB(paths[0])
+	for _, p := range paths[1:] {
+		f := client.DiskAvailableMB(p)
+		if bindFree <= 0 || (f > 0 && f < bindFree) {
+			bindPath, bindFree = p, f
+		}
+	}
+	checkImageStore(rep, bindPath, bindFree, maxDiskGB)
 }
 
 // checkImageStore reports free space on the filesystem where the container

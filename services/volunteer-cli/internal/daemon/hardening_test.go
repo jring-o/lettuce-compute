@@ -44,8 +44,10 @@ func (l *thresholdLimiter) CheckDiskSpace(_ string, requiredMB int) error {
 // Info; any other call panics (none should happen in these tests).
 type fakeDocker struct {
 	runtime.DockerClient
-	exists    bool
-	storePath string // image-store path reported by Info (TODO #31)
+	exists      bool
+	storePath   string   // primary image-store path reported by Info (TODO #31)
+	storePaths  []string // every filesystem the gate should check (containerd snapshotter)
+	snapshotter bool
 }
 
 func (f *fakeDocker) ImageExists(_ context.Context, _ string) (bool, error) {
@@ -53,7 +55,11 @@ func (f *fakeDocker) ImageExists(_ context.Context, _ string) (bool, error) {
 }
 
 func (f *fakeDocker) Info(_ context.Context) (*runtime.EngineInfo, error) {
-	return &runtime.EngineInfo{StoragePath: f.storePath}, nil
+	return &runtime.EngineInfo{
+		StoragePath:     f.storePath,
+		ImageStorePaths: f.storePaths,
+		Snapshotter:     f.snapshotter,
+	}, nil
 }
 
 // pathLimiter reports per-path free space (MB) so a test can model a roomy data
@@ -196,6 +202,40 @@ func TestShouldFetch_ImageStoreAmpleStillFetches(t *testing.T) {
 
 	if !d.shouldFetch() {
 		t.Fatal("shouldFetch = false, want true — both the data dir and image store have ample space")
+	}
+}
+
+// TestShouldFetch_GatesContainerdSnapshotterRoot covers the Docker containerd
+// snapshotter case: DockerRootDir (/var/lib/docker) is roomy, but the image
+// content actually lands under the containerd root (/var/lib/containerd), which
+// here is a small volume below the allowance. The gate must check the containerd
+// root too and refuse to fetch — a DockerRootDir-only gate would pass and the
+// pull would then ENOSPC on /var/lib/containerd.
+func TestShouldFetch_GatesContainerdSnapshotterRoot(t *testing.T) {
+	const dataDir = "/data"
+	const dockerRoot = "/var/lib/docker"         // roomy
+	const containerdRoot = "/var/lib/containerd" // small — where the blobs land
+	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
+	mc := &mockClient{}
+	lim := &pathLimiter{availMB: map[string]int{
+		dataDir:        200 * 1024,
+		dockerRoot:     200 * 1024,
+		containerdRoot: 20 * 1024,
+	}}
+	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, lim, scheduler)
+	d.cfg.DataDir = dataDir
+	d.cfg.ResourceLimits.MaxDiskGB = 100
+
+	dc := &fakeDocker{
+		exists:      false,
+		storePath:   dockerRoot,
+		storePaths:  []string{dockerRoot, containerdRoot},
+		snapshotter: true,
+	}
+	seedContainerLeaf(t, d, mc, dc, "ghcr.io/example/big:1")
+
+	if d.shouldFetch() {
+		t.Fatal("shouldFetch = true, want false — the containerd image-store root is too small (Docker containerd snapshotter)")
 	}
 }
 

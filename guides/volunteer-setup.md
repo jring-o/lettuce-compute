@@ -175,10 +175,15 @@ the container runtime's store:
 - The daemon checks free space on **this store volume** before fetching a
   container leaf — not just the data dir — so a roomy `~/.lettuce` no longer lets
   a too-small image store sail through the gate and then fail mid-pull with "no
-  space left on device". `lettuce-volunteer doctor` prints the store path (from
-  `docker info` → "Docker Root Dir" / Podman's graphroot) and its free space.
-  Lettuce can only **detect** this path — it can't move it: relocate the store by
-  repointing the engine (Docker `data-root`, rootless Podman `graphroot`) or, on
+  space left on device". It is **containerd-snapshotter aware**: when `docker
+  info` reports `driver-type: io.containerd.snapshotter.v1`, the daemon also
+  checks the containerd root (default `/var/lib/containerd`) — where the blobs and
+  snapshots actually land — rather than trusting "Docker Root Dir", which on such
+  hosts is the wrong filesystem. `lettuce-volunteer doctor` prints the path(s) it
+  checks and their free space, and notes when the containerd snapshotter is in
+  use. Lettuce can only **detect** these paths — it can't move them: relocate the
+  store by repointing the engine (Docker `data-root`, the containerd `root` in
+  `/etc/containerd/config.toml`, or rootless Podman `graphroot`) or, on
   Windows/macOS, enlarge the Podman-machine disk (`podman machine init
   --disk-size`).
 
