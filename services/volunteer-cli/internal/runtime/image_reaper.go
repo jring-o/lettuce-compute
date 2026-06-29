@@ -63,16 +63,68 @@ func (c *ContainerRuntime) reapStaleImages(ctx context.Context, pulledRef string
 		return
 	}
 
+	c.reapRepos(ctx, keep, map[string]bool{repo: true})
+}
+
+// ReapStaleImages reaps superseded cached copies across EVERY repository the
+// volunteer currently wants cached. Unlike the per-pull reapStaleImages it is
+// NOT gated on a fresh pull, so it cleans orphans the pull-triggered reaper never
+// sees — most importantly a stale sibling tag left when a leaf moved to a new tag
+// (e.g. lbry.science/beyblade :latest / :v2-progress → :v3-checkpoint) while this
+// volunteer already had the old image cached, so no pull ever re-fires the
+// reaper. Confirmed lingering in the field on v0.8.11 across both Docker and
+// rootless Podman.
+//
+// Safe to run at startup and whenever the enabled-image set changes; best-effort
+// and never blocks compute. No-op until SetWantedImages is installed (so a
+// native-only volunteer or one with no enabled container leaf removes nothing).
+func (c *ContainerRuntime) ReapStaleImages(ctx context.Context) {
+	if c.wantedImages == nil {
+		return
+	}
+	keep := make(map[string]bool)
+	repos := make(map[string]bool)
+	for _, ref := range c.wantedImages() {
+		repo := repoFromImageRef(ref)
+		if repo == "" {
+			continue
+		}
+		repos[repo] = true
+		if id, err := c.dockerClient.ImageID(ctx, ref); err == nil && id != "" {
+			keep[id] = true
+		}
+	}
+	if len(keep) == 0 {
+		// No wanted image resolves yet (none pulled, or the engine is unreachable):
+		// refuse to remove anything rather than risk deleting a live image.
+		c.logger.Debug("ReapStaleImages: empty keep-set, skipping")
+		return
+	}
+	c.reapRepos(ctx, keep, repos)
+}
+
+// reapRepos removes every cached image that belongs to one of repos but whose
+// content ID is not in keep — the shared core of the per-pull and across-wanted
+// reapers. It only ever touches a repository the caller manages (one that has a
+// wanted/just-pulled image), so unrelated images are never candidates. Removal
+// is non-force, so the backend refuses to delete an image still referenced by a
+// container and the reaper simply skips it. Every failure is logged and ignored;
+// it must never block compute.
+func (c *ContainerRuntime) reapRepos(ctx context.Context, keep, repos map[string]bool) {
 	images, err := c.dockerClient.ImageList(ctx)
 	if err != nil {
-		c.logger.Debug("reapStaleImages: image list failed, skipping", "repo", repo, "error", err)
+		c.logger.Debug("reapStaleImages: image list failed, skipping", "error", err)
 		return
 	}
 
 	var removed int
 	var reclaimedBytes int64
 	for _, img := range images {
-		if keep[img.ID] || !imageInRepo(img, repo) {
+		if keep[img.ID] {
+			continue
+		}
+		repo, ok := matchRepo(img, repos)
+		if !ok {
 			continue
 		}
 		if err := c.dockerClient.ImageRemove(ctx, img.ID); err != nil {
@@ -88,8 +140,19 @@ func (c *ContainerRuntime) reapStaleImages(ctx context.Context, pulledRef string
 	}
 	if removed > 0 {
 		c.logger.Info("reclaimed superseded image copies",
-			"repo", repo, "removed", removed, "reclaimed_mb", reclaimedBytes/(1024*1024))
+			"removed", removed, "reclaimed_mb", reclaimedBytes/(1024*1024))
 	}
+}
+
+// matchRepo returns the repository from repos that img belongs to, and whether
+// any matched.
+func matchRepo(img ImageSummary, repos map[string]bool) (string, bool) {
+	for repo := range repos {
+		if imageInRepo(img, repo) {
+			return repo, true
+		}
+	}
+	return "", false
 }
 
 // repoFromImageRef returns the repository portion of an OCI image reference,

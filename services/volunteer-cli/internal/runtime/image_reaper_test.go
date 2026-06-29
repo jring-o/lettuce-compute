@@ -172,6 +172,77 @@ func TestReapStaleImages_EmptyKeepSetRemovesNothing(t *testing.T) {
 	}
 }
 
+// The startup/across-wanted reaper (ReapStaleImages) reclaims orphaned sibling
+// tags WITHOUT a fresh pull — the v0.8.11 field case where a leaf moved to a new
+// tag while the volunteer still had the old image cached, so the pull-triggered
+// reaper never ran. It must clean every wanted repo, keep all wanted images, and
+// never touch an unrelated repository.
+func TestReapStaleImages_StartupAcrossWantedRepos(t *testing.T) {
+	const beyblade = "lbry.science/beyblade"
+	const grep = "ghcr.io/jring-o/extract2-lettuce"
+	var removed []string
+
+	mock := &MockDockerClient{
+		ImageIDFn: idResolver(map[string]string{
+			beyblade + ":v3-checkpoint": "sha256:bb-current",
+			grep + ":1.2":              "sha256:grep-current",
+		}),
+		ImageListFn: func(_ context.Context) ([]ImageSummary, error) {
+			return []ImageSummary{
+				{ID: "sha256:bb-current", RepoTags: []string{beyblade + ":v3-checkpoint"}, Size: 471 << 20},
+				// Orphan sibling tag the leaf moved off of — still tagged, no pull fired.
+				{ID: "sha256:bb-stale", RepoTags: []string{beyblade + ":v2-progress"}, Size: 471 << 20},
+				{ID: "sha256:grep-current", RepoTags: []string{grep + ":1.2"}, Size: 48 << 30},
+				// Unrelated repo must never be touched.
+				{ID: "sha256:other", RepoTags: []string{"docker.io/library/postgres:16"}, Size: 1 << 30},
+			}, nil
+		},
+		ImageRemoveFn: func(_ context.Context, id string) error { removed = append(removed, id); return nil },
+	}
+
+	cr := reaperTestRuntime(t, mock)
+	cr.SetWantedImages(func() []string { return []string{beyblade + ":v3-checkpoint", grep + ":1.2"} })
+	cr.ReapStaleImages(context.Background())
+
+	if fmt.Sprint(removed) != fmt.Sprint([]string{"sha256:bb-stale"}) {
+		t.Fatalf("removed = %v, want [sha256:bb-stale] (current images and the unrelated repo must be kept)", removed)
+	}
+}
+
+// Without a wanted-image callback the startup reaper is a no-op and must not even
+// list images — a native-only volunteer or one with no enabled container leaf
+// removes nothing.
+func TestReapStaleImages_StartupNoWantedFuncIsNoop(t *testing.T) {
+	mock := &MockDockerClient{
+		ImageListFn: func(_ context.Context) ([]ImageSummary, error) {
+			t.Fatal("ReapStaleImages must not list images when no wanted-image callback is set")
+			return nil, nil
+		},
+	}
+	cr := reaperTestRuntime(t, mock)
+	cr.ReapStaleImages(context.Background())
+}
+
+// If no wanted image resolves (none pulled yet / engine unreachable) the startup
+// reaper refuses to remove anything, exactly like the per-pull path.
+func TestReapStaleImages_StartupEmptyKeepSetRemovesNothing(t *testing.T) {
+	const repo = "lbry.science/beyblade"
+	removeCalled := false
+	mock := &MockDockerClient{
+		ImageIDFn: func(_ context.Context, _ string) (string, error) { return "", fmt.Errorf("unresolved") },
+		ImageListFn: func(_ context.Context) ([]ImageSummary, error) {
+			return []ImageSummary{{ID: "sha256:x", RepoTags: []string{repo + ":latest"}}}, nil
+		},
+		ImageRemoveFn: func(_ context.Context, _ string) error { removeCalled = true; return nil },
+	}
+	cr := reaperTestRuntime(t, mock)
+	cr.SetWantedImages(func() []string { return []string{repo + ":v3-checkpoint"} })
+	cr.ReapStaleImages(context.Background())
+	if removeCalled {
+		t.Fatal("startup reaper removed an image despite an unresolved keep-set")
+	}
+}
+
 func TestRepoFromImageRef(t *testing.T) {
 	cases := map[string]string{
 		"lbry.science/beyblade:v2-progress":        "lbry.science/beyblade",

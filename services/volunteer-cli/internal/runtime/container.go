@@ -264,7 +264,7 @@ func interpretPullError(backend ContainerBackend, image string, err error) error
 	case BackendPodman:
 		location = "the Podman machine's disk (on Windows/macOS this is a VM; on Linux it is the host filesystem)"
 	case BackendDocker:
-		location = "Docker's storage (on Windows/macOS this is the Docker Desktop WSL2/VM disk on the system drive; on Linux it is /var/lib/docker)"
+		location = "Docker's image store (on Linux this is /var/lib/docker, or the containerd root such as /var/lib/containerd when Docker uses the containerd snapshotter; on Windows/macOS it is the Docker Desktop WSL2/VM disk on the system drive)"
 	}
 
 	return fmt.Errorf("pull image %q failed: out of disk space on %s. "+

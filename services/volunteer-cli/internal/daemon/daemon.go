@@ -121,7 +121,7 @@ type Daemon struct {
 	// every fetch-loop iteration.
 	imgStoreMu      sync.Mutex
 	imgStoreChecked time.Time
-	imgStorePath    string
+	imgStorePaths   []string
 	imgStoreKnown   bool
 
 	// Disk-gate warning state: surfaces the otherwise-silent "no free disk, so
@@ -342,6 +342,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// still needs (#60).
 	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetWantedImages(d.allEnabledImageRefs)
+		// The per-pull reaper only fires on a fresh pull, so a superseded sibling
+		// image left cached from a previous run (e.g. a leaf that moved to a new tag
+		// while this volunteer held the old one) lingers until the next pull —
+		// confirmed in the field on v0.8.11. Sweep once at startup, off the startup
+		// path and best-effort, so those orphans are reclaimed without waiting for a
+		// pull (#60 follow-up).
+		go cr.ReapStaleImages(ctx)
 	}
 
 	// Readiness banner: now that runtimes are registered and the leaf list is
@@ -971,18 +978,23 @@ func (d *Daemon) shouldFetch() bool {
 			"required_mb", cachedImageWorkspaceHeadroomMB)
 	}
 
-	// Gate 2 — the container image-store volume: the image does NOT live under the
-	// data dir, it lands in the engine's store (Docker DockerRootDir / Podman
+	// Gate 2 — the container image-store volume(s): the image does NOT live under
+	// the data dir, it lands in the engine's store (Docker DockerRootDir / Podman
 	// graphroot), often a different filesystem. When a fresh pull is required (no
 	// enabled leaf's image is cached), gate that filesystem too — otherwise a
 	// roomy data dir lets the fetch pass and the pull then dies with ENOSPC on a
 	// volume Gate 1 never looked at (TODO #31). A cached image needs no pull, so
-	// the store gate is skipped then.
+	// the store gate is skipped then. Under the Docker containerd snapshotter the
+	// store spans more than one path (DockerRootDir plus the containerd root), so
+	// check each — the first below the allowance blocks (i.e. gate on the tightest
+	// filesystem the pull would actually fill).
 	if !cached {
-		if path, ok := d.imageStorePath(); ok {
-			if err := d.limiter.CheckDiskSpace(path, fullRequiredMB); err != nil {
-				d.warnDiskGateOnce("image store", path, fullRequiredMB)
-				return false
+		if paths, ok := d.imageStorePaths(); ok {
+			for _, path := range paths {
+				if err := d.limiter.CheckDiskSpace(path, fullRequiredMB); err != nil {
+					d.warnDiskGateOnce("image store", path, fullRequiredMB)
+					return false
+				}
 			}
 		}
 	}
@@ -1330,47 +1342,60 @@ func (d *Daemon) checkCachedRunnableImage() bool {
 	return false
 }
 
-// imageStorePath returns the filesystem path where the container backend stores
-// images and extracts layers (Docker DockerRootDir / Podman graphroot). ok is
-// false when there is no container runtime, the backend can't be queried, or it
-// reports no path — callers then skip the image-store disk gate rather than
-// block, preserving the pre-#31 behavior for native-only volunteers or an
-// unreachable engine. The result is cached for imageCacheCheckTTL so the fetch
-// gate doesn't issue an /info call on every loop iteration. (TODO #31)
-func (d *Daemon) imageStorePath() (string, bool) {
+// imageStorePaths returns the filesystem path(s) where the container backend
+// stores images and extracts layers — normally one (Docker DockerRootDir /
+// Podman graphroot), but more than one under the Docker containerd snapshotter
+// (DockerRootDir plus the containerd content root, a different filesystem the
+// blobs and overlayfs snapshots actually land on). ok is false when there is no
+// container runtime, the backend can't be queried, or it reports no path —
+// callers then skip the image-store disk gate rather than block, preserving the
+// pre-#31 behavior for native-only volunteers or an unreachable engine. The
+// result is cached for imageCacheCheckTTL so the fetch gate doesn't issue an
+// /info call on every loop iteration. (TODO #31 + containerd-snapshotter
+// follow-up.)
+func (d *Daemon) imageStorePaths() ([]string, bool) {
 	d.imgStoreMu.Lock()
 	if !d.imgStoreChecked.IsZero() && time.Since(d.imgStoreChecked) < imageCacheCheckTTL {
-		path, known := d.imgStorePath, d.imgStoreKnown
+		paths, known := d.imgStorePaths, d.imgStoreKnown
 		d.imgStoreMu.Unlock()
-		return path, known
+		return paths, known
 	}
 	d.imgStoreMu.Unlock()
 
-	path, known := d.probeImageStorePath()
+	paths, known := d.probeImageStorePaths()
 
 	d.imgStoreMu.Lock()
 	d.imgStoreChecked = time.Now()
-	d.imgStorePath = path
+	d.imgStorePaths = paths
 	d.imgStoreKnown = known
 	d.imgStoreMu.Unlock()
-	return path, known
+	return paths, known
 }
 
-func (d *Daemon) probeImageStorePath() (string, bool) {
+func (d *Daemon) probeImageStorePaths() ([]string, bool) {
 	if d.runtimeRegistry == nil {
-		return "", false
+		return nil, false
 	}
 	cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime)
 	if !ok || cr == nil {
-		return "", false
+		return nil, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	info, err := cr.Client().Info(ctx)
-	if err != nil || info == nil || info.StoragePath == "" {
-		return "", false
+	if err != nil || info == nil {
+		return nil, false
 	}
-	return info.StoragePath, true
+	paths := info.ImageStorePaths
+	if len(paths) == 0 {
+		// Older engine info / a backend that reports only the single data-root:
+		// fall back to it so behavior is unchanged from pre-snapshotter resolution.
+		if info.StoragePath == "" {
+			return nil, false
+		}
+		paths = []string{info.StoragePath}
+	}
+	return paths, true
 }
 
 // allEnabledImageRefs returns the container image references of every enabled

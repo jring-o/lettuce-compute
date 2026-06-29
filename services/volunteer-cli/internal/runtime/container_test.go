@@ -361,7 +361,7 @@ func TestInterpretPullError(t *testing.T) {
 		wantDisk  bool
 		wantInMsg string
 	}{
-		{"docker nospace", BackendDocker, fmt.Errorf("write: no space left on device"), true, "Docker's storage"},
+		{"docker nospace", BackendDocker, fmt.Errorf("write: no space left on device"), true, "Docker's image store"},
 		{"podman enospc", BackendPodman, fmt.Errorf("ENOSPC: disk full"), true, "Podman machine"},
 		{"generic", BackendDocker, fmt.Errorf("manifest unknown"), false, ""},
 		{"timeout not disk", BackendPodman, fmt.Errorf("context deadline exceeded"), false, ""},
