@@ -55,6 +55,14 @@ type ExecutionSlot struct {
 	preserved         *PersistedTask // non-nil if work dir was preserved on shutdown
 	processHandle     ProcessHandle  // for suspend/resume
 	suspended         bool
+	// suspendPending records that a suspend (schedule gate / pause) was requested
+	// while this slot was active but had no process handle yet — the window between
+	// StartSlot marking a re-executed resume active and the runtime registering the
+	// spawned process via PIDCallback. The deferred suspend is applied the moment the
+	// handle is attached (see attachProcessHandle); without it a resumed task whose
+	// handle appears after a one-shot SuspendAll would run unfrozen through the whole
+	// off-schedule/pause window.
+	suspendPending    bool
 	pausedAt          time.Time     // when current pause began (zero if not paused)
 	totalPausedDur    time.Duration // accumulated pause time during THIS daemon session
 	fetchedAt         time.Time     // when the WU was fetched from server (from prefetch queue)
@@ -235,6 +243,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		slot.resumedFromCkp = false
 		slot.processHandle = nil
 		slot.suspended = false
+		slot.suspendPending = false
 		slot.pausedAt = time.Time{}
 		slot.totalPausedDur = 0
 		slot.fetchedAt = time.Time{}
@@ -343,15 +352,11 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 	// Wire process handle callbacks for suspend/resume.
 	if prep != nil {
 		prep.PIDCallback = func(pid int) {
-			slot.mu.Lock()
-			slot.processHandle = NewNativeProcessHandle(pid)
-			slot.mu.Unlock()
+			sm.attachProcessHandle(slot, NewNativeProcessHandle(pid))
 		}
 		if cr, ok := rt.(*runtime.ContainerRuntime); ok {
 			prep.ContainerIDCallback = func(containerID string) {
-				slot.mu.Lock()
-				slot.processHandle = NewContainerProcessHandle(cr.Client(), containerID)
-				slot.mu.Unlock()
+				sm.attachProcessHandle(slot, NewContainerProcessHandle(cr.Client(), containerID))
 			}
 		}
 	}
@@ -593,12 +598,20 @@ func (sm *SlotManager) SetShuttingDown() {
 func (sm *SlotManager) SuspendAll() {
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
-		if slot.active && slot.processHandle != nil && !slot.suspended {
-			if err := slot.processHandle.Suspend(); err != nil {
-				sm.logger.Warn("failed to suspend process", "slot", slot.ID, "error", err)
+		if slot.active && !slot.suspended {
+			if slot.processHandle != nil {
+				if err := slot.processHandle.Suspend(); err != nil {
+					sm.logger.Warn("failed to suspend process", "slot", slot.ID, "error", err)
+				} else {
+					slot.suspended = true
+					slot.pausedAt = time.Now()
+				}
 			} else {
-				slot.suspended = true
-				slot.pausedAt = time.Now()
+				// Active but no process handle yet: a task resumed via re-execution is
+				// marked active before its process spawns. Defer the suspend so it is
+				// applied the instant the handle is registered (attachProcessHandle);
+				// otherwise the process runs unfrozen through the whole window.
+				slot.suspendPending = true
 			}
 		}
 		slot.mu.Unlock()
@@ -609,6 +622,9 @@ func (sm *SlotManager) SuspendAll() {
 func (sm *SlotManager) ResumeAll() {
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
+		// Cancel any suspend that was deferred while the handle was missing: the window
+		// reopened before the process ever registered its handle, so it should run.
+		slot.suspendPending = false
 		if slot.active && slot.processHandle != nil && slot.suspended {
 			// Accumulate pause duration before resuming.
 			if !slot.pausedAt.IsZero() {
@@ -630,10 +646,33 @@ func (sm *SlotManager) SetProcessHandle(slotID int, handle ProcessHandle) {
 	if slotID < 0 || slotID >= len(sm.slots) {
 		return
 	}
-	slot := sm.slots[slotID]
+	sm.attachProcessHandle(sm.slots[slotID], handle)
+}
+
+// attachProcessHandle stores a process handle on a slot and, if a suspend was
+// deferred while the slot had no handle (suspendPending), applies it immediately.
+// All handle registration — the runtime's PIDCallback/ContainerIDCallback and the
+// orphan-resume SetProcessHandle path — flows through here, so a handle that
+// appears after a one-shot SuspendAll (e.g. a re-executed task resumed into an
+// already-inactive schedule window) is frozen the moment it exists rather than
+// running on unsuspended. Best-effort: a failed suspend is logged and the pending
+// flag cleared, matching SuspendAll's behavior.
+func (sm *SlotManager) attachProcessHandle(slot *ExecutionSlot, handle ProcessHandle) {
 	slot.mu.Lock()
+	defer slot.mu.Unlock()
 	slot.processHandle = handle
-	slot.mu.Unlock()
+	if handle == nil || !slot.suspendPending || slot.suspended {
+		slot.suspendPending = false
+		return
+	}
+	if err := handle.Suspend(); err != nil {
+		sm.logger.Warn("failed to apply deferred suspend on handle registration",
+			"slot", slot.ID, "error", err)
+	} else {
+		slot.suspended = true
+		slot.pausedAt = time.Now()
+	}
+	slot.suspendPending = false
 }
 
 // GetActivePersistableTasks returns PersistedTask data for all currently active
