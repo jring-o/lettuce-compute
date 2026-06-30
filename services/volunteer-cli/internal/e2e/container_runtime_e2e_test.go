@@ -74,6 +74,10 @@ func (m *mockDockerClient) ImageRemove(ctx context.Context, imageID string) erro
 	return nil
 }
 
+func (m *mockDockerClient) ContainerList(ctx context.Context, labelKey string) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+
 func (m *mockDockerClient) ContainerCreate(ctx context.Context, cfg *runtime.ContainerConfig) (string, error) {
 	m.lastCreateConfig = cfg
 	if m.containerCreateFn != nil {

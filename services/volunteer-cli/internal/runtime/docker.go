@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 )
@@ -66,6 +67,10 @@ type DockerClient interface {
 	// ImageRemove deletes a cached image by ID. It is non-force, so the backend
 	// refuses to delete an image still referenced by any container.
 	ImageRemove(ctx context.Context, imageID string) error
+	// ContainerList returns every container carrying labelKey, in any state
+	// (running or stopped). Used by the stranded-container reaper to find this
+	// volunteer's leftover work-unit containers.
+	ContainerList(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 	ContainerCreate(ctx context.Context, cfg *ContainerConfig) (string, error)
 	ContainerStart(ctx context.Context, containerID string) error
 	ContainerWait(ctx context.Context, containerID string) (int64, error)
@@ -91,6 +96,16 @@ type ImageSummary struct {
 	RepoTags    []string
 	RepoDigests []string
 	Size        int64 // bytes
+}
+
+// ContainerSummary is a backend-agnostic view of a container, used by the
+// stranded-container reaper. State is the lifecycle state as the engine reports
+// it ("running", "exited", "created", "paused", "dead", "restarting", …); Labels
+// carries the lettuce.* identification set at creation.
+type ContainerSummary struct {
+	ID     string
+	State  string
+	Labels map[string]string
 }
 
 // ContainerConfig holds the configuration for creating a Docker container.
@@ -327,6 +342,21 @@ func (d *dockerClientWrapper) ImageList(ctx context.Context) ([]ImageSummary, er
 			RepoDigests: s.RepoDigests,
 			Size:        s.Size,
 		})
+	}
+	return out, nil
+}
+
+func (d *dockerClientWrapper) ContainerList(ctx context.Context, labelKey string) ([]ContainerSummary, error) {
+	list, err := d.cli.ContainerList(ctx, container.ListOptions{
+		All:     true, // include stopped/created containers, not just running ones
+		Filters: filters.NewArgs(filters.Arg("label", labelKey)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("container list: %w", err)
+	}
+	out := make([]ContainerSummary, 0, len(list))
+	for _, c := range list {
+		out = append(out, ContainerSummary{ID: c.ID, State: c.State, Labels: c.Labels})
 	}
 	return out, nil
 }

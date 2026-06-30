@@ -383,8 +383,8 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		CPUPeriod:   cpuPeriod,
 		NetworkMode: networkMode,
 		Labels: map[string]string{
-			"lettuce.work-unit-id": wu.ID,
-			"lettuce.leaf-id":      wu.LeafID,
+			WorkUnitIDLabel:   wu.ID,
+			"lettuce.leaf-id": wu.LeafID,
 		},
 	}
 

@@ -342,13 +342,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// still needs (#60).
 	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetWantedImages(d.allEnabledImageRefs)
-		// The per-pull reaper only fires on a fresh pull, so a superseded sibling
-		// image left cached from a previous run (e.g. a leaf that moved to a new tag
-		// while this volunteer held the old one) lingers until the next pull —
-		// confirmed in the field on v0.8.11. Sweep once at startup, off the startup
-		// path and best-effort, so those orphans are reclaimed without waiting for a
-		// pull (#60 follow-up).
-		go cr.ReapStaleImages(ctx)
+		// The startup image reap runs later (after the resumers), once stranded
+		// containers have been cleared so superseded images are actually reclaimable.
 	}
 
 	// Readiness banner: now that runtimes are registered and the leaf list is
@@ -394,6 +389,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// after both resumers so a dir about to be re-attached is never deleted; the owned set
 	// is exactly the active slots' + restored buffer's work dirs at this point.
 	d.gcOrphanedWorkDirs()
+
+	// Reclaim container-image disk left by a previous session, in two ordered steps.
+	// MUST run after the resumers (so a just-resumed unit is in the owned set and its
+	// freshly-created container is spared) and off the startup path. First remove this
+	// volunteer's own stranded work-unit containers (crash/dirty-shutdown leftovers) —
+	// they pin the leaf image, so the non-force image reaper cannot reclaim it — THEN
+	// sweep superseded cached images now that they are unpinned. Without this, a stale
+	// image left while the wanted image is already cached lingers indefinitely, since
+	// the per-pull reaper only fires on a fresh pull (confirmed in the field on
+	// v0.8.11/v0.8.12). Best-effort; never blocks startup.
+	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
+		owned := d.ownedWorkUnitIDs()
+		go func() {
+			cr.ReapStrandedContainers(ctx, owned)
+			cr.ReapStaleImages(ctx)
+		}()
+	}
 
 	// Start the pending-result retry worker. It sweeps once now (recovering any
 	// results stranded by a previous run's submission failure) then periodically.
@@ -2680,6 +2692,26 @@ var workDirTrees = []string{"work", "container-work", "wasm-work"}
 // (restored buffered units), so any other `<uuid>` dir is an orphan. Running it before the
 // resumers would delete a dir that is about to be re-attached. Best-effort: read/remove
 // failures are logged, never fatal.
+// ownedWorkUnitIDs returns the set of work-unit IDs the volunteer currently owns
+// — every active execution slot plus every buffered (un-run) prefetch unit. It
+// is the spare-set for the startup stranded-container reaper, mirroring the
+// owned-dir set gcOrphanedWorkDirs builds, so a just-resumed unit's freshly
+// created container is never mistaken for a crash leftover and removed.
+func (d *Daemon) ownedWorkUnitIDs() map[string]bool {
+	owned := make(map[string]bool)
+	for _, wu := range d.slotManager.ActiveWorkUnits() {
+		if wu != nil && wu.ID != "" {
+			owned[wu.ID] = true
+		}
+	}
+	for _, it := range d.prefetchQueue.Items() {
+		if it != nil && it.WU != nil && it.WU.ID != "" {
+			owned[it.WU.ID] = true
+		}
+	}
+	return owned
+}
+
 func (d *Daemon) gcOrphanedWorkDirs() {
 	owned := make(map[string]struct{})
 	for _, dir := range d.slotManager.ActiveWorkDirs() {

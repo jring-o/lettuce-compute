@@ -54,6 +54,10 @@ func (f *fakeDocker) ImageExists(_ context.Context, _ string) (bool, error) {
 	return f.exists, nil
 }
 
+func (f *fakeDocker) ContainerList(_ context.Context, _ string) ([]runtime.ContainerSummary, error) {
+	return nil, nil
+}
+
 func (f *fakeDocker) Info(_ context.Context) (*runtime.EngineInfo, error) {
 	return &runtime.EngineInfo{
 		StoragePath:     f.storePath,
