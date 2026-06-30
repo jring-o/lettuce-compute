@@ -117,7 +117,7 @@ func (c *ContainerRuntime) reapRepos(ctx context.Context, keep, repos map[string
 		return
 	}
 
-	var removed int
+	var removed, skipped int
 	var reclaimedBytes int64
 	for _, img := range images {
 		if keep[img.ID] {
@@ -129,6 +129,7 @@ func (c *ContainerRuntime) reapRepos(ctx context.Context, keep, repos map[string
 		}
 		if err := c.dockerClient.ImageRemove(ctx, img.ID); err != nil {
 			// In use by a container, multi-tagged without force, or already gone.
+			skipped++
 			c.logger.Debug("reapStaleImages: skipped image",
 				"repo", repo, "image_id", shortImageID(img.ID), "error", err)
 			continue
@@ -141,6 +142,16 @@ func (c *ContainerRuntime) reapRepos(ctx context.Context, keep, repos map[string
 	if removed > 0 {
 		c.logger.Info("reclaimed superseded image copies",
 			"removed", removed, "reclaimed_mb", reclaimedBytes/(1024*1024))
+	}
+	// Surface non-reclaimable superseded copies at INFO. The per-image reason is
+	// DEBUG-only, so an operator watching the INFO log would otherwise see a stale
+	// image persist with no explanation — almost always because a stopped/dirty
+	// container still references it (non-force removal then refuses). The startup
+	// container reaper clears the volunteer's own such containers; anything left is
+	// held by a container outside Lettuce's control (manual `docker container prune`).
+	if skipped > 0 {
+		c.logger.Info("left superseded image copies cached: still referenced by a stopped container (non-force removal skipped them) — clear with the startup container reaper or `docker/podman container prune`",
+			"skipped", skipped)
 	}
 }
 

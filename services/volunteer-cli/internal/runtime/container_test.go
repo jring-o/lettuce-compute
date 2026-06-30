@@ -31,6 +31,7 @@ type MockDockerClient struct {
 	ImageIDFn          func(ctx context.Context, ref string) (string, error)
 	ImageListFn        func(ctx context.Context) ([]ImageSummary, error)
 	ImageRemoveFn      func(ctx context.Context, imageID string) error
+	ContainerListFn    func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
@@ -83,6 +84,13 @@ func (m *MockDockerClient) ImageRemove(ctx context.Context, imageID string) erro
 		return m.ImageRemoveFn(ctx, imageID)
 	}
 	return nil
+}
+
+func (m *MockDockerClient) ContainerList(ctx context.Context, labelKey string) ([]ContainerSummary, error) {
+	if m.ContainerListFn != nil {
+		return m.ContainerListFn(ctx, labelKey)
+	}
+	return nil, nil
 }
 
 func (m *MockDockerClient) ContainerCreate(ctx context.Context, cfg *ContainerConfig) (string, error) {
