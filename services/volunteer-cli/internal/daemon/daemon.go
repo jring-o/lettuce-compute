@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -616,6 +617,18 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	conn := result.Conn
 
 	if result.Err != nil {
+		if errors.Is(result.Err, context.Canceled) {
+			// Execution was cancelled because the daemon is shutting down or a stop
+			// was requested (Stop() cancels the run context). The slot has already
+			// preserved the work dir + checkpoint for resume — this is the normal
+			// graceful-stop path, not a compute failure, so it must not surface at
+			// ERROR (it would trip alarm-on-ERROR monitoring on every clean shutdown).
+			d.logger.Info("slot execution cancelled (shutdown/stop); work preserved for resume",
+				"work_unit_id", wu.ID,
+				"slot", result.SlotID,
+			)
+			return
+		}
 		d.logger.Error("slot execution failed",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
