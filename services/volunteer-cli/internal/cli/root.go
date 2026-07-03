@@ -81,6 +81,7 @@ func newRootCmd() *cobra.Command {
 		newHistoryCmd(),
 		newUpdateCmd(),
 		newProveIdentityCmd(),
+		newBindDIDCmd(),
 		newDoctorCmd(),
 	)
 
