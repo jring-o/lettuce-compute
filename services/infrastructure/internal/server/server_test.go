@@ -706,6 +706,24 @@ func (m *mockVolunteerRepo) GetByUserID(_ context.Context, _ types.ID) (*volunte
 func (m *mockVolunteerRepo) MarkInactiveOlderThan(_ context.Context, _ time.Duration) (int, error) {
 	return 0, nil
 }
+func (m *mockVolunteerRepo) SetDIDBinding(_ context.Context, _ types.ID, _, _, _ string, _ time.Time) error {
+	return nil
+}
+func (m *mockVolunteerRepo) ListDIDBindingsForRecheck(_ context.Context, _ time.Time, _ int) ([]*volunteer.Volunteer, error) {
+	return nil, nil
+}
+func (m *mockVolunteerRepo) MarkDIDBindingChecked(_ context.Context, _ types.ID, _ string, _ time.Time) error {
+	return nil
+}
+func (m *mockVolunteerRepo) MarkDIDBindingCheckFailed(_ context.Context, _ types.ID, _ time.Time, _ int) error {
+	return nil
+}
+func (m *mockVolunteerRepo) RevokeDIDBinding(_ context.Context, _ types.ID, _ time.Time) error {
+	return nil
+}
+func (m *mockVolunteerRepo) SetDIDFrozenUntil(_ context.Context, _ types.ID, _ time.Time) error {
+	return nil
+}
 
 // testRegisterPubKey is the Ed25519 public key paired with the signing key the
 // register-test client uses (see setupRegisterTestServer). RegisterVolunteer now

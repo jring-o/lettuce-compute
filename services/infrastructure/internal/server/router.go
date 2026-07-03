@@ -16,6 +16,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/atproto"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
 	"github.com/lettuce-compute/infrastructure/internal/config"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
@@ -48,6 +49,10 @@ type Dependencies struct {
 	ChallengeStore   *identity.PgxChallengeStore
 	HeadConfig       *config.HeadConfig
 	ValidationEngine *validation.Engine
+	// AtprotoClient backs the optional DID identity-binding endpoint. It is nil
+	// unless the operator enabled DID binding (HeadConfig.DIDBindingEnabled), which
+	// is the only condition under which the bind-DID route is registered.
+	AtprotoClient *atproto.Client
 	// TrustedProxies is the set of reverse-proxy networks whose X-Forwarded-For /
 	// X-Real-IP headers may be trusted for client-IP extraction (rate limiting and
 	// audit logging). EMPTY (nil) by default: forwarding headers are not trusted and
@@ -119,6 +124,24 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// Identity verification routes (public — Ed25519 challenge/response).
 	identityHandler := identity.NewHandler(deps.ChallengeStore, volunteerRepo, creditRepo, deps.Pool, deps.Logger)
 	identityHandler.RegisterRoutes(mux)
+
+	// Optional DID identity-binding endpoint (Ed25519-authenticated). Registered ONLY
+	// when the operator enabled DID binding and the atproto client was constructed;
+	// when disabled the route is absent and the mux returns its default 404. The
+	// endpoint authenticates the volunteer with the same Ed25519 scheme as the browser
+	// volunteer routes and hands the handler the authenticated public key explicitly
+	// (the identity package cannot read the server package's auth context key).
+	if deps.HeadConfig != nil && deps.HeadConfig.DIDBindingEnabled && deps.AtprotoClient != nil {
+		bindHandler := identity.NewBindHandler(deps.AtprotoClient, volunteerRepo, *deps.HeadConfig, deps.Logger)
+		mux.HandleFunc("POST /api/v1/identity/bind-did", ed25519AuthRequired(func(w http.ResponseWriter, r *http.Request) {
+			pubKey, ok := PublicKeyFromContext(r.Context())
+			if !ok {
+				apierror.WriteError(w, apierror.Unauthorized("missing authenticated key"))
+				return
+			}
+			bindHandler.Handle(w, r, pubKey)
+		}))
+	}
 
 	// Credit analysis routes (protected — researcher/admin).
 	analysisHandler := credit.NewAnalysisHandler(deps.Pool, leafRepo, deps.Logger)

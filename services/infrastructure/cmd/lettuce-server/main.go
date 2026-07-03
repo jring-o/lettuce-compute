@@ -15,6 +15,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/atproto"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
 	"github.com/lettuce-compute/infrastructure/internal/bootstrap"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
@@ -211,6 +212,17 @@ func main() {
 		slog.Info("no redis configured; using in-process replay cache + rate-limit buckets (single-replica)")
 	}
 
+	// Optional ATProto DID identity binding. The atproto client — and therefore both
+	// the bind endpoint and the re-check worker — is constructed ONLY when the operator
+	// enables binding; the default (disabled) leaves the whole subsystem inert.
+	var atprotoClient *atproto.Client
+	if cfg.Head.DIDBindingEnabled {
+		atprotoClient = atproto.NewClient(cfg.Head.EffectiveDIDResolverURL(), nil, logger)
+		slog.Info("DID identity binding enabled",
+			"resolver", cfg.Head.EffectiveDIDResolverURL(),
+			"collection", cfg.Head.EffectiveDIDBindingCollection())
+	}
+
 	// Create HTTP router and server.
 	deps := &server.Dependencies{
 		Pool:             pool,
@@ -225,6 +237,7 @@ func main() {
 		HeadConfig:       &cfg.Head,
 		ValidationEngine: validationEngine,
 		TrustedProxies:   trustedProxies,
+		AtprotoClient:    atprotoClient,
 	}
 	router, rateLimitCleanup := server.NewRouter(deps)
 	defer rateLimitCleanup()
@@ -351,6 +364,14 @@ func main() {
 	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, batchRepo, leafRepo, logger)
 	healthRecorder := health.NewRecorder(pool, stats.NewEngine(pool), leafRepo, logger)
 
+	// Optional DID-binding re-check worker (leader-only): re-verifies bindings on a TTL
+	// and revokes those whose authorization record is gone or repudiated. Constructed
+	// only when DID binding is enabled (same gate as the atproto client above).
+	var didRecheckWorker *identity.DIDRecheckWorker
+	if atprotoClient != nil {
+		didRecheckWorker = identity.NewDIDRecheckWorker(atprotoClient, volunteerRepo, cfg.Head, logger)
+	}
+
 	leadershipMgr := server.NewLeadershipManager(pool, logger)
 	go leadershipMgr.Run(monitorCtx, instanceID.String(), func(leaderCtx context.Context) {
 		// Each Start/Run blocks (ticker loop) and is started with its own goroutine
@@ -363,6 +384,9 @@ func main() {
 		go lazyManager.Run(leaderCtx, 30*time.Second)
 		go healthRecorder.Start(leaderCtx)
 		go artifactGC.Start(leaderCtx)
+		if didRecheckWorker != nil {
+			go didRecheckWorker.Start(leaderCtx)
+		}
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

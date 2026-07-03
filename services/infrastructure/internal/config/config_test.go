@@ -57,6 +57,10 @@ func clearLettuceEnv(t *testing.T) {
 		"LETTUCE_HEAD_NAME", "LETTUCE_HEAD_DESCRIPTION", "LETTUCE_HEAD_URL",
 		"LETTUCE_HEAD_INSTANCE_ID", "LETTUCE_REDIS_URL", "LETTUCE_REPLAY_FAIL_MODE",
 		"LETTUCE_HEAD_CLAIM_LEASE_SECONDS",
+		"LETTUCE_HEAD_DID_BINDING_ENABLED", "LETTUCE_HEAD_DID_RESOLVER_URL",
+		"LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS", "LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS",
+		"LETTUCE_HEAD_DID_STALE_AFTER_FAILURES", "LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS",
+		"LETTUCE_HEAD_DID_BINDING_COLLECTION",
 	}
 	for _, e := range envVars {
 		if orig, ok := os.LookupEnv(e); ok {
@@ -1005,6 +1009,187 @@ func TestTrustedProxiesInvalidFailsValidation(t *testing.T) {
 	t.Setenv("LETTUCE_TRUSTED_PROXIES", "not-a-cidr")
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected validation error for invalid trusted_proxies, got nil")
+	}
+}
+
+// TestDIDBindingDefaults verifies the Effective accessors on a zero-valued
+// HeadConfig return the documented DID identity-binding defaults, and that
+// DIDBindingEnabled is off by default.
+func TestDIDBindingDefaults(t *testing.T) {
+	var h HeadConfig
+	if h.DIDBindingEnabled {
+		t.Error("DIDBindingEnabled should default to false")
+	}
+	if got := h.EffectiveDIDResolverURL(); got != "https://plc.directory" {
+		t.Errorf("EffectiveDIDResolverURL() = %q, want %q", got, "https://plc.directory")
+	}
+	if got := h.EffectiveDIDRecheckTTLSeconds(); got != 3600 {
+		t.Errorf("EffectiveDIDRecheckTTLSeconds() = %d, want 3600", got)
+	}
+	if got := h.EffectiveDIDRecheckIntervalSeconds(); got != 300 {
+		t.Errorf("EffectiveDIDRecheckIntervalSeconds() = %d, want 300", got)
+	}
+	if got := h.EffectiveDIDStaleAfterFailures(); got != 3 {
+		t.Errorf("EffectiveDIDStaleAfterFailures() = %d, want 3", got)
+	}
+	if got := h.EffectiveDIDRotationFreezeHours(); got != 72 {
+		t.Errorf("EffectiveDIDRotationFreezeHours() = %d, want 72", got)
+	}
+	if got := h.EffectiveDIDBindingCollection(); got != "tech.scios.lettuce.keyAuthorization" {
+		t.Errorf("EffectiveDIDBindingCollection() = %q, want %q", got, "tech.scios.lettuce.keyAuthorization")
+	}
+
+	// Explicit non-zero values are returned verbatim.
+	h2 := HeadConfig{
+		DIDResolverURL:            "https://did.example.com",
+		DIDRecheckTTLSeconds:      120,
+		DIDRecheckIntervalSeconds: 60,
+		DIDStaleAfterFailures:     5,
+		DIDRotationFreezeHours:    12,
+		DIDBindingCollection:      "com.example.custom",
+	}
+	if got := h2.EffectiveDIDResolverURL(); got != "https://did.example.com" {
+		t.Errorf("EffectiveDIDResolverURL() = %q, want verbatim", got)
+	}
+	if got := h2.EffectiveDIDRecheckTTLSeconds(); got != 120 {
+		t.Errorf("EffectiveDIDRecheckTTLSeconds() = %d, want 120", got)
+	}
+	if got := h2.EffectiveDIDRecheckIntervalSeconds(); got != 60 {
+		t.Errorf("EffectiveDIDRecheckIntervalSeconds() = %d, want 60", got)
+	}
+	if got := h2.EffectiveDIDStaleAfterFailures(); got != 5 {
+		t.Errorf("EffectiveDIDStaleAfterFailures() = %d, want 5", got)
+	}
+	if got := h2.EffectiveDIDRotationFreezeHours(); got != 12 {
+		t.Errorf("EffectiveDIDRotationFreezeHours() = %d, want 12", got)
+	}
+	if got := h2.EffectiveDIDBindingCollection(); got != "com.example.custom" {
+		t.Errorf("EffectiveDIDBindingCollection() = %q, want verbatim", got)
+	}
+}
+
+// TestDIDBindingValidate covers the DID knob Validate rules: the TTL/interval/
+// stale-after knobs reject negatives (raw 0 is the unset->default sentinel and must
+// pass), rotation_freeze_hours may be 0 but not negative, and a malformed resolver
+// URL is rejected.
+func TestDIDBindingValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "all DID knobs unset ok",
+			cfg:     HeadConfig{Name: "x"},
+			wantErr: false,
+		},
+		{
+			name:    "valid explicit DID knobs",
+			cfg:     HeadConfig{Name: "x", DIDBindingEnabled: true, DIDResolverURL: "https://plc.directory", DIDRecheckTTLSeconds: 600, DIDRecheckIntervalSeconds: 60, DIDStaleAfterFailures: 4, DIDRotationFreezeHours: 0},
+			wantErr: false,
+		},
+		{
+			name:    "rotation freeze zero is valid",
+			cfg:     HeadConfig{Name: "x", DIDRotationFreezeHours: 0},
+			wantErr: false,
+		},
+		{
+			name:    "negative recheck ttl rejected",
+			cfg:     HeadConfig{Name: "x", DIDRecheckTTLSeconds: -1},
+			wantErr: true,
+			errMsg:  "did_recheck_ttl_seconds must be >= 0",
+		},
+		{
+			name:    "negative recheck interval rejected",
+			cfg:     HeadConfig{Name: "x", DIDRecheckIntervalSeconds: -1},
+			wantErr: true,
+			errMsg:  "did_recheck_interval_seconds must be >= 0",
+		},
+		{
+			name:    "negative stale-after rejected",
+			cfg:     HeadConfig{Name: "x", DIDStaleAfterFailures: -1},
+			wantErr: true,
+			errMsg:  "did_stale_after_failures must be >= 0",
+		},
+		{
+			name:    "negative rotation freeze rejected",
+			cfg:     HeadConfig{Name: "x", DIDRotationFreezeHours: -1},
+			wantErr: true,
+			errMsg:  "did_rotation_freeze_hours must be >= 0",
+		},
+		{
+			name:    "resolver url without scheme rejected",
+			cfg:     HeadConfig{Name: "x", DIDResolverURL: "plc.directory"},
+			wantErr: true,
+			errMsg:  "did_resolver_url must include scheme and host",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestDIDBindingEnvOverrides threads the DID env knobs through Load.
+func TestDIDBindingEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_DID_BINDING_ENABLED", "true")
+	t.Setenv("LETTUCE_HEAD_DID_RESOLVER_URL", "https://did.example.org")
+	t.Setenv("LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS", "1800")
+	t.Setenv("LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS", "120")
+	t.Setenv("LETTUCE_HEAD_DID_STALE_AFTER_FAILURES", "6")
+	t.Setenv("LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS", "24")
+	t.Setenv("LETTUCE_HEAD_DID_BINDING_COLLECTION", "com.example.keyauth")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Head.DIDBindingEnabled {
+		t.Error("DIDBindingEnabled = false, want true")
+	}
+	if cfg.Head.DIDResolverURL != "https://did.example.org" {
+		t.Errorf("DIDResolverURL = %q, unexpected", cfg.Head.DIDResolverURL)
+	}
+	if cfg.Head.DIDRecheckTTLSeconds != 1800 {
+		t.Errorf("DIDRecheckTTLSeconds = %d, want 1800", cfg.Head.DIDRecheckTTLSeconds)
+	}
+	if cfg.Head.DIDRecheckIntervalSeconds != 120 {
+		t.Errorf("DIDRecheckIntervalSeconds = %d, want 120", cfg.Head.DIDRecheckIntervalSeconds)
+	}
+	if cfg.Head.DIDStaleAfterFailures != 6 {
+		t.Errorf("DIDStaleAfterFailures = %d, want 6", cfg.Head.DIDStaleAfterFailures)
+	}
+	if cfg.Head.DIDRotationFreezeHours != 24 {
+		t.Errorf("DIDRotationFreezeHours = %d, want 24", cfg.Head.DIDRotationFreezeHours)
+	}
+	if cfg.Head.DIDBindingCollection != "com.example.keyauth" {
+		t.Errorf("DIDBindingCollection = %q, unexpected", cfg.Head.DIDBindingCollection)
+	}
+}
+
+// TestDIDBindingEnvOverrideInvalidBool rejects a non-boolean enabled flag.
+func TestDIDBindingEnvOverrideInvalidBool(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, minimalConfig)
+	t.Setenv("LETTUCE_HEAD_DID_BINDING_ENABLED", "notabool")
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for non-boolean LETTUCE_HEAD_DID_BINDING_ENABLED, got nil")
 	}
 }
 

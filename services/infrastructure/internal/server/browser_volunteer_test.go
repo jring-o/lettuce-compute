@@ -79,6 +79,24 @@ func (m *bvMockVolunteerRepo) List(context.Context, volunteer.VolunteerListFilte
 func (m *bvMockVolunteerRepo) MarkInactiveOlderThan(context.Context, time.Duration) (int, error) {
 	return 0, nil
 }
+func (m *bvMockVolunteerRepo) SetDIDBinding(context.Context, types.ID, string, string, string, time.Time) error {
+	return nil
+}
+func (m *bvMockVolunteerRepo) ListDIDBindingsForRecheck(context.Context, time.Time, int) ([]*volunteer.Volunteer, error) {
+	return nil, nil
+}
+func (m *bvMockVolunteerRepo) MarkDIDBindingChecked(context.Context, types.ID, string, time.Time) error {
+	return nil
+}
+func (m *bvMockVolunteerRepo) MarkDIDBindingCheckFailed(context.Context, types.ID, time.Time, int) error {
+	return nil
+}
+func (m *bvMockVolunteerRepo) RevokeDIDBinding(context.Context, types.ID, time.Time) error {
+	return nil
+}
+func (m *bvMockVolunteerRepo) SetDIDFrozenUntil(context.Context, types.ID, time.Time) error {
+	return nil
+}
 
 type bvMockWURepo struct {
 	wus []*workunit.WorkUnit
