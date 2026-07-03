@@ -667,6 +667,33 @@ func TestValidateValidationConfig(t *testing.T) {
 			errMsg:  "agreement_threshold",
 		},
 		{
+			name:    "agreement_threshold 0.5 rejected on redundant leaf",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.AgreementThreshold = 0.5 },
+			wantErr: true,
+			errMsg:  "greater than 0.5",
+		},
+		{
+			name:    "agreement_threshold 0.4 rejected on redundant leaf",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 3; c.AgreementThreshold = 0.4 },
+			wantErr: true,
+			errMsg:  "greater than 0.5",
+		},
+		{
+			name:    "agreement_threshold just above 0.5 ok on redundant leaf",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.AgreementThreshold = 0.51 },
+			wantErr: false,
+		},
+		{
+			name:    "agreement_threshold 0.5 allowed on single-copy leaf",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 1; c.AgreementThreshold = 0.5 },
+			wantErr: false,
+		},
+		{
+			name:    "agreement_threshold 0 sentinel accepted on redundant leaf (coerced to 1.0 by defaults)",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.AgreementThreshold = 0 },
+			wantErr: false,
+		},
+		{
 			name:    "invalid comparison_mode",
 			modify:  func(c *ValidationConfig) { c.ComparisonMode = "fuzzy" },
 			wantErr: true,
@@ -699,21 +726,22 @@ func TestValidateValidationConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "custom_comparator_ref missing when mode is custom",
+			name: "custom mode rejected as not yet supported",
 			modify: func(c *ValidationConfig) {
 				c.ComparisonMode = "CUSTOM"
 				c.CustomComparatorRef = nil
 			},
 			wantErr: true,
-			errMsg:  "custom_comparator_ref",
+			errMsg:  "not yet supported",
 		},
 		{
-			name: "valid custom comparator config",
+			name: "custom mode rejected even with comparator ref",
 			modify: func(c *ValidationConfig) {
 				c.ComparisonMode = "CUSTOM"
 				c.CustomComparatorRef = &comparatorRef
 			},
-			wantErr: false,
+			wantErr: true,
+			errMsg:  "not yet supported",
 		},
 		{
 			name:    "max_retries zero",

@@ -262,17 +262,27 @@ func (e *Engine) compareExact(proj *leaf.Leaf, pending []*result.Result) ([]*res
 		groups[key] = append(groups[key], r)
 	}
 
-	// Find the largest group (majority). When groups are tied in size, pick the one with the
-	// lexicographically smallest checksum so the outcome is deterministic regardless of map
-	// iteration order.
+	// Find the largest group (majority). A tie for the largest size means there is no unique
+	// majority — two or more distinct content groups are equally supported — so no group can
+	// be trusted as the winner. Return an empty group so the caller treats a tie as "no
+	// agreement" (flowing into its extend-copies-or-reject path). A deterministic content
+	// tie-break would be grindable: an attacker could shape a checksum to win a tie. A genuine
+	// largest group still wins outright.
 	var majorityChecksum string
 	var majorityCount int
+	tie := false
 	for checksum, group := range groups {
-		if len(group) > majorityCount ||
-			(len(group) == majorityCount && (majorityCount == 0 || checksum < majorityChecksum)) {
+		switch {
+		case len(group) > majorityCount:
 			majorityCount = len(group)
 			majorityChecksum = checksum
+			tie = false
+		case len(group) == majorityCount:
+			tie = true
 		}
+	}
+	if tie || majorityCount == 0 {
+		return nil, nil
 	}
 	return groups[majorityChecksum], nil
 }
@@ -339,17 +349,34 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 	return majorityGroup, nil
 }
 
-// applyThreshold applies the agreement threshold and performs the validation outcome.
+// applyThreshold applies the agreement gates and performs the validation outcome.
 func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, majorityCount int) (*ValidationResult, error) {
 	total := len(pending)
 	threshold := proj.ValidationConfig.AgreementThreshold
 	ratio := float64(majorityCount) / float64(total)
 
-	if ratio >= threshold {
+	// A unit VALIDATES only if all three gates hold, mirroring transition.Decide (the
+	// production decider) so the two paths never disagree:
+	//   (1) ratio >= threshold          — the configured agreement fraction, and
+	//   (2) majorityCount >= min_quorum  — the agreeing group is itself quorum-sized (the
+	//                                      floor is on the WINNERS, not just an attempt gate),
+	//   (3) 2*majorityCount > total      — the agreeing group is a STRICT majority of the
+	//                                      compared set, so no config can validate a minority
+	//                                      or plurality.
+	// min_quorum resolves as in transition.ResolvePolicy (spot-check forces a 2-of-2
+	// corroboration). A tie leaves majorityCount == 0, which fails (2) and (3), so an
+	// ambiguous largest group can never validate.
+	quorum := proj.ValidationConfig.EffectiveMinQuorum()
+	if wu.SpotCheck {
+		quorum = 2
+	}
+
+	if majorityCount >= quorum && 2*majorityCount > total && ratio >= threshold {
 		return e.acceptResults(ctx, wu, proj, pending, majorityGroup)
 	}
 
-	// Agreement threshold not met. Check if there are still active assignments.
+	// Agreement not reached (ratio, floor, or strict-majority gate failed). Check if there
+	// are still active assignments.
 	activeCount, err := e.assignmentRepo.CountActiveByWorkUnit(ctx, wu.ID)
 	if err != nil {
 		return nil, fmt.Errorf("count active assignments: %w", err)
@@ -862,8 +889,14 @@ func itoa(i int) string {
 
 // findLargestClique finds the largest subset of nodes where all pairs are mutually compatible.
 // Uses brute force enumeration — suitable for small N (≤ 5, which is the max redundancy factor).
+//
+// A tie for the largest size (two or more distinct-membership cliques of equal maximum size)
+// means the largest agreeing group is ambiguous, so there is no unique majority: it returns
+// nil ("no agreement"). The correct response to ambiguity is more data, never an arbitrary
+// (grindable) pick among equally-large cliques.
 func findLargestClique(n int, compatible [][]bool) []int {
 	var bestClique []int
+	tie := false
 
 	for mask := 1; mask < (1 << n); mask++ {
 		var members []int
@@ -881,11 +914,23 @@ func findLargestClique(n int, compatible [][]bool) []int {
 				}
 			}
 		}
+		if !allCompat {
+			continue
+		}
 
-		if allCompat && len(members) > len(bestClique) {
+		switch {
+		case len(members) > len(bestClique):
 			bestClique = members
+			tie = false
+		case len(members) == len(bestClique):
+			// Another clique of the current maximum size but different membership: the
+			// largest clique is not unique.
+			tie = true
 		}
 	}
 
+	if tie {
+		return nil
+	}
 	return bestClique
 }

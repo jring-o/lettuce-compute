@@ -43,6 +43,11 @@ func (a Action) String() string {
 // results: the largest agreeing group and the agreement ratio. The transitioner computes it
 // from the validation engine when a snapshot has at least MinQuorum pending results; Decide
 // treats a nil verdict as "no agreement attempt is possible yet".
+//
+// MajorityCount and Total are the integer agreeing-group size and compared-pending-set size.
+// Decide gates on them directly (agreeing-group floor and strict-majority checks) rather than
+// only on the derived Ratio, so those checks are exact. A tie or otherwise-ambiguous
+// comparison is reported as MajorityCount == 0 (no unique majority), which can never validate.
 type ComparisonVerdict struct {
 	MajorityCount      int
 	Total              int
@@ -152,13 +157,25 @@ func Decide(s UnitSnapshot) Decision {
 	pending := s.PendingCount
 
 	// 1. Quorum agreement — validate as soon as a quorum's worth of results is in and they
-	//    agree within threshold, WITHOUT waiting for the remaining target copies (the
-	//    validate-at-quorum win). The caller computes Comparison iff PendingCount >= MinQuorum,
-	//    so a non-nil verdict already means the quorum-many results are present; the agreement
-	//    decision is then purely the ratio-vs-threshold gate, identical to today's
-	//    applyThreshold (min_quorum plays the old redundancy_factor's role as the attempt gate,
-	//    NOT an extra agreeing-group-size floor — so threshold < 1.0 leaves are unchanged).
-	if v := s.Comparison; v != nil && v.Ratio >= p.AgreementThreshold {
+	//    agree, WITHOUT waiting for the remaining target copies (the validate-at-quorum win).
+	//    The caller computes Comparison iff PendingCount >= MinQuorum, so a non-nil verdict
+	//    already means the quorum-many results are present. Three independent gates must all
+	//    hold; any failure flows to §2's wait-or-reject path (never an instant reject), exactly
+	//    like "no agreement yet":
+	//      (a) Ratio >= threshold          — the configured agreement fraction, and
+	//      (b) MajorityCount >= MinQuorum   — the agreeing group is itself quorum-sized, so
+	//                                         min_quorum is a floor on the WINNERS, not merely
+	//                                         an attempt gate, and
+	//      (c) 2*MajorityCount > Total      — the agreeing group is a STRICT majority of the
+	//                                         compared pending set, so no config (e.g. a
+	//                                         threshold <= 0.5 legacy row) can validate a
+	//                                         minority or a plurality.
+	//    A tie or non-finite comparison yields a zero-size agreeing group (MajorityCount == 0),
+	//    which fails (b) and (c) and so never validates.
+	if v := s.Comparison; v != nil &&
+		v.Ratio >= p.AgreementThreshold &&
+		v.MajorityCount >= p.MinQuorum &&
+		2*v.MajorityCount > v.Total {
 		return Decision{Action: ActionValidate, CompleteFirst: true, Reason: "quorum agreement"}
 	}
 

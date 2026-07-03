@@ -44,6 +44,9 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 			AgreementThreshold: 1.0,
 			ComparisonMode:     "EXACT",
 			MaxRetries:         3,
+			// This leaf deliberately exercises the external-reference output path, so
+			// it must opt in; SubmitResult otherwise rejects output_data_url.
+			AllowExternalOutput: true,
 		},
 		leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
 	)
