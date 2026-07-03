@@ -16,6 +16,18 @@ const (
 	ScheduleScheduled SchedulingMode = "SCHEDULED"
 )
 
+// DIDBindingStatus* are the binding-status values stamped onto a volunteer row once
+// it is (optionally) bound to an ATProto decentralized identifier (DID); a NULL
+// status means the volunteer is not bound. OK means the binding was verified and is
+// currently trusted. STALE means re-verification has failed for a run of consecutive
+// attempts (a soft-degraded, still-recoverable state that the next success clears).
+// REVOKED means the authorization was found gone or repudiated and is terminal.
+const (
+	DIDBindingStatusOK      = "OK"
+	DIDBindingStatusStale   = "STALE"
+	DIDBindingStatusRevoked = "REVOKED"
+)
+
 // GpuInfo describes a single GPU available on a volunteer machine.
 type GpuInfo struct {
 	Model             string `json:"model"`
@@ -81,6 +93,20 @@ type Volunteer struct {
 	RegisteredAt             time.Time            `json:"registered_at"`
 	CreatedAt                time.Time            `json:"created_at"`
 	UpdatedAt                time.Time            `json:"updated_at"`
+
+	// Optional ATProto DID identity binding. All pointer fields are nil until the
+	// volunteer binds its account to a decentralized identifier and the head
+	// verifies it; DIDBindingCheckFailures is a plain counter (0 when unbound).
+	// See the DIDBindingStatus* constants and the repository's SetDIDBinding /
+	// recheck methods.
+	DID                     *string    `json:"did,omitempty"`
+	DIDBindingURI           *string    `json:"did_binding_uri,omitempty"`
+	DIDBindingCID           *string    `json:"did_binding_cid,omitempty"`
+	DIDBindingStatus        *string    `json:"did_binding_status,omitempty"`
+	DIDBoundAt              *time.Time `json:"did_bound_at,omitempty"`
+	DIDBindingCheckedAt     *time.Time `json:"did_binding_checked_at,omitempty"`
+	DIDBindingCheckFailures int        `json:"did_binding_check_failures"`
+	DIDFrozenUntil          *time.Time `json:"did_frozen_until,omitempty"`
 }
 
 // HardwareCapabilitiesFromProto converts a protobuf HardwareCapabilities message to a Go struct.

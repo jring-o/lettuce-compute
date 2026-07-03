@@ -29,4 +29,24 @@ type Repository interface {
 	// MarkInactiveOlderThan sets is_active = false for all volunteers
 	// whose last_seen_at < NOW() - threshold. Returns count of updated rows.
 	MarkInactiveOlderThan(ctx context.Context, threshold time.Duration) (int, error)
+
+	// --- Optional ATProto DID identity binding ---
+	// These are the only writers of the volunteer row's did_* state.
+
+	// SetDIDBinding records a freshly verified DID binding (status OK, failure
+	// counter cleared, bound_at == checked_at == boundAt).
+	SetDIDBinding(ctx context.Context, volunteerID types.ID, did, recordURI, recordCID string, boundAt time.Time) error
+	// ListDIDBindingsForRecheck returns active (OK/STALE) bindings whose last check
+	// predates checkedBefore, oldest-checked first, up to limit, for TTL re-verification.
+	ListDIDBindingsForRecheck(ctx context.Context, checkedBefore time.Time, limit int) ([]*Volunteer, error)
+	// MarkDIDBindingChecked records a successful re-verification (status OK, CID
+	// refreshed, failure counter reset).
+	MarkDIDBindingChecked(ctx context.Context, volunteerID types.ID, recordCID string, checkedAt time.Time) error
+	// MarkDIDBindingCheckFailed records a failed re-verification attempt, escalating
+	// the binding to STALE once consecutive failures reach staleAfter.
+	MarkDIDBindingCheckFailed(ctx context.Context, volunteerID types.ID, checkedAt time.Time, staleAfter int) error
+	// RevokeDIDBinding hard-revokes a binding (status REVOKED, terminal).
+	RevokeDIDBinding(ctx context.Context, volunteerID types.ID, revokedAt time.Time) error
+	// SetDIDFrozenUntil sets the post-key-rotation re-bind freeze deadline.
+	SetDIDFrozenUntil(ctx context.Context, volunteerID types.ID, until time.Time) error
 }

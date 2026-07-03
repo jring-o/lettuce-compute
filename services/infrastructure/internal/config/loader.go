@@ -311,6 +311,47 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.NoDeadlineCeilingSeconds = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_BINDING_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DID_BINDING_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.DIDBindingEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_RESOLVER_URL"); v != "" {
+		cfg.Head.DIDResolverURL = v
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.DIDRecheckTTLSeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.DIDRecheckIntervalSeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_STALE_AFTER_FAILURES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DID_STALE_AFTER_FAILURES must be an integer: %w", err)
+		}
+		cfg.Head.DIDStaleAfterFailures = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS must be an integer: %w", err)
+		}
+		cfg.Head.DIDRotationFreezeHours = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_DID_BINDING_COLLECTION"); v != "" {
+		cfg.Head.DIDBindingCollection = v
+	}
 	return nil
 }
 

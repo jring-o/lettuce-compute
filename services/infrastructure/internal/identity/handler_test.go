@@ -72,6 +72,24 @@ func (r *mockVolunteerRepo) List(ctx context.Context, f volunteer.VolunteerListF
 func (r *mockVolunteerRepo) MarkInactiveOlderThan(ctx context.Context, d time.Duration) (int, error) {
 	return 0, nil
 }
+func (r *mockVolunteerRepo) SetDIDBinding(ctx context.Context, id types.ID, did, uri, cid string, boundAt time.Time) error {
+	return nil
+}
+func (r *mockVolunteerRepo) ListDIDBindingsForRecheck(ctx context.Context, before time.Time, limit int) ([]*volunteer.Volunteer, error) {
+	return nil, nil
+}
+func (r *mockVolunteerRepo) MarkDIDBindingChecked(ctx context.Context, id types.ID, cid string, checkedAt time.Time) error {
+	return nil
+}
+func (r *mockVolunteerRepo) MarkDIDBindingCheckFailed(ctx context.Context, id types.ID, checkedAt time.Time, staleAfter int) error {
+	return nil
+}
+func (r *mockVolunteerRepo) RevokeDIDBinding(ctx context.Context, id types.ID, revokedAt time.Time) error {
+	return nil
+}
+func (r *mockVolunteerRepo) SetDIDFrozenUntil(ctx context.Context, id types.ID, until time.Time) error {
+	return nil
+}
 
 func setupTestHandler() (*Handler, *mockChallengeStore, *mockVolunteerRepo, ed25519.PublicKey, ed25519.PrivateKey) {
 	store := newMockStore()

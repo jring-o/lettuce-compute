@@ -163,6 +163,50 @@ type HeadConfig struct {
 	// over a few validated units. Unset (<= 0) -> defaultReliabilityQuotaFloor (2). Override
 	// via LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR.
 	ReliabilityQuotaFloor int `yaml:"reliability_quota_floor"`
+
+	// --- Optional ATProto DID identity binding ---
+	//
+	// A volunteer MAY bind its Ed25519 account to a decentralized identifier (DID)
+	// by publishing a key-authorization record in its own ATProto PDS ("Personal
+	// Data Server") repo; the head verifies that record, stamps the binding onto the
+	// volunteer row, and a worker re-verifies it on a TTL. The binding is OPTIONAL
+	// identity metadata layered on top of the existing keypair auth — nothing about
+	// keypair authentication changes when it is disabled.
+
+	// DIDBindingEnabled gates the whole feature (the verification endpoint and the
+	// recheck worker). OFF by default. Override via LETTUCE_HEAD_DID_BINDING_ENABLED.
+	DIDBindingEnabled bool `yaml:"did_binding_enabled"`
+	// DIDResolverURL is the base URL of the DID resolver used to resolve a DID to its
+	// DID document (the PDS endpoint and signing keys). Default "https://plc.directory".
+	// Override via LETTUCE_HEAD_DID_RESOLVER_URL.
+	DIDResolverURL string `yaml:"did_resolver_url"`
+	// DIDRecheckTTLSeconds is how long a verified binding is trusted before it is due
+	// for re-verification. SECURITY PARAMETER: the worst-case latency between a
+	// volunteer revoking its authorization record and the head observing the
+	// revocation is DIDRecheckTTLSeconds + DIDRecheckIntervalSeconds (the TTL plus one
+	// worker sweep). Lower it to tighten revocation latency at the cost of more
+	// resolver traffic. Default 3600 (1h); effective value must be > 0. Override via
+	// LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS.
+	DIDRecheckTTLSeconds int `yaml:"did_recheck_ttl_seconds"`
+	// DIDRecheckIntervalSeconds is the recheck worker's sweep cadence — one input to
+	// the worst-case revocation latency above. Default 300 (5m); effective value must
+	// be > 0. Override via LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS.
+	DIDRecheckIntervalSeconds int `yaml:"did_recheck_interval_seconds"`
+	// DIDStaleAfterFailures is how many CONSECUTIVE failed re-verification attempts
+	// (transient resolve/fetch errors) escalate a binding from OK to STALE. Default 3;
+	// effective value must be > 0. Override via LETTUCE_HEAD_DID_STALE_AFTER_FAILURES.
+	DIDStaleAfterFailures int `yaml:"did_stale_after_failures"`
+	// DIDRotationFreezeHours is the post-rotation cool-down: after a volunteer's DID
+	// signing key rotates, its binding is frozen for this many hours before it may
+	// re-bind (anti-abuse). Default 72; must be >= 0. Override via
+	// LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS.
+	DIDRotationFreezeHours int `yaml:"did_rotation_freeze_hours"`
+	// DIDBindingCollection is the ATProto collection (record namespace) the head looks
+	// for the key-authorization record under in a volunteer's PDS repo. Default
+	// "tech.scios.lettuce.keyAuthorization". NOTE: this namespace is PENDING an
+	// operator decision and is overridable until the first production use — do not
+	// treat it as stable yet. Override via LETTUCE_HEAD_DID_BINDING_COLLECTION.
+	DIDBindingCollection string `yaml:"did_binding_collection"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -204,6 +248,17 @@ const (
 	defaultFlushIntervalMs          = 100
 	defaultFlushBatchSize           = 200
 	defaultNoDeadlineCeilingSeconds = 21600 // 6h
+
+	// --- Optional DID identity-binding defaults ---
+	defaultDIDResolverURL            = "https://plc.directory"
+	defaultDIDRecheckTTLSeconds      = 3600 // 1h
+	defaultDIDRecheckIntervalSeconds = 300  // 5m
+	defaultDIDStaleAfterFailures     = 3
+	defaultDIDRotationFreezeHours    = 72 // 3 days
+	// defaultDIDBindingCollection is the record namespace the head looks for a
+	// volunteer's key-authorization record under. PENDING an operator decision;
+	// overridable until first production use (see HeadConfig.DIDBindingCollection).
+	defaultDIDBindingCollection = "tech.scios.lettuce.keyAuthorization"
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -341,6 +396,35 @@ func (h HeadConfig) Validate() error {
 	if effClaimLease >= h.EffectiveLeaseSeconds() {
 		return fmt.Errorf("head.claim_lease_seconds (effective %d) must be < lease_seconds (effective %d)",
 			effClaimLease, h.EffectiveLeaseSeconds())
+	}
+
+	// --- Optional DID identity-binding validation ---
+	// The TTL/interval/stale-after knobs reject only NEGATIVE raw values; a raw 0
+	// means "unset -> use the (positive) default", mirroring the other dispatch
+	// knobs, so a minimal config that omits them stays valid. rotation_freeze_hours
+	// may legitimately be 0 (no freeze), so it too only rejects negatives.
+	if h.DIDRecheckTTLSeconds < 0 {
+		return fmt.Errorf("head.did_recheck_ttl_seconds must be >= 0, got %d", h.DIDRecheckTTLSeconds)
+	}
+	if h.DIDRecheckIntervalSeconds < 0 {
+		return fmt.Errorf("head.did_recheck_interval_seconds must be >= 0, got %d", h.DIDRecheckIntervalSeconds)
+	}
+	if h.DIDStaleAfterFailures < 0 {
+		return fmt.Errorf("head.did_stale_after_failures must be >= 0, got %d", h.DIDStaleAfterFailures)
+	}
+	if h.DIDRotationFreezeHours < 0 {
+		return fmt.Errorf("head.did_rotation_freeze_hours must be >= 0, got %d", h.DIDRotationFreezeHours)
+	}
+	// The resolver endpoint is a trust anchor for binding verification, so fail fast
+	// on a malformed URL rather than discovering it at first recheck.
+	if h.DIDResolverURL != "" {
+		u, err := url.Parse(h.DIDResolverURL)
+		if err != nil {
+			return fmt.Errorf("head.did_resolver_url is invalid: %w", err)
+		}
+		if u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("head.did_resolver_url must include scheme and host (e.g. https://plc.directory)")
+		}
 	}
 	return nil
 }
@@ -562,6 +646,61 @@ func (h HeadConfig) EffectiveClaimLeaseSeconds() int {
 		return defaultClaimLeaseSeconds
 	}
 	return h.ClaimLeaseSeconds
+}
+
+// EffectiveDIDResolverURL returns the DID resolver base URL, default
+// "https://plc.directory".
+func (h HeadConfig) EffectiveDIDResolverURL() string {
+	if h.DIDResolverURL == "" {
+		return defaultDIDResolverURL
+	}
+	return h.DIDResolverURL
+}
+
+// EffectiveDIDRecheckTTLSeconds returns the binding-trust TTL in seconds, default
+// 3600 (unset/0 -> default).
+func (h HeadConfig) EffectiveDIDRecheckTTLSeconds() int {
+	if h.DIDRecheckTTLSeconds <= 0 {
+		return defaultDIDRecheckTTLSeconds
+	}
+	return h.DIDRecheckTTLSeconds
+}
+
+// EffectiveDIDRecheckIntervalSeconds returns the recheck worker's sweep cadence in
+// seconds, default 300 (unset/0 -> default).
+func (h HeadConfig) EffectiveDIDRecheckIntervalSeconds() int {
+	if h.DIDRecheckIntervalSeconds <= 0 {
+		return defaultDIDRecheckIntervalSeconds
+	}
+	return h.DIDRecheckIntervalSeconds
+}
+
+// EffectiveDIDStaleAfterFailures returns the consecutive-failure count that
+// escalates a binding to STALE, default 3 (unset/0 -> default).
+func (h HeadConfig) EffectiveDIDStaleAfterFailures() int {
+	if h.DIDStaleAfterFailures <= 0 {
+		return defaultDIDStaleAfterFailures
+	}
+	return h.DIDStaleAfterFailures
+}
+
+// EffectiveDIDRotationFreezeHours returns the post-rotation re-bind freeze in
+// hours, default 72. Unset (0) resolves to the default; an explicit non-zero
+// value is used verbatim. Validate rejects negatives.
+func (h HeadConfig) EffectiveDIDRotationFreezeHours() int {
+	if h.DIDRotationFreezeHours <= 0 {
+		return defaultDIDRotationFreezeHours
+	}
+	return h.DIDRotationFreezeHours
+}
+
+// EffectiveDIDBindingCollection returns the ATProto collection the head looks for
+// the key-authorization record under, default the tech.scios.lettuce namespace.
+func (h HeadConfig) EffectiveDIDBindingCollection() string {
+	if h.DIDBindingCollection == "" {
+		return defaultDIDBindingCollection
+	}
+	return h.DIDBindingCollection
 }
 
 // StorageConfig defines local filesystem storage settings.
