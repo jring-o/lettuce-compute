@@ -581,9 +581,13 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		          AND wuah5.outcome IS NULL) < $12
 		  )
 		  -- Homogeneous Redundancy: a unit already pinned to a hardware class only goes to
-		  -- volunteers of that SAME class. Unpinned units (hr_class IS NULL, incl. all
-		  -- non-HR leafs) and an empty requester class are unconstrained.
-		  AND (wu.hr_class IS NULL OR $13::text = '' OR wu.hr_class = $13)
+		  -- volunteers of that SAME class — including a requester that reports NO class
+		  -- (an unknown-class machine is not the pinned class, and its results would not
+		  -- be bit-comparable with the pinned cohort's). Unpinned units (hr_class IS NULL
+		  -- or '', incl. all non-HR leafs) are unconstrained. This clause must mirror
+		  -- eligibleLocked's rejectHRClassMismatch (dispatch_cache.go) exactly; the
+		  -- dispatch-predicate parity suite (internal/dispatchparity) pins the agreement.
+		  AND (wu.hr_class IS NULL OR wu.hr_class = '' OR wu.hr_class = $13)
 		  -- Feasibility-at-dispatch: exclude a unit this host's measured benchmark ($15,
 		  -- FP-ops/sec) says it cannot finish before its deadline. Skipped (no exclusion)
 		  -- when any input is unknown -- benchmark, leaf rsc_fpops_est, or deadline <= 0 --

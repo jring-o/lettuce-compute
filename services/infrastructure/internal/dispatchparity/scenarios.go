@@ -117,7 +117,9 @@ const (
 // its CURRENT verdict so the suite stays green while documenting the drift in code;
 // a behavior change on EITHER side flips a value here and trips the assertion,
 // forcing a deliberate update. See the scenario's construction site for the
-// analysis and the offending code lines.
+// analysis and the offending code lines. There are currently NO known divergences
+// (the empty-requester-hr_class one was reconciled by aligning the SQL to the
+// stricter Go semantics); the mechanism stays for the next one found.
 type LayerDivergence struct {
 	Go  bool   // eligibleLocked's current verdict for this scenario
 	SQL bool   // FindNextAssignable's current verdict for this scenario
@@ -396,30 +398,28 @@ func Scenarios() []Scenario {
 			s.RequesterHRClass = "AppleSilicon/darwin/arm64"
 			s.Eligible = false
 		}),
-		// KNOWN DIVERGENCE (recorded, not fixed — a security-relevant structural
-		// finding for the orchestrator). A unit pinned to a class, requester reports
-		// an EMPTY class:
-		//   - FindNextAssignable ADMITS it: its clause is
-		//       (wu.hr_class IS NULL OR $13::text = '' OR wu.hr_class = $13)
-		//     where $13 is the requester class, so an empty requester class is treated
-		//     as a wildcard (pgx-repo.go, the hr_class predicate ~L586).
-		//   - eligibleLocked REFUSES it: its clause is
-		//       cand.unit.HRClass != nil && *cand.unit.HRClass != "" && *cand.unit.HRClass != opts.HRClass
-		//     which has NO empty-requester-class wildcard, so a pinned class "X" != ""
-		//     rejects (dispatch_cache.go ~L930).
-		// The two predicates are therefore not equivalent functions. It is latent
-		// today because the hot path derives the requester class from
-		// HardwareCapabilities.HRClass(), which never returns "" (missing components
-		// collapse to "unknown"). The suite pins both current verdicts so the drift is
-		// documented and any change to either clause trips this case.
-		with("hr_pinned_empty_requester_class_KNOWN_DIVERGENCE", DimHRClass, func(s *Scenario) {
+		// RECONCILED DIVERGENCE. A unit pinned to a class, requester reports an EMPTY
+		// class: FindNextAssignable historically ADMITTED it (its clause carried an
+		// empty-requester-class wildcard, `$13::text = ''`) while eligibleLocked
+		// REFUSED it — the two predicates were not equivalent functions. The SQL was
+		// aligned to the stricter Go semantics: a pinned unit admits only its own
+		// class, and a requester reporting no class is not the pinned class (its
+		// results would not be bit-comparable with the pinned cohort's). The gRPC hot
+		// path never emits an empty class (HardwareCapabilities.HRClass() collapses
+		// missing components to "unknown"), but the browser-volunteer path builds
+		// AssignmentOptions with no HRClass at all, so before the reconciliation it
+		// could be handed class-pinned units. Both layers now refuse.
+		with("hr_pinned_empty_requester_class_excluded", DimHRClass, func(s *Scenario) {
 			s.UnitHRClass = "GenuineIntel/linux/amd64"
 			s.RequesterHRClass = "" // requester reports no class
-			s.Divergence = &LayerDivergence{
-				Go:  false, // eligibleLocked rejects (no empty-class wildcard)
-				SQL: true,  // FindNextAssignable admits ($13 = '' wildcard)
-				Why: "empty requester hr_class: SQL treats as wildcard (admit), Go rejects a pinned unit",
-			}
+			s.Eligible = false
+		}),
+		with("hr_unpinned_unit_admits_empty_requester_class", DimHRClass, func(s *Scenario) {
+			// The strict rule above must not over-reject: a requester with no class is
+			// excluded only from PINNED units; unpinned units remain open to it.
+			s.UnitHRClass = ""
+			s.RequesterHRClass = ""
+			s.Eligible = true
 		}),
 
 		// --- runtime / capability fit ----------------------------------------
