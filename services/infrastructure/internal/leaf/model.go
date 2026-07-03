@@ -160,6 +160,16 @@ type ValidationConfig struct {
 	// single hardware class (CPU vendor + OS + arch), so bit-for-bit agreement is
 	// achievable even for engines that are not portably deterministic. See dispatch.
 	HomogeneousRedundancy bool `json:"homogeneous_redundancy,omitempty"`
+
+	// AllowExternalOutput permits a volunteer to submit a result as an external
+	// reference (output_data_url) instead of inline bytes. Such a reference carries a
+	// volunteer-claimed output checksum that the head does NOT verify against the
+	// referenced bytes — there is no fetch-and-hash pipeline — so under EXACT
+	// comparison that unverified checksum becomes the agreement key, and "agreement"
+	// degrades to colluders repeating the same string. Enabling this therefore weakens
+	// corroboration for the leaf. Off by default: SubmitResult rejects external-
+	// reference submissions for any leaf that has not opted in.
+	AllowExternalOutput bool `json:"allow_external_output,omitempty"`
 }
 
 // EffectiveTargetCopies resolves the target_copies 0 sentinel (TODO #50): the configured

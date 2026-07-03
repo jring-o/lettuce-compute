@@ -526,16 +526,30 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			validationDetail{Field: "max_error_copies", Reason: "out_of_range"})
 	}
 
-	// Agreement threshold: 0.0-1.0
+	// Agreement threshold: 0.0-1.0.
 	if c.AgreementThreshold < 0 || c.AgreementThreshold > 1 {
 		return apierror.ValidationError("agreement_threshold must be between 0.0 and 1.0",
 			validationDetail{Field: "agreement_threshold", Reason: "out_of_range"})
 	}
+	// On a redundant leaf (effective target_copies >= 2) a threshold of 0.5 or below would let
+	// a minority or bare plurality of results validate a unit, so require a strict majority.
+	// Exactly 0 is the "unset" sentinel (ApplyValidationConfigDefaults rewrites it to 1.0);
+	// leave it to that path so the sentinel keeps working.
+	if effTarget >= 2 && c.AgreementThreshold > 0 && c.AgreementThreshold <= 0.5 {
+		return apierror.ValidationError(
+			"agreement_threshold must be greater than 0.5 for redundant leafs (target_copies >= 2); a lower threshold would let a minority of results validate a unit",
+			validationDetail{Field: "agreement_threshold", Reason: "not_strict_majority"})
+	}
 
-	// Comparison mode
+	// Comparison mode. CUSTOM is a recognized mode but has no runtime comparator (the engine
+	// errors on it and the unit would park forever), so it is rejected here until implemented.
 	switch c.ComparisonMode {
-	case ComparisonExact, ComparisonNumericTolerance, ComparisonCustom:
+	case ComparisonExact, ComparisonNumericTolerance:
 		// valid
+	case ComparisonCustom:
+		return apierror.ValidationError(
+			"comparison_mode CUSTOM is not yet supported; use EXACT or NUMERIC_TOLERANCE",
+			validationDetail{Field: "comparison_mode", Reason: "not_yet_supported"})
 	default:
 		return apierror.ValidationError(
 			fmt.Sprintf("invalid comparison_mode: %q; must be one of EXACT, NUMERIC_TOLERANCE, CUSTOM", c.ComparisonMode),
@@ -550,13 +564,8 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 		}
 	}
 
-	// Custom comparator ref required when mode = CUSTOM
-	if c.ComparisonMode == ComparisonCustom {
-		if c.CustomComparatorRef == nil || *c.CustomComparatorRef == "" {
-			return apierror.ValidationError("custom_comparator_ref is required when comparison_mode is CUSTOM",
-				validationDetail{Field: "custom_comparator_ref", Reason: "required_for_custom"})
-		}
-	}
+	// (CUSTOM mode, and therefore custom_comparator_ref, is rejected above until a runtime
+	// comparator exists.)
 
 	// Max retries: 1-10
 	if c.MaxRetries < 1 || c.MaxRetries > 10 {

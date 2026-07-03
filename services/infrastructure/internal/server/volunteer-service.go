@@ -1153,36 +1153,53 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		ctx = shedCtx
 	}
 
-	// M3: enforce the leaf's researcher-configured per-result output cap on the
-	// INLINE output before storing it (and before opening a transaction). Without
-	// this, an authenticated, assigned volunteer could submit inline output far
-	// larger than the configured maximum, causing unbounded JSONB storage and
-	// memory pressure (the aggregation engine later loads all agreed outputs into
-	// memory). This applies only to inline output_data; the external
-	// output_data_url path carries no inline bytes here.
-	if len(req.OutputData) > 0 {
+	// The leaf backing this work unit governs two pre-storage gates, so it is loaded
+	// once here (before opening a transaction) when either applies:
+	//
+	//   1. External-reference gate: an external output (output_data_url) carries a
+	//      volunteer-claimed checksum that the head never verifies against the bytes —
+	//      there is no fetch-and-hash pipeline — so under EXACT comparison that claimed
+	//      checksum would become the agreement key, making "agreement" merely colluders
+	//      repeating a string. Reject an external reference unless the leaf has opted in
+	//      via allow_external_output. The reference client submits inline only, so this
+	//      breaks no shipped volunteer.
+	//   2. M3 output cap: enforce the leaf's per-result max_output_size_bytes on the
+	//      INLINE output, so an authenticated, assigned volunteer cannot store output far
+	//      larger than configured (unbounded JSONB storage and memory pressure — the
+	//      aggregation engine later loads all agreed outputs into memory). Applies only
+	//      to inline output_data; an external reference carries no inline bytes here.
+	if len(req.OutputData) > 0 || req.OutputDataUrl != "" {
 		submitWU, wuErr := s.wuRepo.GetByID(ctx, workUnitID)
 		if wuErr != nil {
 			apiErr, ok := wuErr.(*apierror.APIError)
 			if ok && apiErr.HTTPStatus == 404 {
 				return nil, status.Errorf(codes.NotFound, "work unit not found")
 			}
-			s.logger.Error("failed to load work unit for output size check", "error", wuErr)
+			s.logger.Error("failed to load work unit for output gate", "error", wuErr)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 		submitLeaf, leafErr := s.leafRepo.GetByID(ctx, submitWU.LeafID)
 		if leafErr != nil {
-			s.logger.Error("failed to load leaf for output size check", "error", leafErr)
+			s.logger.Error("failed to load leaf for output gate", "error", leafErr)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
-		// MaxOutputSizeBytes is always > 0 for a stored leaf (ValidateDataConfig
-		// requires > 0 and ApplyDataConfigDefaults fills 0 with a 100MB default),
-		// but we still guard on > 0 so a max of 0 is treated as "unlimited" and
-		// never rejects a legitimate submission.
-		maxOut := submitLeaf.DataConfig.MaxOutputSizeBytes
-		if maxOut > 0 && int64(len(req.OutputData)) > maxOut {
+
+		// Gate 1: external reference requires leaf opt-in.
+		if req.OutputDataUrl != "" && !submitLeaf.ValidationConfig.AllowExternalOutput {
 			return nil, status.Errorf(codes.InvalidArgument,
-				"output_data size %d bytes exceeds leaf max_output_size_bytes %d", len(req.OutputData), maxOut)
+				"this leaf accepts inline output_data only; external output_data_url is not permitted")
+		}
+
+		// Gate 2: inline output size cap. MaxOutputSizeBytes is always > 0 for a stored
+		// leaf (ValidateDataConfig requires > 0 and ApplyDataConfigDefaults fills 0 with
+		// a 100MB default), but we still guard on > 0 so a max of 0 is treated as
+		// "unlimited" and never rejects a legitimate submission.
+		if len(req.OutputData) > 0 {
+			maxOut := submitLeaf.DataConfig.MaxOutputSizeBytes
+			if maxOut > 0 && int64(len(req.OutputData)) > maxOut {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"output_data size %d bytes exceeds leaf max_output_size_bytes %d", len(req.OutputData), maxOut)
+			}
 		}
 	}
 

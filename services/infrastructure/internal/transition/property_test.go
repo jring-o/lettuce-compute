@@ -160,18 +160,22 @@ func TestProperty_TerminalIsInert(t *testing.T) {
 	}
 }
 
-// goldenDecide models the pre-#50 decision for the DEFAULT regime (target == quorum ==
-// redundancy_factor, default caps): SubmitResult marked COMPLETED at pending >= R, TryValidate
-// ran applyThreshold (accept on ratio >= threshold, else PENDING while active copies remained,
-// else reject), and DeadLetterIfExhausted parked FAILED when QUEUED with no live copy, quorum
-// unmet, and total >= ceiling.
+// goldenDecide models the decision for the DEFAULT regime (target == quorum ==
+// redundancy_factor, default caps): SubmitResult marked COMPLETED at pending >= R, the decider
+// accepted on the agreement gates, else held PENDING while active copies remained, else
+// rejected, and DeadLetterIfExhausted parked FAILED when QUEUED with no live copy, quorum
+// unmet, and total >= ceiling. The acceptance gates fold in the Phase 0 hardening (agreeing
+// group >= min_quorum AND a strict majority AND ratio >= threshold), so this stays an
+// independent reference for Decide's arithmetic rather than the pre-hardening ratio-only rule.
 func goldenDecide(s UnitSnapshot) Action {
 	if s.State == workunit.WorkUnitStateValidated || s.State == workunit.WorkUnitStateFailed {
 		return ActionWait
 	}
 	R := s.Policy.MinQuorum // == target in the default regime
 	if s.PendingCount >= R {
-		if s.Comparison != nil && s.Comparison.Ratio >= s.Policy.AgreementThreshold {
+		v := s.Comparison
+		if v != nil && v.Ratio >= s.Policy.AgreementThreshold &&
+			v.MajorityCount >= s.Policy.MinQuorum && 2*v.MajorityCount > v.Total {
 			return ActionValidate
 		}
 		if s.LiveCopies > 0 {

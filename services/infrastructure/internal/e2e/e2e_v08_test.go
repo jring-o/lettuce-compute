@@ -515,6 +515,9 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 		},
 		leaf.ValidationConfig{
 			RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
+			// This leaf exercises the external-reference output path, so it must opt in;
+			// SubmitResult otherwise rejects output_data_url.
+			AllowExternalOutput: true,
 		},
 		leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
 	)

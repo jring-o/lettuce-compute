@@ -661,15 +661,72 @@ func TestNumericTolerance_OutsideEpsilon_BothRejected(t *testing.T) {
 	}
 }
 
-func TestQuorum_Redundancy3_TwoMatch_OneNot(t *testing.T) {
+func TestQuorum_Redundancy3_TwoMatch_BelowFloor_Rejected(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 	vol1 := types.NewID()
 	vol2 := types.NewID()
 	vol3 := types.NewID()
 
-	// threshold=0.66 so 2/3 = 0.667 >= 0.66 passes
+	// redundancy_factor=3 resolves min_quorum to 3, so a 2-of-3 agreeing group is BELOW the
+	// floor even though its ratio (0.667) meets threshold 0.66. Phase 0 blocks validation: with
+	// no active assignments left, the round is rejected (a fresh set is requeued) rather than
+	// crediting a sub-quorum group.
 	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 1.0)
+	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
+	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r3 := makeResult(wuID, vol3, "bbbb", nil)
+
+	resultRepo := newMockResultRepo()
+	resultRepo.addResult(r1)
+	resultRepo.addResult(r2)
+	resultRepo.addResult(r3)
+
+	wuRepo := newMockWorkUnitRepo()
+	wuRepo.addWorkUnit(wu)
+
+	leafRepo := newMockLeafRepo()
+	leafRepo.addLeaf(proj)
+
+	creditRepo := newMockCreditRepo()
+
+	volRepo := newMockVolunteerRepo()
+	volRepo.addVolunteer(makeVolunteer(vol1))
+	volRepo.addVolunteer(makeVolunteer(vol2))
+	volRepo.addVolunteer(makeVolunteer(vol3))
+
+	assignRepo := newMockAssignmentRepo()
+
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
+
+	vr, err := engine.TryValidate(context.Background(), wuID)
+	if err != nil {
+		t.Fatalf("TryValidate: %v", err)
+	}
+	if vr.Outcome != OutcomeRejected {
+		t.Errorf("Outcome = %q, want REJECTED (agreeing group 2 < min_quorum 3)", vr.Outcome)
+	}
+	if len(vr.RejectedResults) != 3 {
+		t.Errorf("RejectedResults = %d, want 3 (whole set requeued)", len(vr.RejectedResults))
+	}
+	if len(vr.CreditEntries) != 0 {
+		t.Errorf("CreditEntries = %d, want 0", len(vr.CreditEntries))
+	}
+}
+
+func TestQuorum_Target3Quorum2_TwoMatch_Validated(t *testing.T) {
+	leafID := types.NewID()
+	wuID := types.NewID()
+	vol1 := types.NewID()
+	vol2 := types.NewID()
+	vol3 := types.NewID()
+
+	// The supported way to accept a majority under Phase 0: an explicit min_quorum of 2 (with
+	// target/redundancy 3). A 2-of-3 agreeing group now meets the floor (2>=2), is a strict
+	// majority (2*2>3), and clears threshold 0.66 — so it validates the two, rejects the one.
+	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 1.0)
+	proj.ValidationConfig.MinQuorum = 2
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	r1 := makeResult(wuID, vol1, "aaaa", nil)
 	r2 := makeResult(wuID, vol2, "aaaa", nil)
@@ -1190,7 +1247,7 @@ func TestNumericTolerance_FiniteOutsideEpsilon_StillDisagrees(t *testing.T) {
 	}
 }
 
-func TestExactMatch_Tie_DeterministicBreaking(t *testing.T) {
+func TestExactMatch_Tie_NoAgreement(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 	vol1 := types.NewID()
@@ -1198,9 +1255,10 @@ func TestExactMatch_Tie_DeterministicBreaking(t *testing.T) {
 	vol3 := types.NewID()
 	vol4 := types.NewID()
 
-	// redundancy=4, threshold=0.5 so 2/4 = 0.5 >= 0.5 passes.
-	// Two groups of 2: checksum "bbbb" and checksum "aaaa".
-	// Deterministic tie-breaking should pick "aaaa" (lexicographically smaller).
+	// redundancy=4, threshold=0.5. Two equal groups of 2 ("bbbb" and "aaaa") tie for largest.
+	// Phase 0 removes the (grindable) lexicographic tie-break: a tie is NO agreement, so with
+	// no active assignments the whole set is rejected — never a coin-flip winner. Run several
+	// times to prove the outcome does not depend on map iteration order.
 	proj := makeLeaf(leafID, 4, 0.5, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	r1 := makeResult(wuID, vol1, "bbbb", nil)
@@ -1232,7 +1290,6 @@ func TestExactMatch_Tie_DeterministicBreaking(t *testing.T) {
 
 	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
 
-	// Run multiple times to confirm determinism.
 	for i := 0; i < 20; i++ {
 		// Reset state for each iteration.
 		wu.State = workunit.WorkUnitStateCompleted
@@ -1253,23 +1310,14 @@ func TestExactMatch_Tie_DeterministicBreaking(t *testing.T) {
 		if vr == nil {
 			t.Fatalf("iteration %d: expected non-nil ValidationResult", i)
 		}
-		if vr.Outcome != OutcomeValidated {
-			t.Fatalf("iteration %d: Outcome = %q, want VALIDATED", i, vr.Outcome)
+		if vr.Outcome != OutcomeRejected {
+			t.Fatalf("iteration %d: Outcome = %q, want REJECTED (tie = no majority)", i, vr.Outcome)
 		}
-		if len(vr.AgreedResults) != 2 {
-			t.Fatalf("iteration %d: AgreedResults = %d, want 2", i, len(vr.AgreedResults))
+		if len(vr.RejectedResults) != 4 {
+			t.Fatalf("iteration %d: RejectedResults = %d, want 4", i, len(vr.RejectedResults))
 		}
-		if len(vr.RejectedResults) != 2 {
-			t.Fatalf("iteration %d: RejectedResults = %d, want 2", i, len(vr.RejectedResults))
-		}
-		// The "aaaa" group should always win (lexicographically smaller).
-		// Verify the agreed results are vol3 and vol4 (the "aaaa" group).
-		agreedSet := make(map[types.ID]bool)
-		for _, id := range vr.AgreedResults {
-			agreedSet[id] = true
-		}
-		if !agreedSet[r3.ID] || !agreedSet[r4.ID] {
-			t.Fatalf("iteration %d: expected results with checksum 'aaaa' to win tie, but got different agreed set", i)
+		if len(vr.CreditEntries) != 0 {
+			t.Fatalf("iteration %d: CreditEntries = %d, want 0 (nothing validated)", i, len(vr.CreditEntries))
 		}
 	}
 }
@@ -1602,8 +1650,11 @@ func TestAttestationsCreatedForRejectedResults(t *testing.T) {
 	vol2 := types.NewID()
 	vol3 := types.NewID()
 
-	// 2 agree, 1 disagrees. Threshold=0.66 so 2/3 passes.
+	// 2 agree, 1 disagrees. target/redundancy 3 with an explicit min_quorum of 2 lets the
+	// 2-of-3 majority validate (floor 2>=2, strict majority, ratio 0.667 >= threshold 0.66),
+	// so the unit produces both AGREED and DISAGREED attestations.
 	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 2.0)
+	proj.ValidationConfig.MinQuorum = 2
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	r1 := makeResult(wuID, vol1, "aaaa", nil)
 	r2 := makeResult(wuID, vol2, "aaaa", nil)
