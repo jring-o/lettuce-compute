@@ -84,8 +84,12 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	headHandler := leaf.NewHeadHandler(deps.HeadConfig, deps.Pool, deps.Logger)
 	mux.HandleFunc("GET /api/v1/head", headHandler.HandleGetHeadInfo)
 
-	// Work unit handler (RegisterRoutes is no-op; all routes are protected).
-	wuRepo := workunit.NewPgxWorkUnitRepository(deps.Pool)
+	// Work unit handler (RegisterRoutes is no-op; all routes are protected). The repo carries
+	// the head trust-gate dispatch policy so the browser/WASM request-work path resolves the
+	// trusted-corroborator reservation identically to the gRPC path; the zero policy (gate
+	// off, the default) leaves dispatch unchanged.
+	wuRepo := workunit.NewPgxWorkUnitRepository(deps.Pool).
+		WithTrustDispatch(TrustDispatchFromHeadConfig(deps.HeadConfig))
 	batchRepo := workunit.NewPgxBatchRepository(deps.Pool)
 	assignRepo := assignment.NewPgxRepository(deps.Pool)
 	patternRouter := generate.NewRouter(adaptParamSweep, adaptMapReduce, adaptMonteCarlo, custom.Generate, deps.Logger)
@@ -291,6 +295,9 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		headName:                headName,
 		defaultWeights:          defaultWeights,
 		maxInflightPerVolunteer: maxInflight,
+		// Same head trust-gate policy the shared wuRepo carries, so the browser/WASM
+		// request-work path resolves the trusted-corroborator reservation identically.
+		trustDispatch: TrustDispatchFromHeadConfig(deps.HeadConfig),
 	}
 
 	mux.HandleFunc("POST /api/v1/volunteers/register", handleBrowserRegister(bvDeps))

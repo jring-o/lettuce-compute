@@ -30,6 +30,9 @@ func (f *fakeTrustRepo) Slash(context.Context, string) error                { re
 func (f *fakeTrustRepo) List(context.Context, int, int) ([]*trust.Entry, error) {
 	return nil, nil
 }
+func (f *fakeTrustRepo) AllScores(context.Context) (map[string]int, error) {
+	return map[string]int{}, nil
+}
 
 func (f *fakeTrustRepo) totalAccruals() int {
 	n := 0

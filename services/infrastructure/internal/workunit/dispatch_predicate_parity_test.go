@@ -39,6 +39,12 @@ import (
 // SKIP unless LETTUCE_TEST_DB_URL is set (via the shared setupTestDB), and safe under
 // `-p 1` (each scenario DELETE-cleans the shared tables before it seeds).
 
+// parityTrustedScore is the current/stamped trust score a scenario's TRUSTED contributors
+// (live holders, pending authors) are seeded with. It is deliberately far above every
+// scenario's resolved floor so a "trusted" contributor is unambiguously trusted regardless
+// of which floor the scenario resolves.
+const parityTrustedScore = 1000000
+
 // seededParity identifies the freshly seeded rows a single scenario needs.
 type seededParity struct {
 	leafID    types.ID
@@ -54,6 +60,7 @@ func cleanParityTables(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	for _, table := range []string{
+		"volunteer_trust",
 		"work_unit_assignment_history", "credit_ledger", "results",
 		"work_units", "batches", "leafs", "volunteers", "users",
 	} {
@@ -82,9 +89,14 @@ func parityResReq(s dispatchparity.Scenario) string {
 }
 
 func parityValConfig(s dispatchparity.Scenario) string {
+	// min_trusted_corroborators / trust_floor carry the per-leaf trust overrides. Both
+	// resolve via COALESCE((... )::int, 0) > 0 in effTrustKSQL / effTrustFloorSQL, so a 0
+	// here is indistinguishable from the field being absent — inheriting the head default,
+	// exactly like a leaf that never set them. Emitting them unconditionally keeps the JSON
+	// shape uniform across scenarios.
 	return fmt.Sprintf(
-		`{"redundancy_factor":%d,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`,
-		s.TargetCopies,
+		`{"redundancy_factor":%d,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3,"min_trusted_corroborators":%d,"trust_floor":%d}`,
+		s.TargetCopies, s.LeafTrustK, s.LeafTrustFloor,
 	)
 }
 
@@ -134,6 +146,40 @@ func setVolunteerDID(t *testing.T, pool *pgxpool.Pool, vol types.ID, did, status
 	}
 }
 
+// setTrustScore upserts a volunteer_trust row for vol's subject with the given current
+// score. The subject is computed by the PRODUCTION SQL expression (subjectExprSQL) from the
+// volunteer row, never re-implemented here — so the seeded key matches the subject the
+// dispatch queries resolve for the same volunteer. Used to make a live-copy holder (or the
+// requester) count TRUSTED by its CURRENT score (the live arm of the trusted-present count,
+// and the requester-trusted bypass).
+func setTrustScore(t *testing.T, pool *pgxpool.Pool, vol types.ID, score int) {
+	t.Helper()
+	sql := `INSERT INTO volunteer_trust (subject, score)
+		SELECT ` + subjectExprSQL("v") + `, $2 FROM volunteers v WHERE v.id = $1
+		ON CONFLICT (subject) DO UPDATE SET score = EXCLUDED.score, updated_at = NOW()`
+	if _, err := pool.Exec(context.Background(), sql, vol, score); err != nil {
+		t.Fatalf("set trust score: %v", err)
+	}
+}
+
+// stampResultTrust stamps a PENDING result's submission-time trust snapshot
+// (results.trust_subject + results.trust_score_at_submit) for author vol on wuID, so the
+// result counts TRUSTED via the STAMP arm of the trusted-present count — exactly the number
+// the validation verdict will credit, not a later current score. The stamped subject is the
+// author's subject via the production expression (subjectExprSQL). The base
+// insertPendingResult leaves both columns NULL, i.e. untrusted; this promotes a chosen
+// author to trusted.
+func stampResultTrust(t *testing.T, pool *pgxpool.Pool, wuID, vol types.ID, score int) {
+	t.Helper()
+	sql := `UPDATE results r
+		SET trust_subject = (` + subjectExprSQL("v") + `), trust_score_at_submit = $3
+		FROM volunteers v
+		WHERE r.work_unit_id = $1 AND r.volunteer_id = $2 AND v.id = $2`
+	if _, err := pool.Exec(context.Background(), sql, wuID, vol, score); err != nil {
+		t.Fatalf("stamp result trust: %v", err)
+	}
+}
+
 // seedParity materializes one scenario into Postgres and returns the ids the gates
 // need. It is the SQL counterpart of the Go half's projectGo: the same abstract
 // scenario, rendered as rows.
@@ -169,11 +215,29 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 	}
 
 	// Live copies + PENDING results by OTHER, distinct volunteers (redundancy coverage).
+	// The first TrustedOtherLiveCopies live holders and the first TrustedOtherPendingResults
+	// pending authors are made TRUSTED so they count toward the trusted-corroborator
+	// reservation's trusted-present total — a live holder via a high CURRENT volunteer_trust
+	// score, a pending author via a high STAMPED submission-time score (the two arms of
+	// trustedPresentCountSQL). parityTrustedScore is far above every scenario floor.
 	for i := 0; i < s.OtherLiveCopies; i++ {
-		insertLiveCopy(t, pool, wu.ID, createTestVolunteer(t, pool), nil)
+		holder := createTestVolunteer(t, pool)
+		insertLiveCopy(t, pool, wu.ID, holder, nil)
+		if i < s.TrustedOtherLiveCopies {
+			setTrustScore(t, pool, holder, parityTrustedScore)
+		}
 	}
 	for i := 0; i < s.OtherPendingResults; i++ {
-		insertPendingResult(t, pool, wu.ID, createTestVolunteer(t, pool))
+		author := createTestVolunteer(t, pool)
+		insertPendingResult(t, pool, wu.ID, author)
+		if i < s.TrustedOtherPendingResults {
+			stampResultTrust(t, pool, wu.ID, author, parityTrustedScore)
+		}
+	}
+	// The requester's own current trust score (0 = no row = untrusted). A score at or above
+	// the resolved floor makes the requester TRUSTED, bypassing the reservation.
+	if s.RequesterTrustScore > 0 {
+		setTrustScore(t, pool, requester, s.RequesterTrustScore)
 	}
 
 	// The requester's own relationship to the target unit.
@@ -286,6 +350,16 @@ func TestDispatchPredicateParity_SQL(t *testing.T) {
 	for _, s := range dispatchparity.Scenarios() {
 		s := s
 		t.Run(s.Name, func(t *testing.T) {
+			// Feed the scenario's head trust-gate policy into every SQL predicate site for
+			// this scenario (mutates the shared repo in place; each scenario resets it, and
+			// the zero policy every non-trust scenario carries keeps the reservation inert).
+			// The per-leaf (K, floor) overrides ride on validation_config (parityValConfig).
+			repo.WithTrustDispatch(TrustDispatchPolicy{
+				GateEnabled:             s.TrustGateEnabled,
+				DefaultMinCorroborators: s.TrustDefaultK,
+				DefaultFloor:            s.TrustDefaultFloor,
+			})
+
 			// --- FindNextAssignable: the full read-side predicate ---
 			cleanParityTables(t, pool)
 			seed := seedParity(t, pool, repo, s)

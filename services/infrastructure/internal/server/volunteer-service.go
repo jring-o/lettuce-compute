@@ -374,6 +374,10 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		hostRepo:            s.hostRepo,
 		artifactVersionRepo: s.artifactVersionRepo,
 		reliabilityRepo:     s.reliabilityRepo,
+		// Reuse the already-constructed submit-time trust store (nil only in the
+		// gRPC-plumbing tests that pass a nil pool). The refiller reads AllScores off the
+		// hot path to keep the trusted-corroborator reservation's score snapshot fresh.
+		trustRepo: s.trustRepo,
 	}, s.logger)
 	s.dispatchCache = cache
 
@@ -949,7 +953,10 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 	}
 	defer tx.Rollback(ctx)
 
-	txWURepo := workunit.NewPgxWorkUnitRepository(tx)
+	// Carry the head trust-gate policy so ReserveNextAssignable -> FindNextAssignable applies
+	// the trusted-corroborator reservation on this Layer-1 fallback dispatch path identically
+	// to the cache path (inert when the gate is off).
+	txWURepo := workunit.NewPgxWorkUnitRepository(tx).WithTrustDispatch(trustDispatchFromPolicy(s.trustPolicy))
 
 	// leafCache collapses repeated GetByID lookups so N units from one leaf cost
 	// one lookup (the spot-check check and the response build share it). The leaf

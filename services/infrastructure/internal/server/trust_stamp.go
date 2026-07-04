@@ -11,6 +11,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
+	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
 // TrustPolicyFromHeadConfig builds the head trust-gate policy (see internal/trust) from the
@@ -26,6 +27,37 @@ func TrustPolicyFromHeadConfig(hc *config.HeadConfig) transition.TrustPolicy {
 		GateEnabled:             hc.TrustGateEnabled,
 		DefaultMinCorroborators: hc.EffectiveTrustMinCorroborators(),
 		DefaultFloor:            hc.EffectiveTrustFloor(),
+	}
+}
+
+// TrustDispatchFromHeadConfig builds the workunit dispatch trust policy (the head-level
+// (K, floor) the dispatch queries resolve per-leaf for the trusted-corroborator
+// reservation) from the head configuration. It reads the SAME three sources as
+// TrustPolicyFromHeadConfig — the validation-side head policy — so the dispatch reservation
+// and the validation gate can never resolve different numbers from one config. A nil config
+// yields the zero value (gate off, reservation inert). It exists as a distinct type because
+// workunit cannot import transition (transition imports workunit), so the two policies are
+// field-identical mirrors rather than one shared struct.
+func TrustDispatchFromHeadConfig(hc *config.HeadConfig) workunit.TrustDispatchPolicy {
+	if hc == nil {
+		return workunit.TrustDispatchPolicy{}
+	}
+	return workunit.TrustDispatchPolicy{
+		GateEnabled:             hc.TrustGateEnabled,
+		DefaultMinCorroborators: hc.EffectiveTrustMinCorroborators(),
+		DefaultFloor:            hc.EffectiveTrustFloor(),
+	}
+}
+
+// trustDispatchFromPolicy mirrors an already-resolved head trust policy into the workunit
+// dispatch policy. The two structs are field-identical (workunit cannot import transition),
+// so this is the conversion the tx-scoped dispatch repos use to carry the same numbers the
+// volunteer service was constructed with onto their per-request repository.
+func trustDispatchFromPolicy(tp transition.TrustPolicy) workunit.TrustDispatchPolicy {
+	return workunit.TrustDispatchPolicy{
+		GateEnabled:             tp.GateEnabled,
+		DefaultMinCorroborators: tp.DefaultMinCorroborators,
+		DefaultFloor:            tp.DefaultFloor,
 	}
 }
 

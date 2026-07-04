@@ -143,7 +143,12 @@ func main() {
 
 	// Create repositories (shared between HTTP router and gRPC service).
 	volunteerRepo := volunteer.NewPgxRepository(pool)
-	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
+	// The dispatch queries resolve the trusted-corroborator reservation per leaf from the
+	// head trust-gate policy (built from the same config sources as the validation-side
+	// trustPolicy below). The zero policy (gate off, the default) leaves every dispatch query
+	// byte-for-byte as before, so this is safe to wire unconditionally.
+	wuRepo := workunit.NewPgxWorkUnitRepository(pool).
+		WithTrustDispatch(server.TrustDispatchFromHeadConfig(&cfg.Head))
 	leafRepo := leaf.NewPgxRepository(pool)
 	assignRepo := assignment.NewPgxRepository(pool)
 	resultRepo := result.NewPgxRepository(pool)
