@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
@@ -78,7 +79,46 @@ func scanVolunteer(row pgx.Row) (*Volunteer, error) {
 // Create inserts a new volunteer.
 // On return, v is populated with the DB-generated id and timestamps.
 func (r *PgxRepository) Create(ctx context.Context, v *Volunteer) error {
-	row := r.pool.QueryRow(ctx, `
+	return createIn(ctx, r.pool, v)
+}
+
+// CreateAdmitted creates a volunteer through the registration-admission gates
+// (internal/admission). A nil gate is exactly Create — the legacy single-statement
+// path, byte-for-byte. With a gate, the per-(bucket, UTC day) creation-cap increment
+// and the volunteer INSERT run in ONE transaction: a cap refusal
+// (admission.ErrCreationCapExceeded), a duplicate-key conflict, or any failure rolls
+// both back together, so the counter counts exactly the creations that committed.
+func (r *PgxRepository) CreateAdmitted(ctx context.Context, v *Volunteer, gate *admission.CreateGate) error {
+	if gate == nil {
+		return r.Create(ctx, v)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return apierror.Internal("failed to begin registration transaction", err)
+	}
+	// Rollback after a successful Commit is a no-op.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := admission.ReserveCreationSlot(ctx, tx, gate.Bucket, gate.CapPerDay); err != nil {
+		if errors.Is(err, admission.ErrCreationCapExceeded) {
+			return err
+		}
+		return apierror.Internal("failed to enforce registration creation cap", err)
+	}
+	if err := createIn(ctx, tx, v); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return apierror.Internal("failed to commit registration transaction", err)
+	}
+	return nil
+}
+
+// createIn runs the volunteer INSERT on the given pgx surface (the shared pool for the
+// legacy path, the admission transaction for CreateAdmitted).
+func createIn(ctx context.Context, db admission.DBTX, v *Volunteer) error {
+	row := db.QueryRow(ctx, `
 		INSERT INTO volunteers (
 			public_key, user_id, display_name,
 			hardware_capabilities, available_runtimes, scheduling_mode, schedule_config,

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/atproto"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -269,6 +270,9 @@ func (r *recordingVolunteerRepo) SetDIDFrozenUntil(_ context.Context, id types.I
 
 // Remaining Repository methods are unused by these tests.
 func (r *recordingVolunteerRepo) Create(context.Context, *volunteer.Volunteer) error { return nil }
+func (r *recordingVolunteerRepo) CreateAdmitted(context.Context, *volunteer.Volunteer, *admission.CreateGate) error {
+	return nil
+}
 func (r *recordingVolunteerRepo) GetByID(_ context.Context, id types.ID) (*volunteer.Volunteer, error) {
 	return r.byID[id], nil
 }

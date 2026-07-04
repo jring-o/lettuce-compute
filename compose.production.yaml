@@ -141,6 +141,12 @@ services:
       LETTUCE_HEAD_STANDING_BENCH_RATE: ${LETTUCE_HEAD_STANDING_BENCH_RATE:-}
       LETTUCE_HEAD_STANDING_MIN_SAMPLE: ${LETTUCE_HEAD_STANDING_MIN_SAMPLE:-}
       LETTUCE_HEAD_STANDING_BENCH_MINUTES: ${LETTUCE_HEAD_STANDING_BENCH_MINUTES:-}
+      # --- Registration creation cap --- OFF by default; both OPTIONAL (leave unset to
+      # keep the built-in defaults). Bounds NEW volunteer-account registrations per network
+      # (IPv4 address / IPv6 /64) per UTC day; existing volunteers re-registering are never
+      # affected. Full description + defaults: guides/head-setup.md (Registration creation cap).
+      LETTUCE_HEAD_REGISTRATION_CAP_ENABLED: ${LETTUCE_HEAD_REGISTRATION_CAP_ENABLED:-}
+      LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY: ${LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY:-}
     volumes:
       - ./keys:/keys:ro
     healthcheck:

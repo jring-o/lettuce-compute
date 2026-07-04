@@ -524,6 +524,40 @@ all are OPTIONAL and take the defaults below when unset.
 | `standing_min_sample` (`LETTUCE_HEAD_STANDING_MIN_SAMPLE`) | `5` | Minimum decayed sample (good + bad adjudications) before any transition is evaluated, so a newcomer's first unlucky results cannot bench them. |
 | `standing_bench_minutes` (`LETTUCE_HEAD_STANDING_BENCH_MINUTES`) | `1440` (24h) | Auto-bench duration. An expired bench resolves to `PROBATION`, so re-entry to `OK` still goes through the hysteresis exit. |
 
+### Registration creation cap
+
+A **volunteer** joins a head by registering an Ed25519 keypair, which creates one volunteer
+account. The **registration creation cap** bounds how many *new* accounts a single network may
+create per day — counted per network, where a network is one IPv4 address or one IPv6 `/64`
+prefix, and reset at each UTC midnight. It applies to **both** registration paths: the
+`lettuce-volunteer` client and the browser sign-up flow. The count is charged only when a
+genuinely new account is created; a volunteer whose key already exists re-registers freely and
+never touches the limit.
+
+It is **not** a hard security boundary. Someone determined to mint many identities can rotate
+IP addresses (a VPN, a fresh mobile network) to land in a new bucket, so treat the cap as a
+**rate-limiter on identity minting** — it raises the cost of bulk account creation without ever
+touching your legitimate fleet. Already-registered volunteers are unaffected no matter how the
+cap is set, so turning it on cannot lock out existing contributors.
+
+When a network reaches the limit, the head refuses further *new* registrations from it until
+the next UTC day. The `lettuce-volunteer` client surfaces this as a clear
+`daily volunteer registration limit reached` failure for that server, and the browser sign-up
+form shows the same message; in both cases the volunteer can simply try again later. Refused
+attempts leave no trace — the counter records only registrations that actually created an
+account. The per-network counter rows are retained for **7 days** (useful when investigating
+which networks were creating accounts) and swept automatically, so the table does not grow
+unbounded. The cap is **off by default**; enable it by setting the two variables below and
+restarting the head.
+
+These are `head.*` keys in `lettuce.yaml` (or the matching `LETTUCE_HEAD_*` env vars);
+both are OPTIONAL and take the defaults below when unset.
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `registration_cap_enabled` (`LETTUCE_HEAD_REGISTRATION_CAP_ENABLED`) | `false` | Master switch. Off leaves registration unbounded (prior behavior). Enable to bound new-account creation per network on both the CLI and browser paths. |
+| `registration_cap_per_ip_per_day` (`LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY`) | `10` | Maximum new volunteer accounts one network (IPv4 address / IPv6 `/64` prefix) may create per UTC day. Raise it for sites behind one shared NAT — labs, campuses, offices — where many honest volunteers register from a single address. |
+
 ### Horizontal scale-out
 
 The head is **stateless** and can run as **N replicas** behind Caddy against one

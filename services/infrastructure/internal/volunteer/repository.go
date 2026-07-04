@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -16,6 +17,13 @@ type VolunteerListFilters struct {
 // Repository defines the data-access interface for volunteers.
 type Repository interface {
 	Create(ctx context.Context, v *Volunteer) error
+	// CreateAdmitted creates a volunteer through the registration-admission gates
+	// (internal/admission). With a non-nil gate the volunteer INSERT and the
+	// per-(bucket, UTC day) creation-cap increment run in ONE transaction, so a
+	// refusal (admission.ErrCreationCapExceeded) or failure rolls both back and the
+	// cap counts exactly the creations that committed. A nil gate is exactly Create —
+	// the knob-off inertness contract.
+	CreateAdmitted(ctx context.Context, v *Volunteer, gate *admission.CreateGate) error
 	GetByID(ctx context.Context, id types.ID) (*Volunteer, error)
 	GetByPublicKey(ctx context.Context, publicKey []byte) (*Volunteer, error)
 	GetByUserID(ctx context.Context, userID types.ID) (*Volunteer, error)

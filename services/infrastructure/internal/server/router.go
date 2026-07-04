@@ -316,6 +316,10 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		// Same head trust-gate policy the shared wuRepo carries, so the browser/WASM
 		// request-work path resolves the trusted-corroborator reservation identically.
 		trustDispatch: TrustDispatchFromHeadConfig(deps.HeadConfig),
+		// Registration admission cap (design §4.1), enforced identically to the gRPC
+		// register path; zero value (knob off) leaves browser registration unchanged.
+		registrationCap: RegistrationCapFromHeadConfig(deps.HeadConfig),
+		trustedProxies:  deps.TrustedProxies,
 	}
 
 	mux.HandleFunc("POST /api/v1/volunteers/register", handleBrowserRegister(bvDeps))

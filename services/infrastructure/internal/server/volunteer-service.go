@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
@@ -69,6 +71,11 @@ type volunteerService struct {
 	// transitioner. Zero value = gate off (the deploy-safety default); the real policy is
 	// threaded from config via NewVolunteerService.
 	trustPolicy transition.TrustPolicy
+	// registrationCap is the registration admission cap policy (design §4.1): at most
+	// PerDay volunteer CREATIONS per (IP bucket, UTC day). Zero value = gate off (the
+	// deploy-safety default); main.go threads the real policy via SetAdmissionPolicy.
+	// Re-registration of an existing key never consults it.
+	registrationCap admission.CapPolicy
 	// now supplies the current time for trust power-suppression checks; overridable in tests.
 	now func() time.Time
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
@@ -105,6 +112,9 @@ type volunteerService struct {
 	// stays visible without one Warn per shed on the hot path. Atomic, zero-valued.
 	cacheShedLogN    uint64
 	identityShedLogN uint64
+	// capRefusalLogN samples the creation-cap refusal Warn the same way (a capped
+	// network retrying is an abuse signal, not a per-line event).
+	capRefusalLogN uint64
 }
 
 // referenceBenchmarkFPOPS is the head's fixed reference-host throughput (FP ops /
@@ -281,6 +291,43 @@ func SetHeadConfig(svc lettucev1.VolunteerServiceServer, name, description, url 
 		}
 		vs.loadEstimator = newLoadEstimator(cfg, poolSaturation(vs.pool))
 	}
+}
+
+// SetAdmissionPolicy sets the registration admission policy (the per-IP creation cap,
+// design §4.1) on the gRPC volunteer service. The zero value is the deploy-safety
+// default (gate off, registration unchanged); main.go fills the real policy from
+// HeadConfig.Effective* values — a plain struct, so the service stays decoupled from
+// internal/config (the SetHeadConfig pattern).
+func SetAdmissionPolicy(svc lettucev1.VolunteerServiceServer, cap admission.CapPolicy) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.registrationCap = cap
+	}
+}
+
+// registrationGate resolves the per-request admission gate for a volunteer CREATE.
+// nil while the creation cap is disabled — the legacy create path, byte-for-byte.
+// Fails closed (non-nil error) when the cap is enabled but the client IP is missing
+// or unbucketable: a misconfigured head must not silently run uncapped.
+func (s *volunteerService) registrationGate(ctx context.Context) (*admission.CreateGate, error) {
+	if !s.registrationCap.Enabled {
+		return nil, nil
+	}
+	ip, ok := GRPCClientIPFromContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("registration cap enabled but no client IP in request context")
+	}
+	bucket, err := admission.BucketForIP(ip)
+	if err != nil {
+		return nil, err
+	}
+	return &admission.CreateGate{Bucket: bucket, CapPerDay: s.registrationCap.PerDay}, nil
+}
+
+// isConflictErr reports whether err is the repository's duplicate-key Conflict (the
+// get-then-create race on a new public key).
+func isConflictErr(err error) bool {
+	var apiErr *apierror.APIError
+	return errors.As(err, &apiErr) && apiErr.HTTPStatus == 409
 }
 
 // StartDispatchCache builds and launches the Layer-2 in-process dispatch cache on
@@ -588,7 +635,20 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 
-		// Not found — create new volunteer.
+		// Not found — create new volunteer, through the registration admission gates
+		// (design §4.1). The gate is nil while the creation cap is disabled, which is
+		// exactly the legacy create path; only genuinely-NEW registrations ever pay
+		// admission cost (the update branch below never consults it).
+		gate, gateErr := s.registrationGate(ctx)
+		if gateErr != nil {
+			// Fail closed: the cap is enabled but the client IP cannot be bucketed.
+			// Unreachable through a real gRPC server (the rate-limit interceptor always
+			// stashes an IP for this method); a misconfigured deployment must not
+			// silently run uncapped.
+			s.logger.Error("failed to resolve registration admission gate", "method", "RegisterVolunteer", "error", gateErr)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+
 		v := &volunteer.Volunteer{
 			PublicKey:            req.PublicKey,
 			DisplayName:          displayName,
@@ -599,31 +659,55 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			LastSeenAt:           &now,
 		}
 
-		if createErr := s.volunteerRepo.Create(ctx, v); createErr != nil {
+		createErr := s.volunteerRepo.CreateAdmitted(ctx, v, gate)
+		switch {
+		case createErr == nil:
+			// Warm the dispatch cache's in-memory identity snapshot so the FIRST
+			// RequestWorkUnit resolves this volunteer's identity/capabilities in memory
+			// (Blocker 1: identity off the hot path).
+			if s.dispatchCache != nil {
+				s.dispatchCache.putIdentity(v)
+			}
+
+			// Per-machine host (TODO #19): record this machine's advertised runtimes/hardware
+			// against its own host row, so two machines under one key no longer overwrite each
+			// other on the single account row.
+			s.registerHost(ctx, v.ID, req, hw, now)
+
+			// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
+			// now that the generic gRPC access log is demoted to Debug.
+			s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true)
+
+			return &lettucev1.RegisterVolunteerResponse{
+				VolunteerId: v.ID.String(),
+				Registered:  true,
+			}, nil
+
+		case errors.Is(createErr, admission.ErrCreationCapExceeded):
+			// Sampled Warn (H-5 idiom): a capped network hammering register is an abuse
+			// signal, not a per-line event. FailedPrecondition, NEVER ResourceExhausted —
+			// the CLI retries ResourceExhausted forever (~30s backoff) and would look
+			// hung; the pinned message avoids the IsVolunteerTooOldError trigger words.
+			if n := atomic.AddUint64(&s.capRefusalLogN, 1); n%shedLogSampleN == 1 {
+				s.logger.Warn("refusing registration: creation cap exceeded",
+					"method", "RegisterVolunteer", "bucket", gate.Bucket, "refusal_count", n)
+			}
+			return nil, status.Error(codes.FailedPrecondition, admission.CapExceededMessage)
+
+		case isConflictErr(createErr):
+			// Lost the get-then-create race to a concurrent registration of the same
+			// key: re-fetch and fall through to the update path — the correct upsert
+			// semantics (previously this surfaced as Internal).
+			existing, err = s.volunteerRepo.GetByPublicKey(ctx, req.PublicKey)
+			if err != nil {
+				s.logger.Error("failed to re-fetch volunteer after create race", "method", "RegisterVolunteer", "error", err)
+				return nil, status.Errorf(codes.Internal, "internal error")
+			}
+
+		default:
 			s.logger.Error("failed to create volunteer", "method", "RegisterVolunteer", "error", createErr)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
-
-		// Warm the dispatch cache's in-memory identity snapshot so the FIRST
-		// RequestWorkUnit resolves this volunteer's identity/capabilities in memory
-		// (Blocker 1: identity off the hot path).
-		if s.dispatchCache != nil {
-			s.dispatchCache.putIdentity(v)
-		}
-
-		// Per-machine host (TODO #19): record this machine's advertised runtimes/hardware
-		// against its own host row, so two machines under one key no longer overwrite each
-		// other on the single account row.
-		s.registerHost(ctx, v.ID, req, hw, now)
-
-		// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
-		// now that the generic gRPC access log is demoted to Debug.
-		s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true)
-
-		return &lettucev1.RegisterVolunteerResponse{
-			VolunteerId: v.ID.String(),
-			Registered:  true,
-		}, nil
 	}
 
 	// Found — update existing volunteer.

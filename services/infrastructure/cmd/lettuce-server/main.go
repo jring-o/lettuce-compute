@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/atproto"
@@ -338,6 +339,10 @@ func main() {
 			ReliabilityQuotaEnabled: cfg.Head.EffectiveReliabilityQuotaEnabled(),
 			ReliabilityQuotaFloor:   cfg.Head.EffectiveReliabilityQuotaFloor(),
 		})
+	// Registration admission cap (design §4.1) — the same resolved policy the router
+	// hands the browser register path, so both create surfaces enforce one number.
+	// Zero value (knob off, the default) leaves gRPC registration unchanged.
+	server.SetAdmissionPolicy(volunteerSvc, server.RegistrationCapFromHeadConfig(&cfg.Head))
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	// Start HTTP server.
@@ -436,6 +441,12 @@ func main() {
 		go artifactGC.Start(leaderCtx)
 		if didRecheckWorker != nil {
 			go didRecheckWorker.Start(leaderCtx)
+		}
+		// Registration-admission counter retention sweep (design §4.1) — started only
+		// when the creation cap is on (the machine-enabled wiring idiom): with the knob
+		// off nothing writes the table, so there is nothing to sweep.
+		if cfg.Head.RegistrationCapEnabled {
+			go admission.NewCounterSweeper(pool, logger).Start(leaderCtx)
 		}
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})

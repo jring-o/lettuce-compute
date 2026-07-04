@@ -124,6 +124,11 @@ func grpcRateLimitInterceptor(store *rateLimitStore, trustedProxies []*net.IPNet
 			return handler(ctx, req)
 		}
 		ip := grpcClientIP(ctx, trustedProxies)
+		// Stash the trust-aware client IP for handlers that need it (the registration
+		// admission gates). Piggybacked here because this interceptor already computes
+		// it for the bucket key; exempt (in-flight work-lifecycle) methods skip both
+		// the limiter and the stash, and no handler on those paths reads it.
+		ctx = context.WithValue(ctx, grpcClientIPCtxKey{}, ip)
 		key := "grpc:" + ip
 
 		bucket := store.getBucket(key, grpcRateLimit)
@@ -216,4 +221,20 @@ func grpcClientIP(ctx context.Context, trustedProxies []*net.IPNet) string {
 	}
 
 	return clientIPFromForwarded(peerIP, xff, xRealIP, trustedProxies)
+}
+
+// grpcClientIPCtxKey keys the trust-aware client IP the pre-auth rate-limit interceptor
+// stashes in the request context.
+type grpcClientIPCtxKey struct{}
+
+// GRPCClientIPFromContext returns the trust-aware client IP the rate-limit interceptor
+// computed for this request. Present for every rate-limited (non-exempt) method — which
+// includes RegisterVolunteer — and absent on the exempt in-flight work-lifecycle RPCs
+// and in bare unit-test contexts. Note the underlying helper yields the literal
+// "unknown" when the peer address is missing; consumers that need a REAL address (the
+// registration admission gates) must treat unparseable values as absent and fail
+// closed.
+func GRPCClientIPFromContext(ctx context.Context) (string, bool) {
+	ip, ok := ctx.Value(grpcClientIPCtxKey{}).(string)
+	return ip, ok
 }

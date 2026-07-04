@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
@@ -338,6 +339,9 @@ func (m *mockVolunteerRepo) GetByID(_ context.Context, id types.ID) (*volunteer.
 	return v, nil
 }
 func (m *mockVolunteerRepo) Create(_ context.Context, _ *volunteer.Volunteer) error { return nil }
+func (m *mockVolunteerRepo) CreateAdmitted(_ context.Context, _ *volunteer.Volunteer, _ *admission.CreateGate) error {
+	return nil
+}
 func (m *mockVolunteerRepo) GetByPublicKey(_ context.Context, _ []byte) (*volunteer.Volunteer, error) {
 	return nil, fmt.Errorf("not found")
 }

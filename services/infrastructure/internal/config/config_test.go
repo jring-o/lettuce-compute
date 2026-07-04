@@ -66,6 +66,7 @@ func clearLettuceEnv(t *testing.T) {
 		"LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED", "LETTUCE_HEAD_STANDING_PROBATION_RATE",
 		"LETTUCE_HEAD_STANDING_OK_RATE", "LETTUCE_HEAD_STANDING_BENCH_RATE",
 		"LETTUCE_HEAD_STANDING_MIN_SAMPLE", "LETTUCE_HEAD_STANDING_BENCH_MINUTES",
+		"LETTUCE_HEAD_REGISTRATION_CAP_ENABLED", "LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY",
 	}
 	for _, e := range envVars {
 		if orig, ok := os.LookupEnv(e); ok {
@@ -1531,6 +1532,130 @@ func TestStandingBackpressureEnvOverrideInvalid(t *testing.T) {
 		t.Setenv("LETTUCE_HEAD_STANDING_MIN_SAMPLE", "abc")
 		if _, err := Load(path); err == nil {
 			t.Fatal("expected error for non-integer LETTUCE_HEAD_STANDING_MIN_SAMPLE, got nil")
+		}
+	})
+}
+
+// TestRegistrationCapDefaults verifies the registration-cap defaults on a zero-valued
+// HeadConfig: the cap is off, and EffectiveRegistrationCapPerIPPerDay resolves the
+// documented default (10) for both the unset (0) and negative cases (they share the
+// <= 0 branch), while an explicit positive value is returned verbatim.
+func TestRegistrationCapDefaults(t *testing.T) {
+	h := HeadConfig{}
+	if h.RegistrationCapEnabled {
+		t.Error("RegistrationCapEnabled should default to false")
+	}
+	if got := h.EffectiveRegistrationCapPerIPPerDay(); got != 10 {
+		t.Errorf("EffectiveRegistrationCapPerIPPerDay() = %d, want 10", got)
+	}
+	// A negative value shares the unset (<= 0) branch and resolves to the default.
+	if got := (HeadConfig{RegistrationCapPerIPPerDay: -1}).EffectiveRegistrationCapPerIPPerDay(); got != 10 {
+		t.Errorf("EffectiveRegistrationCapPerIPPerDay(-1) = %d, want 10 (default)", got)
+	}
+	// An explicit positive value is returned verbatim.
+	if got := (HeadConfig{RegistrationCapPerIPPerDay: 3}).EffectiveRegistrationCapPerIPPerDay(); got != 3 {
+		t.Errorf("EffectiveRegistrationCapPerIPPerDay(3) = %d, want 3 (verbatim)", got)
+	}
+}
+
+// TestRegistrationCapValidate covers the registration-cap Validate rules: the per-IP
+// cap rejects a negative value (raw 0 is the unset->default sentinel and must pass),
+// while unset and positive values are accepted on an otherwise-valid config.
+func TestRegistrationCapValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "registration cap knobs unset ok",
+			cfg:     HeadConfig{Name: "x"},
+			wantErr: false,
+		},
+		{
+			name:    "zero per-ip cap ok (unset sentinel)",
+			cfg:     HeadConfig{Name: "x", RegistrationCapPerIPPerDay: 0},
+			wantErr: false,
+		},
+		{
+			name:    "valid explicit registration cap knobs",
+			cfg:     HeadConfig{Name: "x", RegistrationCapEnabled: true, RegistrationCapPerIPPerDay: 25},
+			wantErr: false,
+		},
+		{
+			name:    "negative per-ip cap rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationCapPerIPPerDay: -1},
+			wantErr: true,
+			errMsg:  "registration_cap_per_ip_per_day must be >= 0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestRegistrationCapEnvOverrides threads the registration-cap env knobs through Load.
+func TestRegistrationCapEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_REGISTRATION_CAP_ENABLED", "true")
+	t.Setenv("LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY", "25")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Head.RegistrationCapEnabled {
+		t.Error("RegistrationCapEnabled = false, want true")
+	}
+	if cfg.Head.RegistrationCapPerIPPerDay != 25 {
+		t.Errorf("RegistrationCapPerIPPerDay = %d, want 25", cfg.Head.RegistrationCapPerIPPerDay)
+	}
+	if got := cfg.Head.EffectiveRegistrationCapPerIPPerDay(); got != 25 {
+		t.Errorf("EffectiveRegistrationCapPerIPPerDay() = %d, want 25", got)
+	}
+}
+
+// TestRegistrationCapEnvOverrideInvalid rejects a non-boolean enabled flag and a
+// non-integer per-IP cap, and each error names the offending variable.
+func TestRegistrationCapEnvOverrideInvalid(t *testing.T) {
+	t.Run("non-boolean enabled", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_REGISTRATION_CAP_ENABLED", "banana")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for non-boolean LETTUCE_HEAD_REGISTRATION_CAP_ENABLED, got nil")
+		}
+		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_CAP_ENABLED") {
+			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_CAP_ENABLED", err.Error())
+		}
+	})
+	t.Run("non-integer per-ip cap", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY", "banana")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for non-integer LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY, got nil")
+		}
+		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY") {
+			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY", err.Error())
 		}
 	})
 }
