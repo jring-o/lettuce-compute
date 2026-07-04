@@ -77,6 +77,12 @@ const (
 	// report) is not reconciled against — its buffered copies are reclaimed by the
 	// deadline instead, so a transient disconnect never wrongly drops its buffer.
 	heldReportFreshness = 90 * time.Second
+	// trustScoreTTL bounds how long the cache trusts its in-memory snapshot of subject
+	// trust scores before the refill path re-reads them. The snapshot feeds only the
+	// trusted-corroborator reservation in eligibleLocked, which is stale-tolerant by
+	// construction (the SQL landing writes re-check the reservation against fresh scores),
+	// so a modest window keeps the read off the hot path at negligible correctness cost.
+	trustScoreTTL = 30 * time.Second
 )
 
 // candidate is one pre-fetched, ready-to-assign QUEUED unit in the ready pool. It
@@ -106,6 +112,36 @@ type candidate struct {
 	// last refusal so a fresh volunteer gets first crack on a requeue; the DB
 	// reservation is the authoritative cooldown gate, this is the hand-out optimization.
 	benched map[types.ID]struct{}
+	// effectiveTrustK is the leaf's resolved trusted-corroborator requirement
+	// (DispatchCandidate.EffectiveTrustK): the number of this unit's redundant results
+	// that must come from TRUSTED subjects. 0 disables the trusted-corroborator
+	// reservation for this candidate (the head trust gate is off, or the leaf requires no
+	// trusted corroborators) — eligibleLocked then does ZERO extra work, the gate-off fast
+	// path. Non-zero turns on the reservation: the unit's last K-minus-already-present
+	// slots are withheld from UNTRUSTED requesters so the quorum can still be completed by
+	// trusted results.
+	effectiveTrustK int
+	// effectiveTrustFloor is the leaf's resolved trust floor
+	// (DispatchCandidate.EffectiveTrustFloor): the minimum score at which a subject counts
+	// TRUSTED for this unit's reservation. Read against the cache's trust-score snapshot to
+	// classify the requester and the post-refill live holders.
+	effectiveTrustFloor int
+	// trustedContributors is the refill-time snapshot of contributor subjects that already
+	// count TRUSTED toward this unit (DispatchCandidate.TrustedContributorSubjects): a
+	// live-copy holder whose CURRENT score met the floor, or a PENDING-result author whose
+	// STAMPED submission-time score met it. It is FROZEN at refill on purpose — a pending
+	// author's verdict counts its stamped score, so its trustedness must never be
+	// re-evaluated against a later (drifted) current score. eligibleLocked unions this set
+	// with the trusted subjects among the post-refill live copies (current in-memory holds
+	// + onRunStart-converted running copies) to size the reservation.
+	trustedContributors map[string]struct{}
+	// runStartedSubjects is the set of subjects whose in-memory hold was converted to a
+	// RUNNING copy AFTER this candidate was staged (recorded by onRunStart). Unlike the
+	// refill-time contributors these are post-refill LIVE copies, so their trustedness is
+	// evaluated against the CURRENT score snapshot (like an in-memory hold), not frozen —
+	// kept separate from the frozen contributors precisely so the reservation does not
+	// re-score a refill-time pending author. Only populated when effectiveTrustK > 0.
+	runStartedSubjects map[string]struct{}
 }
 
 // heldCopy is one account's in-memory reservation on a unit: when it expires (the lease),
@@ -243,6 +279,14 @@ type dispatchDeps struct {
 	// budget; the hand-out path never touches it. May be nil (tests / reliability disabled):
 	// the budget refresher is then a no-op and the flat in-flight cap applies.
 	reliabilityRepo reliability.Repository
+	// trustRepo provides the account-level trust scores for the trusted-corroborator
+	// reservation. The refill path reads AllScores OFF the hot path (on trustScoreTTL
+	// cadence, riding the maintenance admission slot fetchAndStage already holds) to
+	// refresh an in-memory subject -> score snapshot; the hand-out path reads only that
+	// snapshot. May be nil (tests / no pool / trust gate never used): the snapshot then
+	// stays nil, and since a nil-score map classifies nobody as trusted while every
+	// candidate with effectiveTrustK == 0 skips the reservation entirely, nothing changes.
+	trustRepo trust.Repository
 }
 
 // volunteerIdentity is the in-process snapshot of a volunteer's identity +
@@ -321,6 +365,21 @@ type dispatchCache struct {
 	// ReserveCopy (land the spot-check copy row). Kept separate from pendingWrites
 	// because it is a different (non-batchable) DB shape.
 	pendingSpotChecks []spotCheckWrite
+	// trustScores is a TTL snapshot of subject -> current trust score (positively-scored
+	// subjects only; see trust.Repository.AllScores). eligibleLocked reads it — under mu —
+	// to classify the requester and the post-refill live holders for the trusted-
+	// corroborator reservation. It is refreshed OFF the hot path on the refill cadence
+	// (refreshTrustScores, called from fetchAndStage where a DB touch already happens),
+	// NEVER by a DB call while holding mu (the peekLeaf rule). A nil/empty map means nobody
+	// is known trusted — the conservative default: the reservation then withholds a slot
+	// rather than admit an untrusted requester in a trusted subject's place. Staleness is
+	// SAFE: the SQL landing writes re-check the reservation against fresh scores (mirroring
+	// the #86 subject-distinctness precedent), so a stale verdict costs at most a voided
+	// hand-out or a briefly withheld slot, never a wrong acceptance.
+	trustScores map[string]int
+	// trustScoresAt is when trustScores was last refreshed (zero = never), the TTL clock
+	// refreshTrustScores checks against trustScoreTTL. Guarded by mu with trustScores.
+	trustScoresAt time.Time
 
 	// leafCache caches per-leaf metadata (the full leaf, used for capability matching
 	// and proto building). Guarded by leafMu (separate from mu so a leaf fetch under
@@ -865,6 +924,7 @@ const (
 	rejectLeafNotCached                          // leaf metadata not yet warmed
 	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
 	rejectInfeasibleDeadline                     // host too slow to finish this unit before its deadline
+	rejectTrustReserved                          // untrusted requester; unit's last slots reserved for trusted subjects
 	numRejectReasons                             // sentinel: count of reasons (tally array size)
 )
 
@@ -898,6 +958,8 @@ func (r rejectReason) String() string {
 		return "capability_mismatch"
 	case rejectInfeasibleDeadline:
 		return "infeasible_deadline"
+	case rejectTrustReserved:
+		return "trust_reserved"
 	default:
 		return "unknown"
 	}
@@ -940,6 +1002,42 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	}
 	if len(holders) >= cand.inMemHolderCap() {
 		return false, rejectHolderCap
+	}
+	// Trusted-corroborator reservation: a unit whose leaf requires K TRUSTED
+	// corroborators keeps its LAST slots reserved for trusted subjects, so an UNTRUSTED
+	// volunteer cannot consume a slot the quorum still needs a trusted result to fill. This
+	// is the in-memory mirror of the SQL reservation the landing writes enforce.
+	//
+	// Gate-off fast path: when the leaf resolves no trusted requirement (effectiveTrustK ==
+	// 0 — the head trust gate is disabled, or the leaf asks for no trusted corroborators)
+	// the whole block is skipped, so a non-trust deployment does ZERO extra work here and
+	// behaves byte-for-byte as before.
+	//
+	// With K > 0: the requester is TRUSTED iff its CURRENT snapshot score meets the leaf's
+	// floor, and a trusted requester is NEVER blocked by the reservation (it can fill a
+	// reserved slot itself). An UNTRUSTED requester is refused iff handing it this copy
+	// would leave too few of the unit's remaining slots for the trusted results the quorum
+	// still requires:
+	//     dbActiveCount + len(holders) + 1 + max(0, K - trustedPresent) > effectiveRedundancy
+	// where trustedPresent is the number of DISTINCT trusted subjects already counting
+	// toward the unit (see trustedPresentLocked). Below that bound an untrusted copy still
+	// leaves room for the outstanding trusted results, so it is admitted.
+	//
+	// STALENESS: trustScores is a TTL snapshot refreshed off the hot path on the refill
+	// cadence (never a DB read under mu). A stale verdict is self-correcting — the SQL
+	// landing re-checks the reservation against fresh scores (the #86 precedent) — so it
+	// costs at most a voided hand-out (an untrusted copy the landing then refuses) or a
+	// briefly withheld slot, never a wrong acceptance into a trusted subject's place.
+	if cand.effectiveTrustK > 0 {
+		if c.trustScores[subject] < cand.effectiveTrustFloor {
+			reservedForTrusted := cand.effectiveTrustK - c.trustedPresentLocked(cand)
+			if reservedForTrusted < 0 {
+				reservedForTrusted = 0
+			}
+			if cand.dbActiveCount+len(holders)+1+reservedForTrusted > cand.effectiveRedundancy {
+				return false, rejectTrustReserved
+			}
+		}
 	}
 	// Self-exclusion (per PRINCIPAL): never hand this requester a unit any of whose current
 	// in-memory holders shares its trust subject — the requester's own account, or another
@@ -1015,6 +1113,43 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 		return false, rejectInfeasibleDeadline
 	}
 	return true, rejectNone
+}
+
+// trustedPresentLocked returns how many DISTINCT trusted subjects already count toward
+// cand's trusted-corroborator quorum, the trustedPresent term of eligibleLocked's
+// reservation gate. It unions three sources, deduped by subject string:
+//
+//	(a) cand.trustedContributors — the refill-time snapshot of contributor subjects that
+//	    counted trusted then (a live holder by its score, a PENDING author by its STAMPED
+//	    submission-time score). FROZEN: these are taken as-is and never re-scored, because a
+//	    pending author's verdict counts its stamped score, so re-scoring it against a later
+//	    current value would diverge from what validation will actually credit.
+//	(b) the current in-memory holds (heldCopy.subject) whose CURRENT snapshot score meets
+//	    the floor — post-refill live copies, evaluated live.
+//	(c) cand.runStartedSubjects — subjects converted from a hold to a RUNNING copy after
+//	    staging (onRunStart), also post-refill live copies, evaluated by CURRENT score the
+//	    same way as (b). Kept apart from (a) precisely so a refill-time pending author is
+//	    never swept into the live-scored set.
+//
+// Caller holds mu (it reads reservedInMem and the trust-score snapshot). Only reached for
+// a candidate with effectiveTrustK > 0, so the map allocation stays off the gate-off path.
+func (c *dispatchCache) trustedPresentLocked(cand candidate) int {
+	floor := cand.effectiveTrustFloor
+	present := make(map[string]struct{}, len(cand.trustedContributors)+len(cand.runStartedSubjects))
+	for s := range cand.trustedContributors {
+		present[s] = struct{}{}
+	}
+	for _, hc := range c.reservedInMem[cand.unit.ID] {
+		if hc.subject != "" && c.trustScores[hc.subject] >= floor {
+			present[hc.subject] = struct{}{}
+		}
+	}
+	for s := range cand.runStartedSubjects {
+		if c.trustScores[s] >= floor {
+			present[s] = struct{}{}
+		}
+	}
+	return len(present)
 }
 
 // releaseInMem drops a single in-memory reservation (one holder) and decrements the
@@ -1225,6 +1360,17 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 				c.ready[i].contributors = make(map[string]struct{})
 			}
 			c.ready[i].contributors[subject] = struct{}{}
+			// Trusted-corroborator reservation: also record this run-started subject as a
+			// post-refill live copy so trustedPresentLocked can count it (evaluated against
+			// the CURRENT score snapshot, like an in-memory hold — NOT frozen like the
+			// refill-time contributors). Kept off the gate-off path: only tracked when the
+			// candidate carries a trusted requirement.
+			if c.ready[i].effectiveTrustK > 0 {
+				if c.ready[i].runStartedSubjects == nil {
+					c.ready[i].runStartedSubjects = make(map[string]struct{})
+				}
+				c.ready[i].runStartedSubjects[subject] = struct{}{}
+			}
 			remainingHolders := len(c.reservedInMem[unitID])
 			if c.ready[i].dbActiveCount+remainingHolders >= c.ready[i].effectiveRedundancy {
 				// Redundancy fully covered: drop it from ready (the refiller re-stages it
@@ -1748,6 +1894,14 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	}
 	defer release()
 
+	// Refresh the trusted-subject score snapshot on the refill cadence. This is the ONE
+	// place the trust store is read for the reservation: a DB touch already happens here
+	// under the maintenance slot we hold, so the trust read rides the existing budget and
+	// never lands on the hand-out hot path (nor a DB call under mu — the peekLeaf rule). It
+	// runs before the dispatchable query so an empty dispatchable universe still keeps the
+	// snapshot fresh for already-staged candidates. Stale-tolerant and nil-repo-tolerant.
+	c.refreshTrustScores(dbCtx)
+
 	// Layer 3: when scale-out is enabled, the refill ATOMICALLY stamps a per-head
 	// dispatch claim on each staged unit so no other replica can stage it (claim-on-
 	// refill). When disabled (single-replica), fall back to the claim-free Layer-2
@@ -1787,6 +1941,13 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			dbActiveCount:       dc.ActiveAssignments,
 			contributors:        strSet(dc.ContributorSubjects),
 			benched:             idSet(dc.BenchedVolunteerIDs),
+			// Trusted-corroborator reservation inputs (SQL twin: DispatchCandidate). K == 0
+			// leaves the reservation inert; the trusted-contributor snapshot is frozen here
+			// (see the candidate field docs) so a pending author's stamped trustedness is
+			// never re-scored at hand-out.
+			effectiveTrustK:     dc.EffectiveTrustK,
+			effectiveTrustFloor: dc.EffectiveTrustFloor,
+			trustedContributors: strSet(dc.TrustedContributorSubjects),
 		})
 	}
 
@@ -1813,6 +1974,39 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	// landed (the remainder was already held/staged or hit the pool ceiling).
 	c.logger.Debug("refill: staged",
 		"returned", len(cands), "staged", stagedCount, "leaf_scoped", len(leafIDs) > 0)
+}
+
+// refreshTrustScores re-reads the subject trust-score snapshot from the trust store when
+// it has gone stale (older than trustScoreTTL), feeding eligibleLocked's trusted-
+// corroborator reservation. It is called ONLY from fetchAndStage, where a DB touch already
+// happens under the maintenance admission slot the caller holds, so the read adds no DB
+// call to the hot path — and it never reads the DB while holding mu (the peekLeaf rule):
+// the staleness check and the store are under mu, the AllScores read is not.
+//
+// A nil trust repo (tests, no-pool / mux-only constructions) is tolerated — the snapshot
+// stays nil, which classifies nobody as trusted; combined with only-K==0 candidates the
+// reservation is a no-op. On a read error the previous (stale) snapshot is kept: a stale
+// verdict is self-correcting at the SQL landing, so serving stale beats dropping the
+// snapshot to nil and needlessly withholding slots.
+func (c *dispatchCache) refreshTrustScores(ctx context.Context) {
+	if c.deps.trustRepo == nil {
+		return
+	}
+	c.mu.Lock()
+	fresh := !c.trustScoresAt.IsZero() && c.now().Sub(c.trustScoresAt) < trustScoreTTL
+	c.mu.Unlock()
+	if fresh {
+		return
+	}
+	scores, err := c.deps.trustRepo.AllScores(ctx)
+	if err != nil {
+		c.logger.Warn("dispatch cache: trust score refresh failed; keeping prior snapshot", "error", err)
+		return
+	}
+	c.mu.Lock()
+	c.trustScores = scores
+	c.trustScoresAt = c.now()
+	c.mu.Unlock()
 }
 
 // excludedIDsLocked returns the set of ids the cache currently holds (ready units +

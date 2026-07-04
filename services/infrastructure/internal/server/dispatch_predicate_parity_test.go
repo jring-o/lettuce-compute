@@ -7,6 +7,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/dispatchparity"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -118,10 +119,31 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 	// trust SUBJECTS, keyed exactly as ContributorSubjects would be at refill.
 	dbActive := s.OtherLiveCopies + s.OtherPendingResults
 	contributors := map[string]struct{}{}
+	// trustedContributors is the refill-time snapshot of contributor subjects that already
+	// count TRUSTED toward the unit (DispatchCandidate.TrustedContributorSubjects), sizing
+	// the trusted-corroborator reservation. It mirrors what the SQL refill emits: the first
+	// TrustedOtherLiveCopies live-holder subjects and the first TrustedOtherPendingResults
+	// pending-author subjects — a SUBSET of the contributors, so the two agree on which of
+	// the covering copies are trusted, not merely on the count.
+	trustedContributors := map[string]struct{}{}
 	// Anonymous other contributors carry fresh per-keypair sentinel subjects; they never
-	// equal the requester's, so only the COUNT they add (already in dbActive) matters.
-	for i := 0; i < s.OtherLiveCopies+s.OtherPendingResults; i++ {
-		contributors[trust.SubjectForVolunteerID(types.NewID())] = struct{}{}
+	// equal the requester's, so only the COUNT they add (already in dbActive) matters. Live
+	// copies and pending results are built in separate loops so the trusted subset can be
+	// drawn from each exactly as the SQL trusted-present count sources them (live holders by
+	// current score, pending authors by the submission-time stamp).
+	for i := 0; i < s.OtherLiveCopies; i++ {
+		subj := trust.SubjectForVolunteerID(types.NewID())
+		contributors[subj] = struct{}{}
+		if i < s.TrustedOtherLiveCopies {
+			trustedContributors[subj] = struct{}{}
+		}
+	}
+	for i := 0; i < s.OtherPendingResults; i++ {
+		subj := trust.SubjectForVolunteerID(types.NewID())
+		contributors[subj] = struct{}{}
+		if i < s.TrustedOtherPendingResults {
+			trustedContributors[subj] = struct{}{}
+		}
 	}
 	if s.SelfLiveCopy {
 		dbActive++
@@ -154,6 +176,30 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		benched[requester] = struct{}{}
 	}
 
+	// Resolve the candidate's trusted-corroborator requirement (K) and floor through the
+	// PRODUCTION resolver (transition.TrustPolicy.ResolveTrust) — never re-derived inline —
+	// so this projection cannot drift from the SQL twin (effTrustKSQL / effTrustFloorSQL).
+	// The clamp target is the effective min quorum, which in these scenarios == TargetCopies
+	// (a leaf that sets only redundancy_factor resolves target == quorum).
+	trustK, trustFloor := transition.TrustPolicy{
+		GateEnabled:             s.TrustGateEnabled,
+		DefaultMinCorroborators: s.TrustDefaultK,
+		DefaultFloor:            s.TrustDefaultFloor,
+	}.ResolveTrust(leaf.ValidationConfig{
+		MinTrustedCorroborators: s.LeafTrustK,
+		TrustFloor:              s.LeafTrustFloor,
+	}, s.TargetCopies)
+
+	// Install the requester's current trust score into the cache snapshot the reservation
+	// reads (omit when 0 = no trust row = untrusted). eligibleLocked classifies the
+	// requester TRUSTED iff this meets trustFloor, in which case it bypasses the reservation.
+	if s.RequesterTrustScore > 0 {
+		if c.trustScores == nil {
+			c.trustScores = make(map[string]int)
+		}
+		c.trustScores[reqSubject] = s.RequesterTrustScore
+	}
+
 	cand := candidate{
 		unit: &workunit.WorkUnit{
 			ID:              unitID,
@@ -166,6 +212,9 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		dbActiveCount:       dbActive,
 		contributors:        contributors,
 		benched:             benched,
+		effectiveTrustK:     trustK,
+		effectiveTrustFloor: trustFloor,
+		trustedContributors: trustedContributors,
 	}
 
 	if s.HostOtherInflight > 0 {

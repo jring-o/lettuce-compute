@@ -59,3 +59,63 @@ var (
 	effQuorumWuL   = effQuorumSQL("wu", "l")
 	effMaxTotalWuL = effMaxTotalSQL("wu", "l")
 )
+
+// --- Trust-gate dispatch (trusted-corroborator reservation) ---
+//
+// These two builders are the SQL twins of transition.TrustPolicy.ResolveTrust
+// (internal/transition/trust.go): the resolved trust FLOOR (the score at or above which an
+// agreeing subject counts as trusted) and the resolved trusted-corroborator requirement K
+// (how many DISTINCT trusted subjects a unit's leaf demands). The dispatch reservation
+// embeds these EXACT expressions instead of re-deriving the resolution, so the SQL and Go
+// never drift; the golden parity test (trust_resolve_parity_test.go) pins them to
+// ResolveTrust across a grid of gate / leaf-override / default / min-quorum inputs — the
+// same structural guard subjectExprSQL has against a silent Go<->SQL divergence.
+//
+// Each builder takes the leafs (and, for K, the work_units) alias in scope plus the $N
+// placeholders carrying the head TrustDispatchPolicy fields (gate-enabled, default K,
+// default floor). Resolution mirrors ResolveTrust field-for-field: per-leaf override
+// (validation_config, 0 = none) -> head default. Because the gate-off branch resolves K to
+// a constant 0, the reservation clause that embeds effTrustKSQL collapses to the
+// pre-existing redundancy headroom check when the gate is off — provably inert, exactly as
+// ResolveTrust returns K == 0 with the gate disabled.
+
+// effTrustFloorSQL: the resolved trust floor W. Mirrors ResolveTrust's floor branch — the
+// leaf override validation_config.trust_floor when > 0, else the head-default floor
+// (floorParam). Resolved REGARDLESS of the gate switch, exactly as ResolveTrust resolves
+// the floor even when disabled (accrual needs the real floor before enforcement is ever
+// turned on, so a subject can earn a score first). floorParam is the $N placeholder
+// carrying TrustDispatchPolicy.DefaultFloor.
+func effTrustFloorSQL(l, floorParam string) string {
+	return `(CASE
+		WHEN COALESCE((` + l + `.validation_config->>'trust_floor')::int, 0) > 0
+			THEN (` + l + `.validation_config->>'trust_floor')::int
+		ELSE ` + floorParam + `::int
+	END)`
+}
+
+// effTrustKSQL: the resolved trusted-corroborator requirement K. Mirrors ResolveTrust's K
+// branch exactly:
+//   - gate disabled (gateParam false) -> 0 (the gate then never withholds a slot), else
+//   - the leaf override validation_config.min_trusted_corroborators when > 0, else the
+//     head-default K (kParam), CLAMPED down to the effective min quorum (effQuorumSQL): a
+//     quorum-sized agreeing group holds at most min_quorum distinct subjects, so a K above
+//     it could never be satisfied. The clamp is gated on quorum >= 1, mirroring the Go
+//     guard `minQuorum >= 1 && k > minQuorum`, so a non-positive quorum never clamps.
+//
+// gateParam is the $N bool placeholder (TrustDispatchPolicy.GateEnabled); kParam the $N
+// default-K placeholder (TrustDispatchPolicy.DefaultMinCorroborators). The clamp target is
+// the existing effQuorumSQL fragment for the same wu/l aliases, so the SQL clamp uses the
+// very expression the redundancy SQL<->Go parity already pins to the Go MinQuorum.
+func effTrustKSQL(wu, l, gateParam, kParam string) string {
+	quorum := effQuorumSQL(wu, l)
+	baseK := `(CASE
+		WHEN COALESCE((` + l + `.validation_config->>'min_trusted_corroborators')::int, 0) > 0
+			THEN (` + l + `.validation_config->>'min_trusted_corroborators')::int
+		ELSE ` + kParam + `::int
+	END)`
+	return `(CASE
+		WHEN NOT ` + gateParam + `::boolean THEN 0
+		WHEN ` + quorum + ` >= 1 AND ` + baseK + ` > ` + quorum + ` THEN ` + quorum + `
+		ELSE ` + baseK + `
+	END)`
+}

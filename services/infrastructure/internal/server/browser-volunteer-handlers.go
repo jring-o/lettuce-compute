@@ -51,6 +51,11 @@ type browserVolunteerDeps struct {
 	headName                string
 	defaultWeights          map[string]int32
 	maxInflightPerVolunteer int
+	// trustDispatch is the head trust-gate dispatch policy the browser/WASM request-work path
+	// stamps onto its per-request, tx-scoped work-unit repo so FindNextAssignable resolves the
+	// trusted-corroborator reservation identically to the shared repo. Zero value = gate off
+	// (the reservation is inert and this path dispatches exactly as before).
+	trustDispatch workunit.TrustDispatchPolicy
 }
 
 // --- Request/Response types ---
@@ -327,7 +332,10 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		}
 		defer tx.Rollback(r.Context())
 
-		txWURepo := workunit.NewPgxWorkUnitRepository(tx)
+		// Carry the head trust-gate policy so FindNextAssignable applies the trusted-
+		// corroborator reservation on this browser/WASM dispatch path too (inert with the
+		// gate off).
+		txWURepo := workunit.NewPgxWorkUnitRepository(tx).WithTrustDispatch(deps.trustDispatch)
 
 		wu, err := txWURepo.FindNextAssignable(r.Context(), opts)
 		if err != nil {

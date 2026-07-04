@@ -105,13 +105,45 @@ func scanBatch(row pgx.Row) (*Batch, error) {
 
 // PgxWorkUnitRepository implements WorkUnitRepository using pgx.
 type PgxWorkUnitRepository struct {
-	db DBTX
+	db            DBTX
+	trustDispatch TrustDispatchPolicy
 }
 
 // NewPgxWorkUnitRepository creates a new PgxWorkUnitRepository.
 // Accepts *pgxpool.Pool for normal use or pgx.Tx for transactional use.
 func NewPgxWorkUnitRepository(db DBTX) *PgxWorkUnitRepository {
 	return &PgxWorkUnitRepository{db: db}
+}
+
+// TrustDispatchPolicy is the head-level trust-gate configuration the dispatch
+// queries resolve per-leaf (K, floor) from for the trusted-corroborator
+// reservation. It mirrors transition.TrustPolicy field-for-field — this package
+// cannot import transition (transition imports workunit) — and the SQL twin of
+// transition.TrustPolicy.ResolveTrust built from it is pinned to the Go
+// resolution by a golden parity test.
+//
+// The zero value is the trust gate OFF: every reservation clause resolves
+// K == 0 and admits exactly what the pre-reservation predicate admitted, so a
+// repository whose caller never calls WithTrustDispatch behaves byte-for-byte
+// as before the reservation existed.
+type TrustDispatchPolicy struct {
+	// GateEnabled is the head master switch (LETTUCE_HEAD_TRUST_GATE_ENABLED).
+	// When false the resolved K is 0 and the reservation never withholds a slot.
+	GateEnabled bool
+	// DefaultMinCorroborators is the head-default K when a leaf does not
+	// override it (LETTUCE_HEAD_TRUST_MIN_CORROBORATORS).
+	DefaultMinCorroborators int
+	// DefaultFloor is the head-default trust floor when a leaf does not
+	// override it (LETTUCE_HEAD_TRUST_FLOOR).
+	DefaultFloor int
+}
+
+// WithTrustDispatch sets the trust-gate policy the dispatch queries feed their
+// per-leaf (K, floor) resolution from, returning the repository for chaining.
+// Callers that skip it keep the zero policy: gate off, reservation inert.
+func (r *PgxWorkUnitRepository) WithTrustDispatch(p TrustDispatchPolicy) *PgxWorkUnitRepository {
+	r.trustDispatch = p
+	return r
 }
 
 // Create inserts a new work unit. On return, wu is populated with DB-generated
@@ -498,6 +530,71 @@ func subjectExprSQL(volAlias string) string {
 	END)`
 }
 
+// trustedPresentCountSQL builds the scalar subquery that counts the DISTINCT TRUSTED
+// subjects already covering the work unit identified by unitID (a column expression such as
+// "wu.id" or "v.id"), for the trusted-corroborator reservation. A subject counts trusted
+// when EITHER:
+//   - it holds a LIVE copy (work_unit_assignment_history, outcome IS NULL) whose subject's
+//     CURRENT volunteer_trust score is at or above floorExpr, OR
+//   - it authored a PENDING result whose STAMPED submission-time score
+//     (results.trust_score_at_submit) is at or above floorExpr.
+// The pending arm reads the STAMP, not the current score — deliberately the exact number
+// the validation verdict will count (a device re-scored or suppressed after submit does not
+// change a pending result's corroborating power). The live arm reads the CURRENT score
+// because a buffered copy has stamped nothing yet. The two arms are UNIONed (a subject
+// present in both is counted once). This is the scalar mirror of
+// DispatchCandidate.TrustedContributorSubjects that the FindNextAssignable /
+// FlushReservations reservation arithmetic subtracts from K. floorExpr is the resolved-floor
+// SQL (effTrustFloorSQL) for the query's leaf alias. The fixed tp_* internal aliases collide
+// with none of the dispatch queries' aliases.
+func trustedPresentCountSQL(unitID, floorExpr string) string {
+	return `(SELECT COUNT(*) FROM (
+		SELECT ` + subjectExprSQL("tp_hv") + ` AS subj
+		 FROM work_unit_assignment_history tp_wuah
+		 JOIN volunteers tp_hv ON tp_hv.id = tp_wuah.volunteer_id
+		 JOIN volunteer_trust tp_vt ON tp_vt.subject = ` + subjectExprSQL("tp_hv") + `
+		 WHERE tp_wuah.work_unit_id = ` + unitID + ` AND tp_wuah.outcome IS NULL
+		   AND tp_vt.score >= ` + floorExpr + `
+		UNION
+		SELECT tp_res.trust_subject AS subj
+		 FROM results tp_res
+		 WHERE tp_res.work_unit_id = ` + unitID + `
+		   AND tp_res.validation_status = 'PENDING'
+		   AND tp_res.trust_subject IS NOT NULL
+		   AND tp_res.trust_score_at_submit >= ` + floorExpr + `
+	) tp_present)`
+}
+
+// trustedContributorSubjectsSQL builds the ARRAY(...) of DISTINCT TRUSTED subjects already
+// covering wu.id, for DispatchCandidate.TrustedContributorSubjects. It uses the SAME trusted
+// definition as trustedPresentCountSQL — a live-copy holder by its CURRENT volunteer_trust
+// score, a PENDING-result author by the STAMPED submission-time score — but emits the
+// subjects themselves as a text[] rather than a count. The in-memory hand-out unions this
+// refill snapshot with the trusted holds it stages afterwards to size how many of the unit's
+// remaining copies stay reserved for trusted subjects (the volunteer-agnostic batch selects
+// cannot run the per-requester reservation, so they hand the raw material to the cache).
+// Fixed to the wu / l aliases the two batch selects share; floorExpr is effTrustFloorSQL for
+// the "l" leaf alias. The tc_* internal aliases collide with none of the batch queries'.
+func trustedContributorSubjectsSQL(floorExpr string) string {
+	return `ARRAY(
+		SELECT DISTINCT subj FROM (
+			SELECT ` + subjectExprSQL("tc_hv") + ` AS subj
+			 FROM work_unit_assignment_history tc_wuah
+			 JOIN volunteers tc_hv ON tc_hv.id = tc_wuah.volunteer_id
+			 JOIN volunteer_trust tc_vt ON tc_vt.subject = ` + subjectExprSQL("tc_hv") + `
+			 WHERE tc_wuah.work_unit_id = wu.id AND tc_wuah.outcome IS NULL
+			   AND tc_vt.score >= ` + floorExpr + `
+			UNION
+			SELECT tc_res.trust_subject AS subj
+			 FROM results tc_res
+			 WHERE tc_res.work_unit_id = wu.id
+			   AND tc_res.validation_status = 'PENDING'
+			   AND tc_res.trust_subject IS NOT NULL
+			   AND tc_res.trust_score_at_submit >= ` + floorExpr + `
+		) tc_present
+	)`
+}
+
 // FindNextAssignable finds the highest-priority QUEUED work unit from active projects
 // that matches the volunteer's capabilities and has fewer active assignments than
 // the project's redundancy_factor. Uses FOR UPDATE SKIP LOCKED to prevent
@@ -569,6 +666,48 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
 		  ) < `+effTargetWuL+`
+		  -- Trusted-corroborator reservation (trust gate): when this unit's leaf resolves a
+		  -- trusted-corroborator requirement K > 0 (effTrustKSQL, the SQL twin of
+		  -- transition.TrustPolicy.ResolveTrust), the unit keeps its last slots RESERVED for
+		  -- TRUSTED subjects, so an untrusted requester cannot burn a slot a trusted
+		  -- corroborator still needs to reach K. Applied per requester: admit iff ANY of
+		  --   * K = 0 — the gate is off for this leaf (gate disabled, or no override + a 0
+		  --     default); the OR collapses to TRUE and this reduces EXACTLY to the redundancy
+		  --     headroom check above (provably inert when the gate is off), OR
+		  --   * the requester is itself TRUSTED — its subject has a volunteer_trust score at or
+		  --     above the resolved floor; a trusted requester is NEVER blocked by the
+		  --     reservation, OR
+		  --   * headroom remains even after reserving the still-unfilled trusted slots: the
+		  --     copies already covering redundancy (live copies + PENDING results), plus this
+		  --     one, plus GREATEST(0, K - trusted_present), do not exceed the effective target.
+		  -- trusted_present is the DISTINCT trusted subjects already covering the unit — live
+		  -- holders by their CURRENT score, PENDING authors by the SUBMIT-TIME stamp (exactly
+		  -- what the validation verdict counts). Two deliberate simplifications, documented
+		  -- here and shared by the FlushReservations twin: (1) dispatch ignores STALE/frozen
+		  -- quorum-power suppression — it reads the subject-level score only; suppression is a
+		  -- submission-time stamping rule, and a suppressed device taking a reserved slot costs
+		  -- at most a wasted slot while validation stays authoritative; (2) the counts are a
+		  -- per-statement snapshot (same race class as the redundancy headroom check — the
+		  -- in-memory layer budgets slots sequentially under its lock).
+		  AND (
+		    `+effTrustKSQL("wu", "l", "$16", "$17")+` = 0
+		    OR EXISTS (
+		      SELECT 1 FROM volunteer_trust rvt
+		      WHERE rvt.subject = req.subject
+		        AND rvt.score >= `+effTrustFloorSQL("l", "$18")+`
+		    )
+		    OR (
+		      (
+		        (SELECT COUNT(*) FROM work_unit_assignment_history wuah_rz
+		         WHERE wuah_rz.work_unit_id = wu.id AND wuah_rz.outcome IS NULL)
+		        + (SELECT COUNT(*) FROM results res_rz
+		           WHERE res_rz.work_unit_id = wu.id AND res_rz.validation_status = 'PENDING')
+		        + 1
+		        + GREATEST(0, `+effTrustKSQL("wu", "l", "$16", "$17")+`
+		                      - `+trustedPresentCountSQL("wu.id", effTrustFloorSQL("l", "$18"))+`)
+		      ) <= `+effTargetWuL+`
+		    )
+		  )
 		  -- Subject-distinct self-copy exclusion: never hand this requester a unit a
 		  -- LIVE copy of which is already held by ANY volunteer sharing the requester's
 		  -- trust subject — its own device, or a SIBLING device bound to the same live
@@ -670,6 +809,12 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		opts.HRClass,
 		opts.HostID,
 		opts.BenchmarkFPOPS,
+		// $16-$18: the head trust-gate policy (TrustDispatchPolicy) feeding the resolved
+		// (K, floor) of the reservation clause. The zero policy resolves K = 0, so the
+		// reservation clause is inert — behavior is byte-for-byte unchanged with the gate off.
+		r.trustDispatch.GateEnabled,
+		r.trustDispatch.DefaultMinCorroborators,
+		r.trustDispatch.DefaultFloor,
 	)
 
 	wu, err := scanWorkUnit(row)
@@ -717,6 +862,25 @@ type DispatchCandidate struct {
 	// requeue; after the cooldown elapses they are eligible again, so a small
 	// volunteer pool never strands the work.
 	BenchedVolunteerIDs []types.ID
+	// TrustedContributorSubjects is the subset of ContributorSubjects that counts
+	// TRUSTED for the trusted-corroborator reservation at refill time: a live-copy
+	// holder whose subject's CURRENT volunteer_trust score meets the resolved
+	// floor, or a PENDING-result author whose STAMPED submission-time score
+	// (results.trust_score_at_submit — exactly what the validation verdict will
+	// count) meets it. The in-memory hand-out path unions this refill snapshot
+	// with the trusted holds it stages afterwards to compute how many of the
+	// unit's remaining copies stay reserved for trusted subjects.
+	TrustedContributorSubjects []string
+	// EffectiveTrustK is the resolved trusted-corroborator requirement for this
+	// unit's leaf — the SQL twin of transition.TrustPolicy.ResolveTrust: 0 when
+	// the head trust gate is disabled (reservation inert), else the leaf override
+	// (validation_config.min_trusted_corroborators) or the head default, clamped
+	// to the effective min quorum.
+	EffectiveTrustK int
+	// EffectiveTrustFloor is the resolved trust floor for this unit's leaf: the
+	// leaf override (validation_config.trust_floor) when > 0, else the head
+	// default. Resolved regardless of the gate switch, mirroring ResolveTrust.
+	EffectiveTrustFloor int
 }
 
 // FindDispatchableBatch bulk-selects up to `limit` QUEUED, dispatch-eligible work
@@ -788,7 +952,21 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
 				   AND wuah_b.outcome_at IS NOT NULL
 				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-			) AS benched_ids
+			) AS benched_ids,
+			-- Trusted contributor subjects: the subset of contributor_subjects that counts
+			-- TRUSTED for the reservation at refill — live-copy holders by their CURRENT
+			-- volunteer_trust score, PENDING-result authors by the STAMPED submission-time
+			-- score, both against this leaf's resolved floor. The in-memory hand-out unions
+			-- this snapshot with the trusted holds it stages to size how many remaining copies
+			-- stay reserved for trusted subjects (this volunteer-agnostic refill cannot run the
+			-- per-requester reservation itself; the authoritative gate is FlushReservations).
+			`+trustedContributorSubjectsSQL(effTrustFloorSQL("l", "$6"))+` AS trusted_contributor_subjects,
+			-- Resolved trusted-corroborator K and floor (SQL twins of
+			-- transition.TrustPolicy.ResolveTrust): K = 0 when the head gate is off, so the
+			-- in-memory reservation is inert. Carried out per row so the cache reserves exactly
+			-- the slots the SQL landing gate (FlushReservations) will later enforce.
+			`+effTrustKSQL("wu", "l", "$4", "$5")+` AS effective_trust_k,
+			`+effTrustFloorSQL("l", "$6")+` AS effective_trust_floor
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
 		WHERE wu.state = 'QUEUED'
@@ -825,6 +1003,13 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
 		limit, excludeIDs, leafIDs,
+		// $4-$6: the head trust-gate policy (TrustDispatchPolicy) feeding the resolved
+		// (K, floor) of the per-row reservation fields. The zero policy resolves K = 0, so
+		// the trusted-contributor / K / floor columns are inert (K 0, all subjects "trusted"
+		// is irrelevant), and the cache reserves nothing — behavior unchanged with gate off.
+		r.trustDispatch.GateEnabled,
+		r.trustDispatch.DefaultMinCorroborators,
+		r.trustDispatch.DefaultFloor,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to find dispatchable batch", err)
@@ -836,19 +1021,23 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		var contributorTexts, benchedTexts []string
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts); err != nil {
+		var contributorTexts, benchedTexts, trustedContribTexts []string
+		var trustK, trustFloor int
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:            &cand,
-			LeafID:              wu.LeafID,
-			RedundancyFactor:    redundancy,
-			ActiveAssignments:   active,
-			Runtime:             runtime,
-			ContributorSubjects: contributorTexts,
-			BenchedVolunteerIDs: parseIDTexts(benchedTexts),
+			WorkUnit:                   &cand,
+			LeafID:                     wu.LeafID,
+			RedundancyFactor:           redundancy,
+			ActiveAssignments:          active,
+			Runtime:                    runtime,
+			ContributorSubjects:        contributorTexts,
+			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
+			TrustedContributorSubjects: trustedContribTexts,
+			EffectiveTrustK:            trustK,
+			EffectiveTrustFloor:        trustFloor,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -984,8 +1173,22 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
 				   AND wuah_b.outcome_at IS NOT NULL
 				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-			) AS benched_ids`,
+			) AS benched_ids,
+			-- Trusted contributor subjects + resolved K / floor, exactly as
+			-- FindDispatchableBatch computes them (the trusted subset of the contributors, and
+			-- the SQL twins of transition.TrustPolicy.ResolveTrust), carried out per claimed
+			-- row so the cache reserves the slots the FlushReservations landing gate enforces.
+			-- Inert when the head gate is off (K resolves to 0).
+			`+trustedContributorSubjectsSQL(effTrustFloorSQL("l", "$8"))+` AS trusted_contributor_subjects,
+			`+effTrustKSQL("wu", "l", "$6", "$7")+` AS effective_trust_k,
+			`+effTrustFloorSQL("l", "$8")+` AS effective_trust_floor`,
 		limit, excludeIDs, leafIDs, headID, leaseSecs,
+		// $6-$8: the head trust-gate policy (TrustDispatchPolicy) feeding the resolved
+		// (K, floor) of the per-row reservation fields. The zero policy resolves K = 0, so
+		// the carried fields are inert and the cache reserves nothing (gate-off behavior).
+		r.trustDispatch.GateEnabled,
+		r.trustDispatch.DefaultMinCorroborators,
+		r.trustDispatch.DefaultFloor,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to claim dispatchable batch", err)
@@ -997,19 +1200,23 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 		var wu WorkUnit
 		var redundancy, active int
 		var runtime string
-		var contributorTexts, benchedTexts []string
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts); err != nil {
+		var contributorTexts, benchedTexts, trustedContribTexts []string
+		var trustK, trustFloor int
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan claimed work unit", err)
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:            &cand,
-			LeafID:              wu.LeafID,
-			RedundancyFactor:    redundancy,
-			ActiveAssignments:   active,
-			Runtime:             runtime,
-			ContributorSubjects: contributorTexts,
-			BenchedVolunteerIDs: parseIDTexts(benchedTexts),
+			WorkUnit:                   &cand,
+			LeafID:                     wu.LeafID,
+			RedundancyFactor:           redundancy,
+			ActiveAssignments:          active,
+			Runtime:                    runtime,
+			ContributorSubjects:        contributorTexts,
+			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
+			TrustedContributorSubjects: trustedContribTexts,
+			EffectiveTrustK:            trustK,
+			EffectiveTrustFloor:        trustFloor,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1213,9 +1420,47 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		    OR (COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0)
 		        / NULLIF((vv.hardware_capabilities->>'benchmark_fpops')::float8, 0)) <= wu.deadline_seconds
 		  )
+		  -- Trusted-corroborator reservation (trust gate): the authoritative LANDING-side twin
+		  -- of the FindNextAssignable reservation (full rationale, and the two deliberate
+		  -- simplifications, documented there). When this leaf resolves K > 0, the unit's last
+		  -- slots stay reserved for TRUSTED subjects, so an untrusted requester's hold lands
+		  -- only when it would not consume a slot a trusted corroborator still needs to reach
+		  -- K. Land iff ANY of: K = 0 (gate off -> the clause collapses to TRUE, provably
+		  -- inert), OR this requester's subject is itself TRUSTED (volunteer_trust score at or
+		  -- above the resolved floor), OR headroom remains after reserving the still-unfilled
+		  -- trusted slots GREATEST(0, K - trusted_present). trusted_present is the DISTINCT
+		  -- trusted subjects already covering the unit (live holders by CURRENT score, PENDING
+		  -- authors by the SUBMIT-TIME stamp). Intra-batch snapshot races are accepted here,
+		  -- the same class as the redundancy headroom snapshot above (the in-memory layer
+		  -- budgets slots sequentially under its lock before this batched flush runs).
+		  AND (
+		    `+effTrustKSQL("wu", "l", "$6", "$7")+` = 0
+		    OR EXISTS (
+		      SELECT 1 FROM volunteer_trust fvt
+		      WHERE fvt.subject = `+subjectExprSQL("vv")+`
+		        AND fvt.score >= `+effTrustFloorSQL("l", "$8")+`
+		    )
+		    OR (
+		      (
+		        (SELECT COUNT(*) FROM work_unit_assignment_history wuah_fz
+		         WHERE wuah_fz.work_unit_id = v.id AND wuah_fz.outcome IS NULL)
+		        + (SELECT COUNT(*) FROM results res_fz
+		           WHERE res_fz.work_unit_id = v.id AND res_fz.validation_status = 'PENDING')
+		        + 1
+		        + GREATEST(0, `+effTrustKSQL("wu", "l", "$6", "$7")+`
+		                      - `+trustedPresentCountSQL("v.id", effTrustFloorSQL("l", "$8"))+`)
+		      ) <= `+effTargetWuL+`
+		    )
+		  )
 		ON CONFLICT (work_unit_id, volunteer_id) WHERE outcome IS NULL DO NOTHING
 		RETURNING work_unit_id, volunteer_id`,
 		ids, vols, untils, deadlines, hosts,
+		// $6-$8: the head trust-gate policy (TrustDispatchPolicy) feeding the resolved
+		// (K, floor) of the landing-side reservation. The zero policy resolves K = 0, so the
+		// reservation clause is inert and every hold lands exactly as before the gate existed.
+		r.trustDispatch.GateEnabled,
+		r.trustDispatch.DefaultMinCorroborators,
+		r.trustDispatch.DefaultFloor,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to flush reservations", err)
@@ -1435,6 +1680,13 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		JOIN leafs l ON l.id = wu.leaf_id
 		JOIN volunteers vv ON vv.id = $2
 		WHERE wu.id = $1 AND wu.state = 'QUEUED'
+		  -- No trusted-corroborator reservation re-check here, BY DESIGN — the same contract
+		  -- ReserveCopy already has for the redundancy headroom. This is the spot-check landing
+		  -- path; it trusts FindNextAssignable to have applied the reservation at read time and
+		  -- does not re-derive the requester's trust subject vs. the resolved (K, floor). Like
+		  -- the headroom, the reservation is owned by the read-side gate; the per-volunteer
+		  -- distinctness / cooldown / feasibility guards below are the only invariants
+		  -- ReserveCopy re-enforces authoritatively at the landing write.
 		  -- Subject-distinct already-contributed: never reserve a unit for which a
 		  -- volunteer sharing this requester's trust subject (its bound live DID, else the
 		  -- "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin) already authored a
@@ -1876,6 +2128,64 @@ func (r *PgxWorkUnitRepository) FindRunningWithStaleCheckpoints(ctx context.Cont
 		return nil, apierror.Internal("failed to iterate stale checkpoints", err)
 	}
 	return results, nil
+}
+
+// CountTrustStarvedUnits reports how many QUEUED units are TRUST-STARVED — the
+// trusted-corroborator reservation is withholding ALL of their remaining redundancy
+// headroom for trusted subjects, and no trusted volunteer has taken a slot — plus a small
+// id sample for the log line. This is the observability half of the reservation: a unit in
+// this state is NOT stuck by a bug, it is waiting exactly as designed (an untrusted copy in
+// its last slots could never validate the unit — only trigger a reject round that penalizes
+// the agreeing volunteers), but a POPULATION of them sitting for over an hour is the
+// operator signal that trusted capacity is missing: seed or verify trusted subjects
+// (POST /api/v1/admin/trust), or lower the leaf's min_trusted_corroborators.
+//
+// A unit counts when, under the repository's trust-dispatch policy: resolved K > 0, fewer
+// than K trusted subjects already cover it, headroom remains (live + pending < target — a
+// FULL unit is merely corroborating, not starved), that headroom is entirely reserved
+// (live + pending + still-missing trusted >= target), and the unit is over an hour old
+// (created_at — the same fixed age FindStuckSpotCheckUnits uses; a per-round clock does not
+// exist and precision is not needed for a WARN). Gate off short-circuits to zero without a
+// query, so the fault-monitor sweep costs nothing on a head that never enabled the gate.
+func (r *PgxWorkUnitRepository) CountTrustStarvedUnits(ctx context.Context, sampleLimit int) (int, []types.ID, error) {
+	if !r.trustDispatch.GateEnabled {
+		return 0, nil, nil
+	}
+	kExpr := effTrustKSQL("wu", "l", "$1", "$2")
+	floorExpr := effTrustFloorSQL("l", "$3")
+	presentExpr := trustedPresentCountSQL("wu.id", floorExpr)
+	coveredExpr := `(
+		(SELECT COUNT(*) FROM work_unit_assignment_history ts_wuah
+		 WHERE ts_wuah.work_unit_id = wu.id AND ts_wuah.outcome IS NULL)
+		+ (SELECT COUNT(*) FROM results ts_res
+		   WHERE ts_res.work_unit_id = wu.id AND ts_res.validation_status = 'PENDING')
+	)`
+	var count int
+	var sampleTexts []string
+	err := r.db.QueryRow(ctx, `
+		WITH starved AS (
+			SELECT wu.id
+			FROM work_units wu
+			JOIN leafs l ON wu.leaf_id = l.id
+			WHERE wu.state = 'QUEUED'
+			  AND l.state = 'ACTIVE'
+			  AND wu.created_at < NOW() - INTERVAL '1 hour'
+			  AND `+kExpr+` > 0
+			  AND `+presentExpr+` < `+kExpr+`
+			  AND `+coveredExpr+` < `+effTargetWuL+`
+			  AND `+coveredExpr+` + (`+kExpr+` - `+presentExpr+`) >= `+effTargetWuL+`
+		)
+		SELECT (SELECT COUNT(*) FROM starved),
+		       ARRAY(SELECT id::text FROM starved LIMIT $4)`,
+		r.trustDispatch.GateEnabled,
+		r.trustDispatch.DefaultMinCorroborators,
+		r.trustDispatch.DefaultFloor,
+		sampleLimit,
+	).Scan(&count, &sampleTexts)
+	if err != nil {
+		return 0, nil, apierror.Internal("failed to count trust-starved units", err)
+	}
+	return count, parseIDTexts(sampleTexts), nil
 }
 
 // --- PgxBatchRepository ---

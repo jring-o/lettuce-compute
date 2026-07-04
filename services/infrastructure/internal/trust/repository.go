@@ -23,4 +23,12 @@ type Repository interface {
 	Slash(ctx context.Context, subject string) error
 	// List returns entries ordered by score DESC, subject ASC.
 	List(ctx context.Context, limit, offset int) ([]*Entry, error)
+	// AllScores returns a subject -> current score map of every subject with a positive
+	// score (WHERE score > 0). It is bounded by the trust table itself — only seeded and
+	// accrued subjects earn a row, and only those still holding positive trust are
+	// returned — so the result set is small (the trusted-subject population, not the whole
+	// volunteer base). It exists for the dispatch cache, which reads it on a refresh
+	// cadence to keep an in-memory snapshot of who is trusted for the trusted-corroborator
+	// reservation, rather than issuing a per-subject GetScore on the hand-out hot path.
+	AllScores(ctx context.Context) (map[string]int, error)
 }

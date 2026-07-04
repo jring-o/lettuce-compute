@@ -14,6 +14,22 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
+// trustStarvationProber is the OPTIONAL repository capability behind the trust-starved
+// WARN sweep: counting QUEUED units whose remaining headroom the trusted-corroborator
+// reservation is withholding for trusted subjects none have taken. It is a type-asserted
+// side interface rather than a WorkUnitRepository method so the many repository fakes need
+// not implement it — a repo without it (or with the trust gate off, which short-circuits
+// inside the pgx implementation) simply skips the sweep.
+type trustStarvationProber interface {
+	CountTrustStarvedUnits(ctx context.Context, sampleLimit int) (int, []types.ID, error)
+}
+
+// trustStarvedWarnEvery throttles the trust-starved WARN: the sweep runs every scan (it is
+// one cheap query, and zero queries with the gate off), but the log line repeats at most
+// this often — a starved population changes on operator timescales (seeding trusted
+// subjects, trusted volunteers arriving), so re-warning every 30s scan would only be noise.
+const trustStarvedWarnEvery = 10 * time.Minute
+
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
 	workUnitRepo   workunit.WorkUnitRepository
@@ -32,6 +48,10 @@ type FaultMonitor struct {
 	logger       *slog.Logger
 	scanInterval time.Duration
 	batchSize    int
+	// lastTrustStarvedWarn is when the trust-starved WARN last fired (zero = never),
+	// the trustStarvedWarnEvery throttle clock. Touched only by the single Start loop
+	// (ScanOnce is not concurrent with itself), so it needs no lock.
+	lastTrustStarvedWarn time.Time
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -179,10 +199,46 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 		m.logger.Debug("expired dispatch claims cleared", "count", cleared)
 	}
 
+	// 3. Trust-starved units: the trusted-corroborator reservation is holding their
+	//    remaining slots for trusted subjects none have taken. Waiting is the DESIGNED
+	//    behavior (an untrusted copy there could never validate the unit), but a
+	//    long-lived population of them is the operator signal that trusted capacity is
+	//    missing — surface it.
+	m.warnTrustStarved(ctx)
+
 	// Check for stale checkpoints across all running work units with checkpointing enabled.
 	m.checkStaleCheckpoints(ctx)
 
 	return nil
+}
+
+// warnTrustStarved surfaces the trust-starved population (see trustStarvationProber): a
+// WARN naming the count, a small id sample, and the operator remedies. Skipped entirely
+// when the repository does not implement the probe; free when the trust gate is off (the
+// pgx probe short-circuits before querying); throttled to trustStarvedWarnEvery so a
+// stable starved population does not re-log every scan. Best-effort like every other
+// sweep here — a probe error is logged and the scan continues.
+func (m *FaultMonitor) warnTrustStarved(ctx context.Context) {
+	prober, ok := m.workUnitRepo.(trustStarvationProber)
+	if !ok {
+		return
+	}
+	if !m.lastTrustStarvedWarn.IsZero() && time.Since(m.lastTrustStarvedWarn) < trustStarvedWarnEvery {
+		return
+	}
+	count, sample, err := prober.CountTrustStarvedUnits(ctx, 5)
+	if err != nil {
+		m.logger.Error("trust-starved sweep failed", "error", err)
+		return
+	}
+	if count == 0 {
+		return
+	}
+	m.lastTrustStarvedWarn = time.Now()
+	m.logger.Warn("work units trust-starved: their remaining copies are reserved for trusted subjects, and none have taken a slot for over an hour",
+		"count", count,
+		"sample_work_unit_ids", sample,
+		"remedy", "seed or verify trusted subjects (POST /api/v1/admin/trust), add trusted volunteer capacity, or lower the leaf's min_trusted_corroborators")
 }
 
 // cleanupCheckpointByID deletes checkpoint data for a work unit (best effort).

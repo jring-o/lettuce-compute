@@ -61,6 +61,17 @@ func (f *fakeRepo) List(_ context.Context, limit, offset int) ([]*Entry, error) 
 	return f.list, f.err
 }
 
+func (f *fakeRepo) AllScores(_ context.Context) (map[string]int, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]int{}
+	if f.entry != nil && f.entry.Score > 0 {
+		out[f.entry.Subject] = f.entry.Score
+	}
+	return out, nil
+}
+
 func testHandler(repo Repository) *Handler {
 	return NewHandler(repo, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }

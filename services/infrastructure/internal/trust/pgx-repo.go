@@ -138,3 +138,30 @@ func (r *PgxRepository) List(ctx context.Context, limit, offset int) ([]*Entry, 
 	}
 	return out, nil
 }
+
+// AllScores returns a subject -> score map of every positively-scored subject. The
+// WHERE score > 0 filter bounds the result to the trusted-subject population (seeded or
+// accrued, not slashed to zero), which is what the dispatch cache snapshots for the
+// trusted-corroborator reservation. A slashed or never-seeded subject is simply absent
+// (a map miss reads as 0 — untrusted — for the caller, the correct default).
+func (r *PgxRepository) AllScores(ctx context.Context) (map[string]int, error) {
+	rows, err := r.db.Query(ctx, `SELECT subject, score FROM volunteer_trust WHERE score > 0`)
+	if err != nil {
+		return nil, apierror.Internal("failed to list trust scores", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var subject string
+		var score int
+		if scanErr := rows.Scan(&subject, &score); scanErr != nil {
+			return nil, apierror.Internal("failed to scan trust score", scanErr)
+		}
+		out[subject] = score
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate trust scores", err)
+	}
+	return out, nil
+}

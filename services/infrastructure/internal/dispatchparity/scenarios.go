@@ -34,8 +34,9 @@
 // headroom, self-held-copy exclusion, already-contributed exclusion, subject
 // (DID) distinctness, the post-failure cooldown ("benched"), the per-machine
 // in-flight cap, homogeneous-redundancy hardware-class matching,
-// runtime/capability fit, and feasibility-at-deadline — with boundary cases at
-// each cap/limit edge.
+// runtime/capability fit, feasibility-at-deadline, and the trusted-corroborator
+// reservation (an untrusted requester withheld from a slot the quorum still needs a
+// trusted result to fill) — with boundary cases at each cap/limit edge.
 package dispatchparity
 
 // Dimension names the single predicate axis a Scenario primarily exercises. It
@@ -55,6 +56,7 @@ const (
 	DimHRClass           Dimension = "hr_class_match"
 	DimCapability        Dimension = "runtime_capability"
 	DimFeasibility       Dimension = "deadline_feasibility"
+	DimTrustReservation  Dimension = "trusted_corroborator_reservation"
 )
 
 // Binding-status values for the subject-distinctness dimension. They mirror the
@@ -240,6 +242,45 @@ type Scenario struct {
 	RequesterBenchmarkFPOPS float64
 	DeadlineSeconds         int
 
+	// --- Trusted-corroborator reservation ------------------------------------
+	// The trust gate withholds a unit's last slots from an UNTRUSTED requester so the
+	// quorum can still be completed by TRUSTED results. An untrusted requester (its
+	// subject's current score < the resolved floor) is refused a copy iff
+	//     live_copies + pending_results + 1 + max(0, K - trusted_present) > effective_target
+	// where K is the resolved trusted-corroborator requirement and trusted_present is
+	// the count of DISTINCT trusted subjects already covering the unit. A trusted
+	// requester is never blocked. The ZERO value of every field here leaves the gate
+	// OFF (TrustGateEnabled false -> resolved K == 0 -> the reservation is inert), so
+	// every existing scenario is unaffected. The scenarios express the effective min
+	// quorum (the clamp target for K) via TargetCopies: a leaf that sets only
+	// redundancy_factor resolves target == quorum == TargetCopies.
+	//
+	// TrustGateEnabled is the head master switch (transition.TrustPolicy.GateEnabled).
+	// When false, ResolveTrust yields K == 0 regardless of the leaf/default overrides.
+	TrustGateEnabled bool
+	// TrustDefaultK / TrustDefaultFloor are the head-default trusted-corroborator
+	// requirement and floor used when the leaf does not override them.
+	TrustDefaultK     int
+	TrustDefaultFloor int
+	// LeafTrustK / LeafTrustFloor are the per-leaf overrides
+	// (validation_config.min_trusted_corroborators / trust_floor). 0 = inherit the
+	// head default.
+	LeafTrustK     int
+	LeafTrustFloor int
+	// RequesterTrustScore is the requester subject's current volunteer_trust score
+	// (0 = no trust row, i.e. untrusted). The requester is TRUSTED — and so bypasses
+	// the reservation — iff this is at or above the resolved floor.
+	RequesterTrustScore int
+	// TrustedOtherLiveCopies is how many of the OtherLiveCopies holders are trusted
+	// (their current score meets the floor); it must be <= OtherLiveCopies. They count
+	// toward trusted_present, shrinking the reservation.
+	TrustedOtherLiveCopies int
+	// TrustedOtherPendingResults is how many of the OtherPendingResults are STAMPED
+	// trusted (their submission-time score met the floor); it must be <=
+	// OtherPendingResults. They count toward trusted_present via the stamp — exactly
+	// what the validation verdict will credit — not a later current score.
+	TrustedOtherPendingResults int
+
 	// --- Expected verdict ----------------------------------------------------
 	// Eligible is the verdict BOTH full-predicate layers are expected to reach. For
 	// every scenario except a known divergence the two agree and this is the single
@@ -285,14 +326,22 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 		return true
 	case GateFlushReservations:
 		switch s.Dimension {
-		case DimRedundancy, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
+		// The batched landing write re-checks redundancy headroom AND the
+		// trusted-corroborator reservation (both are unit-level headroom invariants it
+		// owns at the landing write), plus the per-volunteer distinctness / cooldown /
+		// feasibility rules.
+		case DimRedundancy, DimTrustReservation, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
 		default: // capability, hr_class, inflight_cap — delegated to the hand-out
 			return false
 		}
 	case GateReserveCopy:
 		switch s.Dimension {
-		// Note: redundancy is intentionally ABSENT — ReserveCopy does not re-check it.
+		// Note: redundancy AND the trusted-corroborator reservation are intentionally
+		// ABSENT — ReserveCopy does not re-check either. Both are unit-level headroom
+		// invariants owned by the read-side gate (FindNextAssignable), which ReserveCopy's
+		// caller runs first; ReserveCopy re-enforces only the per-volunteer distinctness /
+		// cooldown / feasibility guards. DimTrustReservation follows DimRedundancy exactly.
 		case DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
 		default:
@@ -583,6 +632,148 @@ func Scenarios() []Scenario {
 			s.LeafRscFpopsEst = 1e12
 			s.RequesterBenchmarkFPOPS = 0 // cannot estimate -> never refuse on a guess
 			s.DeadlineSeconds = 10
+			s.Eligible = true
+		}),
+
+		// --- trusted-corroborator reservation --------------------------------
+		// The trust gate keeps a unit's LAST slots reserved for TRUSTED subjects so an
+		// UNTRUSTED requester cannot burn a slot the quorum still needs a trusted result
+		// to fill. Refuse an untrusted requester iff
+		//     live + pending + 1 + max(0, K - trusted_present) > target
+		// (target == the effective min quorum == TargetCopies in these scenarios). Every
+		// negative row keeps redundancy headroom (live + pending < target) so the refusal
+		// is attributable to the reservation ALONE, not to redundancy being full. K and the
+		// floor are resolved by transition.TrustPolicy.ResolveTrust from the head defaults +
+		// per-leaf overrides carried on the scenario.
+		with("trust_gate_off_control_inert", DimTrustReservation, func(s *Scenario) {
+			// Proof of inertness: the leaf asks for 2 trusted corroborators and the
+			// requester is untrusted, but the HEAD gate is OFF, so ResolveTrust yields
+			// K == 0 and the reservation withholds nothing — the last slot is handed out.
+			s.TrustGateEnabled = false
+			s.LeafTrustK = 2
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted (irrelevant with the gate off)
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1 // one slot left; would be withheld iff the gate were on
+			s.Eligible = true
+		}),
+		with("trust_last_slot_reserved_untrusted_refused", DimTrustReservation, func(s *Scenario) {
+			// Gate on, K = 1 (head default), no trusted subject present, one copy already
+			// covering redundancy: the unit's LAST slot is reserved for a trusted result,
+			// so the untrusted requester is refused despite redundancy headroom remaining.
+			//   1 (live) + 1 (this) + max(0, 1 - 0) = 3 > 2 -> refused.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = false
+		}),
+		with("trust_trusted_requester_bypasses_reservation", DimTrustReservation, func(s *Scenario) {
+			// Identical to the refusal above, but the requester's own score meets the
+			// floor: a trusted requester can fill a reserved slot itself, so the
+			// reservation never withholds one from it.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 25 // >= floor -> trusted
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = true
+		}),
+		with("trust_trusted_live_holder_frees_slot", DimTrustReservation, func(s *Scenario) {
+			// The single existing live copy is held by a TRUSTED subject, so the K = 1
+			// requirement is already covered: nothing stays reserved and the untrusted
+			// requester takes the remaining slot.
+			//   1 (live) + 1 (this) + max(0, 1 - 1) = 2 <= 2 -> admitted.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.TrustedOtherLiveCopies = 1 // trusted_present = 1
+			s.Eligible = true
+		}),
+		with("trust_stamped_pending_frees_slot", DimTrustReservation, func(s *Scenario) {
+			// As above but the covering copy is a finished PENDING result whose STAMPED
+			// submission-time score met the floor. A stamped trusted pending author counts
+			// toward K exactly like a trusted live holder (the stamp is what validation
+			// credits), so the slot is freed and the untrusted requester is admitted.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 2
+			s.OtherPendingResults = 1
+			s.TrustedOtherPendingResults = 1 // trusted_present = 1
+			s.Eligible = true
+		}),
+		with("trust_free_slot_beyond_reservation_admitted", DimTrustReservation, func(s *Scenario) {
+			// Target 3 with one copy present and K = 1 reserved: a slot remains BEYOND the
+			// reservation, so the untrusted requester is admitted.
+			//   1 (live) + 1 (this) + max(0, 1 - 0) = 3 <= 3 -> admitted.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 3
+			s.OtherLiveCopies = 1
+			s.Eligible = true
+		}),
+		with("trust_k2_reserves_two_slots_refused", DimTrustReservation, func(s *Scenario) {
+			// K = 2 (head default) with target 3 and one untrusted copy present: TWO slots
+			// stay reserved for trusted results, leaving only one free.
+			//   1 (live) + 1 (this) + max(0, 2 - 0) = 4 > 3 -> refused.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 2
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 3
+			s.OtherLiveCopies = 1
+			s.Eligible = false
+		}),
+		with("trust_k_clamped_to_quorum_refused", DimTrustReservation, func(s *Scenario) {
+			// The leaf demands K = 5 trusted corroborators, but the effective min quorum
+			// (== TargetCopies here) is 2: ResolveTrust CLAMPS K down to 2, since a
+			// quorum-sized agreeing group can hold at most quorum distinct subjects, so an
+			// unclamped K could never be satisfied. Even clamped, with no trusted subject
+			// present the whole target is reserved.
+			//   0 (none) + 1 (this) + max(0, 2 - 0) = 3 > 2 -> refused.
+			s.TrustGateEnabled = true
+			s.LeafTrustK = 5 // leaf override, clamped down to quorum 2
+			s.TrustDefaultFloor = 25
+			s.RequesterTrustScore = 0 // untrusted
+			s.TargetCopies = 2
+			s.Eligible = false
+		}),
+		with("trust_leaf_floor_override_untrusts_requester_refused", DimTrustReservation, func(s *Scenario) {
+			// Per-leaf floor override raises the bar: the requester's score 30 clears the
+			// head default floor (25) but NOT the leaf override (50), so it is UNTRUSTED for
+			// this leaf and the reserved last slot is withheld.
+			//   1 (live) + 1 (this) + max(0, 1 - 0) = 3 > 2 -> refused.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.LeafTrustFloor = 50     // overrides the head default 25
+			s.RequesterTrustScore = 30 // >= 25 default, < 50 override -> untrusted here
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = false
+		}),
+		with("trust_leaf_floor_inherit_trusts_requester_admitted", DimTrustReservation, func(s *Scenario) {
+			// Sibling control for the row above: identical, but the leaf does NOT override
+			// the floor (inherits the head default 25), so the SAME score 30 is trusted and
+			// bypasses the reservation. This isolates the refusal above to the override, not
+			// the score.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.LeafTrustFloor = 0       // inherit the head default 25
+			s.RequesterTrustScore = 30 // >= 25 -> trusted
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
 			s.Eligible = true
 		}),
 	}
