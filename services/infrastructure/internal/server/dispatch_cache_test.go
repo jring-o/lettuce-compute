@@ -11,6 +11,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -571,14 +572,21 @@ func TestHandOut_MinSendInterval_NoWorkDoesNotStartClock(t *testing.T) {
 
 // stageUnitSets appends a ready candidate carrying explicit contributor / benched
 // volunteer sets, so the distinctness + cooldown hand-out filters can be exercised
-// without a DB.
+// without a DB. The contributor ids are mapped to their per-keypair sentinel subjects
+// (trust.SubjectForVolunteerID) — the subject-keyed form the candidate now carries and
+// the same subject a requester with no live DID resolves to — so an id staged here
+// still excludes that requester.
 func (c *dispatchCache) stageUnitSets(unitID, leafID types.ID, redundancy, dbActive int, contributors, benched []types.ID) {
+	subjects := make([]string, 0, len(contributors))
+	for _, id := range contributors {
+		subjects = append(subjects, trust.SubjectForVolunteerID(id))
+	}
 	c.mu.Lock()
 	c.ready = append(c.ready, candidate{
 		unit:                &workunit.WorkUnit{ID: unitID, LeafID: leafID, State: workunit.WorkUnitStateQueued},
 		effectiveRedundancy: redundancy,
 		dbActiveCount:       dbActive,
-		contributors:        idSet(contributors),
+		contributors:        strSet(subjects),
 		benched:             idSet(benched),
 	})
 	c.mu.Unlock()

@@ -474,6 +474,30 @@ func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
 	return rows.Scan(dst...)
 }
 
+// subjectExprSQL returns the SQL twin of trust.SubjectForVolunteer for the volunteers
+// row aliased volAlias: the bound DID while the binding is live (did non-empty and
+// did_binding_status IN ('OK','STALE') — a STALE binding is still the SAME principal,
+// only its quorum power is suppressed elsewhere), else the per-keypair sentinel
+// "vol:<volunteer-uuid>" (unbound, empty DID, or REVOKED). The 'vol:' literal mirrors
+// trust.SubjectVolunteerPrefix.
+//
+// This is the single SQL definition of the subject; every dispatch site below embeds
+// it so the expression is written exactly once. Its semantics MUST equal
+// trust.SubjectForVolunteer (internal/trust/model.go), the account-level trust key:
+// two devices bound to one live DID share ONE subject, so the subject-distinctness
+// exclusions treat them as one principal. The Go/SQL twins are pinned by the golden
+// parity test TestSubjectExprSQL_MatchesSubjectForVolunteer — a change to either side
+// that drifts from the other fails that test. Columns did / did_binding_status exist
+// since migration 00012; this PR adds no schema.
+func subjectExprSQL(volAlias string) string {
+	return `(CASE
+		WHEN ` + volAlias + `.did IS NOT NULL AND ` + volAlias + `.did <> ''
+		     AND ` + volAlias + `.did_binding_status IN ('OK','STALE')
+			THEN ` + volAlias + `.did
+		ELSE 'vol:' || ` + volAlias + `.id::text
+	END)`
+}
+
 // FindNextAssignable finds the highest-priority QUEUED work unit from active projects
 // that matches the volunteer's capabilities and has fewer active assignments than
 // the project's redundancy_factor. Uses FOR UPDATE SKIP LOCKED to prevent
@@ -483,6 +507,17 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		SELECT `+prefixedWorkUnitColumns+`
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
+		-- Requester's account-level trust subject (trust.SubjectForVolunteer's SQL
+		-- twin), computed ONCE per query: the bound DID while the binding is live,
+		-- else the per-keypair "vol:<uuid>" sentinel. A missing volunteers row (should
+		-- not happen for a live requester) degrades to the sentinel via COALESCE. The
+		-- subject-distinctness exclusions below compare each holder's subject to this,
+		-- so two devices bound to one live DID count as ONE principal.
+		CROSS JOIN (
+			SELECT COALESCE(
+			         (SELECT `+subjectExprSQL("rv")+` FROM volunteers rv WHERE rv.id = $9),
+			         'vol:' || $9::text) AS subject
+		) req
 		WHERE wu.state = 'QUEUED'
 		  AND l.state = 'ACTIVE'
 		  AND (array_length($1::uuid[], 1) IS NULL OR wu.leaf_id = ANY($1))
@@ -534,21 +569,32 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		    )
 		  ) < `+effTargetWuL+`
-		  -- Hard distinctness: never hand this volunteer a unit it already holds a LIVE
-		  -- copy of (no two concurrent copies to one volunteer).
+		  -- Subject-distinct self-copy exclusion: never hand this requester a unit a
+		  -- LIVE copy of which is already held by ANY volunteer sharing the requester's
+		  -- trust subject — its own device, or a SIBLING device bound to the same live
+		  -- DID (one principal). A second same-subject copy could only ever produce a
+		  -- result that validation counts as the SAME subject, so it buys no extra
+		  -- corroboration — pure wasted compute. Lifted from volunteer_id = $9 to subject
+		  -- equality; a history row with NULL volunteer_id has no subject and can never
+		  -- match (the inner join drops it), exactly as before the lift.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history wuah2
+		    JOIN volunteers hv2 ON hv2.id = wuah2.volunteer_id
 		    WHERE wuah2.work_unit_id = wu.id
-		      AND wuah2.volunteer_id = $9
 		      AND wuah2.outcome IS NULL
+		      AND `+subjectExprSQL("hv2")+` = req.subject
 		  )
-		  -- Never hand this volunteer a unit it already produced a result for, so each
-		  -- of the N redundant results comes from a DISTINCT volunteer.
+		  -- Subject-distinct already-contributed exclusion: never hand this requester a
+		  -- unit for which a volunteer sharing its trust subject already authored a
+		  -- PENDING result, so each of the N redundant results comes from a DISTINCT
+		  -- principal (two devices of one live DID count as one). Lifted from
+		  -- volunteer_id = $9 to subject equality for the same reason as the clause above.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res3
+		    JOIN volunteers hv3 ON hv3.id = res3.volunteer_id
 		    WHERE res3.work_unit_id = wu.id
-		      AND res3.volunteer_id = $9
 		      AND res3.validation_status = 'PENDING'
+		      AND `+subjectExprSQL("hv3")+` = req.subject
 		  )
 		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
 		  -- this unit TIMED OUT or was abandoned mid-run is benched for roughly one more
@@ -559,6 +605,10 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- (AbandonWorkUnit on a never-run copy, or the buffer reconciler reaping a dropped
 		  -- prefetch — both close it ABANDONED with started_at NULL) is not unreliable and
 		  -- must not bench, else a dominated pool strands the work it returned (#59).
+		  -- This clause stays keyed on volunteer_id ($9), NOT the trust subject, BY
+		  -- DESIGN: the cooldown is a per-DEVICE/per-account reliability signal — one
+		  -- device timing out does not bench its siblings bound to the same DID — so it is
+		  -- deliberately NOT lifted to subject distinctness.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history wuah4
 		    WHERE wuah4.work_unit_id = wu.id
@@ -571,9 +621,11 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- Per-MACHINE inflight cap (TODO #19): this HOST's live copies across all units.
 		  -- Keyed on COALESCE(host_id, volunteer_id) = the requester's effective host id
 		  -- ($14, the account id when no host was reported) so a user's rig and laptop have
-		  -- independent budgets. This is DELIBERATELY separate from the per-account
-		  -- distinctness/redundancy predicates above (which stay keyed on volunteer_id $9):
-		  -- distinctness is per-account, the in-flight cap is per-machine.
+		  -- independent budgets. This is DELIBERATELY separate from the subject-distinctness
+		  -- predicates above (now keyed on the requester's trust SUBJECT) and the
+		  -- per-account cooldown (keyed on volunteer_id $9): three different keys BY DESIGN
+		  -- — distinctness is per-principal, the cooldown is per-account, the in-flight cap
+		  -- is per-machine.
 		  AND (
 		    $12::int <= 0
 		    OR (SELECT COUNT(*) FROM work_unit_assignment_history wuah5
@@ -649,14 +701,16 @@ type DispatchCandidate struct {
 	// Runtime is the leaf's execution_config.runtime (used to assert the WASM
 	// partition and for capability matching at hand-out).
 	Runtime string
-	// ContributorVolunteerIDs is the set of volunteers that ALREADY count toward
-	// this unit's redundancy at refill time: every holder of a live copy (history
-	// row, outcome IS NULL) plus every author of an already-submitted PENDING
-	// result. Each of the unit's redundant results must come from a DISTINCT
-	// volunteer, so the hand-out path excludes any volunteer in this set — the
-	// in-memory mirror of the volunteer-specific distinctness FindNextAssignable
+	// ContributorSubjects is the set of trust SUBJECTS (a live-bound DID, else the
+	// per-keypair "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin)
+	// that ALREADY count toward this unit's redundancy at refill time: every
+	// holder of a live copy (history row, outcome IS NULL) plus every author of an
+	// already-submitted PENDING result. Each of the unit's redundant results must
+	// come from a DISTINCT principal — two devices bound to one DID are ONE — so
+	// the hand-out path excludes any requester whose subject is in this set: the
+	// in-memory mirror of the subject-level distinctness FindNextAssignable
 	// enforces in SQL but FindDispatchableBatch (volunteer-agnostic) cannot.
-	ContributorVolunteerIDs []types.ID
+	ContributorSubjects []string
 	// BenchedVolunteerIDs is the set of volunteers whose recent copy of this unit
 	// TIMED OUT or was ABANDONED within roughly one deadline window. They are
 	// benched (given last refusal) so a fresh volunteer gets first crack on a
@@ -703,19 +757,27 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
-			-- Volunteers already counting toward redundancy (distinct): live-copy holders
-			-- + PENDING-result authors. The hand-out excludes these so each redundant
-			-- result comes from a DISTINCT volunteer (the volunteer-specific guard the
-			-- volunteer-agnostic refill cannot express, re-checked in memory).
+			-- Trust SUBJECTS already counting toward redundancy (distinct): live-copy
+			-- holders + PENDING-result authors, each mapped through the subject expression
+			-- (a live-bound DID, else the "vol:<uuid>" sentinel). The hand-out excludes
+			-- any requester whose subject is in this set, so each redundant result comes
+			-- from a DISTINCT principal — two devices bound to one live DID are one subject
+			-- (the volunteer-agnostic refill cannot express the per-requester guard; it is
+			-- re-checked in memory). A history row with NULL volunteer_id has no subject and
+			-- is dropped by the inner join, exactly as the old volunteer_id filter dropped it.
 			ARRAY(
-				SELECT DISTINCT v::text FROM (
-					SELECT wuah_c.volunteer_id AS v FROM work_unit_assignment_history wuah_c
-					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL AND wuah_c.volunteer_id IS NOT NULL
+				SELECT DISTINCT subj FROM (
+					SELECT `+subjectExprSQL("vc")+` AS subj
+					 FROM work_unit_assignment_history wuah_c
+					 JOIN volunteers vc ON vc.id = wuah_c.volunteer_id
+					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL
 					UNION
-					SELECT res_c.volunteer_id AS v FROM results res_c
+					SELECT `+subjectExprSQL("vr")+` AS subj
+					 FROM results res_c
+					 JOIN volunteers vr ON vr.id = res_c.volunteer_id
 					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
 				) contribs
-			) AS contributor_ids,
+			) AS contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit
 			-- (~one deadline cooldown). Only a STARTED copy benches; a graceful return of
 			-- UN-STARTED buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
@@ -780,13 +842,13 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:                &cand,
-			LeafID:                  wu.LeafID,
-			RedundancyFactor:        redundancy,
-			ActiveAssignments:       active,
-			Runtime:                 runtime,
-			ContributorVolunteerIDs: parseIDTexts(contributorTexts),
-			BenchedVolunteerIDs:     parseIDTexts(benchedTexts),
+			WorkUnit:            &cand,
+			LeafID:              wu.LeafID,
+			RedundancyFactor:    redundancy,
+			ActiveAssignments:   active,
+			Runtime:             runtime,
+			ContributorSubjects: contributorTexts,
+			BenchedVolunteerIDs: parseIDTexts(benchedTexts),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -895,17 +957,23 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
-			-- Distinct volunteers already covering redundancy (live copies + PENDING
-			-- results): excluded at hand-out so each result comes from a distinct volunteer.
+			-- Distinct trust SUBJECTS already covering redundancy (live-copy holders +
+			-- PENDING-result authors, each mapped through the subject expression): excluded
+			-- at hand-out so each result comes from a distinct principal — two devices of
+			-- one live DID are one subject. Rows with NULL volunteer_id are dropped by the join.
 			ARRAY(
-				SELECT DISTINCT v::text FROM (
-					SELECT wuah_c.volunteer_id AS v FROM work_unit_assignment_history wuah_c
-					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL AND wuah_c.volunteer_id IS NOT NULL
+				SELECT DISTINCT subj FROM (
+					SELECT `+subjectExprSQL("vc")+` AS subj
+					 FROM work_unit_assignment_history wuah_c
+					 JOIN volunteers vc ON vc.id = wuah_c.volunteer_id
+					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL
 					UNION
-					SELECT res_c.volunteer_id AS v FROM results res_c
+					SELECT `+subjectExprSQL("vr")+` AS subj
+					 FROM results res_c
+					 JOIN volunteers vr ON vr.id = res_c.volunteer_id
 					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
 				) contribs
-			) AS contributor_ids,
+			) AS contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit (cooldown
 			-- ~1 deadline). Only a STARTED copy benches; a graceful return of un-started
 			-- buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
@@ -935,13 +1003,13 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 		}
 		cand := wu
 		out = append(out, DispatchCandidate{
-			WorkUnit:                &cand,
-			LeafID:                  wu.LeafID,
-			RedundancyFactor:        redundancy,
-			ActiveAssignments:       active,
-			Runtime:                 runtime,
-			ContributorVolunteerIDs: parseIDTexts(contributorTexts),
-			BenchedVolunteerIDs:     parseIDTexts(benchedTexts),
+			WorkUnit:            &cand,
+			LeafID:              wu.LeafID,
+			RedundancyFactor:    redundancy,
+			ActiveAssignments:   active,
+			Runtime:             runtime,
+			ContributorSubjects: contributorTexts,
+			BenchedVolunteerIDs: parseIDTexts(benchedTexts),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1035,30 +1103,58 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 	// Guards:
 	//   * the unit is still QUEUED (the aggregate accepts copies),
 	//   * redundancy headroom remains (live copies + PENDING results < redundancy),
-	//   * the volunteer has NOT already authored a PENDING result for the unit (so each
-	//     of the N redundant results comes from a DISTINCT volunteer) — the guard whose
-	//     absence let a re-queued unit be re-handed to its own prior submitter,
+	//   * NO volunteer sharing this requester's trust SUBJECT (its bound live DID, else
+	//     the "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin) has already
+	//     authored a PENDING result for the unit, so each of the N redundant results comes
+	//     from a DISTINCT principal (the guard whose absence let a re-queued unit be
+	//     re-handed to its own prior submitter — now subject-level, so a sibling device of
+	//     one DID cannot re-contribute either),
+	//   * NO volunteer sharing this requester's subject already holds a LIVE copy of the
+	//     unit — its own device OR a sibling device bound to the same live DID (two devices
+	//     of one live DID are ONE principal; a second same-subject copy buys no extra
+	//     corroboration, only wasted compute). The ON CONFLICT below covers only the EXACT
+	//     same volunteer; this guard closes the sibling-device case,
 	//   * the volunteer is NOT in post-failure cooldown (a recent copy of this unit it
 	//     STARTED but did not finish — EXPIRED, or ABANDONED mid-run — benches it for ~one
 	//     deadline so a fresh volunteer gets first crack; a graceful return of un-started
-	//     buffered work, ABANDONED with started_at NULL, is not unreliable and does not bench),
+	//     buffered work, ABANDONED with started_at NULL, is not unreliable and does not
+	//     bench). Cooldown stays keyed on volunteer_id (per-account), NOT the subject, BY
+	//     DESIGN: one device's timeout does not bench its siblings,
 	//   * ON CONFLICT on the live-copy partial unique enforces "one live copy per
 	//     volunteer" (a duplicate hold for the same volunteer is silently dropped and
 	//     thus voided by the caller).
+	// The source rows are first deduplicated per (work unit, subject) so two same-subject
+	// holds for one unit in ONE batch — which would both pass the same-snapshot NOT EXISTS
+	// guards — collapse to a single landed copy (see the DISTINCT ON note in the query).
 	// A reservation the guard rejects is simply absent from RETURNING, so the caller
 	// voids that in-memory hold and the volunteer never run-starts it — no wasted compute.
-	// Two rows for the SAME unit but DISTINCT volunteers both land when redundancy
+	// Two rows for the SAME unit but DISTINCT SUBJECTS both land when redundancy
 	// allows — that is exactly the parallel-copy case (property 7).
 	rows, err := r.db.Query(ctx, `
 		INSERT INTO work_unit_assignment_history
 			(work_unit_id, volunteer_id, host_id, assigned_at, reserved_until, deadline_seconds)
 		SELECT v.id, v.vol, v.host_id, NOW(), v.reserved_until, v.deadline_seconds
 		FROM (
-			SELECT unnest($1::uuid[]) AS id,
-			       unnest($2::uuid[]) AS vol,
-			       unnest($5::uuid[]) AS host_id,
-			       unnest($3::timestamptz[]) AS reserved_until,
-			       unnest($4::int[]) AS deadline_seconds
+			-- Deduplicate the incoming holds per (work unit, trust subject) BEFORE the
+			-- guards run. All rows of this single INSERT..SELECT evaluate their NOT EXISTS
+			-- guards against the SAME pre-statement snapshot, so two holds for one unit by
+			-- two devices sharing one live DID (one subject) would BOTH pass the same-subject
+			-- guards below and both land — a redundant same-principal copy. Collapsing to one
+			-- row per (unit, subject) here (DISTINCT ON keeps the first) guarantees at most one
+			-- copy per principal per unit lands in a batch; the dropped hold is absent from
+			-- RETURNING, so the caller voids it. (The exact same-volunteer duplicate is also
+			-- caught by the ON CONFLICT below; this additionally closes the sibling-device case.)
+			SELECT DISTINCT ON (u.id, `+subjectExprSQL("dv")+`)
+			       u.id, u.vol, u.host_id, u.reserved_until, u.deadline_seconds
+			FROM (
+				SELECT unnest($1::uuid[]) AS id,
+				       unnest($2::uuid[]) AS vol,
+				       unnest($5::uuid[]) AS host_id,
+				       unnest($3::timestamptz[]) AS reserved_until,
+				       unnest($4::int[]) AS deadline_seconds
+			) u
+			JOIN volunteers dv ON dv.id = u.vol
+			ORDER BY u.id, `+subjectExprSQL("dv")+`
 		) AS v
 		JOIN work_units wu ON wu.id = v.id AND wu.state = 'QUEUED'
 		JOIN leafs l ON l.id = wu.leaf_id
@@ -1069,11 +1165,32 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		        + (SELECT COUNT(*) FROM results res
 		           WHERE res.work_unit_id = v.id AND res.validation_status = 'PENDING')
 		      ) < `+effTargetWuL+`
+		  -- Subject-distinct already-contributed guard: refuse the hold when a volunteer
+		  -- sharing this requester's trust subject already authored a PENDING result for
+		  -- the unit, so each of the N redundant results comes from a DISTINCT principal.
+		  -- Lifted from res2.volunteer_id = v.vol to subject equality (two devices of one
+		  -- live DID count as one).
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res2
-		    WHERE res2.work_unit_id = v.id AND res2.volunteer_id = v.vol
+		    JOIN volunteers rv2 ON rv2.id = res2.volunteer_id
+		    WHERE res2.work_unit_id = v.id
 		      AND res2.validation_status = 'PENDING'
+		      AND `+subjectExprSQL("rv2")+` = `+subjectExprSQL("vv")+`
 		  )
+		  -- Subject-distinct self-copy guard (NEW): refuse the hold when a LIVE copy of the
+		  -- unit is already held by any volunteer sharing this requester's subject — its own
+		  -- device OR a sibling device bound to the same live DID. The per-(unit,volunteer)
+		  -- ON CONFLICT below only covers the EXACT same volunteer; this closes the second-
+		  -- device-of-one-DID case that would otherwise land a redundant same-subject copy.
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history lc
+		    JOIN volunteers lv ON lv.id = lc.volunteer_id
+		    WHERE lc.work_unit_id = v.id
+		      AND lc.outcome IS NULL
+		      AND `+subjectExprSQL("lv")+` = `+subjectExprSQL("vv")+`
+		  )
+		  -- Cooldown stays keyed on volunteer_id (per-account reliability signal), NOT the
+		  -- subject, BY DESIGN: one device's timeout does not bench its siblings.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history hb
 		    WHERE hb.work_unit_id = v.id AND hb.volunteer_id = v.vol
@@ -1299,14 +1416,16 @@ func (r *PgxWorkUnitRepository) ReserveNextAssignable(ctx context.Context, opts 
 // This is the AUTHORITATIVE per-volunteer eligibility gate: it is the single point
 // where a copy comes into existence, so it enforces every distinctness rule
 // regardless of any optimization that decided to offer the unit. It returns
-// apierror.Conflict (no copy created) when the unit is not QUEUED, OR the volunteer
-// already holds a live copy (the live-copy partial unique), OR the volunteer already
-// authored a PENDING result for this unit (each redundant result must come from a
-// DISTINCT volunteer), OR the volunteer's recent copy of this unit timed out / was
+// apierror.Conflict (no copy created) when the unit is not QUEUED, OR a live copy is
+// already held by a volunteer sharing this requester's trust SUBJECT — its own device
+// (the live-copy partial unique) or a sibling device bound to the same live DID (two
+// devices of one live DID are one principal) — OR a volunteer sharing its subject
+// already authored a PENDING result for this unit (each redundant result must come from
+// a DISTINCT principal), OR the volunteer's own recent copy of this unit timed out / was
 // abandoned within the cooldown window (benched until a fresh volunteer gets first
-// refusal). Enforcing these here means a hand-out raced by a concurrent submit is
-// rejected BEFORE the volunteer ever run-starts, so no compute is wasted on a copy
-// that could never be accepted.
+// refusal; the cooldown stays per-account, not per-subject, by design). Enforcing these
+// here means a hand-out raced by a concurrent submit is rejected BEFORE the volunteer
+// ever run-starts, so no compute is wasted on a copy that could never be accepted.
 func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, volunteerID types.ID, hostID *types.ID, reservedUntil time.Time, deadlineSeconds int) (*Copy, error) {
 	row := r.db.QueryRow(ctx, `
 		INSERT INTO work_unit_assignment_history
@@ -1316,13 +1435,33 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		JOIN leafs l ON l.id = wu.leaf_id
 		JOIN volunteers vv ON vv.id = $2
 		WHERE wu.id = $1 AND wu.state = 'QUEUED'
-		  -- Distinctness: never reserve a unit this volunteer already produced a result
-		  -- for (so each of the N redundant results comes from a distinct volunteer).
+		  -- Subject-distinct already-contributed: never reserve a unit for which a
+		  -- volunteer sharing this requester's trust subject (its bound live DID, else the
+		  -- "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin) already authored a
+		  -- PENDING result, so each of the N redundant results comes from a DISTINCT
+		  -- principal (two devices of one live DID are one). Lifted from res.volunteer_id = $2.
 		  AND NOT EXISTS (
 		    SELECT 1 FROM results res
-		    WHERE res.work_unit_id = $1 AND res.volunteer_id = $2 AND res.validation_status = 'PENDING'
+		    JOIN volunteers rv ON rv.id = res.volunteer_id
+		    WHERE res.work_unit_id = $1
+		      AND res.validation_status = 'PENDING'
+		      AND `+subjectExprSQL("rv")+` = `+subjectExprSQL("vv")+`
 		  )
-		  -- Cooldown: a volunteer whose recent copy of this unit it STARTED timed out / was
+		  -- Subject-distinct self-copy (NEW): never reserve a unit a LIVE copy of which is
+		  -- already held by any volunteer sharing this requester's subject — its own device
+		  -- OR a sibling device bound to the same live DID. The per-(unit,volunteer) ON
+		  -- CONFLICT below covers only the EXACT same volunteer; this closes the second-
+		  -- device-of-one-DID case that would otherwise land a redundant same-subject copy.
+		  AND NOT EXISTS (
+		    SELECT 1 FROM work_unit_assignment_history lc
+		    JOIN volunteers lv ON lv.id = lc.volunteer_id
+		    WHERE lc.work_unit_id = $1
+		      AND lc.outcome IS NULL
+		      AND `+subjectExprSQL("lv")+` = `+subjectExprSQL("vv")+`
+		  )
+		  -- Cooldown stays keyed on volunteer_id ($2, per-account), NOT the subject, BY
+		  -- DESIGN: one device's timeout does not bench its siblings. A volunteer whose
+		  -- recent copy of this unit it STARTED timed out / was
 		  -- abandoned mid-run is benched for ~one deadline so a fresh volunteer gets first
 		  -- crack on the requeue. A graceful return of un-started buffered work (ABANDONED,
 		  -- started_at NULL) is not a reliability signal and does not bench (#59).
@@ -1352,7 +1491,7 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, apierror.Conflict(
-				"work unit not dispatchable for this volunteer (not QUEUED, live copy held, result already submitted, or in post-failure cooldown)",
+				"work unit not dispatchable for this volunteer (not QUEUED, a live copy is held by this account or a sibling device of the same DID, a result was already submitted by this subject, or in post-failure cooldown)",
 				map[string]string{"code": "RESERVATION_CONFLICT"},
 			)
 		}

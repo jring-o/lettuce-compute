@@ -7,7 +7,9 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/dispatchparity"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
@@ -40,15 +42,44 @@ func newParityCache(t *testing.T) *dispatchCache {
 	return newDispatchCache(dispatchCacheConfig{}, dispatchDeps{}, logger)
 }
 
+// paritySubject derives the trust subject for a synthetic volunteer row carrying `did` at
+// binding status `binding` (BindingNone leaves it unbound) through the PRODUCTION rule
+// trust.SubjectForVolunteer — never re-implemented inline, so this projection stays honest
+// against the SQL half, which recomputes the same subject in SQL. The dispatchparity binding
+// constants ("OK"/"STALE"/"REVOKED"/"") are the volunteers.did_binding_status domain, so
+// they map straight onto volunteer.DIDBindingStatus*.
+func paritySubject(id types.ID, did, binding string) string {
+	v := &volunteer.Volunteer{ID: id}
+	if binding != dispatchparity.BindingNone {
+		d := did
+		st := binding
+		v.DID = &d
+		v.DIDBindingStatus = &st
+	}
+	return trust.SubjectForVolunteer(v)
+}
+
 // projectGo translates one shared Scenario into the concrete inputs eligibleLocked
 // consumes: it warms the leaf snapshot, builds the candidate, seeds the per-machine
-// inflight counter, and returns the (volunteerID, hostKey, opts, candidate) tuple.
+// inflight counter, and returns the (volunteerID, hostKey, opts, candidate) tuple. The
+// distinctness dimension is projected by trust SUBJECT: every same-DID row shares one
+// minted DID (so their subjects collide while the binding is live), and every subject is
+// derived through the production trust functions rather than re-implemented here.
 func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types.ID, types.ID, workunit.AssignmentOptions, candidate) {
 	t.Helper()
 
 	leafID := types.NewID()
 	unitID := types.NewID()
 	requester := types.NewID()
+
+	// One DID minted per scenario, shared by every same-DID row; a second, distinct DID
+	// stands in for the different-DID control.
+	scenarioDID := "did:plc:" + types.NewID().String()
+	otherDID := "did:plc:" + types.NewID().String()
+
+	// The requester's subject, from its own binding status — exactly what RequestWorkUnit
+	// puts into opts.TrustSubject in production.
+	reqSubject := paritySubject(requester, scenarioDID, s.RequesterBinding)
 
 	// Requester's effective host key: the reported host id when present, else the
 	// account id — exactly meterID / COALESCE(host_id, volunteer_id).
@@ -82,23 +113,41 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		cls := s.UnitHRClass
 		hrClass = &cls
 	}
-	// dbActiveCount = live copies + PENDING results, mirroring
-	// FindDispatchableBatch.active_assignments (all coverage, self and others).
+	// dbActiveCount = live copies + PENDING results (all coverage, self and others),
+	// mirroring FindDispatchableBatch.active_assignments; contributors = their distinct
+	// trust SUBJECTS, keyed exactly as ContributorSubjects would be at refill.
 	dbActive := s.OtherLiveCopies + s.OtherPendingResults
-	contributors := map[types.ID]struct{}{}
+	contributors := map[string]struct{}{}
+	// Anonymous other contributors carry fresh per-keypair sentinel subjects; they never
+	// equal the requester's, so only the COUNT they add (already in dbActive) matters.
+	for i := 0; i < s.OtherLiveCopies+s.OtherPendingResults; i++ {
+		contributors[trust.SubjectForVolunteerID(types.NewID())] = struct{}{}
+	}
 	if s.SelfLiveCopy {
 		dbActive++
-		contributors[requester] = struct{}{}
+		contributors[reqSubject] = struct{}{}
 	}
 	if s.SelfPendingResult {
 		dbActive++
-		contributors[requester] = struct{}{}
+		contributors[reqSubject] = struct{}{}
 	}
-	// The other volunteers' identities never equal the requester, so they cannot
-	// change the requester-membership checks; only the COUNT they contribute (already
-	// in dbActive) matters. Distinct placeholders keep the set realistic.
-	for i := 0; i < s.OtherLiveCopies+s.OtherPendingResults; i++ {
-		contributors[types.NewID()] = struct{}{}
+	// A DIFFERENT volunteer row bound to the SAME DID: its subject collides with the
+	// requester's while the binding is live (OK/STALE) and reverts to a sentinel when
+	// REVOKED — so the exclusion fires or not exactly as the subject rule dictates. It
+	// consumes one unit of redundancy headroom too, so it is added to dbActive.
+	if s.OtherSameDIDLiveCopy {
+		dbActive++
+		contributors[paritySubject(types.NewID(), scenarioDID, s.OtherBinding)] = struct{}{}
+	}
+	if s.OtherSameDIDPendingResult {
+		dbActive++
+		contributors[paritySubject(types.NewID(), scenarioDID, s.OtherBinding)] = struct{}{}
+	}
+	// The different-DID control: a distinct bound principal, mutually eligible with the
+	// requester. It too consumes one unit of headroom.
+	if s.OtherDifferentDIDLiveCopy {
+		dbActive++
+		contributors[paritySubject(types.NewID(), otherDID, dispatchparity.BindingOK)] = struct{}{}
 	}
 	benched := map[types.ID]struct{}{}
 	if s.Benched() {
@@ -134,6 +183,9 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		HRClass:                 s.RequesterHRClass,
 		HostID:                  hostPtr,
 		BenchmarkFPOPS:          s.RequesterBenchmarkFPOPS,
+		// The requester's resolved trust subject drives the per-principal distinctness
+		// checks — the whole point of the subject dimension.
+		TrustSubject: reqSubject,
 	}
 	return requester, hostKey, opts, cand
 }
@@ -203,8 +255,12 @@ func TestDispatchPredicate_Go_InMemoryOnlyBranches(t *testing.T) {
 		_, cand := newCand(c, 2, 0)
 		o := opts
 		o.VolunteerID = requester
-		// The requester holds an as-yet-unflushed in-memory reservation on this unit.
-		c.reservedInMem[cand.unit.ID] = map[types.ID]heldCopy{requester: {hostID: requester}}
+		// The requester holds an as-yet-unflushed in-memory reservation on this unit. Its
+		// hold carries the requester's own subject; with opts.TrustSubject unset the
+		// predicate falls back to the same sentinel, so the self-held scan matches.
+		c.reservedInMem[cand.unit.ID] = map[types.ID]heldCopy{
+			requester: {hostID: requester, subject: trust.SubjectForVolunteerID(requester)},
+		}
 		c.inflight[requester] = 1
 
 		c.mu.Lock()
@@ -212,6 +268,31 @@ func TestDispatchPredicate_Go_InMemoryOnlyBranches(t *testing.T) {
 		c.mu.Unlock()
 		if ok || reason != rejectSelfHeld {
 			t.Fatalf("want ineligible/self_held, got ok=%v reason=%s", ok, reason)
+		}
+	})
+
+	t.Run("self_held_via_same_subject_different_volunteer", func(t *testing.T) {
+		c := newParityCache(t)
+		requester := types.NewID()
+		other := types.NewID()
+		_, cand := newCand(c, 2, 0)
+		o := opts
+		o.VolunteerID = requester
+		// A DIFFERENT account holds an in-memory copy, but under the SAME live DID as the
+		// requester: one principal. The self-held check is per-SUBJECT, so the requester
+		// must be refused even though no holder shares its volunteer id.
+		sharedDID := "did:plc:" + types.NewID().String()
+		o.TrustSubject = sharedDID
+		c.reservedInMem[cand.unit.ID] = map[types.ID]heldCopy{
+			other: {hostID: other, subject: sharedDID},
+		}
+		c.inflight[other] = 1
+
+		c.mu.Lock()
+		ok, reason := c.eligibleLocked(requester, requester, o, cand)
+		c.mu.Unlock()
+		if ok || reason != rejectSelfHeld {
+			t.Fatalf("want ineligible/self_held (same subject, different volunteer id), got ok=%v reason=%s", ok, reason)
 		}
 	})
 
@@ -223,7 +304,9 @@ func TestDispatchPredicate_Go_InMemoryOnlyBranches(t *testing.T) {
 		o := opts
 		o.VolunteerID = requester
 		// Plus one distinct in-memory holder: 1 (db) + 1 (in-mem) == redundancy 2.
-		c.reservedInMem[cand.unit.ID] = map[types.ID]heldCopy{other: {hostID: other}}
+		c.reservedInMem[cand.unit.ID] = map[types.ID]heldCopy{
+			other: {hostID: other, subject: trust.SubjectForVolunteerID(other)},
+		}
 
 		c.mu.Lock()
 		ok, reason := c.eligibleLocked(requester, requester, o, cand)

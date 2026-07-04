@@ -11,6 +11,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -89,14 +90,17 @@ type candidate struct {
 	// dbActiveCount is the active-history-row count of this unit at refill time,
 	// the authoritative floor on its redundancy headroom.
 	dbActiveCount int
-	// contributors is the set of volunteers that already count toward this unit's
+	// contributors is the set of trust SUBJECTS that already count toward this unit's
 	// redundancy: live-copy holders + PENDING-result authors at refill time, kept
-	// current as copies run-start (onRunStart). eligibleLocked excludes them so each
-	// of the N redundant results comes from a DISTINCT volunteer — the in-memory
-	// mirror of the volunteer-specific distinctness the DB reservation also enforces.
-	// A volunteer is never removed once added (a result/copy is monotonic coverage),
-	// so a candidate that lingers staged across the submitter's submit still excludes it.
-	contributors map[types.ID]struct{}
+	// current as copies run-start (onRunStart). A subject is the account-level trust
+	// key — a live-bound DID, else the per-keypair "vol:<uuid>" sentinel
+	// (trust.SubjectForVolunteer). eligibleLocked excludes them so each of the N
+	// redundant results comes from a DISTINCT PRINCIPAL: two devices under one live DID
+	// are ONE principal, so handing each a copy of one unit buys no extra corroboration
+	// (validation counts them as one subject) and only wastes compute. A subject is
+	// never removed once added (a result/copy is monotonic coverage), so a candidate
+	// that lingers staged across the submitter's submit still excludes it.
+	contributors map[string]struct{}
 	// benched is the set of volunteers whose recent copy of this unit timed out / was
 	// abandoned within ~one deadline window (a refill-time snapshot). They are given
 	// last refusal so a fresh volunteer gets first crack on a requeue; the DB
@@ -104,13 +108,19 @@ type candidate struct {
 	benched map[types.ID]struct{}
 }
 
-// heldCopy is one account's in-memory reservation on a unit: when it expires (the lease)
-// and which MACHINE holds it. The reservedInMem inner map keys on the ACCOUNT (per-WU
-// distinctness is per-account), but a release must decrement the right host's in-flight
-// count, so the host id rides along here (TODO #19).
+// heldCopy is one account's in-memory reservation on a unit: when it expires (the lease),
+// which MACHINE holds it, and the holder's trust SUBJECT. The reservedInMem inner map keys
+// on the ACCOUNT (release bookkeeping is per-account — a user's own machines must not
+// corroborate each other), but a release must decrement the right host's in-flight count,
+// so the host id rides along here (TODO #19); and the self-held distinctness check compares
+// PRINCIPALS, so the holder's subject (a live-bound DID, else the "vol:<uuid>" sentinel —
+// trust.SubjectForVolunteer, resolved at hand-out) rides along too. The subject can go
+// stale across a mid-process bind/revoke, which is SAFE: the SQL landing writes recompute
+// subjects fresh and refuse a same-subject copy, so staleness only costs a voided hand-out.
 type heldCopy struct {
 	reservedUntil time.Time
 	hostID        types.ID
+	subject       string
 }
 
 // meterID returns the effective host id the per-machine metering (in-flight cap, send
@@ -121,6 +131,20 @@ func meterID(volunteerID types.ID, hostID *types.ID) types.ID {
 		return *hostID
 	}
 	return volunteerID
+}
+
+// requesterSubject returns the requester's account-level trust subject for the in-memory
+// distinctness checks: opts.TrustSubject when RequestWorkUnit resolved it from the identity
+// snapshot (a live-bound DID, else the per-keypair sentinel), else — defensive, for an
+// unresolved snapshot or a test that did not populate it — the sentinel of the account id.
+// It is the single place the requester subject is read, so the fallback rule lives once.
+// Two volunteer rows sharing a live DID resolve to the SAME subject here, so they are
+// treated as one principal.
+func requesterSubject(volunteerID types.ID, opts workunit.AssignmentOptions) string {
+	if opts.TrustSubject != "" {
+		return opts.TrustSubject
+	}
+	return trust.SubjectForVolunteerID(volunteerID)
 }
 
 // inMemHolderCap is the maximum number of DISTINCT in-memory reservation holders the
@@ -233,6 +257,17 @@ type volunteerIdentity struct {
 	publicKey         []byte
 	hardware          volunteer.HardwareCapabilities
 	availableRuntimes []string
+	// trustSubject is the volunteer's account-level trust subject at warm time
+	// (trust.SubjectForVolunteer): the bound DID while the binding is live (OK or STALE),
+	// else the per-keypair "vol:<uuid>" sentinel. RequestWorkUnit copies it into
+	// opts.TrustSubject so the hot-path distinctness checks compare PRINCIPALS (two
+	// devices under one live DID are one subject) with no DB read. It can go STALE across
+	// a mid-process bind/revoke that does not re-register (the snapshot is only re-warmed
+	// at RegisterVolunteer / a cold-miss resolve). That is SAFE: the SQL landing writes
+	// (FlushReservations / ReserveCopy) recompute the subject fresh and refuse a
+	// same-subject copy, so a stale snapshot costs at most one voided hand-out, never a
+	// wrong corroboration.
+	trustSubject string
 }
 
 // spotCheckWrite is one deferred spot-check marking (MarkSpotCheck + ReserveCopy to
@@ -572,8 +607,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// hostKey is the requesting MACHINE's effective host id — the key for the per-machine
 	// in-flight cap and send-interval floor (TODO #19). It is the account id when the
 	// volunteer reported no host, so the metering transparently falls back to per-account.
-	// Distinctness still keys on volunteerID (the account), never on hostKey.
+	// Distinctness keys on the requester's trust SUBJECT (reqSubject), never on hostKey.
 	hostKey := meterID(volunteerID, opts.HostID)
+	// reqSubject is the requester's account-level trust subject, resolved once for this
+	// whole hand-out (opts and volunteerID are fixed): recorded on each accepted hold so
+	// the self-held distinctness check compares PRINCIPALS.
+	reqSubject := requesterSubject(volunteerID, opts)
 
 	// TODO #54: when the reliability quota is on, the per-machine in-flight cap becomes the
 	// host's ADAPTIVE budget (grounded in measured throughput), not the flat configured cap.
@@ -645,7 +684,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			holders = make(map[types.ID]heldCopy)
 			c.reservedInMem[uid] = holders
 		}
-		holders[volunteerID] = heldCopy{reservedUntil: reservedUntil, hostID: hostKey}
+		holders[volunteerID] = heldCopy{reservedUntil: reservedUntil, hostID: hostKey, subject: reqSubject}
 		c.inflight[hostKey]++
 
 		// HR pin (in-memory, first-writer-wins): the first holder of an unpinned unit on
@@ -870,13 +909,23 @@ func (r rejectReason) String() string {
 // rejectReason so HandOut can tally why a volunteer was handed nothing. Callers that
 // do not need the reason discard the second value.
 //
-// volunteerID is the ACCOUNT (the key for redundancy headroom, self-exclusion,
-// distinctness, and the post-failure cooldown — all per-account by decision). hostKey is
-// the requesting MACHINE's effective host id (the key for the in-flight cap, per-machine
-// by TODO #19) — distinct so a user's rig and laptop get independent in-flight budgets.
+// The distinctness rules (self-held copy, already-contributed) are per-PRINCIPAL: each
+// of a unit's N redundant results must come from a distinct trust SUBJECT, so two
+// volunteer rows sharing one live DID (one principal) never both hold or contribute to
+// the same unit — validation counts them as one, so a second copy only wastes compute.
+// The post-failure cooldown ("benched") and the per-machine in-flight cap deliberately
+// stay keyed on the account / host, not the subject: they are reliability / metering
+// signals, not corroboration distinctness.
+//
+// volunteerID is the ACCOUNT (the key for redundancy headroom release bookkeeping and the
+// per-account post-failure cooldown). hostKey is the requesting MACHINE's effective host
+// id (the key for the in-flight cap, per-machine by TODO #19) — distinct so a user's rig
+// and laptop get independent in-flight budgets. The requester's SUBJECT (for distinctness)
+// is resolved from opts via requesterSubject.
 func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts workunit.AssignmentOptions, cand candidate) (bool, rejectReason) {
 	uid := cand.unit.ID
 	leafID := cand.unit.LeafID
+	subject := requesterSubject(volunteerID, opts)
 
 	// Redundancy headroom, enforced by TWO bounds:
 	//   (1) total redundancy: dbActiveCount (already-running history rows) + distinct
@@ -892,21 +941,37 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	if len(holders) >= cand.inMemHolderCap() {
 		return false, rejectHolderCap
 	}
-	// Self-exclusion: never hand this volunteer a unit it already holds in memory.
+	// Self-exclusion (per PRINCIPAL): never hand this requester a unit any of whose current
+	// in-memory holders shares its trust subject — the requester's own account, or another
+	// of its devices under the same live DID (one principal cannot corroborate itself). The
+	// holder map stays keyed on the account for release bookkeeping, so the check scans the
+	// holders (at most redundancy of them, trivially cheap) comparing subjects. The direct
+	// account-key check stays IN ADDITION to the subject scan: a hold's subject is a
+	// hand-out-time snapshot that can lag a mid-process bind/revoke, but the account key
+	// cannot — the requester's own live hold must be refused no matter how its subject has
+	// since moved.
 	if _, held := holders[volunteerID]; held {
 		return false, rejectSelfHeld
 	}
-	// Distinctness: never hand this volunteer a unit it already contributed to — it
-	// holds a live copy elsewhere or already submitted a (still-PENDING) result for it.
-	// Each of a unit's N redundant results must come from a DISTINCT volunteer; without
-	// this a unit re-queued for corroboration is re-handed to its own prior submitter,
-	// who can only run it and have the duplicate result rejected. The DB reservation is
-	// the authoritative gate; this avoids the wasted hand-out entirely.
-	if _, did := cand.contributors[volunteerID]; did {
+	for _, hc := range holders {
+		if hc.subject == subject {
+			return false, rejectSelfHeld
+		}
+	}
+	// Distinctness (per PRINCIPAL): never hand this requester a unit its subject already
+	// contributed to — a live copy held elsewhere or an already-submitted (still-PENDING)
+	// result, by any device of the same principal. Each of a unit's N redundant results
+	// must come from a DISTINCT subject; without this a unit re-queued for corroboration is
+	// re-handed to its own prior submitter (or that submitter's other device), which can
+	// only run it and have the duplicate result rejected. The DB reservation is the
+	// authoritative gate; this avoids the wasted hand-out entirely.
+	if _, did := cand.contributors[subject]; did {
 		return false, rejectAlreadyContributed
 	}
 	// Post-failure cooldown: a volunteer whose recent copy of this unit timed out or was
-	// abandoned is benched for ~one deadline so a fresh volunteer gets first crack.
+	// abandoned is benched for ~one deadline so a fresh volunteer gets first crack. Keyed on
+	// the ACCOUNT, not the subject, by design — the cooldown is a per-account reliability
+	// signal (this account's copy failed), not corroboration distinctness.
 	if _, benched := cand.benched[volunteerID]; benched {
 		return false, rejectBenched
 	}
@@ -1127,8 +1192,17 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	holders := c.reservedInMem[unitID]
+	// Capture the run-starting holder's trust SUBJECT before dropping its hold, so the
+	// contributor recorded on the staged candidate below is the PRINCIPAL (matching the
+	// subject-keyed contributor set), not the account. Fall back to the sentinel of the
+	// account id when there is no holder entry (e.g. a reservation this replica did not
+	// hand out in memory — recovered from the DB after a restart).
+	subject := trust.SubjectForVolunteerID(volunteerID)
 	if holders != nil {
-		if _, ok := holders[volunteerID]; ok {
+		if hc, ok := holders[volunteerID]; ok {
+			if hc.subject != "" {
+				subject = hc.subject
+			}
 			delete(holders, volunteerID)
 			if len(holders) == 0 {
 				delete(c.reservedInMem, unitID)
@@ -1140,17 +1214,17 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 			// The run-started copy is now a live DB row: move it from the holder set
 			// into dbActiveCount so eligibleLocked still sees the correct coverage.
 			c.ready[i].dbActiveCount++
-			// Record this volunteer as a contributor on the STAGED candidate. The unit
+			// Record this principal as a contributor on the STAGED candidate. The unit
 			// stays QUEUED while a redundancy>1 copy runs, so the candidate lingers in the
 			// ready pool across this volunteer's submit (which does not meet redundancy and
 			// so does not evict it). Its refill-time contributor snapshot predates this
-			// run-start, so without recording it here the same volunteer would become
+			// run-start, so without recording it here the same subject would become
 			// eligible again the moment its in-memory hold is released — re-handed its own
 			// unit. Adding it now keeps the staged candidate's distinctness correct.
 			if c.ready[i].contributors == nil {
-				c.ready[i].contributors = make(map[types.ID]struct{})
+				c.ready[i].contributors = make(map[string]struct{})
 			}
-			c.ready[i].contributors[volunteerID] = struct{}{}
+			c.ready[i].contributors[subject] = struct{}{}
 			remainingHolders := len(c.reservedInMem[unitID])
 			if c.ready[i].dbActiveCount+remainingHolders >= c.ready[i].effectiveRedundancy {
 				// Redundancy fully covered: drop it from ready (the refiller re-stages it
@@ -1358,6 +1432,9 @@ func (c *dispatchCache) putIdentity(v *volunteer.Volunteer) {
 		publicKey:         pk,
 		hardware:          v.HardwareCapabilities,
 		availableRuntimes: rts,
+		// Trust subject resolved through the production rule (the single source of truth):
+		// the bound DID while live (OK/STALE), else the per-keypair sentinel.
+		trustSubject: trust.SubjectForVolunteer(v),
 	}
 	c.identityMu.Unlock()
 }
@@ -1708,7 +1785,7 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			unit:                dc.WorkUnit,
 			effectiveRedundancy: dc.RedundancyFactor,
 			dbActiveCount:       dc.ActiveAssignments,
-			contributors:        idSet(dc.ContributorVolunteerIDs),
+			contributors:        strSet(dc.ContributorSubjects),
 			benched:             idSet(dc.BenchedVolunteerIDs),
 		})
 	}
@@ -2262,6 +2339,20 @@ func idSet(ids []types.ID) map[types.ID]struct{} {
 	s := make(map[types.ID]struct{}, len(ids))
 	for _, id := range ids {
 		s[id] = struct{}{}
+	}
+	return s
+}
+
+// strSet builds a set from a slice of strings (nil for an empty/absent slice, so an
+// unstaged candidate carries a nil — not empty — map, read as "no members" at no
+// allocation cost). The string twin of idSet, for the subject-keyed contributor set.
+func strSet(ss []string) map[string]struct{} {
+	if len(ss) == 0 {
+		return nil
+	}
+	s := make(map[string]struct{}, len(ss))
+	for _, v := range ss {
+		s[v] = struct{}{}
 	}
 	return s
 }
