@@ -111,6 +111,9 @@ func (r *mockWorkUnitRepo) ExpireLiveCopies(context.Context, types.ID, string) (
 func (r *mockWorkUnitRepo) CountLiveCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }
+func (r *mockWorkUnitRepo) CountProbationLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
 func (r *mockWorkUnitRepo) CountTotalCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }

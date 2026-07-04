@@ -183,6 +183,9 @@ func (m *bvMockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID,
 func (m *bvMockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
 	return 0, nil
 }
+func (m *bvMockWURepo) CountProbationLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
 func (m *bvMockWURepo) CountLiveCopies(context.Context, types.ID) (int, error)  { return 0, nil }
 func (m *bvMockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) { return 0, nil }
 func (m *bvMockWURepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }

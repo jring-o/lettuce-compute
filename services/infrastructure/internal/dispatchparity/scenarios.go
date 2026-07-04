@@ -34,9 +34,12 @@
 // headroom, self-held-copy exclusion, already-contributed exclusion, subject
 // (DID) distinctness, the post-failure cooldown ("benched"), the per-machine
 // in-flight cap, homogeneous-redundancy hardware-class matching,
-// runtime/capability fit, feasibility-at-deadline, and the trusted-corroborator
+// runtime/capability fit, feasibility-at-deadline, the trusted-corroborator
 // reservation (an untrusted requester withheld from a slot the quorum still needs a
-// trusted result to fill) — with boundary cases at each cap/limit edge.
+// trusted result to fill), and account standing (a BENCHED requester refused all
+// dispatch, and copies/results held or submitted by a neutralized account not
+// counting toward redundancy coverage — forced replication) — with boundary cases
+// at each cap/limit edge.
 package dispatchparity
 
 // Dimension names the single predicate axis a Scenario primarily exercises. It
@@ -57,6 +60,20 @@ const (
 	DimCapability        Dimension = "runtime_capability"
 	DimFeasibility       Dimension = "deadline_feasibility"
 	DimTrustReservation  Dimension = "trusted_corroborator_reservation"
+	DimStanding          Dimension = "account_standing"
+)
+
+// Requester account-standing values for the DimStanding dimension (account standing,
+// BG-24b). They mirror the volunteers.standing domain as plain strings so this package
+// stays primitive-only. The ZERO value ("") reads as OK — the standing gate is then inert,
+// exactly as an account ABSENT from the head's non-OK standing snapshot resolves to OK. A
+// requester's EFFECTIVE standing is never hand-computed in the projections: each derives it
+// through the production resolver (volunteer.EffectiveStanding on the Go side; standingExprSQL
+// on the SQL side) from the raw standing + benched_until this scenario carries.
+const (
+	StandingOK        = ""          // OK: the gate is inert (zero value)
+	StandingProbation = "PROBATION" // dispatches normally; neutralized in coverage/verdict, never refused at dispatch
+	StandingBenched   = "BENCHED"   // refused all dispatch while the bench is live
 )
 
 // Binding-status values for the subject-distinctness dimension. They mirror the
@@ -281,6 +298,44 @@ type Scenario struct {
 	// what the validation verdict will credit — not a later current score.
 	TrustedOtherPendingResults int
 
+	// --- Account standing (BG-24b) -------------------------------------------
+	// The head neutralizes an unreliable account by moving its STANDING off OK. Two
+	// distinct effects, both exercised here; the ZERO value of every field leaves the
+	// dimension inert (an all-OK population), so every existing scenario is unaffected.
+	//
+	// (1) A BENCHED requester is refused ALL dispatch until its bench lapses — the
+	//     per-account twin of the post-failure cooldown, re-checked by every gate
+	//     including the ReserveCopy landing write. A PROBATION requester (or one whose
+	//     bench has EXPIRED, which resolves to PROBATION) still dispatches normally: its
+	//     results simply never corroborate, so it is neutralized in the coverage/verdict
+	//     arithmetic below, not refused at hand-out.
+	// (2) Forced replication: a live copy held by — or a PENDING result submitted by — a
+	//     neutralized (non-OK) account does NOT COUNT toward a unit's redundancy coverage,
+	//     so a unit whose raw coverage looks full stays open for a fresh OK requester until
+	//     enough COUNTABLE copies exist. Only the countable coverage closes redundancy.
+	//
+	// RequesterStanding is the requester's own raw account standing: StandingOK ("" =
+	// OK, the gate inert), StandingProbation, or StandingBenched. Its EFFECTIVE standing
+	// is resolved from this (and RequesterBenchExpired) through the production resolver.
+	RequesterStanding string
+	// RequesterBenchExpired, with RequesterStanding == StandingBenched, places the bench
+	// deadline (benched_until) in the PAST: the stored standing is BENCHED but its
+	// EFFECTIVE standing resolves to PROBATION, so the requester dispatches (re-entry is
+	// neutralized, never blocked). Meaningful only with a BENCHED requester; the zero
+	// value (false) is a LIVE bench (benched_until NULL/indefinite → effective BENCHED).
+	RequesterBenchExpired bool
+	// OtherProbationLiveCopies is the number of live copies of the target unit held by
+	// OTHER, distinct accounts whose CURRENT effective standing is PROBATION. Each
+	// consumes a RAW redundancy slot (like OtherLiveCopies) and is recorded as a distinct
+	// contributor subject, but is NON-COUNTABLE — it covers no redundancy — so it forces
+	// replication around itself.
+	OtherProbationLiveCopies int
+	// OtherProbationPendingResults is the number of PENDING results on the target unit
+	// from OTHER, distinct accounts, STAMPED PROBATION at submit (results.standing_at_submit
+	// = 'PROBATION'). Like OtherProbationLiveCopies each consumes a raw slot but is
+	// non-countable — the pending-by-stamped twin of the live-by-current filter.
+	OtherProbationPendingResults int
+
 	// --- Expected verdict ----------------------------------------------------
 	// Eligible is the verdict BOTH full-predicate layers are expected to reach. For
 	// every scenario except a known divergence the two agree and this is the single
@@ -313,6 +368,17 @@ func (s Scenario) SQLWant() bool {
 // candidate's benched set.
 func (s Scenario) Benched() bool { return s.Cooldown.benches() }
 
+// benchedRequester reports whether the requester's own account standing (BG-24b) resolves
+// to a LIVE bench — the per-account refusal every dispatch gate AND every landing write
+// (including ReserveCopy) enforces, exactly like the post-failure cooldown. A bench whose
+// deadline has passed (RequesterBenchExpired) resolves to PROBATION and does NOT refuse, and
+// a PROBATION requester dispatches normally, so both leave this false. It is the one standing
+// refusal ReserveCopy re-checks (see EnforcedBy); the forced-replication coverage refusal is a
+// unit-level headroom invariant ReserveCopy delegates to the read-side gate.
+func (s Scenario) benchedRequester() bool {
+	return s.RequesterStanding == StandingBenched && !s.RequesterBenchExpired
+}
+
 // EnforcedBy reports whether gate g re-checks the predicate dimension this scenario
 // exercises, and is therefore expected to reproduce the scenario's ineligibility.
 // The two full-predicate gates enforce every dimension; the landing-write gates
@@ -329,8 +395,12 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 		// The batched landing write re-checks redundancy headroom AND the
 		// trusted-corroborator reservation (both are unit-level headroom invariants it
 		// owns at the landing write), plus the per-volunteer distinctness / cooldown /
-		// feasibility rules.
-		case DimRedundancy, DimTrustReservation, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
+		// feasibility rules AND the BENCHED account-standing gate. DimStanding is enforced
+		// unconditionally here because FlushReservations owns EVERY standing refusal a
+		// negative standing scenario can carry: the BENCHED reserver gate
+		// (standingExprSQL("vv") <> 'BENCHED'), and the countable-coverage headroom /
+		// trusted reservation (both embed countableCoverageSQL).
+		case DimRedundancy, DimTrustReservation, DimStanding, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
 		default: // capability, hr_class, inflight_cap — delegated to the hand-out
 			return false
@@ -344,6 +414,14 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 		// cooldown / feasibility guards. DimTrustReservation follows DimRedundancy exactly.
 		case DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
+		case DimStanding:
+			// A standing scenario splits: the BENCHED-requester refusal IS a per-account
+			// landing invariant ReserveCopy re-checks (standingExprSQL("vv") <> 'BENCHED',
+			// the cooldown parallel), but the forced-replication countable-coverage refusal
+			// is unit-level headroom ReserveCopy delegates to the read-side gate — exactly
+			// as DimRedundancy is absent here. So ReserveCopy enforces a standing scenario
+			// iff its refusal is the live-bench one.
+			return s.benchedRequester()
 		default:
 			return false
 		}
@@ -774,6 +852,111 @@ func Scenarios() []Scenario {
 			s.RequesterTrustScore = 30 // >= 25 -> trusted
 			s.TargetCopies = 2
 			s.OtherLiveCopies = 1
+			s.Eligible = true
+		}),
+
+		// --- account standing (BG-24b) ---------------------------------------
+		// Two neutralization mechanisms, both driven by a volunteer's STANDING moving off
+		// OK. (A) A BENCHED requester is refused ALL dispatch until its bench lapses — a
+		// per-account refusal every gate enforces, ReserveCopy included (the cooldown
+		// parallel). (B) Forced replication: a live copy held by, or a PENDING result
+		// submitted by, a neutralized (non-OK) account does NOT COUNT toward redundancy
+		// coverage, so a unit that looks raw-full stays open for a fresh OK requester —
+		// only the COUNTABLE coverage closes redundancy (the DimRedundancy parallel;
+		// ReserveCopy delegates it to the read-side gate). Every field's zero value is
+		// inert (an all-OK population), so the whole dimension leaves prior scenarios
+		// untouched. A leaf that sets only redundancy_factor resolves effective
+		// target == TargetCopies here, exactly as the redundancy/trust dimensions assume.
+		//
+		// NOT expressible as a distinct row (documented deliberately): "a floor-scoring
+		// covering copy whose account is PROBATION is excluded from trusted_present, so an
+		// untrusted requester still hits the reservation". A floor-scoring covering copy's
+		// standing is provably NET-NEUTRAL on the reservation verdict — going non-OK drops it
+		// from BOTH the countable coverage (−1) and trusted_present (which raises the reserved
+		// term GREATEST(0, K − present) by +1), and while the reservation binds (present < K)
+		// those exactly cancel. So no single-field scenario can make the copy's standing FLIP
+		// a reservation verdict; the trusted_present standing filter is verified only via the
+		// counting parity, not observable here. Skipped rather than contort the table with a
+		// field that decouples coverage from trusted_present (which standing inherently
+		// couples).
+		with("standing_benched_requester_refused", DimStanding, func(s *Scenario) {
+			// (A) A requester the head has BENCHED (indefinite bench, benched_until NULL) is
+			// refused every dispatch and every landing write. Redundancy is wide open
+			// (TargetCopies 2, no copies) so the bench is unambiguously the reason.
+			s.RequesterStanding = StandingBenched
+			s.Eligible = false
+		}),
+		with("standing_expired_bench_dispatches_as_probation", DimStanding, func(s *Scenario) {
+			// (A, neutralized) The stored standing is BENCHED but the bench deadline has
+			// passed, so the EFFECTIVE standing resolves to PROBATION — re-entry is
+			// neutralized, not blocked, and the account is dispatched again.
+			s.RequesterStanding = StandingBenched
+			s.RequesterBenchExpired = true
+			s.Eligible = true
+		}),
+		with("standing_probation_requester_dispatches", DimStanding, func(s *Scenario) {
+			// (A, neutralized) A PROBATION requester still dispatches: neutralization happens
+			// in the coverage/verdict arithmetic (its results never corroborate), not as a
+			// dispatch refusal.
+			s.RequesterStanding = StandingProbation
+			s.Eligible = true
+		}),
+		with("standing_probation_live_copies_force_replication_admit_ok", DimStanding, func(s *Scenario) {
+			// (B) Both live copies covering this redundancy-2 unit are held by PROBATION
+			// accounts, so RAW coverage sits AT the target (2) while COUNTABLE coverage is 0.
+			// A fresh OK requester still finds headroom — full replication forced around the
+			// neutralized copies. Enforced by the redundancy gates (EligibleLocked,
+			// FindNextAssignable, FlushReservations); a positive verdict, so every gate admits.
+			s.TargetCopies = 2
+			s.OtherProbationLiveCopies = 2
+			s.Eligible = true
+		}),
+		with("standing_probation_pending_results_force_replication_admit_ok", DimStanding, func(s *Scenario) {
+			// (B) As above but the covering copies are finished PENDING results STAMPED
+			// PROBATION at submit — non-countable via the pending-by-stamped arm. Raw
+			// coverage 2 == target, countable 0, so the OK requester is admitted.
+			s.TargetCopies = 2
+			s.OtherProbationPendingResults = 2
+			s.Eligible = true
+		}),
+		with("standing_mixed_coverage_probation_netted_admit_ok", DimStanding, func(s *Scenario) {
+			// (B, boundary) One OK (countable) live copy plus one PROBATION (non-countable)
+			// one: raw coverage 2 == target, but countable coverage is 1 < 2, so a slot
+			// remains. This is the exact edge where the standing filter flips the verdict —
+			// without it the raw count 2 would close the unit; with it the probation copy is
+			// netted out and the OK requester is admitted.
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.OtherProbationLiveCopies = 1
+			s.Eligible = true
+		}),
+		with("standing_probation_requester_over_probation_coverage_admit", DimStanding, func(s *Scenario) {
+			// (A+B) Compositional: a PROBATION requester (not refused at dispatch) taking a
+			// forced-replication slot on a unit whose only live copy is PROBATION-held. The
+			// requester-standing gate (PROBATION dispatches) and the countable-coverage gate
+			// (probation copy covers nothing, headroom stays open) both admit, independently.
+			s.RequesterStanding = StandingProbation
+			s.TargetCopies = 2
+			s.OtherProbationLiveCopies = 1
+			s.Eligible = true
+		}),
+		with("standing_coverage_full_net_of_probation_refused", DimStanding, func(s *Scenario) {
+			// (B, refused control) Two OK (countable) live copies fill the redundancy-2
+			// target NET of a third, PROBATION-held copy: countable coverage 2 == target, so
+			// the OK requester is refused (rejectRedundancyFull class). The probation copy is
+			// present but netted out — proving it is the countability, not the raw count, that
+			// closes the unit. A unit-level headroom refusal: enforced by EligibleLocked,
+			// FindNextAssignable and FlushReservations, but NOT ReserveCopy (the DimRedundancy
+			// parallel — ReserveCopy delegates coverage to the read-side gate).
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 2
+			s.OtherProbationLiveCopies = 1
+			s.Eligible = false
+		}),
+		with("standing_inert_control_matches_baseline", DimStanding, func(s *Scenario) {
+			// Gate-inertness control: every standing field at its zero value (OK requester, no
+			// probation coverage) must reach the SAME eligible verdict as the plain baseline,
+			// pinning that a non-standing deployment is byte-for-byte unchanged.
 			s.Eligible = true
 		}),
 	}

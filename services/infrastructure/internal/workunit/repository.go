@@ -196,6 +196,11 @@ type WorkUnitRepository interface {
 	// CountLiveCopies returns the number of live (RESERVED + RUNNING) copies of a unit.
 	CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
 
+	// CountProbationLiveCopies returns the live copies whose HOLDER's CURRENT effective standing
+	// is not OK (BG-24b) — the subset excluded from redundancy coverage so a unit forces full
+	// replication around a probation account instead of counting its copy.
+	CountProbationLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
+
 	// CountTotalCopies returns the total copies ever created for a unit (dead-letter probe).
 	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
 

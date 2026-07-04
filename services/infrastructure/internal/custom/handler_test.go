@@ -148,6 +148,9 @@ func (m *mockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, e
 func (m *mockWURepo) CountLiveCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }
+func (m *mockWURepo) CountProbationLiveCopies(context.Context, types.ID) (int, error) {
+	return 0, nil
+}
 func (m *mockWURepo) CountTotalCopies(context.Context, types.ID) (int, error) {
 	return 0, nil
 }

@@ -30,6 +30,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/montecarlo"
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
@@ -171,15 +172,19 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	}
 
 	// Helper: requireAuth, then inject the authenticated caller's admin status for the
-	// trust admin handlers to enforce. The trust package cannot import the server package
-	// (import cycle) to read UserFromContext, so — mirroring how leafViewer injects
-	// leaf.Viewer — the router passes the admin fact in via trust.WithCaller and the
-	// handler's requireAdmin does the operator-only 403. requireAuth still runs first so
-	// an anonymous request is 401 before any trust logic.
+	// operator-only admin handlers to enforce. Neither the trust nor the standing package
+	// can import the server package (import cycle) to read UserFromContext, so — mirroring
+	// how leafViewer injects leaf.Viewer — the router passes the admin fact in via
+	// {trust,standing}.WithCaller and each handler's requireAdmin does the operator-only
+	// 403. One wrapper injects BOTH caller contexts so the trust and standing admin routes
+	// share it. requireAuth still runs first so an anonymous request is 401 before any
+	// admin logic.
 	authAdmin := func(h http.HandlerFunc) http.HandlerFunc {
 		return requireAuth(func(w http.ResponseWriter, r *http.Request) {
 			u := UserFromContext(r.Context())
-			ctx := trust.WithCaller(r.Context(), trust.Caller{IsAdmin: u != nil && u.Role == "ADMIN"})
+			isAdmin := u != nil && u.Role == "ADMIN"
+			ctx := trust.WithCaller(r.Context(), trust.Caller{IsAdmin: isAdmin})
+			ctx = standing.WithCaller(ctx, standing.Caller{IsAdmin: isAdmin})
 			h(w, r.WithContext(ctx))
 		})
 	}
@@ -237,6 +242,19 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/admin/trust/slash", authAdmin(trustHandler.HandleSlash))
 	mux.HandleFunc("GET /api/v1/admin/trust/{subject}", authAdmin(trustHandler.HandleGet))
 	mux.HandleFunc("GET /api/v1/admin/trust", authAdmin(trustHandler.HandleList))
+
+	// Account-standing administration (operator-only — admin API key). Set, clear, read,
+	// and list the per-account standing that gates dispatch and quorum countability (see
+	// internal/standing). HandleSet is the operator's direct lever: a manually identified
+	// attacker must be stoppable regardless of the automatic backpressure machine, so the
+	// row it writes is OPERATOR-owned and never auto-changed. Shares the authAdmin wrapper,
+	// which injects standing.Caller alongside trust.Caller.
+	standingRepo := standing.NewPgxRepository(deps.Pool)
+	standingHandler := standing.NewHandler(standingRepo, deps.Logger)
+	mux.HandleFunc("POST /api/v1/admin/standing", authAdmin(standingHandler.HandleSet))
+	mux.HandleFunc("POST /api/v1/admin/standing/clear", authAdmin(standingHandler.HandleClear))
+	mux.HandleFunc("GET /api/v1/admin/standing/{volunteer_id}", authAdmin(standingHandler.HandleGet))
+	mux.HandleFunc("GET /api/v1/admin/standing", authAdmin(standingHandler.HandleList))
 
 	// --- Deprecated /api/v1/projects aliases (removed in v0.10) ---
 	// Same handlers, same responses — allows existing clients to migrate gradually.

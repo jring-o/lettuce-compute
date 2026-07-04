@@ -725,8 +725,17 @@ func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.
 	// Collapse to distinct subjects, keeping each subject's max submission-time score (equal
 	// per subject in practice; max is defensive). Reuses the transitioner's subject/score
 	// fallbacks so accrual and the acceptance verdict apply identical rules.
+	//
+	// A non-countable result (submitter's effective standing at submit was not OK — see
+	// transition.StandingCountable) is skipped, so it neither ACCRUES trust nor WITNESSES it:
+	// its subject earns no +1, and its score never counts toward whether some OTHER subject had
+	// a trusted witness. A probation account is invisible to trust just as it is to the verdict,
+	// closing the loophole where a benched-then-agreeing account could seed trust outward.
 	subjectScore := make(map[string]int)
 	for _, r := range agreedResults {
+		if !transition.StandingCountable(r) {
+			continue
+		}
 		subj := transition.SubjectForResult(r)
 		sc := transition.ScoreForResult(r)
 		if cur, ok := subjectScore[subj]; !ok || sc > cur {

@@ -234,10 +234,44 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 			stampResultTrust(t, pool, wu.ID, author, parityTrustedScore)
 		}
 	}
+	// Probation-held coverage (account standing, BG-24b forced replication): live copies held
+	// by OTHER, distinct PROBATION-standing accounts, and PENDING results STAMPED PROBATION at
+	// submit. Each consumes a RAW redundancy slot but is NON-COUNTABLE — a live copy via its
+	// holder's CURRENT effective standing (standingExprSQL <> 'OK'), a pending result via its
+	// stamped standing_at_submit — so the production countableCoverageSQL discounts them and
+	// full replication is forced around them. The production SQL derives all of this; the seed
+	// only writes the raw standing columns (setStanding) and the result stamp (setResultStanding).
+	for i := 0; i < s.OtherProbationLiveCopies; i++ {
+		holder := createTestVolunteer(t, pool)
+		insertLiveCopy(t, pool, wu.ID, holder, nil)
+		setStanding(t, pool, holder, "PROBATION", nil)
+	}
+	for i := 0; i < s.OtherProbationPendingResults; i++ {
+		author := createTestVolunteer(t, pool)
+		insertPendingResult(t, pool, wu.ID, author)
+		setResultStanding(t, pool, wu.ID, author, "PROBATION")
+	}
 	// The requester's own current trust score (0 = no row = untrusted). A score at or above
 	// the resolved floor makes the requester TRUSTED, bypassing the reservation.
 	if s.RequesterTrustScore > 0 {
 		setTrustScore(t, pool, requester, s.RequesterTrustScore)
+	}
+	// Requester account standing (BG-24b): set the requester's RAW standing columns (standing +
+	// benched_until) directly; every SQL gate resolves the CURRENT effective standing through
+	// standingExprSQL. A LIVE bench (benched_until NULL) refuses dispatch everywhere; an EXPIRED
+	// bench (benched_until in the past) resolves to PROBATION and dispatches; a stored PROBATION
+	// dispatches too. StandingOK ("") leaves the createTestVolunteer default (OK), so the gate
+	// is inert.
+	switch s.RequesterStanding {
+	case dispatchparity.StandingBenched:
+		var until *time.Time
+		if s.RequesterBenchExpired {
+			past := time.Now().UTC().Add(-time.Hour) // expired bench => effective PROBATION
+			until = &past
+		}
+		setStanding(t, pool, requester, "BENCHED", until)
+	case dispatchparity.StandingProbation:
+		setStanding(t, pool, requester, "PROBATION", nil)
 	}
 
 	// The requester's own relationship to the target unit.

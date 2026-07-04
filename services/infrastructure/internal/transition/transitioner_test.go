@@ -13,10 +13,11 @@ import (
 // --- fakes ---
 
 type fakeWUS struct {
-	wu          *workunit.WorkUnit
-	live, total int
-	errCopies   int
-	deadLetter  bool // what DeadLetterIfExhausted returns
+	wu            *workunit.WorkUnit
+	live, total   int
+	probationLive int
+	errCopies     int
+	deadLetter    bool // what DeadLetterIfExhausted returns
 
 	markCompletedCalls int
 	expireCalls        []string // outcomes passed to ExpireLiveCopies
@@ -39,6 +40,9 @@ func (f *fakeWUS) DeadLetterIfExhausted(context.Context, types.ID) (bool, error)
 func (f *fakeWUS) ExpireLiveCopies(_ context.Context, _ types.ID, outcome string) (int, error) {
 	f.expireCalls = append(f.expireCalls, outcome)
 	return f.live, nil
+}
+func (f *fakeWUS) CountProbationLiveCopies(context.Context, types.ID) (int, error) {
+	return f.probationLive, nil
 }
 
 type fakeLeaf struct{ lf *leaf.Leaf }

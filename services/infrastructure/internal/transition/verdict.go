@@ -4,6 +4,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 )
 
 // SubjectForResult returns the account-level trust subject a result is attributed to: the
@@ -31,6 +32,16 @@ func ScoreForResult(r *result.Result) int {
 	return 0
 }
 
+// StandingCountable reports whether a result counts toward quorum and redundancy coverage: it
+// does iff the submitter's EFFECTIVE account standing at submission was OK (BG-24b). The
+// STAMP (result.StandingAtSubmit), not a live re-read of the account's standing, is
+// authoritative — the same as-of-submission rule TrustScoreAtSubmit follows: a bench applied
+// after submit cannot retroactively strike a result that was OK when it landed, and a legacy
+// row (nil stamp, created before the standing feature) counts as OK.
+func StandingCountable(r *result.Result) bool {
+	return r.StandingAtSubmit == nil || *r.StandingAtSubmit == volunteer.StandingOK
+}
+
 // BuildComparisonVerdict computes the subject-level comparison verdict from the compared
 // pending set and the comparator's majority (result-level) group. It is a pure function:
 // the same inputs always yield the same verdict, with no I/O.
@@ -46,6 +57,16 @@ func ScoreForResult(r *result.Result) int {
 // meets it. A nil or empty majority yields MajorityCount == 0 and TrustedMajorityCount == 0
 // (the tie-decides-nothing rule): with no majority group, every subject has a result outside
 // it and none can be coherent-agreeing.
+//
+// Non-countable results (a submitter whose EFFECTIVE standing at submission was not OK — see
+// StandingCountable) are skipped ENTIRELY: they contribute to neither Total, MajorityCount,
+// nor TrustedMajorityCount, exactly as if never submitted. They are still adjudicated and
+// credited by the executor's accept path (results accepted, never counted) — only the verdict
+// treats them as invisible. Excluding them from Total as well as the agreeing group is the
+// point: dropping a probation result only from the majority would drag Ratio and the
+// strict-majority gate down and hand a probation account a VETO over its unit — the opposite
+// of the invisible-but-neutralizing intent, which is that a probation account can neither help
+// nor block corroboration.
 func BuildComparisonVerdict(pending, majority []*result.Result, trustFloor int) *ComparisonVerdict {
 	majorityIDs := make(map[types.ID]bool, len(majority))
 	for _, r := range majority {
@@ -62,6 +83,10 @@ func BuildComparisonVerdict(pending, majority []*result.Result, trustFloor int) 
 	}
 	subjects := make(map[string]*subjectAgg)
 	for _, r := range pending {
+		if !StandingCountable(r) {
+			continue // invisible to the verdict; skipped BEFORE subject aggregation so a
+			// probation result on a mixed subject neither breaks its coherence nor adds score
+		}
 		subj := SubjectForResult(r)
 		agg := subjects[subj]
 		if agg == nil {

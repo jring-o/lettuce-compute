@@ -555,6 +555,11 @@ func trustedPresentCountSQL(unitID, floorExpr string) string {
 		 JOIN volunteer_trust tp_vt ON tp_vt.subject = ` + subjectExprSQL("tp_hv") + `
 		 WHERE tp_wuah.work_unit_id = ` + unitID + ` AND tp_wuah.outcome IS NULL
 		   AND tp_vt.score >= ` + floorExpr + `
+		   -- Only a COUNTABLE live holder corroborates (BG-24b): its CURRENT effective
+		   -- standing must be 'OK', the live arm of the countability contract. A trusted
+		   -- but PROBATION/BENCHED holder's result can never count toward quorum, so it must
+		   -- not shrink the still-unfilled trusted reservation either.
+		   AND ` + standingExprSQL("tp_hv") + ` = 'OK'
 		UNION
 		SELECT tp_res.trust_subject AS subj
 		 FROM results tp_res
@@ -562,6 +567,10 @@ func trustedPresentCountSQL(unitID, floorExpr string) string {
 		   AND tp_res.validation_status = 'PENDING'
 		   AND tp_res.trust_subject IS NOT NULL
 		   AND tp_res.trust_score_at_submit >= ` + floorExpr + `
+		   -- Pending arm of the countability contract: the result counts only if it was
+		   -- stamped OK at submit (NULL = legacy = OK), exactly what the validation verdict
+		   -- will credit.
+		   AND (tp_res.standing_at_submit IS NULL OR tp_res.standing_at_submit = 'OK')
 	) tp_present)`
 }
 
@@ -584,6 +593,11 @@ func trustedContributorSubjectsSQL(floorExpr string) string {
 			 JOIN volunteer_trust tc_vt ON tc_vt.subject = ` + subjectExprSQL("tc_hv") + `
 			 WHERE tc_wuah.work_unit_id = wu.id AND tc_wuah.outcome IS NULL
 			   AND tc_vt.score >= ` + floorExpr + `
+			   -- Countable live holder only (BG-24b): a PROBATION/BENCHED holder cannot
+			   -- corroborate, so it is not a trusted contributor. This standing filter is
+			   -- what lets the in-memory trustedPresentLocked take these refill-provided
+			   -- subjects as already standing-filtered.
+			   AND ` + standingExprSQL("tc_hv") + ` = 'OK'
 			UNION
 			SELECT tc_res.trust_subject AS subj
 			 FROM results tc_res
@@ -591,6 +605,8 @@ func trustedContributorSubjectsSQL(floorExpr string) string {
 			   AND tc_res.validation_status = 'PENDING'
 			   AND tc_res.trust_subject IS NOT NULL
 			   AND tc_res.trust_score_at_submit >= ` + floorExpr + `
+			   -- Pending arm: counts only an OK-stamped submission (NULL = legacy = OK).
+			   AND (tc_res.standing_at_submit IS NULL OR tc_res.standing_at_submit = 'OK')
 		) tc_present
 	)`
 }
@@ -605,15 +621,22 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
 		-- Requester's account-level trust subject (trust.SubjectForVolunteer's SQL
-		-- twin), computed ONCE per query: the bound DID while the binding is live,
-		-- else the per-keypair "vol:<uuid>" sentinel. A missing volunteers row (should
-		-- not happen for a live requester) degrades to the sentinel via COALESCE. The
-		-- subject-distinctness exclusions below compare each holder's subject to this,
-		-- so two devices bound to one live DID count as ONE principal.
+		-- twin) AND its CURRENT effective account standing (volunteer.EffectiveStanding's
+		-- SQL twin, standingExprSQL), both computed ONCE per query. subject: the bound DID
+		-- while the binding is live, else the per-keypair "vol:<uuid>" sentinel; the
+		-- subject-distinctness exclusions below compare each holder's subject to it, so two
+		-- devices bound to one live DID count as ONE principal. effective_standing (BG-24b):
+		-- 'BENCHED' while a live bench holds, 'PROBATION' for a stored/expired-bench
+		-- probation, else 'OK'; the BENCHED gate below refuses a benched requester. A
+		-- missing volunteers row (should not happen for a live requester) degrades to the
+		-- sentinel / 'OK' via COALESCE — the same defensive fallback for both.
 		CROSS JOIN (
 			SELECT COALESCE(
 			         (SELECT `+subjectExprSQL("rv")+` FROM volunteers rv WHERE rv.id = $9),
-			         'vol:' || $9::text) AS subject
+			         'vol:' || $9::text) AS subject,
+			       COALESCE(
+			         (SELECT `+standingExprSQL("rv")+` FROM volunteers rv WHERE rv.id = $9),
+			         'OK') AS effective_standing
 		) req
 		WHERE wu.state = 'QUEUED'
 		  AND l.state = 'ACTIVE'
@@ -648,24 +671,19 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    OR (l.resource_requirements->>'gpu_compute_capability') = ANY($11::text[])
 		  )
 		  -- Per-copy redundancy (migration 00006): a unit is dispatchable while the
-		  -- copies already covering its redundancy need are below the leaf's effective
-		  -- redundancy. Coverage = live copies (RESERVED/RUNNING history rows, outcome
-		  -- IS NULL) + already-submitted PENDING results (a copy that finished closed
-		  -- its history row and holds its slot via the result). Each live copy and each
-		  -- result is a DISTINCT volunteer (uq_wuah_live_copy_per_volunteer +
-		  -- uq_results_work_unit_volunteer), so up to N copies of one unit are dispatched
-		  -- IN PARALLEL to N different volunteers. The two terms never overlap (a
-		  -- completed copy is closed, no longer outcome IS NULL).
-		  AND (
-		    (
-		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
-		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
-		    )
-		    + (
-		      SELECT COUNT(*) FROM results res
-		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		    )
-		  ) < `+effTargetWuL+`
+		  -- copies already COUNTABLY covering its redundancy need are below the leaf's
+		  -- effective redundancy. Coverage = COUNTABLE live copies (RESERVED/RUNNING history
+		  -- rows, outcome IS NULL, held by an 'OK'-standing account) + COUNTABLE PENDING
+		  -- results (a finished copy that closed its history row and holds its slot via the
+		  -- result, stamped OK at submit). Each live copy and each result is a DISTINCT
+		  -- volunteer (uq_wuah_live_copy_per_volunteer + uq_results_work_unit_volunteer), so
+		  -- up to N copies of one unit are dispatched IN PARALLEL to N different volunteers.
+		  -- The two terms never overlap (a completed copy is closed, no longer outcome IS
+		  -- NULL). Account standing (BG-24b): a copy/result held or submitted by a
+		  -- PROBATION/BENCHED account does NOT count here (countableCoverageSQL), so full
+		  -- replication is FORCED around neutralized results; with an all-OK population this
+		  -- reduces byte-for-byte to the raw live+pending count.
+		  AND `+countableCoverageSQL("wu.id")+` < `+effTargetWuL+`
 		  -- Trusted-corroborator reservation (trust gate): when this unit's leaf resolves a
 		  -- trusted-corroborator requirement K > 0 (effTrustKSQL, the SQL twin of
 		  -- transition.TrustPolicy.ResolveTrust), the unit keeps its last slots RESERVED for
@@ -698,10 +716,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    )
 		    OR (
 		      (
-		        (SELECT COUNT(*) FROM work_unit_assignment_history wuah_rz
-		         WHERE wuah_rz.work_unit_id = wu.id AND wuah_rz.outcome IS NULL)
-		        + (SELECT COUNT(*) FROM results res_rz
-		           WHERE res_rz.work_unit_id = wu.id AND res_rz.validation_status = 'PENDING')
+		        `+countableCoverageSQL("wu.id")+`
 		        + 1
 		        + GREATEST(0, `+effTrustKSQL("wu", "l", "$16", "$17")+`
 		                      - `+trustedPresentCountSQL("wu.id", effTrustFloorSQL("l", "$18"))+`)
@@ -735,6 +750,15 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		      AND res3.validation_status = 'PENDING'
 		      AND `+subjectExprSQL("hv3")+` = req.subject
 		  )
+		  -- BENCHED requester (account standing, BG-24b): an account the head has BENCHED
+		  -- gets NO dispatch at all until its bench lapses — the per-ACCOUNT standing twin of
+		  -- the per-unit post-failure cooldown just below, enforced beside it because both
+		  -- answer "may this requester take work right now". Reads the requester's CURRENT
+		  -- effective standing resolved once in req (standingExprSQL): only a live bench
+		  -- refuses — an expired bench resolves to PROBATION, and a PROBATION account is still
+		  -- dispatched (its results simply never corroborate; the countable-coverage and
+		  -- reservation arithmetic above neutralize them). With every account OK this is inert.
+		  AND req.effective_standing <> 'BENCHED'
 		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
 		  -- this unit TIMED OUT or was abandoned mid-run is benched for roughly one more
 		  -- deadline so a fresh volunteer gets first refusal; after that cooldown it is
@@ -843,6 +867,14 @@ type DispatchCandidate struct {
 	// redundancy>1 unit with one running holder) is staged with the correct
 	// remaining headroom.
 	ActiveAssignments int
+	// ProbationCoverage is the NON-COUNTABLE portion of ActiveAssignments at refill
+	// time (account standing, BG-24b): the unit's live copies held by a non-OK account
+	// plus its PENDING results stamped non-OK (nonCountableCoverageSQL). The cache
+	// subtracts it from the raw ActiveAssignments seed so its in-memory redundancy
+	// headroom counts only COUNTABLE coverage — the same number countableCoverageSQL
+	// enforces in the SQL headroom — forcing full replication around neutralized
+	// copies/results. 0 for an all-OK population, so the cache arithmetic is unchanged.
+	ProbationCoverage int
 	// Runtime is the leaf's execution_config.runtime (used to assert the WASM
 	// partition and for capability matching at hand-out).
 	Runtime string
@@ -920,6 +952,11 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 				+ (SELECT COUNT(*) FROM results res2
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
+			-- Non-countable portion of active_assignments (account standing, BG-24b): live
+			-- copies held by a non-OK account + PENDING results stamped non-OK. The cache
+			-- subtracts it from the raw seed above so its in-memory redundancy headroom counts
+			-- only COUNTABLE coverage, matching the SQL headroom below (forced replication).
+			`+nonCountableCoverageSQL("wu.id")+` AS probation_coverage,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
 			-- Trust SUBJECTS already counting toward redundancy (distinct): live-copy
 			-- holders + PENDING-result authors, each mapped through the subject expression
@@ -984,21 +1021,15 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		  -- leafs so a leaf-filtered requester can be served even when the ready pool is
 		  -- monopolized by a higher-priority/older leaf.
 		  AND (array_length($3::uuid[], 1) IS NULL OR wu.leaf_id = ANY($3::uuid[]))
-		  -- Per-copy redundancy (volunteer-agnostic at refill): live copies (history
-		  -- rows with outcome IS NULL) + already-submitted PENDING results must be below
-		  -- the leaf's effective redundancy. A unit with one live copy but unmet
-		  -- redundancy stays stageable so a SECOND distinct volunteer gets a parallel
-		  -- copy; the per-requester distinctness is re-checked in memory at hand-out.
-		  AND (
-		    (
-		      SELECT COUNT(*) FROM work_unit_assignment_history wuah
-		      WHERE wuah.work_unit_id = wu.id AND wuah.outcome IS NULL
-		    )
-		    + (
-		      SELECT COUNT(*) FROM results res
-		      WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		    )
-		  ) < `+effTargetWuL+`
+		  -- Per-copy redundancy (volunteer-agnostic at refill): COUNTABLE live copies +
+		  -- COUNTABLE PENDING results must be below the leaf's effective redundancy
+		  -- (countableCoverageSQL — account standing, BG-24b: a copy held or a result
+		  -- submitted by a non-OK account does not count, so full replication is forced
+		  -- around it). A unit with one countable live copy but unmet redundancy stays
+		  -- stageable so a SECOND distinct volunteer gets a parallel copy; the per-requester
+		  -- distinctness is re-checked in memory at hand-out. Reduces to the raw live+pending
+		  -- count for an all-OK population.
+		  AND `+countableCoverageSQL("wu.id")+` < `+effTargetWuL+`
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -1019,11 +1050,11 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 	var out []DispatchCandidate
 	for rows.Next() {
 		var wu WorkUnit
-		var redundancy, active int
+		var redundancy, active, probationCoverage int
 		var runtime string
 		var contributorTexts, benchedTexts, trustedContribTexts []string
 		var trustK, trustFloor int
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
 		}
 		cand := wu
@@ -1032,6 +1063,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 			LeafID:                     wu.LeafID,
 			RedundancyFactor:           redundancy,
 			ActiveAssignments:          active,
+			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
 			ContributorSubjects:        contributorTexts,
 			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
@@ -1120,18 +1152,11 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			  AND (wu2.dispatch_claimed_by IS NULL
 			       OR wu2.dispatch_claim_expires_at < NOW()
 			       OR wu2.dispatch_claimed_by = $4)
-			  -- Per-copy redundancy: live copies (history rows, outcome IS NULL) +
-			  -- already-submitted PENDING results below the leaf's effective redundancy.
-			  AND (
-			    (
-			      SELECT COUNT(*) FROM work_unit_assignment_history wuah
-			      WHERE wuah.work_unit_id = wu2.id AND wuah.outcome IS NULL
-			    )
-			    + (
-			      SELECT COUNT(*) FROM results res
-			      WHERE res.work_unit_id = wu2.id AND res.validation_status = 'PENDING'
-			    )
-			  ) < `+effTargetSQL("wu2", "l2")+`
+			  -- Per-copy redundancy: COUNTABLE live copies + COUNTABLE PENDING results below
+			  -- the leaf's effective redundancy (countableCoverageSQL — account standing,
+			  -- BG-24b: a copy/result held or submitted by a non-OK account does not count, so
+			  -- full replication is forced around it; reduces to raw live+pending when all OK).
+			  AND `+countableCoverageSQL("wu2.id")+` < `+effTargetSQL("wu2", "l2")+`
 			ORDER BY wu2.priority DESC, wu2.created_at ASC
 			LIMIT $1
 			FOR UPDATE OF wu2 SKIP LOCKED
@@ -1145,6 +1170,10 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 				+ (SELECT COUNT(*) FROM results res2
 				   WHERE res2.work_unit_id = wu.id AND res2.validation_status = 'PENDING')
 			) AS active_assignments,
+			-- Non-countable portion of active_assignments (account standing, BG-24b), exactly
+			-- as FindDispatchableBatch emits it: the cache subtracts it to count only COUNTABLE
+			-- coverage in its redundancy headroom (forced replication).
+			`+nonCountableCoverageSQL("wu.id")+` AS probation_coverage,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
 			-- Distinct trust SUBJECTS already covering redundancy (live-copy holders +
 			-- PENDING-result authors, each mapped through the subject expression): excluded
@@ -1198,11 +1227,11 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 	var out []DispatchCandidate
 	for rows.Next() {
 		var wu WorkUnit
-		var redundancy, active int
+		var redundancy, active, probationCoverage int
 		var runtime string
 		var contributorTexts, benchedTexts, trustedContribTexts []string
 		var trustK, trustFloor int
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan claimed work unit", err)
 		}
 		cand := wu
@@ -1211,6 +1240,7 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			LeafID:                     wu.LeafID,
 			RedundancyFactor:           redundancy,
 			ActiveAssignments:          active,
+			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
 			ContributorSubjects:        contributorTexts,
 			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
@@ -1366,12 +1396,12 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		JOIN work_units wu ON wu.id = v.id AND wu.state = 'QUEUED'
 		JOIN leafs l ON l.id = wu.leaf_id
 		JOIN volunteers vv ON vv.id = v.vol
-		WHERE (
-		        (SELECT COUNT(*) FROM work_unit_assignment_history h
-		         WHERE h.work_unit_id = v.id AND h.outcome IS NULL)
-		        + (SELECT COUNT(*) FROM results res
-		           WHERE res.work_unit_id = v.id AND res.validation_status = 'PENDING')
-		      ) < `+effTargetWuL+`
+		WHERE `+countableCoverageSQL("v.id")+` < `+effTargetWuL+`
+		  -- Redundancy headroom counts only COUNTABLE coverage (countableCoverageSQL —
+		  -- account standing, BG-24b): a copy held or a result submitted by a non-OK account
+		  -- does not cover redundancy, so a landing that fills the last COUNTABLE slot is
+		  -- what closes the unit. Reduces to the raw live+pending count for an all-OK
+		  -- population.
 		  -- Subject-distinct already-contributed guard: refuse the hold when a volunteer
 		  -- sharing this requester's trust subject already authored a PENDING result for
 		  -- the unit, so each of the N redundant results comes from a DISTINCT principal.
@@ -1396,6 +1426,14 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		      AND lc.outcome IS NULL
 		      AND `+subjectExprSQL("lv")+` = `+subjectExprSQL("vv")+`
 		  )
+		  -- BENCHED reserver (account standing, BG-24b): a benched account's reservation must
+		  -- NOT land — the landing-side twin of the FindNextAssignable BENCHED gate, enforced
+		  -- here beside the cooldown because both refuse a copy this reserver may not hold
+		  -- right now. Reads the reserver's CURRENT effective standing (standingExprSQL over
+		  -- vv): only a live bench refuses; an expired bench resolves to PROBATION and a
+		  -- PROBATION account still lands copies (its results just never corroborate). Inert
+		  -- when every account is OK.
+		  AND `+standingExprSQL("vv")+` <> 'BENCHED'
 		  -- Cooldown stays keyed on volunteer_id (per-account reliability signal), NOT the
 		  -- subject, BY DESIGN: one device's timeout does not bench its siblings.
 		  AND NOT EXISTS (
@@ -1442,10 +1480,7 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		    )
 		    OR (
 		      (
-		        (SELECT COUNT(*) FROM work_unit_assignment_history wuah_fz
-		         WHERE wuah_fz.work_unit_id = v.id AND wuah_fz.outcome IS NULL)
-		        + (SELECT COUNT(*) FROM results res_fz
-		           WHERE res_fz.work_unit_id = v.id AND res_fz.validation_status = 'PENDING')
+		        `+countableCoverageSQL("v.id")+`
 		        + 1
 		        + GREATEST(0, `+effTrustKSQL("wu", "l", "$6", "$7")+`
 		                      - `+trustedPresentCountSQL("v.id", effTrustFloorSQL("l", "$8"))+`)
@@ -1711,6 +1746,15 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		      AND lc.outcome IS NULL
 		      AND `+subjectExprSQL("lv")+` = `+subjectExprSQL("vv")+`
 		  )
+		  -- BENCHED reserver (account standing, BG-24b): a benched account may not create a
+		  -- copy — the spot-check landing twin of the FindNextAssignable / FlushReservations
+		  -- BENCHED gate, enforced beside the cooldown (both refuse a copy this reserver may
+		  -- not hold right now). Reads the reserver's CURRENT effective standing
+		  -- (standingExprSQL over vv): only a live bench refuses; an expired bench resolves to
+		  -- PROBATION, which still lands copies. Unlike the redundancy headroom (owned by the
+		  -- read-side gate and deliberately NOT re-checked here), the BENCHED refusal is a
+		  -- per-reserver landing invariant this gate owns, so it IS re-checked. Inert when OK.
+		  AND `+standingExprSQL("vv")+` <> 'BENCHED'
 		  -- Cooldown stays keyed on volunteer_id ($2, per-account), NOT the subject, BY
 		  -- DESIGN: one device's timeout does not bench its siblings. A volunteer whose
 		  -- recent copy of this unit it STARTED timed out / was
