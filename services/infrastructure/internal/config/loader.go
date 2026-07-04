@@ -429,6 +429,27 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.RegistrationCapPerIPPerDay = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_REGISTRATION_POW_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REGISTRATION_POW_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.RegistrationPowEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS must be an integer: %w", err)
+		}
+		cfg.Head.RegistrationPowDifficultyBits = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.RegistrationPowChallengeTTLSeconds = n
+	}
 	return nil
 }
 

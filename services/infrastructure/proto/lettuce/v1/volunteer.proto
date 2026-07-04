@@ -13,6 +13,17 @@ service VolunteerService {
   // Upserts by public_key: new key = register, existing key = update.
   rpc RegisterVolunteer(RegisterVolunteerRequest) returns (RegisterVolunteerResponse);
 
+  // Issue a registration proof-of-work challenge for the CALLER's key (derived
+  // from the verified per-request signature, like RegisterVolunteer — the key
+  // need not be registered yet). Relevant only when the head enforces
+  // registration proof-of-work: a brand-new key's RegisterVolunteer is then
+  // refused with FailedPrecondition until it carries a valid solution
+  // (pow_challenge_id + pow_nonce). Solve by finding a nonce such that
+  // SHA-256(challenge || public_key || nonce as 8 big-endian bytes) has at
+  // least difficulty_bits leading zero bits. Challenges expire and are
+  // single-use. Re-registration of an existing key never requires this.
+  rpc GetRegistrationChallenge(GetRegistrationChallengeRequest) returns (GetRegistrationChallengeResponse);
+
   // Request work units matching volunteer capabilities.
   // Returns 0..N assignments and a server-directed `retry_after_seconds` the
   // caller MUST obey before its next call (present on all replies, including
@@ -89,11 +100,27 @@ message RegisterVolunteerRequest {
   // signed under the identity key for free — the per-request signature covers the
   // whole request — so nobody else can claim your machine.
   string host_id = 6;
+  // Registration proof-of-work solution (see GetRegistrationChallenge). Both
+  // fields are OPTIONAL and consulted only when the head enforces registration
+  // proof-of-work AND this registration would create a NEW volunteer; clients
+  // that predate them simply omit them (proto3 unknown-field semantics make
+  // additive fields wire-safe in both directions).
+  string pow_challenge_id = 7;       // id from GetRegistrationChallenge
+  fixed64 pow_nonce = 8;             // solution nonce
 }
 
 message RegisterVolunteerResponse {
   string volunteer_id = 1;           // assigned UUID
   bool registered = 2;               // true if new registration, false if updated existing
+}
+
+message GetRegistrationChallengeRequest {}
+
+message GetRegistrationChallengeResponse {
+  string challenge_id = 1;           // redeem via RegisterVolunteerRequest.pow_challenge_id
+  bytes challenge = 2;               // 32 random bytes, part of the solution-hash preimage
+  uint32 difficulty_bits = 3;        // required leading zero bits of the solution digest
+  int64 expires_at_unix = 4;         // challenge validity deadline (Unix seconds, UTC)
 }
 
 message RequestWorkUnitRequest {

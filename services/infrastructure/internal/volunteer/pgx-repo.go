@@ -84,10 +84,12 @@ func (r *PgxRepository) Create(ctx context.Context, v *Volunteer) error {
 
 // CreateAdmitted creates a volunteer through the registration-admission gates
 // (internal/admission). A nil gate is exactly Create — the legacy single-statement
-// path, byte-for-byte. With a gate, the per-(bucket, UTC day) creation-cap increment
-// and the volunteer INSERT run in ONE transaction: a cap refusal
-// (admission.ErrCreationCapExceeded), a duplicate-key conflict, or any failure rolls
-// both back together, so the counter counts exactly the creations that committed.
+// path, byte-for-byte. With a gate, the proof-of-work redemption (gate.Pow, when set),
+// the per-(bucket, UTC day) creation-cap increment (gate.CapPerDay > 0), and the
+// volunteer INSERT run in ONE transaction: a refusal (a bad or missing solution, the
+// cap, a duplicate-key conflict) or any failure rolls everything back together — so the
+// counter counts exactly the creations that committed, and a consumed challenge
+// un-consumes when an unrelated refusal follows it.
 func (r *PgxRepository) CreateAdmitted(ctx context.Context, v *Volunteer, gate *admission.CreateGate) error {
 	if gate == nil {
 		return r.Create(ctx, v)
@@ -100,11 +102,23 @@ func (r *PgxRepository) CreateAdmitted(ctx context.Context, v *Volunteer, gate *
 	// Rollback after a successful Commit is a no-op.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := admission.ReserveCreationSlot(ctx, tx, gate.Bucket, gate.CapPerDay); err != nil {
-		if errors.Is(err, admission.ErrCreationCapExceeded) {
-			return err
+	// Proof-of-work first (design order): an invalid solution must be refused before a
+	// cap slot is reserved, and its sentinel must surface un-wrapped for the handlers.
+	if gate.Pow != nil {
+		if err := admission.RedeemChallenge(ctx, tx, gate.Pow); err != nil {
+			if errors.Is(err, admission.ErrPowChallengeInvalid) || errors.Is(err, admission.ErrPowSolutionInvalid) {
+				return err
+			}
+			return apierror.Internal("failed to redeem registration proof-of-work challenge", err)
 		}
-		return apierror.Internal("failed to enforce registration creation cap", err)
+	}
+	if gate.CapPerDay > 0 {
+		if err := admission.ReserveCreationSlot(ctx, tx, gate.Bucket, gate.CapPerDay); err != nil {
+			if errors.Is(err, admission.ErrCreationCapExceeded) {
+				return err
+			}
+			return apierror.Internal("failed to enforce registration creation cap", err)
+		}
 	}
 	if err := createIn(ctx, tx, v); err != nil {
 		return err

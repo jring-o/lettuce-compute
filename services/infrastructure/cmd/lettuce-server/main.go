@@ -343,6 +343,11 @@ func main() {
 	// hands the browser register path, so both create surfaces enforce one number.
 	// Zero value (knob off, the default) leaves gRPC registration unchanged.
 	server.SetAdmissionPolicy(volunteerSvc, server.RegistrationCapFromHeadConfig(&cfg.Head))
+	// Registration proof-of-work (design §4.1) — enforcement defaults OFF; the
+	// effective difficulty/TTL are threaded regardless so challenge issuance
+	// (GetRegistrationChallenge / the REST register-challenge endpoint) works
+	// probe-free before any enforcement flip.
+	server.SetRegistrationPowPolicy(volunteerSvc, server.RegistrationPowFromHeadConfig(&cfg.Head))
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	// Start HTTP server.
@@ -448,6 +453,10 @@ func main() {
 		if cfg.Head.RegistrationCapEnabled {
 			go admission.NewCounterSweeper(pool, logger).Start(leaderCtx)
 		}
+		// Registration proof-of-work challenge sweep — UNCONDITIONAL, unlike the
+		// counter sweep: challenge ISSUANCE works even while enforcement is off
+		// (probe-free clients), so expired rows can accumulate regardless of the knob.
+		go admission.NewChallengeSweeper(pool, logger).Start(leaderCtx)
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

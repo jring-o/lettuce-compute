@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -64,6 +65,11 @@ type browserVolunteerDeps struct {
 	// register path enforces identically to the gRPC path. Zero value = gate off (the
 	// deploy-safety default); the router fills it from HeadConfig.Effective* values.
 	registrationCap admission.CapPolicy
+	// registrationPow is the registration proof-of-work policy (design §4.1), enforced
+	// identically to the gRPC path (create branch only). Zero value = enforcement off;
+	// the router fills it from HeadConfig.Effective* values (difficulty/TTL populated
+	// even while off, so the challenge-issuance endpoint works probe-free).
+	registrationPow admission.PowPolicy
 	// trustedProxies backs trust-aware client-IP extraction for the cap's bucket
 	// (clientIPFromRequest — the same set the HTTP rate limiter uses). nil = forwarding
 	// headers ignored, direct peer used (the secure default).
@@ -78,6 +84,12 @@ type browserRegisterRequest struct {
 	PublicKey   string                 `json:"public_key"`
 	DisplayName string                 `json:"display_name"`
 	Hardware    browserHardwareRequest `json:"hardware"`
+	// Registration proof-of-work solution (see POST /api/v1/volunteers/
+	// register-challenge). Optional; consulted only when the head enforces
+	// registration proof-of-work AND this registration would create a new volunteer.
+	// The nonce is a DECIMAL STRING because JSON numbers cannot carry a full uint64.
+	PowChallengeID string `json:"pow_challenge_id,omitempty"`
+	PowNonce       string `json:"pow_nonce,omitempty"`
 }
 
 type browserHardwareRequest struct {
@@ -91,6 +103,17 @@ type browserHardwareRequest struct {
 type browserRegisterResponse struct {
 	VolunteerID  string `json:"volunteer_id"`
 	RegisteredAt string `json:"registered_at"`
+}
+
+type browserRegisterChallengeRequest struct {
+	PublicKey string `json:"public_key"` // base64url, like the register body
+}
+
+type browserRegisterChallengeResponse struct {
+	ChallengeID    string `json:"challenge_id"`
+	ChallengeHex   string `json:"challenge_hex"` // 32 bytes, hex — part of the hash preimage
+	DifficultyBits int    `json:"difficulty_bits"`
+	ExpiresAt      string `json:"expires_at"` // RFC 3339
 }
 
 type browserRequestWorkRequest struct {
@@ -257,6 +280,40 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 				return
 			}
 
+			// Proof-of-work (design §4.1): enforced only on this CREATE branch and
+			// only while enabled — the gRPC path's twin. A missing solution gets the
+			// 403 POW_REQUIRED signal (the machine-readable prefix; the dashboard's
+			// future solver keys on the code); a present one rides the gate into the
+			// registration transaction.
+			if deps.registrationPow.Enabled {
+				if req.PowChallengeID == "" || req.PowNonce == "" {
+					apierror.WriteError(w, &apierror.APIError{
+						Code:       "POW_REQUIRED",
+						Message:    admission.PowRequiredMessagePrefix,
+						HTTPStatus: http.StatusForbidden,
+					})
+					return
+				}
+				challengeID, idErr := types.ParseID(req.PowChallengeID)
+				if idErr != nil {
+					apierror.WriteError(w, apierror.ValidationError("invalid pow_challenge_id", nil))
+					return
+				}
+				nonce, nonceErr := strconv.ParseUint(req.PowNonce, 10, 64)
+				if nonceErr != nil {
+					apierror.WriteError(w, apierror.ValidationError("invalid pow_nonce: must be a decimal uint64 string", nil))
+					return
+				}
+				if gate == nil {
+					gate = &admission.CreateGate{}
+				}
+				gate.Pow = &admission.PowRedemption{
+					ChallengeID: challengeID,
+					PublicKey:   pubKeyBytes,
+					Nonce:       nonce,
+				}
+			}
+
 			now := time.Now().UTC()
 			var displayName *string
 			if req.DisplayName != "" {
@@ -297,6 +354,17 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 				})
 				return
 
+			case errors.Is(createErr, admission.ErrPowChallengeInvalid) || errors.Is(createErr, admission.ErrPowSolutionInvalid):
+				// A solver-capable client sent a stale/foreign challenge or a wrong
+				// nonce: 400, not the POW_REQUIRED signal — retrying the same payload
+				// cannot succeed; fetch a fresh challenge and re-solve.
+				apierror.WriteError(w, &apierror.APIError{
+					Code:       "POW_INVALID",
+					Message:    createErr.Error(),
+					HTTPStatus: http.StatusBadRequest,
+				})
+				return
+
 			case isConflictErr(createErr):
 				// Lost the get-then-create race to a concurrent registration of the same
 				// key: re-fetch and fall through to the existing-key 409 below — the
@@ -321,6 +389,65 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 		json.NewEncoder(w).Encode(browserRegisterResponse{
 			VolunteerID:  existing.ID.String(),
 			RegisteredAt: existing.RegisteredAt.Format(time.RFC3339),
+		})
+	}
+}
+
+// handleBrowserRegisterChallenge handles POST /api/v1/volunteers/register-challenge.
+// Unauthenticated, like register itself: it issues a registration proof-of-work
+// challenge bound to the submitted public key (the challenge is pre-account by design —
+// the key need not exist yet). Issuance is available whether or not enforcement is on,
+// so clients can be written probe-free; the table is bounded by the unauthenticated
+// per-IP rate limit, the TTL, and the challenge sweeper.
+func handleBrowserRegisterChallenge(deps *browserVolunteerDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, browserRegisterMaxBody)
+
+		var req browserRegisterChallengeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+			return
+		}
+		if req.PublicKey == "" {
+			apierror.WriteError(w, apierror.ValidationError("public_key is required", nil))
+			return
+		}
+		pubKeyBytes, err := base64.RawURLEncoding.DecodeString(req.PublicKey)
+		if err != nil {
+			apierror.WriteError(w, apierror.ValidationError("invalid public_key: must be base64url-encoded", nil))
+			return
+		}
+		if len(pubKeyBytes) != ed25519.PublicKeySize {
+			apierror.WriteError(w, apierror.ValidationError(
+				fmt.Sprintf("invalid public_key: must be %d bytes, got %d", ed25519.PublicKeySize, len(pubKeyBytes)), nil))
+			return
+		}
+
+		// Guards the bare-test wiring (nil pool / zero policy); the router always
+		// threads a pool and an effective (>= 8 bits) policy in production.
+		if deps.pool == nil || deps.registrationPow.DifficultyBits <= 0 {
+			apierror.WriteError(w, &apierror.APIError{
+				Code:       "POW_UNAVAILABLE",
+				Message:    "registration challenges are not configured on this head",
+				HTTPStatus: http.StatusServiceUnavailable,
+			})
+			return
+		}
+
+		c, err := admission.IssueChallenge(r.Context(), deps.pool, pubKeyBytes,
+			deps.registrationPow.DifficultyBits, deps.registrationPow.ChallengeTTL)
+		if err != nil {
+			deps.logger.Error("failed to issue registration challenge", "error", err)
+			apierror.WriteError(w, apierror.Internal("internal server error", err))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(browserRegisterChallengeResponse{
+			ChallengeID:    c.ID.String(),
+			ChallengeHex:   hex.EncodeToString(c.Challenge),
+			DifficultyBits: c.DifficultyBits,
+			ExpiresAt:      c.ExpiresAt.Format(time.RFC3339),
 		})
 	}
 }
