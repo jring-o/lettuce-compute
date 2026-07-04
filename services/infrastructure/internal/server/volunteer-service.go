@@ -76,6 +76,13 @@ type volunteerService struct {
 	// deploy-safety default); main.go threads the real policy via SetAdmissionPolicy.
 	// Re-registration of an existing key never consults it.
 	registrationCap admission.CapPolicy
+	// registrationPow is the registration proof-of-work policy (design §4.1): when
+	// enforcement is on, a registration that would CREATE a new volunteer must redeem
+	// a valid server-issued challenge. Zero value = enforcement off (the deploy-safety
+	// default); main.go threads the real policy via SetRegistrationPowPolicy.
+	// Challenge ISSUANCE (GetRegistrationChallenge) works regardless so clients can be
+	// written probe-free. Re-registration of an existing key never consults it.
+	registrationPow admission.PowPolicy
 	// now supplies the current time for trust power-suppression checks; overridable in tests.
 	now func() time.Time
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
@@ -302,6 +309,45 @@ func SetAdmissionPolicy(svc lettucev1.VolunteerServiceServer, cap admission.CapP
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.registrationCap = cap
 	}
+}
+
+// SetRegistrationPowPolicy sets the registration proof-of-work policy (design §4.1)
+// on the gRPC volunteer service. The zero value is the deploy-safety default
+// (enforcement off); main.go fills the real policy — effective difficulty/TTL always
+// populated so challenge ISSUANCE works even while enforcement is off — from
+// HeadConfig.Effective* values (the SetHeadConfig decoupling pattern).
+func SetRegistrationPowPolicy(svc lettucev1.VolunteerServiceServer, pow admission.PowPolicy) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.registrationPow = pow
+	}
+}
+
+// GetRegistrationChallenge issues a registration proof-of-work challenge bound to the
+// CALLER's key (from the verified per-request signature, like RegisterVolunteer — the
+// key need not be registered yet). Issuance works whether or not enforcement is on, so
+// clients can be written probe-free; the table is bounded by the per-IP/per-key rate
+// limits, the TTL, and the challenge sweeper.
+func (s *volunteerService) GetRegistrationChallenge(ctx context.Context, _ *lettucev1.GetRegistrationChallengeRequest) (*lettucev1.GetRegistrationChallengeResponse, error) {
+	authedKey, ok := GRPCAuthPublicKeyFromContext(ctx)
+	if !ok {
+		return nil, status.Errorf(codes.Unauthenticated, "request is not authenticated")
+	}
+	// Guards the gRPC-plumbing unit-test wiring (nil pool / zero policy); production
+	// main.go always threads a pool and an effective (>= 8 bits) policy.
+	if s.pool == nil || s.registrationPow.DifficultyBits <= 0 {
+		return nil, status.Errorf(codes.Unavailable, "registration challenges are not configured on this head")
+	}
+	c, err := admission.IssueChallenge(ctx, s.pool, authedKey, s.registrationPow.DifficultyBits, s.registrationPow.ChallengeTTL)
+	if err != nil {
+		s.logger.Error("failed to issue registration challenge", "method", "GetRegistrationChallenge", "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+	return &lettucev1.GetRegistrationChallengeResponse{
+		ChallengeId:    c.ID.String(),
+		Challenge:      c.Challenge,
+		DifficultyBits: uint32(c.DifficultyBits),
+		ExpiresAtUnix:  c.ExpiresAt.Unix(),
+	}, nil
 }
 
 // registrationGate resolves the per-request admission gate for a volunteer CREATE.
@@ -649,6 +695,31 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 
+		// Proof-of-work (design §4.1): enforced only on this CREATE branch and only
+		// while enabled. A request with no solution gets the pinned pow-required
+		// refusal — a FailedPrecondition whose text existing CLIs classify as
+		// "update your build" (IsVolunteerTooOldError) and future solver-capable
+		// clients match by PowRequiredMessagePrefix. A present solution rides the
+		// gate into the registration transaction (single-use redeem + verify,
+		// rolling back with everything else).
+		if s.registrationPow.Enabled {
+			if req.PowChallengeId == "" {
+				return nil, status.Error(codes.FailedPrecondition, admission.PowRequiredMessage)
+			}
+			challengeID, idErr := types.ParseID(req.PowChallengeId)
+			if idErr != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid pow_challenge_id: %v", idErr)
+			}
+			if gate == nil {
+				gate = &admission.CreateGate{}
+			}
+			gate.Pow = &admission.PowRedemption{
+				ChallengeID: challengeID,
+				PublicKey:   req.PublicKey,
+				Nonce:       req.PowNonce,
+			}
+		}
+
 		v := &volunteer.Volunteer{
 			PublicKey:            req.PublicKey,
 			DisplayName:          displayName,
@@ -693,6 +764,14 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 					"method", "RegisterVolunteer", "bucket", gate.Bucket, "refusal_count", n)
 			}
 			return nil, status.Error(codes.FailedPrecondition, admission.CapExceededMessage)
+
+		case errors.Is(createErr, admission.ErrPowChallengeInvalid) || errors.Is(createErr, admission.ErrPowSolutionInvalid):
+			// A solver-capable client sent a stale/foreign challenge or a wrong
+			// nonce. InvalidArgument, NOT the pow-required signal: retrying the same
+			// payload cannot succeed — the client should fetch a fresh challenge and
+			// re-solve. (A failed redeem rolled back, so a merely-stale challenge was
+			// not burned; an expired one is gone regardless.)
+			return nil, status.Errorf(codes.InvalidArgument, "registration proof-of-work rejected: %v", createErr)
 
 		case isConflictErr(createErr):
 			// Lost the get-then-create race to a concurrent registration of the same

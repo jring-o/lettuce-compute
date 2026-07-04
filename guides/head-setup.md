@@ -558,6 +558,47 @@ both are OPTIONAL and take the defaults below when unset.
 | `registration_cap_enabled` (`LETTUCE_HEAD_REGISTRATION_CAP_ENABLED`) | `false` | Master switch. Off leaves registration unbounded (prior behavior). Enable to bound new-account creation per network on both the CLI and browser paths. |
 | `registration_cap_per_ip_per_day` (`LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY`) | `10` | Maximum new volunteer accounts one network (IPv4 address / IPv6 `/64` prefix) may create per UTC day. Raise it for sites behind one shared NAT — labs, campuses, offices — where many honest volunteers register from a single address. |
 
+### Registration proof-of-work
+
+**Registration proof-of-work** is a second, independent brake on bulk identity minting,
+layered beneath the account trust gate. When enforcement is on, a client that wants to
+register a *new* volunteer account first fetches a short-lived **challenge** from the head,
+then searches for a **nonce** whose SHA-256 digest — computed over the challenge, the
+volunteer's public key, and that nonce — has at least a configured number of leading zero bits
+(the *difficulty target*). Finding such a nonce takes work that grows exponentially with the
+difficulty (roughly `2^bits` hash attempts on average), while the head verifies a submitted
+solution in a single hash. The client submits the winning nonce alongside its registration;
+each challenge is **single-use** and **expires** after a TTL, so a solved challenge can be
+neither stockpiled nor replayed.
+
+Like the creation cap above, it charges only registrations that would **create a brand-new
+account**, and it applies to **both** registration paths — the `lettuce-volunteer` client and
+the browser sign-up flow. A volunteer whose key already exists re-registers freely and never
+solves a puzzle, so turning enforcement on never affects your existing fleet.
+
+It is **not** a hard security boundary. A determined attacker with GPUs can solve challenges
+for pennies per identity, so proof-of-work only raises the *cost* of mass account creation — a
+treadmill slower, best understood as one cheap layer beneath the trust gate rather than a wall.
+Its value is making automated bulk registration uneconomical, not impossible.
+
+> **⚠️ Do not enable enforcement yet.** No shipped client can solve a challenge: neither the
+> `lettuce-volunteer` client nor the dashboard sign-up flow includes a solver at this time, so
+> turning `registration_pow_enabled` on today would reject **every new-volunteer
+> registration** and block all onboarding. Existing volunteers are unaffected. Leave it off
+> until a solver-capable `lettuce-volunteer` release **and** a dashboard deploy exist. Note
+> that **challenge issuance is always available** even while enforcement is off (so a future
+> client can be written without probing for support), and **expired challenges are swept
+> automatically**, so the challenge table never grows unbounded.
+
+These are `head.*` keys in `lettuce.yaml` (or the matching `LETTUCE_HEAD_*` env vars);
+all are OPTIONAL and take the defaults below when unset.
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `registration_pow_enabled` (`LETTUCE_HEAD_REGISTRATION_POW_ENABLED`) | `false` | Master switch for ENFORCEMENT. Off leaves new registrations unchallenged (challenge issuance stays available either way). Do NOT enable until a solver-capable volunteer client and dashboard ship — see the warning above. |
+| `registration_pow_difficulty_bits` (`LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS`) | `20` | Required leading zero bits of the solution digest (~2^20 ≈ 1M hash attempts, about a second of native single-thread work). Must be in `[8, 32]` — below 8 the puzzle is effectively free, above 32 the expected client work stretches to minutes-to-hours. |
+| `registration_pow_challenge_ttl_seconds` (`LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS`) | `600` (10m) | How long an issued challenge stays redeemable. Must be `>= 60` so a slow browser or a loaded machine can still solve and submit within the window. |
+
 ### Horizontal scale-out
 
 The head is **stateless** and can run as **N replicas** behind Caddy against one

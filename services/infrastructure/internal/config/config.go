@@ -288,6 +288,30 @@ type HeadConfig struct {
 	// bucket. Unset (0) resolves to the default 10. Override via
 	// LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY.
 	RegistrationCapPerIPPerDay int `yaml:"registration_cap_per_ip_per_day"`
+
+	// --- Registration admission: proof-of-work (design §4.1) ---
+	//
+	// When enforced, a registration that would CREATE a new volunteer must carry a
+	// valid solution to a server-issued challenge (find a nonce whose
+	// SHA-256(challenge || public_key || nonce) has enough leading zero bits).
+	// Re-registration of an existing key never pays. Challenge ISSUANCE is always
+	// available so clients can be written probe-free; only enforcement is gated.
+	// WARNING: do NOT enable before solver-capable clients ship — no current
+	// volunteer CLI or dashboard build can solve a challenge, so enforcement would
+	// block ALL new-volunteer onboarding (existing volunteers are unaffected).
+
+	// RegistrationPowEnabled is the master switch for ENFORCEMENT. OFF by default.
+	// Override via LETTUCE_HEAD_REGISTRATION_POW_ENABLED.
+	RegistrationPowEnabled bool `yaml:"registration_pow_enabled"`
+	// RegistrationPowDifficultyBits is the required leading zero bits of the solution
+	// digest (~2^bits hash attempts; 20 ≈ one second of native single-thread work).
+	// Unset (0) resolves to the default 20. Override via
+	// LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS.
+	RegistrationPowDifficultyBits int `yaml:"registration_pow_difficulty_bits"`
+	// RegistrationPowChallengeTTLSeconds is how long an issued challenge stays
+	// redeemable. Unset (0) resolves to the default 600 (10 minutes). Override via
+	// LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS.
+	RegistrationPowChallengeTTLSeconds int `yaml:"registration_pow_challenge_ttl_seconds"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -364,6 +388,19 @@ const (
 	// defaultRegistrationCapPerIPPerDay is deliberately generous: the cap slows
 	// identity minting, and honest volunteers behind one NAT share a bucket.
 	defaultRegistrationCapPerIPPerDay = 10
+	// defaultRegistrationPowDifficultyBits: ~2^20 ≈ 1M hash attempts, about a second
+	// of native single-thread work — the one-time cost the design intends.
+	defaultRegistrationPowDifficultyBits = 20
+	// defaultRegistrationPowChallengeTTLSeconds matches the identity-challenge expiry.
+	defaultRegistrationPowChallengeTTLSeconds = 600
+	// Validate bounds for the difficulty: below 8 bits the puzzle is free (no
+	// treadmill slowing at all); above 32 bits the expected client work stretches to
+	// minutes-to-hours — an operator foot-gun, not a tunable.
+	minRegistrationPowDifficultyBits = 8
+	maxRegistrationPowDifficultyBits = 32
+	// Validate floor for the challenge TTL: a slow browser or a loaded machine must
+	// still be able to solve-and-submit within the window.
+	minRegistrationPowChallengeTTLSeconds = 60
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -589,6 +626,23 @@ func (h HeadConfig) Validate() error {
 	}
 	if h.RegistrationCapPerIPPerDay < 0 {
 		return fmt.Errorf("head.registration_cap_per_ip_per_day must be >= 0 (0 = default), got %d", h.RegistrationCapPerIPPerDay)
+	}
+	if h.RegistrationPowDifficultyBits < 0 {
+		return fmt.Errorf("head.registration_pow_difficulty_bits must be >= 0 (0 = default), got %d", h.RegistrationPowDifficultyBits)
+	}
+	if h.RegistrationPowChallengeTTLSeconds < 0 {
+		return fmt.Errorf("head.registration_pow_challenge_ttl_seconds must be >= 0 (0 = default), got %d", h.RegistrationPowChallengeTTLSeconds)
+	}
+	// Checked on the EFFECTIVE values (the standing-band precedent) so an explicit
+	// out-of-band override fails boot instead of silently shipping a free or
+	// hours-long puzzle.
+	if bits := h.EffectiveRegistrationPowDifficultyBits(); bits < minRegistrationPowDifficultyBits || bits > maxRegistrationPowDifficultyBits {
+		return fmt.Errorf("head.registration_pow_difficulty_bits must be in [%d, %d] (effective value, got %d)",
+			minRegistrationPowDifficultyBits, maxRegistrationPowDifficultyBits, bits)
+	}
+	if ttl := h.EffectiveRegistrationPowChallengeTTLSeconds(); ttl < minRegistrationPowChallengeTTLSeconds {
+		return fmt.Errorf("head.registration_pow_challenge_ttl_seconds must be >= %d (effective value, got %d)",
+			minRegistrationPowChallengeTTLSeconds, ttl)
 	}
 	return nil
 }
@@ -940,6 +994,24 @@ func (h HeadConfig) EffectiveRegistrationCapPerIPPerDay() int {
 		return defaultRegistrationCapPerIPPerDay
 	}
 	return h.RegistrationCapPerIPPerDay
+}
+
+// EffectiveRegistrationPowDifficultyBits returns the required leading zero bits of a
+// registration proof-of-work solution, default 20. Unset (<= 0) -> the default.
+func (h HeadConfig) EffectiveRegistrationPowDifficultyBits() int {
+	if h.RegistrationPowDifficultyBits <= 0 {
+		return defaultRegistrationPowDifficultyBits
+	}
+	return h.RegistrationPowDifficultyBits
+}
+
+// EffectiveRegistrationPowChallengeTTLSeconds returns how long an issued registration
+// challenge stays redeemable, default 600 (10 minutes). Unset (<= 0) -> the default.
+func (h HeadConfig) EffectiveRegistrationPowChallengeTTLSeconds() int {
+	if h.RegistrationPowChallengeTTLSeconds <= 0 {
+		return defaultRegistrationPowChallengeTTLSeconds
+	}
+	return h.RegistrationPowChallengeTTLSeconds
 }
 
 // StorageConfig defines local filesystem storage settings.

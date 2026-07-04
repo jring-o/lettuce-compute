@@ -67,6 +67,8 @@ func clearLettuceEnv(t *testing.T) {
 		"LETTUCE_HEAD_STANDING_OK_RATE", "LETTUCE_HEAD_STANDING_BENCH_RATE",
 		"LETTUCE_HEAD_STANDING_MIN_SAMPLE", "LETTUCE_HEAD_STANDING_BENCH_MINUTES",
 		"LETTUCE_HEAD_REGISTRATION_CAP_ENABLED", "LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY",
+		"LETTUCE_HEAD_REGISTRATION_POW_ENABLED", "LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS",
+		"LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS",
 	}
 	for _, e := range envVars {
 		if orig, ok := os.LookupEnv(e); ok {
@@ -1656,6 +1658,197 @@ func TestRegistrationCapEnvOverrideInvalid(t *testing.T) {
 		}
 		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY") {
 			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY", err.Error())
+		}
+	})
+}
+
+// TestRegistrationPowDefaults verifies the registration proof-of-work defaults on a
+// zero-valued HeadConfig: enforcement is off, and the Effective accessors resolve the
+// documented defaults (20 difficulty bits, a 600-second challenge TTL) for both the
+// unset (0) and negative cases (they share the <= 0 branch), while explicit in-band
+// values are returned verbatim.
+func TestRegistrationPowDefaults(t *testing.T) {
+	h := HeadConfig{}
+	if h.RegistrationPowEnabled {
+		t.Error("RegistrationPowEnabled should default to false")
+	}
+	if got := h.EffectiveRegistrationPowDifficultyBits(); got != 20 {
+		t.Errorf("EffectiveRegistrationPowDifficultyBits() = %d, want 20", got)
+	}
+	if got := h.EffectiveRegistrationPowChallengeTTLSeconds(); got != 600 {
+		t.Errorf("EffectiveRegistrationPowChallengeTTLSeconds() = %d, want 600", got)
+	}
+	// Negative raw values share the unset (<= 0) branch and resolve to the defaults.
+	neg := HeadConfig{RegistrationPowDifficultyBits: -1, RegistrationPowChallengeTTLSeconds: -1}
+	if got := neg.EffectiveRegistrationPowDifficultyBits(); got != 20 {
+		t.Errorf("EffectiveRegistrationPowDifficultyBits(-1) = %d, want 20 (default)", got)
+	}
+	if got := neg.EffectiveRegistrationPowChallengeTTLSeconds(); got != 600 {
+		t.Errorf("EffectiveRegistrationPowChallengeTTLSeconds(-1) = %d, want 600 (default)", got)
+	}
+	// Explicit in-band values are returned verbatim.
+	set := HeadConfig{RegistrationPowDifficultyBits: 16, RegistrationPowChallengeTTLSeconds: 300}
+	if got := set.EffectiveRegistrationPowDifficultyBits(); got != 16 {
+		t.Errorf("EffectiveRegistrationPowDifficultyBits(16) = %d, want 16 (verbatim)", got)
+	}
+	if got := set.EffectiveRegistrationPowChallengeTTLSeconds(); got != 300 {
+		t.Errorf("EffectiveRegistrationPowChallengeTTLSeconds(300) = %d, want 300 (verbatim)", got)
+	}
+}
+
+// TestRegistrationPowValidate covers the registration proof-of-work Validate rules. The
+// difficulty and TTL knobs reject NEGATIVE raw values (raw 0 is the unset->default
+// sentinel and must pass, resolving to in-band defaults). The range bounds are then
+// enforced on the EFFECTIVE values — mirroring the standing-band precedent — so an
+// explicit out-of-band override fails boot rather than silently shipping a free or
+// hours-long puzzle: difficulty must land in [8, 32] bits and the challenge TTL must be
+// at least 60 seconds.
+func TestRegistrationPowValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "registration pow knobs unset ok",
+			cfg:     HeadConfig{Name: "x"},
+			wantErr: false,
+		},
+		{
+			name:    "zero pow knobs ok (unset sentinel resolves to in-band defaults)",
+			cfg:     HeadConfig{Name: "x", RegistrationPowDifficultyBits: 0, RegistrationPowChallengeTTLSeconds: 0},
+			wantErr: false,
+		},
+		{
+			name:    "valid explicit registration pow knobs",
+			cfg:     HeadConfig{Name: "x", RegistrationPowEnabled: true, RegistrationPowDifficultyBits: 16, RegistrationPowChallengeTTLSeconds: 120},
+			wantErr: false,
+		},
+		{
+			name:    "negative difficulty bits rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationPowDifficultyBits: -1},
+			wantErr: true,
+			errMsg:  "registration_pow_difficulty_bits must be >= 0",
+		},
+		{
+			name:    "negative challenge ttl rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationPowChallengeTTLSeconds: -1},
+			wantErr: true,
+			errMsg:  "registration_pow_challenge_ttl_seconds must be >= 0",
+		},
+		{
+			// bits 7 is below the min 8 — the effective-value bound rejects a
+			// difficulty so low the puzzle is effectively free.
+			name:    "effective difficulty below min rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationPowDifficultyBits: 7},
+			wantErr: true,
+			errMsg:  "registration_pow_difficulty_bits must be in [8, 32]",
+		},
+		{
+			// bits 33 is above the max 32 — the effective-value bound rejects a
+			// difficulty so high the expected client work stretches to minutes-to-hours.
+			name:    "effective difficulty above max rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationPowDifficultyBits: 33},
+			wantErr: true,
+			errMsg:  "registration_pow_difficulty_bits must be in [8, 32]",
+		},
+		{
+			// ttl 30 is below the 60-second floor — too short for a slow browser or a
+			// loaded machine to solve-and-submit within the window.
+			name:    "effective challenge ttl below floor rejected",
+			cfg:     HeadConfig{Name: "x", RegistrationPowChallengeTTLSeconds: 30},
+			wantErr: true,
+			errMsg:  "registration_pow_challenge_ttl_seconds must be >= 60",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestRegistrationPowEnvOverrides threads the registration proof-of-work env knobs
+// through Load and checks both the raw fields and their Effective values.
+func TestRegistrationPowEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_ENABLED", "true")
+	t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS", "24")
+	t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS", "300")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Head.RegistrationPowEnabled {
+		t.Error("RegistrationPowEnabled = false, want true")
+	}
+	if cfg.Head.RegistrationPowDifficultyBits != 24 {
+		t.Errorf("RegistrationPowDifficultyBits = %d, want 24", cfg.Head.RegistrationPowDifficultyBits)
+	}
+	if cfg.Head.RegistrationPowChallengeTTLSeconds != 300 {
+		t.Errorf("RegistrationPowChallengeTTLSeconds = %d, want 300", cfg.Head.RegistrationPowChallengeTTLSeconds)
+	}
+	if got := cfg.Head.EffectiveRegistrationPowDifficultyBits(); got != 24 {
+		t.Errorf("EffectiveRegistrationPowDifficultyBits() = %d, want 24", got)
+	}
+	if got := cfg.Head.EffectiveRegistrationPowChallengeTTLSeconds(); got != 300 {
+		t.Errorf("EffectiveRegistrationPowChallengeTTLSeconds() = %d, want 300", got)
+	}
+}
+
+// TestRegistrationPowEnvOverrideInvalid rejects a non-boolean enforcement flag, a
+// non-integer difficulty, and a non-integer challenge TTL, and each error names the
+// offending variable.
+func TestRegistrationPowEnvOverrideInvalid(t *testing.T) {
+	t.Run("non-boolean enabled", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_ENABLED", "banana")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for non-boolean LETTUCE_HEAD_REGISTRATION_POW_ENABLED, got nil")
+		}
+		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_POW_ENABLED") {
+			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_POW_ENABLED", err.Error())
+		}
+	})
+	t.Run("non-integer difficulty bits", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS", "banana")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for non-integer LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS, got nil")
+		}
+		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS") {
+			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS", err.Error())
+		}
+	})
+	t.Run("non-integer challenge ttl", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS", "banana")
+		_, err := Load(path)
+		if err == nil {
+			t.Fatal("expected error for non-integer LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS, got nil")
+		}
+		if !contains(err.Error(), "LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS") {
+			t.Errorf("error = %q, want it to name LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS", err.Error())
 		}
 	})
 }

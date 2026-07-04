@@ -42,13 +42,17 @@ type CapPolicy struct {
 
 // CreateGate carries the per-request admission inputs into the transactional create path
 // (volunteer.Repository.CreateAdmitted). nil gate = no admission checks = exactly the
-// legacy single-statement create. The proof-of-work follow-up extends this struct with a
-// challenge redemption; the interface does not change.
+// legacy single-statement create. The two gates are orthogonal: CapPerDay <= 0 skips the
+// creation-cap check (proof-of-work may be enforced with the cap off), and a nil Pow
+// skips the challenge redemption (the cap may be enforced with proof-of-work off).
 type CreateGate struct {
-	// Bucket is the client's IP bucket (BucketForIP).
+	// Bucket is the client's IP bucket (BucketForIP). Consulted only when CapPerDay > 0.
 	Bucket string
-	// CapPerDay is the effective per-bucket daily creation cap (≥ 1).
+	// CapPerDay is the effective per-bucket daily creation cap; <= 0 = cap not enforced.
 	CapPerDay int
+	// Pow, when non-nil, is the proof-of-work solution to redeem (single-use, inside the
+	// same transaction) before the volunteer row may be created.
+	Pow *PowRedemption
 }
 
 // ErrCreationCapExceeded is returned by ReserveCreationSlot when the bucket has already

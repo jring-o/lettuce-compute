@@ -147,6 +147,15 @@ services:
       # affected. Full description + defaults: guides/head-setup.md (Registration creation cap).
       LETTUCE_HEAD_REGISTRATION_CAP_ENABLED: ${LETTUCE_HEAD_REGISTRATION_CAP_ENABLED:-}
       LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY: ${LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY:-}
+      # --- Registration proof-of-work --- OFF by default; all OPTIONAL (leave unset to keep
+      # the built-in defaults). When enforced, a NEW volunteer's client must solve a one-time
+      # SHA-256 puzzle before its first registration; existing volunteers never pay. WARNING:
+      # do NOT enable before solver-capable clients ship — no current lettuce-volunteer or
+      # dashboard build can solve a challenge, so enforcement today blocks ALL new-volunteer
+      # onboarding. Full description + defaults: guides/head-setup.md (Registration proof-of-work).
+      LETTUCE_HEAD_REGISTRATION_POW_ENABLED: ${LETTUCE_HEAD_REGISTRATION_POW_ENABLED:-}
+      LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS: ${LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS:-}
+      LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS: ${LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS:-}
     volumes:
       - ./keys:/keys:ro
     healthcheck:

@@ -77,6 +77,23 @@ func RegistrationCapFromHeadConfig(hc *config.HeadConfig) admission.CapPolicy {
 	}
 }
 
+// RegistrationPowFromHeadConfig builds the registration proof-of-work policy (design
+// §4.1) from the head configuration, for both create surfaces (the same single-source
+// rule as RegistrationCapFromHeadConfig). Unlike the cap policy, the effective
+// difficulty and TTL are populated even while enforcement is OFF, because challenge
+// ISSUANCE stays available regardless (probe-free clients). A nil config yields the
+// zero value (enforcement off, issuance unconfigured — the bare-test wiring).
+func RegistrationPowFromHeadConfig(hc *config.HeadConfig) admission.PowPolicy {
+	if hc == nil {
+		return admission.PowPolicy{}
+	}
+	return admission.PowPolicy{
+		Enabled:        hc.RegistrationPowEnabled,
+		DifficultyBits: hc.EffectiveRegistrationPowDifficultyBits(),
+		ChallengeTTL:   time.Duration(hc.EffectiveRegistrationPowChallengeTTLSeconds()) * time.Second,
+	}
+}
+
 // trustRepoFromPool returns a pgx-backed trust repository, or a genuine nil interface when
 // the pool is nil (the gRPC-plumbing / mux-only tests), so stampTrustSnapshot's nil check
 // works. It centralizes the "nil pool -> nil repo" idiom the submit paths share.

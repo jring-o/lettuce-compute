@@ -319,10 +319,17 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		// Registration admission cap (design §4.1), enforced identically to the gRPC
 		// register path; zero value (knob off) leaves browser registration unchanged.
 		registrationCap: RegistrationCapFromHeadConfig(deps.HeadConfig),
+		// Registration proof-of-work policy (design §4.1); enforcement off by default,
+		// but effective difficulty/TTL always populated so challenge issuance works.
+		registrationPow: RegistrationPowFromHeadConfig(deps.HeadConfig),
 		trustedProxies:  deps.TrustedProxies,
 	}
 
 	mux.HandleFunc("POST /api/v1/volunteers/register", handleBrowserRegister(bvDeps))
+	// Registration proof-of-work challenge issuance (design §4.1). Unauthenticated
+	// like register; rate-limited by the global per-IP chain; challenges expire and
+	// are swept, so the surface is bounded.
+	mux.HandleFunc("POST /api/v1/volunteers/register-challenge", handleBrowserRegisterChallenge(bvDeps))
 	mux.HandleFunc("POST /api/v1/volunteers/request-work",
 		ed25519AuthRequired(handleBrowserRequestWork(bvDeps)))
 	mux.HandleFunc("POST /api/v1/volunteers/submit-result",

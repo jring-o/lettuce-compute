@@ -19,17 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	VolunteerService_GetServerStatus_FullMethodName   = "/lettuce.volunteer.v1.VolunteerService/GetServerStatus"
-	VolunteerService_RegisterVolunteer_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/RegisterVolunteer"
-	VolunteerService_RequestWorkUnit_FullMethodName   = "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"
-	VolunteerService_SubmitResult_FullMethodName      = "/lettuce.volunteer.v1.VolunteerService/SubmitResult"
-	VolunteerService_StartWork_FullMethodName         = "/lettuce.volunteer.v1.VolunteerService/StartWork"
-	VolunteerService_GetWorkUnitStatus_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/GetWorkUnitStatus"
-	VolunteerService_GetHeadInfo_FullMethodName       = "/lettuce.volunteer.v1.VolunteerService/GetHeadInfo"
-	VolunteerService_SaveCheckpoint_FullMethodName    = "/lettuce.volunteer.v1.VolunteerService/SaveCheckpoint"
-	VolunteerService_GetCheckpoint_FullMethodName     = "/lettuce.volunteer.v1.VolunteerService/GetCheckpoint"
-	VolunteerService_AbandonWorkUnit_FullMethodName   = "/lettuce.volunteer.v1.VolunteerService/AbandonWorkUnit"
-	VolunteerService_GetMyContribution_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/GetMyContribution"
+	VolunteerService_GetServerStatus_FullMethodName          = "/lettuce.volunteer.v1.VolunteerService/GetServerStatus"
+	VolunteerService_RegisterVolunteer_FullMethodName        = "/lettuce.volunteer.v1.VolunteerService/RegisterVolunteer"
+	VolunteerService_GetRegistrationChallenge_FullMethodName = "/lettuce.volunteer.v1.VolunteerService/GetRegistrationChallenge"
+	VolunteerService_RequestWorkUnit_FullMethodName          = "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"
+	VolunteerService_SubmitResult_FullMethodName             = "/lettuce.volunteer.v1.VolunteerService/SubmitResult"
+	VolunteerService_StartWork_FullMethodName                = "/lettuce.volunteer.v1.VolunteerService/StartWork"
+	VolunteerService_GetWorkUnitStatus_FullMethodName        = "/lettuce.volunteer.v1.VolunteerService/GetWorkUnitStatus"
+	VolunteerService_GetHeadInfo_FullMethodName              = "/lettuce.volunteer.v1.VolunteerService/GetHeadInfo"
+	VolunteerService_SaveCheckpoint_FullMethodName           = "/lettuce.volunteer.v1.VolunteerService/SaveCheckpoint"
+	VolunteerService_GetCheckpoint_FullMethodName            = "/lettuce.volunteer.v1.VolunteerService/GetCheckpoint"
+	VolunteerService_AbandonWorkUnit_FullMethodName          = "/lettuce.volunteer.v1.VolunteerService/AbandonWorkUnit"
+	VolunteerService_GetMyContribution_FullMethodName        = "/lettuce.volunteer.v1.VolunteerService/GetMyContribution"
 )
 
 // VolunteerServiceClient is the client API for VolunteerService service.
@@ -42,6 +43,16 @@ type VolunteerServiceClient interface {
 	// Called on first connection and when hardware config changes.
 	// Upserts by public_key: new key = register, existing key = update.
 	RegisterVolunteer(ctx context.Context, in *RegisterVolunteerRequest, opts ...grpc.CallOption) (*RegisterVolunteerResponse, error)
+	// Issue a registration proof-of-work challenge for the CALLER's key (derived
+	// from the verified per-request signature, like RegisterVolunteer — the key
+	// need not be registered yet). Relevant only when the head enforces
+	// registration proof-of-work: a brand-new key's RegisterVolunteer is then
+	// refused with FailedPrecondition until it carries a valid solution
+	// (pow_challenge_id + pow_nonce). Solve by finding a nonce such that
+	// SHA-256(challenge || public_key || nonce as 8 big-endian bytes) has at
+	// least difficulty_bits leading zero bits. Challenges expire and are
+	// single-use. Re-registration of an existing key never requires this.
+	GetRegistrationChallenge(ctx context.Context, in *GetRegistrationChallengeRequest, opts ...grpc.CallOption) (*GetRegistrationChallengeResponse, error)
 	// Request work units matching volunteer capabilities.
 	// Returns 0..N assignments and a server-directed `retry_after_seconds` the
 	// caller MUST obey before its next call (present on all replies, including
@@ -103,6 +114,16 @@ func (c *volunteerServiceClient) RegisterVolunteer(ctx context.Context, in *Regi
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RegisterVolunteerResponse)
 	err := c.cc.Invoke(ctx, VolunteerService_RegisterVolunteer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *volunteerServiceClient) GetRegistrationChallenge(ctx context.Context, in *GetRegistrationChallengeRequest, opts ...grpc.CallOption) (*GetRegistrationChallengeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRegistrationChallengeResponse)
+	err := c.cc.Invoke(ctx, VolunteerService_GetRegistrationChallenge_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +230,16 @@ type VolunteerServiceServer interface {
 	// Called on first connection and when hardware config changes.
 	// Upserts by public_key: new key = register, existing key = update.
 	RegisterVolunteer(context.Context, *RegisterVolunteerRequest) (*RegisterVolunteerResponse, error)
+	// Issue a registration proof-of-work challenge for the CALLER's key (derived
+	// from the verified per-request signature, like RegisterVolunteer — the key
+	// need not be registered yet). Relevant only when the head enforces
+	// registration proof-of-work: a brand-new key's RegisterVolunteer is then
+	// refused with FailedPrecondition until it carries a valid solution
+	// (pow_challenge_id + pow_nonce). Solve by finding a nonce such that
+	// SHA-256(challenge || public_key || nonce as 8 big-endian bytes) has at
+	// least difficulty_bits leading zero bits. Challenges expire and are
+	// single-use. Re-registration of an existing key never requires this.
+	GetRegistrationChallenge(context.Context, *GetRegistrationChallengeRequest) (*GetRegistrationChallengeResponse, error)
 	// Request work units matching volunteer capabilities.
 	// Returns 0..N assignments and a server-directed `retry_after_seconds` the
 	// caller MUST obey before its next call (present on all replies, including
@@ -261,6 +292,9 @@ func (UnimplementedVolunteerServiceServer) GetServerStatus(context.Context, *Get
 }
 func (UnimplementedVolunteerServiceServer) RegisterVolunteer(context.Context, *RegisterVolunteerRequest) (*RegisterVolunteerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RegisterVolunteer not implemented")
+}
+func (UnimplementedVolunteerServiceServer) GetRegistrationChallenge(context.Context, *GetRegistrationChallengeRequest) (*GetRegistrationChallengeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRegistrationChallenge not implemented")
 }
 func (UnimplementedVolunteerServiceServer) RequestWorkUnit(context.Context, *RequestWorkUnitRequest) (*RequestWorkUnitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RequestWorkUnit not implemented")
@@ -342,6 +376,24 @@ func _VolunteerService_RegisterVolunteer_Handler(srv interface{}, ctx context.Co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VolunteerServiceServer).RegisterVolunteer(ctx, req.(*RegisterVolunteerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VolunteerService_GetRegistrationChallenge_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRegistrationChallengeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VolunteerServiceServer).GetRegistrationChallenge(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VolunteerService_GetRegistrationChallenge_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VolunteerServiceServer).GetRegistrationChallenge(ctx, req.(*GetRegistrationChallengeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -522,6 +574,10 @@ var VolunteerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RegisterVolunteer",
 			Handler:    _VolunteerService_RegisterVolunteer_Handler,
+		},
+		{
+			MethodName: "GetRegistrationChallenge",
+			Handler:    _VolunteerService_GetRegistrationChallenge_Handler,
 		},
 		{
 			MethodName: "RequestWorkUnit",
