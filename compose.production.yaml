@@ -130,6 +130,17 @@ services:
       # by default (~30s); leave unset to keep the default, or set negative to disable.
       LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS: ${LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS:-}
       LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER:-}
+      # --- Automatic standing backpressure (BG-24b) --- OFF by default; all OPTIONAL
+      # (leave unset to keep the built-in defaults). The machine folds adjudicated
+      # results into a decayed per-volunteer rejection rate and auto-manages account
+      # standing (PROBATION/BENCHED). Full table + defaults: guides/head-setup.md
+      # (Account standing backpressure).
+      LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED: ${LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED:-}
+      LETTUCE_HEAD_STANDING_PROBATION_RATE: ${LETTUCE_HEAD_STANDING_PROBATION_RATE:-}
+      LETTUCE_HEAD_STANDING_OK_RATE: ${LETTUCE_HEAD_STANDING_OK_RATE:-}
+      LETTUCE_HEAD_STANDING_BENCH_RATE: ${LETTUCE_HEAD_STANDING_BENCH_RATE:-}
+      LETTUCE_HEAD_STANDING_MIN_SAMPLE: ${LETTUCE_HEAD_STANDING_MIN_SAMPLE:-}
+      LETTUCE_HEAD_STANDING_BENCH_MINUTES: ${LETTUCE_HEAD_STANDING_BENCH_MINUTES:-}
     volumes:
       - ./keys:/keys:ro
     healthcheck:

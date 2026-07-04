@@ -373,6 +373,48 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.TrustFloor = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.StandingBackpressureEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_PROBATION_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_PROBATION_RATE must be a float: %w", err)
+		}
+		cfg.Head.StandingProbationRate = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_OK_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_OK_RATE must be a float: %w", err)
+		}
+		cfg.Head.StandingOKRate = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_BENCH_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_BENCH_RATE must be a float: %w", err)
+		}
+		cfg.Head.StandingBenchRate = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_MIN_SAMPLE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_MIN_SAMPLE must be an integer: %w", err)
+		}
+		cfg.Head.StandingMinSample = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_STANDING_BENCH_MINUTES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STANDING_BENCH_MINUTES must be an integer: %w", err)
+		}
+		cfg.Head.StandingBenchMinutes = n
+	}
 	return nil
 }
 

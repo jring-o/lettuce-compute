@@ -487,6 +487,43 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > volunteer gets first refusal, then becomes eligible again if the pool is otherwise
 > exhausted (so work never strands).
 
+### Account standing backpressure
+
+Each **volunteer account** carries a **standing** that governs how the head treats its
+work. `OK` is normal service. **`PROBATION`** keeps the account in rotation — it is still
+dispatched work and still credited — but its results never count toward a work unit's
+agreement and never cover redundancy, so the head forces full replication around it.
+**`BENCHED`** stops dispatch to that account entirely until its bench expires (an expired
+bench drops back to `PROBATION`, not straight to `OK`). Operators can set any standing by
+hand through the admin API, and hand-set standings are never changed automatically.
+
+Turned on, the **backpressure machine** sets these standings for you: it folds every
+**adjudicated** result — one the head accepted (`AGREED`) or rejected (`DISAGREED`) after
+comparing the redundant copies of a unit — into a decayed per-account rejection rate
+(7-day half-life) and moves the account between `OK`, `PROBATION`, and `BENCHED` with
+hysteresis (separate entry and exit rates, so an account near a threshold does not flap).
+It is **off by default**: with it off, no signal is recorded and standing stays
+operator-only. Before enabling, watch the head's existing per-volunteer
+`volunteer rejection rate` WARN lines to learn your fleet's normal rejection rates, then
+calibrate the thresholds (effective rates must order `0 < ok_rate < probation_rate <=
+bench_rate <= 1`). Once enabled, the head also logs a throttled
+`automatic standing backpressure` WARN naming how many accounts the machine currently
+holds benched versus on probation. Inspect the current non-OK population with
+`GET /api/v1/admin/standing` and release an account with
+`POST /api/v1/admin/standing/clear`.
+
+These are `head.*` keys in `lettuce.yaml` (or the matching `LETTUCE_HEAD_*` env vars);
+all are OPTIONAL and take the defaults below when unset.
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `standing_backpressure_enabled` (`LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED`) | `false` | Master switch. Off records no signal and leaves standing operator-only. Enable only after observing the WARN rates above. |
+| `standing_probation_rate` (`LETTUCE_HEAD_STANDING_PROBATION_RATE`) | `0.50` | Decayed rejection rate at which an `OK` account enters `PROBATION`. |
+| `standing_ok_rate` (`LETTUCE_HEAD_STANDING_OK_RATE`) | `0.25` | Decayed rejection rate at or below which a `PROBATION` account returns to `OK` — the hysteresis exit, kept strictly below the `PROBATION` entry rate. |
+| `standing_bench_rate` (`LETTUCE_HEAD_STANDING_BENCH_RATE`) | `0.75` | Decayed rejection rate at which a `PROBATION` account is `BENCHED`. |
+| `standing_min_sample` (`LETTUCE_HEAD_STANDING_MIN_SAMPLE`) | `5` | Minimum decayed sample (good + bad adjudications) before any transition is evaluated, so a newcomer's first unlucky results cannot bench them. |
+| `standing_bench_minutes` (`LETTUCE_HEAD_STANDING_BENCH_MINUTES`) | `1440` (24h) | Auto-bench duration. An expired bench resolves to `PROBATION`, so re-entry to `OK` still goes through the hysteresis exit. |
+
 ### Horizontal scale-out
 
 The head is **stateless** and can run as **N replicas** behind Caddy against one

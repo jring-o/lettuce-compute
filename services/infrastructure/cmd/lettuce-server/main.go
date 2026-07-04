@@ -34,6 +34,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
@@ -177,8 +178,32 @@ func main() {
 			"trust_floor", trustPolicy.DefaultFloor)
 	}
 
+	// Automatic standing backpressure (BG-24b PR-B): when enabled, every adjudicated
+	// result folds into the submitting volunteer's decayed rejection-rate signal, which
+	// drives AUTO-owned standing transitions with hysteresis (OK -> PROBATION -> BENCHED
+	// and back); the standing itself is enforced by dispatch and validation since #88.
+	// OFF by default — a nil recorder keeps the validation engine byte-for-byte as
+	// before, legacy lifetime-rate WARN included.
+	var standingRecorder standing.Recorder
+	if cfg.Head.StandingBackpressureEnabled {
+		standingRecorder = standing.NewPgxRecorder(pool, standing.BackpressureConfig{
+			ProbationRate: cfg.Head.EffectiveStandingProbationRate(),
+			OKRate:        cfg.Head.EffectiveStandingOKRate(),
+			BenchRate:     cfg.Head.EffectiveStandingBenchRate(),
+			MinSample:     float64(cfg.Head.EffectiveStandingMinSample()),
+			BenchFor:      time.Duration(cfg.Head.EffectiveStandingBenchMinutes()) * time.Minute,
+		})
+		slog.Info("standing backpressure enabled",
+			"probation_rate", cfg.Head.EffectiveStandingProbationRate(),
+			"ok_rate", cfg.Head.EffectiveStandingOKRate(),
+			"bench_rate", cfg.Head.EffectiveStandingBenchRate(),
+			"min_sample", cfg.Head.EffectiveStandingMinSample(),
+			"bench_minutes", cfg.Head.EffectiveStandingBenchMinutes())
+	}
+
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy).
+		WithStandingBackpressure(standingRecorder)
 
 	// The single transitioner (TODO #50): the sole decider of work-unit redundancy state.
 	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
@@ -376,6 +401,12 @@ func main() {
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
 	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger)
+	if cfg.Head.StandingBackpressureEnabled {
+		// Operator visibility for the backpressure machine: a throttled WARN naming the
+		// population it currently holds in PROBATION/BENCHED. Wired only when the machine
+		// is on, so the sweep stays zero-cost by default.
+		faultMonitor = faultMonitor.WithStandingPopulation(standing.NewPgxRepository(pool))
+	}
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)

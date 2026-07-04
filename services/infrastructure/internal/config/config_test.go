@@ -63,6 +63,9 @@ func clearLettuceEnv(t *testing.T) {
 		"LETTUCE_HEAD_DID_BINDING_COLLECTION",
 		"LETTUCE_HEAD_TRUST_GATE_ENABLED", "LETTUCE_HEAD_TRUST_MIN_CORROBORATORS",
 		"LETTUCE_HEAD_TRUST_FLOOR",
+		"LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED", "LETTUCE_HEAD_STANDING_PROBATION_RATE",
+		"LETTUCE_HEAD_STANDING_OK_RATE", "LETTUCE_HEAD_STANDING_BENCH_RATE",
+		"LETTUCE_HEAD_STANDING_MIN_SAMPLE", "LETTUCE_HEAD_STANDING_BENCH_MINUTES",
 	}
 	for _, e := range envVars {
 		if orig, ok := os.LookupEnv(e); ok {
@@ -1320,6 +1323,214 @@ func TestTrustGateEnvOverrideInvalid(t *testing.T) {
 		t.Setenv("LETTUCE_HEAD_TRUST_FLOOR", "-3")
 		if _, err := Load(path); err == nil {
 			t.Fatal("expected validation error for negative LETTUCE_HEAD_TRUST_FLOOR, got nil")
+		}
+	})
+}
+
+// TestStandingBackpressureDefaults verifies the standing-backpressure defaults on a
+// zero-valued HeadConfig: the machine is off, and the Effective accessors return the
+// documented head defaults (probation 0.50, ok 0.25, bench 0.75, min-sample 5, and a
+// 1440-minute auto-bench). A fully-set config returns its values verbatim.
+func TestStandingBackpressureDefaults(t *testing.T) {
+	h := HeadConfig{}
+	if h.StandingBackpressureEnabled {
+		t.Error("StandingBackpressureEnabled should default to false")
+	}
+	if got := h.EffectiveStandingProbationRate(); got != 0.50 {
+		t.Errorf("EffectiveStandingProbationRate() = %v, want 0.50", got)
+	}
+	if got := h.EffectiveStandingOKRate(); got != 0.25 {
+		t.Errorf("EffectiveStandingOKRate() = %v, want 0.25", got)
+	}
+	if got := h.EffectiveStandingBenchRate(); got != 0.75 {
+		t.Errorf("EffectiveStandingBenchRate() = %v, want 0.75", got)
+	}
+	if got := h.EffectiveStandingMinSample(); got != 5 {
+		t.Errorf("EffectiveStandingMinSample() = %d, want 5", got)
+	}
+	if got := h.EffectiveStandingBenchMinutes(); got != 1440 {
+		t.Errorf("EffectiveStandingBenchMinutes() = %d, want 1440", got)
+	}
+
+	h2 := HeadConfig{
+		StandingProbationRate: 0.6,
+		StandingOKRate:        0.3,
+		StandingBenchRate:     0.8,
+		StandingMinSample:     10,
+		StandingBenchMinutes:  720,
+	}
+	if got := h2.EffectiveStandingProbationRate(); got != 0.6 {
+		t.Errorf("EffectiveStandingProbationRate() = %v, want 0.6 (verbatim)", got)
+	}
+	if got := h2.EffectiveStandingOKRate(); got != 0.3 {
+		t.Errorf("EffectiveStandingOKRate() = %v, want 0.3 (verbatim)", got)
+	}
+	if got := h2.EffectiveStandingBenchRate(); got != 0.8 {
+		t.Errorf("EffectiveStandingBenchRate() = %v, want 0.8 (verbatim)", got)
+	}
+	if got := h2.EffectiveStandingMinSample(); got != 10 {
+		t.Errorf("EffectiveStandingMinSample() = %d, want 10 (verbatim)", got)
+	}
+	if got := h2.EffectiveStandingBenchMinutes(); got != 720 {
+		t.Errorf("EffectiveStandingBenchMinutes() = %d, want 720 (verbatim)", got)
+	}
+}
+
+// TestStandingBackpressureValidate covers the standing-knob Validate rules: the rates,
+// the min-sample, and the bench duration reject negatives (raw 0 is the unset->default
+// sentinel and must pass); a set rate above 1 is rejected; and the EFFECTIVE rates must
+// order 0 < ok < probation <= bench <= 1 — a partial override that inverts the band
+// against a default is rejected on the effective values.
+func TestStandingBackpressureValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "standing knobs unset ok",
+			cfg:     HeadConfig{Name: "x"},
+			wantErr: false,
+		},
+		{
+			name: "valid explicit standing knobs",
+			cfg: HeadConfig{
+				Name:                        "x",
+				StandingBackpressureEnabled: true,
+				StandingProbationRate:       0.6,
+				StandingOKRate:              0.3,
+				StandingBenchRate:           0.8,
+				StandingMinSample:           10,
+				StandingBenchMinutes:        720,
+			},
+			wantErr: false,
+		},
+		{
+			name:    "negative rate rejected",
+			cfg:     HeadConfig{Name: "x", StandingProbationRate: -0.1},
+			wantErr: true,
+			errMsg:  "standing_probation_rate must be >= 0",
+		},
+		{
+			name:    "rate above 1 rejected",
+			cfg:     HeadConfig{Name: "x", StandingBenchRate: 1.5},
+			wantErr: true,
+			errMsg:  "standing_bench_rate must be in (0, 1]",
+		},
+		{
+			name:    "ok_rate >= probation_rate rejected",
+			cfg:     HeadConfig{Name: "x", StandingProbationRate: 0.5, StandingOKRate: 0.5},
+			wantErr: true,
+			errMsg:  "must satisfy 0 < ok_rate",
+		},
+		{
+			name:    "probation_rate > bench_rate rejected",
+			cfg:     HeadConfig{Name: "x", StandingProbationRate: 0.9, StandingBenchRate: 0.8},
+			wantErr: true,
+			errMsg:  "must satisfy 0 < ok_rate",
+		},
+		{
+			name:    "negative min_sample rejected",
+			cfg:     HeadConfig{Name: "x", StandingMinSample: -1},
+			wantErr: true,
+			errMsg:  "standing_min_sample must be >= 0",
+		},
+		{
+			name:    "negative bench_minutes rejected",
+			cfg:     HeadConfig{Name: "x", StandingBenchMinutes: -1},
+			wantErr: true,
+			errMsg:  "standing_bench_minutes must be >= 0",
+		},
+		{
+			// Only the OK rate is set (0.9); the probation rate defaults to 0.50, so the
+			// effective band inverts (0.9 !< 0.50). Proves the ordering runs on effective
+			// values, not just the raw fields.
+			name:    "effective inversion via defaults rejected",
+			cfg:     HeadConfig{Name: "x", StandingOKRate: 0.9},
+			wantErr: true,
+			errMsg:  "must satisfy 0 < ok_rate",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestStandingBackpressureEnvOverrides threads the standing env knobs through Load.
+func TestStandingBackpressureEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED", "true")
+	t.Setenv("LETTUCE_HEAD_STANDING_PROBATION_RATE", "0.6")
+	t.Setenv("LETTUCE_HEAD_STANDING_OK_RATE", "0.3")
+	t.Setenv("LETTUCE_HEAD_STANDING_BENCH_RATE", "0.8")
+	t.Setenv("LETTUCE_HEAD_STANDING_MIN_SAMPLE", "10")
+	t.Setenv("LETTUCE_HEAD_STANDING_BENCH_MINUTES", "720")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Head.StandingBackpressureEnabled {
+		t.Error("StandingBackpressureEnabled = false, want true")
+	}
+	if cfg.Head.StandingProbationRate != 0.6 {
+		t.Errorf("StandingProbationRate = %v, want 0.6", cfg.Head.StandingProbationRate)
+	}
+	if cfg.Head.StandingOKRate != 0.3 {
+		t.Errorf("StandingOKRate = %v, want 0.3", cfg.Head.StandingOKRate)
+	}
+	if cfg.Head.StandingBenchRate != 0.8 {
+		t.Errorf("StandingBenchRate = %v, want 0.8", cfg.Head.StandingBenchRate)
+	}
+	if cfg.Head.StandingMinSample != 10 {
+		t.Errorf("StandingMinSample = %d, want 10", cfg.Head.StandingMinSample)
+	}
+	if cfg.Head.StandingBenchMinutes != 720 {
+		t.Errorf("StandingBenchMinutes = %d, want 720", cfg.Head.StandingBenchMinutes)
+	}
+}
+
+// TestStandingBackpressureEnvOverrideInvalid rejects a non-boolean enabled flag, a
+// non-float rate, and a non-integer min-sample.
+func TestStandingBackpressureEnvOverrideInvalid(t *testing.T) {
+	t.Run("non-boolean enabled", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED", "notabool")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for non-boolean LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED, got nil")
+		}
+	})
+	t.Run("non-float rate", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_STANDING_PROBATION_RATE", "abc")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for non-float LETTUCE_HEAD_STANDING_PROBATION_RATE, got nil")
+		}
+	})
+	t.Run("non-integer min_sample", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_STANDING_MIN_SAMPLE", "abc")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for non-integer LETTUCE_HEAD_STANDING_MIN_SAMPLE, got nil")
 		}
 	})
 }
