@@ -519,6 +519,51 @@ func (h HeadConfig) Validate() error {
 	if h.TrustFloor < 0 {
 		return fmt.Errorf("head.trust_floor must be >= 0, got %d", h.TrustFloor)
 	}
+
+	// --- Automatic standing-backpressure validation ---
+	// The three rates, the min-sample, and the bench duration reject only NEGATIVE raw
+	// values; a raw 0 means "unset -> use the (positive) default", mirroring the trust
+	// and DID knobs, so a minimal config that omits them stays valid and their EFFECTIVE
+	// values are always ordered. A rate is a probability, so a set (positive) rate above
+	// 1 can never be valid and is rejected as well.
+	if h.StandingProbationRate < 0 {
+		return fmt.Errorf("head.standing_probation_rate must be >= 0, got %v", h.StandingProbationRate)
+	}
+	if h.StandingProbationRate > 1 {
+		return fmt.Errorf("head.standing_probation_rate must be in (0, 1], got %v", h.StandingProbationRate)
+	}
+	if h.StandingOKRate < 0 {
+		return fmt.Errorf("head.standing_ok_rate must be >= 0, got %v", h.StandingOKRate)
+	}
+	if h.StandingOKRate > 1 {
+		return fmt.Errorf("head.standing_ok_rate must be in (0, 1], got %v", h.StandingOKRate)
+	}
+	if h.StandingBenchRate < 0 {
+		return fmt.Errorf("head.standing_bench_rate must be >= 0, got %v", h.StandingBenchRate)
+	}
+	if h.StandingBenchRate > 1 {
+		return fmt.Errorf("head.standing_bench_rate must be in (0, 1], got %v", h.StandingBenchRate)
+	}
+	if h.StandingMinSample < 0 {
+		return fmt.Errorf("head.standing_min_sample must be >= 0, got %d", h.StandingMinSample)
+	}
+	if h.StandingBenchMinutes < 0 {
+		return fmt.Errorf("head.standing_bench_minutes must be >= 0, got %d", h.StandingBenchMinutes)
+	}
+	// The AUTO standing machine needs the EFFECTIVE thresholds to form a strictly
+	// ascending hysteresis band bounded by 1: the OK (exit) rate strictly below the
+	// PROBATION (entry) rate, which is at or below the BENCH rate, all within (0, 1].
+	// This is checked on the effective (defaulted) values so a partial override that
+	// inverts the band against a default — e.g. only standing_ok_rate set above the
+	// default probation rate — is rejected rather than silently producing an
+	// unorderable machine. The defaults 0.25/0.50/0.75 satisfy it.
+	okRate := h.EffectiveStandingOKRate()
+	probationRate := h.EffectiveStandingProbationRate()
+	benchRate := h.EffectiveStandingBenchRate()
+	if !(0 < okRate && okRate < probationRate && probationRate <= benchRate && benchRate <= 1) {
+		return fmt.Errorf("head standing rates must satisfy 0 < ok_rate (%v) < probation_rate (%v) <= bench_rate (%v) <= 1 (effective values)",
+			okRate, probationRate, benchRate)
+	}
 	return nil
 }
 

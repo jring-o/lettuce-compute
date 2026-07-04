@@ -401,6 +401,12 @@ func main() {
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
 	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger)
+	if cfg.Head.StandingBackpressureEnabled {
+		// Operator visibility for the backpressure machine: a throttled WARN naming the
+		// population it currently holds in PROBATION/BENCHED. Wired only when the machine
+		// is on, so the sweep stays zero-cost by default.
+		faultMonitor = faultMonitor.WithStandingPopulation(standing.NewPgxRepository(pool))
+	}
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)

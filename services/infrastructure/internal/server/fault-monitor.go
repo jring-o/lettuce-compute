@@ -9,8 +9,10 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
@@ -29,6 +31,12 @@ type trustStarvationProber interface {
 // this often — a starved population changes on operator timescales (seeding trusted
 // subjects, trusted volunteers arriving), so re-warning every 30s scan would only be noise.
 const trustStarvedWarnEvery = 10 * time.Minute
+
+// standingPopulationWarnEvery throttles the auto-benched/probation WARN (see
+// warnStandingPopulation): the sweep is one small in-memory read (and skipped
+// entirely when the backpressure machine is off), but the standing population
+// changes on operator timescales, so re-warning every scan would only be noise.
+const standingPopulationWarnEvery = 10 * time.Minute
 
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
@@ -52,6 +60,16 @@ type FaultMonitor struct {
 	// the trustStarvedWarnEvery throttle clock. Touched only by the single Start loop
 	// (ScanOnce is not concurrent with itself), so it needs no lock.
 	lastTrustStarvedWarn time.Time
+	// standingPopulationRepo is the OPTIONAL account-standing read behind the
+	// auto-benched/probation WARN. nil (the default) = the standing-backpressure
+	// machine is off, so the sweep is skipped at zero cost; the orchestrator wires it
+	// via WithStandingPopulation only when the machine is enabled.
+	standingPopulationRepo standing.Repository
+	// lastStandingPopulationWarn is when the standing-population WARN last fired
+	// (zero = never), the standingPopulationWarnEvery throttle clock. Touched only by
+	// the single Start loop (ScanOnce is not concurrent with itself), so no lock —
+	// same justification as lastTrustStarvedWarn above.
+	lastStandingPopulationWarn time.Time
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -76,6 +94,16 @@ func NewFaultMonitor(
 		scanInterval:    30 * time.Second,
 		batchSize:       100,
 	}
+}
+
+// WithStandingPopulation wires the OPTIONAL account-standing read that backs the
+// auto-benched/probation operator WARN (warnStandingPopulation). Left unset the sweep
+// is a no-op; the orchestrator calls this only when the standing-backpressure machine
+// is enabled, so the feature stays zero-cost by default. Chainable; returns the
+// monitor so it can be composed onto NewFaultMonitor without widening its signature.
+func (m *FaultMonitor) WithStandingPopulation(repo standing.Repository) *FaultMonitor {
+	m.standingPopulationRepo = repo
+	return m
 }
 
 // Start begins the background monitoring loop. Returns when ctx is cancelled.
@@ -206,6 +234,12 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	//    missing — surface it.
 	m.warnTrustStarved(ctx)
 
+	// 4. Automatic standing backpressure population: how many volunteers the machine
+	//    currently holds in PROBATION or BENCHED. A no-op when the machine is off (no
+	//    standing repo wired); a signal that a chunk of the fleet is being neutralized
+	//    or held back when it is on.
+	m.warnStandingPopulation(ctx)
+
 	// Check for stale checkpoints across all running work units with checkpointing enabled.
 	m.checkStaleCheckpoints(ctx)
 
@@ -239,6 +273,58 @@ func (m *FaultMonitor) warnTrustStarved(ctx context.Context) {
 		"count", count,
 		"sample_work_unit_ids", sample,
 		"remedy", "seed or verify trusted subjects (POST /api/v1/admin/trust), add trusted volunteer capacity, or lower the leaf's min_trusted_corroborators")
+}
+
+// warnStandingPopulation surfaces the automatic-standing-backpressure population (see
+// WithStandingPopulation): a WARN naming how many volunteers the machine currently
+// holds in effective PROBATION vs BENCHED, a small id sample, and the operator
+// remedies. Skipped entirely when no standing repo is wired (the machine is off);
+// throttled to standingPopulationWarnEvery so a stable population does not re-log every
+// scan. Best-effort like every other sweep here — a read error is logged and the scan
+// continues. Each row is resolved through volunteer.EffectiveStanding, so an EXPIRED
+// bench counts as PROBATION (its re-entry to OK goes through the backpressure exit
+// threshold), never as BENCHED.
+func (m *FaultMonitor) warnStandingPopulation(ctx context.Context) {
+	if m.standingPopulationRepo == nil {
+		return
+	}
+	if !m.lastStandingPopulationWarn.IsZero() && time.Since(m.lastStandingPopulationWarn) < standingPopulationWarnEvery {
+		return
+	}
+	entries, err := m.standingPopulationRepo.AllNonOK(ctx)
+	if err != nil {
+		m.logger.Error("standing-population sweep failed", "error", err)
+		return
+	}
+	now := time.Now()
+	var benched, probation int
+	sample := make([]types.ID, 0, 5)
+	for id, e := range entries {
+		switch volunteer.EffectiveStanding(e.Standing, e.BenchedUntil, now) {
+		case volunteer.StandingBenched:
+			benched++
+		case volunteer.StandingProbation:
+			probation++
+		default:
+			// An AllNonOK row's stored standing is PROBATION or BENCHED, so it always
+			// resolves to one of the two cases above; guard defensively regardless.
+			continue
+		}
+		if len(sample) < 5 {
+			sample = append(sample, id)
+		}
+	}
+	// Nothing effectively non-OK -> no WARN and, crucially, no throttle stamp, so the
+	// next scan re-reads and the WARN fires the moment a population first appears.
+	if benched == 0 && probation == 0 {
+		return
+	}
+	m.lastStandingPopulationWarn = now
+	m.logger.Warn("volunteers held by automatic standing backpressure: PROBATION accounts are still dispatched and credited but never count toward agreement or cover redundancy; BENCHED accounts get no new work until their bench expires",
+		"benched", benched,
+		"probation", probation,
+		"sample_volunteer_ids", sample,
+		"remedy", "inspect with GET /api/v1/admin/standing, release with POST /api/v1/admin/standing/clear; thresholds are the LETTUCE_HEAD_STANDING_* knobs")
 }
 
 // cleanupCheckpointByID deletes checkpoint data for a work unit (best effort).
