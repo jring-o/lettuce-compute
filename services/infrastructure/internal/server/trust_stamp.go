@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/config"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
@@ -58,6 +59,21 @@ func trustDispatchFromPolicy(tp transition.TrustPolicy) workunit.TrustDispatchPo
 		GateEnabled:             tp.GateEnabled,
 		DefaultMinCorroborators: tp.DefaultMinCorroborators,
 		DefaultFloor:            tp.DefaultFloor,
+	}
+}
+
+// RegistrationCapFromHeadConfig builds the registration admission cap policy (design
+// §4.1) from the head configuration. The process wiring (main.go, for the gRPC service
+// via SetAdmissionPolicy) and the HTTP router (for the browser register path) both derive
+// the policy from this one function, so the two create surfaces can never enforce
+// different numbers from one config. A nil config yields the zero value (gate off).
+func RegistrationCapFromHeadConfig(hc *config.HeadConfig) admission.CapPolicy {
+	if hc == nil || !hc.RegistrationCapEnabled {
+		return admission.CapPolicy{}
+	}
+	return admission.CapPolicy{
+		Enabled: true,
+		PerDay:  hc.EffectiveRegistrationCapPerIPPerDay(),
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -49,6 +50,9 @@ func (r *mockVolunteerRepo) GetByPublicKey(ctx context.Context, publicKey []byte
 
 // Stubs for the rest of the interface.
 func (r *mockVolunteerRepo) Create(ctx context.Context, v *volunteer.Volunteer) error    { return nil }
+func (r *mockVolunteerRepo) CreateAdmitted(ctx context.Context, v *volunteer.Volunteer, _ *admission.CreateGate) error {
+	return nil
+}
 func (r *mockVolunteerRepo) GetByID(ctx context.Context, id types.ID) (*volunteer.Volunteer, error) {
 	return nil, nil
 }

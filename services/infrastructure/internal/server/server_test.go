@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/config"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
@@ -634,6 +635,12 @@ func (m *mockVolunteerRepo) Create(_ context.Context, v *volunteer.Volunteer) er
 	v.UpdatedAt = now
 	m.volunteers[key] = v
 	return nil
+}
+
+// CreateAdmitted delegates to Create: the in-map fake has no transaction/counter, and
+// the nil-gate contract is "exactly Create" anyway.
+func (m *mockVolunteerRepo) CreateAdmitted(ctx context.Context, v *volunteer.Volunteer, _ *admission.CreateGate) error {
+	return m.Create(ctx, v)
 }
 
 func (m *mockVolunteerRepo) GetByID(_ context.Context, id types.ID) (*volunteer.Volunteer, error) {

@@ -270,6 +270,24 @@ type HeadConfig struct {
 	// PROBATION, so re-entry to OK goes through the hysteresis exit. Unset (0) resolves
 	// to the default 1440 (24h). Override via LETTUCE_HEAD_STANDING_BENCH_MINUTES.
 	StandingBenchMinutes int `yaml:"standing_bench_minutes"`
+
+	// --- Registration admission: per-IP creation cap (design §4.1) ---
+	//
+	// The cap bounds how many NEW volunteer rows a single IP bucket (IPv4 address /
+	// IPv6 /64 prefix) may create per UTC day. It gates only the create branch of
+	// registration — re-registration of an existing key never pays admission cost —
+	// and the counter increments in the same transaction as the volunteer INSERT, so
+	// the cap counts exactly the creations that committed. Admission cost is a
+	// treadmill slower, never load-bearing.
+
+	// RegistrationCapEnabled is the master switch. OFF by default: registration
+	// behaves exactly as before. Override via LETTUCE_HEAD_REGISTRATION_CAP_ENABLED.
+	RegistrationCapEnabled bool `yaml:"registration_cap_enabled"`
+	// RegistrationCapPerIPPerDay is the maximum volunteer creations per (IP bucket,
+	// UTC day). Generous by default: honest labs/universities behind one NAT share a
+	// bucket. Unset (0) resolves to the default 10. Override via
+	// LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY.
+	RegistrationCapPerIPPerDay int `yaml:"registration_cap_per_ip_per_day"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -341,6 +359,11 @@ const (
 	defaultStandingBenchRate     = 0.75
 	defaultStandingMinSample     = 5
 	defaultStandingBenchMinutes  = 1440
+
+	// --- Registration-admission defaults (operator-accepted 2026-07-04) ---
+	// defaultRegistrationCapPerIPPerDay is deliberately generous: the cap slows
+	// identity minting, and honest volunteers behind one NAT share a bucket.
+	defaultRegistrationCapPerIPPerDay = 10
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -563,6 +586,9 @@ func (h HeadConfig) Validate() error {
 	if !(0 < okRate && okRate < probationRate && probationRate <= benchRate && benchRate <= 1) {
 		return fmt.Errorf("head standing rates must satisfy 0 < ok_rate (%v) < probation_rate (%v) <= bench_rate (%v) <= 1 (effective values)",
 			okRate, probationRate, benchRate)
+	}
+	if h.RegistrationCapPerIPPerDay < 0 {
+		return fmt.Errorf("head.registration_cap_per_ip_per_day must be >= 0 (0 = default), got %d", h.RegistrationCapPerIPPerDay)
 	}
 	return nil
 }
@@ -905,6 +931,15 @@ func (h HeadConfig) EffectiveStandingBenchMinutes() int {
 		return defaultStandingBenchMinutes
 	}
 	return h.StandingBenchMinutes
+}
+
+// EffectiveRegistrationCapPerIPPerDay returns the per-(IP bucket, UTC day) volunteer
+// creation cap, default 10. Unset (<= 0) -> defaultRegistrationCapPerIPPerDay.
+func (h HeadConfig) EffectiveRegistrationCapPerIPPerDay() int {
+	if h.RegistrationCapPerIPPerDay <= 0 {
+		return defaultRegistrationCapPerIPPerDay
+	}
+	return h.RegistrationCapPerIPPerDay
 }
 
 // StorageConfig defines local filesystem storage settings.

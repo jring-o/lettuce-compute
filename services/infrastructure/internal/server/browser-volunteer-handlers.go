@@ -6,12 +6,16 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
@@ -56,6 +60,16 @@ type browserVolunteerDeps struct {
 	// trusted-corroborator reservation identically to the shared repo. Zero value = gate off
 	// (the reservation is inert and this path dispatches exactly as before).
 	trustDispatch workunit.TrustDispatchPolicy
+	// registrationCap is the registration admission cap policy (design §4.1) the browser
+	// register path enforces identically to the gRPC path. Zero value = gate off (the
+	// deploy-safety default); the router fills it from HeadConfig.Effective* values.
+	registrationCap admission.CapPolicy
+	// trustedProxies backs trust-aware client-IP extraction for the cap's bucket
+	// (clientIPFromRequest — the same set the HTTP rate limiter uses). nil = forwarding
+	// headers ignored, direct peer used (the secure default).
+	trustedProxies []*net.IPNet
+	// capRefusalLogN samples the creation-cap refusal Warn (H-5 first-then-every-N).
+	capRefusalLogN uint64
 }
 
 // --- Request/Response types ---
@@ -131,6 +145,21 @@ type browserSubmitResultResponse struct {
 
 // browserRegisterMaxBody limits the request body size for the unauthenticated register endpoint.
 const browserRegisterMaxBody = 64 * 1024 // 64 KB — registration payloads are tiny
+
+// registrationGate resolves the per-request admission gate for a browser-volunteer
+// CREATE. nil while the creation cap is disabled — the legacy create path,
+// byte-for-byte. Fails closed (non-nil error) when the cap is enabled but the client
+// IP is unbucketable: a misconfigured head must not silently run uncapped.
+func (deps *browserVolunteerDeps) registrationGate(r *http.Request) (*admission.CreateGate, error) {
+	if !deps.registrationCap.Enabled {
+		return nil, nil
+	}
+	bucket, err := admission.BucketForIP(clientIPFromRequest(r, deps.trustedProxies))
+	if err != nil {
+		return nil, err
+	}
+	return &admission.CreateGate{Bucket: bucket, CapPerDay: deps.registrationCap.PerDay}, nil
+}
 
 // --- Handlers ---
 
@@ -215,7 +244,19 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 				return
 			}
 
-			// Not found — create new volunteer.
+			// Not found — create new volunteer, through the registration admission gates
+			// (design §4.1), enforced identically to the gRPC path. The gate is nil while
+			// the creation cap is disabled — exactly the legacy create path.
+			gate, gateErr := deps.registrationGate(r)
+			if gateErr != nil {
+				// Fail closed: the cap is enabled but the client IP cannot be bucketed
+				// (unreachable through a real HTTP server; a misconfigured head must not
+				// silently run uncapped).
+				deps.logger.Error("failed to resolve registration admission gate", "error", gateErr)
+				apierror.WriteError(w, apierror.Internal("internal server error", gateErr))
+				return
+			}
+
 			now := time.Now().UTC()
 			var displayName *string
 			if req.DisplayName != "" {
@@ -232,19 +273,46 @@ func handleBrowserRegister(deps *browserVolunteerDeps) http.HandlerFunc {
 				LastSeenAt:           &now,
 			}
 
-			if createErr := deps.volunteerRepo.Create(r.Context(), v); createErr != nil {
+			createErr := deps.volunteerRepo.CreateAdmitted(r.Context(), v, gate)
+			switch {
+			case createErr == nil:
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				json.NewEncoder(w).Encode(browserRegisterResponse{
+					VolunteerID:  v.ID.String(),
+					RegisteredAt: v.RegisteredAt.Format(time.RFC3339),
+				})
+				return
+
+			case errors.Is(createErr, admission.ErrCreationCapExceeded):
+				// Sampled Warn (H-5 idiom) + the pinned 429 refusal contract.
+				if n := atomic.AddUint64(&deps.capRefusalLogN, 1); n%shedLogSampleN == 1 {
+					deps.logger.Warn("refusing registration: creation cap exceeded",
+						"path", "browser-register", "bucket", gate.Bucket, "refusal_count", n)
+				}
+				apierror.WriteError(w, &apierror.APIError{
+					Code:       "REGISTRATION_CAP_EXCEEDED",
+					Message:    admission.CapExceededMessage,
+					HTTPStatus: http.StatusTooManyRequests,
+				})
+				return
+
+			case isConflictErr(createErr):
+				// Lost the get-then-create race to a concurrent registration of the same
+				// key: re-fetch and fall through to the existing-key 409 below — the
+				// correct upsert semantics (previously this surfaced as a 500).
+				existing, err = deps.volunteerRepo.GetByPublicKey(r.Context(), pubKeyBytes)
+				if err != nil {
+					deps.logger.Error("failed to re-fetch volunteer after create race", "error", err)
+					apierror.WriteError(w, apierror.Internal("internal server error", err))
+					return
+				}
+
+			default:
 				deps.logger.Error("failed to create volunteer", "error", createErr)
 				apierror.WriteError(w, apierror.Internal("internal server error", createErr))
 				return
 			}
-
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(browserRegisterResponse{
-				VolunteerID:  v.ID.String(),
-				RegisteredAt: v.RegisteredAt.Format(time.RFC3339),
-			})
-			return
 		}
 
 		// Already registered — return 409 with existing ID.

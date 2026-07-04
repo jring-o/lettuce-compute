@@ -415,6 +415,20 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.StandingBenchMinutes = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_REGISTRATION_CAP_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REGISTRATION_CAP_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.RegistrationCapEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REGISTRATION_CAP_PER_IP_PER_DAY must be an integer: %w", err)
+		}
+		cfg.Head.RegistrationCapPerIPPerDay = n
+	}
 	return nil
 }
 
