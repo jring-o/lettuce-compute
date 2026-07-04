@@ -708,3 +708,80 @@ func TestResultBatchUpdateValidationStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestResultTrustSnapshot proves the submission-time trust snapshot columns
+// (trust_subject, trust_score_at_submit) persist on Create and round-trip through
+// GetByID, and that a result created without them stores NULL and reads back as nil
+// (the legacy / pre-feature row shape).
+func TestResultTrustSnapshot(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "result-trust")
+	leafID := createTestLeaf(t, pool, &userID)
+	wuID := createTestWorkUnit(t, pool, leafID)
+	wuID2 := createTestWorkUnit(t, pool, leafID)
+	vol1 := createTestVolunteer(t, pool)
+	vol2 := createTestVolunteer(t, pool)
+
+	repo := NewPgxRepository(pool)
+	ctx := context.Background()
+
+	// With the snapshot set.
+	subject := "did:plc:trusted"
+	score := 42
+	r := &Result{
+		WorkUnitID:         wuID,
+		VolunteerID:        vol1,
+		OutputData:         json.RawMessage(`{"answer": 42}`),
+		OutputChecksum:     "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		ExecutionMetadata:  sampleMetadata(),
+		ValidationStatus:   ValidationPending,
+		TrustSubject:       &subject,
+		TrustScoreAtSubmit: &score,
+	}
+	if err := repo.Create(ctx, r); err != nil {
+		t.Fatalf("Create with trust snapshot: %v", err)
+	}
+	// Create's RETURNING already populates the fields; verify there.
+	if r.TrustSubject == nil || *r.TrustSubject != subject {
+		t.Errorf("Create RETURNING TrustSubject = %v, want %q", r.TrustSubject, subject)
+	}
+	if r.TrustScoreAtSubmit == nil || *r.TrustScoreAtSubmit != score {
+		t.Errorf("Create RETURNING TrustScoreAtSubmit = %v, want %d", r.TrustScoreAtSubmit, score)
+	}
+
+	got, err := repo.GetByID(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.TrustSubject == nil || *got.TrustSubject != subject {
+		t.Errorf("GetByID TrustSubject = %v, want %q", got.TrustSubject, subject)
+	}
+	if got.TrustScoreAtSubmit == nil || *got.TrustScoreAtSubmit != score {
+		t.Errorf("GetByID TrustScoreAtSubmit = %v, want %d", got.TrustScoreAtSubmit, score)
+	}
+
+	// Without the snapshot: NULL round-trips as nil.
+	rLegacy := &Result{
+		WorkUnitID:        wuID2,
+		VolunteerID:       vol2,
+		OutputData:        json.RawMessage(`{"answer": 7}`),
+		OutputChecksum:    "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+		ExecutionMetadata: sampleMetadata(),
+		ValidationStatus:  ValidationPending,
+	}
+	if err := repo.Create(ctx, rLegacy); err != nil {
+		t.Fatalf("Create without trust snapshot: %v", err)
+	}
+	gotLegacy, err := repo.GetByID(ctx, rLegacy.ID)
+	if err != nil {
+		t.Fatalf("GetByID legacy: %v", err)
+	}
+	if gotLegacy.TrustSubject != nil {
+		t.Errorf("legacy TrustSubject = %v, want nil", *gotLegacy.TrustSubject)
+	}
+	if gotLegacy.TrustScoreAtSubmit != nil {
+		t.Errorf("legacy TrustScoreAtSubmit = %v, want nil", *gotLegacy.TrustScoreAtSubmit)
+	}
+}

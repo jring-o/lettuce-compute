@@ -30,6 +30,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -92,7 +93,7 @@ func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
 
 	// Validation engine with signer.
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
 
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)
@@ -157,7 +158,7 @@ func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	// gRPC server with checkpoint support.
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-beta", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
+	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-beta", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")

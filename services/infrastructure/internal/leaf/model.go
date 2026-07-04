@@ -170,6 +170,14 @@ type ValidationConfig struct {
 	// corroboration for the leaf. Off by default: SubmitResult rejects external-
 	// reference submissions for any leaf that has not opted in.
 	AllowExternalOutput bool `json:"allow_external_output,omitempty"`
+
+	// MinTrustedCorroborators is the per-leaf trust-gate override: how many DISTINCT
+	// trusted subjects the agreeing group must contain to validate. 0 = inherit the head
+	// default (the gate itself is enabled head-wide by config; this only overrides K).
+	MinTrustedCorroborators int `json:"min_trusted_corroborators,omitempty"`
+	// TrustFloor is the per-leaf trust-floor override: the snapshot score at or above
+	// which a subject counts as trusted. 0 = inherit the head default.
+	TrustFloor int `json:"trust_floor,omitempty"`
 }
 
 // EffectiveTargetCopies resolves the target_copies 0 sentinel (TODO #50): the configured

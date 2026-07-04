@@ -76,20 +76,23 @@ type Locker interface {
 // proven copy/validation primitives — under a per-unit lock so two replicas can't half-apply an
 // invariant.
 type Transitioner struct {
-	locker     Locker
-	wus        WorkUnitStore
-	leaves     LeafStore
-	results    ResultStore
-	comparator Comparator
-	logger     *slog.Logger
+	locker      Locker
+	wus         WorkUnitStore
+	leaves      LeafStore
+	results     ResultStore
+	comparator  Comparator
+	trustPolicy TrustPolicy
+	logger      *slog.Logger
 }
 
-// NewTransitioner wires the transitioner. logger may be nil (a discard logger is used).
-func NewTransitioner(locker Locker, wus WorkUnitStore, leaves LeafStore, results ResultStore, comparator Comparator, logger *slog.Logger) *Transitioner {
+// NewTransitioner wires the transitioner. trustPolicy is the head trust-gate configuration
+// overlaid onto each leaf (its zero value = gate off, the behavior-preserving default).
+// logger may be nil (a discard logger is used).
+func NewTransitioner(locker Locker, wus WorkUnitStore, leaves LeafStore, results ResultStore, comparator Comparator, trustPolicy TrustPolicy, logger *slog.Logger) *Transitioner {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
-	return &Transitioner{locker: locker, wus: wus, leaves: leaves, results: results, comparator: comparator, logger: logger}
+	return &Transitioner{locker: locker, wus: wus, leaves: leaves, results: results, comparator: comparator, trustPolicy: trustPolicy, logger: logger}
 }
 
 // Evaluate re-evaluates a unit after a result submit or a copy close and applies the single
@@ -119,7 +122,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 	if err != nil {
 		return OutcomeNoop, err
 	}
-	policy := ResolvePolicy(lf, wu)
+	policy := ResolvePolicyWithTrust(lf, wu, t.trustPolicy)
 
 	all, err := t.results.ListByWorkUnit(ctx, id)
 	if err != nil {
@@ -171,11 +174,12 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 			return OutcomeWaiting, nil
 		}
 		majority = m
-		snap.Comparison = &ComparisonVerdict{
-			MajorityCount: len(majority),
-			Total:         len(pending),
-			Ratio:         float64(len(majority)) / float64(len(pending)),
-		}
+		// Build the verdict in DISTINCT SUBJECTS, not raw results: copies from one principal
+		// corroborate as one, and a self-contradicting principal corroborates as none. The
+		// resolved trust floor decides which agreeing subjects count as trusted corroborators
+		// (Decide's fourth gate). Behavior-preserving today: every result has a distinct
+		// volunteer and nobody is DID-bound, so subject counts equal result counts.
+		snap.Comparison = BuildComparisonVerdict(pending, majority, policy.TrustFloor)
 	}
 
 	d := Decide(snap)

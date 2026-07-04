@@ -27,6 +27,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/config"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
@@ -276,7 +277,7 @@ func TestGRPCGetServerStatus(t *testing.T) {
 
 	grpcServer, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := NewVolunteerService(nil, "0.1.0-test", startTime, nil, nil, nil, nil, nil, nil, nil, nil, logger)
+	volunteerSvc := NewVolunteerService(nil, "0.1.0-test", startTime, nil, nil, nil, nil, nil, nil, nil, nil, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -797,7 +798,7 @@ func setupRegisterTestServer(t *testing.T, repo volunteer.Repository) (lettucev1
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	grpcServer, grpcCleanup := NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	svc := NewVolunteerService(nil, "0.1.0-test", time.Now(), repo, nil, nil, nil, nil, nil, nil, nil, logger)
+	svc := NewVolunteerService(nil, "0.1.0-test", time.Now(), repo, nil, nil, nil, nil, nil, nil, nil, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, svc)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")

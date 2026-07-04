@@ -72,9 +72,17 @@ type Result struct {
 	// HostID attributes the result to the MACHINE that produced it (TODO #19), copied
 	// from the volunteer's live copy row at submit. nil = a volunteer that reported no
 	// host (per-account fallback).
-	HostID      *types.ID  `json:"host_id,omitempty"`
-	SubmittedAt time.Time  `json:"submitted_at"`
-	ValidatedAt *time.Time `json:"validated_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	HostID *types.ID `json:"host_id,omitempty"`
+	// TrustSubject / TrustScoreAtSubmit are the account-level trust snapshot stamped at
+	// submission (see internal/trust): the subject resolved for the submitting volunteer
+	// and that subject's score AT SUBMIT time. Acceptance decisions must use the
+	// submission-time score (not a later, possibly slashed or re-accrued value), so it is
+	// snapshotted per result rather than re-read at validation. Both nil = a legacy row
+	// created before the trust feature.
+	TrustSubject       *string    `json:"trust_subject,omitempty"`
+	TrustScoreAtSubmit *int       `json:"trust_score_at_submit,omitempty"`
+	SubmittedAt        time.Time  `json:"submitted_at"`
+	ValidatedAt        *time.Time `json:"validated_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }

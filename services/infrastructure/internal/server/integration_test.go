@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/server"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -49,7 +50,7 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 	// Wire up gRPC server.
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := server.NewVolunteerService(nil, version, startTime, nil, nil, nil, nil, nil, nil, nil, nil, logger)
+	volunteerSvc := server.NewVolunteerService(nil, version, startTime, nil, nil, nil, nil, nil, nil, nil, nil, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")

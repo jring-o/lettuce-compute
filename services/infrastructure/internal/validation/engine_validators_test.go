@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
@@ -40,7 +41,7 @@ func runTwoResultsCfg(t *testing.T, mode string, tol *float64, configure func(*l
 	volRepo.addVolunteer(makeVolunteer(vol1))
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 	return engine.TryValidate(context.Background(), wuID)
 }
 

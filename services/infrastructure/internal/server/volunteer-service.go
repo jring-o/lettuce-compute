@@ -22,6 +22,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -54,6 +55,16 @@ type volunteerService struct {
 	batchRepo           workunit.BatchRepository
 	checkpointRepo      checkpoint.Repository
 	validationEngine    *validation.Engine
+	// trustRepo snapshots the submitting subject's account-level trust score onto each result
+	// at submit time (see internal/trust). Constructed from the pool, so it is nil only in the
+	// gRPC-plumbing unit tests that pass a nil pool; SubmitResult is nil-safe (stamps score 0).
+	trustRepo trust.Repository
+	// trustPolicy is the head trust-gate configuration overlaid onto each leaf by the
+	// transitioner. Zero value = gate off (the deploy-safety default); the real policy is
+	// threaded from config via NewVolunteerService.
+	trustPolicy transition.TrustPolicy
+	// now supplies the current time for trust power-suppression checks; overridable in tests.
+	now func() time.Time
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
 	// SubmitResult delegates the validate/reject/wait/dead-letter decision to it. Built in
 	// the constructor from the validation engine + repos; nil only when validationEngine is
@@ -131,6 +142,7 @@ func NewVolunteerService(
 	checkpointRepo checkpoint.Repository,
 	validationEngine *validation.Engine,
 	logger *slog.Logger,
+	trustPolicy transition.TrustPolicy,
 ) lettucev1.VolunteerServiceServer {
 	s := &volunteerService{
 		pool:                pool,
@@ -145,6 +157,8 @@ func NewVolunteerService(
 		batchRepo:           batchRepo,
 		checkpointRepo:      checkpointRepo,
 		validationEngine:    validationEngine,
+		trustPolicy:         trustPolicy,
+		now:                 time.Now,
 		logger:              logger,
 		maxBatchPerRequest:  defaultMaxBatchPerRequest,
 		leaseSeconds:        defaultLeaseSeconds,
@@ -156,6 +170,9 @@ func NewVolunteerService(
 		// Per-host reliability store for the adaptive quota (TODO #54); same nil-only-in-
 		// plumbing-tests treatment as hostRepo.
 		s.reliabilityRepo = reliability.NewPgxRepository(pool)
+		// Account-level trust store for submit-time score snapshots (see internal/trust); same
+		// nil-only-in-plumbing-tests treatment. Stamping is nil-safe regardless.
+		s.trustRepo = trust.NewPgxRepository(pool)
 	}
 	// Default load estimator until SetHeadConfig overrides the tunables. The pool
 	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
@@ -165,7 +182,7 @@ func NewVolunteerService(
 	// Wire the single transitioner (TODO #50). It owns the redundancy decision; the
 	// validation engine is its comparator + accept/reject implementation. nil when no engine
 	// is present (the gRPC-plumbing tests pass nil and skip evaluation).
-	s.transitioner = newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, logger)
+	s.transitioner = newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, trustPolicy, logger)
 	return s
 }
 
@@ -177,7 +194,7 @@ func NewVolunteerService(
 // The per-unit lock is the cross-replica Postgres advisory lock when a pool is available, else a
 // no-op; the optimistic state guards + unique constraints remain the correctness backstop either
 // way, so two transitioner instances over the same pool still serialize per unit via the DB lock.
-func newTransitioner(pool *pgxpool.Pool, wuRepo workunit.WorkUnitRepository, leafRepo leaf.Repository, resultRepo result.Repository, validationEngine *validation.Engine, logger *slog.Logger) *transition.Transitioner {
+func newTransitioner(pool *pgxpool.Pool, wuRepo workunit.WorkUnitRepository, leafRepo leaf.Repository, resultRepo result.Repository, validationEngine *validation.Engine, trustPolicy transition.TrustPolicy, logger *slog.Logger) *transition.Transitioner {
 	if validationEngine == nil {
 		return nil
 	}
@@ -185,7 +202,7 @@ func newTransitioner(pool *pgxpool.Pool, wuRepo workunit.WorkUnitRepository, lea
 	if pool != nil {
 		locker = transition.NewPgxLocker(pool, logger)
 	}
-	return transition.NewTransitioner(locker, wuRepo, leafRepo, resultRepo, validationEngine, logger)
+	return transition.NewTransitioner(locker, wuRepo, leafRepo, resultRepo, validationEngine, trustPolicy, logger)
 }
 
 // HeadDispatchConfig carries the Layer-1 dispatch tunables (work batching,
@@ -1302,6 +1319,19 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		}
 	}
 
+	// Stamp the account-level trust snapshot (see internal/trust): the subject resolved for
+	// this volunteer and its quorum-power score AT SUBMIT time. Loading the volunteer row here
+	// is an extra read on the bounded shed ctx, but trust must never block work: a load failure
+	// falls back to the sentinel subject with score 0 rather than failing the submission.
+	var trustVol *volunteer.Volunteer
+	if v, verr := s.volunteerRepo.GetByID(ctx, volunteerID); verr != nil {
+		s.logger.Warn("failed to load volunteer for trust snapshot; stamping sentinel subject with score 0",
+			"volunteer_id", volunteerID, "error", verr)
+	} else {
+		trustVol = v
+	}
+	trustSubject, trustScore := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
+
 	r := &result.Result{
 		WorkUnitID:        workUnitID,
 		VolunteerID:       volunteerID,
@@ -1316,6 +1346,10 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		// the result's host is exactly the host the work was reserved/run under. nil for a
 		// volunteer that reported no host (per-account fallback).
 		HostID: activeAssignment.HostID,
+		// Account-level trust snapshot (see internal/trust): validation acceptance reads the
+		// submission-time subject + score, not a later re-read a slash/accrual could change.
+		TrustSubject:       &trustSubject,
+		TrustScoreAtSubmit: &trustScore,
 	}
 
 	// Insert result.

@@ -55,6 +55,20 @@ type RedundancyPolicy struct {
 	// SpotCheck mirrors wu.spot_check: a single-copy unit randomly promoted to require a
 	// 2-of-2 corroboration. When set, TargetCopies and MinQuorum are both forced to 2.
 	SpotCheck bool
+
+	// MinTrustedCorroborators is the resolved trust gate K (see internal/trust): the number
+	// of DISTINCT agreeing subjects with a submission-time score >= TrustFloor that a unit
+	// must contain to validate. It is the head TrustPolicy overlaid on the leaf override and
+	// clamped to MinQuorum. 0 means the gate does not block (gate disabled, or no
+	// corroborator requirement); Decide treats 0 as an auto-pass so this field is inert for
+	// every leaf until the operator enables the gate.
+	MinTrustedCorroborators int
+	// TrustFloor is the resolved snapshot-score threshold at or above which an agreeing
+	// subject counts as trusted. It is resolved from the leaf override / head default EVEN
+	// when the gate is disabled, so accrual can grow trust (and decide which subjects may
+	// corroborate others) before enforcement is switched on. Only consulted when
+	// MinTrustedCorroborators > 0.
+	TrustFloor int
 }
 
 // ResolvePolicy resolves the redundancy contract for a unit by layering, in order:
@@ -135,5 +149,18 @@ func ResolvePolicy(lf *leaf.Leaf, wu *workunit.WorkUnit) RedundancyPolicy {
 		p.MaxSuccessCopies = target
 	}
 
+	return p
+}
+
+// ResolvePolicyWithTrust resolves the redundancy policy and overlays the trust gate: it
+// runs ResolvePolicy, then stamps the effective (K, floor) from the head TrustPolicy and
+// the leaf overrides via tp.ResolveTrust(minQuorum). The trust fields are the only
+// difference from ResolvePolicy, so a zero-value TrustPolicy (gate off) yields a policy
+// with MinTrustedCorroborators == 0 that behaves identically to the pre-trust one.
+func ResolvePolicyWithTrust(lf *leaf.Leaf, wu *workunit.WorkUnit, tp TrustPolicy) RedundancyPolicy {
+	p := ResolvePolicy(lf, wu)
+	k, floor := tp.ResolveTrust(lf.ValidationConfig, p.MinQuorum)
+	p.MinTrustedCorroborators = k
+	p.TrustFloor = floor
 	return p
 }

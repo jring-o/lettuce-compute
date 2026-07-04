@@ -35,6 +35,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -93,7 +94,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	attestationRepo := attestation.NewPgxRepository(pool)
 
 	// Validation engine with signer.
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
 
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)
@@ -154,7 +155,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	// gRPC server.
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := server.NewVolunteerService(pool, "0.6.0-alpha", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger)
+	volunteerSvc := server.NewVolunteerService(pool, "0.6.0-alpha", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")

@@ -22,6 +22,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -88,8 +89,8 @@ func setupCheckpointServer(t *testing.T) (
 	batchRepo := workunit.NewPgxBatchRepository(pool)
 	creditRepo := credit.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger)
-	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger, nil, transition.TrustPolicy{})
+	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")

@@ -81,7 +81,7 @@ func pendingResults(n int) []*result.Result {
 
 func runEval(t *testing.T, wus *fakeWUS, lf *leaf.Leaf, results []*result.Result, cmp Comparator) Outcome {
 	t.Helper()
-	tr := NewTransitioner(NoopLocker{}, wus, fakeLeaf{lf}, fakeResults{results}, cmp, nil)
+	tr := NewTransitioner(NoopLocker{}, wus, fakeLeaf{lf}, fakeResults{results}, cmp, TrustPolicy{}, nil)
 	out, err := tr.Evaluate(context.Background(), wus.wu.ID)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)

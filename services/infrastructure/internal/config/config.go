@@ -207,6 +207,32 @@ type HeadConfig struct {
 	// operator decision and is overridable until the first production use — do not
 	// treat it as stable yet. Override via LETTUCE_HEAD_DID_BINDING_COLLECTION.
 	DIDBindingCollection string `yaml:"did_binding_collection"`
+
+	// --- Account-level trust gate (quorum power) ---
+	//
+	// The trust gate (see internal/trust) hardens redundant validation against Sybil
+	// accounts: it requires an agreeing group to contain enough DISTINCT TRUSTED SUBJECTS
+	// (K), where a subject is trusted once its submission-time score is at or above a
+	// floor (W). Trust is earned by corroborated-clean work and is operator-seedable.
+
+	// TrustGateEnabled is the master switch. OFF by default. When false the gate NEVER
+	// blocks validation (the effective K resolves to 0), but submission-time trust
+	// stamping and accrual still run — so an operator can turn the head on, let trust
+	// accumulate for a while, then enable enforcement without starting cold. Override via
+	// LETTUCE_HEAD_TRUST_GATE_ENABLED.
+	TrustGateEnabled bool `yaml:"trust_gate_enabled"`
+	// TrustMinCorroborators is the head-default K: the number of distinct trusted subjects
+	// an agreeing group must contain when the gate is on and a leaf does not override it
+	// (leaf.ValidationConfig.MinTrustedCorroborators). Unset (0) resolves to the default 1;
+	// effective value must be > 0. Override via LETTUCE_HEAD_TRUST_MIN_CORROBORATORS.
+	TrustMinCorroborators int `yaml:"trust_min_corroborators"`
+	// TrustFloor is the head-default trust floor W: the submission-time score at or above
+	// which a subject counts as trusted when a leaf does not override it
+	// (leaf.ValidationConfig.TrustFloor). Because accrual adds 1 per corroborated-clean
+	// unit, W is also the ramp LENGTH — a subject reaches quorum power after ~W
+	// corroborated-clean units (or an operator seed). Unset (0) resolves to the default 25;
+	// effective value must be > 0. Override via LETTUCE_HEAD_TRUST_FLOOR.
+	TrustFloor int `yaml:"trust_floor"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -259,6 +285,15 @@ const (
 	// volunteer's key-authorization record under. PENDING an operator decision;
 	// overridable until first production use (see HeadConfig.DIDBindingCollection).
 	defaultDIDBindingCollection = "tech.scios.lettuce.keyAuthorization"
+
+	// --- Account-level trust-gate defaults ---
+	// defaultTrustMinCorroborators is the head-default K when the gate is on and a leaf
+	// does not override it: require at least one trusted subject in the agreeing group.
+	defaultTrustMinCorroborators = 1
+	// defaultTrustFloor is the head-default trust floor W (also the accrual ramp length):
+	// a subject reaches quorum power after ~25 corroborated-clean units (or an operator
+	// seed to at least this score).
+	defaultTrustFloor = 25
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -425,6 +460,17 @@ func (h HeadConfig) Validate() error {
 		if u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("head.did_resolver_url must include scheme and host (e.g. https://plc.directory)")
 		}
+	}
+
+	// --- Account-level trust-gate validation ---
+	// K and the floor reject only NEGATIVE raw values; a raw 0 means "unset -> use the
+	// (positive) default", mirroring the DID and dispatch knobs, so a minimal config that
+	// omits them stays valid and their EFFECTIVE values are always > 0.
+	if h.TrustMinCorroborators < 0 {
+		return fmt.Errorf("head.trust_min_corroborators must be >= 0, got %d", h.TrustMinCorroborators)
+	}
+	if h.TrustFloor < 0 {
+		return fmt.Errorf("head.trust_floor must be >= 0, got %d", h.TrustFloor)
 	}
 	return nil
 }
@@ -701,6 +747,27 @@ func (h HeadConfig) EffectiveDIDBindingCollection() string {
 		return defaultDIDBindingCollection
 	}
 	return h.DIDBindingCollection
+}
+
+// EffectiveTrustMinCorroborators returns the head-default trust-gate K (distinct trusted
+// subjects required), default 1. Unset (<= 0) -> defaultTrustMinCorroborators. This is
+// the head default only; the resolved K is 0 when TrustGateEnabled is false, and a leaf
+// may override it via ValidationConfig.MinTrustedCorroborators.
+func (h HeadConfig) EffectiveTrustMinCorroborators() int {
+	if h.TrustMinCorroborators <= 0 {
+		return defaultTrustMinCorroborators
+	}
+	return h.TrustMinCorroborators
+}
+
+// EffectiveTrustFloor returns the head-default trust floor W (the score at or above which
+// a subject is trusted, and the accrual ramp length), default 25. Unset (<= 0) ->
+// defaultTrustFloor. A leaf may override it via ValidationConfig.TrustFloor.
+func (h HeadConfig) EffectiveTrustFloor() int {
+	if h.TrustFloor <= 0 {
+		return defaultTrustFloor
+	}
+	return h.TrustFloor
 }
 
 // StorageConfig defines local filesystem storage settings.
