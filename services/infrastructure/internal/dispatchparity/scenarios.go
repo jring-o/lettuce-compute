@@ -31,10 +31,11 @@
 // (workunit.AssignmentOptions, leaf.Leaf, DB rows).
 //
 // The predicate dimensions covered mirror the rule's structure exactly: redundancy
-// headroom, self-held-copy exclusion, already-contributed exclusion, the
-// post-failure cooldown ("benched"), the per-machine in-flight cap, homogeneous-
-// redundancy hardware-class matching, runtime/capability fit, and
-// feasibility-at-deadline — with boundary cases at each cap/limit edge.
+// headroom, self-held-copy exclusion, already-contributed exclusion, subject
+// (DID) distinctness, the post-failure cooldown ("benched"), the per-machine
+// in-flight cap, homogeneous-redundancy hardware-class matching,
+// runtime/capability fit, and feasibility-at-deadline — with boundary cases at
+// each cap/limit edge.
 package dispatchparity
 
 // Dimension names the single predicate axis a Scenario primarily exercises. It
@@ -48,11 +49,34 @@ const (
 	DimRedundancy        Dimension = "redundancy_headroom"
 	DimSelfLiveCopy      Dimension = "self_held_copy"
 	DimSelfPendingResult Dimension = "already_contributed"
+	DimSubjectDistinct   Dimension = "subject_distinctness"
 	DimCooldown          Dimension = "post_failure_cooldown"
 	DimInflightCap       Dimension = "per_machine_inflight_cap"
 	DimHRClass           Dimension = "hr_class_match"
 	DimCapability        Dimension = "runtime_capability"
 	DimFeasibility       Dimension = "deadline_feasibility"
+)
+
+// Binding-status values for the subject-distinctness dimension. They mirror the
+// volunteers.did_binding_status domain ('OK'/'STALE'/'REVOKED'; "" = unbound) as
+// plain strings so this package stays primitive-only. The subject rule they feed
+// is trust.SubjectForVolunteer — the account-level trust key from the trust
+// subsystem: a volunteer row maps to its bound DID while the binding is live
+// (OK, or STALE — re-verification failing suppresses quorum POWER elsewhere but
+// does not change WHO the row is), and to a per-row "vol:<uuid>" sentinel when
+// unbound or REVOKED (an explicitly severed binding reverts the row to keypair
+// identity). Two rows with the SAME live DID are ONE principal: handing each a
+// copy of one unit buys no extra corroboration (validation counts them as one
+// subject) — it only wastes compute — so dispatch distinctness excludes on
+// subject equality, not volunteer-id equality. Each parity projection MUST
+// derive subjects through the production rule (trust.SubjectForVolunteer on the
+// Go side; the shared SQL subject expression on the SQL side), never by
+// re-implementing it inline.
+const (
+	BindingNone    = ""        // no DID binding: subject = the per-row sentinel
+	BindingOK      = "OK"      // live binding: subject = the DID
+	BindingStale   = "STALE"   // still the same principal: subject = the DID
+	BindingRevoked = "REVOKED" // severed: subject = the per-row sentinel again
 )
 
 // CooldownState is the requester's most-recent CLOSED copy of the target unit — the
@@ -155,6 +179,30 @@ type Scenario struct {
 	// Cooldown: the requester's most-recent closed copy of the target unit.
 	Cooldown CooldownState
 
+	// --- Subject (DID) distinctness ------------------------------------------
+	// RequesterBinding is the requester row's DID-binding status: BindingNone
+	// (unbound) or BindingOK/BindingStale/BindingRevoked, in which case the
+	// requester's volunteer row carries the scenario's shared DID (each projection
+	// mints one DID string per scenario and reuses it for every same-DID row).
+	RequesterBinding string
+	// OtherSameDIDLiveCopy: a DIFFERENT volunteer row, carrying the SAME DID as
+	// the requester with binding status OtherBinding, holds a live copy of the
+	// target unit. Like OtherLiveCopies it consumes one unit of redundancy
+	// headroom, so with the baseline TargetCopies=2 headroom remains and any
+	// exclusion is attributable to the subject rule alone.
+	OtherSameDIDLiveCopy bool
+	// OtherSameDIDPendingResult: as above, but the same-DID row authored a
+	// PENDING result for the target unit instead of holding a live copy.
+	OtherSameDIDPendingResult bool
+	// OtherBinding is the same-DID other row's binding status (BindingOK /
+	// BindingStale / BindingRevoked). Meaningful only when OtherSameDIDLiveCopy
+	// or OtherSameDIDPendingResult is set.
+	OtherBinding string
+	// OtherDifferentDIDLiveCopy: a different volunteer row bound (BindingOK) to a
+	// DIFFERENT DID holds a live copy — the control proving that distinct bound
+	// principals remain mutually eligible.
+	OtherDifferentDIDLiveCopy bool
+
 	// --- Per-machine in-flight cap -------------------------------------------
 	// MaxInflight is AssignmentOptions.MaxInflightPerVolunteer (0 = unlimited).
 	MaxInflight int
@@ -237,7 +285,7 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 		return true
 	case GateFlushReservations:
 		switch s.Dimension {
-		case DimRedundancy, DimSelfLiveCopy, DimSelfPendingResult, DimCooldown, DimFeasibility, DimBaseline:
+		case DimRedundancy, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
 		default: // capability, hr_class, inflight_cap — delegated to the hand-out
 			return false
@@ -245,7 +293,7 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 	case GateReserveCopy:
 		switch s.Dimension {
 		// Note: redundancy is intentionally ABSENT — ReserveCopy does not re-check it.
-		case DimSelfLiveCopy, DimSelfPendingResult, DimCooldown, DimFeasibility, DimBaseline:
+		case DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
 		default:
 			return false
@@ -339,6 +387,67 @@ func Scenarios() []Scenario {
 			s.TargetCopies = 2
 			s.SelfPendingResult = true // already contributed a result
 			s.Eligible = false
+		}),
+
+		// --- subject (DID) distinctness ---------------------------------------
+		// Two volunteer rows sharing a live DID binding are ONE principal
+		// (trust.SubjectForVolunteer): the exclusions that keep a unit's redundant
+		// copies on distinct principals must fire on subject equality, not
+		// volunteer-id equality. All same-DID scenarios keep TargetCopies=2 with a
+		// single other contributor, so redundancy headroom remains and any
+		// refusal is the subject rule's.
+		with("subject_same_did_live_copy_excluded", DimSubjectDistinct, func(s *Scenario) {
+			s.RequesterBinding = BindingOK
+			s.OtherSameDIDLiveCopy = true // the requester's OTHER device holds a copy
+			s.OtherBinding = BindingOK
+			s.Eligible = false
+		}),
+		with("subject_same_did_pending_result_excluded", DimSubjectDistinct, func(s *Scenario) {
+			s.RequesterBinding = BindingOK
+			s.OtherSameDIDPendingResult = true // the other device already contributed
+			s.OtherBinding = BindingOK
+			s.Eligible = false
+		}),
+		with("subject_same_did_stale_other_still_excluded", DimSubjectDistinct, func(s *Scenario) {
+			// STALE suppresses quorum POWER, not identity: the row still maps to
+			// its DID, so the two devices are still one principal.
+			s.RequesterBinding = BindingOK
+			s.OtherSameDIDLiveCopy = true
+			s.OtherBinding = BindingStale
+			s.Eligible = false
+		}),
+		with("subject_requester_stale_still_excluded", DimSubjectDistinct, func(s *Scenario) {
+			s.RequesterBinding = BindingStale
+			s.OtherSameDIDLiveCopy = true
+			s.OtherBinding = BindingOK
+			s.Eligible = false
+		}),
+		with("subject_same_did_revoked_other_admitted", DimSubjectDistinct, func(s *Scenario) {
+			// REVOKED severs the binding: the other row reverts to its per-row
+			// keypair sentinel, so the two rows are distinct principals again.
+			s.RequesterBinding = BindingOK
+			s.OtherSameDIDLiveCopy = true
+			s.OtherBinding = BindingRevoked
+			s.Eligible = true
+		}),
+		with("subject_requester_revoked_admitted", DimSubjectDistinct, func(s *Scenario) {
+			s.RequesterBinding = BindingRevoked
+			s.OtherSameDIDLiveCopy = true
+			s.OtherBinding = BindingOK
+			s.Eligible = true
+		}),
+		with("subject_different_did_admitted", DimSubjectDistinct, func(s *Scenario) {
+			// Distinct bound principals stay mutually eligible.
+			s.RequesterBinding = BindingOK
+			s.OtherDifferentDIDLiveCopy = true
+			s.Eligible = true
+		}),
+		with("subject_bound_requester_vs_unbound_contributor_admitted", DimSubjectDistinct, func(s *Scenario) {
+			// A bound requester and an anonymous unbound contributor have
+			// different subjects (DID vs sentinel): eligible.
+			s.RequesterBinding = BindingOK
+			s.OtherLiveCopies = 1
+			s.Eligible = true
 		}),
 
 		// --- post-failure cooldown -------------------------------------------

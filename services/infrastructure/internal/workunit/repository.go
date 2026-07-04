@@ -29,8 +29,20 @@ type AssignmentOptions struct {
 	// volunteer reported no host (per-account fallback). It is stamped on the copy row
 	// for per-machine attribution; the per-machine in-flight cap is enforced on
 	// COALESCE(host_id, volunteer_id) so it equals this value (= VolunteerID when nil).
-	// Distinctness still keys on VolunteerID (the account), never on this.
+	// Distinctness keys on the trust SUBJECT (see TrustSubject), never on this.
 	HostID *types.ID
+	// TrustSubject is the requester's account-level trust subject
+	// (trust.SubjectForVolunteer): the bound DID while the binding is live (OK or
+	// STALE), else the per-keypair sentinel "vol:<volunteer-uuid>". Two volunteer
+	// rows sharing a live DID are ONE principal, so the dispatch distinctness
+	// exclusions (self-held copy, already-contributed) compare subjects, not
+	// volunteer ids. Consumed ONLY by the in-memory hot-path predicate
+	// (eligibleLocked); the SQL gates deliberately recompute the subject fresh from
+	// the volunteers table inside each statement — the DB is always current, while
+	// this snapshot can go stale across a mid-process bind/revoke (harmless: the SQL
+	// landing writes then refuse the copy and the hand-out is voided). Empty means
+	// "not resolved" — the predicate falls back to the sentinel of VolunteerID.
+	TrustSubject string
 	// BenchmarkFPOPS is the requesting host's measured CPU throughput (floating-point
 	// ops per second), reported at registration and stored in hardware_capabilities.
 	// It drives the feasibility-at-dispatch check: a unit whose estimated runtime

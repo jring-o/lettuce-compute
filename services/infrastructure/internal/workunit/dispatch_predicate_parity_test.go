@@ -119,6 +119,21 @@ func insertCooldownCopy(t *testing.T, pool *pgxpool.Pool, wuID, vol types.ID, ou
 	}
 }
 
+// setVolunteerDID binds a volunteer row to a DID with the given binding status via a
+// direct UPDATE (tests may write the DID columns directly). The trust subject is then
+// computed by the production SQL expression at query time, exactly as in production —
+// the seed never re-implements trust.SubjectForVolunteer. status must be one of the
+// did_binding_status domain values (OK / STALE / REVOKED).
+func setVolunteerDID(t *testing.T, pool *pgxpool.Pool, vol types.ID, did, status string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE volunteers
+		SET did = $2, did_binding_status = $3, did_bound_at = NOW(), did_binding_checked_at = NOW()
+		WHERE id = $1`, vol, did, status); err != nil {
+		t.Fatalf("set volunteer DID: %v", err)
+	}
+}
+
 // seedParity materializes one scenario into Postgres and returns the ids the gates
 // need. It is the SQL counterpart of the Go half's projectGo: the same abstract
 // scenario, rendered as rows.
@@ -178,6 +193,37 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 	case dispatchparity.CooldownExpiredStale:
 		// outcome_at older than the cooldown window (GREATEST(deadline,1) seconds).
 		insertCooldownCopy(t, pool, wu.ID, requester, "EXPIRED", true, s.DeadlineSeconds+120)
+	}
+
+	// Subject (DID) distinctness. Mint ONE DID per scenario and reuse it for the
+	// requester and every same-DID "other" row so their trust subjects coincide
+	// (trust.SubjectForVolunteer); a different-DID row gets its own DID. The subjects
+	// are derived by the production SQL expression at query time, never re-implemented here.
+	scenarioDID := "did:plc:parity" + uuid.New().String()[:12]
+	if s.RequesterBinding != "" {
+		setVolunteerDID(t, pool, requester, scenarioDID, s.RequesterBinding)
+	}
+	// A SECOND device bound to the SAME DID as the requester, holding a live copy or a
+	// PENDING result on the target unit. Like OtherLiveCopies / OtherPendingResults it
+	// consumes one unit of redundancy headroom, so with the baseline TargetCopies=2 any
+	// refusal is attributable to the subject rule alone.
+	if s.OtherSameDIDLiveCopy {
+		other := createTestVolunteer(t, pool)
+		setVolunteerDID(t, pool, other, scenarioDID, s.OtherBinding)
+		insertLiveCopy(t, pool, wu.ID, other, nil)
+	}
+	if s.OtherSameDIDPendingResult {
+		other := createTestVolunteer(t, pool)
+		setVolunteerDID(t, pool, other, scenarioDID, s.OtherBinding)
+		insertPendingResult(t, pool, wu.ID, other)
+	}
+	// Control: a distinct bound principal (a DIFFERENT DID) holding a live copy. Its
+	// subject differs from the requester's, so it must NOT exclude — proving the rule
+	// keys on subject equality, not merely on "some other bound row exists".
+	if s.OtherDifferentDIDLiveCopy {
+		other := createTestVolunteer(t, pool)
+		setVolunteerDID(t, pool, other, "did:plc:parityalt"+uuid.New().String()[:12], dispatchparity.BindingOK)
+		insertLiveCopy(t, pool, wu.ID, other, nil)
 	}
 
 	// Per-machine in-flight: live copies of OTHER units attributed to the requester's

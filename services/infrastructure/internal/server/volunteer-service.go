@@ -708,9 +708,10 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 	// and collapsing with "context deadline exceeded". The pre-cache fallback path
 	// keeps the per-request DB read.
 	var (
-		identPubKey  []byte
-		identHW      volunteer.HardwareCapabilities
-		identRuntime []string
+		identPubKey       []byte
+		identHW           volunteer.HardwareCapabilities
+		identRuntime      []string
+		identTrustSubject string
 	)
 	if s.dispatchCache != nil {
 		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
@@ -729,6 +730,7 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		identPubKey = ident.publicKey
 		identHW = ident.hardware
 		identRuntime = ident.availableRuntimes
+		identTrustSubject = ident.trustSubject
 	} else {
 		vol, gerr := s.volunteerRepo.GetByID(ctx, volunteerID)
 		if gerr != nil {
@@ -741,6 +743,9 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		identPubKey = vol.PublicKey
 		identHW = vol.HardwareCapabilities
 		identRuntime = vol.AvailableRuntimes
+		// Pre-cache fallback: resolve the trust subject straight off the fetched row via
+		// the production rule (the cache path reads it from the warmed identity snapshot).
+		identTrustSubject = trust.SubjectForVolunteer(vol)
 	}
 	if !bytes.Equal(identPubKey, authedKey) {
 		return nil, status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
@@ -831,6 +836,13 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		// volunteers.hardware_capabilities; a unit whose estimated runtime on this host
 		// exceeds its deadline is excluded (see FeasibleByDeadline).
 		BenchmarkFPOPS: identHW.BenchmarkFPOPS,
+		// Account-level trust subject (trust.SubjectForVolunteer): the requester's DID
+		// while its binding is live, else the per-keypair sentinel. Consumed ONLY by the
+		// in-memory dispatch predicate for per-PRINCIPAL distinctness (two devices under one
+		// live DID are one subject, so they never both take a copy of one unit); the SQL
+		// gates recompute the subject fresh, so a subject that went stale since the snapshot
+		// was warmed costs at most a voided hand-out.
+		TrustSubject: identTrustSubject,
 	}
 
 	// Server-directed retry delay: computed once from the current load and
