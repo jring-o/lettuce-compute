@@ -877,6 +877,47 @@ func TestValidateValidationConfig(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name:    "min_trusted_corroborators negative rejected",
+			modify:  func(c *ValidationConfig) { c.MinTrustedCorroborators = -1 },
+			wantErr: true,
+			errMsg:  "min_trusted_corroborators",
+		},
+		{
+			name:    "trust_floor negative rejected",
+			modify:  func(c *ValidationConfig) { c.TrustFloor = -5 },
+			wantErr: true,
+			errMsg:  "trust_floor",
+		},
+		{
+			name:    "min_trusted_corroborators zero inherits (accepted)",
+			modify:  func(c *ValidationConfig) { c.MinTrustedCorroborators = 0; c.TrustFloor = 0 },
+			wantErr: false,
+		},
+		{
+			name: "min_trusted_corroborators within quorum accepted",
+			// validConfig has RedundancyFactor 2 -> effective min_quorum 2.
+			modify:  func(c *ValidationConfig) { c.MinTrustedCorroborators = 2; c.TrustFloor = 25 },
+			wantErr: false,
+		},
+		{
+			name:    "min_trusted_corroborators above quorum rejected",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 2; c.MinTrustedCorroborators = 3 },
+			wantErr: true,
+			errMsg:  "min_trusted_corroborators",
+		},
+		{
+			name: "min_trusted_corroborators respects target/quorum split",
+			// target_copies 5 but min_quorum 2 -> K must be <= 2, so 3 is rejected.
+			modify: func(c *ValidationConfig) {
+				c.RedundancyFactor = 2
+				c.TargetCopies = 5
+				c.MinQuorum = 2
+				c.MinTrustedCorroborators = 3
+			},
+			wantErr: true,
+			errMsg:  "min_trusted_corroborators",
+		},
 	}
 
 	for _, tt := range tests {

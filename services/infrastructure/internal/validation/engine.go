@@ -17,6 +17,8 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -53,8 +55,15 @@ type Engine struct {
 	// result is a good outcome for the host that produced it, a DISAGREED result a bad one.
 	// May be nil (tests / pre-#54) -> the signal is simply not recorded (best-effort).
 	reliabilityRepo reliability.Repository
-	signer          *attestation.Signer
-	logger          *slog.Logger
+	// trustRepo accrues account-level trust for corroborated-clean work (see internal/trust):
+	// after a unit validates, each distinct agreed subject earns +1 IFF it was corroborated by
+	// a DISTINCT already-trusted subject. May be nil (tests / feature off) -> no accrual.
+	trustRepo trust.Repository
+	// trustPolicy resolves the effective trust floor (and gate K) per leaf. Its zero value is
+	// the gate off; the floor is still resolved so accrual works before enforcement is enabled.
+	trustPolicy transition.TrustPolicy
+	signer      *attestation.Signer
+	logger      *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.
@@ -70,6 +79,8 @@ func NewEngine(
 	reliabilityRepo reliability.Repository,
 	signer *attestation.Signer,
 	logger *slog.Logger,
+	trustRepo trust.Repository,
+	trustPolicy transition.TrustPolicy,
 ) *Engine {
 	return &Engine{
 		resultRepo:      resultRepo,
@@ -81,6 +92,8 @@ func NewEngine(
 		assignmentRepo:  assignmentRepo,
 		attestationRepo: attestationRepo,
 		reliabilityRepo: reliabilityRepo,
+		trustRepo:       trustRepo,
+		trustPolicy:     trustPolicy,
 		signer:          signer,
 		logger:          logger,
 	}
@@ -238,7 +251,7 @@ func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj 
 	if err != nil {
 		return nil, err
 	}
-	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, len(majorityGroup))
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup)
 }
 
 // compareExact is the read-only EXACT comparator: it returns the largest agreeing group of
@@ -293,7 +306,7 @@ func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.Work
 	if err != nil {
 		return nil, err
 	}
-	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, len(majorityGroup))
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup)
 }
 
 // compareNumericTolerance is the read-only NUMERIC_TOLERANCE comparator: it returns the
@@ -350,28 +363,40 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 }
 
 // applyThreshold applies the agreement gates and performs the validation outcome.
-func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, majorityCount int) (*ValidationResult, error) {
-	total := len(pending)
+//
+// This is the LEGACY path (TryValidate), retained for tests only — every production submit
+// routes through internal/transition. It is deliberately kept in lockstep with transition.Decide
+// (per the PR #80 discipline): it builds the SAME subject-level verdict and applies the SAME
+// four gates the production decider does, so the two can never disagree about what validates.
+func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result) (*ValidationResult, error) {
 	threshold := proj.ValidationConfig.AgreementThreshold
-	ratio := float64(majorityCount) / float64(total)
 
-	// A unit VALIDATES only if all three gates hold, mirroring transition.Decide (the
-	// production decider) so the two paths never disagree:
-	//   (1) ratio >= threshold          — the configured agreement fraction, and
-	//   (2) majorityCount >= min_quorum  — the agreeing group is itself quorum-sized (the
-	//                                      floor is on the WINNERS, not just an attempt gate),
-	//   (3) 2*majorityCount > total      — the agreeing group is a STRICT majority of the
-	//                                      compared set, so no config can validate a minority
-	//                                      or plurality.
 	// min_quorum resolves as in transition.ResolvePolicy (spot-check forces a 2-of-2
-	// corroboration). A tie leaves majorityCount == 0, which fails (2) and (3), so an
-	// ambiguous largest group can never validate.
+	// corroboration); the trust gate K and floor resolve as in transition.ResolvePolicyWithTrust.
 	quorum := proj.ValidationConfig.EffectiveMinQuorum()
 	if wu.SpotCheck {
 		quorum = 2
 	}
+	k, floor := e.trustPolicy.ResolveTrust(proj.ValidationConfig, quorum)
 
-	if majorityCount >= quorum && 2*majorityCount > total && ratio >= threshold {
+	// Build the verdict in DISTINCT SUBJECTS (copies from one principal corroborate as one; a
+	// self-contradicting principal corroborates as none) so this legacy path counts exactly as
+	// the transitioner does. Behavior-preserving for the existing tests, whose results are all
+	// unstamped with distinct volunteers (subject counts == result counts) under a zero-value
+	// TrustPolicy (K == 0, so the trust gate is a vacuous auto-pass).
+	v := transition.BuildComparisonVerdict(pending, majorityGroup, floor)
+
+	// A unit VALIDATES only if all FOUR gates hold, mirroring transition.Decide:
+	//   (1) v.Ratio >= threshold                      — the configured agreement fraction, and
+	//   (2) v.MajorityCount >= quorum                 — the agreeing group is itself quorum-sized
+	//                                                   (the floor is on the WINNERS), and
+	//   (3) 2*v.MajorityCount > v.Total               — a STRICT majority of the compared set, so
+	//                                                   no config validates a minority/plurality, and
+	//   (4) v.TrustedMajorityCount >= k               — enough DISTINCT, TRUSTED subjects (0 when
+	//                                                   the gate is off: a vacuous auto-pass).
+	// A tie leaves MajorityCount == 0, which fails (2) and (3), so an ambiguous largest group
+	// can never validate.
+	if v.MajorityCount >= quorum && 2*v.MajorityCount > v.Total && v.Ratio >= threshold && v.TrustedMajorityCount >= k {
 		return e.acceptResults(ctx, wu, proj, pending, majorityGroup)
 	}
 
@@ -388,8 +413,9 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 		// silent).
 		e.logger.Debug("validation pending: threshold unmet, assignments active",
 			"work_unit_id", wu.ID,
-			"majority", majorityCount,
-			"total", total,
+			"majority", v.MajorityCount,
+			"total", v.Total,
+			"trusted_majority", v.TrustedMajorityCount,
 			"threshold", threshold,
 			"active", activeCount)
 		return &ValidationResult{
@@ -496,6 +522,11 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	// (shrinks it). Best-effort, after credit is already granted (never fails validation).
 	e.recordReliability(ctx, agreedResults, true)
 	e.recordReliability(ctx, rejectedResults, false)
+
+	// Account-level trust accrual (see internal/trust): reward the DISTINCT subjects behind a
+	// corroborated-clean unit, but ONLY when the agreement was witnessed by an already-trusted
+	// subject. Best-effort, after credit is already granted (never fails validation); nil-safe.
+	e.accrueTrust(ctx, proj, wu, agreedResults)
 
 	// H-2: a successful VALIDATED + credit-grant was previously silent — restore the
 	// per-WU "this validated" signal now that the generic access log is demoted.
@@ -660,6 +691,67 @@ func (e *Engine) recordReliability(ctx context.Context, results []*result.Result
 		if err := e.reliabilityRepo.RecordOutcome(ctx, hostKey, good); err != nil {
 			e.logger.Warn("failed to record host reliability signal",
 				"host_id", hostKey, "good", good, "result_id", r.ID, "error", err)
+		}
+	}
+}
+
+// accrueTrust credits account-level trust for a corroborated-clean unit (see internal/trust).
+// It collapses the agreed results to DISTINCT subjects (two devices under one identity are
+// ONE principal, accruing at most once per unit) and awards +1 to a subject ONLY when a
+// DIFFERENT agreed subject was already trusted (its submission-time score met the floor).
+//
+// The floor is resolved even when the gate is DISABLED: trust must accumulate before
+// enforcement is switched on, so accrual can recognize which subjects are trusted. ResolveTrust
+// returns K == 0 when the gate is off but still returns the real floor.
+//
+// The "witnessed by a trusted subject" rule is the Sybil rationale: agreement purely among
+// untrusted newcomers earns credit but ZERO trust, so a Sybil farm cannot bootstrap itself by
+// cross-validating its own answers — trust only ever spreads outward from a subject the
+// operator seeded via the admin API. It is asymmetric: an untrusted subject corroborated by a
+// trusted one accrues, but that lone trusted subject does NOT accrue off untrusted peers (it
+// has no OTHER trusted witness), so a single trusted account cannot mint trust for a second
+// identity it also controls. Best-effort and nil-safe: a nil store or a write error is logged
+// and skipped, never failing validation.
+func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.WorkUnit, agreedResults []*result.Result) {
+	if e.trustRepo == nil {
+		return
+	}
+	quorum := proj.ValidationConfig.EffectiveMinQuorum()
+	if wu.SpotCheck {
+		quorum = 2
+	}
+	_, floor := e.trustPolicy.ResolveTrust(proj.ValidationConfig, quorum)
+
+	// Collapse to distinct subjects, keeping each subject's max submission-time score (equal
+	// per subject in practice; max is defensive). Reuses the transitioner's subject/score
+	// fallbacks so accrual and the acceptance verdict apply identical rules.
+	subjectScore := make(map[string]int)
+	for _, r := range agreedResults {
+		subj := transition.SubjectForResult(r)
+		sc := transition.ScoreForResult(r)
+		if cur, ok := subjectScore[subj]; !ok || sc > cur {
+			subjectScore[subj] = sc
+		}
+	}
+
+	trustedCount := 0
+	for _, sc := range subjectScore {
+		if sc >= floor {
+			trustedCount++
+		}
+	}
+
+	for subj, sc := range subjectScore {
+		trustedOthers := trustedCount
+		if sc >= floor {
+			trustedOthers-- // a trusted subject cannot corroborate itself
+		}
+		if trustedOthers < 1 {
+			continue
+		}
+		if err := e.trustRepo.AccrueCleanUnit(ctx, subj); err != nil {
+			e.logger.Warn("failed to accrue trust for agreed subject",
+				"subject", subj, "work_unit_id", wu.ID, "error", err)
 		}
 	}
 }

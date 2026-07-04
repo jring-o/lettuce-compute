@@ -541,6 +541,27 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			validationDetail{Field: "agreement_threshold", Reason: "not_strict_majority"})
 	}
 
+	// Trust gate per-leaf overrides (see internal/trust). Both are optional (0 = inherit
+	// the head default) and must be non-negative. A required distinct-trusted-corroborator
+	// count above the effective quorum size would defeat validate-at-quorum: a quorum-sized
+	// agreeing group contains at most min_quorum distinct subjects, so the unit could not
+	// validate until extra copies arrived — and never when target equals quorum. The policy
+	// resolution also clamps to min_quorum at runtime; rejecting the config here keeps the
+	// stored value honest rather than silently clamped.
+	if c.MinTrustedCorroborators < 0 {
+		return apierror.ValidationError("min_trusted_corroborators must be >= 0",
+			validationDetail{Field: "min_trusted_corroborators", Reason: "out_of_range"})
+	}
+	if c.TrustFloor < 0 {
+		return apierror.ValidationError("trust_floor must be >= 0",
+			validationDetail{Field: "trust_floor", Reason: "out_of_range"})
+	}
+	if c.MinTrustedCorroborators > 0 && c.MinTrustedCorroborators > c.EffectiveMinQuorum() {
+		return apierror.ValidationError(
+			"min_trusted_corroborators must be <= min_quorum (a quorum cannot contain more distinct trusted subjects than its size)",
+			validationDetail{Field: "min_trusted_corroborators", Reason: "exceeds_quorum"})
+	}
+
 	// Comparison mode. CUSTOM is a recognized mode but has no runtime comparator (the engine
 	// errors on it and the unit would park forever), so it is rejected here until implemented.
 	switch c.ComparisonMode {

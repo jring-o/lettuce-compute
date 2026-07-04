@@ -1,0 +1,74 @@
+package server
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/lettuce-compute/infrastructure/internal/config"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
+	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/volunteer"
+)
+
+// TrustPolicyFromHeadConfig builds the head trust-gate policy (see internal/trust) from the
+// head configuration. The process wiring (main.go) and the HTTP router both derive the policy
+// from this one function, so the gRPC submit path, the browser submit path, the transitioner,
+// and the validation engine all enforce identical numbers. A nil config yields the zero value
+// (gate off).
+func TrustPolicyFromHeadConfig(hc *config.HeadConfig) transition.TrustPolicy {
+	if hc == nil {
+		return transition.TrustPolicy{}
+	}
+	return transition.TrustPolicy{
+		GateEnabled:             hc.TrustGateEnabled,
+		DefaultMinCorroborators: hc.EffectiveTrustMinCorroborators(),
+		DefaultFloor:            hc.EffectiveTrustFloor(),
+	}
+}
+
+// trustRepoFromPool returns a pgx-backed trust repository, or a genuine nil interface when
+// the pool is nil (the gRPC-plumbing / mux-only tests), so stampTrustSnapshot's nil check
+// works. It centralizes the "nil pool -> nil repo" idiom the submit paths share.
+func trustRepoFromPool(pool *pgxpool.Pool) trust.Repository {
+	if pool == nil {
+		return nil
+	}
+	return trust.NewPgxRepository(pool)
+}
+
+// stampTrustSnapshot resolves the account-level trust subject and submission-time score to
+// record on a result (see internal/trust). It is shared by both live submit paths (the gRPC
+// SubmitResult and the browser/WASM handler) so they stamp identically.
+//
+// The policy is fail-OPEN on work, fail-CLOSED on power:
+//   - vol == nil (its row could not be loaded): the submission still succeeds — subject falls
+//     back to the per-keypair sentinel and score is 0. Trust plumbing must never block valid
+//     work.
+//   - the volunteer's quorum power is suppressed (a STALE DID binding the head can no longer
+//     re-verify, or an active post-rotation freeze): the subject is kept, but the score is
+//     forced to 0, so a suppressed principal contributes a copy but no trusted-corroborator
+//     power (QuorumPowerSuppressed owns this decision).
+//   - trustRepo == nil, or GetScore errors: score is 0 (a WARN is logged on error).
+//
+// Stamping is UNCONDITIONAL of whether the gate is enabled: snapshots must accumulate before
+// the gate is ever switched on, so acceptance has a submission-time score to read.
+func stampTrustSnapshot(ctx context.Context, trustRepo trust.Repository, vol *volunteer.Volunteer, volunteerID types.ID, now time.Time, logger *slog.Logger) (subject string, score int) {
+	if vol == nil {
+		return trust.SubjectForVolunteerID(volunteerID), 0
+	}
+	subject = trust.SubjectForVolunteer(vol)
+	if trustRepo == nil || trust.QuorumPowerSuppressed(vol, now) {
+		return subject, 0
+	}
+	s, err := trustRepo.GetScore(ctx, subject)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("failed to read trust score at submit; stamping score 0", "subject", subject, "error", err)
+		}
+		return subject, 0
+	}
+	return subject, s
+}

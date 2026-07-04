@@ -36,6 +36,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -159,16 +160,29 @@ func main() {
 	}
 	checkpointRepo := checkpoint.NewPgxRepository(pool, checkpointDir)
 
+	// Account-level trust (see internal/trust): ONE store + ONE resolved head policy threaded
+	// into the validation engine (accrual), the transitioner + submit paths (the acceptance
+	// gate), and the volunteer service (submit-time score stamping). The gate is off by default;
+	// stamping and accrual are always active so trust accumulates before enforcement is enabled.
+	trustRepo := trust.NewPgxRepository(pool)
+	trustPolicy := server.TrustPolicyFromHeadConfig(&cfg.Head)
+	if trustPolicy.GateEnabled {
+		slog.Info("volunteer trust gate enabled",
+			"min_trusted_corroborators", trustPolicy.DefaultMinCorroborators,
+			"trust_floor", trustPolicy.DefaultFloor)
+	}
+
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy)
 
 	// The single transitioner (TODO #50): the sole decider of work-unit redundancy state.
 	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
 	// dead-letter" decision to it. The validation engine is its comparator + accept/reject
-	// implementation; the per-unit lock is the cross-replica Postgres advisory lock.
+	// implementation; the per-unit lock is the cross-replica Postgres advisory lock. The head
+	// trust gate is overlaid onto each leaf's policy here.
 	transitioner := transition.NewTransitioner(
 		transition.NewPgxLocker(pool, logger),
-		wuRepo, leafRepo, resultRepo, validationEngine, logger)
+		wuRepo, leafRepo, resultRepo, validationEngine, trustPolicy, logger)
 
 	// Parse trusted reverse-proxy networks for trust-aware client-IP extraction.
 	// (Config validation already verified these parse; this cannot fail here.)
@@ -263,7 +277,7 @@ func main() {
 	grpcServer, grpcRateLimitCleanup := server.NewGRPCServer(tlsCfg, logger, trustedProxies)
 	defer grpcRateLimitCleanup()
 
-	volunteerSvc := server.NewVolunteerService(pool, version, startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
+	volunteerSvc := server.NewVolunteerService(pool, version, startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, trustPolicy)
 	weights := make(map[string]int32, len(cfg.Head.DefaultLeafWeights))
 	for k, v := range cfg.Head.DefaultLeafWeights {
 		weights[k] = int32(v)

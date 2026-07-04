@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -35,6 +36,11 @@ type browserVolunteerDeps struct {
 	resultRepo       result.Repository
 	batchRepo        workunit.BatchRepository
 	validationEngine *validation.Engine
+	// trustRepo snapshots the submitting subject's account-level trust score onto each result
+	// at submit time (see internal/trust). May be nil (tests / no pool); stamping is nil-safe.
+	trustRepo trust.Repository
+	// now supplies the current time for trust power-suppression checks (overridable in tests).
+	now func() time.Time
 	// transitioner is the SINGLE owner of the work-unit redundancy decision (TODO #50/#66):
 	// the browser/WASM submit path routes through it (validate / reject / wait / dead-letter /
 	// supersede) exactly like the gRPC SubmitResult path, instead of writing COMPLETED via raw
@@ -590,6 +596,15 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			outputData = json.RawMessage(outputRaw)
 		}
 
+		// Stamp the account-level trust snapshot (see internal/trust). vol was loaded above, so
+		// no extra read; a suppressed/absent principal is stamped score 0 (fail-closed on power),
+		// but stamping never blocks the submission (fail-open on work).
+		now := time.Now
+		if deps.now != nil {
+			now = deps.now
+		}
+		trustSubject, trustScore := stampTrustSnapshot(r.Context(), deps.trustRepo, vol, vol.ID, now(), deps.logger)
+
 		res := &result.Result{
 			WorkUnitID:     workUnitID,
 			VolunteerID:    vol.ID,
@@ -601,6 +616,10 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 				PeakMemoryMB:     req.Metrics.PeakMemoryMB,
 			},
 			ValidationStatus: result.ValidationPending,
+			// Account-level trust snapshot (see internal/trust): acceptance reads the
+			// submission-time subject + score, not a later re-read.
+			TrustSubject:       &trustSubject,
+			TrustScoreAtSubmit: &trustScore,
 		}
 
 		if err := txResultRepo.Create(r.Context(), res); err != nil {
@@ -697,10 +716,13 @@ func RegisterBrowserVolunteerRoutes(mux *http.ServeMux, pool *pgxpool.Pool, volu
 		resultRepo:       resultRepo,
 		batchRepo:        batchRepo,
 		validationEngine: validationEngine,
+		// Trust snapshot store for submit-time stamping (see internal/trust); nil-safe.
+		trustRepo: trustRepoFromPool(pool),
+		now:       time.Now,
 		// Build the same single transitioner the gRPC volunteer service uses so the browser/WASM
-		// submit path routes its redundancy decision through it (TODO #66). Built from the params
-		// already passed here, so this signature is unchanged.
-		transitioner:            newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, logger),
+		// submit path routes its redundancy decision through it (TODO #66). This helper is used by
+		// E2E tests only, so the trust gate is left at its zero (off) default here.
+		transitioner:            newTransitioner(pool, wuRepo, leafRepo, resultRepo, validationEngine, transition.TrustPolicy{}, logger),
 		logger:                  logger,
 		maxInflightPerVolunteer: maxInflight,
 	}

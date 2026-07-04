@@ -31,6 +31,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -165,6 +166,20 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		return requireAuth(requireLeafOwnership(h, leafRepo))
 	}
 
+	// Helper: requireAuth, then inject the authenticated caller's admin status for the
+	// trust admin handlers to enforce. The trust package cannot import the server package
+	// (import cycle) to read UserFromContext, so — mirroring how leafViewer injects
+	// leaf.Viewer — the router passes the admin fact in via trust.WithCaller and the
+	// handler's requireAdmin does the operator-only 403. requireAuth still runs first so
+	// an anonymous request is 401 before any trust logic.
+	authAdmin := func(h http.HandlerFunc) http.HandlerFunc {
+		return requireAuth(func(w http.ResponseWriter, r *http.Request) {
+			u := UserFromContext(r.Context())
+			ctx := trust.WithCaller(r.Context(), trust.Caller{IsAdmin: u != nil && u.Role == "ADMIN"})
+			h(w, r.WithContext(ctx))
+		})
+	}
+
 	// Detailed health (auth required — exposes uptime + DB status).
 	mux.HandleFunc("GET /api/v1/health/detailed", authOnly(HealthDetailedHandler(deps.Pool, deps.StartTime)))
 
@@ -207,6 +222,18 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("GET /api/v1/credit/analysis/cross-leaf", authOnly(analysisHandler.HandleCrossLeaf))
 	mux.HandleFunc("GET /api/v1/credit/analysis/{leaf_id}", authOnly(analysisHandler.HandleLeafAnalysis))
 
+	// Trust administration (operator-only — admin API key). Seed, slash, read, and list
+	// the account-level trust scores that gate quorum power in validation (see
+	// internal/trust). SetScore is the operator's trust bootstrap: accrual only credits a
+	// subject corroborated by an already-trusted subject, which is circular until the
+	// operator seeds the first trusted subjects here.
+	trustRepo := trust.NewPgxRepository(deps.Pool)
+	trustHandler := trust.NewHandler(trustRepo, deps.Logger)
+	mux.HandleFunc("POST /api/v1/admin/trust", authAdmin(trustHandler.HandleSet))
+	mux.HandleFunc("POST /api/v1/admin/trust/slash", authAdmin(trustHandler.HandleSlash))
+	mux.HandleFunc("GET /api/v1/admin/trust/{subject}", authAdmin(trustHandler.HandleGet))
+	mux.HandleFunc("GET /api/v1/admin/trust", authAdmin(trustHandler.HandleList))
+
 	// --- Deprecated /api/v1/projects aliases (removed in v0.10) ---
 	// Same handlers, same responses — allows existing clients to migrate gradually.
 	mux.HandleFunc("GET /api/v1/projects/{leaf_id}", leafViewer(leafHandler.HandleGetDeprecated))
@@ -240,6 +267,11 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		}
 	}
 
+	// Head trust-gate policy (see internal/trust), shared by the browser submit path's
+	// transitioner and its submit-time stamping. Reuses the trustRepo built above for the
+	// admin handler so the router holds a single trust store instance.
+	browserTrustPolicy := TrustPolicyFromHeadConfig(deps.HeadConfig)
+
 	bvDeps := &browserVolunteerDeps{
 		pool:             deps.Pool,
 		volunteerRepo:    volunteerRepo,
@@ -249,10 +281,12 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		resultRepo:       resultRepo,
 		batchRepo:        batchRepo,
 		validationEngine: deps.ValidationEngine,
+		trustRepo:        trustRepo,
+		now:              time.Now,
 		// Route the browser/WASM submit path through the same single transitioner the gRPC
 		// volunteer service uses (TODO #66) so it no longer bypasses it with a raw COMPLETED
-		// write + legacy TryValidate.
-		transitioner:            newTransitioner(deps.Pool, wuRepo, leafRepo, resultRepo, deps.ValidationEngine, deps.Logger),
+		// write + legacy TryValidate. The head trust gate is overlaid identically to the gRPC path.
+		transitioner:            newTransitioner(deps.Pool, wuRepo, leafRepo, resultRepo, deps.ValidationEngine, browserTrustPolicy, deps.Logger),
 		logger:                  deps.Logger,
 		headName:                headName,
 		defaultWeights:          defaultWeights,

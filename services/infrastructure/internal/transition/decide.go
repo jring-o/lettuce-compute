@@ -40,20 +40,42 @@ func (a Action) String() string {
 }
 
 // ComparisonVerdict is the result of the (read-only) comparator over a unit's PENDING
-// results: the largest agreeing group and the agreement ratio. The transitioner computes it
-// from the validation engine when a snapshot has at least MinQuorum pending results; Decide
-// treats a nil verdict as "no agreement attempt is possible yet".
+// results, expressed in DISTINCT SUBJECTS rather than raw results. A subject is the
+// account-level trust key stamped on each result (a bound volunteer's DID, else the
+// per-keypair "vol:<uuid>" sentinel; see internal/trust): every result is attributed to
+// exactly one subject, and two devices bound to one identity are ONE subject. Counting
+// subjects — not results — is what makes validation Sybil-resistant: N copies from one
+// principal corroborate as one, and a principal that contradicts itself corroborates as
+// none. The transitioner computes the verdict via BuildComparisonVerdict when a snapshot
+// has at least MinQuorum pending results; Decide treats a nil verdict as "no agreement
+// attempt is possible yet".
 //
-// MajorityCount and Total are the integer agreeing-group size and compared-pending-set size.
-// Decide gates on them directly (agreeing-group floor and strict-majority checks) rather than
-// only on the derived Ratio, so those checks are exact. A tie or otherwise-ambiguous
-// comparison is reported as MajorityCount == 0 (no unique majority), which can never validate.
+// The three count/ratio fields are all in subject units:
+//
+//   - Total is the number of DISTINCT subjects across the compared pending set.
+//   - MajorityCount is the number of distinct COHERENT AGREEING subjects: a subject whose
+//     every result in the pending set falls in the comparator's majority (result-level)
+//     group. A subject with results on both sides of the split contributes to Total but
+//     NEVER to MajorityCount — incoherent testimony corroborates nothing. A tie or
+//     otherwise-ambiguous comparison yields an empty majority group and thus
+//     MajorityCount == 0, which can never validate.
+//   - TrustedMajorityCount is the subset of those coherent agreeing subjects whose
+//     submission-time snapshot score is at or above the resolved trust floor. This is the
+//     number Decide's trust gate compares against MinTrustedCorroborators; it is always
+//     <= MajorityCount.
+//   - Ratio is MajorityCount/Total (0 when Total is 0), the subject-level agreement
+//     fraction the configured AgreementThreshold is checked against.
+//
+// Decide gates on the integer counts directly (agreeing-group floor, strict majority, and
+// the trusted-corroborator gate) rather than only on the derived Ratio, so those checks are
+// exact.
 type ComparisonVerdict struct {
-	MajorityCount      int
-	Total              int
-	Ratio              float64
-	AgreedResultIDs    []types.ID
-	DisagreedResultIDs []types.ID
+	MajorityCount        int
+	Total                int
+	Ratio                float64
+	TrustedMajorityCount int
+	AgreedResultIDs      []types.ID
+	DisagreedResultIDs   []types.ID
 }
 
 // UnitSnapshot is the immutable, side-effect-free view Decide operates on. Every field is a
@@ -159,9 +181,10 @@ func Decide(s UnitSnapshot) Decision {
 	// 1. Quorum agreement — validate as soon as a quorum's worth of results is in and they
 	//    agree, WITHOUT waiting for the remaining target copies (the validate-at-quorum win).
 	//    The caller computes Comparison iff PendingCount >= MinQuorum, so a non-nil verdict
-	//    already means the quorum-many results are present. Three independent gates must all
-	//    hold; any failure flows to §2's wait-or-reject path (never an instant reject), exactly
-	//    like "no agreement yet":
+	//    already means the quorum-many results are present. All counts are DISTINCT SUBJECTS,
+	//    not raw results (see ComparisonVerdict): copies from one principal corroborate as
+	//    one. FOUR independent gates must all hold; any failure flows to §2's wait-or-reject
+	//    path (never an instant reject), exactly like "no agreement yet":
 	//      (a) Ratio >= threshold          — the configured agreement fraction, and
 	//      (b) MajorityCount >= MinQuorum   — the agreeing group is itself quorum-sized, so
 	//                                         min_quorum is a floor on the WINNERS, not merely
@@ -169,13 +192,28 @@ func Decide(s UnitSnapshot) Decision {
 	//      (c) 2*MajorityCount > Total      — the agreeing group is a STRICT majority of the
 	//                                         compared pending set, so no config (e.g. a
 	//                                         threshold <= 0.5 legacy row) can validate a
-	//                                         minority or a plurality.
+	//                                         minority or a plurality, and
+	//      (d) TrustedMajorityCount >= MinTrustedCorroborators — the agreeing group contains
+	//                                         enough DISTINCT, TRUSTED subjects (see
+	//                                         internal/trust). This is the account-level Sybil
+	//                                         gate: enough copies is not enough; enough copies
+	//                                         from enough trusted principals is. MinTrusted-
+	//                                         Corroborators is 0 whenever the head trust gate
+	//                                         is disabled, so (d) is a vacuous auto-pass and
+	//                                         behavior is byte-for-byte the pre-trust rule.
 	//    A tie or non-finite comparison yields a zero-size agreeing group (MajorityCount == 0),
 	//    which fails (b) and (c) and so never validates.
+	//
+	//    Crucially, when (a)-(c) hold but (d) fails — the results agree but too few trusted
+	//    principals stand behind them — the unit does NOT reject. It flows into §2 exactly
+	//    like "threshold unmet": more copies may bring a trusted corroborator, so it waits
+	//    while any can still arrive and only rejects the round when none can. Blocked-by-trust
+	//    is a "need more (trusted) corroboration" state, never a disagreement.
 	if v := s.Comparison; v != nil &&
 		v.Ratio >= p.AgreementThreshold &&
 		v.MajorityCount >= p.MinQuorum &&
-		2*v.MajorityCount > v.Total {
+		2*v.MajorityCount > v.Total &&
+		v.TrustedMajorityCount >= p.MinTrustedCorroborators {
 		return Decision{Action: ActionValidate, CompleteFirst: true, Reason: "quorum agreement"}
 	}
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
@@ -34,7 +35,7 @@ func TestSpotCheck_WaitsForTwoResults(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, nil, nil, nil, nil, nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, nil, nil, nil, nil, nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	// With only 1 result and effective redundancy=2, should return nil.
 	vr, err := engine.TryValidate(context.Background(), wuID)
@@ -81,7 +82,7 @@ func TestSpotCheck_BothAgree_BothGetCredit(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -146,7 +147,7 @@ func TestSpotCheck_Disagree_BothRejected(t *testing.T) {
 	assignRepo := newMockAssignmentRepo()
 	// No active assignments = all done.
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -201,7 +202,7 @@ func TestSpotCheck_NonSpotCheckWU_UsesRedundancyFactor(t *testing.T) {
 
 	assignRepo := newMockAssignmentRepo()
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	// With redundancy=1 and 1 result, should validate immediately.
 	vr, err := engine.TryValidate(context.Background(), wuID)
@@ -252,7 +253,7 @@ func TestSpotCheck_DisagreeWithActiveAssignment_Pending(t *testing.T) {
 	// One active assignment still in progress — should return PENDING.
 	assignRepo.activeCount[wuID] = 1
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volRepo, assignRepo, nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {

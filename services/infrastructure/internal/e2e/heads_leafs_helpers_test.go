@@ -31,6 +31,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -114,7 +115,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	attestationRepo := attestation.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
 
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger)
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
 
 	// Head configuration.
 	headCfg := &config.HeadConfig{
@@ -199,7 +200,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	// gRPC server with checkpoint support.
 	grpcServer, grpcCleanup := server.NewGRPCServer(nil, logger, nil)
 	defer grpcCleanup()
-	volunteerSvc := server.NewVolunteerService(pool, "0.9.0.1-heads-leafs", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger)
+	volunteerSvc := server.NewVolunteerService(pool, "0.9.0.1-heads-leafs", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, transition.TrustPolicy{})
 	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10, dispatchCfg)
 
 	// Optionally start the Layer-2 in-process dispatch cache so RequestWorkUnit serves

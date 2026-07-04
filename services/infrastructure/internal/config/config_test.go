@@ -61,6 +61,8 @@ func clearLettuceEnv(t *testing.T) {
 		"LETTUCE_HEAD_DID_RECHECK_TTL_SECONDS", "LETTUCE_HEAD_DID_RECHECK_INTERVAL_SECONDS",
 		"LETTUCE_HEAD_DID_STALE_AFTER_FAILURES", "LETTUCE_HEAD_DID_ROTATION_FREEZE_HOURS",
 		"LETTUCE_HEAD_DID_BINDING_COLLECTION",
+		"LETTUCE_HEAD_TRUST_GATE_ENABLED", "LETTUCE_HEAD_TRUST_MIN_CORROBORATORS",
+		"LETTUCE_HEAD_TRUST_FLOOR",
 	}
 	for _, e := range envVars {
 		if orig, ok := os.LookupEnv(e); ok {
@@ -1191,6 +1193,135 @@ func TestDIDBindingEnvOverrideInvalidBool(t *testing.T) {
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for non-boolean LETTUCE_HEAD_DID_BINDING_ENABLED, got nil")
 	}
+}
+
+// TestTrustGateDefaults verifies the trust-gate defaults on a zero-valued HeadConfig:
+// the gate is off, and the Effective accessors return the documented head defaults
+// (K=1, floor/W=25).
+func TestTrustGateDefaults(t *testing.T) {
+	h := HeadConfig{}
+	if h.TrustGateEnabled {
+		t.Error("TrustGateEnabled should default to false")
+	}
+	if got := h.EffectiveTrustMinCorroborators(); got != 1 {
+		t.Errorf("EffectiveTrustMinCorroborators() = %d, want 1", got)
+	}
+	if got := h.EffectiveTrustFloor(); got != 25 {
+		t.Errorf("EffectiveTrustFloor() = %d, want 25", got)
+	}
+
+	h2 := HeadConfig{TrustMinCorroborators: 3, TrustFloor: 50}
+	if got := h2.EffectiveTrustMinCorroborators(); got != 3 {
+		t.Errorf("EffectiveTrustMinCorroborators() = %d, want 3 (verbatim)", got)
+	}
+	if got := h2.EffectiveTrustFloor(); got != 50 {
+		t.Errorf("EffectiveTrustFloor() = %d, want 50 (verbatim)", got)
+	}
+}
+
+// TestTrustGateValidate covers the trust knob Validate rules: K and the floor reject
+// negatives (raw 0 is the unset->default sentinel and must pass).
+func TestTrustGateValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "trust knobs unset ok",
+			cfg:     HeadConfig{Name: "x"},
+			wantErr: false,
+		},
+		{
+			name:    "valid explicit trust knobs",
+			cfg:     HeadConfig{Name: "x", TrustGateEnabled: true, TrustMinCorroborators: 2, TrustFloor: 10},
+			wantErr: false,
+		},
+		{
+			name:    "negative min_corroborators rejected",
+			cfg:     HeadConfig{Name: "x", TrustMinCorroborators: -1},
+			wantErr: true,
+			errMsg:  "trust_min_corroborators must be >= 0",
+		},
+		{
+			name:    "negative trust_floor rejected",
+			cfg:     HeadConfig{Name: "x", TrustFloor: -1},
+			wantErr: true,
+			errMsg:  "trust_floor must be >= 0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestTrustGateEnvOverrides threads the trust env knobs through Load.
+func TestTrustGateEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_TRUST_GATE_ENABLED", "true")
+	t.Setenv("LETTUCE_HEAD_TRUST_MIN_CORROBORATORS", "2")
+	t.Setenv("LETTUCE_HEAD_TRUST_FLOOR", "40")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Head.TrustGateEnabled {
+		t.Error("TrustGateEnabled = false, want true")
+	}
+	if cfg.Head.TrustMinCorroborators != 2 {
+		t.Errorf("TrustMinCorroborators = %d, want 2", cfg.Head.TrustMinCorroborators)
+	}
+	if cfg.Head.TrustFloor != 40 {
+		t.Errorf("TrustFloor = %d, want 40", cfg.Head.TrustFloor)
+	}
+	if got := cfg.Head.EffectiveTrustFloor(); got != 40 {
+		t.Errorf("EffectiveTrustFloor() = %d, want 40", got)
+	}
+}
+
+// TestTrustGateEnvOverrideInvalid rejects a non-boolean gate flag and a non-integer K.
+func TestTrustGateEnvOverrideInvalid(t *testing.T) {
+	t.Run("non-boolean gate", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_TRUST_GATE_ENABLED", "notabool")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for non-boolean LETTUCE_HEAD_TRUST_GATE_ENABLED, got nil")
+		}
+	})
+	t.Run("non-integer min_corroborators", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_TRUST_MIN_CORROBORATORS", "abc")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected error for non-integer LETTUCE_HEAD_TRUST_MIN_CORROBORATORS, got nil")
+		}
+	})
+	t.Run("negative floor fails validation", func(t *testing.T) {
+		clearLettuceEnv(t)
+		path := writeTestConfig(t, minimalConfig)
+		t.Setenv("LETTUCE_HEAD_TRUST_FLOOR", "-3")
+		if _, err := Load(path); err == nil {
+			t.Fatal("expected validation error for negative LETTUCE_HEAD_TRUST_FLOOR, got nil")
+		}
+	})
 }
 
 // contains reports whether s contains substr. Avoids importing strings package.

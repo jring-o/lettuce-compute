@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
@@ -76,7 +77,7 @@ func TestReliabilitySignal_AgreedRecordsGood(t *testing.T) {
 	volRepo.addVolunteer(makeVolunteer(vol2))
 
 	relRepo := &fakeReliabilityRepo{}
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, relRepo, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, relRepo, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {
@@ -125,7 +126,7 @@ func TestReliabilitySignal_RejectedRecordsBad(t *testing.T) {
 
 	relRepo := &fakeReliabilityRepo{}
 	// No active assignments => threshold unmet => rejectAll.
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, relRepo, nil, testLogger())
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, relRepo, nil, testLogger(), nil, transition.TrustPolicy{})
 
 	vr, err := engine.TryValidate(context.Background(), wuID)
 	if err != nil {

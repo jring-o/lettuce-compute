@@ -352,6 +352,27 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("LETTUCE_HEAD_DID_BINDING_COLLECTION"); v != "" {
 		cfg.Head.DIDBindingCollection = v
 	}
+	if v := os.Getenv("LETTUCE_HEAD_TRUST_GATE_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_TRUST_GATE_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.TrustGateEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_TRUST_MIN_CORROBORATORS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_TRUST_MIN_CORROBORATORS must be an integer: %w", err)
+		}
+		cfg.Head.TrustMinCorroborators = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_TRUST_FLOOR"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_TRUST_FLOOR must be an integer: %w", err)
+		}
+		cfg.Head.TrustFloor = n
+	}
 	return nil
 }
 
