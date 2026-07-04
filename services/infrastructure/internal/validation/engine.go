@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -62,8 +63,15 @@ type Engine struct {
 	// trustPolicy resolves the effective trust floor (and gate K) per leaf. Its zero value is
 	// the gate off; the floor is still resolved so accrual works before enforcement is enabled.
 	trustPolicy transition.TrustPolicy
-	signer      *attestation.Signer
-	logger      *slog.Logger
+	// standingRecorder is the automatic rejection-rate backpressure machine (BG-24/BG-24b
+	// PR-B): every adjudicated result (AGREED and DISAGREED) folds into the volunteer's
+	// decayed rejection-rate signal, which drives AUTO-owned standing transitions with
+	// hysteresis. Nil (the default — LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED is false)
+	// keeps today's behavior exactly: the lifetime-rate WARN for rejected results, no
+	// signal recorded. Set via WithStandingBackpressure; consumed best-effort.
+	standingRecorder standing.Recorder
+	signer           *attestation.Signer
+	logger           *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.
@@ -97,6 +105,16 @@ func NewEngine(
 		signer:          signer,
 		logger:          logger,
 	}
+}
+
+// WithStandingBackpressure sets the automatic rejection-rate backpressure recorder,
+// returning the engine for chaining (the workunit.WithTrustDispatch pattern —
+// avoiding another positional NewEngine parameter). Callers that skip it (or pass
+// nil) keep the nil recorder: no signal is recorded and the legacy lifetime-rate
+// WARN behavior is preserved byte-for-byte.
+func (e *Engine) WithStandingBackpressure(rec standing.Recorder) *Engine {
+	e.standingRecorder = rec
+	return e
 }
 
 // TryValidate checks if enough results have arrived for a work unit
@@ -508,13 +526,14 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 			e.logger.Warn("failed to increment work units completed",
 				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
+		e.recordAdjudicated(ctx, r.VolunteerID, true)
 	}
 	for _, r := range rejectedResults {
 		if err := e.volunteerRepo.IncrementWorkUnitsRejected(ctx, r.VolunteerID); err != nil {
 			e.logger.Warn("failed to increment work units rejected",
 				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
-		e.checkRejectionRate(ctx, r.VolunteerID)
+		e.recordAdjudicated(ctx, r.VolunteerID, false)
 	}
 
 	// TODO #54: feed the per-host reliability signal — an AGREED result is a good outcome
@@ -572,7 +591,7 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 			e.logger.Warn("failed to increment work units rejected",
 				"volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
-		e.checkRejectionRate(ctx, r.VolunteerID)
+		e.recordAdjudicated(ctx, r.VolunteerID, false)
 	}
 
 	// TODO #54: every result on a fully-rejected unit is wasted work — a bad reliability
@@ -765,7 +784,61 @@ func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.
 	}
 }
 
+// rejectionWarnRate is the decayed rejection rate above which the per-adjudication
+// WARN fires — the same 20% line the legacy lifetime-rate check used.
+const rejectionWarnRate = 0.20
+
+// recordAdjudicated folds one adjudicated result outcome (AGREED or DISAGREED —
+// EXPIRED/ABANDONED never reach the adjudication paths) into the volunteer's decayed
+// rejection-rate backpressure signal (BG-24/BG-24b PR-B). Best-effort like every
+// other post-credit effect here: errors are logged, never failing the validation
+// outcome. With the machine disabled (nil recorder, the default) it preserves
+// today's behavior exactly: the lifetime-rate WARN for rejected results, nothing
+// for agreed ones.
+func (e *Engine) recordAdjudicated(ctx context.Context, volunteerID types.ID, agreed bool) {
+	if e.standingRecorder == nil {
+		if !agreed {
+			e.checkRejectionRate(ctx, volunteerID)
+		}
+		return
+	}
+	out, err := e.standingRecorder.RecordAdjudicated(ctx, volunteerID, agreed)
+	if err != nil {
+		e.logger.Warn("failed to record adjudicated outcome for standing backpressure",
+			"volunteer_id", volunteerID, "agreed", agreed, "error", err)
+		return
+	}
+	if !out.Applied {
+		// OPERATOR-owned row (or the volunteer vanished): the machine never touches it.
+		return
+	}
+	if out.OldStanding != out.NewStanding {
+		e.logger.Warn("standing backpressure transition",
+			"volunteer_id", volunteerID,
+			"from", out.OldStanding,
+			"to", out.NewStanding,
+			"benched_until", out.BenchedUntil,
+			"rejection_rate", fmt.Sprintf("%.1f%%", out.Rate*100),
+			"decayed_sample", fmt.Sprintf("%.1f", out.Sample),
+		)
+		return
+	}
+	// The legacy WARN, now on the decayed rate: require at least one whole
+	// adjudication of decayed weight so a stale, fully-decayed signal stays quiet.
+	if out.Rate > rejectionWarnRate && out.Sample >= 1 {
+		e.logger.Warn("volunteer rejection rate exceeds 20%",
+			"volunteer_id", volunteerID,
+			"rejection_rate", fmt.Sprintf("%.1f%%", out.Rate*100),
+			"decayed_sample", fmt.Sprintf("%.1f", out.Sample),
+			"standing", out.NewStanding,
+		)
+	}
+}
+
 // checkRejectionRate logs a warning if a volunteer's rejection rate exceeds 20%.
+// It is the legacy lifetime-counter signal, kept for the backpressure-disabled
+// path (nil standingRecorder): the counters are monotonic, so the rate can never
+// recover — the decayed signal above supersedes it when the machine is enabled.
 func (e *Engine) checkRejectionRate(ctx context.Context, volunteerID types.ID) {
 	vol, err := e.volunteerRepo.GetByID(ctx, volunteerID)
 	if err != nil {

@@ -233,6 +233,43 @@ type HeadConfig struct {
 	// corroborated-clean units (or an operator seed). Unset (0) resolves to the default 25;
 	// effective value must be > 0. Override via LETTUCE_HEAD_TRUST_FLOOR.
 	TrustFloor int `yaml:"trust_floor"`
+
+	// --- Automatic standing backpressure (BG-24/BG-24b PR-B) ---
+	//
+	// The backpressure machine folds every adjudicated result (AGREED/DISAGREED — never
+	// EXPIRED/ABANDONED) into a decayed per-volunteer rejection-rate signal (7-day
+	// half-life) and drives AUTO-owned standing transitions with hysteresis:
+	// OK -> PROBATION at StandingProbationRate, PROBATION -> OK at StandingOKRate,
+	// PROBATION -> BENCHED (for StandingBenchMinutes) at StandingBenchRate, all
+	// evaluated only once the decayed sample reaches StandingMinSample. OPERATOR-set
+	// rows are never auto-changed. Effective rates must order
+	// 0 < ok < probation <= bench <= 1.
+
+	// StandingBackpressureEnabled is the master switch. OFF by default: no signal is
+	// recorded and standing changes remain operator-only (the legacy lifetime-rate WARN
+	// stays). Override via LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED.
+	StandingBackpressureEnabled bool `yaml:"standing_backpressure_enabled"`
+	// StandingProbationRate is the decayed rejection rate at which an OK volunteer
+	// enters PROBATION. Unset (0) resolves to the default 0.50. Override via
+	// LETTUCE_HEAD_STANDING_PROBATION_RATE.
+	StandingProbationRate float64 `yaml:"standing_probation_rate"`
+	// StandingOKRate is the decayed rejection rate at or below which a PROBATION
+	// volunteer returns to OK — the hysteresis exit, strictly below the entry rate.
+	// Unset (0) resolves to the default 0.25. Override via LETTUCE_HEAD_STANDING_OK_RATE.
+	StandingOKRate float64 `yaml:"standing_ok_rate"`
+	// StandingBenchRate is the decayed rejection rate at which a PROBATION volunteer is
+	// BENCHED. Unset (0) resolves to the default 0.75. Override via
+	// LETTUCE_HEAD_STANDING_BENCH_RATE.
+	StandingBenchRate float64 `yaml:"standing_bench_rate"`
+	// StandingMinSample is the minimum decayed sample (good + bad adjudications) at
+	// which transitions are evaluated at all, so a newcomer's first unlucky results
+	// cannot bench them. Unset (0) resolves to the default 5. Override via
+	// LETTUCE_HEAD_STANDING_MIN_SAMPLE.
+	StandingMinSample int `yaml:"standing_min_sample"`
+	// StandingBenchMinutes is the auto-bench duration; an expired bench resolves to
+	// PROBATION, so re-entry to OK goes through the hysteresis exit. Unset (0) resolves
+	// to the default 1440 (24h). Override via LETTUCE_HEAD_STANDING_BENCH_MINUTES.
+	StandingBenchMinutes int `yaml:"standing_bench_minutes"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -294,6 +331,16 @@ const (
 	// a subject reaches quorum power after ~25 corroborated-clean units (or an operator
 	// seed to at least this score).
 	defaultTrustFloor = 25
+
+	// --- Automatic standing-backpressure defaults (operator-accepted 2026-07-04) ---
+	// Enter probation at a 50% decayed rejection rate, exit at 25% (the hysteresis
+	// band), bench at 75% for 24 hours, and evaluate transitions only once at least
+	// 5 adjudications of decayed weight exist.
+	defaultStandingProbationRate = 0.50
+	defaultStandingOKRate        = 0.25
+	defaultStandingBenchRate     = 0.75
+	defaultStandingMinSample     = 5
+	defaultStandingBenchMinutes  = 1440
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -768,6 +815,51 @@ func (h HeadConfig) EffectiveTrustFloor() int {
 		return defaultTrustFloor
 	}
 	return h.TrustFloor
+}
+
+// EffectiveStandingProbationRate returns the decayed rejection rate at which an OK
+// volunteer enters PROBATION, default 0.50. Unset (<= 0) -> defaultStandingProbationRate.
+func (h HeadConfig) EffectiveStandingProbationRate() float64 {
+	if h.StandingProbationRate <= 0 {
+		return defaultStandingProbationRate
+	}
+	return h.StandingProbationRate
+}
+
+// EffectiveStandingOKRate returns the decayed rejection rate at or below which a
+// PROBATION volunteer returns to OK, default 0.25. Unset (<= 0) -> defaultStandingOKRate.
+func (h HeadConfig) EffectiveStandingOKRate() float64 {
+	if h.StandingOKRate <= 0 {
+		return defaultStandingOKRate
+	}
+	return h.StandingOKRate
+}
+
+// EffectiveStandingBenchRate returns the decayed rejection rate at which a PROBATION
+// volunteer is BENCHED, default 0.75. Unset (<= 0) -> defaultStandingBenchRate.
+func (h HeadConfig) EffectiveStandingBenchRate() float64 {
+	if h.StandingBenchRate <= 0 {
+		return defaultStandingBenchRate
+	}
+	return h.StandingBenchRate
+}
+
+// EffectiveStandingMinSample returns the minimum decayed sample at which standing
+// transitions are evaluated, default 5. Unset (<= 0) -> defaultStandingMinSample.
+func (h HeadConfig) EffectiveStandingMinSample() int {
+	if h.StandingMinSample <= 0 {
+		return defaultStandingMinSample
+	}
+	return h.StandingMinSample
+}
+
+// EffectiveStandingBenchMinutes returns the auto-bench duration in minutes, default
+// 1440 (24h). Unset (<= 0) -> defaultStandingBenchMinutes.
+func (h HeadConfig) EffectiveStandingBenchMinutes() int {
+	if h.StandingBenchMinutes <= 0 {
+		return defaultStandingBenchMinutes
+	}
+	return h.StandingBenchMinutes
 }
 
 // StorageConfig defines local filesystem storage settings.
