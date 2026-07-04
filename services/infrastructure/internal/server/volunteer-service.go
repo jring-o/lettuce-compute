@@ -21,6 +21,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -59,6 +60,11 @@ type volunteerService struct {
 	// at submit time (see internal/trust). Constructed from the pool, so it is nil only in the
 	// gRPC-plumbing unit tests that pass a nil pool; SubmitResult is nil-safe (stamps score 0).
 	trustRepo trust.Repository
+	// standingRepo feeds the dispatch cache's account-standing snapshot (BG-24b): the BENCHED
+	// gate, the countable-coverage / trusted-present standing filters, and the PROBATION
+	// in-flight floor. Same nil-only-in-plumbing-tests treatment as trustRepo; the cache is
+	// nil-safe (no snapshot = every account OK = gates inert).
+	standingRepo standingSnapshotReader
 	// trustPolicy is the head trust-gate configuration overlaid onto each leaf by the
 	// transitioner. Zero value = gate off (the deploy-safety default); the real policy is
 	// threaded from config via NewVolunteerService.
@@ -173,6 +179,9 @@ func NewVolunteerService(
 		// Account-level trust store for submit-time score snapshots (see internal/trust); same
 		// nil-only-in-plumbing-tests treatment. Stamping is nil-safe regardless.
 		s.trustRepo = trust.NewPgxRepository(pool)
+		// Account-standing store for the dispatch cache's standing snapshot (BG-24b); same
+		// treatment. The cache is nil-safe (everyone OK, gates inert).
+		s.standingRepo = standing.NewPgxRepository(pool)
 	}
 	// Default load estimator until SetHeadConfig overrides the tunables. The pool
 	// saturation closure is nil-safe (returns 0 if the pool is nil, as in some
@@ -378,6 +387,11 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		// gRPC-plumbing tests that pass a nil pool). The refiller reads AllScores off the
 		// hot path to keep the trusted-corroborator reservation's score snapshot fresh.
 		trustRepo: s.trustRepo,
+		// Account-standing store (BG-24b): the refiller reads AllNonOK off the hot path to
+		// keep the standing snapshot fresh for the BENCHED gate, the countable-coverage /
+		// trusted-present standing filters, and the PROBATION in-flight floor. Nil only in
+		// the same plumbing tests; the cache treats nil as everyone-OK.
+		standingRepo: s.standingRepo,
 	}, s.logger)
 	s.dispatchCache = cache
 
@@ -1349,7 +1363,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	} else {
 		trustVol = v
 	}
-	trustSubject, trustScore := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
+	trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
 
 	r := &result.Result{
 		WorkUnitID:        workUnitID,
@@ -1369,6 +1383,9 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		// submission-time subject + score, not a later re-read a slash/accrual could change.
 		TrustSubject:       &trustSubject,
 		TrustScoreAtSubmit: &trustScore,
+		// Effective account standing at submit (see internal/standing): validation counts
+		// only OK-stamped results toward quorum and redundancy coverage.
+		StandingAtSubmit: &standingAtSubmit,
 	}
 
 	// Insert result.

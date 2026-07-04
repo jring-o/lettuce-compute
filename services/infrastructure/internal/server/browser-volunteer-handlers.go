@@ -611,7 +611,7 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		if deps.now != nil {
 			now = deps.now
 		}
-		trustSubject, trustScore := stampTrustSnapshot(r.Context(), deps.trustRepo, vol, vol.ID, now(), deps.logger)
+		trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(r.Context(), deps.trustRepo, vol, vol.ID, now(), deps.logger)
 
 		res := &result.Result{
 			WorkUnitID:     workUnitID,
@@ -628,6 +628,9 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			// submission-time subject + score, not a later re-read.
 			TrustSubject:       &trustSubject,
 			TrustScoreAtSubmit: &trustScore,
+			// Effective account standing at submit (see internal/standing): validation
+			// counts only OK-stamped results toward quorum and redundancy coverage.
+			StandingAtSubmit: &standingAtSubmit,
 		}
 
 		if err := txResultRepo.Create(r.Context(), res); err != nil {

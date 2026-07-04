@@ -28,6 +28,55 @@ const (
 	DIDBindingStatusRevoked = "REVOKED"
 )
 
+// Standing* are the account-standing values (BG-24b): the head's per-account
+// dispatch/validation state machine. OK is normal service. PROBATION is
+// invisible-but-neutralizing: the account is dispatched and its results are
+// accepted, adjudicated, and credited, but they never count toward quorum and
+// never cover redundancy, so full replication is forced around them. BENCHED
+// stops dispatch entirely until BenchedUntil. Standing is per ACCOUNT
+// (volunteer row), deliberately not per trust subject: the quorum layer already
+// collapses a DID's devices to one subject, so standing adds per-account
+// dispatch control without touching subject arithmetic.
+const (
+	StandingOK        = "OK"
+	StandingProbation = "PROBATION"
+	StandingBenched   = "BENCHED"
+)
+
+// StandingSource* record who owns a row's standing. AUTO rows are managed by
+// the rejection-rate backpressure machine; OPERATOR rows were set through the
+// admin API and are never auto-changed (an operator bench must not be undone by
+// a handful of agreeing results).
+const (
+	StandingSourceAuto     = "AUTO"
+	StandingSourceOperator = "OPERATOR"
+)
+
+// EffectiveStanding resolves the standing that enforcement sees at time now —
+// the single rule shared by result stamping, validation countability, dispatch
+// (via its SQL twin, pinned to this function by a golden test), and the admin
+// surface:
+//
+//   - BENCHED while standing is BENCHED and benchedUntil is NULL (indefinite —
+//     the operator-safe reading; the automatic machine always sets a deadline)
+//     or in the future;
+//   - an EXPIRED bench resolves to PROBATION, never straight to OK: re-entry
+//     goes through the backpressure exit threshold or an operator clear;
+//   - PROBATION as stored; anything else (including the legacy empty string) is OK.
+func EffectiveStanding(standing string, benchedUntil *time.Time, now time.Time) string {
+	switch standing {
+	case StandingBenched:
+		if benchedUntil == nil || benchedUntil.After(now) {
+			return StandingBenched
+		}
+		return StandingProbation
+	case StandingProbation:
+		return StandingProbation
+	default:
+		return StandingOK
+	}
+}
+
 // GpuInfo describes a single GPU available on a volunteer machine.
 type GpuInfo struct {
 	Model             string `json:"model"`
@@ -107,6 +156,17 @@ type Volunteer struct {
 	DIDBindingCheckedAt     *time.Time `json:"did_binding_checked_at,omitempty"`
 	DIDBindingCheckFailures int        `json:"did_binding_check_failures"`
 	DIDFrozenUntil          *time.Time `json:"did_frozen_until,omitempty"`
+
+	// Account standing (BG-24b). Standing/StandingSource are never NULL (DB
+	// defaults 'OK'/'AUTO'); the pointer fields are nil until first set. These
+	// columns change only through the dedicated standing repository
+	// (internal/standing) — Create/Update do not write them. Enforcement always
+	// goes through EffectiveStanding, never the raw column.
+	Standing          string     `json:"standing"`
+	BenchedUntil      *time.Time `json:"benched_until,omitempty"`
+	StandingSource    string     `json:"standing_source"`
+	StandingReason    *string    `json:"standing_reason,omitempty"`
+	StandingChangedAt *time.Time `json:"standing_changed_at,omitempty"`
 }
 
 // HardwareCapabilitiesFromProto converts a protobuf HardwareCapabilities message to a Go struct.

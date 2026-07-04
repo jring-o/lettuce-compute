@@ -71,36 +71,44 @@ func trustRepoFromPool(pool *pgxpool.Pool) trust.Repository {
 	return trust.NewPgxRepository(pool)
 }
 
-// stampTrustSnapshot resolves the account-level trust subject and submission-time score to
-// record on a result (see internal/trust). It is shared by both live submit paths (the gRPC
-// SubmitResult and the browser/WASM handler) so they stamp identically.
+// stampTrustSnapshot resolves the account-level trust subject, submission-time score, and
+// effective account standing to record on a result (see internal/trust and
+// internal/standing). It is shared by both live submit paths (the gRPC SubmitResult and the
+// browser/WASM handler) so they stamp identically.
 //
 // The policy is fail-OPEN on work, fail-CLOSED on power:
 //   - vol == nil (its row could not be loaded): the submission still succeeds — subject falls
-//     back to the per-keypair sentinel and score is 0. Trust plumbing must never block valid
-//     work.
+//     back to the per-keypair sentinel, score is 0, and standing is OK. Stamping must never
+//     block valid work; a legacy NULL standing stamp already reads as OK, so OK is the
+//     behavior-preserving fallback here (trust separately stamps score 0, the fail-closed half).
 //   - the volunteer's quorum power is suppressed (a STALE DID binding the head can no longer
 //     re-verify, or an active post-rotation freeze): the subject is kept, but the score is
 //     forced to 0, so a suppressed principal contributes a copy but no trusted-corroborator
 //     power (QuorumPowerSuppressed owns this decision).
 //   - trustRepo == nil, or GetScore errors: score is 0 (a WARN is logged on error).
 //
-// Stamping is UNCONDITIONAL of whether the gate is enabled: snapshots must accumulate before
-// the gate is ever switched on, so acceptance has a submission-time score to read.
-func stampTrustSnapshot(ctx context.Context, trustRepo trust.Repository, vol *volunteer.Volunteer, volunteerID types.ID, now time.Time, logger *slog.Logger) (subject string, score int) {
+// The standing return is the volunteer's EFFECTIVE standing at submit
+// (volunteer.EffectiveStanding) and is UNCONDITIONAL — it does not depend on trust
+// suppression or on whether any gate is enabled. Like the trust score, snapshots must
+// accumulate before enforcement is switched on, so validation has a submission-time standing
+// to read.
+func stampTrustSnapshot(ctx context.Context, trustRepo trust.Repository, vol *volunteer.Volunteer, volunteerID types.ID, now time.Time, logger *slog.Logger) (subject string, score int, standing string) {
 	if vol == nil {
-		return trust.SubjectForVolunteerID(volunteerID), 0
+		return trust.SubjectForVolunteerID(volunteerID), 0, volunteer.StandingOK
 	}
+	// Effective standing is resolved from the loaded row regardless of the trust outcome
+	// below, so it is stamped even for a suppressed principal.
+	standing = volunteer.EffectiveStanding(vol.Standing, vol.BenchedUntil, now)
 	subject = trust.SubjectForVolunteer(vol)
 	if trustRepo == nil || trust.QuorumPowerSuppressed(vol, now) {
-		return subject, 0
+		return subject, 0, standing
 	}
 	s, err := trustRepo.GetScore(ctx, subject)
 	if err != nil {
 		if logger != nil {
 			logger.Warn("failed to read trust score at submit; stamping score 0", "subject", subject, "error", err)
 		}
-		return subject, 0
+		return subject, 0, standing
 	}
-	return subject, s
+	return subject, s, standing
 }

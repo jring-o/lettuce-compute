@@ -81,7 +81,13 @@ type Result struct {
 	// created before the trust feature.
 	TrustSubject       *string    `json:"trust_subject,omitempty"`
 	TrustScoreAtSubmit *int       `json:"trust_score_at_submit,omitempty"`
-	SubmittedAt        time.Time  `json:"submitted_at"`
+	// StandingAtSubmit is the submitter's EFFECTIVE account standing at
+	// submission time (volunteer.EffectiveStanding), stamped alongside the trust
+	// snapshot. Validation counts only OK-stamped results toward quorum and
+	// redundancy coverage — the same as-of-submission semantics as the trust
+	// score above. nil = a legacy row created before the standing feature (OK).
+	StandingAtSubmit *string    `json:"standing_at_submit,omitempty"`
+	SubmittedAt      time.Time  `json:"submitted_at"`
 	ValidatedAt        *time.Time `json:"validated_at,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`

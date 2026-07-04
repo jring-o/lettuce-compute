@@ -11,6 +11,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -83,6 +84,13 @@ const (
 	// construction (the SQL landing writes re-check the reservation against fresh scores),
 	// so a modest window keeps the read off the hot path at negligible correctness cost.
 	trustScoreTTL = 30 * time.Second
+	// standingSnapshotTTL bounds how long the cache trusts its in-memory snapshot of the
+	// non-OK account-standing population (BG-24b) before the refill path re-reads it. Like
+	// trustScoreTTL it is stale-tolerant by construction: the SQL landing gates
+	// (FlushReservations / ReserveCopy / FindNextAssignable) recompute standing fresh and
+	// are authoritative, so a stale snapshot costs at most a voided hand-out to a
+	// just-benched account or a briefly-late bench — never a wrong LANDED copy.
+	standingSnapshotTTL = 30 * time.Second
 )
 
 // candidate is one pre-fetched, ready-to-assign QUEUED unit in the ready pool. It
@@ -94,8 +102,18 @@ type candidate struct {
 	// number of distinct in-memory holders of this unit.
 	effectiveRedundancy int
 	// dbActiveCount is the active-history-row count of this unit at refill time,
-	// the authoritative floor on its redundancy headroom.
+	// the authoritative floor on its redundancy headroom. This is the RAW seed (live
+	// copies + PENDING results, standing-agnostic); the countable portion subtracts
+	// probationCoverage below.
 	dbActiveCount int
+	// probationCoverage is the NON-COUNTABLE portion of dbActiveCount at refill time
+	// (account standing, BG-24b — DispatchCandidate.ProbationCoverage): live copies held by
+	// a non-OK account plus PENDING results stamped non-OK. eligibleLocked's COVERAGE bound
+	// subtracts it (and the in-memory non-OK holders) so redundancy is closed only by
+	// COUNTABLE copies — the same number the SQL headroom enforces — forcing full
+	// replication around neutralized copies/results. 0 for an all-OK population, so the
+	// coverage arithmetic reduces to today's.
+	probationCoverage int
 	// contributors is the set of trust SUBJECTS that already count toward this unit's
 	// redundancy: live-copy holders + PENDING-result authors at refill time, kept
 	// current as copies run-start (onRunStart). A subject is the account-level trust
@@ -287,6 +305,22 @@ type dispatchDeps struct {
 	// stays nil, and since a nil-score map classifies nobody as trusted while every
 	// candidate with effectiveTrustK == 0 skips the reservation entirely, nothing changes.
 	trustRepo trust.Repository
+	// standingRepo provides the non-OK account-standing population (BG-24b) for the
+	// BENCHED dispatch gate, the countable-coverage / trusted-present standing filters, and
+	// the PROBATION in-flight floor. The refill path reads AllNonOK OFF the hot path (on
+	// standingSnapshotTTL cadence, riding the same maintenance slot as the trust read) into
+	// an in-memory account -> entry snapshot; the hand-out path reads only that snapshot.
+	// May be nil (tests / no pool / standing never used): the snapshot then stays nil and
+	// EVERY account resolves OK, so the gates are inert and dispatch behaves as before.
+	standingRepo standingSnapshotReader
+}
+
+// standingSnapshotReader is the narrow read the dispatch cache needs from the account-
+// standing store (internal/standing.Repository): the whole non-OK population in one map
+// keyed by account id. A consumer-side interface so tests can substitute a fake without the
+// full standing repository, and so the cache never depends on the write surface.
+type standingSnapshotReader interface {
+	AllNonOK(ctx context.Context) (map[types.ID]standing.Entry, error)
 }
 
 // volunteerIdentity is the in-process snapshot of a volunteer's identity +
@@ -380,6 +414,22 @@ type dispatchCache struct {
 	// trustScoresAt is when trustScores was last refreshed (zero = never), the TTL clock
 	// refreshTrustScores checks against trustScoreTTL. Guarded by mu with trustScores.
 	trustScoresAt time.Time
+	// standingSnapshot is a TTL snapshot of the NON-OK account-standing population (account
+	// id -> its raw standing entry; only non-OK accounts appear — see
+	// standing.Repository.AllNonOK). eligibleLocked and the coverage/reservation helpers read
+	// it — under mu — via effectiveStandingLocked, which resolves each entry through
+	// volunteer.EffectiveStanding at read time (so an expired bench reads PROBATION, not
+	// BENCHED). Refreshed OFF the hot path on the refill cadence (refreshStanding, from
+	// fetchAndStage), NEVER by a DB call while holding mu (the peekLeaf rule). A nil/absent
+	// entry means the account is OK — the snapshot only carries the neutralized minority, so
+	// a nil map (dep unwired) treats EVERYONE as OK and every standing gate is inert.
+	// Staleness is SAFE: the SQL landing gates recompute standing fresh and are
+	// authoritative, so a stale verdict costs at most a voided hand-out or a briefly-late
+	// bench, never a wrong landed copy (the trustScores precedent).
+	standingSnapshot map[types.ID]standing.Entry
+	// standingSnapshotAt is when standingSnapshot was last refreshed (zero = never), the TTL
+	// clock refreshStanding checks against standingSnapshotTTL. Guarded by mu with the snapshot.
+	standingSnapshotAt time.Time
 
 	// leafCache caches per-leaf metadata (the full leaf, used for capability matching
 	// and proto building). Guarded by leafMu (separate from mu so a leaf fetch under
@@ -682,6 +732,21 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	opts.MaxInflightPerVolunteer = c.effectiveInflightCap(hostKey, opts.MaxInflightPerVolunteer)
 
 	c.mu.Lock()
+	// PROBATION dispatch-budget floor (account standing, BG-24b): a requester the head has
+	// neutralized (effective standing non-OK) is pinned to the cold-start reliability floor
+	// regardless of the adaptive budget effectiveInflightCap just resolved for it — a
+	// neutralized account's results cannot corroborate, so it must not hog dispatch capacity
+	// a once-proven-then-benched account would otherwise keep. A BENCHED requester never
+	// reaches acceptance (eligibleLocked refuses it outright below), so this floor is what
+	// throttles the still-dispatched PROBATION case. Gated on the reliability quota because
+	// that is where the floor exists — with a flat cap every account already shares one
+	// budget, so there is no adaptive budget to hog. Resolved here under the main lock (the
+	// standing snapshot's guard) so it costs no extra lock, before eligibleLocked reads the
+	// capped value. Only lowers, never raises (never above the resolved adaptive cap).
+	if c.cfg.reliabilityQuotaEnabled && opts.MaxInflightPerVolunteer > c.cfg.reliabilityFloor &&
+		c.effectiveStandingLocked(volunteerID) != volunteer.StandingOK {
+		opts.MaxInflightPerVolunteer = c.cfg.reliabilityFloor
+	}
 	// Per-machine minimum send interval: refuse to hand any new work to a machine within
 	// cfg.minSendInterval of ITS last successful hand-out. This is a server-side hard floor
 	// on per-machine work-acquisition cadence that holds even when a (self-compiled)
@@ -925,6 +990,7 @@ const (
 	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
 	rejectInfeasibleDeadline                     // host too slow to finish this unit before its deadline
 	rejectTrustReserved                          // untrusted requester; unit's last slots reserved for trusted subjects
+	rejectStandingBenched                        // requester's account is BENCHED (no dispatch until the bench lapses)
 	numRejectReasons                             // sentinel: count of reasons (tally array size)
 )
 
@@ -960,6 +1026,8 @@ func (r rejectReason) String() string {
 		return "infeasible_deadline"
 	case rejectTrustReserved:
 		return "trust_reserved"
+	case rejectStandingBenched:
+		return "standing_benched"
 	default:
 		return "unknown"
 	}
@@ -989,15 +1057,29 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	leafID := cand.unit.LeafID
 	subject := requesterSubject(volunteerID, opts)
 
-	// Redundancy headroom, enforced by TWO bounds:
-	//   (1) total redundancy: dbActiveCount (already-running history rows) + distinct
-	//       in-memory holders must stay under the leaf's effectiveRedundancy;
-	//   (2) concurrent in-memory holders: at most inMemHolderCap() == effectiveRedundancy
-	//       at once. Each holder lands as its own copy row, so a redundancy=N unit is
-	//       dispatched to N distinct volunteers IN PARALLEL (property 7); run-starting
-	//       one copy keeps the unit QUEUED so the others still dispatch.
+	// Redundancy bounds, enforced by TWO checks that key on DIFFERENT numbers by design:
+	//   (1) COVERAGE (corroboration): only COUNTABLE copies close a unit's redundancy need
+	//       (account standing, BG-24b). The countable coverage is the RAW db seed minus its
+	//       non-countable portion (cand.probationCoverage — non-OK live holders + non-OK
+	//       pending results at refill) PLUS the in-memory holders whose ACCOUNT standing is
+	//       OK (countableHoldersLocked). A unit whose copies are all held by neutralized
+	//       accounts has zero countable coverage, so a fresh OK requester still finds
+	//       headroom — full replication FORCED around neutralized results. Mirrors the SQL
+	//       countableCoverageSQL headroom. With an all-OK population it reduces to
+	//       dbActiveCount + len(holders), byte-for-byte today's arithmetic.
+	//   (2) CONCURRENCY cap (RAW, standing-agnostic): at most inMemHolderCap() ==
+	//       effectiveRedundancy DISTINCT holders may hold this unit AT ONCE regardless of
+	//       standing — it bounds simultaneous work/compute, NOT corroboration coverage, so a
+	//       neutralized holder still occupies a concurrency slot. (Forced replication happens
+	//       over TIME: as a neutralized copy completes or lapses its slot frees and the
+	//       refiller re-stages the unit for a fresh OK volunteer — the coverage bound above,
+	//       not this cap, is what keeps it dispatchable.)
 	holders := c.reservedInMem[uid]
-	if cand.dbActiveCount+len(holders) >= cand.effectiveRedundancy {
+	countableCoverage := cand.dbActiveCount - cand.probationCoverage + c.countableHoldersLocked(holders)
+	if countableCoverage < 0 {
+		countableCoverage = 0 // defensive: snapshot skew can never push coverage below zero
+	}
+	if countableCoverage >= cand.effectiveRedundancy {
 		return false, rejectRedundancyFull
 	}
 	if len(holders) >= cand.inMemHolderCap() {
@@ -1018,23 +1100,25 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// reserved slot itself). An UNTRUSTED requester is refused iff handing it this copy
 	// would leave too few of the unit's remaining slots for the trusted results the quorum
 	// still requires:
-	//     dbActiveCount + len(holders) + 1 + max(0, K - trustedPresent) > effectiveRedundancy
-	// where trustedPresent is the number of DISTINCT trusted subjects already counting
-	// toward the unit (see trustedPresentLocked). Below that bound an untrusted copy still
-	// leaves room for the outstanding trusted results, so it is admitted.
+	//     countableCoverage + 1 + max(0, K - trustedPresent) > effectiveRedundancy
+	// using the SAME countable coverage as the redundancy bound above (account standing,
+	// BG-24b: a neutralized copy/result covers nothing, so it must not be counted here
+	// either) and trustedPresent the number of DISTINCT trusted-AND-countable subjects
+	// already counting toward the unit (see trustedPresentLocked). Below that bound an
+	// untrusted copy still leaves room for the outstanding trusted results, so it is admitted.
 	//
-	// STALENESS: trustScores is a TTL snapshot refreshed off the hot path on the refill
-	// cadence (never a DB read under mu). A stale verdict is self-correcting — the SQL
-	// landing re-checks the reservation against fresh scores (the #86 precedent) — so it
-	// costs at most a voided hand-out (an untrusted copy the landing then refuses) or a
-	// briefly withheld slot, never a wrong acceptance into a trusted subject's place.
+	// STALENESS: trustScores / standingSnapshot are TTL snapshots refreshed off the hot path
+	// on the refill cadence (never a DB read under mu). A stale verdict is self-correcting —
+	// the SQL landing re-checks the reservation against fresh scores/standing (the #86
+	// precedent) — so it costs at most a voided hand-out (a copy the landing then refuses) or
+	// a briefly withheld slot, never a wrong acceptance into a trusted subject's place.
 	if cand.effectiveTrustK > 0 {
 		if c.trustScores[subject] < cand.effectiveTrustFloor {
 			reservedForTrusted := cand.effectiveTrustK - c.trustedPresentLocked(cand)
 			if reservedForTrusted < 0 {
 				reservedForTrusted = 0
 			}
-			if cand.dbActiveCount+len(holders)+1+reservedForTrusted > cand.effectiveRedundancy {
+			if countableCoverage+1+reservedForTrusted > cand.effectiveRedundancy {
 				return false, rejectTrustReserved
 			}
 		}
@@ -1072,6 +1156,17 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// signal (this account's copy failed), not corroboration distinctness.
 	if _, benched := cand.benched[volunteerID]; benched {
 		return false, rejectBenched
+	}
+	// Account standing — BENCHED requester (BG-24b): an account the head has BENCHED gets NO
+	// dispatch at all until its bench lapses. The per-ACCOUNT standing twin of the per-unit
+	// cooldown just above (both are "this requester may not take work right now"), keyed on
+	// the account like the cooldown and read from the TTL standing snapshot. Only a LIVE
+	// bench refuses — effectiveStandingLocked resolves an expired bench to PROBATION, and a
+	// PROBATION account is still dispatched (its results simply never corroborate; the
+	// coverage/reservation arithmetic above and the in-flight floor neutralize it instead).
+	// Absent snapshot / nil dep ⇒ OK ⇒ inert, so a non-standing deployment is unchanged.
+	if c.effectiveStandingLocked(volunteerID) == volunteer.StandingBenched {
+		return false, rejectStandingBenched
 	}
 	// Per-MACHINE inflight cap (TODO #19): a user's beefy rig is not throttled to its
 	// laptop's share — each host has its own live-copy budget. Keyed on hostKey, which is
@@ -1125,22 +1220,36 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 //	    pending author's verdict counts its stamped score, so re-scoring it against a later
 //	    current value would diverge from what validation will actually credit.
 //	(b) the current in-memory holds (heldCopy.subject) whose CURRENT snapshot score meets
-//	    the floor — post-refill live copies, evaluated live.
+//	    the floor AND whose ACCOUNT's current standing is OK — post-refill live copies,
+//	    evaluated live. A neutralized (PROBATION/BENCHED) holder cannot corroborate, so it is
+//	    not trusted-present even if its subject scores above the floor (account standing,
+//	    BG-24b) — the live-arm twin of the standing filter now in trustedContributorSubjectsSQL.
 //	(c) cand.runStartedSubjects — subjects converted from a hold to a RUNNING copy after
 //	    staging (onRunStart), also post-refill live copies, evaluated by CURRENT score the
 //	    same way as (b). Kept apart from (a) precisely so a refill-time pending author is
-//	    never swept into the live-scored set.
+//	    never swept into the live-scored set. UNLIKE (a) and (b), arm (c) is deliberately NOT
+//	    standing-filtered (BG-24b): runStartedSubjects are bare subject strings with no
+//	    account id to resolve against the standing snapshot. The error direction is bounded
+//	    and safe — a neutralized run-started subject can only OVER-count trusted_present,
+//	    which makes the in-memory reservation verdict slightly MORE permissive (it may admit
+//	    an untrusted requester the reservation would otherwise withhold), and that
+//	    self-corrects at the standing-filtered SQL landing (a voided hand-out at worst — the
+//	    #86/#87 staleness class), never a wrong LANDED copy. Tightening it would require
+//	    stamping account ids onto run-started entries; evaluated and skipped as net-new
+//	    coupling for a stale-tolerant optimization.
 //
-// Caller holds mu (it reads reservedInMem and the trust-score snapshot). Only reached for
-// a candidate with effectiveTrustK > 0, so the map allocation stays off the gate-off path.
+// Caller holds mu (it reads reservedInMem and the trust-score / standing snapshots). Only
+// reached for a candidate with effectiveTrustK > 0, so the map allocation stays off the
+// gate-off path.
 func (c *dispatchCache) trustedPresentLocked(cand candidate) int {
 	floor := cand.effectiveTrustFloor
 	present := make(map[string]struct{}, len(cand.trustedContributors)+len(cand.runStartedSubjects))
 	for s := range cand.trustedContributors {
 		present[s] = struct{}{}
 	}
-	for _, hc := range c.reservedInMem[cand.unit.ID] {
-		if hc.subject != "" && c.trustScores[hc.subject] >= floor {
+	for acct, hc := range c.reservedInMem[cand.unit.ID] {
+		if hc.subject != "" && c.trustScores[hc.subject] >= floor &&
+			c.effectiveStandingLocked(acct) == volunteer.StandingOK {
 			present[hc.subject] = struct{}{}
 		}
 	}
@@ -1150,6 +1259,36 @@ func (c *dispatchCache) trustedPresentLocked(cand candidate) int {
 		}
 	}
 	return len(present)
+}
+
+// effectiveStandingLocked resolves the requester/holder ACCOUNT's CURRENT effective standing
+// (BG-24b) from the TTL snapshot. Caller holds mu. An account ABSENT from the snapshot is OK
+// (the snapshot carries only the non-OK minority); a present entry is resolved through
+// volunteer.EffectiveStanding against now() so a live bench reads BENCHED, an EXPIRED bench
+// reads PROBATION, and a stored probation reads PROBATION. A nil snapshot (dep unwired /
+// never refreshed) ⇒ everyone OK, so every standing gate is inert.
+func (c *dispatchCache) effectiveStandingLocked(accountID types.ID) string {
+	e, ok := c.standingSnapshot[accountID]
+	if !ok {
+		return volunteer.StandingOK
+	}
+	return volunteer.EffectiveStanding(e.Standing, e.BenchedUntil, c.now())
+}
+
+// countableHoldersLocked returns how many of the given in-memory holders CORROBORATE — i.e.
+// whose ACCOUNT's current effective standing is OK (BG-24b). A holder held by a
+// PROBATION/BENCHED account occupies a concurrency slot but does not cover redundancy, so
+// eligibleLocked's COVERAGE bound counts only these; the holder map keys on the ACCOUNT
+// (volunteer id), exactly the standing snapshot's key. Caller holds mu. An empty / all-OK
+// population makes this len(holders), so the coverage arithmetic reduces to today's.
+func (c *dispatchCache) countableHoldersLocked(holders map[types.ID]heldCopy) int {
+	n := 0
+	for acct := range holders {
+		if c.effectiveStandingLocked(acct) == volunteer.StandingOK {
+			n++
+		}
+	}
+	return n
 }
 
 // releaseInMem drops a single in-memory reservation (one holder) and decrements the
@@ -1901,6 +2040,11 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	// runs before the dispatchable query so an empty dispatchable universe still keeps the
 	// snapshot fresh for already-staged candidates. Stale-tolerant and nil-repo-tolerant.
 	c.refreshTrustScores(dbCtx)
+	// Same for the account-standing snapshot (BG-24b): one more OFF-hot-path read under the
+	// maintenance slot already held, feeding the BENCHED dispatch gate, the countable-
+	// coverage / trusted-present standing filters, and the PROBATION in-flight floor. Same
+	// staleness / nil-repo tolerance as the trust read.
+	c.refreshStanding(dbCtx)
 
 	// Layer 3: when scale-out is enabled, the refill ATOMICALLY stamps a per-head
 	// dispatch claim on each staged unit so no other replica can stage it (claim-on-
@@ -1939,8 +2083,12 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			unit:                dc.WorkUnit,
 			effectiveRedundancy: dc.RedundancyFactor,
 			dbActiveCount:       dc.ActiveAssignments,
-			contributors:        strSet(dc.ContributorSubjects),
-			benched:             idSet(dc.BenchedVolunteerIDs),
+			// Non-countable portion of the raw seed (account standing, BG-24b), subtracted
+			// by eligibleLocked's coverage bound so redundancy is closed only by countable
+			// copies — the cache's forced-replication parity with countableCoverageSQL.
+			probationCoverage: dc.ProbationCoverage,
+			contributors:      strSet(dc.ContributorSubjects),
+			benched:           idSet(dc.BenchedVolunteerIDs),
 			// Trusted-corroborator reservation inputs (SQL twin: DispatchCandidate). K == 0
 			// leaves the reservation inert; the trusted-contributor snapshot is frozen here
 			// (see the candidate field docs) so a pending author's stamped trustedness is
@@ -2006,6 +2154,40 @@ func (c *dispatchCache) refreshTrustScores(ctx context.Context) {
 	c.mu.Lock()
 	c.trustScores = scores
 	c.trustScoresAt = c.now()
+	c.mu.Unlock()
+}
+
+// refreshStanding re-reads the non-OK account-standing snapshot from the standing store when
+// it has gone stale (older than standingSnapshotTTL), feeding the BENCHED dispatch gate, the
+// countable-coverage / trusted-present standing filters, and the PROBATION in-flight floor
+// (BG-24b). Like refreshTrustScores it is called ONLY from fetchAndStage, where a DB touch
+// already happens under the maintenance admission slot the caller holds, so it adds no DB
+// call to the hot path — and it never reads the DB while holding mu (the peekLeaf rule): the
+// staleness check and the store are under mu, the AllNonOK read is not.
+//
+// A nil standing repo (tests, no-pool / mux-only constructions) is tolerated — the snapshot
+// stays nil, which classifies EVERY account OK, so every standing gate is inert. On a read
+// error the previous (stale) snapshot is kept: a stale verdict is self-correcting at the SQL
+// landing, so serving stale beats dropping the snapshot to nil and either wrongly benching
+// nobody or forcing every gate open.
+func (c *dispatchCache) refreshStanding(ctx context.Context) {
+	if c.deps.standingRepo == nil {
+		return
+	}
+	c.mu.Lock()
+	fresh := !c.standingSnapshotAt.IsZero() && c.now().Sub(c.standingSnapshotAt) < standingSnapshotTTL
+	c.mu.Unlock()
+	if fresh {
+		return
+	}
+	entries, err := c.deps.standingRepo.AllNonOK(ctx)
+	if err != nil {
+		c.logger.Warn("dispatch cache: standing snapshot refresh failed; keeping prior snapshot", "error", err)
+		return
+	}
+	c.mu.Lock()
+	c.standingSnapshot = entries
+	c.standingSnapshotAt = c.now()
 	c.mu.Unlock()
 }
 

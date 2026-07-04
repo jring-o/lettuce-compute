@@ -4,9 +4,11 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/dispatchparity"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -145,6 +147,26 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 			trustedContributors[subj] = struct{}{}
 		}
 	}
+	// Probation-held coverage (account standing, BG-24b forced replication): live copies held
+	// by — or PENDING results submitted by — OTHER, distinct NON-OK accounts. Each is a real
+	// DB row, so it counts in the RAW seed (dbActiveCount) and is recorded as a distinct
+	// contributor subject exactly as the refill's contributor_subjects (which has NO standing
+	// filter) would record it — but its non-countable portion is accumulated into
+	// probationCoverage, mirroring nonCountableCoverageSQL / DispatchCandidate.ProbationCoverage.
+	// eligibleLocked's coverage bound subtracts probationCoverage, so these cover no redundancy.
+	// Their subjects are fresh per-keypair sentinels: never the requester's (no distinctness
+	// collision) and never trusted (a non-OK account cannot be trusted-present).
+	probationCoverage := 0
+	for i := 0; i < s.OtherProbationLiveCopies; i++ {
+		dbActive++
+		probationCoverage++
+		contributors[trust.SubjectForVolunteerID(types.NewID())] = struct{}{}
+	}
+	for i := 0; i < s.OtherProbationPendingResults; i++ {
+		dbActive++
+		probationCoverage++
+		contributors[trust.SubjectForVolunteerID(types.NewID())] = struct{}{}
+	}
 	if s.SelfLiveCopy {
 		dbActive++
 		contributors[reqSubject] = struct{}{}
@@ -200,6 +222,32 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		c.trustScores[reqSubject] = s.RequesterTrustScore
 	}
 
+	// Requester account standing (BG-24b): install the requester's RAW standing (standing +
+	// benched_until) into the TTL snapshot the BENCHED gate reads, built as a standing.Entry —
+	// exactly what refreshStanding would load from the store. Effective standing is NEVER
+	// hand-computed: eligibleLocked resolves the entry through volunteer.EffectiveStanding at
+	// read time (effectiveStandingLocked), so a live bench reads BENCHED, an EXPIRED bench
+	// reads PROBATION, and a stored PROBATION reads PROBATION. StandingOK ("") leaves the
+	// requester ABSENT from the snapshot (it carries only the non-OK minority), so the gate is
+	// inert. Only the REQUESTER's standing goes here; the probation-held OTHER copies above are
+	// pre-counted DB rows carried by probationCoverage, not snapshot entries.
+	if s.RequesterStanding != dispatchparity.StandingOK {
+		var entry standing.Entry
+		switch s.RequesterStanding {
+		case dispatchparity.StandingBenched:
+			var until *time.Time
+			if s.RequesterBenchExpired {
+				past := c.now().Add(-time.Hour) // expired bench => effective PROBATION
+				until = &past
+			}
+			entry = standing.Entry{Standing: volunteer.StandingBenched, BenchedUntil: until}
+		case dispatchparity.StandingProbation:
+			entry = standing.Entry{Standing: volunteer.StandingProbation}
+		}
+		c.standingSnapshot = map[types.ID]standing.Entry{requester: entry}
+		c.standingSnapshotAt = c.now()
+	}
+
 	cand := candidate{
 		unit: &workunit.WorkUnit{
 			ID:              unitID,
@@ -210,6 +258,7 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		},
 		effectiveRedundancy: s.TargetCopies,
 		dbActiveCount:       dbActive,
+		probationCoverage:   probationCoverage,
 		contributors:        contributors,
 		benched:             benched,
 		effectiveTrustK:     trustK,

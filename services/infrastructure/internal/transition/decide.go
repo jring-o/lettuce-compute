@@ -96,9 +96,35 @@ type UnitSnapshot struct {
 	ErrorCopies int
 	// PendingCount is the number of PENDING results (already version-homogeneous filtered).
 	PendingCount int
+	// ProbationLiveCopies and ProbationPendingCount are the subsets of LiveCopies / PendingCount
+	// that DO NOT count toward redundancy coverage because the copy is held (live) or was
+	// submitted (pending) by a non-OK-standing account (BG-24b): a live copy whose HOLDER's
+	// CURRENT effective standing is not OK, and a pending result whose submit-time standing
+	// STAMP was not OK. Redundancy coverage counts only the complement (live+pending MINUS
+	// these), so a probation account forces full replication around itself instead of covering
+	// a target slot. Both zero (the default) reproduce today's arithmetic byte-for-byte.
+	ProbationLiveCopies   int
+	ProbationPendingCount int
 	// Comparison is the comparator verdict over the PENDING results. The caller computes it
 	// iff PendingCount >= Policy.MinQuorum; nil otherwise.
 	Comparison *ComparisonVerdict
+}
+
+// countableCopies is the redundancy-coverage count: live + pending copies MINUS the probation
+// (non-OK-standing) ones, which cover nothing (BG-24b). Each subtraction is clamped at >= 0
+// defensively so a transient miscount (a probation count momentarily above its live/pending
+// total) can never push coverage negative. With zero probation counts this is exactly
+// LiveCopies + PendingCount — the pre-standing coverage expression.
+func countableCopies(s UnitSnapshot) int {
+	live := s.LiveCopies - s.ProbationLiveCopies
+	if live < 0 {
+		live = 0
+	}
+	pending := s.PendingCount - s.ProbationPendingCount
+	if pending < 0 {
+		pending = 0
+	}
+	return live + pending
 }
 
 // Decision is Decide's output: the action plus whether the executor must transition the unit
@@ -119,7 +145,7 @@ type Decision struct {
 // (EffectiveTargetCopiesSQL); the property tests assert the two never diverge.
 func Dispatchable(s UnitSnapshot) bool {
 	return s.State == workunit.WorkUnitStateQueued &&
-		(s.LiveCopies+s.PendingCount) < s.Policy.TargetCopies
+		countableCopies(s) < s.Policy.TargetCopies
 }
 
 // RedundancyMet reports whether the unit's target is already covered (enough copies are live
@@ -132,7 +158,7 @@ func RedundancyMet(s UnitSnapshot) bool {
 	if s.State == workunit.WorkUnitStateValidated {
 		return true
 	}
-	return (s.LiveCopies + s.PendingCount) >= s.Policy.TargetCopies
+	return countableCopies(s) >= s.Policy.TargetCopies
 }
 
 // capsExhausted reports whether the unit's copy budget is spent: the total-copy ceiling is
@@ -140,6 +166,11 @@ func RedundancyMet(s UnitSnapshot) bool {
 // live copy and unmet quorum is dead-lettered. Note: capsExhausted alone never dead-letters a
 // unit with a live copy — that copy is allowed to finish (matches DeadLetterIfExhausted's
 // "no live copy" guard).
+//
+// Both probes are DELIBERATELY RAW (TotalCopies / ErrorCopies, probation included): the copy
+// budget is the resource valve that bounds a unit's total churn, so a unit that keeps drawing
+// probation copies (which never cover redundancy) still eventually exhausts its budget and
+// stops burning the pool — the forced-replication above cannot loop unboundedly.
 func capsExhausted(s UnitSnapshot) bool {
 	p := s.Policy
 	if p.MaxTotalCopies > 0 && s.TotalCopies >= p.MaxTotalCopies {
@@ -220,11 +251,23 @@ func Decide(s UnitSnapshot) Decision {
 	// "More copies may still arrive" = a live copy is running, OR a fresh copy can still be
 	// dispatched (headroom under target) and the copy budget is not exhausted. While true, a
 	// non-agreeing unit waits rather than rejecting or dead-lettering.
-	dispatchHeadroom := (s.LiveCopies + pending) < p.TargetCopies
+	//
+	// dispatchHeadroom uses the COUNTABLE coverage (probation copies excluded): a unit nominally
+	// at target but held short by probation copies still has headroom, so it keeps dispatching
+	// full replication around them instead of rejecting — the forced-replication case.
+	dispatchHeadroom := countableCopies(s) < p.TargetCopies
+	// moreCopiesPossible's first term is DELIBERATELY RAW: ANY live copy — probation included —
+	// may still produce a result, so a unit is never dead-lettered or rejected while one exists.
+	// A probation live copy does not COVER redundancy but it is not dead weight either; letting
+	// it finish is strictly better than reaping the unit.
 	moreCopiesPossible := s.LiveCopies > 0 || (dispatchHeadroom && !capsExhausted(s))
 
 	// 2. A quorum's worth of results is in, but they do not agree (verdict present, didn't
-	//    pass §1).
+	//    pass §1). This gate is DELIBERATELY RAW `pending` (probation results included): it asks
+	//    only whether enough results have physically arrived to attempt a decision — a probation
+	//    result is invisible to the verdict (§1) but its arrival still trips the reject/wait
+	//    branch here, where moreCopiesPossible then keeps a probation-only unit waiting (never
+	//    an instant reject) while the copy budget holds.
 	if pending >= p.MinQuorum {
 		if moreCopiesPossible {
 			// Stragglers may still corroborate (matches applyThreshold's PENDING hold). The

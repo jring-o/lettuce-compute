@@ -46,6 +46,14 @@ type WorkUnitStore interface {
 	GetByID(ctx context.Context, id types.ID) (*workunit.WorkUnit, error)
 	MarkCompleted(ctx context.Context, id types.ID) error
 	CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
+	// CountProbationLiveCopies returns the live copies whose HOLDER's CURRENT effective standing
+	// is not OK (BG-24b) — the probation-held copies Decide EXCLUDES from redundancy coverage so
+	// the unit forces full replication around them. This is a REQUIRED store method, not an
+	// optional type-asserted capability: it feeds Decide's coverage arithmetic (a CORRECTNESS
+	// input), and a silent zero-fallback would quietly disable forced replication and let honest
+	// volunteers be penalized in a reject round. Compile-time satisfaction is the guarantee; the
+	// type-assertion idiom stays reserved for observability probes, never decision inputs.
+	CountProbationLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error)
@@ -148,14 +156,32 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 	if err != nil {
 		return OutcomeNoop, err
 	}
+	probationLive, err := t.wus.CountProbationLiveCopies(ctx, id)
+	if err != nil {
+		return OutcomeNoop, err
+	}
+
+	// Probation-standing coverage (BG-24b): copies that do NOT count toward redundancy because
+	// the holder's CURRENT standing (live copies) or the submit-time stamp (pending results) was
+	// not OK — Decide forces full replication around them. The live count needs the holders'
+	// CURRENT standing (a live copy has stamped nothing yet), so it comes from the store; the
+	// pending count reads the stamps already in the filtered slice.
+	probationPending := 0
+	for _, r := range pending {
+		if !StandingCountable(r) {
+			probationPending++
+		}
+	}
 
 	snap := UnitSnapshot{
-		State:        wu.State,
-		Policy:       policy,
-		LiveCopies:   live,
-		TotalCopies:  total,
-		ErrorCopies:  errCopies,
-		PendingCount: len(pending),
+		State:                 wu.State,
+		Policy:                policy,
+		LiveCopies:            live,
+		ProbationLiveCopies:   probationLive,
+		TotalCopies:           total,
+		ErrorCopies:           errCopies,
+		PendingCount:          len(pending),
+		ProbationPendingCount: probationPending,
 	}
 
 	var majority []*result.Result

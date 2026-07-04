@@ -34,7 +34,8 @@ const volunteerColumns = `id, numeric_id, public_key, user_id, display_name,
 	total_work_units_completed, total_work_units_rejected,
 	registered_at, created_at, updated_at,
 	did, did_binding_uri, did_binding_cid, did_binding_status,
-	did_bound_at, did_binding_checked_at, did_binding_check_failures, did_frozen_until`
+	did_bound_at, did_binding_checked_at, did_binding_check_failures, did_frozen_until,
+	standing, benched_until, standing_source, standing_reason, standing_changed_at`
 
 // scanVolunteer scans a volunteer row into a Volunteer struct. The scan order must
 // match volunteerColumns exactly.
@@ -65,6 +66,11 @@ func scanVolunteer(row pgx.Row) (*Volunteer, error) {
 		&v.DIDBindingCheckedAt,
 		&v.DIDBindingCheckFailures,
 		&v.DIDFrozenUntil,
+		&v.Standing,
+		&v.BenchedUntil,
+		&v.StandingSource,
+		&v.StandingReason,
+		&v.StandingChangedAt,
 	)
 	return &v, err
 }

@@ -22,7 +22,7 @@ type DBTX interface {
 const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_ref,
 	output_checksum, execution_metadata, validation_status,
 	submitted_at, validated_at, created_at, updated_at, artifact_version_id, host_id,
-	trust_subject, trust_score_at_submit`
+	trust_subject, trust_score_at_submit, standing_at_submit`
 
 // prefixedResultColumns is resultColumns with an r. table alias prefix, for
 // queries that JOIN results against another table (e.g. ListByLeaf). Keep it in
@@ -30,7 +30,7 @@ const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_
 const prefixedResultColumns = `r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
 	r.output_checksum, r.execution_metadata, r.validation_status,
 	r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id, r.host_id,
-	r.trust_subject, r.trust_score_at_submit`
+	r.trust_subject, r.trust_score_at_submit, r.standing_at_submit`
 
 func scanResult(row pgx.Row) (*Result, error) {
 	var r Result
@@ -52,6 +52,7 @@ func scanResult(row pgx.Row) (*Result, error) {
 		&r.HostID,
 		&r.TrustSubject,
 		&r.TrustScoreAtSubmit,
+		&r.StandingAtSubmit,
 	)
 	if err != nil {
 		return nil, err
@@ -83,12 +84,12 @@ func (repo *PgxRepository) Create(ctx context.Context, r *Result) error {
 		INSERT INTO results (
 			work_unit_id, volunteer_id, output_data, output_data_ref,
 			output_checksum, execution_metadata, validation_status, artifact_version_id, host_id,
-			trust_subject, trust_score_at_submit
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			trust_subject, trust_score_at_submit, standing_at_submit
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING `+resultColumns,
 		r.WorkUnitID, r.VolunteerID, r.OutputData, r.OutputDataRef,
 		r.OutputChecksum, metadataJSON, r.ValidationStatus, r.ArtifactVersionID, r.HostID,
-		r.TrustSubject, r.TrustScoreAtSubmit,
+		r.TrustSubject, r.TrustScoreAtSubmit, r.StandingAtSubmit,
 	)
 
 	created, err := scanResult(row)
