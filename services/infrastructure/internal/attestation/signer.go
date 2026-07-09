@@ -4,8 +4,6 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"sort"
 )
 
 // Signer creates Ed25519 signatures over attestation data.
@@ -45,20 +43,20 @@ func VerifyAttestation(publicKey ed25519.PublicKey, att *Attestation) bool {
 // CanonicalJSON produces a deterministic JSON representation of the signed
 // attestation fields. Keys are sorted alphabetically. This is the exact byte
 // sequence that is signed/verified.
+//
+// raw_metrics are DELIBERATELY EXCLUDED from the signed bytes: they are volunteer
+// self-reported resource numbers the head never independently verifies, so signing them
+// would let a consumer treat attacker-chosen values as head-certified fact. The signature
+// therefore covers only head-derived facts (outcome, credit, identities, timestamp); the
+// metrics remain stored and served (see the Attestation struct / list handler) as UNSIGNED
+// provenance.
 func CanonicalJSON(att *Attestation) ([]byte, error) {
-	// Sort raw_metrics keys for deterministic output.
-	sortedMetrics, err := sortedMap(att.RawMetrics)
-	if err != nil {
-		return nil, fmt.Errorf("canonical json: sort raw_metrics: %w", err)
-	}
-
 	// Build the canonical map with sorted keys (Go map iteration order is random,
 	// so we use a slice of key-value pairs marshaled manually).
 	canonical := []kv{
 		{"attestation_timestamp", att.AttestationTimestamp.UTC().Format("2006-01-02T15:04:05.000000Z")},
 		{"credit_amount", att.CreditAmount},
 		{"leaf_id", att.LeafID.String()},
-		{"raw_metrics", sortedMetrics},
 		{"validation_outcome", att.ValidationOutcome},
 		{"volunteer_public_key", base64.RawURLEncoding.EncodeToString(att.VolunteerPublicKey)},
 		{"work_unit_id", att.WorkUnitID.String()},
@@ -96,20 +94,3 @@ func marshalSortedKV(pairs []kv) ([]byte, error) {
 	return buf, nil
 }
 
-// sortedMap returns the map re-marshaled with sorted keys for deterministic output.
-func sortedMap(m map[string]any) (json.RawMessage, error) {
-	if m == nil {
-		return json.RawMessage("{}"), nil
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	pairs := make([]kv, len(keys))
-	for i, k := range keys {
-		pairs[i] = kv{Key: k, Value: m[k]}
-	}
-	return marshalSortedKV(pairs)
-}
