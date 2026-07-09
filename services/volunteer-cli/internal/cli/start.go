@@ -80,13 +80,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("loading identity: %w (run 'lettuce-volunteer init' first)", err)
 	}
 
-	// Load (or create, for installs predating the host split) this machine's stable
-	// host id. The keypair is the account; the host id distinguishes this machine under
-	// it so the head meters work per machine while credit pools per account (TODO #19).
-	hostID, err := identity.LoadOrCreateHostID(cfg.HostIDPath())
-	if err != nil {
-		return fmt.Errorf("loading host id: %w", err)
-	}
+	// Per-head host-id store (BG-25). Host identity is HEAD-ISSUED: each head mints a
+	// per-machine id at registration and the client persists it keyed by that head's
+	// gRPC address (empty on first contact => the head mints one). The keypair is the
+	// account (same key everywhere); the head-issued id distinguishes this machine under
+	// it so the head meters work per machine while credit pools per account.
+	hostIDStore := identity.NewHostIDStore(cfg.HostIDsPath())
 
 	// Verify at least one server is configured.
 	if len(cfg.Servers) == 0 {
@@ -211,7 +210,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			headVersion = statusResp.Version
 		}
 
-		volID, isNew, err := client.Register(cmd.Context(), grpcClient, pub, hostID, cfg, cfgPath, advertised...)
+		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
@@ -232,8 +231,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 			Config:      srv,
 			Client:      grpcClient,
 			VolunteerID: volID,
-			Name:        name,
-			Available:   true,
+			// Per-head, head-issued host id (BG-25): exactly what THIS head returned
+			// (empty => host-less this session, retry the mint on a later register).
+			HostID:    issuedHostID,
+			Name:      name,
+			Available: true,
 		})
 
 		stateServers = append(stateServers, daemon.ServerState{
@@ -297,7 +299,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		Config:          cfg,
 		PubKey:          pub,
 		PrivKey:         priv,
-		HostID:          hostID,
+		HostIDStore:     hostIDStore,
 		Servers:         connections,
 		RuntimeRegistry: registry,
 		MachineManager:  machineManager,

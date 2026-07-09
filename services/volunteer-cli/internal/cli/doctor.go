@@ -147,10 +147,27 @@ func checkAccountInfo(rep *doctorReport) {
 		rep.add(docInfo, "volunteer id", "not yet assigned — registers on first start", "")
 	}
 
-	if hostID, err := identity.LoadHostID(cfg.HostIDPath()); err == nil && hostID != "" {
-		rep.add(docInfo, "host id", hostID+" (this machine, under the account)", "")
+	// Host ids are HEAD-ISSUED and stored per-head (BG-25): the head mints a
+	// per-machine id at registration and the client persists it keyed by that head's
+	// gRPC address. Report each configured head's id, or 'none yet' before the first
+	// registration mints one.
+	ids, _ := identity.NewHostIDStore(cfg.HostIDsPath()).All()
+	if len(cfg.Servers) == 0 {
+		rep.add(docInfo, "host id", "no heads configured — a head issues one on first start", "")
 	} else {
-		rep.add(docInfo, "host id", "not created yet — created on first start", "")
+		seen := make(map[string]bool, len(cfg.Servers))
+		for _, srv := range cfg.Servers {
+			if seen[srv.GRPCAddress] {
+				continue
+			}
+			seen[srv.GRPCAddress] = true
+			label := "host id (" + srv.DisplayName() + ")"
+			if id := ids[srv.GRPCAddress]; id != "" {
+				rep.add(docInfo, label, id+" (issued by this head, under the account)", "")
+			} else {
+				rep.add(docInfo, label, "none yet — minted on first start", "")
+			}
+		}
 	}
 
 	rep.add(docInfo, "schedule", describeSchedule(cfg.Scheduling), "")

@@ -18,11 +18,12 @@ type Config struct {
 	DataDir    string `yaml:"data_dir"`
 	KeyFile    string `yaml:"key_file"`
 	PubKeyFile string `yaml:"pubkey_file"`
-	// HostIDFile holds this MACHINE's stable host key (default <DataDir>/host.id). The
-	// keypair is the ACCOUNT — run the same key everywhere — and the host key
-	// distinguishes this machine under it so the head meters in-flight work and the
-	// work-send floor per machine while credit pools per account (TODO #19). Empty =>
-	// <DataDir>/host.id.
+	// HostIDFile is the path of the RETIRED client-generated per-machine host id
+	// (default <DataDir>/host.id). Host identity is now HEAD-ISSUED and stored
+	// per-head in <DataDir>/host-ids.json (see HostIDsPath); this legacy single-file
+	// value is no longer read or written. The field is retained only so an existing
+	// config carrying host_id_file still loads (and `config get/set host_id_file`
+	// keep working) rather than erroring on an unknown key.
 	HostIDFile string `yaml:"host_id_file,omitempty"`
 
 	VolunteerID string `yaml:"volunteer_id,omitempty"`
@@ -232,13 +233,22 @@ func (c *Config) LogFilePath() string {
 	return filepath.Join(c.DataDir, "logs", "volunteer.log")
 }
 
-// HostIDPath returns the resolved host-id file path: the explicit HostIDFile when set,
-// otherwise <DataDir>/host.id.
+// HostIDPath returns the resolved path of the RETIRED single-file host id. It is kept
+// only for reference/diagnostics; nothing consults this file anymore (see HostIDsPath
+// for the current head-issued, per-head store).
 func (c *Config) HostIDPath() string {
 	if c.HostIDFile != "" {
 		return c.HostIDFile
 	}
 	return filepath.Join(c.DataDir, "host.id")
+}
+
+// HostIDsPath returns the path of the per-head host-id store (<DataDir>/host-ids.json),
+// a JSON object mapping each head's gRPC address to the host id that head issued this
+// machine. Head identity is minted server-side (BG-25); the client persists and echoes
+// exactly what each head returns.
+func (c *Config) HostIDsPath() string {
+	return filepath.Join(c.DataDir, "host-ids.json")
 }
 
 // Load reads and parses a YAML config file. Returns defaults if the file doesn't exist.

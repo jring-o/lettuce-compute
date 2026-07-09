@@ -15,10 +15,17 @@ type ServerConnection struct {
 	Config      config.ServerConfig
 	Client      WorkClient
 	VolunteerID string
-	Name        string        // display name (config.Name or hostname)
-	Available   bool          // false if last request failed
-	LastError   time.Time     // when the last error occurred
-	Backoff     time.Duration // current backoff for this server
+	// HostID is the SERVER-ISSUED per-machine host id THIS head minted for this machine
+	// (BG-25), echoed on every work request so the head keys per-machine metering on it.
+	// It is per-head: each head issues its own id, so it lives on the connection beside
+	// the per-head VolunteerID rather than as one daemon-wide value. Empty => host-less
+	// (per-account fallback). Updated in place when the work path self-heals a
+	// host-unknown refusal by re-registering.
+	HostID    string
+	Name      string        // display name (config.Name or hostname)
+	Available bool          // false if last request failed
+	LastError time.Time     // when the last error occurred
+	Backoff   time.Duration // current backoff for this server
 
 	// NextContactAt is the earliest wall-clock time the fetcher may issue the
 	// next RequestWorkUnit to this head. It is set from the head's authoritative
