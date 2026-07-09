@@ -2062,23 +2062,29 @@ func (s *volunteerService) GetCheckpoint(ctx context.Context, req *lettucev1.Get
 
 	// Prefer the caller's OWN latest checkpoint (its own resumable chain). Only
 	// when it has none do we consider another volunteer's checkpoint, and only for
-	// non-redundant leaves: handing one corroborator another's in-progress state
-	// would defeat the independence that redundancy>1 validation relies on.
+	// genuinely single-copy units: handing one corroborator another's in-progress
+	// state would defeat the independence that corroboration relies on.
 	cp, data, err := s.checkpointRepo.GetLatestForVolunteer(ctx, workUnitID, caller.ID)
 	if err != nil {
 		s.logger.Error("failed to get checkpoint", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 	if cp == nil {
-		// Resolve redundancy from the leaf; default to corroborated (>1) on any
-		// lookup failure so we never leak a checkpoint across volunteers by mistake.
-		redundancy := 2
+		// A unit is safe to share a checkpoint across volunteers ONLY when it is
+		// single-copy. The corroboration signal is the RESOLVED redundancy policy —
+		// the same source dispatch and quorum read (transition.ResolvePolicy) — NOT
+		// redundancy_factor: a leaf can require corroboration via target_copies /
+		// min_quorum (or a live spot-check promotion) while redundancy_factor is still
+		// 1, so reading redundancy_factor would leak one volunteer's in-progress state
+		// to a distinct corroborator on the same unit. Default to corroborated (never
+		// share) on any lookup failure.
+		corroborated := true
 		if wu, wuErr := s.wuRepo.GetByID(ctx, workUnitID); wuErr == nil {
 			if lf, lfErr := s.leafRepo.GetByID(ctx, wu.LeafID); lfErr == nil && lf != nil {
-				redundancy = lf.ValidationConfig.RedundancyFactor
+				corroborated = transition.ResolvePolicy(lf, wu).TargetCopies > 1
 			}
 		}
-		if redundancy <= 1 {
+		if !corroborated {
 			cp, data, err = s.checkpointRepo.GetLatest(ctx, workUnitID)
 			if err != nil {
 				s.logger.Error("failed to get checkpoint", "error", err)
