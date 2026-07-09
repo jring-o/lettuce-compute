@@ -39,7 +39,6 @@ export interface WorkUnitResponse {
   code_artifact_url?: string;
   parameters_json?: string;
   deadline_seconds: number;
-  heartbeat_interval_seconds: number;
   env_vars?: Record<string, string>;
   execution_spec: ExecutionSpec;
   rsc_fpops_est?: number;
@@ -58,21 +57,53 @@ export interface SubmitResultResponse {
   validation_status: string;
 }
 
-export interface HeartbeatRequest {
-  work_unit_id: string;
-  progress_pct: number;
-  metrics: Partial<ExecutionMetrics>;
-}
-
-export interface HeartbeatResponse {
-  continue_execution: boolean;
-}
-
 export interface ExecutionMetrics {
   wall_clock_seconds: number;
   cpu_seconds_user: number;
   peak_memory_mb: number;
 }
+
+// Registration proof-of-work (the head's REST contract: POST
+// /api/v1/volunteers/register-challenge issues a challenge; the register body then
+// carries pow_challenge_id + pow_nonce). The solution rule is pinned by the golden
+// byte vector shared with the head's pow package: the digest of
+// SHA-256(challenge || publicKey || nonce as 8 big-endian bytes) must have at least
+// difficulty_bits leading zero bits.
+
+export interface RegisterChallengeResponse {
+  challenge_id: string;
+  challenge_hex: string; // 32 bytes, hex-encoded — part of the hash preimage
+  difficulty_bits: number;
+  expires_at: string; // RFC 3339
+}
+
+// A solved challenge, ready to ride a register request.
+export interface RegisterPow {
+  challengeId: string;
+  // Decimal uint64 string — the wire encoding (JSON numbers cannot carry uint64).
+  nonce: string;
+}
+
+export interface PowSolution {
+  nonce: string; // decimal uint64 string, same encoding as RegisterPow.nonce
+  attempts: number;
+}
+
+// Solver worker <-> main thread messages (one-shot pow-worker). The solve loop is
+// synchronous, so the worker never processes incoming messages mid-solve —
+// cancellation is exclusively worker.terminate() from the main thread.
+
+export type SolverRequestMessage = {
+  type: "solve";
+  challengeHex: string;
+  publicKeyBase64url: string;
+  difficultyBits: number;
+};
+
+export type SolverResponseMessage =
+  | { type: "solved"; nonce: string; attempts: number }
+  | { type: "pow-progress"; attempts: number }
+  | { type: "error"; message: string };
 
 // Worker <-> Main thread message types (discriminated union).
 

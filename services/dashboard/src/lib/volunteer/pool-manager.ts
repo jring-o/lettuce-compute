@@ -37,8 +37,6 @@ export class PoolManager {
   private client: VolunteerClient;
   private workers: WorkerState[] = [];
   private running = false;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatIntervalMs = 30_000;
   private options: PoolManagerOptions;
   private stats: PoolStats = {
     activeWorkers: 0,
@@ -61,11 +59,6 @@ export class PoolManager {
       this.spawnWorker();
     }
 
-    // Start heartbeat timer.
-    this.heartbeatTimer = setInterval(() => {
-      this.sendHeartbeats();
-    }, this.heartbeatIntervalMs);
-
     // Kick off initial work fetch for all workers.
     for (const ws of this.workers) {
       this.fetchAndDispatch(ws);
@@ -74,11 +67,6 @@ export class PoolManager {
 
   async stop(): Promise<void> {
     this.running = false;
-
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
 
     // Abort and terminate all workers.
     for (const ws of this.workers) {
@@ -184,7 +172,7 @@ export class PoolManager {
         break;
 
       case "progress":
-        // Progress updates are informational; heartbeats handle server communication.
+        // Progress updates are informational; nothing to report to the server.
         break;
 
       case "error":
@@ -259,15 +247,6 @@ export class PoolManager {
         return;
       }
 
-      // Update heartbeat interval from server response (only reset timer if changed).
-      if (wu.heartbeat_interval_seconds > 0) {
-        const newInterval = wu.heartbeat_interval_seconds * 1000;
-        if (newInterval !== this.heartbeatIntervalMs) {
-          this.heartbeatIntervalMs = newInterval;
-          this.resetHeartbeatTimer();
-        }
-      }
-
       ws.busy = true;
       ws.currentWorkUnit = wu;
       ws.startedAt = performance.now();
@@ -282,48 +261,6 @@ export class PoolManager {
     } catch {
       // Fetch failed — retry after a delay.
       setTimeout(() => this.fetchAndDispatch(ws), 10_000);
-    }
-  }
-
-  private async sendHeartbeats(): Promise<void> {
-    // Send all heartbeats concurrently to avoid serial latency accumulation.
-    // With N workers and 200-500ms latency each, sequential sends would take
-    // N * latency. Promise.allSettled ensures one failure doesn't block others.
-    const promises = this.workers
-      .filter((ws) => ws.busy && ws.currentWorkUnit)
-      .map(async (ws) => {
-        const elapsed = ws.startedAt
-          ? Math.round((performance.now() - ws.startedAt) / 1000)
-          : 0;
-
-        try {
-          const resp = await this.client.heartbeat({
-            work_unit_id: ws.currentWorkUnit!.work_unit_id,
-            progress_pct: 0,
-            metrics: { wall_clock_seconds: elapsed },
-          });
-
-          if (!resp.continue_execution) {
-            // Server says stop — abort this worker's task.
-            const abortMsg: MainToWorkerMessage = { type: "abort" };
-            ws.worker.postMessage(abortMsg);
-          }
-        } catch {
-          // Heartbeat failed — continue; server will handle timeout.
-        }
-      });
-
-    await Promise.allSettled(promises);
-  }
-
-  private resetHeartbeatTimer(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-    }
-    if (this.running) {
-      this.heartbeatTimer = setInterval(() => {
-        this.sendHeartbeats();
-      }, this.heartbeatIntervalMs);
     }
   }
 

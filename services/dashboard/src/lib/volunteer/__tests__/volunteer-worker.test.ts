@@ -92,7 +92,6 @@ function makeWorkUnit(overrides: Partial<WorkUnitResponse> = {}): WorkUnitRespon
     leaf_id: "leaf-test-1",
     runtime: "WASM",
     deadline_seconds: 3600,
-    heartbeat_interval_seconds: 30,
     execution_spec: {
       binaries: { wasm: "http://example.com/compute.wasm" },
       gpu_required: false,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -12,14 +12,24 @@ import { ActivityLog, type LogEntry } from "./activity-log";
 import { getOrCreateIdentity, createNewIdentity, deleteIdentity } from "@/lib/volunteer/identity";
 import type { VolunteerIdentity } from "@/lib/volunteer/identity";
 import { createVolunteerClient } from "@/lib/volunteer/client";
+import {
+  registerWithPow,
+  type RegisterFlowHandle,
+} from "@/lib/volunteer/register-flow";
+import { PowSolveCancelledError } from "@/lib/volunteer/pow-solver";
 import { PoolManager, type PoolStats } from "@/lib/volunteer/pool-manager";
 
 type ContributeStatus =
   | "idle"
   | "initializing"
   | "registering"
+  | "solving"
   | "running"
   | "stopping";
+
+// Solve-progress log lines are sampled to one per ~1M attempts (16 solver callbacks)
+// so a difficulty-20 solve emits at most a couple of lines.
+const SOLVE_LOG_SAMPLE_ATTEMPTS = 1_048_576;
 
 const MAX_LOG_ENTRIES = 50;
 
@@ -48,7 +58,16 @@ export function ContributePage() {
   const [confirmRegenerate, setConfirmRegenerate] = useState(false);
 
   const poolRef = useRef<PoolManager | null>(null);
+  const solverRef = useRef<RegisterFlowHandle | null>(null);
   const logIdRef = useRef(0);
+
+  // A solve runs in a dedicated worker that only terminate() can interrupt; make sure
+  // navigating away from the page never leaves one spinning.
+  useEffect(() => {
+    return () => {
+      solverRef.current?.cancel();
+    };
+  }, []);
 
   const addLog = useCallback(
     (message: string, level: LogEntry["level"] = "info") => {
@@ -115,14 +134,43 @@ export function ContributePage() {
       addLog("Registering with server...");
 
       const client = createVolunteerClient(serverUrl, id);
-      await client.register({
-        cpu_cores: hardware.cpuCores,
-        memory_mb: (hardware.memoryGB ?? 4) * 1024,
-        has_gpu: hardware.webgpuAvailable && gpuEnabled,
-        gpu_vendors:
-          hardware.webgpuAvailable && gpuEnabled ? ["WEBGPU"] : [],
-        available_runtimes: ["WASM"],
-      });
+      const flow = registerWithPow(
+        client,
+        {
+          cpu_cores: hardware.cpuCores,
+          memory_mb: (hardware.memoryGB ?? 4) * 1024,
+          has_gpu: hardware.webgpuAvailable && gpuEnabled,
+          gpu_vendors:
+            hardware.webgpuAvailable && gpuEnabled ? ["WEBGPU"] : [],
+          available_runtimes: ["WASM"],
+        },
+        id.publicKeyBase64url,
+        {
+          onSolvingStart: (difficultyBits) => {
+            setStatus("solving");
+            addLog(
+              `Registration requires proof-of-work — solving a difficulty-${difficultyBits} challenge...`
+            );
+          },
+          onSolveProgress: (attempts) => {
+            if (attempts % SOLVE_LOG_SAMPLE_ATTEMPTS === 0) {
+              addLog(`Still solving... (${attempts.toLocaleString()} attempts)`);
+            }
+          },
+          onSolved: (attempts, elapsedMs) => {
+            addLog(
+              `Challenge solved in ${(elapsedMs / 1000).toFixed(1)}s (${attempts.toLocaleString()} attempts)`,
+              "success"
+            );
+          },
+        }
+      );
+      solverRef.current = flow;
+      try {
+        await flow.promise;
+      } finally {
+        solverRef.current = null;
+      }
 
       addLog("Registered successfully", "success");
       setStatus("running");
@@ -143,11 +191,20 @@ export function ContributePage() {
       await pool.start();
       addLog(`${workerCount} worker(s) started`, "success");
     } catch (err) {
+      if (err instanceof PowSolveCancelledError) {
+        addLog("Registration cancelled", "info");
+        setStatus("idle");
+        return;
+      }
       const msg =
         err instanceof Error ? err.message : "Failed to start";
       addLog(msg, "error");
       setStatus("idle");
     }
+  }
+
+  function handleCancelSolve() {
+    solverRef.current?.cancel();
   }
 
   async function handleStop() {
@@ -184,6 +241,7 @@ export function ContributePage() {
   const isBusy =
     status === "initializing" ||
     status === "registering" ||
+    status === "solving" ||
     status === "stopping";
 
   const showGpuToggle =
@@ -338,6 +396,15 @@ export function ContributePage() {
                   {status === "stopping"
                     ? "Stopping..."
                     : "Stop Contributing"}
+                </Button>
+              ) : status === "solving" ? (
+                <Button
+                  variant="outline"
+                  size="lg"
+                  className="w-full"
+                  onClick={handleCancelSolve}
+                >
+                  Solving challenge... — Cancel
                 </Button>
               ) : (
                 <Button

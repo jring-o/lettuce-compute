@@ -5,12 +5,12 @@ import { base64urlEncode, bytesToHex } from "./identity";
 import type {
   HardwareCapabilities,
   RegisterResponse,
+  RegisterChallengeResponse,
+  RegisterPow,
   RequestWorkOptions,
   WorkUnitResponse,
   SubmitResultRequest,
   SubmitResultResponse,
-  HeartbeatRequest,
-  HeartbeatResponse,
 } from "./types";
 
 // Default timeout for API requests (30 seconds).
@@ -18,11 +18,81 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 // Longer timeout for result submission (large payloads).
 const SUBMIT_TIMEOUT_MS = 60_000;
 
+// Error raised for non-ok responses from the head's REST API. The head wraps
+// errors in an {"error":{"code","message"}} envelope; ApiError surfaces the
+// parsed code so callers classify on it (e.g. POW_REQUIRED, POW_INVALID,
+// REGISTRATION_CAP_EXCEEDED) instead of matching brittle message text. When the
+// body is not that envelope, code and serverMessage are null and the raw body
+// rides Error.message.
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+  readonly serverMessage: string | null;
+
+  constructor(
+    status: number,
+    code: string | null,
+    serverMessage: string | null,
+    message: string
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.serverMessage = serverMessage;
+  }
+}
+
+// Parse the head's {"error":{"code","message"}} envelope out of a body string.
+// Returns nulls for both fields when the body is not that shape (non-JSON, or
+// JSON without the envelope).
+function parseErrorEnvelope(raw: string): {
+  code: string | null;
+  message: string | null;
+} {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "error" in parsed &&
+      parsed.error &&
+      typeof parsed.error === "object"
+    ) {
+      const err = parsed.error as { code?: unknown; message?: unknown };
+      return {
+        code: typeof err.code === "string" ? err.code : null,
+        message: typeof err.message === "string" ? err.message : null,
+      };
+    }
+  } catch {
+    // Not JSON — fall through to the null/raw-text fallback.
+  }
+  return { code: null, message: null };
+}
+
+// Build an ApiError from a non-ok Response with a SINGLE body read. Real
+// browsers throw "body stream already read" if both .json() and .text() are
+// called on one Response, so the body is read exactly once via .text() and
+// JSON-parsed in a try/catch.
+async function apiErrorFromResponse(
+  resp: Response,
+  context: string
+): Promise<ApiError> {
+  const raw = await resp.text();
+  const { code, message: serverMessage } = parseErrorEnvelope(raw);
+  const message = `${context} failed: ${resp.status} ${serverMessage ?? raw}`;
+  return new ApiError(resp.status, code, serverMessage, message);
+}
+
 export interface VolunteerClient {
-  register(hardware: HardwareCapabilities): Promise<RegisterResponse>;
+  register(
+    hardware: HardwareCapabilities,
+    pow?: RegisterPow
+  ): Promise<RegisterResponse>;
+  fetchRegistrationChallenge(): Promise<RegisterChallengeResponse>;
   requestWork(opts: RequestWorkOptions): Promise<WorkUnitResponse | null>;
   submitResult(result: SubmitResultRequest): Promise<SubmitResultResponse>;
-  heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
 }
 
 async function sha256Hex(data: string): Promise<string> {
@@ -81,11 +151,23 @@ export function createVolunteerClient(
   }
 
   return {
-    async register(hardware: HardwareCapabilities): Promise<RegisterResponse> {
-      const body = {
+    async register(
+      hardware: HardwareCapabilities,
+      pow?: RegisterPow
+    ): Promise<RegisterResponse> {
+      const body: {
+        public_key: string;
+        hardware: HardwareCapabilities;
+        pow_challenge_id?: string;
+        pow_nonce?: string;
+      } = {
         public_key: identity.publicKeyBase64url,
         hardware,
       };
+      if (pow) {
+        body.pow_challenge_id = pow.challengeId;
+        body.pow_nonce = pow.nonce;
+      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
       let resp: Response;
@@ -100,9 +182,31 @@ export function createVolunteerClient(
         clearTimeout(timer);
       }
       if (!resp.ok && resp.status !== 409) {
-        throw new Error(
-          `Registration failed: ${resp.status} ${await resp.text()}`
+        throw await apiErrorFromResponse(resp, "Registration");
+      }
+      return resp.json();
+    },
+
+    async fetchRegistrationChallenge(): Promise<RegisterChallengeResponse> {
+      const body = { public_key: identity.publicKeyBase64url };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+      let resp: Response;
+      try {
+        resp = await fetch(
+          `${baseUrl}/api/v1/volunteers/register-challenge`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          }
         );
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!resp.ok) {
+        throw await apiErrorFromResponse(resp, "Registration challenge");
       }
       return resp.json();
     },
@@ -135,17 +239,6 @@ export function createVolunteerClient(
       if (!resp.ok) {
         throw new Error(
           `Submit result failed: ${resp.status} ${await resp.text()}`
-        );
-      }
-      return resp.json();
-    },
-
-    async heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse> {
-      const path = "/api/v1/volunteers/heartbeat";
-      const resp = await authenticatedFetch(path, req);
-      if (!resp.ok) {
-        throw new Error(
-          `Heartbeat failed: ${resp.status} ${await resp.text()}`
         );
       }
       return resp.json();

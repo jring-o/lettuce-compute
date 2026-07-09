@@ -6,14 +6,12 @@ import type { WorkerToMainMessage } from "../types";
 const mockRegister = jest.fn();
 const mockRequestWork = jest.fn();
 const mockSubmitResult = jest.fn();
-const mockHeartbeat = jest.fn();
 
 jest.mock("../client", () => ({
   createVolunteerClient: jest.fn(() => ({
     register: mockRegister,
     requestWork: mockRequestWork,
     submitResult: mockSubmitResult,
-    heartbeat: mockHeartbeat,
   })),
 }));
 
@@ -72,7 +70,6 @@ describe("PoolManager", () => {
       accepted: true,
       validation_status: "VALIDATION_PENDING",
     });
-    mockHeartbeat.mockResolvedValue({ continue_execution: true });
   });
 
   afterEach(() => {
@@ -122,7 +119,7 @@ describe("PoolManager", () => {
   });
 
   describe("stop", () => {
-    it("terminates all workers and clears heartbeat timer", async () => {
+    it("terminates all workers", async () => {
       const pool = createPool(2);
       await pool.start();
 
@@ -155,7 +152,6 @@ describe("PoolManager", () => {
         leaf_id: "leaf-1",
         runtime: "WASM",
         deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
         execution_spec: {
           binaries: { wasm: "http://example.com/compute.wasm" },
           gpu_required: false,
@@ -191,7 +187,6 @@ describe("PoolManager", () => {
         leaf_id: "leaf-1",
         runtime: "WASM",
         deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
         execution_spec: {
           binaries: { wasm: "http://example.com/compute.wasm" },
           gpu_required: false,
@@ -320,7 +315,6 @@ describe("PoolManager", () => {
         leaf_id: "leaf-1",
         runtime: "WASM",
         deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
         execution_spec: {
           binaries: {},
           gpu_required: false,
@@ -352,7 +346,6 @@ describe("PoolManager", () => {
         leaf_id: "leaf-1",
         runtime: "WASM",
         deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
         execution_spec: {
           binaries: {},
           gpu_required: false,
@@ -388,7 +381,6 @@ describe("PoolManager", () => {
         leaf_id: "leaf-1",
         runtime: "WASM",
         deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
         execution_spec: {
           binaries: {},
           gpu_required: false,
@@ -423,86 +415,4 @@ describe("PoolManager", () => {
     });
   });
 
-  describe("heartbeats", () => {
-    it("sends heartbeats for busy workers at configured interval", async () => {
-      const mockWU = {
-        work_unit_id: "wu-1",
-        leaf_id: "leaf-1",
-        runtime: "WASM",
-        deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
-        execution_spec: {
-          binaries: {},
-          gpu_required: false,
-          max_memory_mb: 4096,
-          max_disk_mb: 51200,
-          network_access: false,
-        },
-      };
-
-      mockRequestWork.mockResolvedValueOnce(mockWU);
-      mockRequestWork.mockResolvedValue(null);
-
-      const pool = createPool(1);
-      await pool.start();
-      await jest.advanceTimersByTimeAsync(0);
-
-      // Default heartbeat interval is 30s (from default heartbeatIntervalMs).
-      await jest.advanceTimersByTimeAsync(30_000);
-
-      expect(mockHeartbeat).toHaveBeenCalledWith(
-        expect.objectContaining({
-          work_unit_id: "wu-1",
-          progress_pct: 0,
-        })
-      );
-    });
-
-    it("sends abort to worker when server says stop", async () => {
-      const mockWU = {
-        work_unit_id: "wu-abort",
-        leaf_id: "leaf-1",
-        runtime: "WASM",
-        deadline_seconds: 3600,
-        heartbeat_interval_seconds: 30,
-        execution_spec: {
-          binaries: {},
-          gpu_required: false,
-          max_memory_mb: 4096,
-          max_disk_mb: 51200,
-          network_access: false,
-        },
-      };
-
-      mockRequestWork.mockResolvedValueOnce(mockWU);
-      mockRequestWork.mockResolvedValue(null);
-      mockHeartbeat.mockResolvedValue({ continue_execution: false });
-
-      const pool = createPool(1);
-      await pool.start();
-      await jest.advanceTimersByTimeAsync(0);
-
-      const worker = createdWorkers[0];
-
-      // Advance past the heartbeat interval.
-      await jest.advanceTimersByTimeAsync(30_000);
-
-      // The heartbeat returned continue_execution: false, so the worker should get abort.
-      expect(worker.postMessage).toHaveBeenCalledWith({ type: "abort" });
-    });
-
-    it("does not send heartbeats for idle workers", async () => {
-      mockRequestWork.mockResolvedValue(null);
-
-      const pool = createPool(1);
-      await pool.start();
-      await jest.advanceTimersByTimeAsync(0);
-
-      // Advance past the heartbeat interval.
-      await jest.advanceTimersByTimeAsync(30_000);
-
-      // No heartbeat should be sent since no workers are busy.
-      expect(mockHeartbeat).not.toHaveBeenCalled();
-    });
-  });
 });
