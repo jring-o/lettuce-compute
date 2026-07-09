@@ -958,6 +958,13 @@ func flattenInto(out map[string]flatVal, path string, v interface{}, ignore, com
 // numericMatch returns true if two flattened outputs agree: identical path sets, numeric
 // leaves within epsilon, non-numeric leaves equal.
 func numericMatch(a, b map[string]flatVal, epsilon float64) bool {
+	// An EMPTY compared set is never agreement. If compare_fields selected no path that
+	// exists in the output, or ignore_fields stripped every leaf, both maps are empty and
+	// the loop below would vacuously return true — letting two results with DIFFERENT
+	// content corroborate on nothing. Fail closed: nothing compared means no match.
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
 	if len(a) != len(b) {
 		return false
 	}
@@ -994,7 +1001,17 @@ func comparisonKey(r *result.Result, ignoreFields []string) (string, error) {
 	if len(ignoreFields) == 0 || len(r.OutputData) == 0 {
 		return r.OutputChecksum, nil
 	}
-	canon, err := canonicalizeJSON(r.OutputData, ignoreFields)
+	stripped, err := strippedValue(r.OutputData, ignoreFields)
+	if err != nil {
+		return "", err
+	}
+	// If ignore_fields strips every leaf, the canonical form collapses to the SAME empty
+	// shape for every result — a vacuous agreement among differing outputs. Give such a
+	// result a unique, non-grouping key so it can never corroborate on nothing.
+	if !hasAnyLeaf(stripped) {
+		return "canon-empty:" + r.ID.String(), nil
+	}
+	canon, err := json.Marshal(stripped)
 	if err != nil {
 		return "", err
 	}
@@ -1002,17 +1019,42 @@ func comparisonKey(r *result.Result, ignoreFields []string) (string, error) {
 	return "canon:" + hex.EncodeToString(sum[:]), nil
 }
 
-// canonicalizeJSON parses output JSON, strips ignoreFields, and re-marshals
-// deterministically (json.Marshal sorts object keys and emits json.Number verbatim, so
-// numeric tokens and key order are normalized identically for every result).
-func canonicalizeJSON(data json.RawMessage, ignoreFields []string) ([]byte, error) {
+// strippedValue parses output JSON (numbers preserved via UseNumber) and removes
+// ignoreFields, returning the decoded value with those paths stripped. comparisonKey then
+// re-marshals it deterministically (json.Marshal sorts object keys and emits json.Number
+// verbatim, so numeric tokens and key order normalize identically for every result).
+func strippedValue(data json.RawMessage, ignoreFields []string) (interface{}, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var v interface{}
 	if err := dec.Decode(&v); err != nil {
 		return nil, fmt.Errorf("parse output as JSON: %w", err)
 	}
-	return json.Marshal(stripFields(v, "", ignoreFields))
+	return stripFields(v, "", ignoreFields), nil
+}
+
+// hasAnyLeaf reports whether v contains at least one scalar leaf. An object or array whose
+// descendants were all stripped by ignore_fields has no leaves, so there is nothing to
+// compare — such a result must not group with any other (see comparisonKey).
+func hasAnyLeaf(v interface{}) bool {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for _, val := range t {
+			if hasAnyLeaf(val) {
+				return true
+			}
+		}
+		return false
+	case []interface{}:
+		for _, val := range t {
+			if hasAnyLeaf(val) {
+				return true
+			}
+		}
+		return false
+	default:
+		return true
+	}
 }
 
 // stripFields recursively removes object fields whose dotted path matches an ignore
