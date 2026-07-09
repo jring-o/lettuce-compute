@@ -348,6 +348,10 @@ func main() {
 	// (GetRegistrationChallenge / the REST register-challenge endpoint) works
 	// probe-free before any enforcement flip.
 	server.SetRegistrationPowPolicy(volunteerSvc, server.RegistrationPowFromHeadConfig(&cfg.Head))
+	// Per-account host cap (BG-25) — ON by default (10, 30-day activity window):
+	// bounds how many server-issued per-machine host ids one account may hold; a
+	// machine past the cap works in the shared per-account bucket.
+	server.SetHostCapPolicy(volunteerSvc, server.HostCapFromHeadConfig(&cfg.Head))
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	// Start HTTP server.

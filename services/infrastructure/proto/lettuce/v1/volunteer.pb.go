@@ -132,13 +132,21 @@ type RegisterVolunteerRequest struct {
 	Hardware          *HardwareCapabilities  `protobuf:"bytes,3,opt,name=hardware,proto3" json:"hardware,omitempty"`
 	AvailableRuntimes []string               `protobuf:"bytes,4,rep,name=available_runtimes,json=availableRuntimes,proto3" json:"available_runtimes,omitempty"` // ["NATIVE", "CONTAINER"]
 	SchedulingMode    string                 `protobuf:"bytes,5,opt,name=scheduling_mode,json=schedulingMode,proto3" json:"scheduling_mode,omitempty"`          // ALWAYS, WHEN_IDLE, SCHEDULED
-	// Stable per-MACHINE host identifier the volunteer self-generates and persists in
-	// its data dir (alongside the keypair). The keypair is the ACCOUNT — one user runs
-	// the SAME key on every machine — and this distinguishes the machines under it so
-	// per-machine facts (advertised runtimes/hardware, in-flight cap, work-send floor,
-	// last-seen, work attribution) are tracked per host while credit/distinctness stay
-	// per account. ADDITIVE: an empty host_id falls back to per-account behavior (host
-	// == account), so a volunteer that sends none is not a breaking cutover. It is
+	// The SERVER-ISSUED per-MACHINE host id this machine previously received in
+	// RegisterVolunteerResponse.host_id, echoed back so the head refreshes the same
+	// hosts row (per-machine facts: advertised runtimes/hardware, in-flight cap,
+	// work-send floor, last-seen, work attribution — while credit/distinctness stay
+	// per ACCOUNT, the keypair). Host identity is head-minted only — clients never
+	// generate host ids. Semantics by value:
+	//   - EMPTY: an explicit request for a machine id — the head mints a fresh one
+	//     (subject to the per-account host cap) and returns it.
+	//   - A known id of THIS account: the same hosts row is refreshed and the id is
+	//     echoed back.
+	//   - An unknown/revoked id: NOT an implicit mint — the response carries an EMPTY
+	//     host_id; the client should discard its stored id and re-register with an
+	//     empty one to mint explicitly.
+	//
+	// The client MUST persist and echo exactly what the response carries. It is
 	// signed under the identity key for free — the per-request signature covers the
 	// whole request — so nobody else can claim your machine.
 	HostId string `protobuf:"bytes,6,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
@@ -240,9 +248,17 @@ func (x *RegisterVolunteerRequest) GetPowNonce() uint64 {
 }
 
 type RegisterVolunteerResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VolunteerId   string                 `protobuf:"bytes,1,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"` // assigned UUID
-	Registered    bool                   `protobuf:"varint,2,opt,name=registered,proto3" json:"registered,omitempty"`                     // true if new registration, false if updated existing
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	VolunteerId string                 `protobuf:"bytes,1,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"` // assigned UUID
+	Registered  bool                   `protobuf:"varint,2,opt,name=registered,proto3" json:"registered,omitempty"`                     // true if new registration, false if updated existing
+	// The SERVER-ISSUED host id for THIS machine — the echoed known id
+	// (request.host_id matched one of this account's hosts) or, when the request
+	// carried an EMPTY host_id, a freshly minted one. The client persists it and
+	// presents it on every subsequent request. EMPTY means no id: either the echoed
+	// id is unknown/revoked (discard it and re-register empty to mint), or the
+	// account is at its host cap (the machine still works, sharing the per-account
+	// fallback bucket, and may re-register later once a slot frees).
+	HostId        string `protobuf:"bytes,3,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -289,6 +305,13 @@ func (x *RegisterVolunteerResponse) GetRegistered() bool {
 		return x.Registered
 	}
 	return false
+}
+
+func (x *RegisterVolunteerResponse) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
 }
 
 type GetRegistrationChallengeRequest struct {
@@ -411,13 +434,17 @@ type RequestWorkUnitRequest struct {
 	// and the unit redispatches immediately. An empty list means the volunteer
 	// holds nothing. Sent on every request; the head treats it as authoritative.
 	HeldWorkUnitIds []string `protobuf:"bytes,7,rep,name=held_work_unit_ids,json=heldWorkUnitIds,proto3" json:"held_work_unit_ids,omitempty"`
-	// Stable per-MACHINE host id (see RegisterVolunteerRequest.host_id). The head keys
-	// the per-machine in-flight cap and work-send-interval floor on this, attributes the
-	// copy rows this request reserves to it, and reconciles the held_work_unit_ids buffer
-	// per host — so a user's beefy rig and laptop each get an independent work budget and
-	// never evict each other's buffers. Per-WU distinctness still keys on the ACCOUNT, so
-	// a user's own machines never corroborate the same unit. ADDITIVE: empty = per-account
-	// behavior (host == account). Signed under the identity key via the request signature.
+	// The SERVER-ISSUED per-MACHINE host id (see RegisterVolunteerResponse.host_id).
+	// The head keys the per-machine in-flight cap and work-send-interval floor on this,
+	// attributes the copy rows this request reserves to it, and reconciles the
+	// held_work_unit_ids buffer per host — so a user's beefy rig and laptop each get an
+	// independent work budget and never evict each other's buffers. Per-WU distinctness
+	// still keys on the ACCOUNT, so a user's own machines never corroborate the same
+	// unit. Empty = per-account fallback (host == account; browser volunteers and
+	// at-cap machines). A NON-empty id that the head did not issue to THIS account is
+	// REFUSED (FailedPrecondition, pinned "unknown or revoked host id" prefix) — the
+	// client should re-register to acquire a valid id. Signed under the identity key
+	// via the request signature.
 	HostId        string `protobuf:"bytes,8,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2554,12 +2581,13 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0fscheduling_mode\x18\x05 \x01(\tR\x0eschedulingMode\x12\x17\n" +
 	"\ahost_id\x18\x06 \x01(\tR\x06hostId\x12(\n" +
 	"\x10pow_challenge_id\x18\a \x01(\tR\x0epowChallengeId\x12\x1b\n" +
-	"\tpow_nonce\x18\b \x01(\x06R\bpowNonce\"^\n" +
+	"\tpow_nonce\x18\b \x01(\x06R\bpowNonce\"w\n" +
 	"\x19RegisterVolunteerResponse\x12!\n" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1e\n" +
 	"\n" +
 	"registered\x18\x02 \x01(\bR\n" +
-	"registered\"!\n" +
+	"registered\x12\x17\n" +
+	"\ahost_id\x18\x03 \x01(\tR\x06hostId\"!\n" +
 	"\x1fGetRegistrationChallengeRequest\"\xb4\x01\n" +
 	" GetRegistrationChallengeResponse\x12!\n" +
 	"\fchallenge_id\x18\x01 \x01(\tR\vchallengeId\x12\x1c\n" +

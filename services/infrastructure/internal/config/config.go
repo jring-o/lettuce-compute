@@ -312,6 +312,25 @@ type HeadConfig struct {
 	// redeemable. Unset (0) resolves to the default 600 (10 minutes). Override via
 	// LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS.
 	RegistrationPowChallengeTTLSeconds int `yaml:"registration_pow_challenge_ttl_seconds"`
+
+	// --- BG-25: server-issued host identity — the per-account host cap ---
+	//
+	// The head mints per-machine host ids at registration (clients never generate
+	// them) and hard-caps how many one account may hold; a machine past the cap still
+	// works, sharing the per-account fallback bucket. A slot frees when an idle host
+	// (unseen past the activity window) is evicted at mint time; a WORKING machine is
+	// never evictable (the work path bumps its last-seen).
+
+	// HostCapPerAccount is the hard bound on one account's TOTAL issued host ids.
+	// ON BY DEFAULT (nil resolves to 10, per the BG-25 design — this shipped as part
+	// of the issuance hard cutover, so secure-by-default is coherent). An explicit 0
+	// disables the cap (unlimited hosts; issuance stays server-owned). Override via
+	// LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT.
+	HostCapPerAccount *int `yaml:"host_cap_per_account"`
+	// HostCapActiveDays is the staleness window in DAYS: a host unseen this long is
+	// evictable at mint time when the account is at cap. Unset (0) resolves to the
+	// default 30. Override via LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS.
+	HostCapActiveDays int `yaml:"host_cap_active_days"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -401,6 +420,16 @@ const (
 	// Validate floor for the challenge TTL: a slow browser or a loaded machine must
 	// still be able to solve-and-submit within the window.
 	minRegistrationPowChallengeTTLSeconds = 60
+
+	// --- BG-25 host-cap defaults (operator-accepted 2026-07-09) ---
+	// defaultHostCapPerAccount: design §4.6's "cap hosts per account (default ~10)".
+	// Bounds one account's concurrent per-machine quota buckets at cap (+1 shared
+	// fallback bucket) while never blocking the machines themselves.
+	defaultHostCapPerAccount = 10
+	// defaultHostCapActiveDays: a host unseen this long is evictable at mint time.
+	// Working machines bump last-seen on the work path, so only genuinely idle
+	// machines ever age out — and only when a new machine actually needs the slot.
+	defaultHostCapActiveDays = 30
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -643,6 +672,14 @@ func (h HeadConfig) Validate() error {
 	if ttl := h.EffectiveRegistrationPowChallengeTTLSeconds(); ttl < minRegistrationPowChallengeTTLSeconds {
 		return fmt.Errorf("head.registration_pow_challenge_ttl_seconds must be >= %d (effective value, got %d)",
 			minRegistrationPowChallengeTTLSeconds, ttl)
+	}
+	if h.HostCapPerAccount != nil && *h.HostCapPerAccount < 0 {
+		return fmt.Errorf("head.host_cap_per_account must be >= 0 (0 = unlimited, unset = default %d), got %d",
+			defaultHostCapPerAccount, *h.HostCapPerAccount)
+	}
+	if h.HostCapActiveDays < 0 {
+		return fmt.Errorf("head.host_cap_active_days must be >= 0 (0 = default %d), got %d",
+			defaultHostCapActiveDays, h.HostCapActiveDays)
 	}
 	return nil
 }
@@ -1012,6 +1049,25 @@ func (h HeadConfig) EffectiveRegistrationPowChallengeTTLSeconds() int {
 		return defaultRegistrationPowChallengeTTLSeconds
 	}
 	return h.RegistrationPowChallengeTTLSeconds
+}
+
+// EffectiveHostCapPerAccount returns the hard bound on one account's TOTAL issued host
+// ids (BG-25). ON BY DEFAULT: nil (unset) -> defaultHostCapPerAccount (10); an explicit
+// 0 disables the cap (unlimited hosts, issuance still server-owned).
+func (h HeadConfig) EffectiveHostCapPerAccount() int {
+	if h.HostCapPerAccount == nil {
+		return defaultHostCapPerAccount
+	}
+	return *h.HostCapPerAccount
+}
+
+// EffectiveHostCapActiveDays returns the staleness window (days) after which an unseen
+// host is evictable at mint time. Unset (<= 0) -> defaultHostCapActiveDays (30).
+func (h HeadConfig) EffectiveHostCapActiveDays() int {
+	if h.HostCapActiveDays <= 0 {
+		return defaultHostCapActiveDays
+	}
+	return h.HostCapActiveDays
 }
 
 // StorageConfig defines local filesystem storage settings.

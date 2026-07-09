@@ -1572,8 +1572,8 @@ func (r *PgxWorkUnitRepository) CountActiveByVolunteer(ctx context.Context) (map
 // CountActiveByHost returns the authoritative per-MACHINE inflight count (live copies)
 // keyed by effective host id (TODO #19). It groups on COALESCE(host_id, volunteer_id)
 // so a copy from a volunteer that reported no host (NULL host_id) counts under its
-// account id — which is exactly effectiveHostID(volunteer, "") — so the keys match the
-// dispatch cache's per-host inflight map with no special-casing. Pre-migration copies
+// account id — exactly the per-account fallback the dispatch cache's meterID uses — so
+// the keys match the per-host inflight map with no special-casing. Pre-migration copies
 // (NULL host_id) therefore fold into the account's key, identical to the fallback.
 func (r *PgxWorkUnitRepository) CountActiveByHost(ctx context.Context) (map[types.ID]int, error) {
 	rows, err := r.db.Query(ctx, `

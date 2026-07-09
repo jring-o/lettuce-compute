@@ -90,13 +90,20 @@ message RegisterVolunteerRequest {
   HardwareCapabilities hardware = 3;
   repeated string available_runtimes = 4; // ["NATIVE", "CONTAINER"]
   string scheduling_mode = 5;        // ALWAYS, WHEN_IDLE, SCHEDULED
-  // Stable per-MACHINE host identifier the volunteer self-generates and persists in
-  // its data dir (alongside the keypair). The keypair is the ACCOUNT — one user runs
-  // the SAME key on every machine — and this distinguishes the machines under it so
-  // per-machine facts (advertised runtimes/hardware, in-flight cap, work-send floor,
-  // last-seen, work attribution) are tracked per host while credit/distinctness stay
-  // per account. ADDITIVE: an empty host_id falls back to per-account behavior (host
-  // == account), so a volunteer that sends none is not a breaking cutover. It is
+  // The SERVER-ISSUED per-MACHINE host id this machine previously received in
+  // RegisterVolunteerResponse.host_id, echoed back so the head refreshes the same
+  // hosts row (per-machine facts: advertised runtimes/hardware, in-flight cap,
+  // work-send floor, last-seen, work attribution — while credit/distinctness stay
+  // per ACCOUNT, the keypair). Host identity is head-minted only — clients never
+  // generate host ids. Semantics by value:
+  //   - EMPTY: an explicit request for a machine id — the head mints a fresh one
+  //     (subject to the per-account host cap) and returns it.
+  //   - A known id of THIS account: the same hosts row is refreshed and the id is
+  //     echoed back.
+  //   - An unknown/revoked id: NOT an implicit mint — the response carries an EMPTY
+  //     host_id; the client should discard its stored id and re-register with an
+  //     empty one to mint explicitly.
+  // The client MUST persist and echo exactly what the response carries. It is
   // signed under the identity key for free — the per-request signature covers the
   // whole request — so nobody else can claim your machine.
   string host_id = 6;
@@ -112,6 +119,14 @@ message RegisterVolunteerRequest {
 message RegisterVolunteerResponse {
   string volunteer_id = 1;           // assigned UUID
   bool registered = 2;               // true if new registration, false if updated existing
+  // The SERVER-ISSUED host id for THIS machine — the echoed known id
+  // (request.host_id matched one of this account's hosts) or, when the request
+  // carried an EMPTY host_id, a freshly minted one. The client persists it and
+  // presents it on every subsequent request. EMPTY means no id: either the echoed
+  // id is unknown/revoked (discard it and re-register empty to mint), or the
+  // account is at its host cap (the machine still works, sharing the per-account
+  // fallback bucket, and may re-register later once a slot frees).
+  string host_id = 3;
 }
 
 message GetRegistrationChallengeRequest {}
@@ -138,13 +153,17 @@ message RequestWorkUnitRequest {
   // and the unit redispatches immediately. An empty list means the volunteer
   // holds nothing. Sent on every request; the head treats it as authoritative.
   repeated string held_work_unit_ids = 7;
-  // Stable per-MACHINE host id (see RegisterVolunteerRequest.host_id). The head keys
-  // the per-machine in-flight cap and work-send-interval floor on this, attributes the
-  // copy rows this request reserves to it, and reconciles the held_work_unit_ids buffer
-  // per host — so a user's beefy rig and laptop each get an independent work budget and
-  // never evict each other's buffers. Per-WU distinctness still keys on the ACCOUNT, so
-  // a user's own machines never corroborate the same unit. ADDITIVE: empty = per-account
-  // behavior (host == account). Signed under the identity key via the request signature.
+  // The SERVER-ISSUED per-MACHINE host id (see RegisterVolunteerResponse.host_id).
+  // The head keys the per-machine in-flight cap and work-send-interval floor on this,
+  // attributes the copy rows this request reserves to it, and reconciles the
+  // held_work_unit_ids buffer per host — so a user's beefy rig and laptop each get an
+  // independent work budget and never evict each other's buffers. Per-WU distinctness
+  // still keys on the ACCOUNT, so a user's own machines never corroborate the same
+  // unit. Empty = per-account fallback (host == account; browser volunteers and
+  // at-cap machines). A NON-empty id that the head did not issue to THIS account is
+  // REFUSED (FailedPrecondition, pinned "unknown or revoked host id" prefix) — the
+  // client should re-register to acquire a valid id. Signed under the identity key
+  // via the request signature.
   string host_id = 8;
 }
 

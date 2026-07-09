@@ -3,15 +3,13 @@ package admission
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/bits"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/pow"
 )
 
 // PowPolicy is the head's registration proof-of-work configuration, a plain struct (no
@@ -132,44 +130,24 @@ func RedeemChallenge(ctx context.Context, db DBTX, red *PowRedemption) error {
 }
 
 // VerifySolution reports whether nonce solves the challenge for publicKey at the given
-// difficulty. THE solution rule, shared verbatim by server verification, the Solve
-// helper future CLI builds import, and (re-implemented against the golden test vector)
-// the dashboard's solver:
+// difficulty. THE solution rule lives in the exported module-root package `pow` (so the
+// volunteer CLI — a separate module that cannot import internal/ packages — ships the
+// same implementation); this delegate keeps the admission-side call sites and test pins
+// on one name:
 //
 //	digest = SHA-256(challenge || publicKey || nonce as 8 big-endian bytes)
 //	valid  = LeadingZeroBits(digest) >= difficultyBits
 func VerifySolution(challenge, publicKey []byte, nonce uint64, difficultyBits int) bool {
-	var nb [8]byte
-	binary.BigEndian.PutUint64(nb[:], nonce)
-	h := sha256.New()
-	h.Write(challenge)
-	h.Write(publicKey)
-	h.Write(nb[:])
-	return LeadingZeroBits(h.Sum(nil)) >= difficultyBits
+	return pow.VerifySolution(challenge, publicKey, nonce, difficultyBits)
 }
 
-// LeadingZeroBits counts the leading zero bits of digest.
+// LeadingZeroBits counts the leading zero bits of digest (delegate — see VerifySolution).
 func LeadingZeroBits(digest []byte) int {
-	n := 0
-	for _, b := range digest {
-		if b == 0 {
-			n += 8
-			continue
-		}
-		n += bits.LeadingZeros8(b)
-		break
-	}
-	return n
+	return pow.LeadingZeroBits(digest)
 }
 
-// Solve brute-forces a nonce for the challenge (the reference solver future CLI builds
-// import; tests use it with a low difficulty). It scans nonces from 0 and returns the
-// first solution, so it never terminates only if no solution exists in the uint64 space
-// — astronomically unlikely for any sane difficulty.
+// Solve brute-forces a nonce for the challenge (delegate — see VerifySolution; the CLI
+// imports the pow package directly, tests here use it with a low difficulty).
 func Solve(challenge, publicKey []byte, difficultyBits int) uint64 {
-	for nonce := uint64(0); ; nonce++ {
-		if VerifySolution(challenge, publicKey, nonce, difficultyBits) {
-			return nonce
-		}
-	}
+	return pow.Solve(challenge, publicKey, difficultyBits)
 }

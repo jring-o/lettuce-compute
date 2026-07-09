@@ -106,8 +106,10 @@ start a Podman machine for you on first `start`.
 ## Disk and the data directory
 
 The data dir defaults to `~/.lettuce` (override with `--data-dir <path>`). It
-holds your **identity keypair** (`identity.key`/`.pub`), a per-machine
-`host.id`, config, logs, and per-unit work files.
+holds your **identity keypair** (`identity.key`/`.pub`), the per-machine **host
+ids** each head issues you (see [Running one identity on several
+machines](#running-one-identity-on-several-machines)), config, logs, and per-unit
+work files.
 
 - Before fetching any work, the daemon requires `max_disk_gb` free on **both**
   the data-dir volume **and** the container image-store volume (where the
@@ -124,17 +126,21 @@ holds your **identity keypair** (`identity.key`/`.pub`), a per-machine
 
 Your keypair **is your account** — credit pools to it, so running the **same**
 `identity.key`/`.pub` on every machine you own is the intended setup, not a
-trick. Each machine separately generates a stable `host.id` (kept in its own data
-dir) the first time it runs, so the head tracks your machines independently: a
-beefy rig and a laptop on one key each get their **own** work budget and pace
-(the rig is never throttled to the laptop's share), and each advertises its own
-runtimes — so a native-only box is never handed container work just because
-another of your machines runs containers. You don't manage `host.id`; it's
-created automatically and you can leave it alone. (Don't copy `host.id` between
-machines — let each generate its own; copying just makes two machines look like
-one.) For honest verification, your own machines are still treated as one account
-for redundancy, so they won't corroborate each other's results — that needs
-genuinely different contributors.
+trick. To track your machines independently, **each head issues every machine its
+own host id** when it registers, and your volunteer stores that id (one per
+attached head) in its data dir. So a beefy rig and a laptop on one key each get
+their **own** work budget and pace (the rig is never throttled to the laptop's
+share), and each advertises its own runtimes — so a native-only box is never
+handed container work just because another of your machines runs containers. You
+don't manage these host ids: the head hands them out automatically, and if one is
+deleted the head simply issues a fresh one the next time that machine registers.
+(There's nothing to copy between machines — each registers and gets its own id;
+two machines sharing one id would just look like a single machine to the head.) A
+head may cap how many machines it meters separately per account (10 by default);
+past that, additional machines still run and earn credit — they just share one
+work budget instead of getting their own. For honest verification, your own
+machines are still treated as one account for redundancy, so they won't
+corroborate each other's results — that needs genuinely different contributors.
 
 ### Moving the data dir to another user (keep the same identity)
 
@@ -154,8 +160,8 @@ Do **not** generate fresh files with `lettuce-volunteer init` to "fix" a key tha
 won't load — `init` creates a **new** identity and abandons the credit on your old
 one. If the daemon or `doctor` reports the keypair is present but unreadable, it is
 a permission/ownership or partial-copy problem; the error now names the exact
-`chown`/`chmod` (or re-copy) fix. Let each machine create its own `host.id` — don't
-copy it across (see above).
+`chown`/`chmod` (or re-copy) fix. Copy only the identity keypair — leave each
+machine to get its own head-issued host ids (see above).
 
 ### Where container images actually live (VM/LXC users, read this)
 
@@ -416,9 +422,14 @@ windows you can instead set a 5-field cron expression
 the cron equivalent of the overnight window above); when both a window and a cron
 expression are present, the window wins.
 
-> **Breaking release — update required.** This release changes the
-> volunteer⇄head work protocol. **A volunteer older than this release cannot talk
-> to the new head.** Run `lettuce-volunteer update`, then restart the daemon.
+> **Breaking release — update required.** This release moves machine **host ids**
+> from client-generated to **head-issued** (see [Running one identity on several
+> machines](#running-one-identity-on-several-machines)), a deliberate hard cutover
+> with no backward path. **A volunteer older than this release keeps presenting a
+> host id the head never issued, so an upgraded head stops handing it work** — it
+> logs that its build is outdated at each retry. Run `lettuce-volunteer update`,
+> then restart the daemon; the updated client re-registers and receives a fresh id
+> automatically.
 
 ## Choosing what you work on
 

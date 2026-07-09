@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -28,9 +27,9 @@ func TestComputeVolunteerBreakdown_ByHost(t *testing.T) {
 	host2 := types.NewID()
 	mkHost := func(id types.ID, name string) {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO hosts (id, volunteer_id, host_key, display_name, hardware_capabilities, available_runtimes, is_active, last_seen_at)
-			VALUES ($1, $2, $3, $4, '{}'::jsonb, '{}'::text[], true, now())`,
-			id, volID, "hk-"+uuid.New().String()[:8], name); err != nil {
+			INSERT INTO hosts (id, volunteer_id, display_name, hardware_capabilities, available_runtimes, is_active, last_seen_at)
+			VALUES ($1, $2, $3, '{}'::jsonb, '{}'::text[], true, now())`,
+			id, volID, name); err != nil {
 			t.Fatalf("insert host %s: %v", name, err)
 		}
 	}
