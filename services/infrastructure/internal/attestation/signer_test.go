@@ -140,13 +140,14 @@ func TestCanonicalJSONSortedKeys(t *testing.T) {
 	}
 
 	s := string(canonical)
-	// Verify keys are in sorted order: attestation_timestamp, credit_amount,
-	// leaf_id, raw_metrics, validation_outcome, volunteer_public_key, work_unit_id
+	// Verify keys are in sorted order. raw_metrics is intentionally NOT among the
+	// signed keys (self-reported, head-unverified — see CanonicalJSON):
+	// attestation_timestamp, credit_amount, leaf_id, validation_outcome,
+	// volunteer_public_key, work_unit_id
 	keys := []string{
 		`"attestation_timestamp"`,
 		`"credit_amount"`,
 		`"leaf_id"`,
-		`"raw_metrics"`,
 		`"validation_outcome"`,
 		`"volunteer_public_key"`,
 		`"work_unit_id"`,
@@ -194,10 +195,10 @@ func TestCanonicalJSON_NilMetrics(t *testing.T) {
 		t.Fatalf("CanonicalJSON with nil metrics: %v", err)
 	}
 
-	// Should contain "raw_metrics":{} (empty object for nil map).
+	// raw_metrics is never part of the signed bytes, nil or not.
 	s := string(canonical)
-	if indexOf(s, `"raw_metrics":{}`) == -1 {
-		t.Errorf("expected raw_metrics to be empty object, got: %s", s)
+	if indexOf(s, `"raw_metrics"`) != -1 {
+		t.Errorf("raw_metrics must be excluded from signed bytes, got: %s", s)
 	}
 }
 
@@ -211,8 +212,8 @@ func TestCanonicalJSON_EmptyMetrics(t *testing.T) {
 	}
 
 	s := string(canonical)
-	if indexOf(s, `"raw_metrics":{}`) == -1 {
-		t.Errorf("expected raw_metrics to be empty object, got: %s", s)
+	if indexOf(s, `"raw_metrics"`) != -1 {
+		t.Errorf("raw_metrics must be excluded from signed bytes, got: %s", s)
 	}
 }
 
@@ -356,7 +357,6 @@ func TestVerifyAttestation_TamperedEachField(t *testing.T) {
 		{"attestation_timestamp", func(att *Attestation) {
 			att.AttestationTimestamp = att.AttestationTimestamp.Add(time.Second)
 		}},
-		{"raw_metrics", func(att *Attestation) { att.RawMetrics["extra_field"] = float64(999) }},
 	}
 
 	for _, tc := range tests {
@@ -377,28 +377,36 @@ func TestVerifyAttestation_TamperedEachField(t *testing.T) {
 	}
 }
 
-func TestCanonicalJSON_MetricsKeysAreSorted(t *testing.T) {
+// TestRawMetricsNotSigned documents the contract: raw_metrics are volunteer
+// self-reported and head-unverified, so they are excluded from the signed bytes.
+// Mutating them (as a malicious volunteer's fabricated numbers would) must NOT
+// invalidate an otherwise-valid signature, and the metrics must not appear in the
+// canonical JSON at all.
+func TestRawMetricsNotSigned(t *testing.T) {
+	signer := testSigner(t)
 	att := testAttestation()
+
+	sig, err := signer.Sign(att)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	att.Signature = sig
+
+	// A volunteer swaps in absurd resource numbers after the head signed.
 	att.RawMetrics = map[string]any{
-		"zebra":    float64(1),
-		"alpha":    float64(2),
-		"middle":   float64(3),
+		"cpu_seconds_user": float64(9.9e12),
+		"peak_memory_mb":   float64(2_000_000_000),
+	}
+	if !VerifyAttestation(signer.PublicKey(), att) {
+		t.Error("mutating unsigned raw_metrics must not break signature verification")
 	}
 
+	// And the metrics never appear in the signed bytes.
 	canonical, err := CanonicalJSON(att)
 	if err != nil {
 		t.Fatalf("CanonicalJSON: %v", err)
 	}
-
-	s := string(canonical)
-	alphaIdx := indexOf(s, `"alpha"`)
-	middleIdx := indexOf(s, `"middle"`)
-	zebraIdx := indexOf(s, `"zebra"`)
-
-	if alphaIdx == -1 || middleIdx == -1 || zebraIdx == -1 {
-		t.Fatalf("missing keys in canonical JSON: %s", s)
-	}
-	if !(alphaIdx < middleIdx && middleIdx < zebraIdx) {
-		t.Errorf("raw_metrics keys not sorted: alpha@%d, middle@%d, zebra@%d", alphaIdx, middleIdx, zebraIdx)
+	if indexOf(string(canonical), `"raw_metrics"`) != -1 {
+		t.Errorf("raw_metrics must not be present in signed canonical JSON: %s", canonical)
 	}
 }
