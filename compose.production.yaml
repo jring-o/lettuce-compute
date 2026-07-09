@@ -156,6 +156,15 @@ services:
       LETTUCE_HEAD_REGISTRATION_POW_ENABLED: ${LETTUCE_HEAD_REGISTRATION_POW_ENABLED:-}
       LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS: ${LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS:-}
       LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS: ${LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS:-}
+      # --- Per-account host cap (server-issued host identity) --- ON by default (10);
+      # both OPTIONAL (leave unset to keep the built-in defaults). The head issues each
+      # machine a per-machine "host id" at registration and meters that machine's work by
+      # it — never identity/credit/validation, which stay per account. This cap bounds how
+      # many host ids one account may hold; a refused machine keeps working under a shared
+      # per-account bucket. Full description + defaults: guides/head-setup.md (Server-issued
+      # host identity & per-account host cap).
+      LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT: ${LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT:-}
+      LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS: ${LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS:-}
     volumes:
       - ./keys:/keys:ro
     healthcheck:

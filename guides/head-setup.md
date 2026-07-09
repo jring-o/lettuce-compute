@@ -599,6 +599,85 @@ all are OPTIONAL and take the defaults below when unset.
 | `registration_pow_difficulty_bits` (`LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS`) | `20` | Required leading zero bits of the solution digest (~2^20 ≈ 1M hash attempts, about a second of native single-thread work). Must be in `[8, 32]` — below 8 the puzzle is effectively free, above 32 the expected client work stretches to minutes-to-hours. |
 | `registration_pow_challenge_ttl_seconds` (`LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS`) | `600` (10m) | How long an issued challenge stays redeemable. Must be `>= 60` so a slow browser or a loaded machine can still solve and submit within the window. |
 
+### Server-issued host identity & per-account host cap
+
+A **volunteer account** is a volunteer's Ed25519 keypair — credit, trust, result
+validation, and distinctness all key on it. Separately, the head labels each physical
+**machine** behind that account with a **host id**. The host id exists only so the head
+can meter and pace *per machine*: how much work a given machine holds in flight, its
+work-send floor, its reliability-weighted work budget, and which machine produced a
+given result. A user's beefy rig and their laptop, both attached under one account
+keypair, get their own independent work budgets through their distinct host ids, while
+credit still pools to the one account. **A host id is never an identity, credit, or trust
+boundary** — nothing about result validation, agreement, or distinctness ever keys on it.
+That separation is deliberate and load-bearing: it lets the host cap below bound abuse
+without ever touching how results are judged.
+
+**The head issues host ids; clients no longer make their own.** When a volunteer
+registers, the head mints a fresh random host id for that machine, returns it in the
+registration response, and the client stores it (per head) and echoes it on every later
+registration to that head. A machine that presents an id the head already issued to its
+account keeps that id; a machine that presents an **empty** id is asking to be minted a
+new one; a machine that presents an id the head does **not** recognize is answered with
+an empty id and re-registers to mint a fresh one. Running **with no host id is always
+valid** — browser volunteers, and any machine refused an id (below), simply share one
+per-account fallback bucket for metering.
+
+**The cap bounds how many host ids one account may hold.** Left alone the head allows
+**10** host ids per account. This is a hard bound on the *total*: an account can never
+have more than the cap machines metered independently at once (plus the one shared
+fallback bucket). When a machine asks for a new id and the account is already at the cap,
+the head first tries to reclaim a slot from a **genuinely idle** machine — one whose host
+id has gone unseen longer than the activity window (default **30 days**) — and gives the
+slot to the newcomer. Actively working machines refresh their last-seen on the work path
+(at most once every few minutes), so a working machine is **never** evicted. If every
+slot is held by a recently active machine, the mint is **refused**: registration still
+succeeds, the machine simply runs under the shared per-account fallback bucket, and the
+head emits a sampled `refusing host id mint: per-account host cap reached` WARN naming
+the account. Nothing is rejected or lost — the refused machine keeps computing and
+earning credit; it just shares one metering bucket with the account's other host-less
+workers.
+
+> **Unlike most knobs on this page, the cap is ON by default.** Server-issued host
+> identity shipped as a hard cutover (see the compatibility note below), so a sensible
+> default ships with it rather than off. Set `host_cap_per_account` to `0` to disable the
+> cap entirely — host ids are still server-issued, there is just no ceiling on how many an
+> account may hold.
+
+These are `head.*` keys in `lettuce.yaml` (or the matching `LETTUCE_HEAD_*` env vars);
+both are OPTIONAL and take the defaults below when unset.
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `host_cap_per_account` (`LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT`) | `10` (**on**) | Hard bound on how many server-issued host ids one account may hold at once. Reached only when every slot is held by a recently active machine; further machines then run under the shared per-account bucket (not rejected). `0` disables the cap (ids stay server-issued, no ceiling). |
+| `host_cap_active_days` (`LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS`) | `30` | How many days a host id may go unseen before it becomes evictable to free a slot for a new machine when the account is at the cap. Actively working machines refresh their last-seen on the work path, so only genuinely idle machines ever age out — and only when a new machine actually needs the slot. |
+
+**Revoking a machine's host id.** There is no admin API for this in this release; revoke
+by deleting the row directly:
+
+```bash
+docker compose -f compose.production.yaml exec postgres \
+  psql -U lettuce lettuce -c "DELETE FROM hosts WHERE id = '<host-id>';"
+```
+
+The deletion takes effect on the work-request hot path within about **30 seconds** (the
+head caches host-ownership facts for that long). After that the revoked machine's next
+work request is refused; an up-to-date volunteer client notices, discards the stale id,
+re-registers to mint a **fresh** one (subject to the cap), and resumes — so you can free a
+specific id without stopping the machine. Deleting a host row is safe for accounting:
+credit and result history key on the account, not the host id, so nothing already earned
+is lost.
+
+> **⚠️ Compatibility cutover — volunteers must update for this release.** Server-issued
+> host identity replaces the older scheme in which each client generated its own machine
+> id, and there is **no backward path**: a volunteer client built before this release
+> still presents a self-generated id the head never issued, so an upgraded head
+> **refuses it work**. Such a client is not silently broken — at each retry it logs that
+> its build is outdated and to run `lettuce-volunteer update`, then backs off and retries
+> — but it does **no work** until updated. When you upgrade the head, tell your
+> volunteers to run `lettuce-volunteer update` and restart. Updated clients re-register,
+> receive an issued id automatically, and continue with no manual steps.
+
 ### Horizontal scale-out
 
 The head is **stateless** and can run as **N replicas** behind Caddy against one
