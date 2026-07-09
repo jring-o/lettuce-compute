@@ -9,7 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"google.golang.org/grpc/codes"
@@ -43,16 +46,80 @@ type WorkClient interface {
 	Close() error
 }
 
+// registerClient is the subset of a head client the work-path self-heal needs. The
+// production client (*client.Client) implements it; keeping it a separate narrow
+// interface (rather than widening WorkClient) means the many WorkClient mocks need not
+// grow a RegisterVolunteer method just to compile.
+type registerClient interface {
+	RegisterVolunteer(ctx context.Context, req *lettucev1.RegisterVolunteerRequest) (*lettucev1.RegisterVolunteerResponse, error)
+}
+
+// reRegisterHost re-registers this machine against one head after a host-unknown
+// work-path refusal (BG-25 self-heal). It registers with an EMPTY host id so the head
+// mints a fresh one (discarding the refused id), persists exactly what the head returns
+// (empty => run host-less), and returns the new id. Re-registration of the existing
+// account key is an UPDATE branch, so it never trips registration proof-of-work — no
+// solver needed here. It is wired into the Fetcher as reRegisterFn.
+func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (string, error) {
+	rc, ok := head.Client.(registerClient)
+	if !ok {
+		return "", fmt.Errorf("head client does not support re-registration")
+	}
+	hostname, _ := os.Hostname()
+	resp, err := rc.RegisterVolunteer(ctx, &lettucev1.RegisterVolunteerRequest{
+		PublicKey:         d.pubKey,
+		DisplayName:       hostname,
+		Hardware:          d.cachedHW,
+		AvailableRuntimes: d.advertisedRuntimes(),
+		SchedulingMode:    d.cfg.Scheduling.Mode,
+		HostId:            "", // discard the refused id: empty => the head mints a fresh one
+	})
+	if err != nil {
+		return "", err
+	}
+	if d.hostIDStore != nil {
+		key := head.Config.GRPCAddress
+		var perr error
+		if resp.HostId == "" {
+			perr = d.hostIDStore.Delete(key)
+		} else {
+			perr = d.hostIDStore.Set(key, resp.HostId)
+		}
+		if perr != nil {
+			d.logger.Warn("daemon: failed to persist re-issued host id", "server", head.Name, "error", perr)
+		}
+	}
+	return resp.HostId, nil
+}
+
+// advertisedRuntimes returns the UPPERCASE runtime enum names this daemon can actually
+// run, derived from the live registry (registry Name()s are lowercase). It mirrors the
+// list start.go advertises at initial registration so a self-heal re-register presents
+// the same capabilities.
+func (d *Daemon) advertisedRuntimes() []string {
+	if d.runtimeRegistry == nil {
+		return nil
+	}
+	names := d.runtimeRegistry.AvailableRuntimes()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, strings.ToUpper(n))
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Daemon manages the volunteer compute loop using concurrent execution slots
 // and a pre-fetch queue.
 type Daemon struct {
 	cfg     *config.Config
 	pubKey  ed25519.PublicKey
 	privKey ed25519.PrivateKey
-	// hostID is this machine's stable host key (TODO #19), reported on each work
-	// request so the head meters in-flight work + the work-send floor per machine.
-	// Empty => the head falls back to per-account behavior.
-	hostID          string
+	// hostIDStore persists head-issued per-machine host ids keyed by head gRPC address
+	// (BG-25). The work-path self-heal (reRegisterHost) updates it after a host-unknown
+	// refusal. Per-head ids themselves live on each ServerConnection.HostID; this store
+	// is the durable backing. May be nil in tests that never exercise self-heal.
+	hostIDStore     *identity.HostIDStore
 	multiClient     *MultiServerClient
 	runtimeRegistry *RuntimeRegistry
 	logger          *slog.Logger
@@ -137,9 +204,10 @@ type DaemonConfig struct {
 	Config  *config.Config
 	PubKey  ed25519.PublicKey
 	PrivKey ed25519.PrivateKey
-	// HostID is this machine's stable host key (TODO #19). Empty is valid (the head
-	// then treats the volunteer as a single per-account host).
-	HostID string
+	// HostIDStore persists head-issued per-machine host ids keyed by head gRPC address
+	// (BG-25). Threaded in so the work-path self-heal can persist a re-minted id. May
+	// be nil (self-heal then re-registers but persists nothing).
+	HostIDStore *identity.HostIDStore
 
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
@@ -271,7 +339,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cfg:              cfg.Config,
 		pubKey:           cfg.PubKey,
 		privKey:          cfg.PrivKey,
-		hostID:           cfg.HostID,
+		hostIDStore:      cfg.HostIDStore,
 		multiClient:      multiClient,
 		runtimeRegistry:  registry,
 		machineManager:   cfg.MachineManager,

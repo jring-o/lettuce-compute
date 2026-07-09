@@ -109,15 +109,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Host id — a stable per-MACHINE identifier persisted next to the keypair. The
-	// keypair is the account (run the same key everywhere); the host id distinguishes
-	// this machine so the head meters work per machine while credit pools per account
-	// (TODO #19). LoadOrCreate so a re-init keeps the existing machine id.
-	hostIDFile := filepath.Join(dataDir, "host.id")
-	c.HostIDFile = hostIDFile
-	if _, err := identity.LoadOrCreateHostID(hostIDFile); err != nil {
-		return fmt.Errorf("initializing host id: %w", err)
-	}
+	// Host identity is HEAD-ISSUED (BG-25): the head mints a per-machine host id at
+	// registration and the client persists it per-head in <DataDir>/host-ids.json. So
+	// init no longer creates a host id — there is nothing to generate before first
+	// contact, and the head is the sole minter. The id is acquired on the first
+	// `start` (empty request => the head mints one under the per-account cap).
 
 	// Fresh init: size the resource ceilings to this machine so a default volunteer is
 	// eligible for standard leafs. The prior static defaults (2048 MB / 10 GB) left

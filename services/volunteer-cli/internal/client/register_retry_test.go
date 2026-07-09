@@ -84,7 +84,7 @@ func TestRegisterRidesOutRateLimit(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, registered, err := Register(context.Background(), client, pub, "host-abc", cfg, configPath)
+	volID, registered, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath)
 	if err != nil {
 		t.Fatalf("Register should ride out the rate limit, got error: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestRegisterDoesNotRetryGenuineError(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, err = Register(context.Background(), client, pub, "host-abc", cfg, configPath)
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath)
 	if err == nil {
 		t.Fatal("expected error for a genuinely unreachable head, got nil")
 	}
@@ -165,7 +165,7 @@ func TestRegisterRateLimitRespectsContextCancel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, e := Register(ctx, client, pub, "host-abc", cfg, configPath)
+		_, _, _, e := Register(ctx, client, pub, nil, "", cfg, configPath)
 		done <- e
 	}()
 

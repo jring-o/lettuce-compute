@@ -30,10 +30,13 @@ type Fetcher struct {
 	maxBackoff  time.Duration
 	cachedHW    *lettucev1.HardwareCapabilities
 	pubKey      ed25519.PublicKey
-	// hostID is this machine's stable host key, sent on every work request so the head
-	// keys the per-machine in-flight cap + work-send floor on it (TODO #19). Empty =>
-	// per-account fallback.
-	hostID      string
+
+	// reRegisterFn re-registers this machine against one head after a host-unknown
+	// work-path refusal (BG-25 self-heal): it discards the refused id, registers with an
+	// empty host id (so the head mints a fresh one), persists and returns the head's
+	// new id (possibly empty). Injected from the daemon; nil disables self-heal (the
+	// refusal then falls through to the normal reconnect backoff).
+	reRegisterFn func(ctx context.Context, head *ServerConnection) (string, error)
 
 	// enabledLeafsFunc is called to get enabled leafs for a server.
 	// Injected from the daemon to reuse its filtering logic.
@@ -104,7 +107,7 @@ type Fetcher struct {
 // codes.ResourceExhausted (which carries no server-directed value). It is
 // jittered ±20% and capped at maxResourceExhaustedBackoff.
 const (
-	defaultRateLimitBackoff    = 30 * time.Second
+	defaultRateLimitBackoff     = 30 * time.Second
 	maxResourceExhaustedBackoff = 900 * time.Second
 )
 
@@ -143,29 +146,29 @@ const runtimeAbandonCooldown = 10 * time.Minute
 // NewFetcher creates a new fetcher that fills the pre-fetch queue.
 func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, leafCache *LeafCache) *Fetcher {
 	return &Fetcher{
-		queue:            queue,
-		selector:         selector,
-		leafCache:        leafCache,
-		registry:         d.runtimeRegistry,
-		multiClient:      d.multiClient,
-		logger:           d.logger,
-		backoff:          d.initialBackoff,
-		maxBackoff:       d.maxBackoff,
-		cachedHW:         d.cachedHW,
-		pubKey:           d.pubKey,
-		hostID:           d.hostID,
+		queue:                    queue,
+		selector:                 selector,
+		leafCache:                leafCache,
+		registry:                 d.runtimeRegistry,
+		multiClient:              d.multiClient,
+		logger:                   d.logger,
+		backoff:                  d.initialBackoff,
+		maxBackoff:               d.maxBackoff,
+		cachedHW:                 d.cachedHW,
+		pubKey:                   d.pubKey,
+		reRegisterFn:             d.reRegisterHost,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
 		shouldFetchFunc:          d.shouldFetch,
-		workBufferFullFn:  d.workBufferFull,
-		batchSizeFn:       d.requestBatchSize,
-		leafEstSecondsFn:  d.leafEstSeconds,
-		heldWorkUnitIDsFn: d.heldWorkUnitIDs,
-		rateLimitBackoff:  defaultRateLimitBackoff,
-		runtimeAbandons:  make(map[string]int),
-		pausedRuntimes:   make(map[string]time.Time),
-		now:              time.Now,
+		workBufferFullFn:         d.workBufferFull,
+		batchSizeFn:              d.requestBatchSize,
+		leafEstSecondsFn:         d.leafEstSeconds,
+		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
+		rateLimitBackoff:         defaultRateLimitBackoff,
+		runtimeAbandons:          make(map[string]int),
+		pausedRuntimes:           make(map[string]time.Time),
+		now:                      time.Now,
 	}
 }
 
@@ -515,7 +518,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 		VolunteerId:      head.VolunteerID,
 		PublicKey:        f.pubKey,
-		HostId:           f.hostID,
+		HostId:           head.HostID,
 		LeafIds:          leafIDs,
 		BlockedLeafIds:   blockedIDs,
 		MaxAssignments:   maxAssignments,
@@ -542,6 +545,45 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 			head.Available = true
 			head.Backoff = 0
 			return 0, false
+		}
+		// HOST-UNKNOWN self-heal (BG-25): a non-empty host id this head no longer
+		// recognizes (a head reset, a mint-time eviction, or an operator revocation).
+		// Checked BEFORE IsVolunteerTooOldError — the refusal text also carries the word
+		// "outdated" (so PRE-issuance builds classify it as too-old and print the update
+		// hint), so this ordering is load-bearing (design audit F-G): an issuance-aware
+		// build MUST re-register here instead of degrading to the no-work update path.
+		// One re-register attempt per refusal, then the normal reconnect backoff.
+		if client.IsHostUnknownError(err) {
+			f.logger.Warn("fetcher: head refused our host id (unknown or revoked); discarding it and re-registering",
+				"server", head.Name, "leaf_slug", leaf.Slug, "error", err)
+			if f.reRegisterFn != nil {
+				newID, rerr := f.reRegisterFn(ctx, head)
+				if rerr == nil {
+					// Re-registered: adopt the fresh id (possibly empty = host-less) and
+					// keep the head available so the next loop tick retries it with the
+					// new id — no backoff growth. Stop trying this head's other leafs
+					// this cycle.
+					head.HostID = newID
+					f.logger.Info("fetcher: re-registered after host-unknown refusal",
+						"server", head.Name, "host_id_issued", newID != "")
+					return 0, true
+				}
+				f.logger.Warn("fetcher: re-register after host-unknown refusal failed; backing off",
+					"server", head.Name, "error", rerr)
+			}
+			// No self-heal hook, or the re-register failed: fall through to the reconnect
+			// backoff and try again later.
+			head.Available = false
+			head.LastError = f.now()
+			if head.Backoff == 0 {
+				head.Backoff = f.backoff
+			} else {
+				head.Backoff = time.Duration(float64(head.Backoff) * 2)
+				if head.Backoff > f.maxBackoff {
+					head.Backoff = f.maxBackoff
+				}
+			}
+			return 0, true
 		}
 		// "Volunteer too old": the head's version-coupling rejection. Surface a
 		// distinct, actionable WARN rather than burying it in the generic transport

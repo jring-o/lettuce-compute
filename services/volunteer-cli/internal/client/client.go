@@ -151,6 +151,17 @@ func (c *Client) RegisterVolunteer(ctx context.Context, req *lettucev1.RegisterV
 	return c.svc.RegisterVolunteer(ctx, req)
 }
 
+// GetRegistrationChallenge calls the GetRegistrationChallenge RPC. It issues a
+// registration proof-of-work challenge bound to this client's key (the head derives
+// the key from the verified request signature). Relevant only when the head enforces
+// registration proof-of-work; the Register flow calls it reactively on the
+// pow-required refusal.
+func (c *Client) GetRegistrationChallenge(ctx context.Context, req *lettucev1.GetRegistrationChallengeRequest) (*lettucev1.GetRegistrationChallengeResponse, error) {
+	ctx, cancel := c.rpcCtx(ctx)
+	defer cancel()
+	return c.svc.GetRegistrationChallenge(ctx, req)
+}
+
 // RequestWorkUnit calls the RequestWorkUnit RPC.
 func (c *Client) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
 	ctx, cancel := c.rpcCtx(ctx)

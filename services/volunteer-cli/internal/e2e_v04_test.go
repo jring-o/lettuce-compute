@@ -30,6 +30,7 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
+	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	"github.com/lettuce-compute/volunteer-cli/internal/project"
 	volruntime "github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
@@ -168,8 +169,10 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 	}
 	defer grpcClient.Close()
 
-	const hostID = "host-e2e-v04"
-	volID, _, err := client.Register(ctx, grpcClient, pub, hostID, cfg, cfgPath)
+	// Host identity is head-issued (BG-25): register with an empty per-head store so the
+	// head mints an id, then present exactly that id on subsequent work requests.
+	hostStore := identity.NewHostIDStore(filepath.Join(volDir, "host-ids.json"))
+	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath)
 	if err != nil {
 		t.Fatalf("registering: %v", err)
 	}
@@ -230,7 +233,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 		daemon.AppendHistory(volDir, daemon.HistoryEntry{
 			WorkUnitID:       wu.ID,
-			LeafID:        wu.LeafID,
+			LeafID:           wu.LeafID,
 			CompletedAt:      time.Now().UTC(),
 			WallClockSeconds: result.Metrics.WallClockSeconds,
 			ResultAccepted:   submitResp.Accepted,
@@ -283,7 +286,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 		daemon.AppendHistory(volDir, daemon.HistoryEntry{
 			WorkUnitID:       wu.ID,
-			LeafID:        wu.LeafID,
+			LeafID:           wu.LeafID,
 			CompletedAt:      time.Now().UTC(),
 			WallClockSeconds: result.Metrics.WallClockSeconds,
 			ResultAccepted:   submitResp.Accepted,
@@ -569,7 +572,7 @@ func createTestLeaf(t *testing.T, base, userID, name, binURL, binChecksum, platf
 			"aggregation_format":    "JSON",
 			"max_input_size_bytes":  1048576,
 			"max_output_size_bytes": 104857600,
-			"splitting_config":     map[string]interface{}{"x": params},
+			"splitting_config":      map[string]interface{}{"x": params},
 		},
 	}
 	resp = restReq(t, "PUT", pURL, update)
