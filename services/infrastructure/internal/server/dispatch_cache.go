@@ -178,8 +178,9 @@ type heldCopy struct {
 }
 
 // meterID returns the effective host id the per-machine metering (in-flight cap, send
-// floor) keys on: the reported host id when present, else the account id (the per-account
-// fallback). It equals effectiveHostID and matches COALESCE(host_id, volunteer_id) in SQL.
+// floor) keys on: the VALIDATED server-issued host id when present (BG-25 — the handler
+// only populates opts.HostID for an id issued to the requesting account), else the
+// account id (the per-account fallback). Matches COALESCE(host_id, volunteer_id) in SQL.
 func meterID(volunteerID types.ID, hostID *types.ID) types.ID {
 	if hostID != nil {
 		return *hostID
@@ -463,6 +464,17 @@ type dispatchCache struct {
 	hostRuntimeMu    sync.Mutex
 	hostRuntimeCache map[types.ID][]string
 
+	// hostOwnerCache caches per-host OWNERSHIP facts (issued host id -> account) plus
+	// the work-path last-seen bump throttle, for BG-25's work-path validation: a
+	// non-empty host id must have been issued to the requesting account or the request
+	// is refused. TTL'd (hostOwnerTTL) — unlike hostRuntimeCache — because expiry is
+	// what makes DELETE-based revocation and mint-time eviction land on the hot path;
+	// negative outcomes are cached too, bounding unknown-id lookups. See
+	// host_identity.go for the methods and semantics (incl. the fold-don't-refuse rule
+	// on shed/error).
+	hostOwnerMu    sync.Mutex
+	hostOwnerCache map[types.ID]*hostOwnerEntry
+
 	// hostBudgetCache maps a machine's effective host id -> its current adaptive in-flight
 	// budget (TODO #54), recomputed OFF the hot path by runBudgetRefresher from the
 	// reliability store. The hand-out hot path reads ONE entry here under budgetMu (mirrors
@@ -574,6 +586,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		versionCache:         make(map[types.ID]*leaf.ArtifactVersion),
 		identityCache:        make(map[types.ID]*volunteerIdentity),
 		hostRuntimeCache:     make(map[types.ID][]string),
+		hostOwnerCache:       make(map[types.ID]*hostOwnerEntry),
 		hostBudgetCache:      make(map[types.ID]int),
 		admission:            make(chan struct{}, cfg.admissionCap),
 		maintenanceAdmission: make(chan struct{}, cfg.maintenanceAdmissionCap),

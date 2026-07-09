@@ -94,6 +94,21 @@ func RegistrationPowFromHeadConfig(hc *config.HeadConfig) admission.PowPolicy {
 	}
 }
 
+// HostCapFromHeadConfig builds the per-account host cap policy (BG-25) from the head
+// configuration (the single-source rule of its two siblings above). A nil config yields
+// the zero value (cap off — the bare-test wiring); production resolves the effective
+// cap (default 10, explicit 0 = unlimited) and the staleness window that makes an idle
+// slot evictable at mint time.
+func HostCapFromHeadConfig(hc *config.HeadConfig) HostCapPolicy {
+	if hc == nil {
+		return HostCapPolicy{}
+	}
+	return HostCapPolicy{
+		PerAccount:   hc.EffectiveHostCapPerAccount(),
+		ActiveWindow: time.Duration(hc.EffectiveHostCapActiveDays()) * 24 * time.Hour,
+	}
+}
+
 // trustRepoFromPool returns a pgx-backed trust repository, or a genuine nil interface when
 // the pool is nil (the gRPC-plumbing / mux-only tests), so stampTrustSnapshot's nil check
 // works. It centralizes the "nil pool -> nil repo" idiom the submit paths share.

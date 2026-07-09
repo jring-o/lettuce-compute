@@ -83,6 +83,11 @@ type volunteerService struct {
 	// Challenge ISSUANCE (GetRegistrationChallenge) works regardless so clients can be
 	// written probe-free. Re-registration of an existing key never consults it.
 	registrationPow admission.PowPolicy
+	// hostCap is the per-account host cap policy (BG-25): how many server-issued
+	// per-machine host ids one account may hold, and the staleness window that makes
+	// an idle slot evictable at mint time. Zero value = cap off (mints always succeed
+	// — the unit-test default); main.go threads the real policy via SetHostCapPolicy.
+	hostCap HostCapPolicy
 	// now supplies the current time for trust power-suppression checks; overridable in tests.
 	now func() time.Time
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
@@ -122,6 +127,8 @@ type volunteerService struct {
 	// capRefusalLogN samples the creation-cap refusal Warn the same way (a capped
 	// network retrying is an abuse signal, not a per-line event).
 	capRefusalLogN uint64
+	// hostCapRefusalLogN samples the host-mint refusal Warn (BG-25) the same way.
+	hostCapRefusalLogN uint64
 }
 
 // referenceBenchmarkFPOPS is the head's fixed reference-host throughput (FP ops /
@@ -319,6 +326,17 @@ func SetAdmissionPolicy(svc lettucev1.VolunteerServiceServer, cap admission.CapP
 func SetRegistrationPowPolicy(svc lettucev1.VolunteerServiceServer, pow admission.PowPolicy) {
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.registrationPow = pow
+	}
+}
+
+// SetHostCapPolicy sets the per-account host cap policy (BG-25) on the gRPC volunteer
+// service. The zero value disables the cap (mints always succeed — the unit-test
+// default); main.go fills the real policy from HeadConfig.Effective* values (the
+// SetHeadConfig decoupling pattern). Host-id ISSUANCE itself is unconditional — the
+// cap only bounds how many ids one account may hold.
+func SetHostCapPolicy(svc lettucev1.VolunteerServiceServer, p HostCapPolicy) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.hostCap = p
 	}
 }
 
@@ -740,10 +758,11 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 				s.dispatchCache.putIdentity(v)
 			}
 
-			// Per-machine host (TODO #19): record this machine's advertised runtimes/hardware
-			// against its own host row, so two machines under one key no longer overwrite each
-			// other on the single account row.
-			s.registerHost(ctx, v.ID, req, hw, now)
+			// Per-machine host (BG-25, TODO #19): resolve this machine's server-issued
+			// host id (mint on an empty request id, under the per-account cap) and
+			// record its advertised runtimes/hardware against its own host row, so two
+			// machines under one key no longer overwrite each other on the account row.
+			issuedHostID := s.resolveRegisteredHost(ctx, v.ID, req, hw, now)
 
 			// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
 			// now that the generic gRPC access log is demoted to Debug.
@@ -752,6 +771,7 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			return &lettucev1.RegisterVolunteerResponse{
 				VolunteerId: v.ID.String(),
 				Registered:  true,
+				HostId:      issuedHostID,
 			}, nil
 
 		case errors.Is(createErr, admission.ErrCreationCapExceeded):
@@ -808,52 +828,122 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 		s.dispatchCache.putIdentity(existing)
 	}
 
-	// Per-machine host (TODO #19): refresh this machine's host row + warmed runtimes.
-	s.registerHost(ctx, existing.ID, req, hw, now)
+	// Per-machine host (BG-25, TODO #19): resolve this machine's server-issued host id
+	// (echo-refresh a known id; mint on an empty request id) + warm the per-host caches.
+	issuedHostID := s.resolveRegisteredHost(ctx, existing.ID, req, hw, now)
 
 	s.logger.Info("volunteer registered", "volunteer_id", existing.ID, "is_new", false)
 
 	return &lettucev1.RegisterVolunteerResponse{
 		VolunteerId: existing.ID.String(),
 		Registered:  false,
+		HostId:      issuedHostID,
 	}, nil
 }
 
-// registerHost upserts the per-MACHINE host row for a registration that reported a host
-// id (TODO #19): one row per (account, machine), keyed by the deterministic effective
-// host id, carrying THIS machine's advertised runtimes/hardware/last-seen. It also warms
-// the dispatch cache's per-host runtime snapshot so the machine's first work request
-// resolves its own runtimes in memory (the flapping-row fix). A no-op when the volunteer
-// reported no host id (per-account fallback) or in unit tests with no pool. Best-effort:
-// a host-upsert failure is logged and swallowed so registration still succeeds (the
-// account row carries the fallback facts).
-func (s *volunteerService) registerHost(ctx context.Context, volunteerID types.ID, req *lettucev1.RegisterVolunteerRequest, hw volunteer.HardwareCapabilities, now time.Time) {
-	if s.hostRepo == nil || req.GetHostId() == "" {
-		return
+// resolveRegisteredHost resolves THIS machine's server-issued host id for a
+// registration (BG-25, TODO #19): one row per (account, machine), carrying the
+// machine's advertised runtimes/hardware/last-seen while credit/distinctness stay per
+// account. Three-way on the request's host_id:
+//
+//   - a known id of THIS account → echo-refresh (best-effort: a refresh failure never
+//     fails registration; the id is still echoed);
+//   - EMPTY → an explicit mint request: a fresh random id under the per-account cap
+//     (transactional in the repo); a cap refusal returns "" — the machine works in the
+//     shared per-account bucket;
+//   - unknown/foreign/unparseable → "" and NOTHING is created (mint-on-unknown would
+//     let pre-issuance builds, which echo self-generated ids forever, mint garbage
+//     rows every restart — the client discards its stored id and re-registers empty).
+//
+// The returned string rides RegisterVolunteerResponse.host_id verbatim. Also warms the
+// dispatch cache's per-host runtime + ownership snapshots so the machine's first work
+// request resolves in memory. Returns "" in unit tests with no pool (nil hostRepo).
+func (s *volunteerService) resolveRegisteredHost(ctx context.Context, volunteerID types.ID, req *lettucev1.RegisterVolunteerRequest, hw volunteer.HardwareCapabilities, now time.Time) string {
+	if s.hostRepo == nil {
+		return ""
 	}
-	hostID := effectiveHostID(volunteerID, req.GetHostId())
 	var displayName *string
 	if req.DisplayName != "" {
 		displayName = &req.DisplayName
 	}
+
+	if raw := req.GetHostId(); raw != "" {
+		id, err := types.ParseID(raw)
+		if err != nil {
+			return ""
+		}
+		existing, err := s.hostRepo.GetByID(ctx, id)
+		if err != nil {
+			if !isNotFound(err) {
+				// A transient read failure is answered like unknown ("" → the client
+				// re-registers empty and mints): the old row stays, cap-bounded and
+				// aged out by eviction. Log it — a burst here means DB trouble.
+				s.logger.Warn("failed to look up echoed host id; answering unknown",
+					"volunteer_id", volunteerID, "host_id", id, "error", err)
+			}
+			return ""
+		}
+		if existing.VolunteerID != volunteerID {
+			return ""
+		}
+		h := &volunteer.Host{
+			ID:                   id,
+			VolunteerID:          volunteerID,
+			DisplayName:          displayName,
+			HardwareCapabilities: hw,
+			AvailableRuntimes:    req.AvailableRuntimes,
+			IsActive:             true,
+			LastSeenAt:           &now,
+		}
+		if err := s.hostRepo.Upsert(ctx, h); err != nil {
+			// Best-effort refresh: ownership already verified, so still echo the id.
+			s.logger.Warn("failed to refresh host row",
+				"volunteer_id", volunteerID, "host_id", id, "error", err)
+			s.warmHostCaches(id, volunteerID, req.AvailableRuntimes)
+			return id.String()
+		}
+		s.warmHostCaches(id, volunteerID, req.AvailableRuntimes)
+		return id.String()
+	}
+
+	// Mint path: an explicitly empty id is the client's request for a machine id.
 	h := &volunteer.Host{
-		ID:                   hostID,
+		ID:                   types.NewID(),
 		VolunteerID:          volunteerID,
-		HostKey:              req.GetHostId(),
 		DisplayName:          displayName,
 		HardwareCapabilities: hw,
 		AvailableRuntimes:    req.AvailableRuntimes,
 		IsActive:             true,
 		LastSeenAt:           &now,
 	}
-	if err := s.hostRepo.Upsert(ctx, h); err != nil {
-		s.logger.Warn("failed to upsert host; falling back to per-account",
+	minted, err := s.hostRepo.Mint(ctx, h, s.hostCap.PerAccount, s.hostCap.ActiveWindow)
+	if err != nil {
+		s.logger.Warn("failed to mint host id; falling back to per-account",
 			"volunteer_id", volunteerID, "error", err)
+		return ""
+	}
+	if !minted {
+		// At cap with every slot recently active: the refusal (sampled Warn, H-5
+		// idiom — an account hammering mints is a signal, not a per-line event).
+		if n := atomic.AddUint64(&s.hostCapRefusalLogN, 1); n%shedLogSampleN == 1 {
+			s.logger.Warn("refusing host id mint: per-account host cap reached",
+				"volunteer_id", volunteerID, "cap", s.hostCap.PerAccount, "refusal_count", n)
+		}
+		return ""
+	}
+	s.warmHostCaches(h.ID, volunteerID, req.AvailableRuntimes)
+	return h.ID.String()
+}
+
+// warmHostCaches warms the dispatch cache's per-host snapshots (advertised runtimes for
+// the flapping-row fix; ownership for BG-25 work-path validation) at registration, the
+// natural write point.
+func (s *volunteerService) warmHostCaches(hostID, owner types.ID, runtimes []string) {
+	if s.dispatchCache == nil {
 		return
 	}
-	if s.dispatchCache != nil {
-		s.dispatchCache.putHostRuntimes(hostID, req.AvailableRuntimes)
-	}
+	s.dispatchCache.putHostRuntimes(hostID, runtimes)
+	s.dispatchCache.putHostOwner(hostID, owner)
 }
 
 func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
@@ -932,17 +1022,41 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		return nil, status.Errorf(codes.PermissionDenied, "authenticated key does not match volunteer record")
 	}
 
-	// Per-machine host id (TODO #19): a stable id the volunteer self-generates so the head
-	// meters in-flight work + the work-send floor per machine and attributes copies/results
-	// to it, while credit + distinctness stay per account. hostID == nil means the volunteer
-	// reported no host -> the copy row's host_id is NULL and everything falls back to
-	// per-account behavior. The effective host id (= volunteer id in that fallback) is what
-	// the dispatch metering keys on; opts.HostID (the nullable pointer) is what the copy row
-	// records, so a no-host copy stays NULL and queryable as "no machine reported".
+	// Per-machine host id (BG-25, TODO #19): the SERVER-ISSUED id this machine received
+	// at registration, so the head meters in-flight work + the work-send floor per
+	// machine and attributes copies/results to it, while credit + distinctness stay per
+	// account. hostID == nil means no host -> the copy row's host_id is NULL and
+	// everything falls back to per-account behavior. A NON-empty id must have been
+	// issued to THIS account (the hosts row is the ledger): validation resolves through
+	// the TTL'd host-owner cache — memory-only when warm, one bounded read on a cold
+	// miss. Outcomes:
+	//   - valid           -> per-machine metering + the throttled last-seen bump that
+	//                        keeps a WORKING machine out of the cap's eviction window;
+	//   - definitively unknown/foreign (incl. unparseable) -> the pinned refusal:
+	//                        pre-issuance builds classify it as "run update"
+	//                        (IsVolunteerTooOldError — the word "outdated"), issuance-
+	//                        era builds match HostUnknownMessagePrefix and re-register;
+	//   - undeterminable (admission shed / DB error) -> fold to the account bucket for
+	//                        THIS request only, never refuse (a post-deploy cold cache
+	//                        under reconnect load must not start a re-mint storm).
 	var hostID *types.ID
-	if req.GetHostId() != "" {
-		h := effectiveHostID(volunteerID, req.GetHostId())
-		hostID = &h
+	if raw := req.GetHostId(); raw != "" {
+		id, perr := types.ParseID(raw)
+		if perr != nil {
+			return nil, status.Error(codes.FailedPrecondition, HostUnknownMessage)
+		}
+		if s.dispatchCache == nil {
+			// gRPC-plumbing unit tests: no oracle available — fold, never refuse.
+		} else if owner, found, definitive := s.dispatchCache.resolveHostOwner(id); found && owner == volunteerID {
+			hostID = &id
+			if s.hostRepo != nil && s.dispatchCache.shouldBumpHostSeen(id) {
+				// Best-effort, throttled (hostSeenBumpInterval): the eviction clock,
+				// not correctness — an error is swallowed like the account-row bump.
+				_ = s.hostRepo.UpdateLastSeen(ctx, id)
+			}
+		} else if definitive {
+			return nil, status.Error(codes.FailedPrecondition, HostUnknownMessage)
+		}
 	}
 
 	// Resolve the REQUESTING host's advertised runtimes (the flapping-row fix): two

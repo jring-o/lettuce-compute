@@ -450,6 +450,22 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.RegistrationPowChallengeTTLSeconds = n
 	}
+	// BG-25 per-account host cap. A pointer field (the ReliabilityQuotaEnabled
+	// pattern) because an EXPLICIT 0 means "unlimited" while unset means the default.
+	if v := os.Getenv("LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_HOST_CAP_PER_ACCOUNT must be an integer: %w", err)
+		}
+		cfg.Head.HostCapPerAccount = &n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS must be an integer: %w", err)
+		}
+		cfg.Head.HostCapActiveDays = n
+	}
 	return nil
 }
 
