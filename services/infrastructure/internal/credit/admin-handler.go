@@ -1,11 +1,13 @@
 package credit
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -20,6 +22,12 @@ const (
 	maxReasonLength            = 64
 )
 
+// reasonCodeRe constrains a clawback reason to an uppercase machine code. Free text would put
+// Go-HTML-escaped bytes into the signed revocation payload and break third-party recompute
+// (audit F-M2); the house style is already OPERATOR_CLAWBACK-shaped codes. This tightens the
+// slice-1 endpoint contract deliberately (recorded, alpha-sanctioned behavior change).
+var reasonCodeRe = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
+
 // AdminHandler serves the operator-only credit-settlement endpoints (manual clawback and the
 // per-volunteer adjustment list). Every method re-checks admin authorization via requireAdmin
 // against the router-injected Caller, so the operator-only invariant is enforced in the
@@ -27,14 +35,30 @@ const (
 // a handler wrapped in it WITHOUT this in-handler check would be fail-open. This mirrors
 // trust.Handler verbatim in shape.
 type AdminHandler struct {
-	adjRepo    AdjustmentsRepository
-	ledgerRepo Repository
-	logger     *slog.Logger
+	adjRepo           AdjustmentsRepository
+	ledgerRepo        Repository
+	revocationEmitter RevocationEmitter
+	logger            *slog.Logger
 }
 
 // NewAdminHandler creates a new credit admin Handler.
 func NewAdminHandler(adjRepo AdjustmentsRepository, ledgerRepo Repository, logger *slog.Logger) *AdminHandler {
 	return &AdminHandler{adjRepo: adjRepo, ledgerRepo: ledgerRepo, logger: logger}
+}
+
+// RevocationEmitter emits the signed revocation attestation that records a clawback. The
+// credit handler depends only on this narrow write surface; the concrete emitter lives in the
+// attestation package and is attached at router wiring (consumer-side interface, house style).
+type RevocationEmitter interface {
+	EmitForAdjustment(ctx context.Context, adjustmentID types.ID) error
+}
+
+// WithRevocationEmitter attaches the emitter invoked after a committed clawback. Additive:
+// NewAdminHandler stays emitter-free (existing callers and tests are unaffected) and the
+// router wires this setter. Returns h for chaining.
+func (h *AdminHandler) WithRevocationEmitter(e RevocationEmitter) *AdminHandler {
+	h.revocationEmitter = e
+	return h
 }
 
 // requireAdmin writes a 403 and returns false unless the injected caller is an admin. The
@@ -105,6 +129,11 @@ func (h *AdminHandler) HandleClawback(w http.ResponseWriter, r *http.Request) {
 			"reason must be at most 64 characters", nil))
 		return
 	}
+	if !reasonCodeRe.MatchString(reason) {
+		apierror.WriteError(w, apierror.ValidationError(
+			"reason must be an uppercase machine code matching ^[A-Z0-9_]{1,64}$", nil))
+		return
+	}
 
 	// Resolve the target ledger entry id. A result_id is resolved to its ledger entry via
 	// GetByResultID; a result with no grant returns the repository's NotFound → 404.
@@ -149,6 +178,16 @@ func (h *AdminHandler) HandleClawback(w http.ResponseWriter, r *http.Request) {
 		"amount", adj.Amount,
 		"reason", adj.Reason,
 	)
+
+	// Best-effort: record the signed revocation attestation. A failure here never fails the
+	// committed clawback — the leader-gated reconciliation sweep re-emits any that are missed.
+	if h.revocationEmitter != nil {
+		if err := h.revocationEmitter.EmitForAdjustment(r.Context(), adj.ID); err != nil {
+			l.Warn("revocation attestation emission failed; reconciliation sweep will retry",
+				"adjustment_id", adj.ID, "error", err)
+		}
+	}
+
 	writeJSON(w, http.StatusCreated, adj)
 }
 

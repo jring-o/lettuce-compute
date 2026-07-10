@@ -124,6 +124,7 @@ func setupHostIssuanceServer(t *testing.T, capPerAccount int) (*pgxpool.Pool, le
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
 		_, _ = pool.Exec(ctx, "DELETE FROM result_audits")
 		_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_attestations")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_units")
 		_, _ = pool.Exec(ctx, "DELETE FROM batches")

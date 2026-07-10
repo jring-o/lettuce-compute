@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +106,46 @@ func createTestWorkUnit(t *testing.T, pool *pgxpool.Pool, leafID types.ID) types
 	return id
 }
 
+// createTestResult inserts a minimal AGREED result so v2 attestations (which are
+// result-bound and unique per AGREED result) have a real row to reference.
+func createTestResult(t *testing.T, pool *pgxpool.Pool, wuID types.ID) types.ID {
+	t.Helper()
+	id := types.NewID()
+	_, err := pool.Exec(context.Background(), `
+		INSERT INTO results (id, work_unit_id, output_data, output_checksum, execution_metadata, validation_status)
+		VALUES ($1, $2, '{}', $3, '{}', 'AGREED')`,
+		id, wuID, strings.Repeat("ab", 32),
+	)
+	if err != nil {
+		t.Fatalf("create test result: %v", err)
+	}
+	return id
+}
+
+// makeV2TestAttestation builds a fully-populated v2 grant attestation (the only shape the
+// write path produces post-cutover; the v2 shape CHECK refuses anything less).
+func makeV2TestAttestation(leafID, wuID, resultID types.ID, pubKey []byte, credit float64, ts time.Time) *Attestation {
+	checksum := strings.Repeat("ab", 32)
+	policyVersion := PolicyVersion
+	return &Attestation{
+		SchemaVersion:      SchemaVersionV2,
+		LeafID:             leafID,
+		VolunteerPublicKey: pubKey,
+		WorkUnitID:         wuID,
+		ResultID:           &resultID,
+		OutputChecksum:     &checksum,
+		QuorumDescriptor: &QuorumDescriptor{
+			GroupSize: 2, MinQuorum: 2, PendingSize: 2, TargetCopies: 2, TrustFloor: 1,
+		},
+		PolicyVersion:         &policyVersion,
+		RawMetrics:            map[string]any{"wall_clock_seconds": float64(100), "cpu_seconds_user": float64(90)},
+		ValidationOutcome:     OutcomeAgreed,
+		CreditAmount:          credit,
+		CreditAmountCanonical: CanonicalCreditString(credit),
+		AttestationTimestamp:  ts,
+	}
+}
+
 func TestCreateAndList(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
@@ -112,6 +153,7 @@ func TestCreateAndList(t *testing.T) {
 	userID := createTestUser(t, pool, "att-creator1")
 	leafID := createTestLeaf(t, pool, &userID)
 	wuID := createTestWorkUnit(t, pool, leafID)
+	resultID := createTestResult(t, pool, wuID)
 
 	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	signer := NewSigner(priv)
@@ -119,18 +161,7 @@ func TestCreateAndList(t *testing.T) {
 	repo := NewPgxRepository(pool)
 	ctx := context.Background()
 
-	att := &Attestation{
-		LeafID:          leafID,
-		VolunteerPublicKey: signer.PublicKey(),
-		WorkUnitID:         wuID,
-		RawMetrics: map[string]any{
-			"wall_clock_seconds": float64(100),
-			"cpu_seconds_user":   float64(90),
-		},
-		ValidationOutcome:   OutcomeAgreed,
-		CreditAmount:        1.5,
-		AttestationTimestamp: types.Now(),
-	}
+	att := makeV2TestAttestation(leafID, wuID, resultID, signer.PublicKey(), 1.5, types.Now())
 
 	sig, err := signer.Sign(att)
 	if err != nil {
@@ -195,15 +226,8 @@ func TestListByProjectWithTimeRange(t *testing.T) {
 	wuIDs := []types.ID{wu1, wu2, wu3}
 
 	for i, ts := range timestamps {
-		att := &Attestation{
-			LeafID:           leafID,
-			VolunteerPublicKey:  signer.PublicKey(),
-			WorkUnitID:          wuIDs[i],
-			RawMetrics:          map[string]any{"cpu": float64(100)},
-			ValidationOutcome:   OutcomeAgreed,
-			CreditAmount:        1.0,
-			AttestationTimestamp: ts,
-		}
+		resultID := createTestResult(t, pool, wuIDs[i])
+		att := makeV2TestAttestation(leafID, wuIDs[i], resultID, signer.PublicKey(), 1.0, ts)
 		sig, _ := signer.Sign(att)
 		att.Signature = sig
 		if err := repo.Create(ctx, att); err != nil {
@@ -240,18 +264,13 @@ func TestListByVolunteerWithPagination(t *testing.T) {
 	repo := NewPgxRepository(pool)
 	ctx := context.Background()
 
-	// Create 5 attestations.
+	// Create 5 attestations (each bound to its own AGREED result — the partial unique
+	// index allows at most one AGREED grant attestation per result).
 	for i := 0; i < 5; i++ {
 		wuID := createTestWorkUnit(t, pool, leafID)
-		att := &Attestation{
-			LeafID:           leafID,
-			VolunteerPublicKey:  signer.PublicKey(),
-			WorkUnitID:          wuID,
-			RawMetrics:          map[string]any{"cpu": float64(i)},
-			ValidationOutcome:   OutcomeAgreed,
-			CreditAmount:        1.0,
-			AttestationTimestamp: types.Now().Add(time.Duration(-i) * time.Minute),
-		}
+		resultID := createTestResult(t, pool, wuID)
+		att := makeV2TestAttestation(leafID, wuID, resultID, signer.PublicKey(), 1.0,
+			types.Now().Add(time.Duration(-i)*time.Minute))
 		sig, _ := signer.Sign(att)
 		att.Signature = sig
 		if err := repo.Create(ctx, att); err != nil {

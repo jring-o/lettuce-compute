@@ -3,6 +3,7 @@ package credit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -433,5 +434,114 @@ func TestHandleListAdjustments_InvalidParams(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", target, rec.Code)
 		}
+	}
+}
+
+// --- clawback: reason charset (audit F-M2) ----------------------------------------------
+
+// A reason that is not an uppercase machine code is rejected 400 before any repository call —
+// free text would leak Go-HTML-escaped bytes into the signed revocation payload. An
+// OPERATOR_CLAWBACK-shaped code (uppercase, digits, underscore) is accepted.
+func TestHandleClawback_ReasonCharset(t *testing.T) {
+	entryID := types.NewID()
+	okAdj := &Adjustment{
+		ID: types.NewID(), LedgerEntryID: entryID, VolunteerID: types.NewID(),
+		LeafID: types.NewID(), Amount: -1.0, Reason: "OPERATOR_CLAWBACK",
+		CreatedBy: AdjustmentByOperator, CreatedAt: time.Now().UTC(),
+	}
+	cases := []struct {
+		name     string
+		reason   string
+		wantCode int
+	}{
+		{"lowercase rejected", "operator_clawback", http.StatusBadRequest},
+		{"ampersand rejected", "FRAUD&X", http.StatusBadRequest},
+		{"angle bracket rejected", "FRAUD<X", http.StatusBadRequest},
+		{"space rejected", "OPERATOR CLAWBACK", http.StatusBadRequest},
+		{"65 chars rejected", strings.Repeat("A", 65), http.StatusBadRequest},
+		{"machine code accepted", "OPERATOR_CLAWBACK", http.StatusCreated},
+		{"digits underscore accepted", "SLASH_2", http.StatusCreated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			adj := &fakeAdjRepo{adj: okAdj}
+			h := testAdminHandler(adj, &fakeLedgerRepo{})
+			body := `{"ledger_entry_id":"` + entryID.String() + `","reason":"` + tc.reason + `"}`
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/credit/adjustments",
+				strings.NewReader(body)).WithContext(adminContext())
+			rec := httptest.NewRecorder()
+			h.HandleClawback(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("reason %q: status = %d, want %d (body %s)", tc.reason, rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantCode == http.StatusBadRequest && len(adj.clawbackCalls) != 0 {
+				t.Errorf("reason %q: Clawback must not be called on a rejected reason", tc.reason)
+			}
+		})
+	}
+}
+
+// --- clawback: revocation emission ------------------------------------------------------
+
+// fakeRevEmitter records EmitForAdjustment calls and optionally fails them.
+type fakeRevEmitter struct {
+	calls []types.ID
+	err   error
+}
+
+func (f *fakeRevEmitter) EmitForAdjustment(_ context.Context, adjustmentID types.ID) error {
+	f.calls = append(f.calls, adjustmentID)
+	return f.err
+}
+
+func TestHandleClawback_EmitsRevocationOnSuccess(t *testing.T) {
+	adjID := types.NewID()
+	entryID := types.NewID()
+	adj := &fakeAdjRepo{adj: &Adjustment{
+		ID: adjID, LedgerEntryID: entryID, VolunteerID: types.NewID(),
+		LeafID: types.NewID(), Amount: -1.0, Reason: "OPERATOR_CLAWBACK",
+		CreatedBy: AdjustmentByOperator, CreatedAt: time.Now().UTC(),
+	}}
+	emitter := &fakeRevEmitter{}
+	h := testAdminHandler(adj, &fakeLedgerRepo{}).WithRevocationEmitter(emitter)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/credit/adjustments",
+		strings.NewReader(`{"ledger_entry_id":"`+entryID.String()+`","reason":"OPERATOR_CLAWBACK"}`)).
+		WithContext(adminContext())
+	rec := httptest.NewRecorder()
+	h.HandleClawback(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	if len(emitter.calls) != 1 || emitter.calls[0] != adjID {
+		t.Fatalf("EmitForAdjustment calls = %v, want [%v]", emitter.calls, adjID)
+	}
+}
+
+// A revocation-emission failure never fails the committed clawback: the endpoint still returns
+// 201 (the reconciliation sweep recovers the missing attestation).
+func TestHandleClawback_EmissionFailureStill201(t *testing.T) {
+	adjID := types.NewID()
+	entryID := types.NewID()
+	adj := &fakeAdjRepo{adj: &Adjustment{
+		ID: adjID, LedgerEntryID: entryID, VolunteerID: types.NewID(),
+		LeafID: types.NewID(), Amount: -1.0, Reason: "OPERATOR_CLAWBACK",
+		CreatedBy: AdjustmentByOperator, CreatedAt: time.Now().UTC(),
+	}}
+	emitter := &fakeRevEmitter{err: errors.New("signer unavailable")}
+	h := testAdminHandler(adj, &fakeLedgerRepo{}).WithRevocationEmitter(emitter)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/credit/adjustments",
+		strings.NewReader(`{"ledger_entry_id":"`+entryID.String()+`","reason":"OPERATOR_CLAWBACK"}`)).
+		WithContext(adminContext())
+	rec := httptest.NewRecorder()
+	h.HandleClawback(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 despite emission failure (body %s)", rec.Code, rec.Body.String())
+	}
+	if len(emitter.calls) != 1 {
+		t.Fatalf("EmitForAdjustment calls = %d, want 1", len(emitter.calls))
 	}
 }

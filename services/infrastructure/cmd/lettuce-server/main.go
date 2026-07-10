@@ -304,21 +304,28 @@ func main() {
 	}
 
 	// Create HTTP router and server.
+	// Revocation emitter (attestation v2, design §8.4): signs the clawback record the
+	// credit admin handler emits and the leader-gated reconciler recovers. Shares the
+	// head signer; its repository view is a plain pgx wrapper over the shared pool.
+	revocationEmitter := attestation.NewRevocationEmitter(
+		pool, attestation.NewPgxRepository(pool), attestationSigner, logger)
+
 	deps := &server.Dependencies{
-		Pool:             pool,
-		Logger:           logger,
-		Version:          version,
-		StartTime:        startTime,
-		CORSOrigins:      cfg.Server.CORSOrigins,
-		SigningPublicKey: attestationSigner.PublicKey(),
-		AdminAPIKey:      adminAPIKey,
-		ApiKeyRepo:       apiKeyRepo,
-		ChallengeStore:   challengeStore,
-		HeadConfig:       &cfg.Head,
-		ValidationEngine: validationEngine,
-		TrustedProxies:   trustedProxies,
-		AtprotoClient:    atprotoClient,
-		AnomalyChecker:   anomalyChecker,
+		Pool:              pool,
+		Logger:            logger,
+		Version:           version,
+		StartTime:         startTime,
+		CORSOrigins:       cfg.Server.CORSOrigins,
+		SigningPublicKey:  attestationSigner.PublicKey(),
+		AdminAPIKey:       adminAPIKey,
+		ApiKeyRepo:        apiKeyRepo,
+		ChallengeStore:    challengeStore,
+		HeadConfig:        &cfg.Head,
+		ValidationEngine:  validationEngine,
+		TrustedProxies:    trustedProxies,
+		AtprotoClient:     atprotoClient,
+		AnomalyChecker:    anomalyChecker,
+		RevocationEmitter: revocationEmitter,
 	}
 	router, rateLimitCleanup := server.NewRouter(deps)
 	defer rateLimitCleanup()
@@ -535,6 +542,12 @@ func main() {
 		// them within the queue lifetime regardless, releasing the pins; on a head
 		// that never enabled audits it is two no-op UPDATEs a minute on the leader.
 		go audit.NewReclaimWorker(auditsRepo, logger).Start(leaderCtx)
+		// Revocation reconciliation sweep (design §8.4) — UNCONDITIONAL like the reclaim
+		// sweep: a clawback whose best-effort in-handler emission failed must still get
+		// its signed revocation attestation, and re-POSTing the clawback endpoint can
+		// never re-reach emission (the adjustment already exists). On a head with no
+		// missing revocations it is one indexed no-row query per sweep on the leader.
+		go attestation.NewRevocationReconciler(revocationEmitter, 10*time.Minute, logger).Run(leaderCtx)
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 
