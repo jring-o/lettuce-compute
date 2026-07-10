@@ -189,6 +189,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_attestations")
 		_, _ = pool.Exec(ctx, "DELETE FROM volunteer_rac")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM leaf_stats_snapshots")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")

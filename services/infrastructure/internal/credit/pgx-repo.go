@@ -81,6 +81,60 @@ func (r *PgxRepository) Create(ctx context.Context, entry *LedgerEntry) error {
 	return nil
 }
 
+// CreateCapped inserts entry only if the volunteer's credit granted over the trailing
+// rolling 24h window plus this amount would stay within capPerDay. The guard and the insert
+// ride a single INSERT ... SELECT ... WHERE statement (one round trip) — this narrows, but
+// does not close, the concurrency window, which is acceptable because the cap is an anomaly
+// bound, not an accounting invariant (see CappedCreator).
+//
+// A suppressed grant is the NORMAL over-cap outcome, NOT an error: the WHERE excludes the
+// row, the INSERT touches zero rows, the RETURNING scan yields pgx.ErrNoRows, and this
+// returns (false, nil) so the caller's validation continues. The one-credit-per-result
+// idempotency guard (SQLSTATE 23505) and the FK guard (23503) STILL surface as the same
+// Conflict errors Create returns — those are real conflicts, not cap suppression.
+func (r *PgxRepository) CreateCapped(ctx context.Context, entry *LedgerEntry, capPerDay float64) (bool, error) {
+	row := r.db.QueryRow(ctx, `
+		INSERT INTO credit_ledger (
+			volunteer_id, leaf_id, work_unit_id, result_id, credit_amount
+		)
+		SELECT $1, $2, $3, $4, $5
+		WHERE (
+			SELECT COALESCE(SUM(credit_amount), 0)
+			FROM credit_ledger
+			WHERE volunteer_id = $1 AND granted_at >= now() - interval '24 hours'
+		) + $5 <= $6
+		RETURNING `+ledgerColumns,
+		entry.VolunteerID, entry.LeafID, entry.WorkUnitID,
+		entry.ResultID, entry.CreditAmount, capPerDay,
+	)
+
+	created, err := scanLedgerEntry(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Guard excluded the row: grant suppressed by the daily cap. Non-error branch.
+			return false, nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "23505" {
+				return false, apierror.Conflict(
+					"credit already granted for this result",
+					map[string]string{"constraint": pgErr.ConstraintName},
+				)
+			}
+			if pgErr.Code == "23503" {
+				return false, apierror.Conflict(
+					"referenced entity does not exist",
+					map[string]string{"constraint": pgErr.ConstraintName},
+				)
+			}
+		}
+		return false, apierror.Internal("failed to create capped credit ledger entry", err)
+	}
+	*entry = *created
+	return true, nil
+}
+
 // GetByResultID retrieves a credit ledger entry by its result ID.
 func (r *PgxRepository) GetByResultID(ctx context.Context, resultID types.ID) (*LedgerEntry, error) {
 	row := r.db.QueryRow(ctx,

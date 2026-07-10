@@ -38,6 +38,12 @@ const trustStarvedWarnEvery = 10 * time.Minute
 // changes on operator timescales, so re-warning every scan would only be noise.
 const standingPopulationWarnEvery = 10 * time.Minute
 
+// emissionAnomalyWarnEvery throttles the emission-anomaly WARN (see warnEmissionAnomaly):
+// like the trust-starved sweep the probe runs every scan (and not at all when the anomaly
+// halt is off), but the WARN line repeats at most this often — an emission burst is an
+// operator-timescale event, so re-warning every 30s scan would only be noise.
+const emissionAnomalyWarnEvery = 10 * time.Minute
+
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
 	workUnitRepo   workunit.WorkUnitRepository
@@ -70,6 +76,16 @@ type FaultMonitor struct {
 	// the single Start loop (ScanOnce is not concurrent with itself), so no lock —
 	// same justification as lastTrustStarvedWarn above.
 	lastStandingPopulationWarn time.Time
+	// emissionAnomalyCheck is the OPTIONAL global emission-anomaly probe behind the
+	// emission-anomaly operator WARN. nil (the default) = the sweep is skipped at zero
+	// cost; the orchestrator wires it via WithEmissionAnomalyCheck only when the emission
+	// anomaly halt is armed. The closure reports whether the export circuit breaker has
+	// tripped plus the figures the WARN names.
+	emissionAnomalyCheck func(ctx context.Context) (halted bool, today, baseline float64, err error)
+	// lastEmissionAnomalyWarn is when the emission-anomaly WARN last fired (zero = never),
+	// the emissionAnomalyWarnEvery throttle clock. Touched only by the single Start loop
+	// (ScanOnce is not concurrent with itself), so no lock — same as lastTrustStarvedWarn.
+	lastEmissionAnomalyWarn time.Time
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -103,6 +119,16 @@ func NewFaultMonitor(
 // monitor so it can be composed onto NewFaultMonitor without widening its signature.
 func (m *FaultMonitor) WithStandingPopulation(repo standing.Repository) *FaultMonitor {
 	m.standingPopulationRepo = repo
+	return m
+}
+
+// WithEmissionAnomalyCheck wires the OPTIONAL global emission-anomaly probe that backs the
+// emission-anomaly operator WARN (warnEmissionAnomaly). Left unset the sweep is a no-op;
+// the orchestrator calls this only when the emission anomaly halt is enabled, so the
+// feature stays zero-cost by default. Chainable; returns the monitor so it can be composed
+// onto NewFaultMonitor without widening its signature.
+func (m *FaultMonitor) WithEmissionAnomalyCheck(check func(ctx context.Context) (halted bool, today, baseline float64, err error)) *FaultMonitor {
+	m.emissionAnomalyCheck = check
 	return m
 }
 
@@ -234,6 +260,11 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	//    missing — surface it.
 	m.warnTrustStarved(ctx)
 
+	// 3b. Emission anomaly circuit breaker: WARN when today's global grant total has
+	//     tripped the anomaly halt and the public credit export has self-frozen (503). A
+	//     no-op when the halt is off (no probe wired); the operator "page" for the freeze.
+	m.warnEmissionAnomaly(ctx)
+
 	// 4. Automatic standing backpressure population: how many volunteers the machine
 	//    currently holds in PROBATION or BENCHED. A no-op when the machine is off (no
 	//    standing repo wired); a signal that a chunk of the fleet is being neutralized
@@ -273,6 +304,36 @@ func (m *FaultMonitor) warnTrustStarved(ctx context.Context) {
 		"count", count,
 		"sample_work_unit_ids", sample,
 		"remedy", "seed or verify trusted subjects (POST /api/v1/admin/trust), add trusted volunteer capacity, or lower the leaf's min_trusted_corroborators")
+}
+
+// warnEmissionAnomaly surfaces a TRIPPED emission anomaly circuit breaker: a WARN naming
+// today's total grant, the trailing baseline, and the operator remedies. Skipped entirely
+// when no probe is wired (the anomaly halt is off); throttled to emissionAnomalyWarnEvery
+// so a stable anomaly does not re-log every scan. Only warns when the breaker is actually
+// tripped, so a healthy head is silent and — like the zero-count trust-starved sweep —
+// never arms the throttle, meaning the WARN fires on the very scan the anomaly first
+// appears. Best-effort like every other sweep here — a probe error is logged and the scan
+// continues.
+func (m *FaultMonitor) warnEmissionAnomaly(ctx context.Context) {
+	if m.emissionAnomalyCheck == nil {
+		return
+	}
+	if !m.lastEmissionAnomalyWarn.IsZero() && time.Since(m.lastEmissionAnomalyWarn) < emissionAnomalyWarnEvery {
+		return
+	}
+	halted, today, baseline, err := m.emissionAnomalyCheck(ctx)
+	if err != nil {
+		m.logger.Error("emission-anomaly sweep failed", "error", err)
+		return
+	}
+	if !halted {
+		return
+	}
+	m.lastEmissionAnomalyWarn = time.Now()
+	m.logger.Warn("emission anomaly: today's granted credit far exceeds the trailing baseline, and the public credit export has self-frozen (503) until the burst enters the baseline window or the operator intervenes",
+		"today", today,
+		"baseline", baseline,
+		"remedy", "investigate the credit burst; if legitimate, raise LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR or disable the halt (LETTUCE_HEAD_EMISSION_ANOMALY_HALT_ENABLED=false) and restart the head; the export stays frozen meanwhile")
 }
 
 // warnStandingPopulation surfaces the automatic-standing-backpressure population (see

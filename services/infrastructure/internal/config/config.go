@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"strconv"
@@ -331,6 +332,46 @@ type HeadConfig struct {
 	// evictable at mint time when the account is at cap. Unset (0) resolves to the
 	// default 30. Override via LETTUCE_HEAD_HOST_CAP_ACTIVE_DAYS.
 	HostCapActiveDays int `yaml:"host_cap_active_days"`
+
+	// --- Credit settlement: maturation, export kill switch, emission caps ---
+	//
+	// The settlement layer makes fraudulent credit unwindable before an external
+	// consumer can treat it as money: credit younger than the maturation window is
+	// excluded from the public export, clawbacks (compensating negative entries in
+	// credit_adjustments) net against it per-entry, a per-account daily cap bounds
+	// the burst rate any account can mint, and an anomaly check freezes the export
+	// when today's global grant rate far exceeds the trailing norm. Every knob
+	// defaults to current behavior.
+
+	// CreditMaturationDays is the maturation window in DAYS. 0 (the default)
+	// disables maturation: the public fleet feed serves raw lifetime sums exactly
+	// as before. > 0: the feed serves per-entry adjustment-net sums over entries at
+	// least this many days old. Override via LETTUCE_HEAD_CREDIT_MATURATION_DAYS.
+	CreditMaturationDays int `yaml:"credit_maturation_days"`
+	// StatsExportEnabled is the export kill switch for the public credit-stats
+	// feeds (the fleet feed and the per-volunteer public stats). ON BY DEFAULT
+	// (nil resolves to true): set false to freeze the export during an incident —
+	// the endpoints answer 503 so a consumer halts payouts instead of ingesting
+	// numbers under investigation. Override via LETTUCE_HEAD_STATS_EXPORT_ENABLED.
+	StatsExportEnabled *bool `yaml:"stats_export_enabled"`
+	// MaxDailyCreditPerAccount caps one account's granted credit over a rolling 24h
+	// window (DB clock). 0 (the default) = unlimited. A grant that would exceed the
+	// cap is SUPPRESSED (no ledger entry, no RAC; the result stays AGREED and its
+	// attestation records credit 0) — the cap bounds emission, not merit. Override
+	// via LETTUCE_HEAD_MAX_DAILY_CREDIT_PER_ACCOUNT.
+	MaxDailyCreditPerAccount float64 `yaml:"max_daily_credit_per_account"`
+	// EmissionAnomalyHaltEnabled arms the global anomaly circuit breaker: the
+	// public export self-halts (503) when the last 24h's total granted credit
+	// exceeds EmissionAnomalyFactor times the trailing 30-day daily average
+	// (SUM over [now()-31d, now()-1d) / 30, armed only once that window has grants
+	// on >= 7 distinct days, so a young or sparse head cannot trip on noise). OFF
+	// by default. Override via LETTUCE_HEAD_EMISSION_ANOMALY_HALT_ENABLED.
+	EmissionAnomalyHaltEnabled bool `yaml:"emission_anomaly_halt_enabled"`
+	// EmissionAnomalyFactor is the anomaly multiple. Unset (0) resolves to the
+	// default 3.0; the effective value must be > 1 when the halt is enabled (at or
+	// below 1 any busier-than-average day would freeze the export). Override via
+	// LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR.
+	EmissionAnomalyFactor float64 `yaml:"emission_anomaly_factor"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -430,6 +471,14 @@ const (
 	// Working machines bump last-seen on the work path, so only genuinely idle
 	// machines ever age out — and only when a new machine actually needs the slot.
 	defaultHostCapActiveDays = 30
+
+	// --- Credit settlement defaults ---
+	// defaultStatsExportEnabled: the public export serves by default; the kill
+	// switch exists to be flipped OFF in an incident.
+	defaultStatsExportEnabled = true
+	// defaultEmissionAnomalyFactor: today's grants must exceed 3x the trailing
+	// 30-day daily average before the export freezes itself.
+	defaultEmissionAnomalyFactor = 3.0
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -680,6 +729,24 @@ func (h HeadConfig) Validate() error {
 	if h.HostCapActiveDays < 0 {
 		return fmt.Errorf("head.host_cap_active_days must be >= 0 (0 = default %d), got %d",
 			defaultHostCapActiveDays, h.HostCapActiveDays)
+	}
+	if h.CreditMaturationDays < 0 {
+		return fmt.Errorf("head.credit_maturation_days must be >= 0 (0 = disabled), got %d", h.CreditMaturationDays)
+	}
+	if h.MaxDailyCreditPerAccount < 0 || math.IsNaN(h.MaxDailyCreditPerAccount) || math.IsInf(h.MaxDailyCreditPerAccount, 0) {
+		return fmt.Errorf("head.max_daily_credit_per_account must be a finite value >= 0 (0 = unlimited), got %v", h.MaxDailyCreditPerAccount)
+	}
+	if h.EmissionAnomalyFactor < 0 || math.IsNaN(h.EmissionAnomalyFactor) || math.IsInf(h.EmissionAnomalyFactor, 0) {
+		return fmt.Errorf("head.emission_anomaly_factor must be a finite value >= 0 (0 = default %v), got %v",
+			defaultEmissionAnomalyFactor, h.EmissionAnomalyFactor)
+	}
+	// Checked on the EFFECTIVE value (the standing-band precedent): a factor at or
+	// below 1 would freeze the export on any busier-than-average day — a foot-gun,
+	// not a tunable. Only enforced when the halt is armed at all.
+	if h.EmissionAnomalyHaltEnabled {
+		if f := h.EffectiveEmissionAnomalyFactor(); f <= 1 {
+			return fmt.Errorf("head.emission_anomaly_factor must be > 1 when the anomaly halt is enabled (effective value, got %v)", f)
+		}
 	}
 	return nil
 }
@@ -1068,6 +1135,26 @@ func (h HeadConfig) EffectiveHostCapActiveDays() int {
 		return defaultHostCapActiveDays
 	}
 	return h.HostCapActiveDays
+}
+
+// EffectiveStatsExportEnabled reports whether the public credit-stats export serves.
+// ON BY DEFAULT: nil (unset) -> defaultStatsExportEnabled (true); an explicit false is
+// the incident kill switch (gated endpoints answer 503).
+func (h HeadConfig) EffectiveStatsExportEnabled() bool {
+	if h.StatsExportEnabled == nil {
+		return defaultStatsExportEnabled
+	}
+	return *h.StatsExportEnabled
+}
+
+// EffectiveEmissionAnomalyFactor returns the anomaly multiple the export's circuit
+// breaker compares today's grant total against. Unset (<= 0) ->
+// defaultEmissionAnomalyFactor (3.0).
+func (h HeadConfig) EffectiveEmissionAnomalyFactor() float64 {
+	if h.EmissionAnomalyFactor <= 0 {
+		return defaultEmissionAnomalyFactor
+	}
+	return h.EmissionAnomalyFactor
 }
 
 // StorageConfig defines local filesystem storage settings.

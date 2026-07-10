@@ -55,6 +55,12 @@ type Dependencies struct {
 	// unless the operator enabled DID binding (HeadConfig.DIDBindingEnabled), which
 	// is the only condition under which the bind-DID route is registered.
 	AtprotoClient *atproto.Client
+	// AnomalyChecker backs the export emission-anomaly circuit breaker. nil unless
+	// the operator enabled the emission anomaly halt; when set, the router wires it
+	// into the public credit-stats settlement gates. The SAME instance also feeds
+	// the fault monitor's WARN sweep, so the 503 gate and the operator page consult
+	// one cached verdict and cannot disagree.
+	AnomalyChecker *credit.AnomalyChecker
 	// TrustedProxies is the set of reverse-proxy networks whose X-Forwarded-For /
 	// X-Real-IP headers may be trusted for client-IP extraction (rate limiting and
 	// audit logging). EMPTY (nil) by default: forwarding headers are not trusted and
@@ -118,6 +124,23 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	racRepo := credit.NewPgxRACRepository(deps.Pool)
 	creditRepo := credit.NewPgxRepository(deps.Pool)
 	volunteerStatsHandler := credit.NewVolunteerStatsHandler(deps.Pool, volunteerRepo, racRepo, creditRepo, leafRepo, deps.Logger)
+	// Settlement gates on the public credit-stats feeds (kill switch, maturation
+	// window, emission-anomaly halt). With every knob at its default this config is
+	// behaviorally identical to no config (export on, maturation 0, halt off).
+	// AnomalyChecker is assigned only when non-nil: a typed-nil pointer stuffed into
+	// the interface field would defeat the handler's nil guard.
+	if deps.HeadConfig != nil {
+		settlementCfg := &credit.SettlementExportConfig{
+			ExportEnabled:      deps.HeadConfig.EffectiveStatsExportEnabled(),
+			MaturationDays:     deps.HeadConfig.CreditMaturationDays,
+			AnomalyHaltEnabled: deps.HeadConfig.EmissionAnomalyHaltEnabled,
+			AnomalyFactor:      deps.HeadConfig.EffectiveEmissionAnomalyFactor(),
+		}
+		if deps.AnomalyChecker != nil {
+			settlementCfg.AnomalyChecker = deps.AnomalyChecker
+		}
+		volunteerStatsHandler = volunteerStatsHandler.WithSettlement(settlementCfg)
+	}
 	volunteerStatsHandler.RegisterRoutes(mux)
 
 	// Attestation routes (public — signed credit records).
@@ -185,6 +208,7 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 			isAdmin := u != nil && u.Role == "ADMIN"
 			ctx := trust.WithCaller(r.Context(), trust.Caller{IsAdmin: isAdmin})
 			ctx = standing.WithCaller(ctx, standing.Caller{IsAdmin: isAdmin})
+			ctx = credit.WithCaller(ctx, credit.Caller{IsAdmin: isAdmin})
 			h(w, r.WithContext(ctx))
 		})
 	}
@@ -255,6 +279,17 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/admin/standing/clear", authAdmin(standingHandler.HandleClear))
 	mux.HandleFunc("GET /api/v1/admin/standing/{volunteer_id}", authAdmin(standingHandler.HandleGet))
 	mux.HandleFunc("GET /api/v1/admin/standing", authAdmin(standingHandler.HandleList))
+
+	// Credit settlement administration (operator-only — admin API key). The manual
+	// clawback appends a compensating negative credit_adjustments row against one
+	// credit_ledger entry (the ledger stays append-only); the incident-runbook lever
+	// until automated clawback ships. Shares the authAdmin wrapper, which injects
+	// credit.Caller alongside trust.Caller and standing.Caller — the handler's own
+	// requireAdmin enforces the 403 (fail-closed without the injection).
+	adjustmentsRepo := credit.NewPgxAdjustmentsRepository(deps.Pool)
+	creditAdminHandler := credit.NewAdminHandler(adjustmentsRepo, creditRepo, deps.Logger)
+	mux.HandleFunc("POST /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleClawback))
+	mux.HandleFunc("GET /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleListAdjustments))
 
 	// --- Deprecated /api/v1/projects aliases (removed in v0.10) ---
 	// Same handlers, same responses — allows existing clients to migrate gradually.

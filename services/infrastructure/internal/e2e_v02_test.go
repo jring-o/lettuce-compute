@@ -74,6 +74,7 @@ func setupE2EServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) {
 	cleanup := func() {
 		ts.Close()
 		_, _ = pool.Exec(ctx, "DELETE FROM leaf_stats_snapshots")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_units")

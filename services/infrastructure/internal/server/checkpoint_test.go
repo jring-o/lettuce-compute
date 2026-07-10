@@ -113,6 +113,7 @@ func setupCheckpointServer(t *testing.T) (
 		grpcServer.Stop()
 		_, _ = pool.Exec(ctx, "DELETE FROM file_uploads WHERE file_type = 'CHECKPOINT'")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_units")
