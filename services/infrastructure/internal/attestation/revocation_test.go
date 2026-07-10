@@ -68,7 +68,7 @@ func (s *stubDBTX) Exec(context.Context, string, ...any) (pgconn.CommandTag, err
 	return pgconn.CommandTag{}, nil
 }
 func (s *stubDBTX) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
-func (s *stubDBTX) QueryRow(context.Context, string, ...any) pgx.Row       { return s.row }
+func (s *stubDBTX) QueryRow(context.Context, string, ...any) pgx.Row        { return s.row }
 
 // fakeGrantRepo is a grantLookupCreator double recording created revocation rows.
 type fakeGrantRepo struct {

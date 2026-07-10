@@ -126,13 +126,13 @@ func TestV1FixtureRow_VerifiesUnderV1Rule(t *testing.T) {
 	repo := NewPgxRepository(pool)
 
 	att := &Attestation{
-		SchemaVersion:      SchemaVersionV1,
-		LeafID:             leafID,
-		VolunteerPublicKey: signer.PublicKey(),
-		WorkUnitID:         wuID,
-		RawMetrics:         map[string]any{"cpu_seconds_user": float64(90)},
-		ValidationOutcome:  OutcomeAgreed,
-		CreditAmount:       1.0,
+		SchemaVersion:        SchemaVersionV1,
+		LeafID:               leafID,
+		VolunteerPublicKey:   signer.PublicKey(),
+		WorkUnitID:           wuID,
+		RawMetrics:           map[string]any{"cpu_seconds_user": float64(90)},
+		ValidationOutcome:    OutcomeAgreed,
+		CreditAmount:         1.0,
 		AttestationTimestamp: types.Now(),
 	}
 	sig, err := signer.Sign(att)

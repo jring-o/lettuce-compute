@@ -240,8 +240,8 @@ func TestListByProjectWithTimeRange(t *testing.T) {
 	to := types.FormatTimestamp(now.Add(time.Hour))
 	results, _, err := repo.List(ctx, ListFilters{
 		LeafID: &leafID,
-		From:      &from,
-		To:        &to,
+		From:   &from,
+		To:     &to,
 	}, types.PaginationRequest{})
 	if err != nil {
 		t.Fatalf("List: %v", err)
@@ -306,4 +306,3 @@ func TestListByVolunteerWithPagination(t *testing.T) {
 		t.Error("page 2: HasMore should be false")
 	}
 }
-
