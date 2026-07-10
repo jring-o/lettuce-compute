@@ -314,6 +314,9 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/admin/audit/runners/deactivate", authAdmin(auditAdminHandler.HandleDeactivateRunner))
 	mux.HandleFunc("GET /api/v1/admin/audit/runners", authAdmin(auditAdminHandler.HandleListRunners))
 	mux.HandleFunc("GET /api/v1/admin/audit/results", authAdmin(auditAdminHandler.HandleListAudits))
+	// Slice-3 leaf-owner flag surface (design §9.8): leaves with enforcement history
+	// (ENFORCED / CONTRADICTED / STALLED root audits), derived — no flag schema exists.
+	mux.HandleFunc("GET /api/v1/admin/audit/flagged-leaves", authAdmin(auditAdminHandler.HandleFlaggedLeaves))
 
 	// --- Deprecated /api/v1/projects aliases (removed in v0.10) ---
 	// Same handlers, same responses — allows existing clients to migrate gradually.

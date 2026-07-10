@@ -56,9 +56,11 @@ func (f *fakeRunnersRepo) ActiveRunnerSubjects(context.Context) ([]string, error
 	return nil, f.err
 }
 
-// fakeAuditsRepo is an in-memory AuditsRepository double; only List is exercised here.
+// fakeAuditsRepo is an in-memory AuditsRepository double; the admin handler exercises List
+// and FlaggedLeaves.
 type fakeAuditsRepo struct {
 	list       []*Audit
+	flagged    []FlaggedLeaf
 	err        error
 	lastFilter ListFilter
 }
@@ -68,7 +70,7 @@ func (f *fakeAuditsRepo) Claim(context.Context, types.ID, string) (*Audit, error
 	return nil, f.err
 }
 func (f *fakeAuditsRepo) GetByID(context.Context, types.ID) (*Audit, error) { return nil, f.err }
-func (f *fakeAuditsRepo) CompleteVerdict(context.Context, types.ID, types.ID, Verdict, string, []byte, string) error {
+func (f *fakeAuditsRepo) CompleteVerdict(context.Context, types.ID, types.ID, Verdict, string, []byte, string, bool) error {
 	return f.err
 }
 func (f *fakeAuditsRepo) CompleteInconclusive(context.Context, types.ID, types.ID, string) error {
@@ -83,6 +85,27 @@ func (f *fakeAuditsRepo) Stats(context.Context) (Stats, error)                { 
 func (f *fakeAuditsRepo) List(_ context.Context, filter ListFilter) ([]*Audit, error) {
 	f.lastFilter = filter
 	return f.list, f.err
+}
+func (f *fakeAuditsRepo) EnqueueConfirmation(context.Context, types.ID) (*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) GetRunnerOutput(context.Context, types.ID) ([]byte, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) ListActionableRoots(context.Context, int) ([]*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) ConfirmationsForRoot(context.Context, types.ID) ([]*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) SetEnforcementState(context.Context, types.ID, EnforcementState) (bool, error) {
+	return false, f.err
+}
+func (f *fakeAuditsRepo) ClaimRepair(context.Context, types.ID, types.ID) (bool, error) {
+	return false, f.err
+}
+func (f *fakeAuditsRepo) FlaggedLeaves(context.Context) ([]FlaggedLeaf, error) {
+	return f.flagged, f.err
 }
 
 func testAdminHandler(runners RunnersRepository, audits AuditsRepository) *AdminHandler {
@@ -118,6 +141,10 @@ func TestAdminRoutes_NonAdminForbidden(t *testing.T) {
 		{"list-audits", func(h *AdminHandler, rec *httptest.ResponseRecorder, ctx context.Context) {
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/results", nil).WithContext(ctx)
 			h.HandleListAudits(rec, req)
+		}},
+		{"flagged-leaves", func(h *AdminHandler, rec *httptest.ResponseRecorder, ctx context.Context) {
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/flagged-leaves", nil).WithContext(ctx)
+			h.HandleFlaggedLeaves(rec, req)
 		}},
 	}
 
@@ -319,6 +346,7 @@ func TestHandleListAudits_InvalidParams(t *testing.T) {
 		"/api/v1/admin/audit/results?limit=0",
 		"/api/v1/admin/audit/results?limit=-1",
 		"/api/v1/admin/audit/results?limit=abc",
+		"/api/v1/admin/audit/results?enforcement_state=BOGUS",
 		"/api/v1/admin/audit/results?leaf_id=" + leaf + "&status=nope",
 	} {
 		audits := &fakeAuditsRepo{}
@@ -339,7 +367,7 @@ func TestHandleListAudits_Success(t *testing.T) {
 	}}
 	h := testAdminHandler(&fakeRunnersRepo{}, audits)
 
-	target := "/api/v1/admin/audit/results?status=COMPLETED&verdict=MISMATCH&leaf_id=" +
+	target := "/api/v1/admin/audit/results?status=COMPLETED&verdict=MISMATCH&enforcement_state=ENFORCED&leaf_id=" +
 		leafID.String() + "&limit=99999"
 	req := httptest.NewRequest(http.MethodGet, target, nil).WithContext(adminContext())
 	rec := httptest.NewRecorder()
@@ -351,6 +379,9 @@ func TestHandleListAudits_Success(t *testing.T) {
 	if audits.lastFilter.Status != StatusCompleted || audits.lastFilter.Verdict != VerdictMismatch {
 		t.Errorf("filter status/verdict = %v/%v, want COMPLETED/MISMATCH",
 			audits.lastFilter.Status, audits.lastFilter.Verdict)
+	}
+	if audits.lastFilter.EnforcementState != EnforcementEnforced {
+		t.Errorf("filter enforcement_state = %v, want ENFORCED", audits.lastFilter.EnforcementState)
 	}
 	if audits.lastFilter.LeafID == nil || *audits.lastFilter.LeafID != leafID {
 		t.Errorf("filter leaf_id = %v, want %v", audits.lastFilter.LeafID, leafID)
@@ -366,5 +397,55 @@ func TestHandleListAudits_Success(t *testing.T) {
 	}
 	if len(resp.Data) != 1 {
 		t.Fatalf("data length = %d, want 1", len(resp.Data))
+	}
+}
+
+// --- flagged leaves ---------------------------------------------------------------------
+
+func TestHandleFlaggedLeaves_Success(t *testing.T) {
+	leafID := types.NewID()
+	ownerID := types.NewID()
+	audits := &fakeAuditsRepo{flagged: []FlaggedLeaf{
+		{LeafID: leafID, OwnerID: &ownerID, EnforcedCount: 2, ContradictedCount: 1, StalledCount: 0},
+	}}
+	h := testAdminHandler(&fakeRunnersRepo{}, audits)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/flagged-leaves", nil).
+		WithContext(adminContext())
+	rec := httptest.NewRecorder()
+	h.HandleFlaggedLeaves(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data []FlaggedLeaf `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("data length = %d, want 1", len(resp.Data))
+	}
+	got := resp.Data[0]
+	if got.LeafID != leafID || got.OwnerID == nil || *got.OwnerID != ownerID {
+		t.Errorf("leaf/owner = %v/%v, want %v/%v", got.LeafID, got.OwnerID, leafID, ownerID)
+	}
+	if got.EnforcedCount != 2 || got.ContradictedCount != 1 || got.StalledCount != 0 {
+		t.Errorf("counts = %d/%d/%d, want 2/1/0",
+			got.EnforcedCount, got.ContradictedCount, got.StalledCount)
+	}
+}
+
+// HandleFlaggedLeaves returns an empty (non-null) array when nothing is flagged.
+func TestHandleFlaggedLeaves_Empty(t *testing.T) {
+	h := testAdminHandler(&fakeRunnersRepo{}, &fakeAuditsRepo{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit/flagged-leaves", nil).
+		WithContext(adminContext())
+	rec := httptest.NewRecorder()
+	h.HandleFlaggedLeaves(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"data":[]`) {
+		t.Errorf("empty flagged-leaves body = %s, want data:[]", rec.Body.String())
 	}
 }

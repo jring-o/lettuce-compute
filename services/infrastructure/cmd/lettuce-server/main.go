@@ -225,7 +225,8 @@ func main() {
 		WithStandingBackpressure(standingRecorder).
 		WithEmissionCap(cfg.Head.MaxDailyCreditPerAccount).
 		WithTrustedRunners(auditRunnersRepo).
-		WithResultAudits(auditsRepo, cfg.Head.ResultAuditEnabled, cfg.Head.EffectiveResultAuditRate(), leafRepo)
+		WithResultAudits(auditsRepo, cfg.Head.ResultAuditEnabled, cfg.Head.EffectiveResultAuditRate(), leafRepo).
+		WithRepairSupport(auditsRepo)
 	if cfg.Head.ResultAuditEnabled {
 		slog.Info("result audits enabled",
 			"head_rate", cfg.Head.EffectiveResultAuditRate())
@@ -235,9 +236,12 @@ func main() {
 	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
 	// dead-letter" decision to it. The validation engine is its comparator + accept/reject
 	// implementation; the per-unit lock is the cross-replica Postgres advisory lock. The head
-	// trust gate is overlaid onto each leaf's policy here.
+	// trust gate is overlaid onto each leaf's policy here. The lock instance is shared with
+	// the enforcement worker below (same key space — an enforcement pass serializes against
+	// in-flight decisions on the same unit).
+	unitLocker := transition.NewPgxLocker(pool, logger)
 	transitioner := transition.NewTransitioner(
-		transition.NewPgxLocker(pool, logger),
+		unitLocker,
 		wuRepo, leafRepo, resultRepo, validationEngine, trustPolicy, logger)
 
 	// Parse trusted reverse-proxy networks for trust-aware client-IP extraction.
@@ -402,7 +406,7 @@ func main() {
 	// deliberately NOT in grpcPublicMethods) and an empty registry fails every claim
 	// closed with PermissionDenied, so a head with audits off exposes nothing. The
 	// adjudicator is the head-side verdict function; a runner only ever returns bytes.
-	auditSvc := server.NewAuditService(auditRunnersRepo, auditsRepo, wuRepo, leafRepo, volunteerRepo, validation.AdjudicateAudit, resultRepo, logger)
+	auditSvc := server.NewAuditService(auditRunnersRepo, auditsRepo, wuRepo, leafRepo, volunteerRepo, validation.AdjudicateAudit, resultRepo, cfg.Head.AuditEnforcementEnabled, logger)
 	lettucev1.RegisterAuditServiceServer(grpcServer, auditSvc)
 
 	// Start HTTP server.
@@ -481,11 +485,14 @@ func main() {
 		// is on, so the sweep stays zero-cost by default.
 		faultMonitor = faultMonitor.WithStandingPopulation(standing.NewPgxRepository(pool))
 	}
-	if cfg.Head.ResultAuditEnabled {
+	if cfg.Head.ResultAuditEnabled || cfg.Head.AuditEnforcementEnabled {
 		// Operator visibility for the audit net (design §7.4): throttled WARNs on new
 		// MISMATCH verdicts, on queue decay (EXPIRED growth / claim starvation), and on
-		// the owner-selectable ineligible lanes. Wired only when audits are on; the
-		// closure composes the DB stats with the engine's in-memory ineligible counter.
+		// the owner-selectable ineligible lanes. Wired when audits are on — and ALSO
+		// when only enforcement is on (design §9.9: an operator may disable sampling
+		// while the enforcement sweep drains the recorded backlog; its lanes must not
+		// go dark). The closure composes the DB stats with the engine's in-memory
+		// ineligible counter.
 		faultMonitor = faultMonitor.WithResultAuditStats(func(ctx context.Context) (audit.Stats, error) {
 			s, err := auditsRepo.Stats(ctx)
 			if err != nil {
@@ -494,6 +501,11 @@ func main() {
 			s.IneligibleByLeaf = validationEngine.AuditIneligibleCounts()
 			return s, nil
 		})
+	}
+	if cfg.Head.AuditEnforcementEnabled {
+		// Slice-3 enforcement lanes (design §9.8): ENFORCED/CONTRADICTED deltas, STALLED
+		// count, and the enforcement-horizon aging guard against the maturation window.
+		faultMonitor = faultMonitor.WithEnforcementWatch(cfg.Head.CreditMaturationDays)
 	}
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
@@ -508,6 +520,36 @@ func main() {
 	var didRecheckWorker *identity.DIDRecheckWorker
 	if atprotoClient != nil {
 		didRecheckWorker = identity.NewDIDRecheckWorker(atprotoClient, volunteerRepo, cfg.Head, logger)
+	}
+
+	// Audit-enforcement worker (design §9): constructed ONLY when the knob is on —
+	// the default (off) leaves verdicts observe-only exactly as slice 2 shipped them.
+	// Every seam is a narrow adapter over the real repositories (enforcement_wiring.go);
+	// the repair path and the mutual ground-truth check live in the validation engine
+	// (the adjudicator-closure precedent).
+	var enforcementWorker *audit.EnforcementWorker
+	if cfg.Head.AuditEnforcementEnabled {
+		enforcementWorker = audit.NewEnforcementWorker(audit.EnforcementDeps{
+			Audits:  auditsRepo,
+			Slasher: trustRepo,
+			Credit: &creditEnforcer{
+				ledger: creditRepo,
+				adj:    credit.NewPgxAdjustmentsRepository(pool),
+				rac:    racRepo,
+				logger: logger,
+			},
+			Revocations: revocationEmitter,
+			Results:     &fraudSetLoader{results: resultRepo},
+			Repairer:    validationEngine,
+			Disposer: workunit.NewEnforcementDemoter(
+				wuRepo, newEnforcementBudgetResolver(leafRepo, trustPolicy), logger),
+			Locker:         &enforcementUnitLocker{locker: unitLocker},
+			Agreement:      validation.AdjudicateGroundTruthAgreement,
+			MaturationDays: cfg.Head.CreditMaturationDays,
+			Logger:         logger,
+		})
+		slog.Info("audit enforcement armed",
+			"maturation_days", cfg.Head.CreditMaturationDays)
 	}
 
 	leadershipMgr := server.NewLeadershipManager(pool, logger)
@@ -548,6 +590,14 @@ func main() {
 		// never re-reach emission (the adjustment already exists). On a head with no
 		// missing revocations it is one indexed no-row query per sweep on the leader.
 		go attestation.NewRevocationReconciler(revocationEmitter, 10*time.Minute, logger).Run(leaderCtx)
+		// Audit-enforcement sweep (design §9.2-§9.3) — gated on the knob, UNLIKE the
+		// reclaim sweep: with enforcement off, verdicts must stay observe-only
+		// byte-identically, and this worker is the only actor that executes
+		// consequences. Verdicts recorded while the knob was off are stamped
+		// ineligible and stay unactionable even after a later restart with it on.
+		if enforcementWorker != nil {
+			go enforcementWorker.Start(leaderCtx)
+		}
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

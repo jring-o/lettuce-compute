@@ -2091,6 +2091,52 @@ func (r *PgxWorkUnitRepository) Reassign(ctx context.Context, id types.ID) (*Wor
 	return updated, true, nil
 }
 
+// RefundCopyBudget rematerializes a fresh copy budget on a demoted (REJECTED) unit so it
+// can requeue and revalidate without immediately dead-lettering (design doc §9.7, audit
+// H3). The naive `max_total_copies += <fresh ceiling>` is WRONG: max_total_copies
+// defaults to 0 = "derive target+margin at resolve time", so a += would MATERIALIZE an
+// absolute ceiling below the copies already consumed and the requeued unit would park
+// FAILED before drawing one fresh copy. Instead this writes an ABSOLUTE ceiling on top of
+// everything already consumed:
+//
+//	max_total_copies = <copies ever created> + maxTotal
+//	max_error_copies = <error copies so far> + maxError   (only when maxError > 0)
+//
+// The two count subqueries are inlined verbatim from CountTotalCopies and
+// CountErrorCopies so the refund reads exactly the same tallies the dead-letter probe
+// does. maxError == 0 means the resolved error ceiling is unlimited (0 = unlimited): the
+// CASE leaves max_error_copies untouched, because materializing count+0 would CREATE a
+// finite error ceiling that never existed.
+//
+// Guarded WHERE state = 'REJECTED': it runs only on the demotion / resume path before the
+// unit is requeued, never after it is QUEUED, so a leadership-failover double-sweep cannot
+// double-refund (once QUEUED the guard misses). Because it is an absolute write keyed off
+// the copy count — stable while the unit is REJECTED (nothing dispatches) — re-running it
+// on a resume pass is idempotent in value. Returns true iff a row moved (RowsAffected == 1);
+// false means the unit was no longer REJECTED (a prior pass already refunded + requeued),
+// which the demoter treats as success.
+func (r *PgxWorkUnitRepository) RefundCopyBudget(ctx context.Context, id types.ID, maxTotal, maxError int) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE work_units SET
+			max_total_copies = (
+				SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1
+			) + $2,
+			max_error_copies = CASE WHEN $3 > 0 THEN (
+				(SELECT COUNT(*) FROM work_unit_assignment_history
+				 WHERE work_unit_id = $1 AND outcome IN ('EXPIRED', 'ABANDONED'))
+				+ (SELECT COUNT(*) FROM results
+				   WHERE work_unit_id = $1 AND validation_status = 'DISAGREED')
+			) + $3 ELSE max_error_copies END,
+			updated_at = now()
+		WHERE id = $1 AND state = 'REJECTED'`,
+		id, maxTotal, maxError,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to refund work unit copy budget", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 // MarkSpotCheck sets spot_check = true for a work unit.
 func (r *PgxWorkUnitRepository) MarkSpotCheck(ctx context.Context, id types.ID) error {
 	tag, err := r.db.Exec(ctx,

@@ -24,7 +24,14 @@ var validTransitions = map[WorkUnitState][]WorkUnitState{
 	WorkUnitStateCompleted: {WorkUnitStateValidated, WorkUnitStateRejected},
 	WorkUnitStateRejected:  {WorkUnitStateQueued, WorkUnitStateFailed},
 	WorkUnitStateExpired:   {WorkUnitStateQueued, WorkUnitStateFailed},
-	// WorkUnitStateValidated and WorkUnitStateFailed are terminal — no outbound transitions.
+	// VALIDATED has exactly ONE outbound edge: the audit-enforcement demotion (design doc
+	// §9.7 Q2-C) — a unit whose accepted output was refuted by trusted re-execution and
+	// nothing was repairable is demoted so it can requeue and revalidate honestly. NOTE
+	// this deliberately diverges from IsTerminalState, which still reports VALIDATED as
+	// terminal: "terminal" means "the TRANSITIONER never re-decides it" (the
+	// decideAndApply guard), not "no edge exists". Only the enforcement pass takes this
+	// edge. WorkUnitStateFailed remains fully terminal.
+	WorkUnitStateValidated: {WorkUnitStateRejected},
 }
 
 // ValidateTransition checks whether a state transition is allowed.
@@ -45,7 +52,12 @@ func ValidateTransition(from, to WorkUnitState) error {
 	)
 }
 
-// IsTerminalState returns true for VALIDATED and FAILED — no transitions out.
+// IsTerminalState returns true for VALIDATED and FAILED. "Terminal" here means the
+// TRANSITIONER never re-decides the unit (transition.decideAndApply no-ops on it) — NOT
+// "no edge exists": validTransitions carries the single VALIDATED→REJECTED
+// audit-enforcement demotion edge (design doc §9.7), taken only by the enforcement pass,
+// never by the transitioner. Keep the two in deliberate divergence; gating new behavior
+// on IsTerminalState alone must account for the enforcement edge.
 func IsTerminalState(state WorkUnitState) bool {
 	return state == WorkUnitStateValidated || state == WorkUnitStateFailed
 }

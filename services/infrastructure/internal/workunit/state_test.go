@@ -32,6 +32,10 @@ func TestValidateTransition(t *testing.T) {
 		{"REJECTED → FAILED", WorkUnitStateRejected, WorkUnitStateFailed},
 		{"EXPIRED → QUEUED", WorkUnitStateExpired, WorkUnitStateQueued},
 		{"EXPIRED → FAILED", WorkUnitStateExpired, WorkUnitStateFailed},
+		// The single audit-enforcement demotion edge (design doc §9.7 Q2-C): a VALIDATED
+		// unit whose accepted output was refuted with nothing repairable is demoted so it
+		// can requeue and revalidate honestly. Taken only by the enforcement pass.
+		{"VALIDATED → REJECTED", WorkUnitStateValidated, WorkUnitStateRejected},
 	}
 
 	for _, tc := range validCases {
@@ -47,7 +51,10 @@ func TestValidateTransition(t *testing.T) {
 		from WorkUnitState
 		to   WorkUnitState
 	}{
+		// VALIDATED has exactly ONE outbound edge (→ REJECTED, above); every other exit
+		// stays refused (design doc §9.10 viii).
 		{"VALIDATED → QUEUED", WorkUnitStateValidated, WorkUnitStateQueued},
+		{"VALIDATED → COMPLETED", WorkUnitStateValidated, WorkUnitStateCompleted},
 		{"FAILED → QUEUED", WorkUnitStateFailed, WorkUnitStateQueued},
 		{"CREATED → RUNNING", WorkUnitStateCreated, WorkUnitStateRunning},
 		{"COMPLETED → QUEUED", WorkUnitStateCompleted, WorkUnitStateQueued},

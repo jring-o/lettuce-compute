@@ -22,6 +22,12 @@ type Adjustment struct {
 	Note          string    `json:"note,omitempty"`
 	CreatedBy     string    `json:"created_by"`
 	CreatedAt     time.Time `json:"created_at"`
+	// AuditID links an AUDIT-created adjustment to the result_audits row that caused it
+	// (nil for OPERATOR adjustments — settlement provenance, migration 00021).
+	AuditID *types.ID `json:"audit_id,omitempty"`
+	// RACAppliedAt stamps the exactly-once clamped RAC decrement for this adjustment
+	// (same transaction as the RAC update; nil = not applied). Design doc §9.5.
+	RACAppliedAt *time.Time `json:"rac_applied_at,omitempty"`
 }
 
 // created_by values: who initiated an adjustment. OPERATOR = the manual admin clawback
@@ -31,6 +37,20 @@ type Adjustment struct {
 const (
 	AdjustmentByOperator = "OPERATOR"
 	AdjustmentByAudit    = "AUDIT"
+)
+
+// Machine reason codes the automated enforcement clawback writes (design doc §9.4).
+// Both MUST satisfy the revocation signer's ^[A-Z0-9_]{1,64}$ charset — asserted by a
+// unit test against the signer's regexp so an emit-time signing failure is
+// unrepresentable.
+const (
+	// ReasonAuditMismatch: cancellation of a mismatched unit's own grant.
+	ReasonAuditMismatch = "AUDIT_MISMATCH"
+	// ReasonAuditMismatchUnmatured: the account-wide sweep of a sanctioned account's
+	// unmatured entries on OTHER units (§4.5's "all unmatured credit of those
+	// accounts"; the distinct code lets attestation consumers tell account-wide
+	// collateral from direct fraud).
+	ReasonAuditMismatchUnmatured = "AUDIT_MISMATCH_UNMATURED"
 )
 
 // ErrAdjustmentExhausted: the ledger entry is already fully adjusted (remaining net is 0).
@@ -56,10 +76,32 @@ type AdjustmentsRepository interface {
 	// computed inside the same transaction. Returns ErrAdjustmentExhausted when nothing
 	// remains and ErrAdjustmentOvershoot when magnitude exceeds the remaining net.
 	Clawback(ctx context.Context, entryID types.ID, magnitude *float64, reason, note, createdBy string) (*Adjustment, error)
+	// ClawbackForAudit is the automated-enforcement variant (design doc §9.4): the same
+	// transactional FOR-UPDATE net guard, always full-remaining, created_by='AUDIT',
+	// stamping the causing audit id. ErrAdjustmentExhausted is the caller's idempotent
+	// no-op (F17 — a retrying enforcement pass treats "already clawed" as success).
+	ClawbackForAudit(ctx context.Context, entryID, auditID types.ID, reason string) (*Adjustment, error)
+	// ListUnmaturedEntryIDs returns the ids of the volunteer's ledger entries still
+	// inside the maturation window (granted_at > now() - maturationDays), oldest
+	// first. Deliberately NOT net-filtered: ClawbackForAudit recomputes net under its
+	// lock and no-ops exhausted entries — one race-safe path, no TOCTOU pre-filter
+	// (the F1/F9 lesson).
+	ListUnmaturedEntryIDs(ctx context.Context, volunteerID types.ID, maturationDays int) ([]types.ID, error)
 	// ListByVolunteer returns a volunteer's adjustments, newest first.
 	ListByVolunteer(ctx context.Context, volunteerID types.ID, limit, offset int) ([]*Adjustment, error)
 	// SumForEntry returns the (negative or zero) sum of an entry's adjustments.
 	SumForEntry(ctx context.Context, entryID types.ID) (float64, error)
+}
+
+// RACAdjuster applies the clamped RAC decrement for one committed adjustment
+// EXACTLY-ONCE (design doc §9.5): one transaction stamps credit_adjustments.rac_applied_at
+// (guarded IS NULL) and, in the same transaction, decays the (volunteer, leaf) RAC row to
+// now and subtracts the adjustment's magnitude clamped at 0. applied=false when a prior
+// pass already stamped it. A missing RAC row is a no-op (nothing to decrement) that still
+// stamps. total_credit is NOT reduced (lifetime-granted monotonic tally; the
+// settlement-true figure is the per-entry-netted export).
+type RACAdjuster interface {
+	ApplyAdjustment(ctx context.Context, adjustmentID types.ID) (applied bool, err error)
 }
 
 // CappedCreator is the optional capability the validation engine type-asserts on its

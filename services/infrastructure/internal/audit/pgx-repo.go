@@ -189,14 +189,17 @@ func (r *PgxRunnersRepository) ActiveRunnerSubjects(ctx context.Context) ([]stri
 const auditColumns = `id, work_unit_id, leaf_id, accepted_result_id, accepted_comparison_key,
 	comparison_snapshot, required_hr_class, artifact_version_id, execution_snapshot,
 	status, verdict, verdict_detail, attempts, claimed_by, lease_expires_at,
-	runner_output_checksum, created_at, claimed_at, completed_at`
+	runner_output_checksum, created_at, claimed_at, completed_at,
+	enforcement_eligible, enforcement_state, enforced_at, confirms_audit_id, claimed_hr_class`
 
 func scanAudit(row pgx.Row) (*Audit, error) {
 	var a Audit
-	// status is never NULL; verdict is NULL until COMPLETED. Scanning both through string
-	// locals sidesteps any pgx named-string-type edge and keeps NULL handling explicit.
+	// status/enforcement_state are never NULL; verdict is NULL until COMPLETED. Scanning
+	// the named-string columns through string locals sidesteps any pgx named-string-type
+	// edge and keeps NULL handling explicit.
 	var status string
 	var verdict *string
+	var enforcementState string
 	err := row.Scan(
 		&a.ID,
 		&a.WorkUnitID,
@@ -217,11 +220,17 @@ func scanAudit(row pgx.Row) (*Audit, error) {
 		&a.CreatedAt,
 		&a.ClaimedAt,
 		&a.CompletedAt,
+		&a.EnforcementEligible,
+		&enforcementState,
+		&a.EnforcedAt,
+		&a.ConfirmsAuditID,
+		&a.ClaimedHRClass,
 	)
 	if err != nil {
 		return nil, err
 	}
 	a.Status = Status(status)
+	a.EnforcementState = EnforcementState(enforcementState)
 	if verdict != nil {
 		v := Verdict(*verdict)
 		a.Verdict = &v
@@ -281,11 +290,25 @@ func (r *PgxAuditsRepository) Claim(ctx context.Context, runnerID types.ID, runn
 	// scalar subquery rather than an UPDATE ... FROM join — a join would put work_units in
 	// RETURNING scope and make bare column names (id/leaf_id/created_at exist on both tables)
 	// ambiguous. FOR UPDATE OF c SKIP LOCKED is the concurrent-claim queue idiom.
+	// The confirmation-exclusion predicates (design doc §9.2, audits M1/M2/L1) live INSIDE
+	// the inner row-selection subquery, never on the outer UPDATE: on the outer UPDATE a
+	// failed predicate voids the whole claim (returns nothing) and self-starves a runner
+	// whose own confirmation heads the queue, instead of skipping the one ineligible row.
+	// They gate ONLY confirmation rows (confirms_audit_id NOT NULL); for an original
+	// (confirms_audit_id IS NULL) the guard is always-true, so originals behave
+	// byte-identically to before slice 3. A confirmation is claimable by a runner that
+	// (a) did NOT complete the parent ROOT, (b) has NOT already touched a PRIOR
+	// confirmation of the same root that ended INCONCLUSIVE/EXPIRED (each re-enqueue must
+	// reach a FRESH runner so a broken confirmer exhausts the pool into STALLED rather than
+	// silently absorbing every confirmation), and (c) for an UNPINNED unit presents an
+	// hr_class DIFFERENT from the root runner's recorded class (mutual agreement between
+	// two same-class runners proves nothing about a hardware-biased EXACT leaf).
 	row := r.db.QueryRow(ctx, `
 		UPDATE result_audits
 		SET status = 'CLAIMED',
 			claimed_by = $1,
 			claimed_at = now(),
+			claimed_hr_class = $2,
 			attempts = attempts + 1,
 			lease_expires_at = now() + make_interval(secs => GREATEST(
 				(SELECT wu.deadline_seconds FROM work_units wu WHERE wu.id = result_audits.work_unit_id),
@@ -294,6 +317,23 @@ func (r *PgxAuditsRepository) Claim(ctx context.Context, runnerID types.ID, runn
 			SELECT c.id FROM result_audits c
 			WHERE c.status = 'QUEUED'
 			  AND (c.required_hr_class IS NULL OR c.required_hr_class = $2)
+			  AND (c.confirms_audit_id IS NULL OR (
+				NOT EXISTS (
+					SELECT 1 FROM result_audits root
+					WHERE root.id = c.confirms_audit_id AND root.claimed_by = $1
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM result_audits sib
+					WHERE sib.confirms_audit_id = c.confirms_audit_id
+					  AND sib.claimed_by = $1
+					  AND ((sib.status = 'COMPLETED' AND sib.verdict = 'INCONCLUSIVE')
+						   OR sib.status = 'EXPIRED')
+				)
+				AND (c.required_hr_class IS NOT NULL OR NOT EXISTS (
+					SELECT 1 FROM result_audits root
+					WHERE root.id = c.confirms_audit_id AND root.claimed_hr_class = $2
+				))
+			  ))
 			ORDER BY c.created_at
 			LIMIT 1
 			FOR UPDATE OF c SKIP LOCKED
@@ -331,8 +371,12 @@ func (r *PgxAuditsRepository) GetByID(ctx context.Context, id types.ID) (*Audit,
 
 // CompleteVerdict finalizes a CLAIMED job with a head-computed verdict, storing the verbatim
 // runner bytes + head-computed checksum. Guarded: the row must still be CLAIMED by runnerID,
-// else ErrNotClaimant.
-func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string) error {
+// else ErrNotClaimant. enforcementEligible stamps the enforcement knob's verdict-write-time
+// state, and the SAME statement moves an eligible MISMATCH ORIGINAL straight to
+// AWAITING_CONFIRMATION — an actionable root is never observable in NONE, so no crash
+// window between verdict and confirmation-enqueue can route around the second-runner
+// requirement (design doc §9.2, audit H1).
+func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string, enforcementEligible bool) error {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE result_audits SET
 			status = 'COMPLETED',
@@ -341,9 +385,16 @@ func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID 
 			runner_output = $5,
 			runner_output_checksum = $6,
 			completed_at = now(),
-			lease_expires_at = NULL
+			lease_expires_at = NULL,
+			enforcement_eligible = $7,
+			enforcement_state = CASE
+				WHEN $7 AND $8 AND confirms_audit_id IS NULL
+					THEN 'AWAITING_CONFIRMATION'
+				ELSE enforcement_state
+			END
 		WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2`,
-		id, runnerID, string(verdict), detail, runnerOutput, checksum,
+		id, runnerID, string(verdict), detail, runnerOutput, checksum, enforcementEligible,
+		verdict == VerdictMismatch,
 	)
 	if err != nil {
 		return apierror.Internal("failed to complete audit verdict", err)
@@ -427,12 +478,18 @@ func (r *PgxAuditsRepository) SweepLapsedLeases(ctx context.Context) (int, int, 
 	return int(reqTag.RowsAffected()), int(expTag.RowsAffected()), nil
 }
 
-// SweepStaleQueued expires QUEUED rows older than QueuedLifetime.
+// SweepStaleQueued expires QUEUED rows older than their per-row queued lifetime: originals
+// (confirms_audit_id IS NULL) get QueuedLifetime (72h); confirmations get the tighter
+// ConfirmationQueuedLifetime (24h) — priority work, and a shorter lifetime keeps the
+// worst-case enforcement horizon inside the maturation window Validate() demands (audit H2).
 func (r *PgxAuditsRepository) SweepStaleQueued(ctx context.Context) (int, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE result_audits SET status = 'EXPIRED'
-		WHERE status = 'QUEUED' AND created_at < now() - make_interval(secs => $1)`,
-		int(QueuedLifetime.Seconds()),
+		WHERE status = 'QUEUED'
+		  AND created_at < now() - make_interval(secs => CASE
+			WHEN confirms_audit_id IS NULL THEN $1::int
+			ELSE $2::int END)`,
+		int(QueuedLifetime.Seconds()), int(ConfirmationQueuedLifetime.Seconds()),
 	)
 	if err != nil {
 		return 0, apierror.Internal("failed to expire stale queued audits", err)
@@ -440,11 +497,14 @@ func (r *PgxAuditsRepository) SweepStaleQueued(ctx context.Context) (int, error)
 	return int(tag.RowsAffected()), nil
 }
 
-// Stats returns the fault-monitor probe payload in one round trip.
+// Stats returns the fault-monitor probe payload. Two round trips: the scalar lanes in one
+// aggregate query, and the per-runner INCONCLUSIVE-confirmation share (a GROUP BY) in a
+// second (design doc §9.8).
 func (r *PgxAuditsRepository) Stats(ctx context.Context) (Stats, error) {
 	var (
-		s          Stats
-		oldestSecs float64
+		s              Stats
+		oldestQueued   float64
+		oldestAwaiting float64
 	)
 	err := r.db.QueryRow(ctx, `
 		SELECT
@@ -453,12 +513,49 @@ func (r *PgxAuditsRepository) Stats(ctx context.Context) (Stats, error) {
 			(SELECT COUNT(*) FROM result_audits WHERE status = 'QUEUED')::int,
 			COALESCE(EXTRACT(EPOCH FROM (
 				now() - (SELECT MIN(created_at) FROM result_audits WHERE status = 'QUEUED')
+			)), 0)::float8,
+			(SELECT COUNT(*) FROM result_audits WHERE enforcement_state = 'ENFORCED')::int,
+			(SELECT COUNT(*) FROM result_audits WHERE enforcement_state = 'CONTRADICTED')::int,
+			(SELECT COUNT(*) FROM result_audits WHERE enforcement_state = 'STALLED')::int,
+			COALESCE(EXTRACT(EPOCH FROM (
+				now() - (SELECT MIN(completed_at) FROM result_audits
+					WHERE enforcement_state = 'AWAITING_CONFIRMATION' AND confirms_audit_id IS NULL)
 			)), 0)::float8`,
-	).Scan(&s.MismatchTotal, &s.ExpiredTotal, &s.QueuedCount, &oldestSecs)
+	).Scan(&s.MismatchTotal, &s.ExpiredTotal, &s.QueuedCount, &oldestQueued,
+		&s.EnforcedTotal, &s.ContradictedTotal, &s.StalledCount, &oldestAwaiting)
 	if err != nil {
 		return Stats{}, apierror.Internal("failed to read audit stats", err)
 	}
-	s.OldestQueuedAge = time.Duration(oldestSecs * float64(time.Second))
+	s.OldestQueuedAge = time.Duration(oldestQueued * float64(time.Second))
+	s.OldestAwaitingConfirmationAge = time.Duration(oldestAwaiting * float64(time.Second))
+
+	// Per-runner INCONCLUSIVE share over CONFIRMATION rows only (a broken/suppressing
+	// confirmer must be named, audit M2). Left nil when there are no such rows.
+	rows, err := r.db.Query(ctx, `
+		SELECT claimed_by, COUNT(*)::int
+		FROM result_audits
+		WHERE confirms_audit_id IS NOT NULL
+		  AND status = 'COMPLETED' AND verdict = 'INCONCLUSIVE'
+		  AND claimed_by IS NOT NULL
+		GROUP BY claimed_by`)
+	if err != nil {
+		return Stats{}, apierror.Internal("failed to read confirmation inconclusive share", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var runnerID types.ID
+		var n int
+		if scanErr := rows.Scan(&runnerID, &n); scanErr != nil {
+			return Stats{}, apierror.Internal("failed to scan confirmation inconclusive share", scanErr)
+		}
+		if s.InconclusiveByRunner == nil {
+			s.InconclusiveByRunner = make(map[string]int)
+		}
+		s.InconclusiveByRunner[runnerID.String()] = n
+	}
+	if err := rows.Err(); err != nil {
+		return Stats{}, apierror.Internal("failed to iterate confirmation inconclusive share", err)
+	}
 	return s, nil
 }
 
@@ -479,6 +576,10 @@ func (r *PgxAuditsRepository) List(ctx context.Context, f ListFilter) ([]*Audit,
 	if f.LeafID != nil {
 		args = append(args, *f.LeafID)
 		conds = append(conds, fmt.Sprintf("leaf_id = $%d", len(args)))
+	}
+	if f.EnforcementState != "" {
+		args = append(args, string(f.EnforcementState))
+		conds = append(conds, fmt.Sprintf("enforcement_state = $%d", len(args)))
 	}
 	if len(conds) > 0 {
 		q += " WHERE " + strings.Join(conds, " AND ")
@@ -506,6 +607,200 @@ func (r *PgxAuditsRepository) List(ctx context.Context, f ListFilter) ([]*Audit,
 	}
 	if err := rows.Err(); err != nil {
 		return nil, apierror.Internal("failed to iterate result audits", err)
+	}
+	return out, nil
+}
+
+// --- slice-3 enforcement surface (design doc §9) ---
+
+// EnqueueConfirmation inserts a QUEUED second-runner confirmation for the root: one
+// INSERT ... SELECT copying the root's unit/leaf/accepted/snapshot/pin/execution columns
+// with confirms_audit_id = rootID (design doc §9.2). A unique-violation on
+// uq_result_audits_open_unit (there is already an OPEN audit for the unit — the confirmation
+// is already enqueued, or a fresh sample is open) surfaces as ErrDuplicateOpenAudit, which
+// the enforcement pass treats as already-enqueued (WARN, never a retry storm). A rootID that
+// no longer resolves (cascaded deletion) inserts zero rows → NotFound.
+func (r *PgxAuditsRepository) EnqueueConfirmation(ctx context.Context, rootID types.ID) (*Audit, error) {
+	row := r.db.QueryRow(ctx, `
+		INSERT INTO result_audits (
+			work_unit_id, leaf_id, accepted_result_id, accepted_comparison_key,
+			comparison_snapshot, required_hr_class, artifact_version_id, execution_snapshot,
+			confirms_audit_id, status
+		)
+		SELECT work_unit_id, leaf_id, accepted_result_id, accepted_comparison_key,
+			comparison_snapshot, required_hr_class, artifact_version_id, execution_snapshot,
+			$1, 'QUEUED'
+		FROM result_audits WHERE id = $1
+		RETURNING `+auditColumns,
+		rootID,
+	)
+	created, err := scanAudit(row)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, ErrDuplicateOpenAudit
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.NotFound("result_audit", rootID.String())
+		}
+		return nil, apierror.Internal("failed to enqueue confirmation audit", err)
+	}
+	return created, nil
+}
+
+// GetRunnerOutput returns the persisted verbatim runner bytes of a COMPLETED audit (the
+// enforcement pass's mutual ground-truth agreement check + repair, design doc §9.3/§9.6).
+// runner_output is excluded from every other read; NotFound when the row is absent or not
+// yet COMPLETED.
+func (r *PgxAuditsRepository) GetRunnerOutput(ctx context.Context, id types.ID) ([]byte, error) {
+	var out []byte
+	err := r.db.QueryRow(ctx,
+		`SELECT runner_output FROM result_audits WHERE id = $1 AND status = 'COMPLETED'`, id,
+	).Scan(&out)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, apierror.NotFound("result_audit runner output", id.String())
+		}
+		return nil, apierror.Internal("failed to read audit runner output", err)
+	}
+	return out, nil
+}
+
+// ListActionableRoots returns eligible MISMATCH ORIGINALS still in NONE/AWAITING_CONFIRMATION,
+// oldest completed_at first — the exact predicate of idx_result_audits_enforcement (design
+// doc §9.3). Observe-era rows (enforcement_eligible = false) are structurally excluded, as
+// are confirmation rows and non-MISMATCH verdicts.
+func (r *PgxAuditsRepository) ListActionableRoots(ctx context.Context, limit int) ([]*Audit, error) {
+	if limit <= 0 {
+		limit = defaultAuditListLimit
+	}
+	rows, err := r.db.Query(ctx, `
+		SELECT `+auditColumns+` FROM result_audits
+		WHERE verdict = 'MISMATCH' AND enforcement_eligible
+		  AND enforcement_state IN ('NONE', 'AWAITING_CONFIRMATION')
+		  AND confirms_audit_id IS NULL
+		ORDER BY completed_at ASC
+		LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to list actionable roots", err)
+	}
+	defer rows.Close()
+
+	var out []*Audit
+	for rows.Next() {
+		a, scanErr := scanAudit(rows)
+		if scanErr != nil {
+			return nil, apierror.Internal("failed to scan actionable root", scanErr)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate actionable roots", err)
+	}
+	return out, nil
+}
+
+// ConfirmationsForRoot returns every confirmation row of the root, newest first. Their COUNT
+// is the derived confirmation-attempt counter (audit M4); the newest is the row the sweep
+// examines (design doc §9.3 step 1).
+func (r *PgxAuditsRepository) ConfirmationsForRoot(ctx context.Context, rootID types.ID) ([]*Audit, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT `+auditColumns+` FROM result_audits WHERE confirms_audit_id = $1 ORDER BY created_at DESC`,
+		rootID,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to list confirmations for root", err)
+	}
+	defer rows.Close()
+
+	var out []*Audit
+	for rows.Next() {
+		a, scanErr := scanAudit(rows)
+		if scanErr != nil {
+			return nil, apierror.Internal("failed to scan confirmation", scanErr)
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate confirmations for root", err)
+	}
+	return out, nil
+}
+
+// SetEnforcementState transitions a root's enforcement bookkeeping. Guarded to the
+// non-terminal states (NONE/AWAITING_CONFIRMATION) so a terminal row is never re-opened and
+// a leadership-failover double-sweep is a no-op; ENFORCED also stamps enforced_at. Returns
+// false when the guard missed (the row is already ENFORCED/CONTRADICTED/STALLED).
+func (r *PgxAuditsRepository) SetEnforcementState(ctx context.Context, id types.ID, state EnforcementState) (bool, error) {
+	// $3 carries the "is ENFORCED" flag as a bool rather than re-testing $2 in the CASE:
+	// a bare `$2 = 'ENFORCED'` alongside `enforcement_state = $2` makes Postgres deduce two
+	// types for $2 (varchar from the column, text from the literal) and reject the prepare.
+	tag, err := r.db.Exec(ctx, `
+		UPDATE result_audits SET
+			enforcement_state = $2,
+			enforced_at = CASE WHEN $3 THEN now() ELSE enforced_at END
+		WHERE id = $1 AND enforcement_state IN ('NONE', 'AWAITING_CONFIRMATION')`,
+		id, string(state), state == EnforcementEnforced,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to set enforcement state", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClaimRepair inserts the audit_repairs idempotency claim for (auditID, resultID). The
+// UNIQUE(result_id) constraint means only the FIRST claim of a result wins: claimed=false
+// when the result was already repaired (by any audit), gating the non-idempotent repair
+// effects (design doc §9.6).
+func (r *PgxAuditsRepository) ClaimRepair(ctx context.Context, auditID, resultID types.ID) (bool, error) {
+	tag, err := r.db.Exec(ctx,
+		`INSERT INTO audit_repairs (audit_id, result_id) VALUES ($1, $2)
+		 ON CONFLICT (result_id) DO NOTHING`,
+		auditID, resultID,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to claim audit repair", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// FlaggedLeaves returns the admin flagged-leaves surface (design doc §9.8): one row per leaf
+// with ≥ 1 ENFORCED/CONTRADICTED/STALLED ROOT audit (confirms_audit_id IS NULL), with
+// per-state counts, the newest enforced_at, and the leaf's creator id. Newest-enforced first.
+func (r *PgxAuditsRepository) FlaggedLeaves(ctx context.Context) ([]FlaggedLeaf, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT ra.leaf_id, lf.creator_id,
+			COUNT(*) FILTER (WHERE ra.enforcement_state = 'ENFORCED')::int,
+			COUNT(*) FILTER (WHERE ra.enforcement_state = 'CONTRADICTED')::int,
+			COUNT(*) FILTER (WHERE ra.enforcement_state = 'STALLED')::int,
+			MAX(ra.enforced_at)
+		FROM result_audits ra
+		JOIN leafs lf ON lf.id = ra.leaf_id
+		WHERE ra.confirms_audit_id IS NULL
+		  AND ra.enforcement_state IN ('ENFORCED', 'CONTRADICTED', 'STALLED')
+		GROUP BY ra.leaf_id, lf.creator_id
+		ORDER BY MAX(ra.enforced_at) DESC NULLS LAST`)
+	if err != nil {
+		return nil, apierror.Internal("failed to list flagged leaves", err)
+	}
+	defer rows.Close()
+
+	var out []FlaggedLeaf
+	for rows.Next() {
+		var fl FlaggedLeaf
+		if scanErr := rows.Scan(
+			&fl.LeafID, &fl.OwnerID,
+			&fl.EnforcedCount, &fl.ContradictedCount, &fl.StalledCount,
+			&fl.LastEnforcedAt,
+		); scanErr != nil {
+			return nil, apierror.Internal("failed to scan flagged leaf", scanErr)
+		}
+		out = append(out, fl)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate flagged leaves", err)
 	}
 	return out, nil
 }

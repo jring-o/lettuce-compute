@@ -518,6 +518,13 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.ResultAuditRate = f
 	}
+	if v := os.Getenv("LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.AuditEnforcementEnabled = b
+	}
 	return nil
 }
 

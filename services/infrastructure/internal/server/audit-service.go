@@ -73,7 +73,12 @@ type auditServiceServer struct {
 	volunteerRepo auditVolunteerLookup
 	adjudicator   audit.Adjudicator
 	resultRepo    auditResultLister
-	logger        *slog.Logger
+	// enforcementEnabled mirrors the boot-time LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED
+	// knob: verdicts written while it is on are stamped enforcement-eligible (the
+	// observe-era pin made structural), and an eligible MISMATCH original gets its
+	// second-runner confirmation enqueued at verdict time (design doc §9.2).
+	enforcementEnabled bool
+	logger             *slog.Logger
 }
 
 // NewAuditService creates the AuditService gRPC implementation. The adjudicator is
@@ -88,17 +93,19 @@ func NewAuditService(
 	volunteerRepo auditVolunteerLookup,
 	adjudicator audit.Adjudicator,
 	resultRepo auditResultLister,
+	enforcementEnabled bool,
 	logger *slog.Logger,
 ) lettucev1.AuditServiceServer {
 	return &auditServiceServer{
-		runnersRepo:   runnersRepo,
-		auditsRepo:    auditsRepo,
-		wuRepo:        wuRepo,
-		leafRepo:      leafRepo,
-		volunteerRepo: volunteerRepo,
-		adjudicator:   adjudicator,
-		resultRepo:    resultRepo,
-		logger:        logger,
+		runnersRepo:        runnersRepo,
+		auditsRepo:         auditsRepo,
+		wuRepo:             wuRepo,
+		leafRepo:           leafRepo,
+		volunteerRepo:      volunteerRepo,
+		adjudicator:        adjudicator,
+		resultRepo:         resultRepo,
+		enforcementEnabled: enforcementEnabled,
+		logger:             logger,
 	}
 }
 
@@ -309,7 +316,7 @@ func (s *auditServiceServer) SubmitResult(ctx context.Context, req *lettucev1.Su
 		detail = audit.ReasonCompareError + ": " + adjErr.Error()
 	}
 
-	if err := s.auditsRepo.CompleteVerdict(ctx, auditID, runner.ID, verdict, detail, req.GetOutputData(), checksum); err != nil {
+	if err := s.auditsRepo.CompleteVerdict(ctx, auditID, runner.ID, verdict, detail, req.GetOutputData(), checksum, s.enforcementEnabled); err != nil {
 		if errors.Is(err, audit.ErrNotClaimant) {
 			return nil, status.Error(codes.FailedPrecondition, audit.ErrNotClaimant.Error())
 		}
@@ -317,8 +324,9 @@ func (s *auditServiceServer) SubmitResult(ctx context.Context, req *lettucev1.Su
 		return nil, status.Error(codes.Internal, "internal error")
 	}
 
-	// MISMATCH is the observe-only signal (slice 2): recorded above + WARNed here, with
-	// no slash / clawback / result flip / trust or standing effect (those are slice 3).
+	// With enforcement OFF (the default), MISMATCH stays the observe-only signal exactly
+	// as slice 2 shipped it: recorded above + WARNed here, no slash / clawback / result
+	// flip / trust or standing effect.
 	if verdict == audit.VerdictMismatch {
 		s.logger.Warn("result audit mismatch",
 			"audit_id", auditRow.ID,
@@ -328,6 +336,17 @@ func (s *auditServiceServer) SubmitResult(ctx context.Context, req *lettucev1.Su
 			"accepted_key", derefString(auditRow.AcceptedComparisonKey),
 			"runner_checksum", checksum,
 		)
+		// With enforcement ON and this row an ORIGINAL, enqueue the second-runner
+		// confirmation at verdict time (design doc §9.2 — minimizes the artifact-GC
+		// unpinned window). Best-effort: the verdict UPDATE above already moved the
+		// root to AWAITING_CONFIRMATION, so a lost enqueue is healed by the
+		// enforcement sweep, never a consequence bypass (audit H1).
+		if s.enforcementEnabled && auditRow.ConfirmsAuditID == nil {
+			if _, err := s.auditsRepo.EnqueueConfirmation(ctx, auditRow.ID); err != nil {
+				s.logger.Warn("failed to enqueue confirmation audit; enforcement sweep will retry",
+					"audit_id", auditRow.ID, "work_unit_id", auditRow.WorkUnitID, "error", err)
+			}
+		}
 	}
 
 	return &lettucev1.SubmitAuditResultResponse{Accepted: true}, nil

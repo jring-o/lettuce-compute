@@ -84,6 +84,14 @@ type Locker interface {
 	WithUnitLock(ctx context.Context, key int64, fn func() error) error
 }
 
+// WithUnitLock runs fn under the SAME per-unit advisory key the transitioner uses for
+// workUnitID, so an out-of-package caller (the slice-3 enforcement pass) can serialize
+// against in-flight decisions without exporting the key derivation. Best-effort like the
+// Locker itself — callers' correctness must rest on their own guards.
+func WithUnitLock(ctx context.Context, l Locker, workUnitID types.ID, fn func() error) error {
+	return l.WithUnitLock(ctx, unitLockKey(workUnitID), fn)
+}
+
 // Transitioner is the SINGLE entry point + decider for work-unit state transitions. Every site
 // that used to decide "complete / validate / reject / dead-letter / requeue" now calls Evaluate,
 // which loads an immutable snapshot, runs the pure Decide, and applies the one decision via the

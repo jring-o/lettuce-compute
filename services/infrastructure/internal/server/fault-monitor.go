@@ -116,11 +116,23 @@ type FaultMonitor struct {
 	// are what WARN. Touched only by the single Start loop, so no lock.
 	auditBaselineSet              bool
 	auditMismatchBaseline         int
-	auditExpiredBaseline          int
+	auditExpiredBaseline         int
 	auditIneligibleBaseline       int64
 	lastResultAuditWarn           time.Time
 	lastResultAuditQueueWarn      time.Time
 	lastResultAuditIneligibleWarn time.Time
+	// enforcementMaturationDays > 0 arms the slice-3 enforcement lanes inside
+	// warnResultAudits (design §9.8): ENFORCED delta, CONTRADICTED delta (a
+	// trusted-runner conflict is an incident), STALLED count, and the enforcement-
+	// horizon aging guard (an actionable root older than half the maturation window
+	// WARNs every scan — the live backstop for workloads whose lease-scaled horizon
+	// outruns the static Validate() bound). Set via WithEnforcementWatch only when
+	// LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED is on.
+	enforcementMaturationDays  int
+	auditEnforcedBaseline      int
+	auditContradictedBaseline  int
+	lastEnforcementWarn        time.Time
+	lastEnforcementStalledWarn time.Time
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -175,6 +187,15 @@ func (m *FaultMonitor) WithEmissionAnomalyCheck(check func(ctx context.Context) 
 // enabled. Chainable, same pattern as the other optional probes.
 func (m *FaultMonitor) WithResultAuditStats(stats func(ctx context.Context) (audit.Stats, error)) *FaultMonitor {
 	m.auditStats = stats
+	return m
+}
+
+// WithEnforcementWatch arms the slice-3 enforcement lanes of the result-audit sweep
+// (design §9.8). maturationDays is the head's credit-maturation window; the aging guard
+// pages when an actionable root has waited past half of it. Wired only when audit
+// enforcement is enabled; requires WithResultAuditStats to be wired too.
+func (m *FaultMonitor) WithEnforcementWatch(maturationDays int) *FaultMonitor {
+	m.enforcementMaturationDays = maturationDays
 	return m
 }
 
@@ -420,6 +441,8 @@ func (m *FaultMonitor) warnResultAudits(ctx context.Context) {
 		m.auditMismatchBaseline = stats.MismatchTotal
 		m.auditExpiredBaseline = stats.ExpiredTotal
 		m.auditIneligibleBaseline = ineligibleTotal
+		m.auditEnforcedBaseline = stats.EnforcedTotal
+		m.auditContradictedBaseline = stats.ContradictedTotal
 		return
 	}
 	if !mismatchThrottled {
@@ -454,6 +477,64 @@ func (m *FaultMonitor) warnResultAudits(ctx context.Context) {
 				"note", "these leaves receive no post-hoc re-execution coverage; closing the lanes is the deferred determinism_class work")
 		}
 	}
+	m.warnEnforcement(stats)
+}
+
+// warnEnforcement is the slice-3 enforcement lane set (design §9.8), armed by
+// WithEnforcementWatch. CONTRADICTED shares the enforcement throttle but is always
+// included when present — two vetted runners disagreeing about ground truth is an
+// incident (a compromised/broken runner OR latent leaf non-determinism). The aging
+// guard is DELIBERATELY un-throttled: it is the live backstop for workloads whose
+// lease-scaled enforcement horizon can outrun the static Validate() bound, and it
+// pages until the root resolves or the operator intervenes.
+func (m *FaultMonitor) warnEnforcement(stats audit.Stats) {
+	if m.enforcementMaturationDays <= 0 {
+		return
+	}
+	if !m.auditBaselineSet {
+		return // first probe of warnResultAudits set the baselines below on its pass
+	}
+	throttled := !m.lastEnforcementWarn.IsZero() && time.Since(m.lastEnforcementWarn) < resultAuditWarnEvery
+	if !throttled {
+		enforcedDelta := stats.EnforcedTotal - m.auditEnforcedBaseline
+		contradictedDelta := stats.ContradictedTotal - m.auditContradictedBaseline
+		if enforcedDelta > 0 || contradictedDelta > 0 {
+			m.lastEnforcementWarn = time.Now()
+			m.auditEnforcedBaseline = stats.EnforcedTotal
+			m.auditContradictedBaseline = stats.ContradictedTotal
+			m.logger.Warn("audit enforcement activity: confirmed mismatches executed consequences and/or trusted runners contradicted each other",
+				"new_enforced", enforcedDelta,
+				"new_contradicted", contradictedDelta,
+				"remedy", "review GET /api/v1/admin/audit/flagged-leaves and GET /api/v1/admin/audit/results?enforcement_state=ENFORCED (or CONTRADICTED — investigate BOTH runners of a contradicted root before trusting either)")
+		}
+	}
+	stalledThrottled := !m.lastEnforcementStalledWarn.IsZero() && time.Since(m.lastEnforcementStalledWarn) < resultAuditWarnEvery
+	if !stalledThrottled && stats.StalledCount > 0 {
+		m.lastEnforcementStalledWarn = time.Now()
+		m.logger.Warn("audit enforcement stalled: confirmed-mismatch roots exhausted their confirmation attempts without an adjudicable second verdict",
+			"stalled", stats.StalledCount,
+			"inconclusive_by_runner", topRunnerInconclusive(stats.InconclusiveByRunner, 3),
+			"remedy", "enforcement liveness wants >= 3 independent registered runners spanning >= 2 hardware classes; the manual levers (admin trust slash + credit clawback) remain available")
+	}
+	// Aging guard (audit H2 backstop): un-throttled by design.
+	if half := time.Duration(m.enforcementMaturationDays) * 24 * time.Hour / 2; stats.OldestAwaitingConfirmationAge > half {
+		m.logger.Warn("audit enforcement horizon at risk: an actionable mismatch has waited past half the credit-maturation window without resolution",
+			"oldest_awaiting_confirmation_age", stats.OldestAwaitingConfirmationAge.Truncate(time.Minute).String(),
+			"maturation_days", m.enforcementMaturationDays,
+			"inconclusive_by_runner", topRunnerInconclusive(stats.InconclusiveByRunner, 3),
+			"remedy", "register an additional runner (different hardware class for unpinned units) or enforce manually before the fraud credit matures")
+	}
+}
+
+// topRunnerInconclusive renders the N largest per-runner confirmation-INCONCLUSIVE
+// counters as a compact "runner=count" list — a runner anomalously high here is either
+// broken or suppressing enforcement (audit M2: liveness denial must be attributable).
+func topRunnerInconclusive(byRunner map[string]int, n int) []string {
+	converted := make(map[string]int64, len(byRunner))
+	for k, v := range byRunner {
+		converted[k] = int64(v)
+	}
+	return topIneligibleLeaves(converted, n)
 }
 
 // topIneligibleLeaves renders the N largest per-leaf ineligible counters as a compact

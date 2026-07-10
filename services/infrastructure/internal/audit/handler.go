@@ -28,12 +28,23 @@ const (
 type AdminHandler struct {
 	runnersRepo RunnersRepository
 	auditsRepo  AuditsRepository
+	// flaggedRepo is the flagged-leaves read view, derived from auditsRepo at construction
+	// (the concrete PgxAuditsRepository satisfies both). Kept off the AuditsRepository
+	// interface so the gRPC AuditService consumer is unaffected; nil only if a caller wired
+	// an audits repo that does not implement the read (never in production).
+	flaggedRepo FlaggedLeavesReader
 	logger      *slog.Logger
 }
 
 // NewAdminHandler creates a new audit admin Handler.
 func NewAdminHandler(runnersRepo RunnersRepository, auditsRepo AuditsRepository, logger *slog.Logger) *AdminHandler {
-	return &AdminHandler{runnersRepo: runnersRepo, auditsRepo: auditsRepo, logger: logger}
+	flaggedRepo, _ := auditsRepo.(FlaggedLeavesReader)
+	return &AdminHandler{
+		runnersRepo: runnersRepo,
+		auditsRepo:  auditsRepo,
+		flaggedRepo: flaggedRepo,
+		logger:      logger,
+	}
 }
 
 // requireAdmin writes a 403 and returns false unless the injected caller is an admin. The
@@ -195,6 +206,14 @@ func (h *AdminHandler) HandleListAudits(w http.ResponseWriter, r *http.Request) 
 		f.LeafID = &leafID
 	}
 
+	if raw := strings.TrimSpace(r.URL.Query().Get("enforcement_state")); raw != "" {
+		if !isValidEnforcementState(raw) {
+			apierror.WriteError(w, apierror.ValidationError("enforcement_state is not a valid value", nil))
+			return
+		}
+		f.EnforcementState = EnforcementState(raw)
+	}
+
 	f.Limit = defaultAuditsListLimit
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -220,9 +239,46 @@ func (h *AdminHandler) HandleListAudits(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"data": audits})
 }
 
+// HandleFlaggedLeaves handles GET /api/v1/admin/audit/flagged-leaves: leaves with at least
+// one enforced/contradicted/stalled ROOT audit, with per-state counts, the newest
+// enforced_at, and the owner id (design doc §9.8). The flag is derived on read — no persisted
+// column. Same operator-only dual-auth as the other audit admin routes.
+func (h *AdminHandler) HandleFlaggedLeaves(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	if h.flaggedRepo == nil {
+		l.Error("audits repo does not implement the flagged-leaves read")
+		apierror.WriteError(w, apierror.Internal("flagged-leaves surface unavailable", nil))
+		return
+	}
+	leaves, err := h.flaggedRepo.FlaggedLeaves(r.Context())
+	if err != nil {
+		l.Error("failed to list flagged leaves", "error", err)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+	if leaves == nil {
+		leaves = []FlaggedLeaf{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": leaves})
+}
+
 func isValidStatus(s string) bool {
 	switch Status(s) {
 	case StatusQueued, StatusClaimed, StatusCompleted, StatusExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func isValidEnforcementState(s string) bool {
+	switch EnforcementState(s) {
+	case EnforcementNone, EnforcementAwaitingConfirmation, EnforcementEnforced,
+		EnforcementContradicted, EnforcementStalled:
 		return true
 	default:
 		return false
