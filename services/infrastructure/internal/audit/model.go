@@ -146,4 +146,10 @@ type Stats struct {
 	// A large value means claim starvation — e.g. a required hardware class no
 	// registered runner presents.
 	OldestQueuedAge time.Duration
+	// IneligibleByLeaf counts validated-but-audit-ineligible units per leaf id since
+	// process start (network access, CUSTOM, unpinned/ref-only NUMERIC, canon-empty —
+	// the owner-steerable never-audited lanes, made operator-visible per the design
+	// audit). Composed in from the validation engine's in-memory counter by the main.go
+	// probe closure; nil when the engine counter is not wired.
+	IneligibleByLeaf map[string]int64
 }

@@ -26,6 +26,17 @@ const artifactVersionColumnsAV = `av.id, av.leaf_id, av.version_label, av.runtim
 // an import cycle (workunit already depends on leaf).
 const sqlNonTerminalPinFilter = `state NOT IN ('VALIDATED','FAILED')`
 
+// sqlOpenAuditVersionFilter, embedded in the PRUNE paths only (audit spec §7.5, F-M7),
+// additionally protects a version referenced by an OPEN (QUEUED/CLAIMED) result audit: the
+// runner must be able to re-execute the pinned artifact for the life of the audit. The join
+// target is the pruning candidate aliased `r`. DeleteVersion is DELIBERATELY not extended —
+// a new owner-visible refusal on an all-terminal version would leak an audit-presence oracle;
+// there, deletion proceeds and the audit degrades to INCONCLUSIVE via SET NULL at claim time.
+const sqlOpenAuditVersionFilter = `NOT EXISTS (
+			SELECT 1 FROM result_audits ra
+			WHERE ra.artifact_version_id = r.id AND ra.status IN ('QUEUED','CLAIMED')
+		)`
+
 func scanArtifactVersion(row pgx.Row) (*ArtifactVersion, error) {
 	var v ArtifactVersion
 	err := row.Scan(
@@ -237,7 +248,8 @@ func (r *PgxRepository) PruneVersions(ctx context.Context, leafID types.ID, keep
 		  AND NOT EXISTS (
 			SELECT 1 FROM work_units w
 			WHERE w.pinned_artifact_version_id = r.id AND w.`+sqlNonTerminalPinFilter+`
-		  )`,
+		  )
+		  AND `+sqlOpenAuditVersionFilter,
 		leafID, keep)
 	if err != nil {
 		return 0, apierror.Internal("failed to select prunable versions", err)
@@ -307,6 +319,7 @@ func (r *PgxRepository) PruneAllVersions(ctx context.Context, keep int) (int, er
 				SELECT 1 FROM work_units w
 				WHERE w.pinned_artifact_version_id = r.id AND w.`+sqlNonTerminalPinFilter+`
 			  )
+			  AND `+sqlOpenAuditVersionFilter+`
 		)`, keep)
 	if err != nil {
 		return 0, apierror.Internal("failed to prune artifact versions (all leaves)", err)

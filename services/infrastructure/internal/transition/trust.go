@@ -30,14 +30,34 @@ type TrustPolicy struct {
 // minQuorum, because a quorum-sized agreeing group cannot contain more distinct subjects
 // than its size, so a K above min_quorum could never be satisfied.
 //
-// floor = the leaf override (vc.TrustFloor) when > 0, else the head default. The floor is
-// resolved REGARDLESS of GateEnabled: accrual credits trust before the gate is ever turned
-// on (a subject must earn a score before enforcement can recognize it), and it needs the
-// real floor to decide which agreeing subjects are trusted enough to corroborate others.
+// floor = max(max(vc.TrustFloor, tp.DefaultFloor), 1) — two BG-01a rules folded together:
+//
+//   - TIGHTEN-ONLY leaf override (F-H5): the effective floor is the MAX of the leaf's
+//     override and the head default, never the leaf's value outright. Leaf creation is
+//     self-service and the leaf owner is the primary adversary, so a leaf may only DEMAND
+//     a higher floor, never redefine the head's trust currency downward. (The pre-BG-01a
+//     rule — leaf override when > 0 else head default — let any authenticated user create
+//     a leaf with trust_floor: 1 and thereby lower the bar for which agreeing subjects
+//     count as trusted "witnesses" for accrual, letting a farm accrue past the head floor.)
+//   - UNCONDITIONAL >= 1 clamp: even a directly-constructed TrustPolicy{DefaultFloor: 0}
+//     resolves to floor 1. This matters gate-OFF, where the floor is resolved for ACCRUAL
+//     (engine.accrueTrust): a floor of 0 would make every score-0 fresh account a trusted
+//     witness, letting a Sybil farm self-mint trust before the gate is ever enabled. Every
+//     production config resolves >= 1 already (head default 25), so the clamp is inert on
+//     real deployments; it exists to make a floor-0 config fail SAFE.
+//
+// The floor is resolved REGARDLESS of GateEnabled: accrual credits trust before the gate is
+// ever turned on (a subject must earn a score before enforcement can recognize it), and it
+// needs the real floor to decide which agreeing subjects are trusted enough to corroborate
+// others. effTrustFloorSQL (workunit/redundancy_sql.go) is the golden-pinned SQL twin of
+// this branch and must clamp in lockstep (GREATEST(1, GREATEST(leaf, default))).
 func (tp TrustPolicy) ResolveTrust(vc leaf.ValidationConfig, minQuorum int) (k, floor int) {
-	floor = vc.TrustFloor
-	if floor <= 0 {
-		floor = tp.DefaultFloor
+	floor = tp.DefaultFloor
+	if vc.TrustFloor > floor {
+		floor = vc.TrustFloor // tighten-only: a leaf may raise the floor, never lower it
+	}
+	if floor < 1 {
+		floor = 1 // unconditional clamp: floor 0 would make score-0 accounts trusted witnesses
 	}
 
 	if !tp.GateEnabled {

@@ -33,10 +33,12 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	cleanup := func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
 		_, _ = pool.Exec(ctx, "DELETE FROM volunteers")
 		pool.Close()
 	}
 	// Start clean in case a prior aborted run left rows.
+	_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
 	_, _ = pool.Exec(ctx, "DELETE FROM volunteers")
 	return pool, cleanup
 }

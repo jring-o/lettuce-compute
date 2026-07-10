@@ -14,12 +14,14 @@ import (
 func TestEffTrustFloorSQL_Construction(t *testing.T) {
 	got := effTrustFloorSQL("lf", "$7")
 	for _, want := range []string{
-		// Reads the per-leaf override off the aliased leaf's validation_config...
-		"lf.validation_config->>'trust_floor'",
-		// ...uses it only when > 0...
-		"> 0",
-		// ...and otherwise falls back to the head-default floor placeholder as an int.
+		// Reads the per-leaf override off the aliased leaf's validation_config, defaulting a
+		// missing value to 0 via COALESCE (BG-01a: the CASE-when-positive form collapsed into
+		// GREATEST once both branches became max'd).
+		"COALESCE((lf.validation_config->>'trust_floor')::int, 0)",
+		// The head-default floor placeholder as an int.
 		"$7::int",
+		// Tighten-only leaf override + unconditional >= 1 clamp: GREATEST(1, GREATEST(leaf, default)).
+		"GREATEST(1",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("effTrustFloorSQL missing %q in:\n%s", want, got)

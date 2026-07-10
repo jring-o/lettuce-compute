@@ -855,6 +855,53 @@ func Scenarios() []Scenario {
 			s.Eligible = true
 		}),
 
+		// --- BG-01a floor clamp + tighten-only floor in the reservation ------
+		// These three exercise the BG-01a changes to the resolved trust floor (ResolveTrust +
+		// its effTrustFloorSQL twin, now GREATEST(1, GREATEST(leaf, default))). Each keeps
+		// redundancy headroom so the verdict is attributable to the reservation alone.
+		with("trust_clamp_floor0_default_untrusts_score0_refused", DimTrustReservation, func(s *Scenario) {
+			// >= 1 clamp: gate on, head default floor 0. WITHOUT the clamp a score-0 requester
+			// counts as trusted (0 >= 0) and bypasses the reservation; the clamp resolves the floor
+			// to 1, so score 0 is UNTRUSTED and the reserved last slot is withheld. Fails against
+			// pre-clamp code (which would admit).
+			//   1 (live) + 1 (this) + max(0, 1 - 0) = 3 > 2 -> refused.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 0 // clamped up to 1 by ResolveTrust / effTrustFloorSQL
+			s.RequesterTrustScore = 0
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = false
+		}),
+		with("trust_clamp_floor0_admits_score1_requester", DimTrustReservation, func(s *Scenario) {
+			// Clamp boundary control: with the floor clamped to 1, a requester scoring exactly 1 IS
+			// trusted (1 >= 1) and bypasses the reservation — proving the clamp raises the bar to
+			// exactly 1, not above it, so it never over-rejects.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 0 // clamped to 1
+			s.RequesterTrustScore = 1
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = true
+		}),
+		with("trust_leaf_floor_below_default_tightened_untrusts_requester_refused", DimTrustReservation, func(s *Scenario) {
+			// Tighten-only (F-H5): a leaf sets trust_floor 1, BELOW the head default 25. Pre-fix the
+			// leaf's 1 would win and a score-10 requester would clear it (trusted, bypassing the
+			// reservation). Tighten-only resolves the floor to max(1, 25) = 25, so score 10 is
+			// UNTRUSTED and the reserved last slot is withheld. Fails against the pre-fix
+			// leaf-when-positive rule (which would admit).
+			//   1 (live) + 1 (this) + max(0, 1 - 0) = 3 > 2 -> refused.
+			s.TrustGateEnabled = true
+			s.TrustDefaultK = 1
+			s.TrustDefaultFloor = 25
+			s.LeafTrustFloor = 1 // below the head default; tighten-only raises the effective floor to 25
+			s.RequesterTrustScore = 10
+			s.TargetCopies = 2
+			s.OtherLiveCopies = 1
+			s.Eligible = false
+		}),
+
 		// --- account standing (BG-24b) ---------------------------------------
 		// Two neutralization mechanisms, both driven by a volunteer's STANDING moving off
 		// OK. (A) A BENCHED requester is refused ALL dispatch until its bench lapses — a
