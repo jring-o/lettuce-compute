@@ -466,6 +466,44 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.HostCapActiveDays = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_CREDIT_MATURATION_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_CREDIT_MATURATION_DAYS must be an integer: %w", err)
+		}
+		cfg.Head.CreditMaturationDays = n
+	}
+	// Export kill switch: a pointer field (the ReliabilityQuotaEnabled pattern)
+	// because the default is ON — a plain bool's zero value would ship the export
+	// disabled.
+	if v := os.Getenv("LETTUCE_HEAD_STATS_EXPORT_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_STATS_EXPORT_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.StatsExportEnabled = &b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_MAX_DAILY_CREDIT_PER_ACCOUNT"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAX_DAILY_CREDIT_PER_ACCOUNT must be a number: %w", err)
+		}
+		cfg.Head.MaxDailyCreditPerAccount = f
+	}
+	if v := os.Getenv("LETTUCE_HEAD_EMISSION_ANOMALY_HALT_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_EMISSION_ANOMALY_HALT_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.EmissionAnomalyHaltEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR must be a number: %w", err)
+		}
+		cfg.Head.EmissionAnomalyFactor = f
+	}
 	return nil
 }
 
