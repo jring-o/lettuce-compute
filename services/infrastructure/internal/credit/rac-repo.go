@@ -180,9 +180,86 @@ func (r *PgxRACRepository) DecayAll(ctx context.Context) (int64, error) {
 	return tag.RowsAffected(), nil
 }
 
-// ApplyAdjustment applies the clamped RAC decrement for one committed adjustment
-// exactly-once (design doc §9.5) — keel stub; the credit implementer replaces it with
-// the single-transaction stamp + decay-subtract-clamp UPDATE.
+// txBeginner is the transaction-starting subset shared by *pgxpool.Pool and pgx.Tx.
+// PgxRACRepository holds the shared DBTX interface, which has no Begin, but ApplyAdjustment
+// needs its OWN transaction so the exactly-once stamp and the RAC decrement commit atomically.
+// Every production and test constructor passes a *pgxpool.Pool, which satisfies this.
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// ApplyAdjustment applies the clamped RAC decrement for one committed adjustment EXACTLY-ONCE
+// (design doc §9.5) inside ONE transaction:
+//
+//  1. Stamp credit_adjustments.rac_applied_at guarded on IS NULL, RETURNING the target
+//     (volunteer, leaf) and the positive magnitude (-amount, since amount < 0). Zero rows
+//     means the row is either already stamped — (false, nil), the idempotent no-op a crashed
+//     pass re-runs into — or absent — (false, NotFound).
+//  2. In the SAME transaction, decay the (volunteer, leaf) RAC row to now with the exact
+//     half-life expression Upsert/DecayAll use, subtract the magnitude, and clamp at 0 with
+//     GREATEST so the decrement can never trip CHECK (rac >= 0). A missing RAC row is a no-op
+//     (nothing to decrement) that still keeps the stamp. total_credit is NOT reduced (it is
+//     the lifetime-granted monotonic tally; the settlement-true figure is the netted export).
+//  3. Commit. The stamp and the decrement are atomic — double-apply and lost-apply are both
+//     structurally impossible.
 func (r *PgxRACRepository) ApplyAdjustment(ctx context.Context, adjustmentID types.ID) (bool, error) {
-	return false, apierror.Internal("ApplyAdjustment not implemented (slice-3 keel stub)", nil)
+	beginner, ok := r.db.(txBeginner)
+	if !ok {
+		return false, apierror.Internal("RAC repository is not transaction-capable", nil)
+	}
+	tx, err := beginner.Begin(ctx)
+	if err != nil {
+		return false, apierror.Internal("failed to begin RAC adjustment transaction", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Step 1: exactly-once stamp. magnitude is the positive credit the adjustment cancelled.
+	var volunteerID, leafID types.ID
+	var magnitude float64
+	err = tx.QueryRow(ctx,
+		`UPDATE credit_adjustments SET rac_applied_at = now()
+		WHERE id = $1 AND rac_applied_at IS NULL
+		RETURNING volunteer_id, leaf_id, (-amount)::float8`,
+		adjustmentID,
+	).Scan(&volunteerID, &leafID, &magnitude)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Zero rows: distinguish an already-stamped adjustment (idempotent no-op) from a
+			// nonexistent id (caller error).
+			var exists bool
+			if e := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM credit_adjustments WHERE id = $1)`, adjustmentID,
+			).Scan(&exists); e != nil {
+				return false, apierror.Internal("failed to check adjustment existence", e)
+			}
+			if !exists {
+				return false, apierror.NotFound("credit_adjustment", adjustmentID.String())
+			}
+			return false, nil
+		}
+		return false, apierror.Internal("failed to stamp adjustment rac_applied_at", err)
+	}
+
+	// Step 2: decay-to-now, subtract, clamp. The decay factor is the EXACT half-life
+	// expression Upsert (rac-repo.go) blends the grant into and DecayAll ages by — copied
+	// verbatim so the RAC ages on the identical curve before the decrement. GREATEST(0, ...)
+	// keeps the clamped decrement from tripping CHECK (rac >= 0). A missing row → 0 rows
+	// affected, which is fine (nothing to decrement); the stamp still commits.
+	_, err = tx.Exec(ctx, `
+		UPDATE volunteer_rac SET
+			rac = GREATEST(0, rac
+				* exp(-EXTRACT(EPOCH FROM (NOW() - last_updated_at)) * ln(2) / $3)
+				- $4),
+			last_updated_at = NOW()
+		WHERE volunteer_id = $1 AND leaf_id = $2`,
+		volunteerID, leafID, float64(HalfLifeSeconds), magnitude,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to decrement volunteer_rac", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, apierror.Internal("failed to commit RAC adjustment transaction", err)
+	}
+	return true, nil
 }

@@ -204,4 +204,44 @@ type Stats struct {
 	// audit). Composed in from the validation engine's in-memory counter by the main.go
 	// probe closure; nil when the engine counter is not wired.
 	IneligibleByLeaf map[string]int64
+
+	// --- slice-3 enforcement lanes (design doc §9.8) ---
+
+	// EnforcedTotal is the lifetime count of roots that reached ENFORCED (consequences
+	// applied).
+	EnforcedTotal int
+	// ContradictedTotal is the lifetime count of roots that reached CONTRADICTED (two
+	// trusted runners disagreed about ground truth — an operator incident, never
+	// throttled below its own WARN lane).
+	ContradictedTotal int
+	// StalledCount is the current count of roots stuck in STALLED (confirmation
+	// attempts exhausted without an adjudicable second verdict — runner/hr-class
+	// starvation).
+	StalledCount int
+	// OldestAwaitingConfirmationAge is the age of the oldest root still in
+	// AWAITING_CONFIRMATION (by completed_at); 0 when none. A large value means a
+	// starved confirmation queue: single-runner deployment or hr-class starvation.
+	OldestAwaitingConfirmationAge time.Duration
+	// InconclusiveByRunner counts COMPLETED-INCONCLUSIVE CONFIRMATION rows per
+	// claimed_by runner id: a runner whose confirmations are anomalously INCONCLUSIVE
+	// is either broken or suppressing enforcement (audit M2 — liveness denial must be
+	// attributable, not silent). Confirmation rows only; nil when none.
+	InconclusiveByRunner map[string]int
+}
+
+// FlaggedLeaf is one row of the admin flagged-leaves surface (design doc §9.8): a leaf
+// with at least one enforced/contradicted/stalled ROOT audit. Derived on read (GROUP BY
+// over result_audits) — no persisted flag column, per the alpha no-vestigial posture.
+type FlaggedLeaf struct {
+	LeafID types.ID `json:"leaf_id"`
+	// OwnerID is the leaf's creator (leafs.creator_id); nil for creator-less leaves
+	// (creator_public_key-only, or a since-deleted user — the FK is ON DELETE SET NULL).
+	OwnerID           *types.ID `json:"owner_id,omitempty"`
+	EnforcedCount     int       `json:"enforced_count"`
+	ContradictedCount int       `json:"contradicted_count"`
+	StalledCount      int       `json:"stalled_count"`
+	// LastEnforcedAt is the newest enforced_at across the leaf's ENFORCED roots; nil
+	// when the leaf is flagged only by CONTRADICTED/STALLED roots (which carry no
+	// enforced_at).
+	LastEnforcedAt *time.Time `json:"last_enforced_at,omitempty"`
 }

@@ -99,6 +99,33 @@ func CanDelete(ctx context.Context, pool *pgxpool.Pool, leafID types.ID, current
 		)
 	}
 
+	// Audit-enforcement evidence (design doc §9.1, audit M7). A leaf whose audits
+	// produced enforcement evidence can no longer CASCADE-delete cleanly even with NO
+	// credit_ledger rows (e.g. cap-suppressed grants): migration 00021's RESTRICT FKs
+	// (credit_adjustments.audit_id, audit_repairs.audit_id/result_id) would make the
+	// delete 500 on the FK instead of 409ing here. Refuse deletion when the leaf has any
+	// audit row in a non-NONE enforcement state OR with a repair recorded against it.
+	var hasEnforcement bool
+	err = pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM result_audits ra
+			WHERE ra.leaf_id = $1
+			  AND (ra.enforcement_state <> 'NONE'
+			       OR EXISTS (SELECT 1 FROM audit_repairs ar WHERE ar.audit_id = ra.id))
+		)`,
+		leafID,
+	).Scan(&hasEnforcement)
+	if err != nil {
+		return apierror.Internal("failed to check audit-enforcement history", err)
+	}
+
+	if hasEnforcement {
+		return apierror.Conflict(
+			"cannot delete leaf with audit-enforcement history; archive instead",
+			nil,
+		)
+	}
+
 	return nil
 }
 

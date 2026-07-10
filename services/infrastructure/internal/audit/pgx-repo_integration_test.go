@@ -1,4 +1,4 @@
-﻿//go:build integration
+//go:build integration
 
 package audit
 
@@ -34,13 +34,19 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 	}
 
 	cleanup := func() {
-		// Children first: result_audits / trusted_runners are FK-bearing children of
-		// work_units/leafs/results/volunteers (audit spec Â§7.1 FK-cleanup lore).
+		// FK-cleanup order (design doc §9.1 FK-cleanup lore) under the slice-3/4 RESTRICT
+		// FKs: audit_repairs (→ result_audits + results) goes FIRST; credit_attestations
+		// (→ credit_adjustments via adjustment_id, the slice-4 revocation FK) goes BEFORE
+		// credit_adjustments; credit_adjustments (→ result_audits via audit_id, → credit_ledger
+		// via ledger_entry_id) goes BEFORE result_audits and credit_ledger. Only then can
+		// result_audits / trusted_runners be cleared. Errors are discarded, so a wrong order
+		// would silently leak rows across tests rather than fail loudly.
+		_, _ = pool.Exec(ctx, "DELETE FROM audit_repairs")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_attestations")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM result_audits")
 		_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
-		_, _ = pool.Exec(ctx, "DELETE FROM credit_attestations")
-		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM volunteer_rac")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
@@ -802,4 +808,386 @@ func absDur(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+// --- slice-3 enforcement surface --------------------------------------------------------
+
+// completeAudit claims the (single QUEUED) audit `a` as the given runner+class and completes
+// it with the verdict + enforcement-eligibility stamp, returning the reloaded row. Callers
+// must ensure `a` is the only claimable QUEUED job when this runs (assert on the claimed id).
+func completeAudit(t *testing.T, repo *PgxAuditsRepository, a *Audit, runnerID types.ID, runnerClass string, verdict Verdict, eligible bool) *Audit {
+	t.Helper()
+	ctx := context.Background()
+	claimed, err := repo.Claim(ctx, runnerID, runnerClass)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim for completion: %v (nil=%v)", err, claimed == nil)
+	}
+	if claimed.ID != a.ID {
+		t.Fatalf("claim grabbed a different audit (%v) than the target (%v)", claimed.ID, a.ID)
+	}
+	out := []byte("groundtruth-" + a.ID.String())
+	if err := repo.CompleteVerdict(ctx, a.ID, runnerID, verdict, "", out, "cs", eligible); err != nil {
+		t.Fatalf("complete verdict: %v", err)
+	}
+	got, err := repo.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("reload after complete: %v", err)
+	}
+	return got
+}
+
+func TestCompleteVerdictAwaitingConfirmationFold(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	repo := NewPgxAuditsRepository(pool)
+	runner := registerTestRunner(t, pool, "fold-runner")
+
+	// Eligible MISMATCH original → folded to AWAITING_CONFIRMATION inside the verdict UPDATE.
+	a1 := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	got := completeAudit(t, repo, a1, runner, "classX", VerdictMismatch, true)
+	if !got.EnforcementEligible || got.EnforcementState != EnforcementAwaitingConfirmation {
+		t.Errorf("eligible MISMATCH: eligible=%v state=%q, want true/AWAITING_CONFIRMATION",
+			got.EnforcementEligible, got.EnforcementState)
+	}
+
+	// Eligible MATCH stays NONE (the fold is MISMATCH-only) but still records the era.
+	a2 := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	got = completeAudit(t, repo, a2, runner, "classX", VerdictMatch, true)
+	if !got.EnforcementEligible || got.EnforcementState != EnforcementNone {
+		t.Errorf("eligible MATCH: eligible=%v state=%q, want true/NONE",
+			got.EnforcementEligible, got.EnforcementState)
+	}
+
+	// Ineligible (observe-era) MISMATCH stays NONE and ineligible — never actionable (F-M10).
+	a3 := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	got = completeAudit(t, repo, a3, runner, "classX", VerdictMismatch, false)
+	if got.EnforcementEligible || got.EnforcementState != EnforcementNone {
+		t.Errorf("ineligible MISMATCH: eligible=%v state=%q, want false/NONE",
+			got.EnforcementEligible, got.EnforcementState)
+	}
+}
+
+func TestClaimStampsHRClass(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+
+	enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	runner := registerTestRunner(t, pool, "class-runner")
+
+	const class = "GenuineIntel/linux/amd64"
+	claimed, err := repo.Claim(ctx, runner, class)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v (nil=%v)", err, claimed == nil)
+	}
+	if claimed.ClaimedHRClass == nil || *claimed.ClaimedHRClass != class {
+		t.Errorf("claimed_hr_class = %v, want %q (stamped by the claim)", claimed.ClaimedHRClass, class)
+	}
+	// And it persists on the row.
+	got, _ := repo.GetByID(ctx, claimed.ID)
+	if got.ClaimedHRClass == nil || *got.ClaimedHRClass != class {
+		t.Errorf("persisted claimed_hr_class = %v, want %q", got.ClaimedHRClass, class)
+	}
+}
+
+func TestEnqueueConfirmationCopiesAndConflict(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+	runner := registerTestRunner(t, pool, "conf-runner")
+
+	root := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	rootDone := completeAudit(t, repo, root, runner, "classX", VerdictMismatch, true)
+
+	conf, err := repo.EnqueueConfirmation(ctx, rootDone.ID)
+	if err != nil {
+		t.Fatalf("enqueue confirmation: %v", err)
+	}
+	if conf.ConfirmsAuditID == nil || *conf.ConfirmsAuditID != rootDone.ID {
+		t.Errorf("confirms_audit_id = %v, want %v", conf.ConfirmsAuditID, rootDone.ID)
+	}
+	if conf.Status != StatusQueued {
+		t.Errorf("confirmation status = %s, want QUEUED", conf.Status)
+	}
+	if conf.WorkUnitID != rootDone.WorkUnitID || conf.LeafID != rootDone.LeafID ||
+		conf.AcceptedResultID != rootDone.AcceptedResultID {
+		t.Errorf("confirmation did not copy the root's unit/leaf/accepted ids")
+	}
+	if !eqStrPtr(conf.AcceptedComparisonKey, rootDone.AcceptedComparisonKey) {
+		t.Errorf("accepted_comparison_key = %v, want copied %v", conf.AcceptedComparisonKey, rootDone.AcceptedComparisonKey)
+	}
+	if conf.EnforcementEligible || conf.EnforcementState != EnforcementNone {
+		t.Errorf("fresh confirmation eligible=%v state=%q, want false/NONE", conf.EnforcementEligible, conf.EnforcementState)
+	}
+
+	// A second confirmation while the first is still OPEN (QUEUED) violates uq_result_audits_open_unit.
+	if _, err := repo.EnqueueConfirmation(ctx, rootDone.ID); err != ErrDuplicateOpenAudit {
+		t.Fatalf("duplicate confirmation err = %v, want ErrDuplicateOpenAudit", err)
+	}
+}
+
+// A confirmation on an UNPINNED unit refuses the root's own runner (a) and a same-class
+// runner (c); it accepts a class-diverse, non-parent runner. The M1 regression.
+func TestConfirmationClaimExclusionsUnpinned(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+
+	root := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	runnerRoot := registerTestRunner(t, pool, "root-runner")
+	rootDone := completeAudit(t, repo, root, runnerRoot, "classX", VerdictMismatch, true)
+	if _, err := repo.EnqueueConfirmation(ctx, rootDone.ID); err != nil {
+		t.Fatalf("enqueue confirmation: %v", err)
+	}
+	runnerOther := registerTestRunner(t, pool, "other-runner")
+
+	// (a) The root's own runner cannot claim its confirmation (class differs, isolating (a)).
+	if got, err := repo.Claim(ctx, runnerRoot, "classY"); err != nil || got != nil {
+		t.Fatalf("root runner claimed its own confirmation (%v, err=%v); want refused", got, err)
+	}
+	// (c) A same-class runner cannot claim an unpinned unit's confirmation.
+	if got, err := repo.Claim(ctx, runnerOther, "classX"); err != nil || got != nil {
+		t.Fatalf("same-class runner claimed unpinned confirmation (%v, err=%v); want refused", got, err)
+	}
+	// A class-diverse, non-parent runner CAN claim it.
+	got, err := repo.Claim(ctx, runnerOther, "classY")
+	if err != nil || got == nil {
+		t.Fatalf("class-diverse runner claim: %v (nil=%v); want the confirmation", err, got == nil)
+	}
+	if got.ConfirmsAuditID == nil || *got.ConfirmsAuditID != rootDone.ID {
+		t.Errorf("claimed row is not the confirmation of the root")
+	}
+}
+
+// A confirmation on a PINNED unit has the hardware channel closed by the pin, so the
+// class-diversity rule does not apply: a different runner of the SAME (pinned) class claims it.
+func TestConfirmationClaimPinnedAllowsSameClass(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+
+	const pin = "classP"
+	root := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, strptr(pin)), strptr(pin), nil)
+	runnerRoot := registerTestRunner(t, pool, "pinned-root")
+	rootDone := completeAudit(t, repo, root, runnerRoot, pin, VerdictMismatch, true)
+	if _, err := repo.EnqueueConfirmation(ctx, rootDone.ID); err != nil {
+		t.Fatalf("enqueue confirmation: %v", err)
+	}
+	runnerOther := registerTestRunner(t, pool, "pinned-other")
+
+	// (a) still refuses the parent runner even at the matching class.
+	if got, err := repo.Claim(ctx, runnerRoot, pin); err != nil || got != nil {
+		t.Fatalf("parent runner claimed pinned confirmation (%v, err=%v); want refused", got, err)
+	}
+	// A different runner of the same pinned class claims it ((c) does not apply to pinned units).
+	got, err := repo.Claim(ctx, runnerOther, pin)
+	if err != nil || got == nil {
+		t.Fatalf("same-class different runner on a pinned unit: %v (nil=%v); want the confirmation", err, got == nil)
+	}
+}
+
+// Each re-enqueued confirmation must reach a FRESH runner: a runner that INCONCLUSIVE'd a
+// prior confirmation of the same root cannot claim the re-enqueue. The M2 regression.
+func TestConfirmationClaimExcludesPriorInconclusiveToucher(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+
+	root := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	runnerRoot := registerTestRunner(t, pool, "m2-root")
+	rootDone := completeAudit(t, repo, root, runnerRoot, "classX", VerdictMismatch, true)
+
+	// conf1: claimed by runnerA (class-diverse), completed INCONCLUSIVE.
+	conf1, err := repo.EnqueueConfirmation(ctx, rootDone.ID)
+	if err != nil {
+		t.Fatalf("enqueue conf1: %v", err)
+	}
+	runnerA := registerTestRunner(t, pool, "m2-a")
+	got, err := repo.Claim(ctx, runnerA, "classY")
+	if err != nil || got == nil || got.ID != conf1.ID {
+		t.Fatalf("runnerA claim conf1: %v (nil=%v)", err, got == nil)
+	}
+	if err := repo.CompleteInconclusive(ctx, conf1.ID, runnerA, "ARTIFACT_UNAVAILABLE"); err != nil {
+		t.Fatalf("complete conf1 inconclusive: %v", err)
+	}
+
+	// conf2: the re-enqueue. runnerA (prior INCONCLUSIVE toucher) is refused; a fresh
+	// runnerB is accepted.
+	conf2, err := repo.EnqueueConfirmation(ctx, rootDone.ID)
+	if err != nil {
+		t.Fatalf("enqueue conf2: %v", err)
+	}
+	if refused, err := repo.Claim(ctx, runnerA, "classY"); err != nil || refused != nil {
+		t.Fatalf("prior-INCONCLUSIVE runnerA claimed the re-enqueue (%v, err=%v); want refused", refused, err)
+	}
+	runnerB := registerTestRunner(t, pool, "m2-b")
+	fresh, err := repo.Claim(ctx, runnerB, "classY")
+	if err != nil || fresh == nil || fresh.ID != conf2.ID {
+		t.Fatalf("fresh runnerB claim conf2: %v (nil=%v)", err, fresh == nil)
+	}
+}
+
+func TestSweepStaleQueuedPerRowLifetime(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+	runner := registerTestRunner(t, pool, "stale-runner")
+
+	// A confirmation on unitB, aged 30h: past the 24h confirmation lifetime → expires.
+	rootB := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	rootBDone := completeAudit(t, repo, rootB, runner, "classX", VerdictMismatch, true)
+	confB, err := repo.EnqueueConfirmation(ctx, rootBDone.ID)
+	if err != nil {
+		t.Fatalf("enqueue confirmation: %v", err)
+	}
+
+	// An ORIGINAL sampled audit on unitA, aged 30h: still WELL under the 72h original lifetime.
+	origA := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+
+	if _, err := pool.Exec(ctx,
+		"UPDATE result_audits SET created_at = now() - interval '30 hours' WHERE id = ANY($1)",
+		[]types.ID{confB.ID, origA.ID}); err != nil {
+		t.Fatalf("age created_at: %v", err)
+	}
+
+	expired, err := repo.SweepStaleQueued(ctx)
+	if err != nil {
+		t.Fatalf("sweep stale: %v", err)
+	}
+	if expired != 1 {
+		t.Fatalf("expired = %d, want 1 (only the >24h confirmation)", expired)
+	}
+	if c, _ := repo.GetByID(ctx, confB.ID); c.Status != StatusExpired {
+		t.Errorf("confirmation status = %s, want EXPIRED (past 24h)", c.Status)
+	}
+	if o, _ := repo.GetByID(ctx, origA.ID); o.Status != StatusQueued {
+		t.Errorf("original status = %s, want QUEUED (under 72h)", o.Status)
+	}
+}
+
+func TestListActionableRootsPredicate(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+	runnerRoot := registerTestRunner(t, pool, "actionable-root")
+	runnerConf := registerTestRunner(t, pool, "actionable-conf")
+
+	// Actionable: eligible MISMATCH original (→ AWAITING_CONFIRMATION).
+	aMismatch := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	doneMismatch := completeAudit(t, repo, aMismatch, runnerRoot, "classX", VerdictMismatch, true)
+
+	// Not actionable: ineligible (observe-era) MISMATCH — the F-M10 structural exclusion.
+	aObserve := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	completeAudit(t, repo, aObserve, runnerRoot, "classX", VerdictMismatch, false)
+
+	// Not actionable: eligible MATCH.
+	aMatch := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	completeAudit(t, repo, aMatch, runnerRoot, "classX", VerdictMatch, true)
+
+	// Not actionable: a confirmation row, even when eligible MISMATCH (confirms_audit_id set).
+	conf, err := repo.EnqueueConfirmation(ctx, doneMismatch.ID)
+	if err != nil {
+		t.Fatalf("enqueue confirmation: %v", err)
+	}
+	claimedConf, err := repo.Claim(ctx, runnerConf, "classY")
+	if err != nil || claimedConf == nil || claimedConf.ID != conf.ID {
+		t.Fatalf("claim confirmation: %v (nil=%v)", err, claimedConf == nil)
+	}
+	if err := repo.CompleteVerdict(ctx, conf.ID, runnerConf, VerdictMismatch, "", []byte("gt"), "cs", true); err != nil {
+		t.Fatalf("complete confirmation: %v", err)
+	}
+
+	roots, err := repo.ListActionableRoots(ctx, 100)
+	if err != nil {
+		t.Fatalf("list actionable roots: %v", err)
+	}
+	if len(roots) != 1 || roots[0].ID != doneMismatch.ID {
+		ids := make([]types.ID, len(roots))
+		for i, r := range roots {
+			ids[i] = r.ID
+		}
+		t.Fatalf("actionable roots = %v, want exactly [%v]", ids, doneMismatch.ID)
+	}
+}
+
+func TestSetEnforcementStateGuards(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+	runner := registerTestRunner(t, pool, "guard-runner")
+
+	a := enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
+	done := completeAudit(t, repo, a, runner, "classX", VerdictMismatch, true) // AWAITING_CONFIRMATION
+
+	// AWAITING_CONFIRMATION → ENFORCED: guard hits, enforced_at stamped.
+	ok, err := repo.SetEnforcementState(ctx, done.ID, EnforcementEnforced)
+	if err != nil || !ok {
+		t.Fatalf("set ENFORCED: ok=%v err=%v, want true/nil", ok, err)
+	}
+	got, _ := repo.GetByID(ctx, done.ID)
+	if got.EnforcementState != EnforcementEnforced || got.EnforcedAt == nil {
+		t.Errorf("after ENFORCED: state=%q enforced_at=%v, want ENFORCED + a timestamp", got.EnforcementState, got.EnforcedAt)
+	}
+
+	// A terminal row is guarded: a further transition is a no-op (ok=false), state unchanged.
+	ok, err = repo.SetEnforcementState(ctx, done.ID, EnforcementStalled)
+	if err != nil {
+		t.Fatalf("set STALLED on terminal: %v", err)
+	}
+	if ok {
+		t.Errorf("guard let a terminal ENFORCED row transition to STALLED")
+	}
+	got, _ = repo.GetByID(ctx, done.ID)
+	if got.EnforcementState != EnforcementEnforced {
+		t.Errorf("terminal state mutated to %q, want ENFORCED", got.EnforcementState)
+	}
+}
+
+func TestClaimRepairOnce(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxAuditsRepository(pool)
+	runner := registerTestRunner(t, pool, "repair-runner")
+
+	f := newAuditFixture(t, pool, 600, nil)
+	a := enqueueTestAudit(t, repo, f, nil, nil)
+	done := completeAudit(t, repo, a, runner, "classX", VerdictMismatch, true)
+
+	// First claim of the result wins.
+	claimed, err := repo.ClaimRepair(ctx, done.ID, f.result)
+	if err != nil || !claimed {
+		t.Fatalf("first ClaimRepair: claimed=%v err=%v, want true/nil", claimed, err)
+	}
+	// A second claim of the SAME result loses (UNIQUE(result_id)) — the idempotency guard.
+	claimed, err = repo.ClaimRepair(ctx, done.ID, f.result)
+	if err != nil {
+		t.Fatalf("second ClaimRepair: %v", err)
+	}
+	if claimed {
+		t.Errorf("second ClaimRepair of the same result claimed again; want false")
+	}
+
+	// A fresh result (distinct volunteer — uq_results_work_unit_volunteer forbids a second
+	// result from the same volunteer on the unit) claims true.
+	other := createTestResult(t, pool, f.wuID, createTestVolunteer(t, pool), randChecksum())
+	claimed, err = repo.ClaimRepair(ctx, done.ID, other)
+	if err != nil || !claimed {
+		t.Fatalf("ClaimRepair of a fresh result: claimed=%v err=%v, want true/nil", claimed, err)
+	}
+}
+
+func eqStrPtr(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }

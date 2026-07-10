@@ -12,13 +12,15 @@ import (
 )
 
 // adjustmentColumns is the projection every read and RETURNING clause shares, in
-// scanAdjustment order.
+// scanAdjustment order. audit_id and rac_applied_at (migration 00021) are nullable and
+// present on every row: an OPERATOR clawback and an as-yet-unRAC'd adjustment leave them NULL.
 const adjustmentColumns = `id, ledger_entry_id, volunteer_id, leaf_id,
-	amount, reason, note, created_by, created_at`
+	amount, reason, note, created_by, created_at, audit_id, rac_applied_at`
 
 // scanAdjustment scans one Adjustment from a pgx.Row (a QueryRow result or a Rows cursor).
 // note is nullable in the schema, so it is scanned through a pointer and flattened to the
-// empty string when NULL (which the struct's omitempty tag then drops from JSON).
+// empty string when NULL (which the struct's omitempty tag then drops from JSON). audit_id
+// and rac_applied_at are scanned straight into the struct's pointer fields (nil on NULL).
 func scanAdjustment(row pgx.Row) (*Adjustment, error) {
 	var a Adjustment
 	var note *string
@@ -32,6 +34,8 @@ func scanAdjustment(row pgx.Row) (*Adjustment, error) {
 		&note,
 		&a.CreatedBy,
 		&a.CreatedAt,
+		&a.AuditID,
+		&a.RACAppliedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -54,13 +58,33 @@ func NewPgxAdjustmentsRepository(pool *pgxpool.Pool) *PgxAdjustmentsRepository {
 	return &PgxAdjustmentsRepository{pool: pool}
 }
 
-// Clawback appends a guarded negative adjustment against entryID inside ONE transaction.
+// Clawback appends a guarded negative adjustment against entryID inside ONE transaction, on
+// behalf of a manual operator action (audit_id NULL). See clawback for the transactional
+// contract.
 //
-// magnitude is the POSITIVE amount to claw back; nil means "the full remaining net",
-// computed inside the same transaction so the read and the write cannot straddle a
-// concurrent adjustment (TOCTOU-free). Returns ErrAdjustmentExhausted when nothing remains
-// and ErrAdjustmentOvershoot when magnitude exceeds the remaining net.
+// magnitude is the POSITIVE amount to claw back; nil means "the full remaining net", computed
+// inside the same transaction so the read and the write cannot straddle a concurrent
+// adjustment (TOCTOU-free). Returns ErrAdjustmentExhausted when nothing remains and
+// ErrAdjustmentOvershoot when magnitude exceeds the remaining net.
 func (r *PgxAdjustmentsRepository) Clawback(ctx context.Context, entryID types.ID, magnitude *float64, reason, note, createdBy string) (*Adjustment, error) {
+	return r.clawback(ctx, entryID, magnitude, reason, note, createdBy, nil)
+}
+
+// ClawbackForAudit is the automated-enforcement clawback (design doc §9.4): the same
+// transactional FOR-UPDATE net guard as Clawback, ALWAYS full-remaining (magnitude nil,
+// resolved under the lock), stamped created_by='AUDIT' and the causing audit_id. reason is a
+// package machine code (ReasonAuditMismatch / ReasonAuditMismatchUnmatured); note is empty.
+// ErrAdjustmentExhausted is the caller's idempotent no-op (F17): a retrying enforcement pass
+// treats an already-cancelled entry as success.
+func (r *PgxAdjustmentsRepository) ClawbackForAudit(ctx context.Context, entryID, auditID types.ID, reason string) (*Adjustment, error) {
+	return r.clawback(ctx, entryID, nil, reason, "", AdjustmentByAudit, &auditID)
+}
+
+// clawback is the single transactional code path behind both Clawback (auditID nil) and
+// ClawbackForAudit (auditID set). It locks the parent ledger row, recomputes the committed
+// net under that lock, rejects overshoot/exhaustion, and appends one negative adjustment
+// carrying the given audit_id.
+func (r *PgxAdjustmentsRepository) clawback(ctx context.Context, entryID types.ID, magnitude *float64, reason, note, createdBy string, auditID *types.ID) (*Adjustment, error) {
 	// Defensive magnitude check for an explicit request. nil ("full remaining") is resolved
 	// below from the locked row and is > 0 by construction. A non-positive or non-finite
 	// magnitude is a caller bug, not an overshoot — reject it distinctly.
@@ -127,13 +151,14 @@ func (r *PgxAdjustmentsRepository) Clawback(ctx context.Context, entryID types.I
 	}
 
 	// volunteer_id/leaf_id are taken from the LOCKED ledger row, never from the caller, so a
-	// clawback can never be mis-attributed by a forged request field.
+	// clawback can never be mis-attributed by a forged request field. audit_id is nil for the
+	// operator path (stored NULL) and set for the enforcement path.
 	row := tx.QueryRow(ctx,
 		`INSERT INTO credit_adjustments (
-			ledger_entry_id, volunteer_id, leaf_id, amount, reason, note, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ledger_entry_id, volunteer_id, leaf_id, amount, reason, note, created_by, audit_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING `+adjustmentColumns,
-		entryID, volunteerID, leafID, -mag, reason, noteArg, createdBy,
+		entryID, volunteerID, leafID, -mag, reason, noteArg, createdBy, auditID,
 	)
 	adj, err := scanAdjustment(row)
 	if err != nil {
@@ -199,15 +224,34 @@ func (r *PgxAdjustmentsRepository) SumForEntry(ctx context.Context, entryID type
 	return sum, nil
 }
 
-// --- slice-3 enforcement surface (design doc §9.4) — keel stubs; the credit
-// implementer replaces each with the real transactional SQL. ---
-
-// ClawbackForAudit is the automated-enforcement clawback (full-remaining, AUDIT-stamped).
-func (r *PgxAdjustmentsRepository) ClawbackForAudit(ctx context.Context, entryID, auditID types.ID, reason string) (*Adjustment, error) {
-	return nil, apierror.Internal("ClawbackForAudit not implemented (slice-3 keel stub)", nil)
-}
-
-// ListUnmaturedEntryIDs returns the volunteer's in-window ledger entry ids, oldest first.
+// ListUnmaturedEntryIDs returns the ids of the volunteer's ledger entries still inside the
+// maturation window (granted_at > now() - maturationDays), oldest first, riding
+// idx_credit_ledger_volunteer_time (design doc §9.4). It DELIBERATELY does NOT pre-filter on
+// remaining net: ClawbackForAudit recomputes net under its FOR-UPDATE lock and no-ops the
+// already-cancelled entries, so there is one race-safe code path rather than a TOCTOU-prone
+// pre-filter (the F1/F9 lesson).
 func (r *PgxAdjustmentsRepository) ListUnmaturedEntryIDs(ctx context.Context, volunteerID types.ID, maturationDays int) ([]types.ID, error) {
-	return nil, apierror.Internal("ListUnmaturedEntryIDs not implemented (slice-3 keel stub)", nil)
+	rows, err := r.pool.Query(ctx,
+		`SELECT id FROM credit_ledger
+		WHERE volunteer_id = $1 AND granted_at > now() - ($2::int * interval '1 day')
+		ORDER BY granted_at ASC`,
+		volunteerID, maturationDays,
+	)
+	if err != nil {
+		return nil, apierror.Internal("failed to list unmatured ledger entries", err)
+	}
+	defer rows.Close()
+
+	var ids []types.ID
+	for rows.Next() {
+		var id types.ID
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			return nil, apierror.Internal("failed to scan unmatured ledger entry id", scanErr)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate unmatured ledger entries", err)
+	}
+	return ids, nil
 }

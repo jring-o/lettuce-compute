@@ -31,10 +31,14 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 
 	cleanup := func() {
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
-		_, _ = pool.Exec(ctx, "DELETE FROM result_audits")
 		_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
+		_, _ = pool.Exec(ctx, "DELETE FROM audit_repairs")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_attestations")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
+		// result_audits AFTER audit_repairs + credit_adjustments: migration 00021 added
+		// audit_repairs.audit_id and credit_adjustments.audit_id -> result_audits(id)
+		// ON DELETE RESTRICT, so both children must be gone before their audit rows.
+		_, _ = pool.Exec(ctx, "DELETE FROM result_audits")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM volunteer_rac")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")

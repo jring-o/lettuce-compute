@@ -139,12 +139,25 @@ type AuditsRepository interface {
 	ClaimRepair(ctx context.Context, auditID, resultID types.ID) (claimed bool, err error)
 }
 
+// FlaggedLeavesReader is the admin flagged-leaves read surface (design doc §9.8). It is
+// DELIBERATELY separate from AuditsRepository: the gRPC AuditService consumes the
+// job-lifecycle interface but never this admin read, so keeping it off AuditsRepository
+// leaves that consumer (and its test fakes) untouched. The concrete PgxAuditsRepository
+// satisfies both; the AdminHandler derives this view from its audits repo at construction.
+type FlaggedLeavesReader interface {
+	// FlaggedLeaves returns one row per leaf with ≥ 1 ENFORCED/CONTRADICTED/STALLED ROOT
+	// audit, with per-state counts, the newest enforced_at, and the owner id.
+	// Newest-enforced first.
+	FlaggedLeaves(ctx context.Context) ([]FlaggedLeaf, error)
+}
+
 // ListFilter narrows the admin list. Zero values mean "no filter".
 type ListFilter struct {
-	Status  Status
-	Verdict Verdict
-	LeafID  *types.ID
-	Limit   int
+	Status           Status
+	Verdict          Verdict
+	LeafID           *types.ID
+	EnforcementState EnforcementState
+	Limit            int
 }
 
 // Adjudicator computes the verdict for a returned re-execution output, entirely

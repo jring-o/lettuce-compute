@@ -22,6 +22,18 @@ const EnforcementInterval = 10 * time.Minute
 // EnforcementBatchLimit bounds actionable roots examined per sweep pass.
 const EnforcementBatchLimit = 20
 
+// Machine-readable credit-adjustment reason codes the enforcement pass stamps (design doc
+// §9.4). The STRING VALUES are the contract shared with internal/credit and the revocation
+// signer's charset check (^[A-Z0-9_]{1,64}$); the worker passes them through the
+// CreditEnforcer seam by value, so this package never imports credit. ReasonAuditMismatch
+// cancels the mismatched unit's own entries; ReasonAuditMismatchUnmatured cancels the
+// agreeing accounts' OTHER unmatured credit (§4.5's account-wide sweep) — the distinct code
+// lets attestation consumers tell direct fraud from account-wide collateral.
+const (
+	ReasonAuditMismatch          = "AUDIT_MISMATCH"
+	ReasonAuditMismatchUnmatured = "AUDIT_MISMATCH_UNMATURED"
+)
+
 // RepairRequest carries everything validation needs to adjudicate and repair a unit's
 // DISAGREED results against ground truth (design doc §9.6, audit M3: candidate selection
 // AND adjudication live INSIDE validation — this package cannot import the comparators).

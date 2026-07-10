@@ -601,6 +601,34 @@ all are OPTIONAL and take the defaults below when unset.
 | `registration_pow_difficulty_bits` (`LETTUCE_HEAD_REGISTRATION_POW_DIFFICULTY_BITS`) | `20` | Required leading zero bits of the solution digest (~2^20 ≈ 1M hash attempts, about a second of native single-thread work). Must be in `[8, 32]` — below 8 the puzzle is effectively free, above 32 the expected client work stretches to minutes-to-hours. |
 | `registration_pow_challenge_ttl_seconds` (`LETTUCE_HEAD_REGISTRATION_POW_CHALLENGE_TTL_SECONDS`) | `600` (10m) | How long an issued challenge stays redeemable. Must be `>= 60` so a slow browser or a loaded machine can still solve and submit within the window. |
 
+### Result-audit enforcement (advanced, default off)
+
+Heads can re-execute a random sample of validated work on operator-vetted **trusted
+runner** machines (`LETTUCE_HEAD_RESULT_AUDIT_ENABLED`; runners are registered via the
+admin API and run the `lettuce-volunteer audit-runner` subcommand). By default a mismatch
+between a runner's output and the accepted result is only recorded and logged.
+Setting `LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED=true` arms the consequences: after a
+**second, different** runner independently reproduces the mismatch (and the two runners'
+outputs agree with each other), the head zeroes the trust of every account that backed the
+wrong output, claws back the unit's credit plus all of those accounts' still-immature
+credit (publishing signed revocation attestations), restores credit and trust to any
+volunteer whose dissenting result matches the re-executed ground truth, and re-queues the
+unit if nothing on it was right. Operational notes:
+
+- The head **refuses to boot** with enforcement on unless `LETTUCE_HEAD_CREDIT_MATURATION_DAYS`
+  is greater than 9 — the clawback must be able to land before credit matures out of the
+  settlement window. Set it to 10 or more.
+- Enforcement liveness wants at least **two registered runners on genuinely independent
+  machines** (three or more, spanning two hardware classes, is the robust setup). With one
+  runner, mismatches park in a `STALLED` state and page the log — you can still act
+  manually with the admin trust-slash and credit-clawback endpoints.
+- Watch the log for `CONTRADICTED`: two of your trusted runners disagree about ground
+  truth. One of them is broken or compromised, or the leaf is not deterministic —
+  investigate both before trusting either again. `GET /api/v1/admin/audit/flagged-leaves`
+  lists the leaves with enforcement history.
+- Verdicts recorded while enforcement was off are never acted on retroactively; only
+  mismatches observed while the switch is on can trigger consequences.
+
 ### Server-issued host identity & per-account host cap
 
 A **volunteer account** is a volunteer's Ed25519 keypair — credit, trust, result

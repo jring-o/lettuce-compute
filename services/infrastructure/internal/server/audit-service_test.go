@@ -196,6 +196,9 @@ func (f *fakeAuditsRepo) SetEnforcementState(context.Context, types.ID, audit.En
 func (f *fakeAuditsRepo) ClaimRepair(context.Context, types.ID, types.ID) (bool, error) {
 	return false, nil
 }
+func (f *fakeAuditsRepo) FlaggedLeaves(context.Context) ([]audit.FlaggedLeaf, error) {
+	return nil, nil
+}
 
 // capturingHandler records emitted log records so a test can assert a WARN was made.
 type capturingHandler struct {

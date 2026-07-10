@@ -275,7 +275,7 @@ payload is **eleven** keys, in this order, under a **distinct context**:
 | `context` | the exact literal `"lettuce/credit-attestation-revocation/v2"` |
 | `credit_amount` | the revoked magnitude as a positive six-digit decimal string, e.g. `"0.500000"` |
 | `leaf_id` | UUID string |
-| `reason` | a machine-readable reason code matching `^[A-Z0-9_]{1,64}$` (e.g. `OPERATOR_CLAWBACK`) |
+| `reason` | a machine-readable reason code matching `^[A-Z0-9_]{1,64}$` (e.g. `OPERATOR_CLAWBACK` for manual operator clawbacks; `AUDIT_MISMATCH` and `AUDIT_MISMATCH_UNMATURED` for automated audit enforcement — see the note after Netting) |
 | `result_id` | UUID string of the result whose grant is being revoked |
 | `revokes_attestation_id` | UUID of the original grant attestation being revoked |
 | `schema_version` | JSON integer `2` |
@@ -301,6 +301,26 @@ effective_credit(grant) = grant.credit_amount − Σ revocation.credit_amount
 
 The verify endpoint's `revocations` list (§2) returns exactly the referencing revocations for
 a grant, so a consumer can compute the net without scanning the whole table.
+
+### Audit enforcement: repair grants and multiple outcome rows per result
+
+Heads can re-execute a sample of validated work on operator-vetted trusted runner machines
+and, when two independent runners both refute an accepted output, automatically claw back
+the fraudulent credit (revocations with `reason` `AUDIT_MISMATCH`, plus
+`AUDIT_MISMATCH_UNMATURED` for the sanctioned accounts' other still-immature grants) and
+**repair** honest dissenters: a result that originally lost the vote but matches the
+re-executed ground truth is re-adjudicated, credited, and issued a NEW `AGREED` v2
+attestation. Two consequences for consumers:
+
+- A single `result_id` may carry more than one outcome row — typically a `DISAGREED`
+  (credit 0) row from the original validation followed by a later `AGREED` grant from the
+  repair. The chronologically newest outcome row reflects the head's current adjudication
+  of that result. Revocations remain the only netting instrument; a credit-0 `DISAGREED`
+  row has nothing to net.
+- Repair-issued `AGREED` rows verify under the ordinary v2 grant rule (§6) — same canonical
+  form, same signed fields. Their `quorum_descriptor` reflects the post-repair agreeing set
+  of the unit under the head's current policy numbers; the descriptor field semantics are
+  unchanged (`policy_version` does not change for repairs).
 
 ## 8. What is *not* signed
 
