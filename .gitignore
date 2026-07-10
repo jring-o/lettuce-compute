@@ -72,20 +72,12 @@ apps/volunteer-desktop/src-tauri/resources/*.msi
 .DS_Store
 Thumbs.db
 
-# Security review tracker (internal, not for the public repo)
-/SECURITY.md
-
-# Operator notes (cross-project blockers/follow-ups, not for the public repo)
-/TODO.md
-/TODO.md.bak-*
-/STATE.md
-/DEVLOG.md
-/LOGGING.md
-/lbry-science head instructions/
+# Internal docs (audits, operator notes, trackers) — kept locally, not for the public repo.
+# CLAUDE.md is deliberately NOT here; it lives at the repo root and is ignored separately below.
+/docs/
 
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
-BUG_BASHING_PRIMER.md
 logs
 CLAUDE.md
