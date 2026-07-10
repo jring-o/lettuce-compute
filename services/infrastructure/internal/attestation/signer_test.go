@@ -354,6 +354,7 @@ func TestVerifyAttestation_TamperedEachField(t *testing.T) {
 		{"work_unit_id", func(att *Attestation) { att.WorkUnitID = types.NewID() }},
 		{"volunteer_public_key", func(att *Attestation) { att.VolunteerPublicKey = []byte{99, 99} }},
 		{"validation_outcome", func(att *Attestation) { att.ValidationOutcome = OutcomeDisagreed }},
+		{"credit_amount", func(att *Attestation) { att.CreditAmount += 1 }},
 		{"attestation_timestamp", func(att *Attestation) {
 			att.AttestationTimestamp = att.AttestationTimestamp.Add(time.Second)
 		}},
