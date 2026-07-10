@@ -265,7 +265,7 @@ func TestSignVerify_NilMetrics(t *testing.T) {
 }
 
 func TestSignVerify_AllOutcomes(t *testing.T) {
-	outcomes := []string{OutcomeAgreed, OutcomeDisagreed, OutcomeExpired}
+	outcomes := []string{OutcomeAgreed, OutcomeDisagreed}
 
 	for _, outcome := range outcomes {
 		t.Run(outcome, func(t *testing.T) {

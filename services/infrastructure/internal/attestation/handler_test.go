@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -74,6 +75,25 @@ func (m *mockAttestationRepo) List(_ context.Context, filters ListFilters, page 
 	}
 
 	return filtered, pagination, nil
+}
+
+func (m *mockAttestationRepo) GetByID(_ context.Context, id types.ID) (*Attestation, error) {
+	for _, a := range m.attestations {
+		if a.ID == id {
+			return a, nil
+		}
+	}
+	return nil, apierror.NotFound("attestation", id.String())
+}
+
+func (m *mockAttestationRepo) ListRevocationsOf(_ context.Context, attestationID types.ID) ([]*Attestation, error) {
+	var revocations []*Attestation
+	for _, a := range m.attestations {
+		if a.RevokesAttestationID != nil && *a.RevokesAttestationID == attestationID {
+			revocations = append(revocations, a)
+		}
+	}
+	return revocations, nil
 }
 
 // --- Test Helpers ---

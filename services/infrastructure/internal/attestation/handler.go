@@ -15,13 +15,13 @@ import (
 
 // Handler handles attestation HTTP requests.
 type Handler struct {
-	repo      Repository
+	repo      Reader
 	publicKey ed25519.PublicKey
 	logger    *slog.Logger
 }
 
 // NewHandler creates a new attestation Handler.
-func NewHandler(repo Repository, publicKey ed25519.PublicKey, logger *slog.Logger) *Handler {
+func NewHandler(repo Reader, publicKey ed25519.PublicKey, logger *slog.Logger) *Handler {
 	return &Handler{
 		repo:      repo,
 		publicKey: publicKey,

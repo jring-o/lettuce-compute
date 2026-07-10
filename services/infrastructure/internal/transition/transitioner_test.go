@@ -56,22 +56,28 @@ func (f fakeResults) ListByWorkUnit(context.Context, types.ID) ([]*result.Result
 }
 
 type fakeComparator struct {
-	majority      []*result.Result
-	compareErr    error
-	acceptCalls   int
-	rejectCalls   int
+	majority    []*result.Result
+	compareErr  error
+	acceptCalls int
+	rejectCalls int
+	// The verdicts the transitioner threaded through (attestation v2 wiring): non-nil on
+	// every accept/reject by construction.
+	lastAcceptVerdict *ComparisonVerdict
+	lastRejectVerdict *ComparisonVerdict
 }
 
 func (f fakeComparator) FilterPending(p []*result.Result) []*result.Result { return p }
 func (f fakeComparator) Compare(context.Context, *workunit.WorkUnit, *leaf.Leaf, []*result.Result) ([]*result.Result, error) {
 	return f.majority, f.compareErr
 }
-func (f *fakeComparator) ApplyAccept(context.Context, *workunit.WorkUnit, *leaf.Leaf, []*result.Result, []*result.Result) error {
+func (f *fakeComparator) ApplyAccept(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy) error {
 	f.acceptCalls++
+	f.lastAcceptVerdict = verdict
 	return nil
 }
-func (f *fakeComparator) ApplyReject(context.Context, *workunit.WorkUnit, []*result.Result) error {
+func (f *fakeComparator) ApplyReject(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy) error {
 	f.rejectCalls++
+	f.lastRejectVerdict = verdict
 	return nil
 }
 
