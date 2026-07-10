@@ -35,10 +35,16 @@ type Comparator interface {
 	// or a non-finite output) is treated by the transitioner as "cannot validate yet".
 	Compare(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result) ([]*result.Result, error)
 	// ApplyAccept performs the validate effects (mark AGREED/DISAGREED, COMPLETED->VALIDATED,
-	// credit/RAC/attest). The unit must already be COMPLETED.
-	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result) error
+	// credit/RAC/attest). The unit must already be COMPLETED. The comparison verdict and the
+	// resolved redundancy policy the decision was made under are threaded through so the
+	// attestation builder can sign the quorum event as it was actually gated (attestation v2
+	// quorum descriptor); both are non-nil/resolved on every transitioner path by
+	// construction (a unit only validates or rejects after a verdict exists).
+	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
 	// ApplyReject performs the reject effects (mark DISAGREED, COMPLETED->REJECTED, requeue).
-	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, pending []*result.Result) error
+	// On a reject the verdict carries the LOSING clique (the largest coherent agreeing group
+	// that failed the gates) — the honest descriptor for the attestations of a rejected unit.
+	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
 }
 
 // WorkUnitStore is the narrow work-unit repo surface the transitioner needs.
@@ -214,7 +220,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority); err != nil {
+		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority, snap.Comparison, policy); err != nil {
 			return OutcomeNoop, err
 		}
 		// Over-dispatch hygiene (TODO #50): validate-at-quorum can leave extra copies still
@@ -232,7 +238,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyReject(ctx, wu, pending); err != nil {
+		if err := t.comparator.ApplyReject(ctx, wu, lf, pending, snap.Comparison, policy); err != nil {
 			return OutcomeNoop, err
 		}
 		return OutcomeRejected, nil

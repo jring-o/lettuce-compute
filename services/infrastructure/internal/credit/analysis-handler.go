@@ -6,10 +6,22 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
-	"github.com/lettuce-compute/infrastructure/internal/logging"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/logging"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
+
+// MetricsProvenanceUnverified is the fixed provenance marker stamped on every
+// response aggregate that is derived from volunteer-self-reported execution_metadata
+// (cpu-seconds, gpu-seconds, wall-clock, peak memory). The head NEVER verifies these
+// resource metrics: a volunteer reports them alongside its result and the head stores
+// and aggregates the raw numbers as-is. Labeling every such aggregate with this value
+// keeps a consumer from mistaking unverified volunteer input for head-certified fact.
+//
+// The marker covers ONLY the resource-usage aggregates. The credit figures carried
+// beside them in these same responses ARE head-derived (the head computes and grants
+// credit from validated results) and are deliberately NOT covered by it.
+const MetricsProvenanceUnverified = "unverified_volunteer_reported"
 
 // --- Response types ---
 
@@ -25,22 +37,26 @@ type taskPatternStats struct {
 }
 
 type leafAnalysisResponse struct {
-	LeafID       types.ID                    `json:"leaf_id"`
-	WorkUnitsAnalyzed int                       `json:"work_units_analyzed"`
-	CPUSecondsPerWU   percentileStats           `json:"cpu_seconds_per_wu"`
-	GPUSecondsPerWU   percentileStats           `json:"gpu_seconds_per_wu"`
-	WallClockPerWU    percentileStats           `json:"wall_clock_per_wu"`
-	MemoryMBPerWU     percentileStats           `json:"memory_mb_per_wu"`
+	LeafID            types.ID                    `json:"leaf_id"`
+	WorkUnitsAnalyzed int                         `json:"work_units_analyzed"`
+	CPUSecondsPerWU   percentileStats             `json:"cpu_seconds_per_wu"`
+	GPUSecondsPerWU   percentileStats             `json:"gpu_seconds_per_wu"`
+	WallClockPerWU    percentileStats             `json:"wall_clock_per_wu"`
+	MemoryMBPerWU     percentileStats             `json:"memory_mb_per_wu"`
 	ByTaskPattern     map[string]taskPatternStats `json:"by_task_pattern"`
+	// MetricsProvenance labels the cpu/gpu/wall/memory percentile aggregates above as
+	// unverified volunteer-reported input (never head-certified). Always
+	// MetricsProvenanceUnverified.
+	MetricsProvenance string `json:"metrics_provenance"`
 }
 
 type crossLeafEntry struct {
-	LeafID              types.ID  `json:"leaf_id"`
-	LeafName            string    `json:"leaf_name"`
-	AvgCPUSecondsPerCredit float64   `json:"avg_cpu_seconds_per_credit"`
-	AvgGPUSecondsPerCredit float64   `json:"avg_gpu_seconds_per_credit"`
-	TotalCreditGranted     float64   `json:"total_credit_granted"`
-	ActiveVolunteers       int       `json:"active_volunteers"`
+	LeafID                 types.ID `json:"leaf_id"`
+	LeafName               string   `json:"leaf_name"`
+	AvgCPUSecondsPerCredit float64  `json:"avg_cpu_seconds_per_credit"`
+	AvgGPUSecondsPerCredit float64  `json:"avg_gpu_seconds_per_credit"`
+	TotalCreditGranted     float64  `json:"total_credit_granted"`
+	ActiveVolunteers       int      `json:"active_volunteers"`
 }
 
 type normalizationFactors struct {
@@ -50,8 +66,14 @@ type normalizationFactors struct {
 }
 
 type crossLeafResponse struct {
-	Leafs             []crossLeafEntry  `json:"leafs"`
+	Leafs                []crossLeafEntry     `json:"leafs"`
 	NormalizationFactors normalizationFactors `json:"normalization_factors"`
+	// MetricsProvenance labels the per-leaf avg cpu/gpu-seconds-per-credit figures
+	// (and the normalization factors derived from them) as unverified
+	// volunteer-reported input. Placed at the envelope top level: every row is built
+	// from the same unverified execution_metadata, so one marker on the envelope is
+	// the honest, least-invasive placement. Always MetricsProvenanceUnverified.
+	MetricsProvenance string `json:"metrics_provenance"`
 }
 
 // The per-volunteer credit breakdown response types live in breakdown.go
@@ -63,9 +85,9 @@ type crossLeafResponse struct {
 
 // AnalysisHandler serves credit analysis endpoints.
 type AnalysisHandler struct {
-	pool        *pgxpool.Pool
+	pool     *pgxpool.Pool
 	leafRepo leaf.Repository
-	logger      *slog.Logger
+	logger   *slog.Logger
 }
 
 // NewAnalysisHandler creates a new AnalysisHandler.
@@ -145,13 +167,14 @@ func (h *AnalysisHandler) HandleLeafAnalysis(w http.ResponseWriter, r *http.Requ
 	}
 
 	resp := leafAnalysisResponse{
-		LeafID:         leafID,
+		LeafID:            leafID,
 		WorkUnitsAnalyzed: wuCount,
 		CPUSecondsPerWU:   percentileStats{P50: cpuP50, P90: cpuP90, P99: cpuP99},
 		GPUSecondsPerWU:   percentileStats{P50: gpuP50, P90: gpuP90, P99: gpuP99},
 		WallClockPerWU:    percentileStats{P50: wallP50, P90: wallP90, P99: wallP99},
 		MemoryMBPerWU:     percentileStats{P50: memP50, P90: memP90, P99: memP99},
 		ByTaskPattern:     byPattern,
+		MetricsProvenance: MetricsProvenanceUnverified,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -222,6 +245,7 @@ func (h *AnalysisHandler) HandleCrossLeaf(w http.ResponseWriter, r *http.Request
 			MinCPUSecondsPerCredit: minCPUPerCredit,
 			Ratio:                  ratio,
 		},
+		MetricsProvenance: MetricsProvenanceUnverified,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -245,4 +269,3 @@ func (h *AnalysisHandler) HandleVolunteerBreakdown(w http.ResponseWriter, r *htt
 
 	writeJSON(w, http.StatusOK, bd)
 }
-

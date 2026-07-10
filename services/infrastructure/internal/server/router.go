@@ -67,6 +67,11 @@ type Dependencies struct {
 	// audit logging). EMPTY (nil) by default: forwarding headers are not trusted and
 	// the direct peer IP is always used. Populated from config.Server.TrustedProxies.
 	TrustedProxies []*net.IPNet
+	// RevocationEmitter writes the signed revocation attestation after a manual
+	// clawback commits (attestation v2). Built in main next to the signer; attached
+	// to the credit admin handler here. Best-effort at the handler; the leader-gated
+	// reconciliation sweep recovers lost emissions.
+	RevocationEmitter credit.RevocationEmitter
 }
 
 // NewRouter creates the HTTP router with all routes and middleware.
@@ -290,6 +295,9 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// requireAdmin enforces the 403 (fail-closed without the injection).
 	adjustmentsRepo := credit.NewPgxAdjustmentsRepository(deps.Pool)
 	creditAdminHandler := credit.NewAdminHandler(adjustmentsRepo, creditRepo, deps.Logger)
+	if deps.RevocationEmitter != nil {
+		creditAdminHandler.WithRevocationEmitter(deps.RevocationEmitter)
+	}
 	mux.HandleFunc("POST /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleClawback))
 	mux.HandleFunc("GET /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleListAdjustments))
 

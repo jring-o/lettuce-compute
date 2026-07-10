@@ -69,7 +69,7 @@ type Engine struct {
 	racRepo         credit.RACRepository
 	volunteerRepo   volunteer.Repository
 	assignmentRepo  assignment.Repository
-	attestationRepo attestation.Repository
+	attestationRepo attestation.Creator
 	// reliabilityRepo feeds the per-host measured-reliability signal (TODO #54): an AGREED
 	// result is a good outcome for the host that produced it, a DISAGREED result a bad one.
 	// May be nil (tests / pre-#54) -> the signal is simply not recorded (best-effort).
@@ -127,7 +127,7 @@ func NewEngine(
 	racRepo credit.RACRepository,
 	volunteerRepo volunteer.Repository,
 	assignmentRepo assignment.Repository,
-	attestationRepo attestation.Repository,
+	attestationRepo attestation.Creator,
 	reliabilityRepo reliability.Repository,
 	signer *attestation.Signer,
 	logger *slog.Logger,
@@ -295,16 +295,16 @@ func (e *Engine) Compare(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.
 // mark AGREED/DISAGREED, transition COMPLETED -> VALIDATED, grant credit/RAC, sign
 // attestations, update counters + reliability. The unit must already be COMPLETED (the
 // transitioner marks it so first). The engine half of the transitioner's ActionValidate.
-func (e *Engine) ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending, majority []*result.Result) error {
-	_, err := e.acceptResults(ctx, wu, proj, pending, majority)
+func (e *Engine) ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending, majority []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) error {
+	_, err := e.acceptResults(ctx, wu, proj, pending, majority, verdict, policy)
 	return err
 }
 
 // ApplyReject performs the reject effects: mark all pending DISAGREED, transition
 // COMPLETED -> REJECTED, attest, and requeue (Reassign). The unit must already be COMPLETED.
 // The engine half of the transitioner's ActionReject.
-func (e *Engine) ApplyReject(ctx context.Context, wu *workunit.WorkUnit, pending []*result.Result) error {
-	_, err := e.rejectAll(ctx, wu, pending)
+func (e *Engine) ApplyReject(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) error {
+	_, err := e.rejectAll(ctx, wu, proj, pending, verdict, policy)
 	return err
 }
 
@@ -490,8 +490,13 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	//                                                   the gate is off: a vacuous auto-pass).
 	// A tie leaves MajorityCount == 0, which fails (2) and (3), so an ambiguous largest group
 	// can never validate.
+	// The resolved policy for the attestation quorum descriptor — the same pure resolution
+	// the transitioner performs (its quorum/gate numbers match the k/floor/quorum above by
+	// construction; both derive from ResolveTrust + the leaf config under the same lock).
+	policy := transition.ResolvePolicyWithTrust(proj, wu, e.trustPolicy)
+
 	if v.MajorityCount >= quorum && 2*v.MajorityCount > v.Total && v.Ratio >= threshold && v.TrustedMajorityCount >= k {
-		return e.acceptResults(ctx, wu, proj, pending, majorityGroup)
+		return e.acceptResults(ctx, wu, proj, pending, majorityGroup, v, policy)
 	}
 
 	// Agreement not reached (ratio, floor, or strict-majority gate failed). Check if there
@@ -519,12 +524,16 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	}
 
 	// All assignments completed, no agreement. Reject all.
-	return e.rejectAll(ctx, wu, pending)
+	return e.rejectAll(ctx, wu, proj, pending, v, policy)
 }
 
 // acceptResults marks majority results as AGREED, minority as DISAGREED,
-// transitions the work unit, grants credit, and updates volunteer counters.
-func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result) (*ValidationResult, error) {
+// transitions the work unit, grants credit, and updates volunteer counters. verdict and
+// policy describe the quorum event the decision was gated on; they feed the signed v2
+// attestation quorum descriptor (both are non-nil/resolved on every production path — the
+// transitioner threads its own, and the legacy applyThreshold path self-resolves identical
+// values from the same pure functions).
+func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) (*ValidationResult, error) {
 	majorityIDs := make(map[types.ID]bool)
 	for _, r := range majorityGroup {
 		majorityIDs[r.ID] = true
@@ -622,10 +631,13 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 
 	// Create attestations for agreed results. The amount attested is the credit actually granted
 	// (attestedAmounts): a cap-suppressed AGREED result is absent from the map and attests 0.
-	e.createAttestations(ctx, wu, agreedResults, attestation.OutcomeAgreed, attestedAmounts)
+	// AGREED and DISAGREED members of the unit share the unit's quorum descriptor — both attest
+	// the same quorum event.
+	desc := e.buildQuorumDescriptor(proj, verdict, policy)
+	e.createAttestations(ctx, wu, agreedResults, attestation.OutcomeAgreed, attestedAmounts, desc)
 
 	// Create attestations for disagreed results (credit_amount = 0 via the nil map).
-	e.createAttestations(ctx, wu, rejectedResults, attestation.OutcomeDisagreed, nil)
+	e.createAttestations(ctx, wu, rejectedResults, attestation.OutcomeDisagreed, nil, desc)
 
 	// Update volunteer counters. H-7: best-effort counter bumps — a failure does not
 	// fail validation, so log at Warn, not Error.
@@ -698,8 +710,11 @@ func (e *Engine) cappedCreator() (credit.CappedCreator, bool) {
 }
 
 // rejectAll marks all pending results as DISAGREED, transitions the work unit to REJECTED,
-// and triggers reassignment (or failure if max reassignments reached).
-func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending []*result.Result) (*ValidationResult, error) {
+// and triggers reassignment (or failure if max reassignments reached). verdict carries the
+// LOSING clique when the caller compared (the largest coherent agreeing group that failed
+// the gates — the honest group_size for a rejected unit's attestations); a nil verdict
+// (no production caller) degrades to the empty-majority shape, group_size 0.
+func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) (*ValidationResult, error) {
 	ids := make([]types.ID, len(pending))
 	for i, r := range pending {
 		ids[i] = r.ID
@@ -714,8 +729,13 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 		return nil, fmt.Errorf("transition work unit to REJECTED: %w", err)
 	}
 
+	if verdict == nil {
+		verdict = transition.BuildComparisonVerdict(pending, nil, policy.TrustFloor)
+	}
+
 	// Create attestations for all rejected results (credit_amount = 0 via the nil map).
-	e.createAttestations(ctx, wu, pending, attestation.OutcomeDisagreed, nil)
+	e.createAttestations(ctx, wu, pending, attestation.OutcomeDisagreed, nil,
+		e.buildQuorumDescriptor(proj, verdict, policy))
 
 	// Update volunteer counters. H-7: best-effort — a failure does not fail the
 	// rejection, so log at Warn, not Error.
@@ -760,18 +780,20 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 	}, nil
 }
 
-// createAttestations creates signed credit attestations for each result. The attested
+// createAttestations creates signed v2 credit attestations for each result. The attested
 // credit_amount is looked up per result in amounts (keyed by result ID); a result absent from
 // the map attests 0. This records the credit ACTUALLY granted, not the nominal leaf amount: a
 // DISAGREED result (callers pass nil) attests 0, and an AGREED result whose grant the emission
 // cap suppressed is likewise absent from the map and attests 0 — the attestation states facts
-// (outcome AGREED, credit 0), per the design.
-func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, results []*result.Result, outcome string, amounts map[types.ID]float64) {
+// (outcome AGREED, credit 0), per the design. desc is the unit's quorum descriptor, shared by
+// every result of the unit (they all attest the same quorum event).
+func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, results []*result.Result, outcome string, amounts map[types.ID]float64, desc *attestation.QuorumDescriptor) {
 	if e.attestationRepo == nil || e.signer == nil {
 		return
 	}
 
 	now := types.Now()
+	policyVersion := attestation.PolicyVersion
 	for _, r := range results {
 		// Look up the volunteer's public key.
 		vol, err := e.volunteerRepo.GetByID(ctx, r.VolunteerID)
@@ -784,14 +806,32 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 		// Convert execution metadata to map[string]any for raw_metrics.
 		rawMetrics := executionMetadataToMap(r.ExecutionMetadata)
 
+		// Only a well-formed checksum may enter the signed payload: lowercase 64-hex, or ""
+		// when the result carries none. A malformed value is only reachable through a
+		// ref-only submission's CLAIMED checksum (head-computed inline hashes are hex by
+		// construction); attest "" and say so rather than signing arbitrary bytes.
+		checksum, ok := attestation.NormalizeOutputChecksum(r.OutputChecksum)
+		if !ok {
+			e.logger.Warn("result output checksum is not attestable; attesting empty",
+				"work_unit_id", wu.ID, "result_id", r.ID)
+		}
+
+		resultID := r.ID
+		amount := amounts[r.ID]
 		att := &attestation.Attestation{
-			LeafID:               wu.LeafID,
-			VolunteerPublicKey:   vol.PublicKey,
-			WorkUnitID:           wu.ID,
-			RawMetrics:           rawMetrics,
-			ValidationOutcome:    outcome,
-			CreditAmount:         amounts[r.ID],
-			AttestationTimestamp: now,
+			SchemaVersion:         attestation.SchemaVersionV2,
+			LeafID:                wu.LeafID,
+			VolunteerPublicKey:    vol.PublicKey,
+			WorkUnitID:            wu.ID,
+			ResultID:              &resultID,
+			OutputChecksum:        &checksum,
+			QuorumDescriptor:      desc,
+			PolicyVersion:         &policyVersion,
+			RawMetrics:            rawMetrics,
+			ValidationOutcome:     outcome,
+			CreditAmount:          amount,
+			CreditAmountCanonical: attestation.CanonicalCreditString(amount),
+			AttestationTimestamp:  now,
 		}
 
 		sig, err := e.signer.Sign(att)
@@ -807,6 +847,52 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 				"work_unit_id", wu.ID, "volunteer_id", r.VolunteerID, "result_id", r.ID, "error", err)
 		}
 	}
+}
+
+// buildQuorumDescriptor assembles the signed v2 quorum descriptor from the resolved policy
+// (what was DEMANDED) and the comparison verdict (what was DELIVERED, in distinct-subject
+// units). A nil verdict — no production path — leaves the delivered counts at zero.
+func (e *Engine) buildQuorumDescriptor(proj *leaf.Leaf, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) *attestation.QuorumDescriptor {
+	d := &attestation.QuorumDescriptor{
+		AuditRatePPM:            e.effectiveAuditRatePPM(proj),
+		MinQuorum:               policy.MinQuorum,
+		MinTrustedCorroborators: policy.MinTrustedCorroborators,
+		TargetCopies:            policy.TargetCopies,
+		TrustFloor:              policy.TrustFloor,
+	}
+	if verdict != nil {
+		d.GroupSize = verdict.MajorityCount
+		d.PendingSize = verdict.Total
+		d.TrustedCorroborators = verdict.TrustedMajorityCount
+	}
+	return d
+}
+
+// effectiveAuditRate is the post-hoc result-audit sampling rate in force for a leaf: the MAX
+// of the leaf override and the head default (a leaf may only RAISE sampling, audit F-H4), or
+// 0 when auditing is disabled. Shared by the sampling hook and the attestation descriptor so
+// the signed rate is exactly the operative one.
+func (e *Engine) effectiveAuditRate(proj *leaf.Leaf) float64 {
+	if !e.auditEnabled {
+		return 0
+	}
+	rate := e.auditHeadRate
+	if proj.ValidationConfig.AuditRate > rate {
+		rate = proj.ValidationConfig.AuditRate
+	}
+	if rate < 0 {
+		return 0
+	}
+	if rate > 1 {
+		return 1
+	}
+	return rate
+}
+
+// effectiveAuditRatePPM renders the effective audit rate in parts-per-million for the signed
+// quorum descriptor (integers only in the canonical form).
+func (e *Engine) effectiveAuditRatePPM(proj *leaf.Leaf) int {
+	return int(math.Round(e.effectiveAuditRate(proj) * 1e6))
 }
 
 // executionMetadataToMap converts an ExecutionMetadata struct to a map for attestation raw_metrics.
@@ -993,11 +1079,9 @@ func (e *Engine) maybeSampleForAudit(ctx context.Context, wu *workunit.WorkUnit,
 
 	// Effective rate is the MAX of the leaf override and the head default (audit F-H4): leaf
 	// creation is self-service and the owner is the primary adversary, so a per-leaf audit_rate may
-	// only RAISE sampling above the head floor, never lower it.
-	rate := e.auditHeadRate
-	if proj.ValidationConfig.AuditRate > rate {
-		rate = proj.ValidationConfig.AuditRate
-	}
+	// only RAISE sampling above the head floor, never lower it. Shared with the attestation
+	// quorum descriptor so the signed rate is exactly the operative one.
+	rate := e.effectiveAuditRate(proj)
 
 	// Representative winner: the AGREED member with the lexicographically smallest result UUID
 	// (deterministic; all members were co-credited so the pick carries no incentive weight, and the

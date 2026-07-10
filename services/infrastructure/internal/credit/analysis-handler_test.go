@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,5 +149,94 @@ func TestHandleVolunteerBreakdownTimeline(t *testing.T) {
 	}
 	if weeklySum != 6.0 {
 		t.Errorf("weekly timeline sum = %v, want 6.0", weeklySum)
+	}
+}
+
+// TestHandleLeafAnalysis_LabelsUnverifiedMetrics is a BG-06a item-3 regression
+// (fails on pre-fix code): the leaf-analysis response aggregates volunteer-reported
+// execution_metadata (cpu/gpu/wall/memory percentiles), so the served JSON must carry
+// the unverified-metrics provenance marker.
+func TestHandleLeafAnalysis_LabelsUnverifiedMetrics(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "leaf-analysis-prov")
+	leafID := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+	wuID := createTestWorkUnit(t, pool, leafID)
+	createTestResult(t, pool, wuID, volID,
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+
+	h := NewAnalysisHandler(pool, nil, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/analysis", h.HandleLeafAnalysis)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/leafs/"+leafID.String()+"/analysis", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), wantMarker) {
+		t.Errorf("leaf-analysis response missing provenance marker %s\ngot: %s", wantMarker, rec.Body.String())
+	}
+}
+
+// TestHandleCrossLeaf_LabelsUnverifiedMetrics is a BG-06a item-3 regression (fails on
+// pre-fix code): the cross-leaf response aggregates volunteer-reported
+// execution_metadata (avg cpu/gpu-seconds per credit), so the served JSON must carry
+// the unverified-metrics provenance marker at the envelope top level.
+func TestHandleCrossLeaf_LabelsUnverifiedMetrics(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "cross-leaf-prov")
+	leafID := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+	insertCreditAt(t, pool, leafID, volID, 2.0, time.Now().UTC())
+
+	h := NewAnalysisHandler(pool, nil, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/analysis/cross-leaf", h.HandleCrossLeaf)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/analysis/cross-leaf", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), wantMarker) {
+		t.Errorf("cross-leaf response missing provenance marker %s\ngot: %s", wantMarker, rec.Body.String())
+	}
+}
+
+// TestHandleVolunteerBreakdown_LabelsUnverifiedMetrics is a BG-06a item-3 regression
+// (fails on pre-fix code): the volunteer credit breakdown response aggregates
+// volunteer-reported execution_metadata (per-leaf/per-host cpu/gpu-seconds), so the
+// served JSON must carry the unverified-metrics provenance marker.
+func TestHandleVolunteerBreakdown_LabelsUnverifiedMetrics(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "breakdown-prov")
+	leafID := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+	insertCreditAt(t, pool, leafID, volID, 2.0, time.Now().UTC())
+
+	h := NewAnalysisHandler(pool, nil, slog.Default())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", h.HandleVolunteerBreakdown)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/volunteers/"+volID.String()+"/credit/breakdown", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), wantMarker) {
+		t.Errorf("breakdown response missing provenance marker %s\ngot: %s", wantMarker, rec.Body.String())
 	}
 }

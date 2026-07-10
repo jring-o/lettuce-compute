@@ -272,7 +272,9 @@ The head signs credit attestations with an Ed25519 key. This key is the head's
 **external trust anchor** — volunteers and consumers verify attestations against its
 published public key. You **must** generate it before starting the production stack:
 the server **fails to start** (a clear fatal error, not a silent regeneration) if the
-key file is missing, so it can never quietly mint a new signing identity.
+key file is missing, so it can never quietly mint a new signing identity. For how consumers
+independently verify attestations against this key's public half, see
+[guides/attestation-verification.md](attestation-verification.md).
 
 ```bash
 mkdir -p keys

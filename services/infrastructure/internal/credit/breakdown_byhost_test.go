@@ -4,6 +4,8 @@ package credit
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,5 +95,58 @@ func TestComputeVolunteerBreakdown_ByHost(t *testing.T) {
 	}
 	if unattributed.Credit != 0.5 {
 		t.Errorf("unattributed credit = %v, want 0.5", unattributed.Credit)
+	}
+}
+
+// TestComputeVolunteerBreakdown_ByHost_LabelsUnverifiedMetrics is a BG-06a item-3
+// regression (fails on pre-fix code): the per-machine (by-host) breakdown surfaces
+// volunteer-reported cpu/gpu-seconds, served nested in the VolunteerBreakdown
+// envelope, so the producer must stamp the unverified-metrics provenance marker and
+// it must survive to the JSON wire form.
+func TestComputeVolunteerBreakdown_ByHost_LabelsUnverifiedMetrics(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	userID := createTestUser(t, pool, "byhost-prov")
+	leafID := createTestLeaf(t, pool, &userID)
+	volID := createTestVolunteer(t, pool)
+
+	host := types.NewID()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO hosts (id, volunteer_id, display_name, hardware_capabilities, available_runtimes, is_active, last_seen_at)
+		VALUES ($1, $2, 'laptop', '{}'::jsonb, '{}'::text[], true, now())`,
+		host, volID); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+	wuID := createTestWorkUnit(t, pool, leafID)
+	resID := createTestResult(t, pool, wuID, volID,
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+	if _, err := pool.Exec(ctx, "UPDATE results SET host_id = $1 WHERE id = $2", host, resID); err != nil {
+		t.Fatalf("attach host to result: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO credit_ledger (volunteer_id, leaf_id, work_unit_id, result_id, credit_amount, granted_at)
+		VALUES ($1, $2, $3, $4, 2.0, now())`,
+		volID, leafID, wuID, resID); err != nil {
+		t.Fatalf("insert credit: %v", err)
+	}
+
+	bd, err := ComputeVolunteerBreakdown(ctx, pool, volID)
+	if err != nil {
+		t.Fatalf("ComputeVolunteerBreakdown: %v", err)
+	}
+	if len(bd.ByHost) == 0 {
+		t.Fatal("expected at least one by-host row")
+	}
+	if bd.MetricsProvenance != MetricsProvenanceUnverified {
+		t.Errorf("MetricsProvenance = %q, want %q", bd.MetricsProvenance, MetricsProvenanceUnverified)
+	}
+	b, err := json.Marshal(bd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), wantMarker) {
+		t.Errorf("by-host breakdown JSON missing provenance marker %s\ngot: %s", wantMarker, b)
 	}
 }

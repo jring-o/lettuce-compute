@@ -75,6 +75,19 @@ type VolunteerBreakdown struct {
 	ByHost         []HostCredit                  `json:"by_host"`
 	ByResourceType map[string]ResourceTypeCredit `json:"by_resource_type"`
 	Timeline       CreditTimeline                `json:"timeline"`
+	// MetricsProvenance labels the cpu/gpu-seconds figures carried in the per-leaf
+	// (ByLeaf) and per-machine (ByHost) rows as unverified volunteer-reported input:
+	// the head never verifies self-reported resource metrics. It sits at the envelope
+	// top level because the by-host rows are served only nested here (never as a
+	// standalone response), so one marker honestly covers both aggregates. The credit
+	// totals in this response are head-derived and are NOT covered by it. Always
+	// MetricsProvenanceUnverified (defined in analysis-handler.go).
+	//
+	// This is a JSON field on the shared Go struct, so it appears in the operator REST
+	// breakdown. The gRPC self-view (GetMyContribution) maps this struct field-by-field
+	// into a SEPARATE protobuf response and does not carry this marker; labeling that
+	// surface is a proto-message change tracked separately.
+	MetricsProvenance string `json:"metrics_provenance"`
 }
 
 // ComputeVolunteerBreakdown sums a volunteer's credit_ledger into a full
@@ -87,8 +100,9 @@ type VolunteerBreakdown struct {
 // scan. Errors are returned, never swallowed.
 func ComputeVolunteerBreakdown(ctx context.Context, pool *pgxpool.Pool, volunteerID types.ID) (*VolunteerBreakdown, error) {
 	bd := &VolunteerBreakdown{
-		VolunteerID: volunteerID,
-		ByLeaf:      make([]LeafCredit, 0),
+		VolunteerID:       volunteerID,
+		ByLeaf:            make([]LeafCredit, 0),
+		MetricsProvenance: MetricsProvenanceUnverified,
 	}
 
 	// Per-leaf credit + resource usage. cpu/gpu seconds come from the AGREED

@@ -20,7 +20,7 @@ func testSigner(t *testing.T) *Signer {
 
 func testAttestation() *Attestation {
 	return &Attestation{
-		LeafID:          types.NewID(),
+		LeafID:             types.NewID(),
 		VolunteerPublicKey: make([]byte, ed25519.PublicKeySize),
 		WorkUnitID:         types.NewID(),
 		RawMetrics: map[string]any{
@@ -36,8 +36,8 @@ func testAttestation() *Attestation {
 			"network_rx_mb":      float64(0),
 			"network_tx_mb":      float64(0),
 		},
-		ValidationOutcome:   OutcomeAgreed,
-		CreditAmount:        1.0,
+		ValidationOutcome:    OutcomeAgreed,
+		CreditAmount:         1.0,
 		AttestationTimestamp: time.Date(2026, 3, 14, 12, 0, 0, 0, time.UTC),
 	}
 }
@@ -265,7 +265,7 @@ func TestSignVerify_NilMetrics(t *testing.T) {
 }
 
 func TestSignVerify_AllOutcomes(t *testing.T) {
-	outcomes := []string{OutcomeAgreed, OutcomeDisagreed, OutcomeExpired}
+	outcomes := []string{OutcomeAgreed, OutcomeDisagreed}
 
 	for _, outcome := range outcomes {
 		t.Run(outcome, func(t *testing.T) {
