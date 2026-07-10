@@ -14,6 +14,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
+	"github.com/lettuce-compute/infrastructure/internal/audit"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
@@ -40,6 +41,22 @@ type ValidationResult struct {
 	AgreedResults   []types.ID
 	RejectedResults []types.ID
 	CreditEntries   []*credit.LedgerEntry
+}
+
+// runnerSubjectsProvider is the narrow, consumer-side view of the trusted-runner registry the
+// engine uses to GATE the D9 accrual-witness upgrade (§7.6). Declared here (not imported from
+// the audit package) so the engine depends on one method; audit.RunnersRepository satisfies it.
+type runnerSubjectsProvider interface {
+	// ActiveRunnerSubjects returns the current trust subjects of all ACTIVE trusted runners; an
+	// empty slice means the registry has no active runner (accrual then stays on the legacy rule).
+	ActiveRunnerSubjects(ctx context.Context) ([]string, error)
+}
+
+// artifactVersionResolver resolves a pinned artifact version's frozen ExecutionConfig for the
+// sampling hook, so a sampled audit records the exact exec config the winner RAN (audit F-M4:
+// leafs.execution_config is owner-mutable mid-window). Matched by leaf.PgxRepository.
+type artifactVersionResolver interface {
+	GetVersionByID(ctx context.Context, id types.ID) (*leaf.ArtifactVersion, error)
 }
 
 // Engine performs result validation by comparing redundant results,
@@ -81,8 +98,24 @@ type Engine struct {
 	// configured but the credit repository does not implement credit.CappedCreator (the grant
 	// then falls back to uncapped Create — loud, but never a validation failure).
 	capWarnOnce sync.Once
-	signer      *attestation.Signer
-	logger      *slog.Logger
+	// runnerSubjects GATES the D9 trust-accrual witness upgrade (§7.6/F-H1): nil (the default)
+	// keeps the legacy single-trusted-witness rule so accrual is byte-identical to today until a
+	// trusted runner is actually registered. Set via WithTrustedRunners.
+	runnerSubjects runnerSubjectsProvider
+	// auditEnq/auditEnabled/auditHeadRate/auditVersions configure the post-validation result-audit
+	// sampling hook (§7.2). auditEnabled false or auditEnq nil (the default) disables sampling
+	// entirely — no audit rows, no eligibility work. Set via WithResultAudits.
+	auditEnq      audit.Enqueuer
+	auditEnabled  bool
+	auditHeadRate float64
+	auditVersions artifactVersionResolver
+	// auditIneligible counts validated-but-ineligible units per leaf id (string) for the
+	// fault-monitor probe (§7.2 skip-lane visibility). Guarded by auditIneligibleMu; lazily
+	// initialized on first ineligible unit. Read via AuditIneligibleCounts.
+	auditIneligibleMu sync.Mutex
+	auditIneligible   map[string]int64
+	signer            *attestation.Signer
+	logger            *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.
@@ -135,6 +168,28 @@ func (e *Engine) WithStandingBackpressure(rec standing.Recorder) *Engine {
 // is the default — so no credit_ledger row is ever suppressed and CreateCapped is never called.
 func (e *Engine) WithEmissionCap(capPerDay float64) *Engine {
 	e.emissionCapPerDay = capPerDay
+	return e
+}
+
+// WithTrustedRunners wires the trusted-runner registry provider that GATES the D9 accrual-witness
+// upgrade (§7.6/F-H1), returning the engine for chaining. A nil provider (the default) keeps the
+// legacy single-trusted-witness accrual rule, so newcomer accrual is byte-identical to today
+// until the operator registers a runner — the G2-preserving gate that stops an un-gated rule
+// change from freezing accrual on a head whose registry is (necessarily) empty on deploy day.
+func (e *Engine) WithTrustedRunners(p runnerSubjectsProvider) *Engine {
+	e.runnerSubjects = p
+	return e
+}
+
+// WithResultAudits configures the post-validation result-audit sampling hook (§7.2), returning
+// the engine for chaining. enabled false or enq nil (the default) disables sampling entirely.
+// headRate is the head-default fraction the per-leaf audit_rate can only RAISE (F-H4); versions
+// resolves a versioned winner's frozen ExecutionConfig snapshot (F-M4).
+func (e *Engine) WithResultAudits(enq audit.Enqueuer, enabled bool, headRate float64, versions artifactVersionResolver) *Engine {
+	e.auditEnq = enq
+	e.auditEnabled = enabled
+	e.auditHeadRate = headRate
+	e.auditVersions = versions
 	return e
 }
 
@@ -608,6 +663,10 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 		"disagreed", len(rejectedIDs),
 		"credit_amount", creditAmount)
 
+	// Post-validation result-audit sampling (§7.2): the unit is fully validated + credited, so
+	// selection is post-hoc and carries zero dispatch signal. Best-effort, never fails validation.
+	e.maybeSampleForAudit(ctx, wu, proj, agreedResults)
+
 	return &ValidationResult{
 		WorkUnitID:      wu.ID,
 		Outcome:         OutcomeValidated,
@@ -794,22 +853,35 @@ func (e *Engine) recordReliability(ctx context.Context, results []*result.Result
 }
 
 // accrueTrust credits account-level trust for a corroborated-clean unit (see internal/trust).
-// It collapses the agreed results to DISTINCT subjects (two devices under one identity are
-// ONE principal, accruing at most once per unit) and awards +1 to a subject ONLY when a
-// DIFFERENT agreed subject was already trusted (its submission-time score met the floor).
+// It collapses the agreed results to DISTINCT subjects (two devices under one identity are ONE
+// principal, accruing at most once per unit) and awards +1 to a subject only when the agreement
+// was WITNESSED strongly enough that a Sybil farm cannot bootstrap itself by cross-validating its
+// own answers.
 //
-// The floor is resolved even when the gate is DISABLED: trust must accumulate before
-// enforcement is switched on, so accrual can recognize which subjects are trusted. ResolveTrust
-// returns K == 0 when the gate is off but still returns the real floor.
+// The floor is resolved even when the gate is DISABLED: trust must accumulate before enforcement
+// is switched on, so accrual can recognize which subjects are trusted. ResolveTrust returns
+// K == 0 when the gate is off but still returns the real floor (now clamped >= 1 — BG-01a).
 //
-// The "witnessed by a trusted subject" rule is the Sybil rationale: agreement purely among
-// untrusted newcomers earns credit but ZERO trust, so a Sybil farm cannot bootstrap itself by
-// cross-validating its own answers — trust only ever spreads outward from a subject the
-// operator seeded via the admin API. It is asymmetric: an untrusted subject corroborated by a
-// trusted one accrues, but that lone trusted subject does NOT accrue off untrusted peers (it
-// has no OTHER trusted witness), so a single trusted account cannot mint trust for a second
-// identity it also controls. Best-effort and nil-safe: a nil store or a write error is logged
-// and skipped, never failing validation.
+// Witness rule (D9 / audit F-H1), GATED on trusted-runner registry state so it is byte-identical
+// to the pre-D9 rule until the operator actually registers a runner (accrual is always active in
+// production, so an un-gated change would FREEZE newcomer accrual on every head whose only trusted
+// subject is the seeded corroborator — the registry is necessarily empty on deploy day — a G2
+// violation). Per call:
+//
+//   - registry EMPTY, no provider wired, or the registry query ERRORS (best-effort; a transient
+//     DB blip must not freeze newcomer bootstrap — WARN and fall back): the legacy rule — a
+//     subject accrues iff its agreeing group contains >= 1 OTHER trusted subject.
+//   - registry has >= 1 ACTIVE runner: a subject accrues iff its agreeing group contains (a) a
+//     trusted OTHER subject that is an active trusted runner, OR (b) >= 2 distinct trusted OTHER
+//     subjects. This keeps G2 (the head's own registered corroborator single-witnesses newcomers
+//     under (a)) while denying two colluding trusted accounts the ability to cheaply mint a
+//     third identity's trust.
+//
+// The registry is queried at most ONCE per call, and only when at least one subject is a
+// candidate to accrue under the base (>= 1 trusted other) rule. A non-countable result (submitter
+// effective standing not OK at submit) is skipped, so it neither ACCRUES nor WITNESSES — a
+// probation account is invisible to trust just as it is to the verdict. Best-effort and nil-safe:
+// a nil store or a write error is logged and skipped, never failing validation.
 func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.WorkUnit, agreedResults []*result.Result) {
 	if e.trustRepo == nil {
 		return
@@ -820,15 +892,9 @@ func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.
 	}
 	_, floor := e.trustPolicy.ResolveTrust(proj.ValidationConfig, quorum)
 
-	// Collapse to distinct subjects, keeping each subject's max submission-time score (equal
-	// per subject in practice; max is defensive). Reuses the transitioner's subject/score
-	// fallbacks so accrual and the acceptance verdict apply identical rules.
-	//
-	// A non-countable result (submitter's effective standing at submit was not OK — see
-	// transition.StandingCountable) is skipped, so it neither ACCRUES trust nor WITNESSES it:
-	// its subject earns no +1, and its score never counts toward whether some OTHER subject had
-	// a trusted witness. A probation account is invisible to trust just as it is to the verdict,
-	// closing the loophole where a benched-then-agreeing account could seed trust outward.
+	// Collapse to distinct subjects, keeping each subject's max submission-time score (equal per
+	// subject in practice; max is defensive). Reuses the transitioner's subject/score fallbacks so
+	// accrual and the acceptance verdict apply identical rules. Non-countable results are skipped.
 	subjectScore := make(map[string]int)
 	for _, r := range agreedResults {
 		if !transition.StandingCountable(r) {
@@ -848,12 +914,59 @@ func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.
 		}
 	}
 
+	// Candidate under the base rule = some subject has >= 1 OTHER trusted subject. An untrusted
+	// subject has trustedCount trusted others; a trusted one has trustedCount-1. So a candidate
+	// exists iff trustedCount >= 2, or trustedCount == 1 with an untrusted subject present. If
+	// none, nobody accrues under ANY rule — skip the registry query entirely.
+	if !(trustedCount >= 2 || (trustedCount == 1 && len(subjectScore) > trustedCount)) {
+		return
+	}
+
+	// Resolve the trusted-runner registry state ONCE. registryActive stays false (legacy rule)
+	// when there is no provider, the registry is empty, or the query errors (G2: a transient blip
+	// must not freeze newcomer bootstrap).
+	registryActive := false
+	var runnerSet map[string]bool
+	if e.runnerSubjects != nil {
+		subs, err := e.runnerSubjects.ActiveRunnerSubjects(ctx)
+		if err != nil {
+			e.logger.Warn("failed to resolve active trusted-runner subjects for trust accrual; using legacy witness rule",
+				"work_unit_id", wu.ID, "error", err)
+		} else if len(subs) > 0 {
+			registryActive = true
+			runnerSet = make(map[string]bool, len(subs))
+			for _, s := range subs {
+				runnerSet[s] = true
+			}
+		}
+	}
+
+	// Count trusted subjects that are active runners (rule (a)); only meaningful when active.
+	trustedRunnerCount := 0
+	if registryActive {
+		for subj, sc := range subjectScore {
+			if sc >= floor && runnerSet[subj] {
+				trustedRunnerCount++
+			}
+		}
+	}
+
 	for subj, sc := range subjectScore {
 		trustedOthers := trustedCount
+		runnerOthers := trustedRunnerCount
 		if sc >= floor {
 			trustedOthers-- // a trusted subject cannot corroborate itself
+			if runnerSet[subj] {
+				runnerOthers-- // ... nor count itself toward the runner-witness rule
+			}
 		}
 		if trustedOthers < 1 {
+			continue // no trusted witness at all -> never accrues under any rule
+		}
+		// registry off -> legacy (>= 1 trusted other); registry on -> rule (a) a trusted-other
+		// runner OR rule (b) >= 2 distinct trusted others.
+		accrues := !registryActive || trustedOthers >= 2 || runnerOthers >= 1
+		if !accrues {
 			continue
 		}
 		if err := e.trustRepo.AccrueCleanUnit(ctx, subj); err != nil {
@@ -861,6 +974,195 @@ func (e *Engine) accrueTrust(ctx context.Context, proj *leaf.Leaf, wu *workunit.
 				"subject", subj, "work_unit_id", wu.ID, "error", err)
 		}
 	}
+}
+
+// maybeSampleForAudit is the post-validation result-audit sampling hook (spec §7.2). It runs at
+// the TAIL of acceptResults — the unit is VALIDATED and fully credited — so selection is post-hoc
+// and carries zero dispatch signal. Best-effort: any error is WARNed and never fails validation
+// (a dropped sample is indistinguishable from an unlucky draw).
+//
+// Eligibility is applied BEFORE the draw so no runner compute is wasted on a verdict that would be
+// INCONCLUSIVE by construction; every owner-selectable skip lane (NetworkAccess, CUSTOM, unpinned
+// or ref-only NUMERIC, HR-without-pin, canon-empty) increments the per-leaf ineligible counter the
+// fault-monitor probe reads (§7.2 skip-lane visibility — the lanes are made operator-VISIBLE in v1
+// rather than closed, which is the deferred determinism_class work).
+func (e *Engine) maybeSampleForAudit(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, agreedResults []*result.Result) {
+	if !e.auditEnabled || e.auditEnq == nil {
+		return
+	}
+
+	// Effective rate is the MAX of the leaf override and the head default (audit F-H4): leaf
+	// creation is self-service and the owner is the primary adversary, so a per-leaf audit_rate may
+	// only RAISE sampling above the head floor, never lower it.
+	rate := e.auditHeadRate
+	if proj.ValidationConfig.AuditRate > rate {
+		rate = proj.ValidationConfig.AuditRate
+	}
+
+	// Representative winner: the AGREED member with the lexicographically smallest result UUID
+	// (deterministic; all members were co-credited so the pick carries no incentive weight, and the
+	// NUMERIC verdict reads ALL members anyway — F-M3).
+	var winner *result.Result
+	for _, r := range agreedResults {
+		if winner == nil || r.ID.String() < winner.ID.String() {
+			winner = r
+		}
+	}
+	if winner == nil {
+		return
+	}
+
+	leafID := wu.LeafID.String()
+	mode := proj.ValidationConfig.ComparisonMode
+	pin := ""
+	if wu.HRClass != nil {
+		pin = *wu.HRClass
+	}
+
+	// --- Eligibility filter (§7.2), in order; log Debug + count the ineligible lane on each skip. ---
+
+	// CUSTOM is unshippable (unchanged) — checked first so an unshippable leaf never triggers an
+	// artifact-version lookup.
+	if mode == leaf.ComparisonCustom {
+		e.recordAuditIneligible(leafID, wu.ID, "custom_comparison_mode")
+		return
+	}
+
+	// Resolve the winner's effective ExecutionConfig SNAPSHOT (audit F-M4): leafs.execution_config
+	// is owner-mutable mid-window, so the runner must execute the pinned artifact version's frozen
+	// config when the winner ran one — never a claim-time resolution of owner-mutable config. It
+	// drives both the NetworkAccess check below and the recorded ExecutionSnapshot.
+	execSnap := proj.ExecutionConfig
+	if winner.ArtifactVersionID != nil {
+		if e.auditVersions == nil {
+			e.logger.Warn("result-audit sampling: no artifact-version resolver wired for a versioned winner; skipping",
+				"work_unit_id", wu.ID, "artifact_version_id", winner.ArtifactVersionID)
+			return
+		}
+		av, err := e.auditVersions.GetVersionByID(ctx, *winner.ArtifactVersionID)
+		if err != nil || av == nil {
+			e.logger.Warn("result-audit sampling: failed to resolve winner artifact version; skipping",
+				"work_unit_id", wu.ID, "artifact_version_id", winner.ArtifactVersionID, "error", err)
+			return
+		}
+		execSnap = av.ExecutionConfig
+	}
+
+	// A network-touching leaf can be legitimately non-deterministic across time; a false MISMATCH
+	// recorded now would poison slice-3 enforcement later.
+	if execSnap.NetworkAccess {
+		e.recordAuditIneligible(leafID, wu.ID, "network_access")
+		return
+	}
+
+	// HR pinning (audit F-H2): HomogeneousRedundancy exists precisely because such leaves are NOT
+	// portably deterministic across hardware classes, so a leaf that declares it but whose unit
+	// somehow lacks a pin cannot be safely re-executed cross-class.
+	if proj.ValidationConfig.HomogeneousRedundancy && pin == "" {
+		e.recordAuditIneligible(leafID, wu.ID, "homogeneous_redundancy_without_pin")
+		return
+	}
+
+	var acceptedKey *string
+	switch mode {
+	case leaf.ComparisonNumericTolerance:
+		// NUMERIC needs the winner's inline bytes (flattenOutput needs raw bytes) AND an hr_class
+		// pin (bit-for-bit numeric reproduction is only expected within one class).
+		if len(winner.OutputData) == 0 || pin == "" {
+			e.recordAuditIneligible(leafID, wu.ID, "numeric_unpinned_or_ref_only")
+			return
+		}
+	case leaf.ComparisonExact:
+		key, err := comparisonKey(winner, proj.ValidationConfig.IgnoreFields)
+		if err != nil {
+			e.logger.Warn("result-audit sampling: failed to compute accepted comparison key; skipping",
+				"work_unit_id", wu.ID, "result_id", winner.ID, "error", err)
+			e.recordAuditIneligible(leafID, wu.ID, "comparison_key_error")
+			return
+		}
+		// canon-empty keys embed the winner's result UUID and are unadjudicable against runner bytes
+		// (F-M2).
+		if strings.HasPrefix(key, "canon-empty:") {
+			e.recordAuditIneligible(leafID, wu.ID, "canon_empty_key")
+			return
+		}
+		k := key
+		acceptedKey = &k
+	default:
+		e.logger.Warn("result-audit sampling: unknown comparison mode; skipping",
+			"work_unit_id", wu.ID, "comparison_mode", mode)
+		e.recordAuditIneligible(leafID, wu.ID, "unknown_comparison_mode")
+		return
+	}
+
+	// The draw is LAST: eligibility is deterministic; only eligible units consume the sampling
+	// probability, and the RNG is fail-safe (samples on rand error).
+	if !audit.ShouldSample(rate) {
+		return
+	}
+
+	snap := audit.ComparisonSnapshot{
+		ComparisonMode: mode,
+		IgnoreFields:   proj.ValidationConfig.IgnoreFields,
+		CompareFields:  proj.ValidationConfig.CompareFields,
+	}
+	if mode == leaf.ComparisonNumericTolerance && proj.ValidationConfig.NumericTolerance != nil {
+		snap.NumericTolerance = *proj.ValidationConfig.NumericTolerance
+	}
+
+	var requiredHRClass *string
+	if pin != "" {
+		p := pin
+		requiredHRClass = &p // set for EVERY pinned unit regardless of mode (F-H2)
+	}
+
+	a := &audit.Audit{
+		WorkUnitID:            wu.ID,
+		LeafID:                wu.LeafID,
+		AcceptedResultID:      winner.ID,
+		AcceptedComparisonKey: acceptedKey, // EXACT only; nil for NUMERIC (value-level verdict)
+		ComparisonSnapshot:    snap,
+		RequiredHRClass:       requiredHRClass,
+		ArtifactVersionID:     winner.ArtifactVersionID,
+		ExecutionSnapshot:     execSnap,
+	}
+	if err := e.auditEnq.Enqueue(ctx, a); err != nil {
+		// A unique-violation (one open audit per unit already) or any other error is best-effort:
+		// WARN and drop, never fail validation.
+		e.logger.Warn("result-audit sampling: failed to enqueue audit job",
+			"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "error", err)
+		return
+	}
+	e.logger.Info("result audit sampled",
+		"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "accepted_result_id", winner.ID, "rate", rate)
+}
+
+// recordAuditIneligible logs a Debug skip and bumps the per-leaf validated-but-ineligible counter
+// the fault-monitor probe reads. Lazily initializes the map under the lock.
+func (e *Engine) recordAuditIneligible(leafID string, wuID types.ID, reason string) {
+	e.logger.Debug("result-audit sampling: unit ineligible",
+		"leaf_id", leafID, "work_unit_id", wuID, "reason", reason)
+	e.auditIneligibleMu.Lock()
+	if e.auditIneligible == nil {
+		e.auditIneligible = make(map[string]int64)
+	}
+	e.auditIneligible[leafID]++
+	e.auditIneligibleMu.Unlock()
+}
+
+// AuditIneligibleCounts returns a snapshot copy of the per-leaf count of validated-but-ineligible
+// units the sampling hook has skipped (network access, CUSTOM, unpinned/ref-only NUMERIC,
+// canon-empty, HR-without-pin, ...). The fault-monitor probe reads it to WARN when a leaf's
+// ineligible share is anomalous (F-H4/F-M5: owner-steerable never-audited lanes made
+// operator-visible in v1). Keyed by leaf id string; empty when nothing has been skipped.
+func (e *Engine) AuditIneligibleCounts() map[string]int64 {
+	e.auditIneligibleMu.Lock()
+	defer e.auditIneligibleMu.Unlock()
+	out := make(map[string]int64, len(e.auditIneligible))
+	for k, v := range e.auditIneligible {
+		out[k] = v
+	}
+	return out
 }
 
 // rejectionWarnRate is the decayed rejection rate above which the per-adjudication

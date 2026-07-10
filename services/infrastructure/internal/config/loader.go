@@ -504,6 +504,20 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.EmissionAnomalyFactor = f
 	}
+	if v := os.Getenv("LETTUCE_HEAD_RESULT_AUDIT_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_RESULT_AUDIT_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.ResultAuditEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_RESULT_AUDIT_RATE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_RESULT_AUDIT_RATE must be a number: %w", err)
+		}
+		cfg.Head.ResultAuditRate = f
+	}
 	return nil
 }
 

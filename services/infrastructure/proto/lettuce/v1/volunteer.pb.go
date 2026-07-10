@@ -2561,6 +2561,277 @@ func (x *WeeklyContribution) GetCredit() float64 {
 	return 0
 }
 
+type ClaimAuditJobRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Hardware-class inputs (os / cpu_arch / cpu_vendor); the head composes the
+	// class string server-side and matches it against each job's requirement.
+	Hardware      *HardwareCapabilities `protobuf:"bytes,1,opt,name=hardware,proto3" json:"hardware,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClaimAuditJobRequest) Reset() {
+	*x = ClaimAuditJobRequest{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClaimAuditJobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClaimAuditJobRequest) ProtoMessage() {}
+
+func (x *ClaimAuditJobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClaimAuditJobRequest.ProtoReflect.Descriptor instead.
+func (*ClaimAuditJobRequest) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *ClaimAuditJobRequest) GetHardware() *HardwareCapabilities {
+	if x != nil {
+		return x.Hardware
+	}
+	return nil
+}
+
+type ClaimAuditJobResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Unset when no job is claimable right now.
+	Job           *AuditJob `protobuf:"bytes,1,opt,name=job,proto3" json:"job,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClaimAuditJobResponse) Reset() {
+	*x = ClaimAuditJobResponse{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClaimAuditJobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClaimAuditJobResponse) ProtoMessage() {}
+
+func (x *ClaimAuditJobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClaimAuditJobResponse.ProtoReflect.Descriptor instead.
+func (*ClaimAuditJobResponse) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *ClaimAuditJobResponse) GetJob() *AuditJob {
+	if x != nil {
+		return x.Job
+	}
+	return nil
+}
+
+type AuditJob struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	AuditId string                 `protobuf:"bytes,1,opt,name=audit_id,json=auditId,proto3" json:"audit_id,omitempty"`
+	// The unit's execution payload, rebuilt from the sampling-time snapshot, with
+	// checkpoint fields cleared (audits always re-execute from scratch) and
+	// reserved_until_unix set to the audit lease.
+	Assignment       *WorkUnitAssignment `protobuf:"bytes,2,opt,name=assignment,proto3" json:"assignment,omitempty"`
+	LeaseExpiresUnix int64               `protobuf:"varint,3,opt,name=lease_expires_unix,json=leaseExpiresUnix,proto3" json:"lease_expires_unix,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *AuditJob) Reset() {
+	*x = AuditJob{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuditJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuditJob) ProtoMessage() {}
+
+func (x *AuditJob) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuditJob.ProtoReflect.Descriptor instead.
+func (*AuditJob) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *AuditJob) GetAuditId() string {
+	if x != nil {
+		return x.AuditId
+	}
+	return ""
+}
+
+func (x *AuditJob) GetAssignment() *WorkUnitAssignment {
+	if x != nil {
+		return x.Assignment
+	}
+	return nil
+}
+
+func (x *AuditJob) GetLeaseExpiresUnix() int64 {
+	if x != nil {
+		return x.LeaseExpiresUnix
+	}
+	return 0
+}
+
+type SubmitAuditResultRequest struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	AuditId string                 `protobuf:"bytes,1,opt,name=audit_id,json=auditId,proto3" json:"audit_id,omitempty"`
+	// Raw output bytes produced by the re-execution. The head computes the checksum
+	// and the verdict; there is deliberately no checksum or verdict field.
+	OutputData []byte `protobuf:"bytes,2,opt,name=output_data,json=outputData,proto3" json:"output_data,omitempty"`
+	// Set instead of output_data when the runner could not execute the job
+	// (artifact fetch failure, runtime error). The job is released for another
+	// attempt until the attempt budget is exhausted.
+	ExecutionFailed bool   `protobuf:"varint,3,opt,name=execution_failed,json=executionFailed,proto3" json:"execution_failed,omitempty"`
+	ErrorMessage    string `protobuf:"bytes,4,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *SubmitAuditResultRequest) Reset() {
+	*x = SubmitAuditResultRequest{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitAuditResultRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitAuditResultRequest) ProtoMessage() {}
+
+func (x *SubmitAuditResultRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitAuditResultRequest.ProtoReflect.Descriptor instead.
+func (*SubmitAuditResultRequest) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *SubmitAuditResultRequest) GetAuditId() string {
+	if x != nil {
+		return x.AuditId
+	}
+	return ""
+}
+
+func (x *SubmitAuditResultRequest) GetOutputData() []byte {
+	if x != nil {
+		return x.OutputData
+	}
+	return nil
+}
+
+func (x *SubmitAuditResultRequest) GetExecutionFailed() bool {
+	if x != nil {
+		return x.ExecutionFailed
+	}
+	return false
+}
+
+func (x *SubmitAuditResultRequest) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+type SubmitAuditResultResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Accepted      bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitAuditResultResponse) Reset() {
+	*x = SubmitAuditResultResponse{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitAuditResultResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitAuditResultResponse) ProtoMessage() {}
+
+func (x *SubmitAuditResultResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitAuditResultResponse.ProtoReflect.Descriptor instead.
+func (*SubmitAuditResultResponse) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *SubmitAuditResultResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
 var File_proto_lettuce_v1_volunteer_proto protoreflect.FileDescriptor
 
 const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
@@ -2799,7 +3070,25 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x12WeeklyContribution\x12\x1d\n" +
 	"\n" +
 	"week_start\x18\x01 \x01(\tR\tweekStart\x12\x16\n" +
-	"\x06credit\x18\x02 \x01(\x01R\x06credit2\xd0\n" +
+	"\x06credit\x18\x02 \x01(\x01R\x06credit\"^\n" +
+	"\x14ClaimAuditJobRequest\x12F\n" +
+	"\bhardware\x18\x01 \x01(\v2*.lettuce.volunteer.v1.HardwareCapabilitiesR\bhardware\"I\n" +
+	"\x15ClaimAuditJobResponse\x120\n" +
+	"\x03job\x18\x01 \x01(\v2\x1e.lettuce.volunteer.v1.AuditJobR\x03job\"\x9d\x01\n" +
+	"\bAuditJob\x12\x19\n" +
+	"\baudit_id\x18\x01 \x01(\tR\aauditId\x12H\n" +
+	"\n" +
+	"assignment\x18\x02 \x01(\v2(.lettuce.volunteer.v1.WorkUnitAssignmentR\n" +
+	"assignment\x12,\n" +
+	"\x12lease_expires_unix\x18\x03 \x01(\x03R\x10leaseExpiresUnix\"\xa6\x01\n" +
+	"\x18SubmitAuditResultRequest\x12\x19\n" +
+	"\baudit_id\x18\x01 \x01(\tR\aauditId\x12\x1f\n" +
+	"\voutput_data\x18\x02 \x01(\fR\n" +
+	"outputData\x12)\n" +
+	"\x10execution_failed\x18\x03 \x01(\bR\x0fexecutionFailed\x12#\n" +
+	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\"7\n" +
+	"\x19SubmitAuditResultResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted2\xd0\n" +
 	"\n" +
 	"\x10VolunteerService\x12n\n" +
 	"\x0fGetServerStatus\x12,.lettuce.volunteer.v1.GetServerStatusRequest\x1a-.lettuce.volunteer.v1.GetServerStatusResponse\x12t\n" +
@@ -2813,7 +3102,10 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0eSaveCheckpoint\x12+.lettuce.volunteer.v1.SaveCheckpointRequest\x1a,.lettuce.volunteer.v1.SaveCheckpointResponse\x12h\n" +
 	"\rGetCheckpoint\x12*.lettuce.volunteer.v1.GetCheckpointRequest\x1a+.lettuce.volunteer.v1.GetCheckpointResponse\x12n\n" +
 	"\x0fAbandonWorkUnit\x12,.lettuce.volunteer.v1.AbandonWorkUnitRequest\x1a-.lettuce.volunteer.v1.AbandonWorkUnitResponse\x12t\n" +
-	"\x11GetMyContribution\x12..lettuce.volunteer.v1.GetMyContributionRequest\x1a/.lettuce.volunteer.v1.GetMyContributionResponseBFZDgithub.com/lettuce-compute/infrastructure/proto/lettuce/v1;lettucev1b\x06proto3"
+	"\x11GetMyContribution\x12..lettuce.volunteer.v1.GetMyContributionRequest\x1a/.lettuce.volunteer.v1.GetMyContributionResponse2\xe4\x01\n" +
+	"\fAuditService\x12c\n" +
+	"\bClaimJob\x12*.lettuce.volunteer.v1.ClaimAuditJobRequest\x1a+.lettuce.volunteer.v1.ClaimAuditJobResponse\x12o\n" +
+	"\fSubmitResult\x12..lettuce.volunteer.v1.SubmitAuditResultRequest\x1a/.lettuce.volunteer.v1.SubmitAuditResultResponseBFZDgithub.com/lettuce-compute/infrastructure/proto/lettuce/v1;lettucev1b\x06proto3"
 
 var (
 	file_proto_lettuce_v1_volunteer_proto_rawDescOnce sync.Once
@@ -2827,7 +3119,7 @@ func file_proto_lettuce_v1_volunteer_proto_rawDescGZIP() []byte {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescData
 }
 
-var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
+var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 43)
 var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*GetServerStatusRequest)(nil),           // 0: lettuce.volunteer.v1.GetServerStatusRequest
 	(*GetServerStatusResponse)(nil),          // 1: lettuce.volunteer.v1.GetServerStatusResponse
@@ -2863,57 +3155,69 @@ var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*ResourceTypeContribution)(nil),         // 31: lettuce.volunteer.v1.ResourceTypeContribution
 	(*DailyContribution)(nil),                // 32: lettuce.volunteer.v1.DailyContribution
 	(*WeeklyContribution)(nil),               // 33: lettuce.volunteer.v1.WeeklyContribution
-	nil,                                      // 34: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
-	nil,                                      // 35: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	nil,                                      // 36: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	nil,                                      // 37: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	(*ClaimAuditJobRequest)(nil),             // 34: lettuce.volunteer.v1.ClaimAuditJobRequest
+	(*ClaimAuditJobResponse)(nil),            // 35: lettuce.volunteer.v1.ClaimAuditJobResponse
+	(*AuditJob)(nil),                         // 36: lettuce.volunteer.v1.AuditJob
+	(*SubmitAuditResultRequest)(nil),         // 37: lettuce.volunteer.v1.SubmitAuditResultRequest
+	(*SubmitAuditResultResponse)(nil),        // 38: lettuce.volunteer.v1.SubmitAuditResultResponse
+	nil,                                      // 39: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	nil,                                      // 40: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	nil,                                      // 41: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	nil,                                      // 42: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 }
 var file_proto_lettuce_v1_volunteer_proto_depIdxs = []int32{
 	19, // 0: lettuce.volunteer.v1.RegisterVolunteerRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	19, // 1: lettuce.volunteer.v1.RequestWorkUnitRequest.current_available:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	8,  // 2: lettuce.volunteer.v1.RequestWorkUnitResponse.assignments:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	34, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	39, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
 	22, // 4: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
 	21, // 5: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
 	20, // 6: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
-	35, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	36, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	40, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	41, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
 	25, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
-	37, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	42, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 	22, // 11: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
 	30, // 12: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
 	31, // 13: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
 	32, // 14: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
 	33, // 15: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
-	0,  // 16: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
-	2,  // 17: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
-	4,  // 18: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
-	6,  // 19: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
-	9,  // 20: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
-	11, // 21: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
-	13, // 22: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
-	23, // 23: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
-	15, // 24: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
-	17, // 25: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
-	26, // 26: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
-	28, // 27: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
-	1,  // 28: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
-	3,  // 29: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
-	5,  // 30: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
-	7,  // 31: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
-	10, // 32: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
-	12, // 33: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
-	14, // 34: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
-	24, // 35: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
-	16, // 36: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
-	18, // 37: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
-	27, // 38: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
-	29, // 39: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
-	28, // [28:40] is the sub-list for method output_type
-	16, // [16:28] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	19, // 16: lettuce.volunteer.v1.ClaimAuditJobRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
+	36, // 17: lettuce.volunteer.v1.ClaimAuditJobResponse.job:type_name -> lettuce.volunteer.v1.AuditJob
+	8,  // 18: lettuce.volunteer.v1.AuditJob.assignment:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
+	0,  // 19: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
+	2,  // 20: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
+	4,  // 21: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
+	6,  // 22: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
+	9,  // 23: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
+	11, // 24: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
+	13, // 25: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:input_type -> lettuce.volunteer.v1.GetWorkUnitStatusRequest
+	23, // 26: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
+	15, // 27: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
+	17, // 28: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
+	26, // 29: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
+	28, // 30: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
+	34, // 31: lettuce.volunteer.v1.AuditService.ClaimJob:input_type -> lettuce.volunteer.v1.ClaimAuditJobRequest
+	37, // 32: lettuce.volunteer.v1.AuditService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitAuditResultRequest
+	1,  // 33: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
+	3,  // 34: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
+	5,  // 35: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
+	7,  // 36: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
+	10, // 37: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
+	12, // 38: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
+	14, // 39: lettuce.volunteer.v1.VolunteerService.GetWorkUnitStatus:output_type -> lettuce.volunteer.v1.GetWorkUnitStatusResponse
+	24, // 40: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
+	16, // 41: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
+	18, // 42: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
+	27, // 43: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
+	29, // 44: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
+	35, // 45: lettuce.volunteer.v1.AuditService.ClaimJob:output_type -> lettuce.volunteer.v1.ClaimAuditJobResponse
+	38, // 46: lettuce.volunteer.v1.AuditService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitAuditResultResponse
+	33, // [33:47] is the sub-list for method output_type
+	19, // [19:33] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_proto_lettuce_v1_volunteer_proto_init() }
@@ -2927,9 +3231,9 @@ func file_proto_lettuce_v1_volunteer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_lettuce_v1_volunteer_proto_rawDesc), len(file_proto_lettuce_v1_volunteer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   38,
+			NumMessages:   43,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_proto_lettuce_v1_volunteer_proto_goTypes,
 		DependencyIndexes: file_proto_lettuce_v1_volunteer_proto_depIdxs,

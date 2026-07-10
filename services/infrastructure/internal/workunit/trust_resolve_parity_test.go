@@ -55,11 +55,16 @@ func TestTrustResolveSQL_MatchesResolveTrust(t *testing.T) {
 		WHERE wu.id = $4`
 
 	gates := []bool{false, true}
-	leafKs := []int{0, 1, 2, 5}    // 0 = no per-leaf override
-	leafFloors := []int{0, 10, 50} // 0 = no per-leaf override
-	defaultKs := []int{1, 3}       // head default K
-	defaultFloors := []int{25, 50} // head default floor
-	quorums := []int{1, 2, 3}      // effQuorumSQL == wu.min_quorum here
+	leafKs := []int{0, 1, 2, 5} // 0 = no per-leaf override
+	// leafFloors spans the BG-01a floor regions: -3 (negative, GREATEST/max must resolve to the
+	// head default), 0 (no override), 1 and 10 (BELOW-default overrides the tighten-only rule must
+	// raise to the head default — F-H5), and 50 (an ABOVE-default override that is honored).
+	leafFloors := []int{-3, 0, 1, 10, 50}
+	defaultKs := []int{1, 3} // head default K
+	// defaultFloors includes 0 to exercise the unconditional >= 1 clamp: with leaf floor <= 0 and a
+	// head default of 0, BOTH sides must resolve floor 1, not 0.
+	defaultFloors := []int{0, 25, 50}
+	quorums := []int{1, 2, 3} // effQuorumSQL == wu.min_quorum here
 
 	for _, gate := range gates {
 		for _, leafK := range leafKs {

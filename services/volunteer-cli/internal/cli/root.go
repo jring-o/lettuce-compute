@@ -83,6 +83,7 @@ func newRootCmd() *cobra.Command {
 		newProveIdentityCmd(),
 		newBindDIDCmd(),
 		newDoctorCmd(),
+		newAuditRunnerCmd(),
 	)
 
 	return root

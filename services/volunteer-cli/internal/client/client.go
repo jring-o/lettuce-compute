@@ -20,6 +20,7 @@ import (
 type Client struct {
 	conn           *grpc.ClientConn
 	svc            lettucev1.VolunteerServiceClient
+	auditSvc       lettucev1.AuditServiceClient
 	logger         *slog.Logger
 	requestTimeout time.Duration
 }
@@ -92,8 +93,12 @@ func New(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 	}
 
 	return &Client{
-		conn:           conn,
-		svc:            lettucev1.NewVolunteerServiceClient(conn),
+		conn: conn,
+		svc:  lettucev1.NewVolunteerServiceClient(conn),
+		// AuditService shares the same connection and interceptor chain, so the
+		// runner RPCs are Ed25519-signed with nonce replay protection for free
+		// (the head derives the caller identity from the signature).
+		auditSvc:       lettucev1.NewAuditServiceClient(conn),
 		logger:         logger,
 		requestTimeout: cfg.RequestTimeout,
 	}, nil

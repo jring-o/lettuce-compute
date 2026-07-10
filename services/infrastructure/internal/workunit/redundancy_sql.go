@@ -79,18 +79,24 @@ var (
 // pre-existing redundancy headroom check when the gate is off — provably inert, exactly as
 // ResolveTrust returns K == 0 with the gate disabled.
 
-// effTrustFloorSQL: the resolved trust floor W. Mirrors ResolveTrust's floor branch — the
-// leaf override validation_config.trust_floor when > 0, else the head-default floor
-// (floorParam). Resolved REGARDLESS of the gate switch, exactly as ResolveTrust resolves
-// the floor even when disabled (accrual needs the real floor before enforcement is ever
-// turned on, so a subject can earn a score first). floorParam is the $N placeholder
-// carrying TrustDispatchPolicy.DefaultFloor.
+// effTrustFloorSQL: the resolved trust floor W. Mirrors ResolveTrust's floor branch
+// (BG-01a): floor = GREATEST(1, GREATEST(leaf override, head default)) — the TIGHTEN-ONLY
+// leaf override (F-H5: a leaf may only RAISE the floor, so the effective value is the max of
+// its trust_floor and the head default, never the leaf's value outright) plus the
+// unconditional >= 1 clamp (a floor of 0 would make every score-0 account a trusted witness
+// for accrual). The old "leaf when > 0 else default" CASE collapses into GREATEST because
+// both branches are now max'd: COALESCE(..., 0) supplies a stored leaf floor (0 when absent),
+// and GREATEST with the head default handles negative stored values IDENTICALLY to the Go
+// max() (validation pins trust_floor >= 0 at leaf create, but this SQL stays safe for any
+// stored value). Resolved REGARDLESS of the gate switch, exactly as ResolveTrust resolves the
+// floor even when disabled (accrual needs the real floor before enforcement is ever turned on,
+// so a subject can earn a score first). floorParam is the $N placeholder carrying
+// TrustDispatchPolicy.DefaultFloor. The golden parity test pins this to ResolveTrust in
+// lockstep — a change to EITHER side that drifts fails there.
 func effTrustFloorSQL(l, floorParam string) string {
-	return `(CASE
-		WHEN COALESCE((` + l + `.validation_config->>'trust_floor')::int, 0) > 0
-			THEN (` + l + `.validation_config->>'trust_floor')::int
-		ELSE ` + floorParam + `::int
-	END)`
+	return `GREATEST(1, GREATEST(
+		COALESCE((` + l + `.validation_config->>'trust_floor')::int, 0),
+		` + floorParam + `::int))`
 }
 
 // effTrustKSQL: the resolved trusted-corroborator requirement K. Mirrors ResolveTrust's K

@@ -18,6 +18,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/atproto"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
+	"github.com/lettuce-compute/infrastructure/internal/audit"
 	"github.com/lettuce-compute/infrastructure/internal/bootstrap"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/config"
@@ -202,13 +203,33 @@ func main() {
 			"bench_minutes", cfg.Head.EffectiveStandingBenchMinutes())
 	}
 
+	// Result audits (design §7, observe-only phase): the trusted-runner registry and the
+	// audit job store. Constructed unconditionally — the admin registry surface and the
+	// AuditService must work before the sampling knob is ever flipped (an empty registry
+	// fails every claim closed), and the registry also gates the trust-accrual witness
+	// upgrade below.
+	auditRunnersRepo := audit.NewPgxRunnersRepository(pool)
+	auditsRepo := audit.NewPgxAuditsRepository(pool)
+
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
 	// WithEmissionCap wires the per-account rolling-24h credit cap (0 = unlimited, the
 	// default): an over-cap grant is suppressed at the choke point — never a validation
 	// failure — bounding the daily burst any single account can mint.
+	// WithTrustedRunners gates the D9 accrual-witness upgrade on REGISTRY STATE (empty
+	// registry = today's rule exactly), so wiring it unconditionally is the design: the
+	// operator registering a runner IS the opt-in. WithResultAudits arms the post-hoc
+	// sampling hook only when LETTUCE_HEAD_RESULT_AUDIT_ENABLED is set; leafRepo doubles
+	// as the artifact-version resolver so a sampled audit pins the exec config the
+	// winner actually ran.
 	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy).
 		WithStandingBackpressure(standingRecorder).
-		WithEmissionCap(cfg.Head.MaxDailyCreditPerAccount)
+		WithEmissionCap(cfg.Head.MaxDailyCreditPerAccount).
+		WithTrustedRunners(auditRunnersRepo).
+		WithResultAudits(auditsRepo, cfg.Head.ResultAuditEnabled, cfg.Head.EffectiveResultAuditRate(), leafRepo)
+	if cfg.Head.ResultAuditEnabled {
+		slog.Info("result audits enabled",
+			"head_rate", cfg.Head.EffectiveResultAuditRate())
+	}
 
 	// The single transitioner (TODO #50): the sole decider of work-unit redundancy state.
 	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
@@ -369,6 +390,14 @@ func main() {
 	server.SetHostCapPolicy(volunteerSvc, server.HostCapFromHeadConfig(&cfg.Head))
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
+	// AuditService (design §7.3): the trusted-runner claim/submit surface. Registered
+	// unconditionally — the interceptor authenticates it by default (its methods are
+	// deliberately NOT in grpcPublicMethods) and an empty registry fails every claim
+	// closed with PermissionDenied, so a head with audits off exposes nothing. The
+	// adjudicator is the head-side verdict function; a runner only ever returns bytes.
+	auditSvc := server.NewAuditService(auditRunnersRepo, auditsRepo, wuRepo, leafRepo, volunteerRepo, validation.AdjudicateAudit, resultRepo, logger)
+	lettucev1.RegisterAuditServiceServer(grpcServer, auditSvc)
+
 	// Start HTTP server.
 	go func() {
 		slog.Info("HTTP server starting", "addr", cfg.Server.HTTPAddr)
@@ -445,6 +474,20 @@ func main() {
 		// is on, so the sweep stays zero-cost by default.
 		faultMonitor = faultMonitor.WithStandingPopulation(standing.NewPgxRepository(pool))
 	}
+	if cfg.Head.ResultAuditEnabled {
+		// Operator visibility for the audit net (design §7.4): throttled WARNs on new
+		// MISMATCH verdicts, on queue decay (EXPIRED growth / claim starvation), and on
+		// the owner-selectable ineligible lanes. Wired only when audits are on; the
+		// closure composes the DB stats with the engine's in-memory ineligible counter.
+		faultMonitor = faultMonitor.WithResultAuditStats(func(ctx context.Context) (audit.Stats, error) {
+			s, err := auditsRepo.Stats(ctx)
+			if err != nil {
+				return audit.Stats{}, err
+			}
+			s.IneligibleByLeaf = validationEngine.AuditIneligibleCounts()
+			return s, nil
+		})
+	}
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)
@@ -485,6 +528,13 @@ func main() {
 		// counter sweep: challenge ISSUANCE works even while enforcement is off
 		// (probe-free clients), so expired rows can accumulate regardless of the knob.
 		go admission.NewChallengeSweeper(pool, logger).Start(leaderCtx)
+		// Audit reclaim sweep (design §7.5) — UNCONDITIONAL like the challenge sweep,
+		// deliberately NOT gated on the audit knob: open audit rows can outlive an
+		// enabled period (operator samples, then flips the knob off), and while OPEN
+		// they pin their artifact versions against the GC prune. The sweep expires
+		// them within the queue lifetime regardless, releasing the pins; on a head
+		// that never enabled audits it is two no-op UPDATEs a minute on the leader.
+		go audit.NewReclaimWorker(auditsRepo, logger).Start(leaderCtx)
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

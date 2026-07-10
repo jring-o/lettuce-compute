@@ -619,3 +619,183 @@ var VolunteerService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "proto/lettuce/v1/volunteer.proto",
 }
+
+const (
+	AuditService_ClaimJob_FullMethodName     = "/lettuce.volunteer.v1.AuditService/ClaimJob"
+	AuditService_SubmitResult_FullMethodName = "/lettuce.volunteer.v1.AuditService/SubmitResult"
+)
+
+// AuditServiceClient is the client API for AuditService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// --- Result audits: post-hoc trusted re-execution (observe-only phase) ---
+//
+// A separate service from VolunteerService: audit runners are a distinct principal
+// class (operator-vetted accounts in the head's trusted_runners registry), and the
+// runner surface evolves independently of the volunteer contract. Both RPCs are
+// authenticated by the standard per-request Ed25519 signature; the caller's identity
+// is derived from the VERIFIED signature (never from a request field), then required
+// to be an ACTIVE registered runner. The head computes every verdict from the
+// returned bytes — a runner never self-adjudicates, and the claim payload never
+// reveals the accepted output it will be compared against.
+type AuditServiceClient interface {
+	// Claim the next queued audit job this runner's hardware class is eligible for.
+	// Returns an empty response (no job field) when nothing is claimable. The
+	// assignment mirrors what the original volunteer received, rebuilt from the
+	// execution snapshot pinned when the unit was sampled; reserved_until_unix
+	// carries the audit lease.
+	ClaimJob(ctx context.Context, in *ClaimAuditJobRequest, opts ...grpc.CallOption) (*ClaimAuditJobResponse, error)
+	// Submit the re-executed output bytes (or an execution failure) for a claimed
+	// audit job. The head hashes and adjudicates server-side. Submitting a job that
+	// is no longer CLAIMED by this runner fails with FailedPrecondition — treat that
+	// as job-done and claim the next.
+	SubmitResult(ctx context.Context, in *SubmitAuditResultRequest, opts ...grpc.CallOption) (*SubmitAuditResultResponse, error)
+}
+
+type auditServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewAuditServiceClient(cc grpc.ClientConnInterface) AuditServiceClient {
+	return &auditServiceClient{cc}
+}
+
+func (c *auditServiceClient) ClaimJob(ctx context.Context, in *ClaimAuditJobRequest, opts ...grpc.CallOption) (*ClaimAuditJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClaimAuditJobResponse)
+	err := c.cc.Invoke(ctx, AuditService_ClaimJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *auditServiceClient) SubmitResult(ctx context.Context, in *SubmitAuditResultRequest, opts ...grpc.CallOption) (*SubmitAuditResultResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubmitAuditResultResponse)
+	err := c.cc.Invoke(ctx, AuditService_SubmitResult_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AuditServiceServer is the server API for AuditService service.
+// All implementations must embed UnimplementedAuditServiceServer
+// for forward compatibility.
+//
+// --- Result audits: post-hoc trusted re-execution (observe-only phase) ---
+//
+// A separate service from VolunteerService: audit runners are a distinct principal
+// class (operator-vetted accounts in the head's trusted_runners registry), and the
+// runner surface evolves independently of the volunteer contract. Both RPCs are
+// authenticated by the standard per-request Ed25519 signature; the caller's identity
+// is derived from the VERIFIED signature (never from a request field), then required
+// to be an ACTIVE registered runner. The head computes every verdict from the
+// returned bytes — a runner never self-adjudicates, and the claim payload never
+// reveals the accepted output it will be compared against.
+type AuditServiceServer interface {
+	// Claim the next queued audit job this runner's hardware class is eligible for.
+	// Returns an empty response (no job field) when nothing is claimable. The
+	// assignment mirrors what the original volunteer received, rebuilt from the
+	// execution snapshot pinned when the unit was sampled; reserved_until_unix
+	// carries the audit lease.
+	ClaimJob(context.Context, *ClaimAuditJobRequest) (*ClaimAuditJobResponse, error)
+	// Submit the re-executed output bytes (or an execution failure) for a claimed
+	// audit job. The head hashes and adjudicates server-side. Submitting a job that
+	// is no longer CLAIMED by this runner fails with FailedPrecondition — treat that
+	// as job-done and claim the next.
+	SubmitResult(context.Context, *SubmitAuditResultRequest) (*SubmitAuditResultResponse, error)
+	mustEmbedUnimplementedAuditServiceServer()
+}
+
+// UnimplementedAuditServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedAuditServiceServer struct{}
+
+func (UnimplementedAuditServiceServer) ClaimJob(context.Context, *ClaimAuditJobRequest) (*ClaimAuditJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClaimJob not implemented")
+}
+func (UnimplementedAuditServiceServer) SubmitResult(context.Context, *SubmitAuditResultRequest) (*SubmitAuditResultResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitResult not implemented")
+}
+func (UnimplementedAuditServiceServer) mustEmbedUnimplementedAuditServiceServer() {}
+func (UnimplementedAuditServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeAuditServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AuditServiceServer will
+// result in compilation errors.
+type UnsafeAuditServiceServer interface {
+	mustEmbedUnimplementedAuditServiceServer()
+}
+
+func RegisterAuditServiceServer(s grpc.ServiceRegistrar, srv AuditServiceServer) {
+	// If the following call panics, it indicates UnimplementedAuditServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&AuditService_ServiceDesc, srv)
+}
+
+func _AuditService_ClaimJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimAuditJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuditServiceServer).ClaimJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AuditService_ClaimJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuditServiceServer).ClaimJob(ctx, req.(*ClaimAuditJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AuditService_SubmitResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitAuditResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuditServiceServer).SubmitResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AuditService_SubmitResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuditServiceServer).SubmitResult(ctx, req.(*SubmitAuditResultRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AuditService_ServiceDesc is the grpc.ServiceDesc for AuditService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AuditService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "lettuce.volunteer.v1.AuditService",
+	HandlerType: (*AuditServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ClaimJob",
+			Handler:    _AuditService_ClaimJob_Handler,
+		},
+		{
+			MethodName: "SubmitResult",
+			Handler:    _AuditService_SubmitResult_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/lettuce/v1/volunteer.proto",
+}

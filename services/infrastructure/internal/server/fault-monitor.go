@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/audit"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
@@ -43,6 +46,23 @@ const standingPopulationWarnEvery = 10 * time.Minute
 // halt is off), but the WARN line repeats at most this often — an emission burst is an
 // operator-timescale event, so re-warning every 30s scan would only be noise.
 const emissionAnomalyWarnEvery = 10 * time.Minute
+
+// resultAuditWarnEvery throttles the result-audit WARNs (see warnResultAudits): the probe
+// is one cheap aggregate query per scan (and not at all when audits are off), but new
+// MISMATCH verdicts and a starving claim queue are operator-timescale events.
+const resultAuditWarnEvery = 10 * time.Minute
+
+// resultAuditQueueAgeWarn is the oldest-QUEUED age past which the claim queue counts as
+// starved even if nothing has expired yet — e.g. every queued job requires a hardware
+// class no registered runner presents. Well under the queue lifetime (72h) so the WARN
+// fires before jobs start expiring silently.
+const resultAuditQueueAgeWarn = 24 * time.Hour
+
+// resultAuditIneligibleWarnEvery throttles the ineligible-lane WARN: a leaf sitting in a
+// never-audited lane (network access, CUSTOM, unpinned NUMERIC) skips EVERY validated
+// unit, so a tight throttle would re-log constantly for a single legitimate leaf. Six
+// hours keeps the lane operator-visible without drowning the log.
+const resultAuditIneligibleWarnEvery = 6 * time.Hour
 
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
@@ -86,6 +106,21 @@ type FaultMonitor struct {
 	// the emissionAnomalyWarnEvery throttle clock. Touched only by the single Start loop
 	// (ScanOnce is not concurrent with itself), so no lock — same as lastTrustStarvedWarn.
 	lastEmissionAnomalyWarn time.Time
+	// auditStats is the OPTIONAL result-audit health probe behind the observe-only audit
+	// WARNs (warnResultAudits). nil (the default) = audits are off, sweep skipped at zero
+	// cost; the orchestrator wires it via WithResultAuditStats only when
+	// LETTUCE_HEAD_RESULT_AUDIT_ENABLED is set.
+	auditStats func(ctx context.Context) (audit.Stats, error)
+	// Result-audit baselines: lifetime totals observed on the FIRST probe of this
+	// process, so restart never re-pages historical verdicts; deltas above the baseline
+	// are what WARN. Touched only by the single Start loop, so no lock.
+	auditBaselineSet              bool
+	auditMismatchBaseline         int
+	auditExpiredBaseline          int
+	auditIneligibleBaseline       int64
+	lastResultAuditWarn           time.Time
+	lastResultAuditQueueWarn      time.Time
+	lastResultAuditIneligibleWarn time.Time
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -129,6 +164,17 @@ func (m *FaultMonitor) WithStandingPopulation(repo standing.Repository) *FaultMo
 // onto NewFaultMonitor without widening its signature.
 func (m *FaultMonitor) WithEmissionAnomalyCheck(check func(ctx context.Context) (halted bool, today, baseline float64, err error)) *FaultMonitor {
 	m.emissionAnomalyCheck = check
+	return m
+}
+
+// WithResultAuditStats wires the OPTIONAL result-audit health probe that backs the
+// observe-only audit WARNs (warnResultAudits): new MISMATCH verdicts (the whole point of
+// the audit net — findings someone must look at) and a dying queue (EXPIRED growth or a
+// claim-starved backlog, the failure mode where the net silently stops observing). Left
+// unset the sweep is a no-op; the orchestrator wires it only when result audits are
+// enabled. Chainable, same pattern as the other optional probes.
+func (m *FaultMonitor) WithResultAuditStats(stats func(ctx context.Context) (audit.Stats, error)) *FaultMonitor {
+	m.auditStats = stats
 	return m
 }
 
@@ -265,6 +311,11 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	//     no-op when the halt is off (no probe wired); the operator "page" for the freeze.
 	m.warnEmissionAnomaly(ctx)
 
+	// 3c. Result-audit health: WARN on new MISMATCH verdicts (observe-only findings) and
+	//     on a dying audit queue (EXPIRED growth / claim starvation). A no-op when result
+	//     audits are off (no probe wired).
+	m.warnResultAudits(ctx)
+
 	// 4. Automatic standing backpressure population: how many volunteers the machine
 	//    currently holds in PROBATION or BENCHED. A no-op when the machine is off (no
 	//    standing repo wired); a signal that a chunk of the fleet is being neutralized
@@ -334,6 +385,102 @@ func (m *FaultMonitor) warnEmissionAnomaly(ctx context.Context) {
 		"today", today,
 		"baseline", baseline,
 		"remedy", "investigate the credit burst; if legitimate, raise LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR or disable the halt (LETTUCE_HEAD_EMISSION_ANOMALY_HALT_ENABLED=false) and restart the head; the export stays frozen meanwhile")
+}
+
+// warnResultAudits surfaces result-audit health (see WithResultAuditStats). Two
+// independent signals, each with its own throttle clock so a mismatch page never
+// suppresses a starvation page: (1) MISMATCH verdicts recorded since this process's
+// baseline — the audit net found something a human must look at (observe-only: nothing
+// slashes, but silence here would make the whole mechanism decorative); (2) queue decay —
+// EXPIRED growth since baseline, or an oldest-QUEUED age past resultAuditQueueAgeWarn
+// (claim starvation: e.g. every queued job pins a hardware class no registered runner
+// presents). Baselines are the lifetime totals at the FIRST probe, so a head restart
+// never re-pages historical rows. Best-effort like every other sweep here.
+func (m *FaultMonitor) warnResultAudits(ctx context.Context) {
+	if m.auditStats == nil {
+		return
+	}
+	mismatchThrottled := !m.lastResultAuditWarn.IsZero() && time.Since(m.lastResultAuditWarn) < resultAuditWarnEvery
+	queueThrottled := !m.lastResultAuditQueueWarn.IsZero() && time.Since(m.lastResultAuditQueueWarn) < resultAuditWarnEvery
+	ineligibleThrottled := !m.lastResultAuditIneligibleWarn.IsZero() && time.Since(m.lastResultAuditIneligibleWarn) < resultAuditIneligibleWarnEvery
+	if mismatchThrottled && queueThrottled && ineligibleThrottled {
+		return
+	}
+	stats, err := m.auditStats(ctx)
+	if err != nil {
+		m.logger.Error("result-audit sweep failed", "error", err)
+		return
+	}
+	ineligibleTotal := int64(0)
+	for _, n := range stats.IneligibleByLeaf {
+		ineligibleTotal += n
+	}
+	if !m.auditBaselineSet {
+		m.auditBaselineSet = true
+		m.auditMismatchBaseline = stats.MismatchTotal
+		m.auditExpiredBaseline = stats.ExpiredTotal
+		m.auditIneligibleBaseline = ineligibleTotal
+		return
+	}
+	if !mismatchThrottled {
+		if delta := stats.MismatchTotal - m.auditMismatchBaseline; delta > 0 {
+			m.lastResultAuditWarn = time.Now()
+			m.auditMismatchBaseline = stats.MismatchTotal
+			m.logger.Warn("result audits recorded MISMATCH verdicts: a trusted re-execution contradicted an accepted quorum output (observe-only: nothing was slashed or clawed back)",
+				"new_mismatches", delta,
+				"remedy", "review GET /api/v1/admin/audit/results?verdict=MISMATCH; investigate the agreeing accounts and the leaf before enabling any enforcement")
+		}
+	}
+	if !queueThrottled {
+		expiredDelta := stats.ExpiredTotal - m.auditExpiredBaseline
+		starved := stats.OldestQueuedAge > resultAuditQueueAgeWarn
+		if expiredDelta > 0 || starved {
+			m.lastResultAuditQueueWarn = time.Now()
+			m.auditExpiredBaseline = stats.ExpiredTotal
+			m.logger.Warn("result-audit queue is decaying: jobs are expiring unserviced or the oldest queued job has waited too long",
+				"new_expired", expiredDelta,
+				"queued", stats.QueuedCount,
+				"oldest_queued_age", stats.OldestQueuedAge.Truncate(time.Minute).String(),
+				"remedy", "check that at least one registered runner is running `lettuce-volunteer audit-runner`, covers the required hardware classes, and can reach the head")
+		}
+	}
+	if !ineligibleThrottled {
+		if delta := ineligibleTotal - m.auditIneligibleBaseline; delta > 0 {
+			m.lastResultAuditIneligibleWarn = time.Now()
+			m.auditIneligibleBaseline = ineligibleTotal
+			m.logger.Warn("result audits: validated units skipped as audit-ineligible (owner-selectable never-audited lanes: network access, CUSTOM comparison, unpinned or ref-only NUMERIC)",
+				"new_ineligible", delta,
+				"by_leaf", topIneligibleLeaves(stats.IneligibleByLeaf, 3),
+				"note", "these leaves receive no post-hoc re-execution coverage; closing the lanes is the deferred determinism_class work")
+		}
+	}
+}
+
+// topIneligibleLeaves renders the N largest per-leaf ineligible counters as a compact
+// "leaf=count" list for the ineligible-lane WARN.
+func topIneligibleLeaves(byLeaf map[string]int64, n int) []string {
+	type kv struct {
+		leaf  string
+		count int64
+	}
+	all := make([]kv, 0, len(byLeaf))
+	for l, c := range byLeaf {
+		all = append(all, kv{l, c})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].count != all[j].count {
+			return all[i].count > all[j].count
+		}
+		return all[i].leaf < all[j].leaf
+	})
+	if len(all) > n {
+		all = all[:n]
+	}
+	out := make([]string, len(all))
+	for i, e := range all {
+		out[i] = fmt.Sprintf("%s=%d", e.leaf, e.count)
+	}
+	return out
 }
 
 // warnStandingPopulation surfaces the automatic-standing-backpressure population (see

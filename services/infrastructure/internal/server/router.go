@@ -18,6 +18,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/atproto"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
+	"github.com/lettuce-compute/infrastructure/internal/audit"
 	"github.com/lettuce-compute/infrastructure/internal/config"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/custom"
@@ -209,6 +210,7 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 			ctx := trust.WithCaller(r.Context(), trust.Caller{IsAdmin: isAdmin})
 			ctx = standing.WithCaller(ctx, standing.Caller{IsAdmin: isAdmin})
 			ctx = credit.WithCaller(ctx, credit.Caller{IsAdmin: isAdmin})
+			ctx = audit.WithCaller(ctx, audit.Caller{IsAdmin: isAdmin})
 			h(w, r.WithContext(ctx))
 		})
 	}
@@ -290,6 +292,20 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	creditAdminHandler := credit.NewAdminHandler(adjustmentsRepo, creditRepo, deps.Logger)
 	mux.HandleFunc("POST /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleClawback))
 	mux.HandleFunc("GET /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleListAdjustments))
+
+	// Result-audit administration (operator-only — admin API key). The trusted-runner
+	// registry (register / deactivate / list — registry membership is what authorizes the
+	// AuditService claim/submit surface AND upgrades the trust-accrual witness rule) plus
+	// the observe-only verdict read surface. Shares the authAdmin wrapper, which injects
+	// audit.Caller alongside the other admin callers — the handler's own requireAdmin
+	// enforces the 403 (fail-closed without the injection).
+	auditRunnersRepo := audit.NewPgxRunnersRepository(deps.Pool)
+	auditsRepo := audit.NewPgxAuditsRepository(deps.Pool)
+	auditAdminHandler := audit.NewAdminHandler(auditRunnersRepo, auditsRepo, deps.Logger)
+	mux.HandleFunc("POST /api/v1/admin/audit/runners", authAdmin(auditAdminHandler.HandleRegisterRunner))
+	mux.HandleFunc("POST /api/v1/admin/audit/runners/deactivate", authAdmin(auditAdminHandler.HandleDeactivateRunner))
+	mux.HandleFunc("GET /api/v1/admin/audit/runners", authAdmin(auditAdminHandler.HandleListRunners))
+	mux.HandleFunc("GET /api/v1/admin/audit/results", authAdmin(auditAdminHandler.HandleListAudits))
 
 	// --- Deprecated /api/v1/projects aliases (removed in v0.10) ---
 	// Same handlers, same responses — allows existing clients to migrate gradually.

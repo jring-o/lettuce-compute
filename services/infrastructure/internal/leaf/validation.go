@@ -3,6 +3,7 @@ package leaf
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -609,6 +610,14 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 				"spot_check_percentage must be between 1.0 and 20.0",
 				validationDetail{Field: "spot_check_percentage", Reason: "out_of_range"})
 		}
+	}
+
+	// Post-hoc audit-rate override: a fraction in [0, 1]. 0 = no override. The effective
+	// rate is max(this, head default) — raise-only, so no bound below the head rate needs
+	// rejecting here; the overlay makes a low value simply inert.
+	if c.AuditRate < 0 || c.AuditRate > 1 || math.IsNaN(c.AuditRate) || math.IsInf(c.AuditRate, 0) {
+		return apierror.ValidationError("audit_rate must be a fraction between 0 and 1",
+			validationDetail{Field: "audit_rate", Reason: "out_of_range"})
 	}
 
 	// Comparison field-path lists (ignore_fields / compare_fields): each entry must be a
