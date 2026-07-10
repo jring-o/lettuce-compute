@@ -406,3 +406,64 @@ message WeeklyContribution {
   string week_start = 1;      // YYYY-MM-DD (week start, UTC)
   double credit = 2;
 }
+
+// --- Result audits: post-hoc trusted re-execution (observe-only phase) ---
+//
+// A separate service from VolunteerService: audit runners are a distinct principal
+// class (operator-vetted accounts in the head's trusted_runners registry), and the
+// runner surface evolves independently of the volunteer contract. Both RPCs are
+// authenticated by the standard per-request Ed25519 signature; the caller's identity
+// is derived from the VERIFIED signature (never from a request field), then required
+// to be an ACTIVE registered runner. The head computes every verdict from the
+// returned bytes — a runner never self-adjudicates, and the claim payload never
+// reveals the accepted output it will be compared against.
+service AuditService {
+  // Claim the next queued audit job this runner's hardware class is eligible for.
+  // Returns an empty response (no job field) when nothing is claimable. The
+  // assignment mirrors what the original volunteer received, rebuilt from the
+  // execution snapshot pinned when the unit was sampled; reserved_until_unix
+  // carries the audit lease.
+  rpc ClaimJob(ClaimAuditJobRequest) returns (ClaimAuditJobResponse);
+
+  // Submit the re-executed output bytes (or an execution failure) for a claimed
+  // audit job. The head hashes and adjudicates server-side. Submitting a job that
+  // is no longer CLAIMED by this runner fails with FailedPrecondition — treat that
+  // as job-done and claim the next.
+  rpc SubmitResult(SubmitAuditResultRequest) returns (SubmitAuditResultResponse);
+}
+
+message ClaimAuditJobRequest {
+  // Hardware-class inputs (os / cpu_arch / cpu_vendor); the head composes the
+  // class string server-side and matches it against each job's requirement.
+  HardwareCapabilities hardware = 1;
+}
+
+message ClaimAuditJobResponse {
+  // Unset when no job is claimable right now.
+  AuditJob job = 1;
+}
+
+message AuditJob {
+  string audit_id = 1;
+  // The unit's execution payload, rebuilt from the sampling-time snapshot, with
+  // checkpoint fields cleared (audits always re-execute from scratch) and
+  // reserved_until_unix set to the audit lease.
+  WorkUnitAssignment assignment = 2;
+  int64 lease_expires_unix = 3;
+}
+
+message SubmitAuditResultRequest {
+  string audit_id = 1;
+  // Raw output bytes produced by the re-execution. The head computes the checksum
+  // and the verdict; there is deliberately no checksum or verdict field.
+  bytes output_data = 2;
+  // Set instead of output_data when the runner could not execute the job
+  // (artifact fetch failure, runtime error). The job is released for another
+  // attempt until the attempt budget is exhausted.
+  bool execution_failed = 3;
+  string error_message = 4;
+}
+
+message SubmitAuditResultResponse {
+  bool accepted = 1;
+}

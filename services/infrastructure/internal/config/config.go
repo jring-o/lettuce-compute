@@ -372,6 +372,21 @@ type HeadConfig struct {
 	// below 1 any busier-than-average day would freeze the export). Override via
 	// LETTUCE_HEAD_EMISSION_ANOMALY_FACTOR.
 	EmissionAnomalyFactor float64 `yaml:"emission_anomaly_factor"`
+
+	// ResultAuditEnabled arms post-hoc result audits: after a work unit VALIDATES,
+	// it is sampled (crypto/rand) for re-execution by a registered trusted runner,
+	// and the head adjudicates the returned bytes against the accepted output.
+	// OFF by default — no sampling, no audit rows. Verdicts in this phase are
+	// recorded + logged only (no slash, no clawback). Override via
+	// LETTUCE_HEAD_RESULT_AUDIT_ENABLED.
+	ResultAuditEnabled bool `yaml:"result_audit_enabled"`
+	// ResultAuditRate is the head-default sampling fraction in (0, 1]. Unset (0)
+	// resolves to the default 0.01 (1 in 100 validated units). A leaf's
+	// validation_config.audit_rate can only RAISE the effective rate above this
+	// (max-overlay): leaf creation is self-service and the leaf owner is the
+	// primary adversary, so the per-leaf knob must never lower sampling. Override
+	// via LETTUCE_HEAD_RESULT_AUDIT_RATE.
+	ResultAuditRate float64 `yaml:"result_audit_rate"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -479,6 +494,10 @@ const (
 	// defaultEmissionAnomalyFactor: today's grants must exceed 3x the trailing
 	// 30-day daily average before the export freezes itself.
 	defaultEmissionAnomalyFactor = 3.0
+	// defaultResultAuditRate: 1 in 100 validated units is re-executed when result
+	// audits are enabled — the sampling economics baseline (one trusted machine per
+	// ~100 volunteer machines).
+	defaultResultAuditRate = 0.01
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -747,6 +766,10 @@ func (h HeadConfig) Validate() error {
 		if f := h.EffectiveEmissionAnomalyFactor(); f <= 1 {
 			return fmt.Errorf("head.emission_anomaly_factor must be > 1 when the anomaly halt is enabled (effective value, got %v)", f)
 		}
+	}
+	if h.ResultAuditRate < 0 || h.ResultAuditRate > 1 || math.IsNaN(h.ResultAuditRate) {
+		return fmt.Errorf("head.result_audit_rate must be a fraction in [0, 1] (0 = default %v), got %v",
+			defaultResultAuditRate, h.ResultAuditRate)
 	}
 	return nil
 }
@@ -1155,6 +1178,16 @@ func (h HeadConfig) EffectiveEmissionAnomalyFactor() float64 {
 		return defaultEmissionAnomalyFactor
 	}
 	return h.EmissionAnomalyFactor
+}
+
+// EffectiveResultAuditRate returns the head-default post-hoc audit sampling fraction:
+// the configured result_audit_rate, or 0.01 when unset (0). A leaf's audit_rate override
+// can only raise the effective rate above this (max-overlay; see the sampling hook).
+func (h HeadConfig) EffectiveResultAuditRate() float64 {
+	if h.ResultAuditRate <= 0 {
+		return defaultResultAuditRate
+	}
+	return h.ResultAuditRate
 }
 
 // StorageConfig defines local filesystem storage settings.

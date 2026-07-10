@@ -176,8 +176,17 @@ type ValidationConfig struct {
 	// default (the gate itself is enabled head-wide by config; this only overrides K).
 	MinTrustedCorroborators int `json:"min_trusted_corroborators,omitempty"`
 	// TrustFloor is the per-leaf trust-floor override: the snapshot score at or above
-	// which a subject counts as trusted. 0 = inherit the head default.
+	// which a subject counts as trusted. 0 = inherit the head default. TIGHTEN-ONLY:
+	// the effective floor is max(this, head default) — a leaf may demand a higher
+	// floor, never redefine the head's trust currency downward.
 	TrustFloor int `json:"trust_floor,omitempty"`
+
+	// AuditRate is the per-leaf post-hoc result-audit sampling override, a fraction
+	// in [0, 1]. 0 = no override. RAISE-ONLY: the effective rate is
+	// max(this, head default) — leaf creation is self-service and the leaf owner is
+	// the threat model's primary adversary, so a leaf can volunteer for MORE
+	// scrutiny but never dodge the head's sampling floor.
+	AuditRate float64 `json:"audit_rate,omitempty"`
 }
 
 // EffectiveTargetCopies resolves the target_copies 0 sentinel (TODO #50): the configured
