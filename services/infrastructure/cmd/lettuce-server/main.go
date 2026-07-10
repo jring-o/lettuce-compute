@@ -203,8 +203,12 @@ func main() {
 	}
 
 	// Create validation engine (shared between HTTP browser handlers and gRPC service).
+	// WithEmissionCap wires the per-account rolling-24h credit cap (0 = unlimited, the
+	// default): an over-cap grant is suppressed at the choke point — never a validation
+	// failure — bounding the daily burst any single account can mint.
 	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy).
-		WithStandingBackpressure(standingRecorder)
+		WithStandingBackpressure(standingRecorder).
+		WithEmissionCap(cfg.Head.MaxDailyCreditPerAccount)
 
 	// The single transitioner (TODO #50): the sole decider of work-unit redundancy state.
 	// SubmitResult and the fault monitor delegate every "complete / validate / reject / wait /
@@ -268,6 +272,16 @@ func main() {
 			"collection", cfg.Head.EffectiveDIDBindingCollection())
 	}
 
+	// Emission-anomaly circuit breaker: constructed only when the operator armed the
+	// halt. The SAME instance backs the export's 503 gate (via router deps) and the
+	// fault monitor's WARN sweep below, so both consult one cached verdict.
+	var anomalyChecker *credit.AnomalyChecker
+	if cfg.Head.EmissionAnomalyHaltEnabled {
+		anomalyChecker = credit.NewAnomalyChecker(pool, cfg.Head.EffectiveEmissionAnomalyFactor())
+		slog.Info("emission anomaly halt armed",
+			"factor", cfg.Head.EffectiveEmissionAnomalyFactor())
+	}
+
 	// Create HTTP router and server.
 	deps := &server.Dependencies{
 		Pool:             pool,
@@ -283,6 +297,7 @@ func main() {
 		ValidationEngine: validationEngine,
 		TrustedProxies:   trustedProxies,
 		AtprotoClient:    atprotoClient,
+		AnomalyChecker:   anomalyChecker,
 	}
 	router, rateLimitCleanup := server.NewRouter(deps)
 	defer rateLimitCleanup()
@@ -415,6 +430,15 @@ func main() {
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
 	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger)
+	if anomalyChecker != nil {
+		// Operator visibility for the emission circuit breaker: a throttled WARN when
+		// the export has self-frozen. Wired only when the halt is armed, sharing the
+		// export gate's checker (one cached verdict for both).
+		faultMonitor = faultMonitor.WithEmissionAnomalyCheck(func(ctx context.Context) (bool, float64, float64, error) {
+			v, err := anomalyChecker.Check(ctx)
+			return v.Halted, v.Today, v.Baseline, err
+		})
+	}
 	if cfg.Head.StandingBackpressureEnabled {
 		// Operator visibility for the backpressure machine: a throttled WARN naming the
 		// population it currently holds in PROBATION/BENCHED. Wired only when the machine

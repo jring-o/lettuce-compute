@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
@@ -70,8 +71,18 @@ type Engine struct {
 	// keeps today's behavior exactly: the lifetime-rate WARN for rejected results, no
 	// signal recorded. Set via WithStandingBackpressure; consumed best-effort.
 	standingRecorder standing.Recorder
-	signer           *attestation.Signer
-	logger           *slog.Logger
+	// emissionCapPerDay is the per-account rolling-24h credit ceiling enforced at the grant
+	// choke point in acceptResults (design §5.3). <= 0 (the default, and the zero value) means
+	// no cap: the grant loop stays on the byte-for-byte legacy Create path. When positive, an
+	// agreed result whose account would exceed the cap is SUPPRESSED (no ledger row, no RAC, a
+	// credit-0 attestation) while still counting as corroborated work. Set via WithEmissionCap.
+	emissionCapPerDay float64
+	// capWarnOnce fires the misconfiguration WARN at most once per engine lifetime, when a cap is
+	// configured but the credit repository does not implement credit.CappedCreator (the grant
+	// then falls back to uncapped Create — loud, but never a validation failure).
+	capWarnOnce sync.Once
+	signer      *attestation.Signer
+	logger      *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.
@@ -114,6 +125,16 @@ func NewEngine(
 // WARN behavior is preserved byte-for-byte.
 func (e *Engine) WithStandingBackpressure(rec standing.Recorder) *Engine {
 	e.standingRecorder = rec
+	return e
+}
+
+// WithEmissionCap sets the per-account daily credit emission cap enforced at the grant choke
+// point, returning the engine for chaining (the WithStandingBackpressure pattern — avoiding
+// another positional NewEngine parameter). A capPerDay <= 0 means NO cap: callers that skip it
+// (or pass a non-positive value) keep today's grant path byte-for-byte — the zero-value field
+// is the default — so no credit_ledger row is ever suppressed and CreateCapped is never called.
+func (e *Engine) WithEmissionCap(capPerDay float64) *Engine {
+	e.emissionCapPerDay = capPerDay
 	return e
 }
 
@@ -490,6 +511,17 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 		creditAmount = 1.0
 	}
 
+	// attestedAmounts carries the credit ACTUALLY granted per result into createAttestations: a
+	// granted result attests the leaf amount; a result whose grant the emission cap suppressed is
+	// ABSENT (resolving to 0). DISAGREED results are never keyed here, so they attest 0 as before.
+	attestedAmounts := make(map[types.ID]float64, len(agreedResults))
+
+	// When an emission cap is configured, route grants through CreateCapped so a suppression is a
+	// non-error branch (design §5.3, audit F3). cappedCreator returns (nil, false) both when no
+	// cap is set — the default, keeping the byte-for-byte legacy Create path below — and when a
+	// cap is set but the repo lacks the capability (it WARNs once and falls back to Create).
+	cc, capEnforced := e.cappedCreator()
+
 	var creditEntries []*credit.LedgerEntry
 	for _, r := range agreedResults {
 		entry := &credit.LedgerEntry{
@@ -499,7 +531,26 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 			ResultID:     r.ID,
 			CreditAmount: creditAmount,
 		}
-		if err := e.creditRepo.Create(ctx, entry); err != nil {
+		if capEnforced {
+			inserted, err := cc.CreateCapped(ctx, entry, e.emissionCapPerDay)
+			if err != nil {
+				return nil, fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
+			}
+			if !inserted {
+				// Suppression branch (design §5.3, audit F3/F10): the account's rolling-24h
+				// grants plus this amount would exceed the cap. Grant NOTHING — no ledger row,
+				// no RAC upsert, no attested credit — but leave the result AGREED so every
+				// work-quality effect below (counters, standing, reliability, trust) still
+				// fires. The cap bounds emission, not merit.
+				e.logger.Warn("credit suppressed by daily emission cap",
+					"volunteer_id", r.VolunteerID,
+					"work_unit_id", wu.ID,
+					"result_id", r.ID,
+					"amount", creditAmount,
+					"cap", e.emissionCapPerDay)
+				continue
+			}
+		} else if err := e.creditRepo.Create(ctx, entry); err != nil {
 			return nil, fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
 		}
 		// Update RAC for this volunteer+project. H-7: best-effort — a failure does not
@@ -511,13 +562,15 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 			}
 		}
 		creditEntries = append(creditEntries, entry)
+		attestedAmounts[r.ID] = creditAmount
 	}
 
-	// Create attestations for agreed results.
-	e.createAttestations(ctx, wu, agreedResults, attestation.OutcomeAgreed, creditAmount)
+	// Create attestations for agreed results. The amount attested is the credit actually granted
+	// (attestedAmounts): a cap-suppressed AGREED result is absent from the map and attests 0.
+	e.createAttestations(ctx, wu, agreedResults, attestation.OutcomeAgreed, attestedAmounts)
 
-	// Create attestations for disagreed results (credit_amount = 0).
-	e.createAttestations(ctx, wu, rejectedResults, attestation.OutcomeDisagreed, 0)
+	// Create attestations for disagreed results (credit_amount = 0 via the nil map).
+	e.createAttestations(ctx, wu, rejectedResults, attestation.OutcomeDisagreed, nil)
 
 	// Update volunteer counters. H-7: best-effort counter bumps — a failure does not
 	// fail validation, so log at Warn, not Error.
@@ -564,6 +617,27 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	}, nil
 }
 
+// cappedCreator resolves whether the grant loop must enforce the per-account emission cap.
+// It returns (cc, true) ONLY when a cap is configured AND the credit repository implements
+// credit.CappedCreator. It returns (nil, false) — the uncapped legacy Create path — in two
+// cases: no cap configured (the default, and the common production state), or a cap configured
+// against a repository that cannot enforce it (a misconfiguration). The misconfiguration is
+// surfaced LOUD but not fatal: it WARNs at most once per engine lifetime (capWarnOnce) and lets
+// the grant proceed uncapped, so a mis-wired cap never silently drops or fails every grant.
+func (e *Engine) cappedCreator() (credit.CappedCreator, bool) {
+	if e.emissionCapPerDay <= 0 {
+		return nil, false
+	}
+	cc, ok := e.creditRepo.(credit.CappedCreator)
+	if !ok {
+		e.capWarnOnce.Do(func() {
+			e.logger.Warn("emission cap configured but credit repository does not support capped creation")
+		})
+		return nil, false
+	}
+	return cc, true
+}
+
 // rejectAll marks all pending results as DISAGREED, transitions the work unit to REJECTED,
 // and triggers reassignment (or failure if max reassignments reached).
 func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending []*result.Result) (*ValidationResult, error) {
@@ -581,8 +655,8 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 		return nil, fmt.Errorf("transition work unit to REJECTED: %w", err)
 	}
 
-	// Create attestations for all rejected results (credit_amount = 0).
-	e.createAttestations(ctx, wu, pending, attestation.OutcomeDisagreed, 0)
+	// Create attestations for all rejected results (credit_amount = 0 via the nil map).
+	e.createAttestations(ctx, wu, pending, attestation.OutcomeDisagreed, nil)
 
 	// Update volunteer counters. H-7: best-effort — a failure does not fail the
 	// rejection, so log at Warn, not Error.
@@ -627,8 +701,13 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, pending [
 	}, nil
 }
 
-// createAttestations creates signed credit attestations for each result.
-func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, results []*result.Result, outcome string, creditAmount float64) {
+// createAttestations creates signed credit attestations for each result. The attested
+// credit_amount is looked up per result in amounts (keyed by result ID); a result absent from
+// the map attests 0. This records the credit ACTUALLY granted, not the nominal leaf amount: a
+// DISAGREED result (callers pass nil) attests 0, and an AGREED result whose grant the emission
+// cap suppressed is likewise absent from the map and attests 0 — the attestation states facts
+// (outcome AGREED, credit 0), per the design.
+func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, results []*result.Result, outcome string, amounts map[types.ID]float64) {
 	if e.attestationRepo == nil || e.signer == nil {
 		return
 	}
@@ -652,7 +731,7 @@ func (e *Engine) createAttestations(ctx context.Context, wu *workunit.WorkUnit, 
 			WorkUnitID:           wu.ID,
 			RawMetrics:           rawMetrics,
 			ValidationOutcome:    outcome,
-			CreditAmount:         creditAmount,
+			CreditAmount:         amounts[r.ID],
 			AttestationTimestamp: now,
 		}
 

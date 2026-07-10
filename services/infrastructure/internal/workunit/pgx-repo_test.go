@@ -33,6 +33,7 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 
 	cleanup := func() {
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
+		_, _ = pool.Exec(ctx, "DELETE FROM credit_adjustments")
 		_, _ = pool.Exec(ctx, "DELETE FROM credit_ledger")
 		_, _ = pool.Exec(ctx, "DELETE FROM results")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_units")
