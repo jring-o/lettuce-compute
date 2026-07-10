@@ -151,7 +151,7 @@ func (f *fakeAuditsRepo) GetByID(_ context.Context, id types.ID) (*audit.Audit, 
 	}
 	return nil, apierror.NotFound("audit", id.String())
 }
-func (f *fakeAuditsRepo) CompleteVerdict(_ context.Context, id, runnerID types.ID, v audit.Verdict, detail string, output []byte, checksum string) error {
+func (f *fakeAuditsRepo) CompleteVerdict(_ context.Context, id, runnerID types.ID, v audit.Verdict, detail string, output []byte, checksum string, _ bool) error {
 	if f.verdictErr != nil {
 		return f.verdictErr
 	}
@@ -177,6 +177,24 @@ func (f *fakeAuditsRepo) SweepStaleQueued(context.Context) (int, error)       { 
 func (f *fakeAuditsRepo) Stats(context.Context) (audit.Stats, error)          { return audit.Stats{}, nil }
 func (f *fakeAuditsRepo) List(context.Context, audit.ListFilter) ([]*audit.Audit, error) {
 	return nil, nil
+}
+func (f *fakeAuditsRepo) EnqueueConfirmation(context.Context, types.ID) (*audit.Audit, error) {
+	return nil, nil
+}
+func (f *fakeAuditsRepo) GetRunnerOutput(context.Context, types.ID) ([]byte, error) {
+	return nil, nil
+}
+func (f *fakeAuditsRepo) ListActionableRoots(context.Context, int) ([]*audit.Audit, error) {
+	return nil, nil
+}
+func (f *fakeAuditsRepo) ConfirmationsForRoot(context.Context, types.ID) ([]*audit.Audit, error) {
+	return nil, nil
+}
+func (f *fakeAuditsRepo) SetEnforcementState(context.Context, types.ID, audit.EnforcementState) (bool, error) {
+	return false, nil
+}
+func (f *fakeAuditsRepo) ClaimRepair(context.Context, types.ID, types.ID) (bool, error) {
+	return false, nil
 }
 
 // capturingHandler records emitted log records so a test can assert a WARN was made.
@@ -249,7 +267,7 @@ func newAuditHarness(t *testing.T, adj audit.Adjudicator) *auditHarness {
 	results := &fakeAuditResultRepo{byWU: map[types.ID][]*result.Result{}}
 	logs := &capturingHandler{}
 
-	svc := NewAuditService(runners, audits, wus, leafs, vols, adj, results, slog.New(logs))
+	svc := NewAuditService(runners, audits, wus, leafs, vols, adj, results, false, slog.New(logs))
 	return &auditHarness{svc, runners, audits, wus, leafs, vols, results, logs, pub, volID, runnerID}
 }
 

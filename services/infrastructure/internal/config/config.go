@@ -387,6 +387,18 @@ type HeadConfig struct {
 	// primary adversary, so the per-leaf knob must never lower sampling. Override
 	// via LETTUCE_HEAD_RESULT_AUDIT_RATE.
 	ResultAuditRate float64 `yaml:"result_audit_rate"`
+
+	// AuditEnforcementEnabled arms the consequences on a confirmed audit MISMATCH:
+	// slash every agreeing trust subject, claw back the unit's credit plus all
+	// unmatured credit of those accounts (with revocation attestations), and
+	// retroactively repair honest dissenters (design doc §9). OFF by default —
+	// verdicts stay observe-only exactly as slice 2 shipped them. Enforcement acts
+	// only on verdicts recorded while this knob was on (stamped per row), and only
+	// after a SECOND registered runner independently confirms the mismatch.
+	// Requires CreditMaturationDays > 9 (Validate — the enforcement horizon must
+	// land inside the maturation window). Override via
+	// LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED.
+	AuditEnforcementEnabled bool `yaml:"audit_enforcement_enabled"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -770,6 +782,16 @@ func (h HeadConfig) Validate() error {
 	if h.ResultAuditRate < 0 || h.ResultAuditRate > 1 || math.IsNaN(h.ResultAuditRate) {
 		return fmt.Errorf("head.result_audit_rate must be a fraction in [0, 1] (0 = default %v), got %v",
 			defaultResultAuditRate, h.ResultAuditRate)
+	}
+	// Hard cross-check (design doc §9.9, F-M9 strengthened by audit H2): enforcement
+	// claws back credit, so the worst-case enforcement horizon — root audit (3d queue +
+	// lease retries) plus up to 3 second-runner confirmation cycles (1d queue + lease
+	// retries each) — must land INSIDE the maturation window, or fraud credit matures
+	// and exports before the clawback can fire.
+	if h.AuditEnforcementEnabled && h.CreditMaturationDays <= 9 {
+		return fmt.Errorf("head.credit_maturation_days must be > 9 when audit enforcement is enabled "+
+			"(worst-case enforcement horizon: 3d root queue + lease retries, plus up to 3 confirmation "+
+			"cycles of 1d queue + lease retries each), got %d", h.CreditMaturationDays)
 	}
 	return nil
 }

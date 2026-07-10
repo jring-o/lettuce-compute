@@ -68,7 +68,7 @@ func (f *fakeAuditsRepo) Claim(context.Context, types.ID, string) (*Audit, error
 	return nil, f.err
 }
 func (f *fakeAuditsRepo) GetByID(context.Context, types.ID) (*Audit, error) { return nil, f.err }
-func (f *fakeAuditsRepo) CompleteVerdict(context.Context, types.ID, types.ID, Verdict, string, []byte, string) error {
+func (f *fakeAuditsRepo) CompleteVerdict(context.Context, types.ID, types.ID, Verdict, string, []byte, string, bool) error {
 	return f.err
 }
 func (f *fakeAuditsRepo) CompleteInconclusive(context.Context, types.ID, types.ID, string) error {
@@ -83,6 +83,24 @@ func (f *fakeAuditsRepo) Stats(context.Context) (Stats, error)                { 
 func (f *fakeAuditsRepo) List(_ context.Context, filter ListFilter) ([]*Audit, error) {
 	f.lastFilter = filter
 	return f.list, f.err
+}
+func (f *fakeAuditsRepo) EnqueueConfirmation(context.Context, types.ID) (*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) GetRunnerOutput(context.Context, types.ID) ([]byte, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) ListActionableRoots(context.Context, int) ([]*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) ConfirmationsForRoot(context.Context, types.ID) ([]*Audit, error) {
+	return nil, f.err
+}
+func (f *fakeAuditsRepo) SetEnforcementState(context.Context, types.ID, EnforcementState) (bool, error) {
+	return false, f.err
+}
+func (f *fakeAuditsRepo) ClaimRepair(context.Context, types.ID, types.ID) (bool, error) {
+	return false, f.err
 }
 
 func testAdminHandler(runners RunnersRepository, audits AuditsRepository) *AdminHandler {

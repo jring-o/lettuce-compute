@@ -402,7 +402,7 @@ func main() {
 	// deliberately NOT in grpcPublicMethods) and an empty registry fails every claim
 	// closed with PermissionDenied, so a head with audits off exposes nothing. The
 	// adjudicator is the head-side verdict function; a runner only ever returns bytes.
-	auditSvc := server.NewAuditService(auditRunnersRepo, auditsRepo, wuRepo, leafRepo, volunteerRepo, validation.AdjudicateAudit, resultRepo, logger)
+	auditSvc := server.NewAuditService(auditRunnersRepo, auditsRepo, wuRepo, leafRepo, volunteerRepo, validation.AdjudicateAudit, resultRepo, cfg.Head.AuditEnforcementEnabled, logger)
 	lettucev1.RegisterAuditServiceServer(grpcServer, auditSvc)
 
 	// Start HTTP server.

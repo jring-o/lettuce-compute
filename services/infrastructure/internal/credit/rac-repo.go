@@ -179,3 +179,10 @@ func (r *PgxRACRepository) DecayAll(ctx context.Context) (int64, error) {
 	}
 	return tag.RowsAffected(), nil
 }
+
+// ApplyAdjustment applies the clamped RAC decrement for one committed adjustment
+// exactly-once (design doc §9.5) — keel stub; the credit implementer replaces it with
+// the single-transaction stamp + decay-subtract-clamp UPDATE.
+func (r *PgxRACRepository) ApplyAdjustment(ctx context.Context, adjustmentID types.ID) (bool, error) {
+	return false, apierror.Internal("ApplyAdjustment not implemented (slice-3 keel stub)", nil)
+}

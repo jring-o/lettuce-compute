@@ -331,8 +331,12 @@ func (r *PgxAuditsRepository) GetByID(ctx context.Context, id types.ID) (*Audit,
 
 // CompleteVerdict finalizes a CLAIMED job with a head-computed verdict, storing the verbatim
 // runner bytes + head-computed checksum. Guarded: the row must still be CLAIMED by runnerID,
-// else ErrNotClaimant.
-func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string) error {
+// else ErrNotClaimant. enforcementEligible stamps the enforcement knob's verdict-write-time
+// state, and the SAME statement moves an eligible MISMATCH ORIGINAL straight to
+// AWAITING_CONFIRMATION — an actionable root is never observable in NONE, so no crash
+// window between verdict and confirmation-enqueue can route around the second-runner
+// requirement (design doc §9.2, audit H1).
+func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string, enforcementEligible bool) error {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE result_audits SET
 			status = 'COMPLETED',
@@ -341,9 +345,15 @@ func (r *PgxAuditsRepository) CompleteVerdict(ctx context.Context, id, runnerID 
 			runner_output = $5,
 			runner_output_checksum = $6,
 			completed_at = now(),
-			lease_expires_at = NULL
+			lease_expires_at = NULL,
+			enforcement_eligible = $7,
+			enforcement_state = CASE
+				WHEN $7 AND $3 = 'MISMATCH' AND confirms_audit_id IS NULL
+					THEN 'AWAITING_CONFIRMATION'
+				ELSE enforcement_state
+			END
 		WHERE id = $1 AND status = 'CLAIMED' AND claimed_by = $2`,
-		id, runnerID, string(verdict), detail, runnerOutput, checksum,
+		id, runnerID, string(verdict), detail, runnerOutput, checksum, enforcementEligible,
 	)
 	if err != nil {
 		return apierror.Internal("failed to complete audit verdict", err)
@@ -508,4 +518,37 @@ func (r *PgxAuditsRepository) List(ctx context.Context, f ListFilter) ([]*Audit,
 		return nil, apierror.Internal("failed to iterate result audits", err)
 	}
 	return out, nil
+}
+
+// --- slice-3 enforcement surface (design doc §9) — keel stubs; the enforcement
+// implementer replaces each with the real guarded SQL. ---
+
+// EnqueueConfirmation inserts a QUEUED confirmation row for the root (§9.2).
+func (r *PgxAuditsRepository) EnqueueConfirmation(ctx context.Context, rootID types.ID) (*Audit, error) {
+	return nil, apierror.Internal("EnqueueConfirmation not implemented (slice-3 keel stub)", nil)
+}
+
+// GetRunnerOutput returns the persisted verbatim runner bytes of a COMPLETED audit.
+func (r *PgxAuditsRepository) GetRunnerOutput(ctx context.Context, id types.ID) ([]byte, error) {
+	return nil, apierror.Internal("GetRunnerOutput not implemented (slice-3 keel stub)", nil)
+}
+
+// ListActionableRoots returns eligible MISMATCH originals awaiting enforcement (§9.3).
+func (r *PgxAuditsRepository) ListActionableRoots(ctx context.Context, limit int) ([]*Audit, error) {
+	return nil, apierror.Internal("ListActionableRoots not implemented (slice-3 keel stub)", nil)
+}
+
+// ConfirmationsForRoot returns every confirmation row of the root, newest first.
+func (r *PgxAuditsRepository) ConfirmationsForRoot(ctx context.Context, rootID types.ID) ([]*Audit, error) {
+	return nil, apierror.Internal("ConfirmationsForRoot not implemented (slice-3 keel stub)", nil)
+}
+
+// SetEnforcementState transitions a root's enforcement bookkeeping (guarded).
+func (r *PgxAuditsRepository) SetEnforcementState(ctx context.Context, id types.ID, state EnforcementState) (bool, error) {
+	return false, apierror.Internal("SetEnforcementState not implemented (slice-3 keel stub)", nil)
+}
+
+// ClaimRepair inserts the audit_repairs idempotency claim (§9.6).
+func (r *PgxAuditsRepository) ClaimRepair(ctx context.Context, auditID, resultID types.ID) (bool, error) {
+	return false, apierror.Internal("ClaimRepair not implemented (slice-3 keel stub)", nil)
 }

@@ -114,8 +114,12 @@ type Engine struct {
 	// initialized on first ineligible unit. Read via AuditIneligibleCounts.
 	auditIneligibleMu sync.Mutex
 	auditIneligible   map[string]int64
-	signer            *attestation.Signer
-	logger            *slog.Logger
+	// repairClaimer guards the non-idempotent slice-3 repair effects (one repair per
+	// result, ever — design doc §9.6). nil disables RepairUnit (it errors). Set via
+	// WithRepairSupport.
+	repairClaimer RepairClaimer
+	signer        *attestation.Signer
+	logger        *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.

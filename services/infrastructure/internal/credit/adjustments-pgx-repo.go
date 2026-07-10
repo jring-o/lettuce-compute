@@ -198,3 +198,16 @@ func (r *PgxAdjustmentsRepository) SumForEntry(ctx context.Context, entryID type
 	}
 	return sum, nil
 }
+
+// --- slice-3 enforcement surface (design doc §9.4) — keel stubs; the credit
+// implementer replaces each with the real transactional SQL. ---
+
+// ClawbackForAudit is the automated-enforcement clawback (full-remaining, AUDIT-stamped).
+func (r *PgxAdjustmentsRepository) ClawbackForAudit(ctx context.Context, entryID, auditID types.ID, reason string) (*Adjustment, error) {
+	return nil, apierror.Internal("ClawbackForAudit not implemented (slice-3 keel stub)", nil)
+}
+
+// ListUnmaturedEntryIDs returns the volunteer's in-window ledger entry ids, oldest first.
+func (r *PgxAdjustmentsRepository) ListUnmaturedEntryIDs(ctx context.Context, volunteerID types.ID, maturationDays int) ([]types.ID, error) {
+	return nil, apierror.Internal("ListUnmaturedEntryIDs not implemented (slice-3 keel stub)", nil)
+}

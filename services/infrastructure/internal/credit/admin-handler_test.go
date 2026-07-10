@@ -54,6 +54,14 @@ func (f *fakeAdjRepo) SumForEntry(_ context.Context, _ types.ID) (float64, error
 	return 0, f.err
 }
 
+func (f *fakeAdjRepo) ClawbackForAudit(_ context.Context, _, _ types.ID, _ string) (*Adjustment, error) {
+	return nil, f.err
+}
+
+func (f *fakeAdjRepo) ListUnmaturedEntryIDs(_ context.Context, _ types.ID, _ int) ([]types.ID, error) {
+	return nil, f.err
+}
+
 // fakeLedgerRepo is an in-memory Repository double; only GetByResultID is exercised here.
 type fakeLedgerRepo struct {
 	entry    *LedgerEntry

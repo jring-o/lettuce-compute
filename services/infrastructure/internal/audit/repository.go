@@ -74,7 +74,12 @@ type AuditsRepository interface {
 	// the verbatim runner bytes + head-computed checksum. Guarded: the row must be
 	// CLAIMED by runnerID, else ErrNotClaimant (a lapsed-but-unswept lease still
 	// completes — sweeps are lazy; an already-reclaimed row does not).
-	CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string) error
+	// enforcementEligible stamps the enforcement knob's state at verdict-write time
+	// (the observe-era pin, §7.11/F-M10); the SAME statement moves an eligible
+	// MISMATCH ORIGINAL to AWAITING_CONFIRMATION so it is never observable in NONE
+	// (audit H1 — the state column is bookkeeping, but no crash window may leave an
+	// actionable root outside the confirmation flow).
+	CompleteVerdict(ctx context.Context, id, runnerID types.ID, verdict Verdict, detail string, runnerOutput []byte, checksum string, enforcementEligible bool) error
 
 	// CompleteInconclusive finalizes a job INCONCLUSIVE outside the submit path (the
 	// claim handler uses it when the sampled artifacts cannot be resolved). Guarded on
@@ -101,6 +106,37 @@ type AuditsRepository interface {
 	// List returns audit rows for the admin read surface, newest first, optionally
 	// filtered; limit <= 0 applies a server default.
 	List(ctx context.Context, f ListFilter) ([]*Audit, error)
+
+	// --- slice-3 enforcement surface (design doc §9) ---
+
+	// EnqueueConfirmation inserts a QUEUED second-runner confirmation for the root:
+	// a new audit row copying the root's unit/leaf/accepted/snapshot/pin columns with
+	// confirms_audit_id = rootID. The one-open-audit-per-unit unique index makes a
+	// duplicate enqueue a constraint error the caller treats as already-enqueued.
+	EnqueueConfirmation(ctx context.Context, rootID types.ID) (*Audit, error)
+
+	// GetRunnerOutput returns the persisted verbatim runner bytes of a COMPLETED
+	// audit (excluded from every other read — verdict rows can be large).
+	GetRunnerOutput(ctx context.Context, id types.ID) ([]byte, error)
+
+	// ListActionableRoots returns eligible MISMATCH ORIGINALS still in
+	// NONE/AWAITING_CONFIRMATION, oldest completed_at first (the partial-index scan).
+	ListActionableRoots(ctx context.Context, limit int) ([]*Audit, error)
+
+	// ConfirmationsForRoot returns every confirmation row of the root, newest first.
+	// Their COUNT is the derived confirmation-attempt counter (audit M4 — the per-row
+	// attempts column is lease accounting and resets across re-enqueues).
+	ConfirmationsForRoot(ctx context.Context, rootID types.ID) ([]*Audit, error)
+
+	// SetEnforcementState transitions a root's bookkeeping. Guarded UPDATE from the
+	// non-terminal states (NONE/AWAITING_CONFIRMATION) only; ENFORCED also stamps
+	// enforced_at. Returns false when the guard missed (already terminal).
+	SetEnforcementState(ctx context.Context, id types.ID, state EnforcementState) (bool, error)
+
+	// ClaimRepair inserts the audit_repairs idempotency claim for (auditID, resultID);
+	// claimed=false when the result was already repaired by any audit (the UNIQUE
+	// result_id guard for the non-idempotent repair effects, design doc §9.6).
+	ClaimRepair(ctx context.Context, auditID, resultID types.ID) (claimed bool, err error)
 }
 
 // ListFilter narrows the admin list. Zero values mean "no filter".

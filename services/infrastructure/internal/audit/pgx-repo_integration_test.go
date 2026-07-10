@@ -1,4 +1,4 @@
-//go:build integration
+﻿//go:build integration
 
 package audit
 
@@ -35,7 +35,7 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, func()) {
 
 	cleanup := func() {
 		// Children first: result_audits / trusted_runners are FK-bearing children of
-		// work_units/leafs/results/volunteers (audit spec §7.1 FK-cleanup lore).
+		// work_units/leafs/results/volunteers (audit spec Â§7.1 FK-cleanup lore).
 		_, _ = pool.Exec(ctx, "DELETE FROM result_audits")
 		_, _ = pool.Exec(ctx, "DELETE FROM trusted_runners")
 		_, _ = pool.Exec(ctx, "DELETE FROM work_unit_assignment_history")
@@ -405,7 +405,7 @@ func TestAuditClaimConcurrentDistinct(t *testing.T) {
 	ctx := context.Background()
 	repo := NewPgxAuditsRepository(pool)
 
-	// Two queued jobs, two runners claiming concurrently — SKIP LOCKED must hand out two
+	// Two queued jobs, two runners claiming concurrently â€” SKIP LOCKED must hand out two
 	// DISTINCT jobs, never the same one twice.
 	enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
 	enqueueTestAudit(t, repo, newAuditFixture(t, pool, 600, nil), nil, nil)
@@ -459,13 +459,13 @@ func TestAuditCompleteVerdictGuards(t *testing.T) {
 	}
 
 	// The wrong runner cannot complete another runner's claim.
-	if err := repo.CompleteVerdict(ctx, a.ID, other, VerdictMatch, "", []byte("out"), "cs"); err != ErrNotClaimant {
+	if err := repo.CompleteVerdict(ctx, a.ID, other, VerdictMatch, "", []byte("out"), "cs", false); err != ErrNotClaimant {
 		t.Fatalf("wrong-runner complete err = %v, want ErrNotClaimant", err)
 	}
 
 	// The claimant completes it.
 	out := []byte(`{"answer":42}`)
-	if err := repo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", out, "deadbeef"); err != nil {
+	if err := repo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", out, "deadbeef", false); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	got, err := repo.GetByID(ctx, a.ID)
@@ -480,7 +480,7 @@ func TestAuditCompleteVerdictGuards(t *testing.T) {
 	}
 
 	// A double-complete is refused (no longer CLAIMED).
-	if err := repo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", out, "deadbeef"); err != ErrNotClaimant {
+	if err := repo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", out, "deadbeef", false); err != ErrNotClaimant {
 		t.Fatalf("double complete err = %v, want ErrNotClaimant", err)
 	}
 }
@@ -625,12 +625,12 @@ func TestActiveRunnerSubjects(t *testing.T) {
 	ctx := context.Background()
 	runners := NewPgxRunnersRepository(pool)
 
-	// A keypair-only runner → vol: sentinel subject.
+	// A keypair-only runner â†’ vol: sentinel subject.
 	volPlain := createTestVolunteer(t, pool)
 	if _, err := runners.Register(ctx, volPlain, "plain", ""); err != nil {
 		t.Fatalf("register plain: %v", err)
 	}
-	// A DID-bound runner → the DID is its subject.
+	// A DID-bound runner â†’ the DID is its subject.
 	const did = "did:plc:auditsubjecttest"
 	volDID := createTestVolunteerWithDID(t, pool, did)
 	if _, err := runners.Register(ctx, volDID, "did", ""); err != nil {
@@ -670,7 +670,7 @@ func TestRunnerRegisterUpsertAndUnknown(t *testing.T) {
 	ctx := context.Background()
 	runners := NewPgxRunnersRepository(pool)
 
-	// Unknown volunteer → ErrUnknownVolunteer (FK violation surfaced).
+	// Unknown volunteer â†’ ErrUnknownVolunteer (FK violation surfaced).
 	if _, err := runners.Register(ctx, types.NewID(), "ghost", ""); err != ErrUnknownVolunteer {
 		t.Fatalf("register unknown volunteer err = %v, want ErrUnknownVolunteer", err)
 	}
@@ -696,7 +696,7 @@ func TestRunnerRegisterUpsertAndUnknown(t *testing.T) {
 		t.Errorf("re-registered runner = active %v / label %q, want active/label-two", second.Active, second.Label)
 	}
 
-	// GetActiveByVolunteerID resolves it; Deactivate then Get → ErrNotRegistered.
+	// GetActiveByVolunteerID resolves it; Deactivate then Get â†’ ErrNotRegistered.
 	if _, err := runners.GetActiveByVolunteerID(ctx, volID); err != nil {
 		t.Fatalf("get active: %v", err)
 	}
@@ -706,7 +706,7 @@ func TestRunnerRegisterUpsertAndUnknown(t *testing.T) {
 	if _, err := runners.GetActiveByVolunteerID(ctx, volID); err != ErrNotRegistered {
 		t.Fatalf("get inactive err = %v, want ErrNotRegistered", err)
 	}
-	// Deactivating an unknown volunteer → ErrNotRegistered.
+	// Deactivating an unknown volunteer â†’ ErrNotRegistered.
 	if err := runners.Deactivate(ctx, types.NewID()); err != ErrNotRegistered {
 		t.Fatalf("deactivate unknown err = %v, want ErrNotRegistered", err)
 	}
@@ -735,7 +735,7 @@ func TestEnqueueDuplicateOpenAudit(t *testing.T) {
 	}
 }
 
-// --- Artifact-GC pin (spec §7.5, F-M7) --------------------------------------------------
+// --- Artifact-GC pin (spec Â§7.5, F-M7) --------------------------------------------------
 
 func TestAuditGCPinPruneAndDelete(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
@@ -761,12 +761,12 @@ func TestAuditGCPinPruneAndDelete(t *testing.T) {
 		t.Fatalf("open-audit version was pruned (pruned=%d): %v", pruned, err)
 	}
 
-	// Complete the audit → no longer OPEN → v-old becomes prunable.
+	// Complete the audit â†’ no longer OPEN â†’ v-old becomes prunable.
 	runnerID := registerTestRunner(t, pool, "gc-runner")
 	if _, err := auditRepo.Claim(ctx, runnerID, "any"); err != nil {
 		t.Fatalf("claim for GC: %v", err)
 	}
-	if err := auditRepo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", []byte("o"), "cs"); err != nil {
+	if err := auditRepo.CompleteVerdict(ctx, a.ID, runnerID, VerdictMatch, "", []byte("o"), "cs", false); err != nil {
 		t.Fatalf("complete for GC: %v", err)
 	}
 	if _, err := leafRepo.PruneAllVersions(ctx, 1); err != nil {
