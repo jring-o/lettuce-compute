@@ -25,6 +25,13 @@ import (
 //     embeds its own result UUID and is unadjudicable against runner bytes by construction.
 //     Sampling already excludes these (F-M2); this branch is defense-in-depth and returns
 //     INCONCLUSIVE rather than a meaningless MATCH/MISMATCH.
+//   - "unverified-ref:<uuid>" — a ref-only result the head has not fetched and hashed, so
+//     its key embeds its own result UUID and is unadjudicable against runner bytes by
+//     construction (§10.8, BG-02b). Sampling already excludes these (a sampled ref winner is
+//     promoted-verified, so its key is 64-hex); this branch mirrors canon-empty and returns
+//     INCONCLUSIVE — the raw-hex default would otherwise sha256 the runner bytes against the
+//     literal "unverified-ref:<uuid>" string and fabricate a MISMATCH, slashing an honest
+//     submitter under slice-3 enforcement.
 //   - "canon:<hex>" — EXACT with effective ignore_fields. Adjudicated by VALUE, never by
 //     key-string across the raw/stored boundary (audit F-H3): the winner's canon key was
 //     computed from jsonb-NORMALIZED stored bytes (Postgres re-renders numeric tokens, e.g.
@@ -34,11 +41,16 @@ import (
 //     ignore_fields and compared with numericMatch(epsilon = 0).
 //   - empty key — NUMERIC_TOLERANCE (its accepted key is NULL). Value-level within the
 //     snapshot tolerance, MATCH iff within epsilon of ANY AGREED member (audit F-M3).
-//   - otherwise a raw 64-hex checksum — EXACT without effective canon, INCLUDING ref-only
-//     winners on any EXACT leaf. sha256 of the runner bytes vs the accepted key. Symmetric
-//     (both hashes are over RAW bytes), works for non-JSON runner bytes (F-M8), and catches
-//     the BG-02b fabricated-checksum shape: a ref-only quorum's accepted key is the
-//     volunteer-CLAIMED checksum, which MISMATCHes real re-executed bytes.
+//   - otherwise a raw 64-hex checksum — EXACT without effective canon, INCLUDING promoted
+//     ref-only winners on any EXACT leaf. sha256 of the runner bytes vs the accepted key.
+//     Symmetric (both hashes are over RAW bytes), works for non-JSON runner bytes (F-M8).
+//     The accepted key is always a HEAD-VERIFIED hash: for an inline winner it is the
+//     submit-time head-computed checksum; for a ref-only winner, post-slice-5 a sampled ref
+//     is always promoted-verified, so its key is the head-computed hash of the fetched bytes
+//     — a volunteer-CLAIMED checksum can never reach this case (§10.8, BG-02b). Either way it
+//     adjudicates runner bytes against a head-verified hash and catches wrong content as a
+//     MISMATCH — the mechanism delivering the §2 "slice-3 fraud consequence" on verified
+//     bytes (§10.7).
 //
 // Unadjudicable inputs (accepted output missing, runner bytes unparseable where a value
 // compare is required, no comparable NUMERIC member) yield VerdictInconclusive with a
@@ -50,6 +62,9 @@ func AdjudicateAudit(snap audit.ComparisonSnapshot, acceptedKey string, accepted
 	case strings.HasPrefix(acceptedKey, "canon-empty:"):
 		return audit.VerdictInconclusive,
 			audit.ReasonCompareError + ": accepted key is canon-empty (winner stripped every comparable leaf)", nil
+	case strings.HasPrefix(acceptedKey, "unverified-ref:"):
+		return audit.VerdictInconclusive,
+			audit.ReasonCompareError + ": accepted key is an unverified external reference (never adjudicable)", nil
 	case strings.HasPrefix(acceptedKey, "canon:"):
 		return adjudicateCanonValue(snap, acceptedOutputs, runnerOutput)
 	case acceptedKey == "":
@@ -60,9 +75,11 @@ func AdjudicateAudit(snap audit.ComparisonSnapshot, acceptedKey string, accepted
 }
 
 // adjudicateRawChecksum is the raw-64-hex-key case: hex(sha256(runnerOutput)) vs the accepted
-// key. The accepted key is the submit-time HEAD-computed checksum (or, for a ref-only winner,
-// the volunteer-claimed checksum), so this compares two raw-byte hashes on a symmetric channel
-// and is adjudicable even for non-JSON runner bytes.
+// key. The accepted key is always a HEAD-computed checksum — the submit-time hash for an
+// inline winner, or (post-slice-5) the head-verified fetched-bytes hash for a promoted
+// ref-only winner (a volunteer-claimed checksum can never reach here, §10.8) — so this
+// compares two raw-byte hashes on a symmetric channel and is adjudicable even for non-JSON
+// runner bytes.
 func adjudicateRawChecksum(acceptedKey string, runnerOutput []byte) (audit.Verdict, string, error) {
 	sum := sha256.Sum256(runnerOutput)
 	if hex.EncodeToString(sum[:]) == acceptedKey {

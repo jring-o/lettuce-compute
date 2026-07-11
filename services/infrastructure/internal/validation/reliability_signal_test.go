@@ -61,9 +61,9 @@ func TestReliabilitySignal_AgreedRecordsGood(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
 	r1.HostID = &host1
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -110,8 +110,8 @@ func TestReliabilitySignal_RejectedRecordsBad(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil) // disagree -> no quorum -> rejectAll
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData) // disagree -> no quorum -> rejectAll
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)

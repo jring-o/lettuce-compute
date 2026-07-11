@@ -1174,6 +1174,14 @@ func (e *Engine) maybeSampleForAudit(ctx context.Context, wu *workunit.WorkUnit,
 			e.recordAuditIneligible(leafID, wu.ID, "canon_empty_key")
 			return
 		}
+		// unverified-ref keys embed the winner's result UUID (a ref not yet head-verified) and are
+		// unadjudicable against runner bytes exactly like canon-empty (F4). Unreachable on current
+		// paths — a sampled ref winner is promoted-verified, so its key is the 64-hex verified hash —
+		// but this mirrors the canon-empty defense-in-depth at the enqueue seam.
+		if strings.HasPrefix(key, "unverified-ref:") {
+			e.recordAuditIneligible(leafID, wu.ID, "unverified_ref_key")
+			return
+		}
 		k := key
 		acceptedKey = &k
 	default:
@@ -1461,14 +1469,28 @@ func numericMatch(a, b map[string]flatVal, epsilon float64) bool {
 	return true
 }
 
-// comparisonKey returns the EXACT-mode grouping key for a result. With no ignore_fields
-// (or no inline output to canonicalize) it is the raw submitted checksum — identical to
-// the historical behavior. With ignore_fields AND inline output present, it is a canonical
-// SHA-256 over the output with those fields stripped and object keys sorted, so volatile
-// provenance (e.g. a wall-clock compute_time_ms) no longer prevents agreement.
+// comparisonKey returns the EXACT-mode grouping key for a result. A volunteer-CLAIMED
+// checksum can never be a comparison key (BG-02b, §10.8): a ref-only result (no inline
+// output bytes) keys on the HEAD-computed verified_output_checksum once the head has
+// fetched and hashed the external bytes itself, and until then gets a per-result
+// non-grouping key ("unverified-ref:<uuid>") so two refs sharing a fabricated claimed
+// checksum can never group — it is NOT an error (erroring would break Compare/rejectAll
+// on legacy rows; this is the canon-empty:<uuid> precedent). An INLINE result with no
+// ignore_fields keys on its output_checksum — head-verified at submit, identical to the
+// historical behavior. With ignore_fields AND inline output present, the key is a
+// canonical SHA-256 over the output with those fields stripped and object keys sorted, so
+// volatile provenance (e.g. a wall-clock compute_time_ms) no longer prevents agreement.
 func comparisonKey(r *result.Result, ignoreFields []string) (string, error) {
-	if len(ignoreFields) == 0 || len(r.OutputData) == 0 {
-		return r.OutputChecksum, nil
+	if len(r.OutputData) == 0 { // ref-only result: no inline bytes, only an external output URL
+		if r.VerifiedOutputChecksum != nil { // the head fetched + hashed these bytes itself
+			return *r.VerifiedOutputChecksum, nil // the ONLY key a ref may ever vote on (§10.8)
+		}
+		// Not yet (or never) head-verified: a per-result key that groups with nothing, so a
+		// volunteer-claimed checksum can never corroborate two refs (the BG-02b hole).
+		return "unverified-ref:" + r.ID.String(), nil
+	}
+	if len(ignoreFields) == 0 {
+		return r.OutputChecksum, nil // inline result: output_checksum is head-verified at submit
 	}
 	stripped, err := strippedValue(r.OutputData, ignoreFields)
 	if err != nil {

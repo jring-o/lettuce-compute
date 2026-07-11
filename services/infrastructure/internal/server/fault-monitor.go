@@ -64,6 +64,19 @@ const resultAuditQueueAgeWarn = 24 * time.Hour
 // hours keeps the lane operator-visible without drowning the log.
 const resultAuditIneligibleWarnEvery = 6 * time.Hour
 
+// contentVerifyWarnEvery throttles the content-verification WARNs (see
+// warnContentVerification): like the other optional probes the sweep runs every scan
+// (and not at all when no probe is wired), but a stalled fetch lane, a run of terminal
+// CONTENT_VERIFICATION_FAILED rows, and knob-off stragglers are all operator-timescale
+// events, so each WARN line repeats at most this often.
+const contentVerifyWarnEvery = 10 * time.Minute
+
+// contentVerifyStalledAge is the oldest-held age past which the fetch-and-verify lane
+// counts as stalled: a ref-only result should be fetched and hashed within seconds, so a
+// row held past ten minutes means the lane is not draining (leadership flapping, the
+// fetch worker is dead, or the origin is unreachable).
+const contentVerifyStalledAge = 10 * time.Minute
+
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
 	workUnitRepo   workunit.WorkUnitRepository
@@ -133,6 +146,45 @@ type FaultMonitor struct {
 	auditContradictedBaseline  int
 	lastEnforcementWarn        time.Time
 	lastEnforcementStalledWarn time.Time
+	// contentVerifyStats is the OPTIONAL fetch-and-verify health probe behind the
+	// observe-only content-verification WARNs (warnContentVerification): a stalled fetch
+	// lane, new terminal CONTENT_VERIFICATION_FAILED rows, and knob-off stragglers. nil
+	// (the default) = no probe wired, sweep skipped at zero cost; the orchestrator wires
+	// it via WithContentVerificationStats. Unlike the result-audit probe it is wired even
+	// when the content-fetch knob is OFF, so the knob-off-with-held lane can observe the
+	// expiry drain (the closure reports the knob state in FetchEnabled).
+	contentVerifyStats func(ctx context.Context) (ContentVerificationStats, error)
+	// contentVerifyBaselineSet / contentVerifyFailedBaseline boot-baseline the terminal
+	// CONTENT_VERIFICATION_FAILED total on the FIRST probe so pre-existing failed rows
+	// never page at startup; only the delta above the baseline WARNs. Touched only by the
+	// single Start loop, so no lock — same as the audit baselines above.
+	contentVerifyBaselineSet    bool
+	contentVerifyFailedBaseline int
+	// Content-verification WARN throttle clocks (zero = never), one per lane so a stalled
+	// page never suppresses a failed-delta or knob-off page. Same single-loop no-lock
+	// justification as the other throttle clocks above.
+	lastContentVerifyStalledWarn time.Time
+	lastContentVerifyFailedWarn  time.Time
+	lastContentVerifyKnobOffWarn time.Time
+}
+
+// ContentVerificationStats is the health snapshot behind the fetch-and-verify observe-only
+// WARNs (warnContentVerification), composed by the orchestrator's probe closure from a
+// single aggregate query over the results table (design doc §10.10). It carries the held
+// (AWAITING_CONTENT_VERIFICATION) population and its oldest age, the lifetime terminal
+// CONTENT_VERIFICATION_FAILED total, and whether the content-fetch knob is currently on.
+type ContentVerificationStats struct {
+	// Held is the current AWAITING_CONTENT_VERIFICATION backlog size.
+	Held int
+	// OldestHeldAge is the age of the oldest held row (0 when none are held). A large
+	// value means the fetch lane is not draining.
+	OldestHeldAge time.Duration
+	// FailedTotal is the lifetime count of CONTENT_VERIFICATION_FAILED rows (the terminal
+	// did-not-become-votable state); the delta above the boot baseline is what WARNs.
+	FailedTotal int
+	// FetchEnabled mirrors LETTUCE_HEAD_CONTENT_FETCH_ENABLED: with fetching off, held
+	// rows can only drain via the 24h holding-expiry lane, never through verification.
+	FetchEnabled bool
 }
 
 // NewFaultMonitor creates a new FaultMonitor with default settings. transitioner may be nil
@@ -196,6 +248,18 @@ func (m *FaultMonitor) WithResultAuditStats(stats func(ctx context.Context) (aud
 // enforcement is enabled; requires WithResultAuditStats to be wired too.
 func (m *FaultMonitor) WithEnforcementWatch(maturationDays int) *FaultMonitor {
 	m.enforcementMaturationDays = maturationDays
+	return m
+}
+
+// WithContentVerificationStats wires the OPTIONAL fetch-and-verify health probe that backs
+// the observe-only content-verification WARNs (warnContentVerification): a stalled fetch
+// lane, new terminal CONTENT_VERIFICATION_FAILED rows, and knob-off stragglers waiting on
+// the holding-expiry lane. Left unset the sweep is a no-op; the orchestrator wires it
+// whenever the results table can hold ref rows (independent of the content-fetch knob, so
+// the knob-off-with-held lane stays observable). Chainable, same pattern as the other
+// optional probes.
+func (m *FaultMonitor) WithContentVerificationStats(stats func(ctx context.Context) (ContentVerificationStats, error)) *FaultMonitor {
+	m.contentVerifyStats = stats
 	return m
 }
 
@@ -336,6 +400,12 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	//     on a dying audit queue (EXPIRED growth / claim starvation). A no-op when result
 	//     audits are off (no probe wired).
 	m.warnResultAudits(ctx)
+
+	// 3d. Content-verification (fetch-and-verify) health: WARN on a stalled fetch lane
+	//     (ref-only results held too long), new terminal CONTENT_VERIFICATION_FAILED rows,
+	//     and knob-off stragglers draining on the holding-expiry lane. A no-op when no
+	//     probe is wired.
+	m.warnContentVerification(ctx)
 
 	// 4. Automatic standing backpressure population: how many volunteers the machine
 	//    currently holds in PROBATION or BENCHED. A no-op when the machine is off (no
@@ -523,6 +593,69 @@ func (m *FaultMonitor) warnEnforcement(stats audit.Stats) {
 			"maturation_days", m.enforcementMaturationDays,
 			"inconclusive_by_runner", topRunnerInconclusive(stats.InconclusiveByRunner, 3),
 			"remedy", "register an additional runner (different hardware class for unpinned units) or enforce manually before the fraud credit matures")
+	}
+}
+
+// warnContentVerification surfaces fetch-and-verify health (see WithContentVerificationStats).
+// Three independent signals, each with its own throttle clock so one page never suppresses
+// another: (1) a stalled fetch lane — held (AWAITING_CONTENT_VERIFICATION) rows whose oldest
+// has waited past contentVerifyStalledAge (leadership flapping, the fetch worker is dead, or
+// an origin outage); (2) new terminal CONTENT_VERIFICATION_FAILED rows since this process's
+// baseline (the delta a human should look at); (3) knob-off-with-held — the content-fetch
+// knob is OFF yet ref rows are still held, so they can only drain on the 24h holding-expiry
+// lane. Only the FAILED lane is boot-baselined (pre-existing terminal rows must not page at
+// startup); the two absolute-state lanes fire on the very first probe by design, so a
+// restart into an already-stalled or knob-off-with-held state pages promptly rather than
+// waiting for a fresh delta. Best-effort like every other sweep here.
+func (m *FaultMonitor) warnContentVerification(ctx context.Context) {
+	if m.contentVerifyStats == nil {
+		return
+	}
+	stalledThrottled := !m.lastContentVerifyStalledWarn.IsZero() && time.Since(m.lastContentVerifyStalledWarn) < contentVerifyWarnEvery
+	failedThrottled := !m.lastContentVerifyFailedWarn.IsZero() && time.Since(m.lastContentVerifyFailedWarn) < contentVerifyWarnEvery
+	knobOffThrottled := !m.lastContentVerifyKnobOffWarn.IsZero() && time.Since(m.lastContentVerifyKnobOffWarn) < contentVerifyWarnEvery
+	if stalledThrottled && failedThrottled && knobOffThrottled {
+		return
+	}
+	stats, err := m.contentVerifyStats(ctx)
+	if err != nil {
+		m.logger.Error("content-verification sweep failed", "error", err)
+		return
+	}
+	// Boot-baseline the terminal FAILED total on the first probe so historical rows never
+	// re-page after a restart; the delta below is measured from here. Unlike warnResultAudits
+	// this does NOT return early, so the two absolute-state lanes still evaluate on the first
+	// probe (on which the failed delta is 0 against the just-set baseline).
+	if !m.contentVerifyBaselineSet {
+		m.contentVerifyBaselineSet = true
+		m.contentVerifyFailedBaseline = stats.FailedTotal
+	}
+	// Lane 1: stalled fetch lane. A held population whose oldest row has outlived the
+	// stalled threshold means the lane is not draining.
+	if !stalledThrottled && stats.Held > 0 && stats.OldestHeldAge > contentVerifyStalledAge {
+		m.lastContentVerifyStalledWarn = time.Now()
+		m.logger.Warn("content-verification fetch lane stalled: ref-only results have sat awaiting an external-output fetch past the stalled threshold (leadership flapping, the fetch worker is dead, or the origin serving output_data_ref is unreachable)",
+			"held", stats.Held,
+			"oldest_held_age", stats.OldestHeldAge.Truncate(time.Minute).String(),
+			"remedy", "confirm this head holds leadership and the content-verification worker is running; check that the origin serving output_data_ref is reachable; held rows otherwise drain via the 24h holding-expiry lane")
+	}
+	// Lane 2: new terminal CONTENT_VERIFICATION_FAILED rows since baseline.
+	if !failedThrottled {
+		if delta := stats.FailedTotal - m.contentVerifyFailedBaseline; delta > 0 {
+			m.lastContentVerifyFailedWarn = time.Now()
+			m.contentVerifyFailedBaseline = stats.FailedTotal
+			m.logger.Warn("content-verification results reached CONTENT_VERIFICATION_FAILED: ref-only results ended their fetch pipeline without becoming votable (fetch failure, size cap, disallowed URL, holding expiry, or unit finalized)",
+				"new_failed", delta,
+				"remedy", "review the leaf's results with ?validation_status=CONTENT_VERIFICATION_FAILED and each row's content_fetch_last_error reason code")
+		}
+	}
+	// Lane 3: knob-off with held rows. With fetching disabled no verification runs, so held
+	// stragglers can only leave via the holding-expiry lane.
+	if !knobOffThrottled && !stats.FetchEnabled && stats.Held > 0 {
+		m.lastContentVerifyKnobOffWarn = time.Now()
+		m.logger.Warn("content-fetch knob is OFF but ref-only results are still held: with fetching disabled none can be verified, so these stragglers wait on the 24h holding-expiry lane to fail them out",
+			"held", stats.Held,
+			"remedy", "re-enable LETTUCE_HEAD_CONTENT_FETCH_ENABLED to verify them, or let the holding-expiry lane drain them after the 24h holding lifetime")
 	}
 }
 

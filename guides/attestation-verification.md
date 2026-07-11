@@ -206,11 +206,13 @@ Two encoding points deserve emphasis:
   string, because the stored value is already at that scale.)
 - **`output_checksum` provenance.** For a result whose full output the head received inline,
   this checksum is head-computed. For a *reference-only* result — where the volunteer
-  submitted a pointer to output stored elsewhere — this is the checksum the volunteer
-  **claimed** and that validation adjudicated on. The attestation states "the outcome was
-  computed over this key," not "the head re-fetched and re-hashed these bytes." A later
-  release makes it head-verified for reference results; until then, read it with that
-  distinction in mind.
+  submitted a pointer to output stored elsewhere — attestations written by heads at schema
+  version 22 or later are head-verified too: the head fetches the referenced URL, hashes the
+  served bytes itself, and only that head-computed hash can enter validation and the
+  attestation, so `output_checksum` is head-verified for every result regardless of how the
+  output arrived. (On rows written by older heads, a reference-only result's checksum was the
+  volunteer's **claim**, adjudicated on but never fetched — read those with that distinction
+  in mind.)
 
 ### The quorum descriptor
 

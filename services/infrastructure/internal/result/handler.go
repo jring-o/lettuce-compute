@@ -61,11 +61,12 @@ func (h *ResultHandler) handleListByLeaf(w http.ResponseWriter, r *http.Request)
 	if vs := r.URL.Query().Get("validation_status"); vs != "" {
 		status := ValidationStatus(vs)
 		switch status {
-		case ValidationPending, ValidationAgreed, ValidationDisagreed:
+		case ValidationPending, ValidationAgreed, ValidationDisagreed,
+			ValidationAwaitingContentVerification, ValidationContentVerificationFailed:
 			filters.ValidationStatus = &status
 		default:
 			apierror.WriteError(w, apierror.ValidationError(
-				"validation_status must be PENDING, AGREED, or DISAGREED",
+				"validation_status must be PENDING, AGREED, DISAGREED, AWAITING_CONTENT_VERIFICATION, or CONTENT_VERIFICATION_FAILED",
 				nil,
 			))
 			return

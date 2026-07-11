@@ -84,8 +84,8 @@ func accrualEngine(t *testing.T, trustRepo trust.Repository, results ...*result.
 // the witness) but the trusted subject does NOT (it has no OTHER trusted witness). The exact
 // asymmetry the Sybil rule requires.
 func TestTrustAccrual_TrustedWitnessAsymmetry(t *testing.T) {
-	trustedRes := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:trusted", 30)
-	untrustedRes := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	trustedRes := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:trusted", 30)
+	untrustedRes := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	engine, wuID := accrualEngine(t, repo, trustedRes, untrustedRes)
 
@@ -106,8 +106,8 @@ func TestTrustAccrual_TrustedWitnessAsymmetry(t *testing.T) {
 
 // (ii) no trusted subject -> zero accruals (a Sybil ring cannot bootstrap itself).
 func TestTrustAccrual_NoTrustedWitnessNoAccrual(t *testing.T) {
-	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 0)
-	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 10) // below floor 25
+	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 0)
+	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 10) // below floor 25
 	repo := newFakeTrustRepo()
 	engine, wuID := accrualEngine(t, repo, r1, r2)
 
@@ -127,9 +127,9 @@ func TestTrustAccrual_NoTrustedWitnessNoAccrual(t *testing.T) {
 func TestTrustAccrual_MultiDeviceSubjectAccruesOnce(t *testing.T) {
 	// Subject A on two devices (distinct volunteers, one DID), plus trusted subject B — both
 	// trusted (score 30 >= floor 25), so both have a trusted OTHER and accrue.
-	aDev1 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 30)
-	aDev2 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 30)
-	b := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 30)
+	aDev1 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 30)
+	aDev2 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 30)
+	b := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 30)
 	repo := newFakeTrustRepo()
 	engine, wuID := accrualEngine(t, repo, aDev1, aDev2, b)
 
@@ -150,8 +150,8 @@ func TestTrustAccrual_MultiDeviceSubjectAccruesOnce(t *testing.T) {
 
 // (iv) a nil trust repo (feature off) never panics.
 func TestTrustAccrual_NilRepoNoPanic(t *testing.T) {
-	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 30)
-	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 30)
+	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 30)
+	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 30)
 	engine, wuID := accrualEngine(t, nil, r1, r2)
 
 	vr, err := engine.TryValidate(context.Background(), wuID)

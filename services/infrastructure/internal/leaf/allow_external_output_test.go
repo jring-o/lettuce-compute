@@ -61,6 +61,11 @@ func TestValidationConfig_AllowExternalOutput_ValidatesEitherWay(t *testing.T) {
 	for _, allow := range []bool{false, true} {
 		c := base()
 		c.AllowExternalOutput = allow
+		// Opting in now requires a non-empty host allowlist (D10, §10.3): the reference
+		// gate matches a submitted URL host against it, and an empty list matches nothing.
+		if allow {
+			c.ExternalOutputHosts = []string{"storage.example.com"}
+		}
 		if apiErr := ValidateValidationConfig(c); apiErr != nil {
 			t.Errorf("ValidateValidationConfig(allow=%v) unexpected error: %v", allow, apiErr)
 		}

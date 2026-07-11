@@ -361,21 +361,52 @@ func TestRepairUnit_UnparseableCandidateSkipped(t *testing.T) {
 	}
 }
 
-func TestRepairUnit_RefOnlyExactMatchesClaimedChecksum(t *testing.T) {
-	// A ref-only EXACT candidate has NO inline bytes; comparisonKey falls back to its CLAIMED
-	// checksum, which adjudicates raw against the re-executed ground-truth bytes — exactly the
-	// validation-time semantics (BG-02b residual until slice 5).
+// TestRepairUnit_RefOnly_VerifiedHashOnly is the closure of backlog note (i) (§10.8): slice-3
+// repair may grant a ref-only dissenter ONLY on a HEAD-VERIFIED hash, never on a volunteer-CLAIMED
+// checksum. comparisonKey keys a ref on verified_output_checksum once the head has fetched and
+// hashed the bytes, and until then on a per-result "unverified-ref:" key that matches nothing.
+func TestRepairUnit_RefOnly_VerifiedHashOnly(t *testing.T) {
 	gt := []byte(`{"answer":42}`)
-	cand := disagreed(makeResult(types.NewID(), types.NewID(), sha256Hex(gt), nil)) // nil OutputData = ref-only
-	f := newRepairFixture(t, leaf.ComparisonExact, nil, nil, 1.0, cand)
 
-	rep, err := f.run(gt)
-	if err != nil {
-		t.Fatalf("RepairUnit: %v", err)
-	}
-	if rep.Repaired != 1 {
-		t.Fatalf("Repaired = %d, want 1 (ref-only claimed-checksum match)", rep.Repaired)
-	}
+	// (1) THE note-(i) REGRESSION: an UNVERIFIED ref-only dissenter whose volunteer-CLAIMED checksum
+	// EQUALS the ground-truth hash is NOT repaired. Its comparisonKey is "unverified-ref:<uuid>",
+	// which matches no ground-truth 64-hex, so AdjudicateAudit returns INCONCLUSIVE and repair skips
+	// it. FAILS on pre-fix code, which repaired on the claimed checksum (the exact BG-02b hole).
+	t.Run("unverified claimed checksum is never repaired", func(t *testing.T) {
+		cand := disagreed(makeResult(types.NewID(), types.NewID(), sha256Hex(gt), nil)) // ref-only; VerifiedOutputChecksum nil
+		f := newRepairFixture(t, leaf.ComparisonExact, nil, nil, 1.0, cand)
+
+		rep, err := f.run(gt)
+		if err != nil {
+			t.Fatalf("RepairUnit: %v", err)
+		}
+		if rep.Repaired != 0 {
+			t.Fatalf("Repaired = %d, want 0 (a volunteer-claimed checksum can no longer earn a repair grant)", rep.Repaired)
+		}
+		if got := rep.Skipped[cand.ID]; got != repairSkipInconclusive {
+			t.Errorf("Skipped[cand] = %q, want %q (AdjudicateAudit treats an unverified-ref key as unadjudicable)", got, repairSkipInconclusive)
+		}
+	})
+
+	// (2) A VERIFIED ref dissenter IS repaired on the head-verified hash — exactly validation-time
+	// semantics. Promotion stamped verified_output_checksum AND overwrote output_checksum with the
+	// same head hash (bytes are hashed then discarded, so OutputData stays empty). comparisonKey
+	// keys on that verified hash, which equals the re-executed ground-truth hash, so AdjudicateAudit
+	// MATCHES and the dissenter repairs.
+	t.Run("verified head hash is repaired", func(t *testing.T) {
+		verified := sha256Hex(gt)
+		cand := disagreed(makeResult(types.NewID(), types.NewID(), verified, nil)) // ref-only: bytes hashed + discarded
+		cand.VerifiedOutputChecksum = &verified                                    // promotion stamped the head-computed hash
+		f := newRepairFixture(t, leaf.ComparisonExact, nil, nil, 1.0, cand)
+
+		rep, err := f.run(gt)
+		if err != nil {
+			t.Fatalf("RepairUnit: %v", err)
+		}
+		if rep.Repaired != 1 {
+			t.Fatalf("Repaired = %d, want 1 (a verified ref dissenter repairs on the head-verified hash)", rep.Repaired)
+		}
+	})
 }
 
 func TestRepairUnit_CanonEmptySkipped(t *testing.T) {

@@ -26,9 +26,9 @@ func stampProbation(r *result.Result) *result.Result {
 // it would be the trusted witness that lets a and b each accrue; because a probation result is
 // skipped in accrual, t witnesses nothing, so NOBODY accrues — and t itself earns nothing.
 func TestTrustAccrual_ProbationNeitherAccruesNorWitnesses(t *testing.T) {
-	okA := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 0)
-	okB := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 0)
-	probationTrusted := stampProbation(stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:t", 30))
+	okA := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 0)
+	okB := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 0)
+	probationTrusted := stampProbation(stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:t", 30))
 	repo := newFakeTrustRepo()
 	engine, wuID := accrualEngine(t, repo, okA, okB, probationTrusted)
 

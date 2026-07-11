@@ -328,7 +328,7 @@ export interface HealthResponse {
   database: string;
 }
 
-export type ResultValidationStatus = "PENDING" | "AGREED" | "DISAGREED";
+export type ResultValidationStatus = "PENDING" | "AGREED" | "DISAGREED" | "AWAITING_CONTENT_VERIFICATION" | "CONTENT_VERIFICATION_FAILED";
 
 export interface ResultExecutionMetadata {
   wall_clock_seconds: number;

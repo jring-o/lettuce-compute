@@ -32,8 +32,8 @@ var _ runnerSubjectsProvider = (audit.RunnersRepository)(nil)
 // path; a head whose registry is empty on deploy day must not freeze newcomer accrual). Fails
 // against an un-gated D9 upgrade that would demand a runner or two witnesses.
 func TestTrustAccrualD9_RegistryEmptyLegacyRuleFires(t *testing.T) {
-	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:trusted", 30)
-	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:trusted", 30)
+	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	prov := &fakeRunnerSubjects{subjects: nil} // registry empty
 	engine, wuID := accrualEngine(t, repo, trusted, newcomer)
@@ -53,8 +53,8 @@ func TestTrustAccrualD9_RegistryEmptyLegacyRuleFires(t *testing.T) {
 // registry ACTIVE, the sole witness is a trusted NON-runner -> NO accrual. THE D9 regression: the
 // legacy rule would accrue the newcomer here.
 func TestTrustAccrualD9_ActiveRegistryNonRunnerWitnessNoAccrual(t *testing.T) {
-	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:trusted", 30)
-	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:trusted", 30)
+	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	// A DIFFERENT active runner exists (registry active), but it is not a witness on this unit — and
 	// an inactive/unregistered runner would likewise be absent from this set, counting only as a
@@ -77,8 +77,8 @@ func TestTrustAccrualD9_ActiveRegistryNonRunnerWitnessNoAccrual(t *testing.T) {
 // registry ACTIVE, the trusted witness IS an active runner -> the newcomer accrues under rule (a)
 // (the head's own corroborator single-witnesses newcomer bootstrap, preserving G2).
 func TestTrustAccrualD9_ActiveRunnerWitnessAccrues(t *testing.T) {
-	runner := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:runner", 30)
-	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	runner := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:runner", 30)
+	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	prov := &fakeRunnerSubjects{subjects: []string{"did:plc:runner"}} // the witness is an active runner
 	engine, wuID := accrualEngine(t, repo, runner, newcomer)
@@ -98,9 +98,9 @@ func TestTrustAccrualD9_ActiveRunnerWitnessAccrues(t *testing.T) {
 // registry ACTIVE, TWO trusted non-runner witnesses -> the newcomer accrues under rule (b) (an
 // inactive/unregistered runner counts as a plain trusted subject exactly like these).
 func TestTrustAccrualD9_TwoTrustedNonRunnersAccrue(t *testing.T) {
-	trustedA := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 30)
-	trustedB := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 30)
-	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	trustedA := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 30)
+	trustedB := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 30)
+	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	prov := &fakeRunnerSubjects{subjects: []string{"did:plc:unrelated-runner"}} // active registry, no witness is a runner
 	engine, wuID := accrualEngine(t, repo, trustedA, trustedB, newcomer)
@@ -122,8 +122,8 @@ func TestTrustAccrualD9_TwoTrustedNonRunnersAccrue(t *testing.T) {
 // registry query ERROR -> fall back to the legacy rule + WARN (G2: a transient DB blip must not
 // freeze newcomer bootstrap).
 func TestTrustAccrualD9_RegistryErrorFallsBackToLegacy(t *testing.T) {
-	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:trusted", 30)
-	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:newcomer", 0)
+	trusted := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:trusted", 30)
+	newcomer := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:newcomer", 0)
 	repo := newFakeTrustRepo()
 	prov := &fakeRunnerSubjects{err: errors.New("registry query blip")}
 	engine, wuID := accrualEngine(t, repo, trusted, newcomer)
@@ -143,8 +143,8 @@ func TestTrustAccrualD9_RegistryErrorFallsBackToLegacy(t *testing.T) {
 // No trusted subject at all -> nobody accrues and the registry is never queried (there is no
 // candidate to decide, so the query is skipped).
 func TestTrustAccrualD9_NoCandidateSkipsRegistryQuery(t *testing.T) {
-	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:a", 0)
-	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), "aaaa", nil), "did:plc:b", 0)
+	r1 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:a", 0)
+	r2 := stampSubject(makeResult(types.NewID(), types.NewID(), inlineAgreeCk, inlineAgreeData), "did:plc:b", 0)
 	repo := newFakeTrustRepo()
 	prov := &fakeRunnerSubjects{subjects: []string{"did:plc:runner"}}
 	engine, wuID := accrualEngine(t, repo, r1, r2)

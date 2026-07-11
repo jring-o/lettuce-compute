@@ -24,7 +24,7 @@ func TestSpotCheck_WaitsForTwoResults(t *testing.T) {
 	wu.SpotCheck = true
 
 	// Only one result so far.
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -52,7 +52,7 @@ func TestSpotCheck_BothAgree_BothGetCredit(t *testing.T) {
 	wuID := types.NewID()
 	vol1 := types.NewID()
 	vol2 := types.NewID()
-	checksum := "aaaa"
+	checksum := inlineAgreeCk
 
 	proj := makeLeaf(leafID, 1, 1.0, "EXACT", nil, 1.0)
 	proj.ValidationConfig.SpotCheckEnabled = true
@@ -61,8 +61,8 @@ func TestSpotCheck_BothAgree_BothGetCredit(t *testing.T) {
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	wu.SpotCheck = true
 
-	r1 := makeResult(wuID, vol1, checksum, nil)
-	r2 := makeResult(wuID, vol2, checksum, nil)
+	r1 := makeResult(wuID, vol1, checksum, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, checksum, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -125,8 +125,8 @@ func TestSpotCheck_Disagree_BothRejected(t *testing.T) {
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	wu.SpotCheck = true
 
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil) // Different checksum
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData) // Different checksum
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -184,7 +184,7 @@ func TestSpotCheck_NonSpotCheckWU_UsesRedundancyFactor(t *testing.T) {
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	wu.SpotCheck = false // NOT a spot-check WU
 
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -230,8 +230,8 @@ func TestSpotCheck_DisagreeWithActiveAssignment_Pending(t *testing.T) {
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	wu.SpotCheck = true
 
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
