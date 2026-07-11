@@ -302,6 +302,81 @@ func TestRequireAuth_WithUserPassesThrough(t *testing.T) {
 	}
 }
 
+// --- requireAdmin tests ---
+
+func TestRequireAdmin_AdminPassesThrough(t *testing.T) {
+	called := false
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := requireAdmin(inner.ServeHTTP)
+
+	req := httptest.NewRequest("GET", "/api/v1/credit/analysis/cross-leaf", nil)
+	ctx := ContextWithUser(req.Context(), &AuthUser{
+		ID:   types.NewID(),
+		Role: "ADMIN",
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if !called {
+		t.Fatal("expected inner handler to be called for admin")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestRequireAdmin_UserGetsForbidden(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := requireAdmin(inner.ServeHTTP)
+
+	req := httptest.NewRequest("GET", "/api/v1/credit/analysis/cross-leaf", nil)
+	ctx := ContextWithUser(req.Context(), &AuthUser{
+		ID:   types.NewID(),
+		Role: "USER",
+	})
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+
+	var resp apierror.ErrorResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if resp.Error.Code != "FORBIDDEN" {
+		t.Fatalf("expected FORBIDDEN, got %s", resp.Error.Code)
+	}
+}
+
+func TestRequireAdmin_NoUserGetsForbidden(t *testing.T) {
+	// requireAdmin assumes requireAuth already ran, but must still fail closed
+	// if wired without it.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handler := requireAdmin(inner.ServeHTTP)
+
+	req := httptest.NewRequest("GET", "/api/v1/credit/analysis/cross-leaf", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
 // --- requireLeafOwnership tests ---
 
 func TestRequireProjectOwnership_CreatorCanAccess(t *testing.T) {

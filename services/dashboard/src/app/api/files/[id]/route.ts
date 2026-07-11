@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { auth } from "@/lib/auth";
+import { requireFileAccess } from "@/lib/authz-routes";
 import { getFileContent } from "@/lib/file-storage";
 
 function sanitizeFilename(name: string): string {
@@ -11,17 +11,16 @@ export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const session = await auth();
-  if (!session?.user) {
-    return NextResponse.json(
-      { error: { code: "UNAUTHENTICATED", message: "You must be signed in." } },
-      { status: 401 },
-    );
-  }
-
   const { id } = await params;
-  const file = await getFileContent(id);
 
+  // A file blob is readable by its uploader, the owner of its leaf, or an
+  // ADMIN (BG-10). requireFileAccess resolves the file and enforces that
+  // predicate; every denial — including "no such file" — is the same 404, so a
+  // caller cannot probe which file ids exist.
+  const access = await requireFileAccess(id);
+  if (!access.ok) return access.response;
+
+  const file = await getFileContent(id);
   if (!file) {
     return NextResponse.json(
       { error: { code: "NOT_FOUND", message: "File not found" } },

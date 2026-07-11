@@ -78,8 +78,13 @@ func setupHandlerServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) 
 
 	mux := http.NewServeMux()
 	leafHandler.RegisterRoutes(mux)
-	// Leaf management routes (no auth in tests).
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	// Leaf management routes (no auth in tests). Create binds creator_id to the
+	// caller (★BG-11d-write); inject an admin viewer so this harness can set
+	// creator_id via the request body.
+	mux.HandleFunc("POST /api/v1/leafs", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(leaf.WithViewer(r.Context(), leaf.Viewer{IsAdmin: true, Authed: true}))
+		leafHandler.HandleCreate(w, r)
+	})
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", leafHandler.HandleActivate)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", leafHandler.HandleConfigure)

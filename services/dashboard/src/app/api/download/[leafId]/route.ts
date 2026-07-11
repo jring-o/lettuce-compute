@@ -1,27 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
-import { infrastructureClient } from "@/lib/infrastructure-client";
-import type { WorkUnitSummary } from "@/types/infrastructure";
 
-// TODO(v0.6): Add results list endpoint to infrastructure API for full result data download.
-// For Alpha, we export work unit summary data (id, state, priority, attempts, timestamps).
-// Parameters require fetching full work units individually — we batch those fetches here.
+import { requireLeafAccess } from "@/lib/authz-routes";
+import { infrastructureClient } from "@/lib/infrastructure-client";
+import type { Result, WorkUnitSummary } from "@/types/infrastructure";
+
+// BG-23: "Download Results" must export the SCIENCE-COMPLETE payload. Before
+// this fix the endpoint paginated COMPLETED units while the button keyed on the
+// disjoint work_units_validated > 0 (so a finished leaf downloaded nothing),
+// and even with data it exported work-unit INPUT parameters, not results. It
+// now fetches VALIDATED units — the same state the button keys on — and emits
+// each unit's validated result output_data, keeping the input parameters as
+// context. Ownership is enforced through the shared requireLeafAccess adapter
+// (the result output_data is owner-only contents).
+
+interface ExportRow {
+  work_unit_id: string;
+  parameters: Record<string, unknown>;
+  output_data: Record<string, unknown> | null;
+  output_data_ref: string | null;
+  output_checksum: string | null;
+  validated_at: string | null;
+}
 
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ leafId: string }> },
 ) {
-  const session = await auth();
-  if (!session?.user) {
-    return NextResponse.json(
-      { error: { code: "UNAUTHENTICATED", message: "You must be signed in." } },
-      { status: 401 },
-    );
-  }
-
   const { leafId } = await params;
-  const format = request.nextUrl.searchParams.get("format") ?? "json";
 
+  const access = await requireLeafAccess(leafId);
+  if (!access.ok) return access.response;
+
+  const format = request.nextUrl.searchParams.get("format") ?? "json";
   if (format !== "csv" && format !== "json") {
     return NextResponse.json(
       { error: { code: "INVALID_FORMAT", message: "Format must be csv or json." } },
@@ -29,104 +39,124 @@ export async function GET(
     );
   }
 
-  // Fetch leaf and verify ownership
-  let leaf;
+  // The leaf is needed only for the download filename; ownership is already
+  // enforced above.
+  let slug = leafId;
   try {
-    leaf = await infrastructureClient.getLeaf(leafId);
+    const leaf = await infrastructureClient.getLeaf(leafId);
+    slug = leaf.slug;
   } catch {
-    return NextResponse.json(
-      { error: { code: "NOT_FOUND", message: "Leaf not found." } },
-      { status: 404 },
-    );
+    // Fall back to the id in the filename; not fatal.
   }
 
-  if (leaf.creator_id !== session.user.id) {
-    return NextResponse.json(
-      { error: { code: "NOT_FOUND", message: "Leaf not found." } },
-      { status: 404 },
-    );
-  }
-
-  // Paginate through all COMPLETED work units
-  const completedUnits: WorkUnitSummary[] = [];
+  // Paginate through all VALIDATED work units — the science-complete state the
+  // "Download Results" button keys on (work_units_validated > 0).
+  const validatedUnits: WorkUnitSummary[] = [];
   let cursor: string | undefined;
-
   do {
-    const result = await infrastructureClient.listWorkUnits(leafId, {
-      state: "COMPLETED",
+    const page = await infrastructureClient.listWorkUnits(leafId, {
+      state: "VALIDATED",
       limit: 200,
       cursor,
     });
-    completedUnits.push(...result.data);
-    cursor = result.pagination.next_cursor ?? undefined;
+    validatedUnits.push(...page.data);
+    cursor = page.pagination.next_cursor ?? undefined;
   } while (cursor);
 
-  if (completedUnits.length === 0) {
+  if (validatedUnits.length === 0) {
     return new NextResponse(null, { status: 204 });
   }
 
-  // Fetch full work units to get parameters (batch in parallel)
-  const fullUnits = await Promise.all(
-    completedUnits.map((wu) =>
-      infrastructureClient.getWorkUnit(leafId, wu.id).catch(() => null),
-    ),
-  );
+  // For each validated unit fetch its parameters (full work unit) and its
+  // agreed result's output_data, in parallel.
+  const rows = (
+    await Promise.all(
+      validatedUnits.map(async (wu): Promise<ExportRow | null> => {
+        const [fullUnit, results] = await Promise.all([
+          infrastructureClient.getWorkUnit(leafId, wu.id).catch(() => null),
+          infrastructureClient
+            .listResults(leafId, {
+              work_unit_id: wu.id,
+              validation_status: "AGREED",
+              limit: 1,
+            })
+            .then((r) => r.data[0] ?? null)
+            .catch(() => null as Result | null),
+        ]);
 
-  const results = fullUnits
-    .filter((wu) => wu !== null)
-    .map((wu) => ({
-      work_unit_id: wu.id,
-      parameters: wu.parameters ?? {},
-      state: wu.state,
-      created_at: wu.created_at,
-    }));
+        if (!fullUnit && !results) return null;
 
-  const filename = `${leaf.slug}-results.${format}`;
+        return {
+          work_unit_id: wu.id,
+          parameters: fullUnit?.parameters ?? {},
+          output_data: results?.output_data ?? null,
+          output_data_ref: results?.output_data_ref ?? null,
+          output_checksum: results?.output_checksum ?? null,
+          validated_at: results?.validated_at ?? null,
+        };
+      }),
+    )
+  ).filter((r): r is ExportRow => r !== null);
+
+  const filename = `${slug}-results.${format}`;
+  const disposition = `attachment; filename="${filename.replace(/["\r\n]/g, "_")}"`;
 
   if (format === "json") {
-    return new NextResponse(JSON.stringify(results, null, 2), {
+    return new NextResponse(JSON.stringify(rows, null, 2), {
       headers: {
         "Content-Type": "application/json",
-        "Content-Disposition": `attachment; filename="${filename.replace(/["\r\n]/g, "_")}"`,
+        "Content-Disposition": disposition,
       },
     });
   }
 
-  // CSV format
-  // Build header from parameter keys of first result
-  const paramKeys = new Set<string>();
-  for (const r of results) {
-    for (const key of Object.keys(r.parameters)) {
-      paramKeys.add(key);
-    }
-  }
-  const paramCols = Array.from(paramKeys).sort();
-  const headers = ["work_unit_id", ...paramCols, "state", "created_at"];
-
-  const rows = [headers.join(",")];
-  for (const r of results) {
-    const values = [
-      r.work_unit_id,
-      ...paramCols.map((k) => {
-        const val = r.parameters[k];
-        if (val === undefined || val === null) return "";
-        const str = String(val);
-        // Escape CSV values with commas or quotes
-        if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-          return `"${str.replace(/"/g, '""')}"`;
-        }
-        return str;
-      }),
-      r.state,
-      r.created_at,
-    ];
-    rows.push(values.join(","));
-  }
-
-  return new NextResponse(rows.join("\n"), {
+  return new NextResponse(toCsv(rows), {
     headers: {
       "Content-Type": "text/csv",
-      "Content-Disposition": `attachment; filename="${filename.replace(/["\r\n]/g, "_")}"`,
+      "Content-Disposition": disposition,
     },
   });
+}
+
+// toCsv flattens each row's parameter keys into columns (the input context) and
+// carries the result as a JSON-encoded output_data column (output is arbitrary
+// nested JSON, not a flat scalar set), plus the checksum and validated_at.
+function toCsv(rows: ExportRow[]): string {
+  const paramKeys = new Set<string>();
+  for (const r of rows) {
+    for (const key of Object.keys(r.parameters)) paramKeys.add(key);
+  }
+  const paramCols = Array.from(paramKeys).sort();
+  const headers = [
+    "work_unit_id",
+    ...paramCols,
+    "output_data",
+    "output_data_ref",
+    "output_checksum",
+    "validated_at",
+  ];
+
+  const escape = (val: unknown): string => {
+    if (val === undefined || val === null) return "";
+    const str = typeof val === "string" ? val : JSON.stringify(val);
+    if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const lines = [headers.join(",")];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.work_unit_id,
+        ...paramCols.map((k) => escape(r.parameters[k])),
+        escape(r.output_data),
+        escape(r.output_data_ref),
+        escape(r.output_checksum),
+        escape(r.validated_at),
+      ].join(","),
+    );
+  }
+  return lines.join("\n");
 }

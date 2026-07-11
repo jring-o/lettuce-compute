@@ -156,7 +156,7 @@ func setupTwoReplicas(t *testing.T) (*scaleoutEnv, func()) {
 	aggHandler.RegisterRoutes(mux)
 	identityHandler.RegisterRoutes(mux)
 	mux.HandleFunc("GET /api/v1/head", headHandler.HandleGetHeadInfo)
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	mux.HandleFunc("POST /api/v1/leafs", e2eAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", leafHandler.HandleConfigure)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", leafHandler.HandleActivate)

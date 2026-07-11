@@ -90,11 +90,54 @@ func TestArtifactVersionRegistry(t *testing.T) {
 	}
 
 	// The current version cannot be deleted; a non-current/unpinned one can.
-	if err := repo.DeleteVersion(ctx, v1.ID); err == nil {
+	if err := repo.DeleteVersion(ctx, lf.ID, v1.ID); err == nil {
 		t.Fatal("expected delete of current version to be refused")
 	}
-	if err := repo.DeleteVersion(ctx, v2.ID); err != nil {
+	if err := repo.DeleteVersion(ctx, lf.ID, v2.ID); err != nil {
 		t.Fatalf("delete non-current v2: %v", err)
+	}
+}
+
+// TestDeleteVersionIsLeafScoped is the BG-11c object-scoping regression at the
+// repository layer: DeleteVersion must act ONLY on a version of the named leaf.
+// A version id from a DIFFERENT leaf resolves to NotFound and is never touched,
+// even though it is non-current and unpinned (i.e. would otherwise be
+// deletable). This is what makes the authOwner wrapper on the route sufficient:
+// the wrapper authorizes {leaf_id}, and the SQL acts on that same leaf only.
+func TestDeleteVersionIsLeafScoped(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+	repo := NewPgxRepository(pool)
+
+	ownerA := createTestUser(t, pool, "scopeowner-a")
+	ownerB := createTestUser(t, pool, "scopeowner-b")
+	leafA := newTestLeaf(&ownerA)
+	leafB := newTestLeaf(&ownerB)
+	if err := repo.Create(ctx, leafA); err != nil {
+		t.Fatalf("create leaf A: %v", err)
+	}
+	if err := repo.Create(ctx, leafB); err != nil {
+		t.Fatalf("create leaf B: %v", err)
+	}
+
+	// A non-current, never-pinned version of victim leaf B.
+	vB := publishTestVersion(t, repo, leafB.ID, "victim-v1")
+
+	// Attacker owns leaf A and names B's version under A's id.
+	err := repo.DeleteVersion(ctx, leafA.ID, vB.ID)
+	if err == nil {
+		t.Fatal("cross-leaf DeleteVersion must be refused, but it succeeded")
+	}
+
+	// B's version must still exist.
+	if _, err := repo.GetVersionByID(ctx, vB.ID); err != nil {
+		t.Fatalf("victim version was removed by a cross-leaf delete: %v", err)
+	}
+
+	// The legitimate owner (correct leaf id) can still delete it.
+	if err := repo.DeleteVersion(ctx, leafB.ID, vB.ID); err != nil {
+		t.Fatalf("owner delete of own version: %v", err)
 	}
 }
 
@@ -138,7 +181,7 @@ func TestArtifactVersionPinning(t *testing.T) {
 	}
 
 	// A version pinned by a non-terminal unit cannot be deleted.
-	if err := repo.DeleteVersion(ctx, v1.ID); err == nil {
+	if err := repo.DeleteVersion(ctx, lf.ID, v1.ID); err == nil {
 		t.Fatal("expected delete of a live-pinned version to be refused")
 	}
 }

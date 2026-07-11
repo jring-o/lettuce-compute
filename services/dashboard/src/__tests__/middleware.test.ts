@@ -3,35 +3,31 @@
  */
 
 /**
- * Tests for the middleware configuration and redirect logic.
+ * Tests for the middleware configuration and its default-deny / redirect logic.
  *
  * The actual middleware (src/middleware.ts) does:
  *   const { auth } = NextAuth(authConfig);
- *   export default auth((req) => { ...redirect logic... });
+ *   export default auth((req) => { ...default-deny + redirect logic... });
  *
  * `next-auth` is an ESM-only package that jest cannot load untransformed, so we
  * mock it at the boundary (the same pattern used by auth/authorize.test.ts).
  * The mock's default export stands in for `NextAuth()` and returns an `auth`
  * wrapper that captures the callback the middleware passes to it. We then invoke
- * that real callback directly against mock requests to exercise the redirect /
- * allow logic with the real `next/server` `NextResponse`.
+ * that real callback directly against mock requests to exercise the logic with
+ * the real `next/server` `NextResponse`.
  */
 
-// Minimal shape of the request the middleware callback reads off of.
 type MockReq = {
   auth: { user: { id: string; username: string; role: string } } | null;
   nextUrl: { pathname: string; origin: string };
 };
 type MiddlewareCallback = (req: MockReq) => Response | undefined;
 
-// We capture the callback passed to auth() so we can test it in isolation.
 let capturedCallback: MiddlewareCallback | null = null;
 
 jest.mock("next-auth", () => ({
   __esModule: true,
   default: () => ({
-    // `auth` wraps the middleware callback; capture it and return it unchanged
-    // so the module's default export is the bare callback we want to test.
     auth: (cb: MiddlewareCallback) => {
       capturedCallback = cb;
       return cb;
@@ -42,11 +38,7 @@ jest.mock("next-auth", () => ({
 // Must import after mock setup
 import { config } from "@/middleware";
 
-// Helper to create a mock request
-function mockRequest(
-  pathname: string,
-  authenticated: boolean,
-): MockReq {
+function mockRequest(pathname: string, authenticated: boolean): MockReq {
   return {
     auth: authenticated
       ? { user: { id: "1", username: "testuser", role: "USER" } }
@@ -65,34 +57,28 @@ describe("middleware", () => {
   });
 
   describe("matcher config", () => {
-    it("matches /dashboard routes", () => {
+    it("gates the dashboard pages", () => {
       expect(config.matcher).toContain("/dashboard/:path*");
     });
 
-    it("only gates /dashboard/:path* and nothing else", () => {
-      // The matcher must be exactly the dashboard path so that no other
-      // route (public pages, API, auth) is unintentionally gated.
-      expect(config.matcher).toEqual(["/dashboard/:path*"]);
+    it("gates the whole /api/* surface (default-deny authentication)", () => {
+      expect(config.matcher).toContain("/api/:path*");
     });
 
-    it("does not include public routes like /leafs", () => {
+    it("gates exactly the dashboard pages and the API surface", () => {
+      expect(config.matcher).toEqual(["/dashboard/:path*", "/api/:path*"]);
+    });
+
+    it("does not include public page routes like /leafs", () => {
       const matchers = config.matcher as string[];
       const matchesProjects = matchers.some(
         (m) => m === "/leafs" || m === "/leafs/:path*",
       );
       expect(matchesProjects).toBe(false);
     });
-
-    it("does not include auth routes", () => {
-      const matchers = config.matcher as string[];
-      const matchesAuth = matchers.some(
-        (m) => m.includes("sign-in") || m.includes("sign-up"),
-      );
-      expect(matchesAuth).toBe(false);
-    });
   });
 
-  describe("redirect logic", () => {
+  describe("dashboard page redirect logic", () => {
     it("captures the auth callback", () => {
       expect(capturedCallback).not.toBeNull();
     });
@@ -101,20 +87,18 @@ describe("middleware", () => {
       const req = mockRequest("/dashboard/leafs", false);
       const result = capturedCallback!(req);
 
-      // NextResponse.redirect returns a Response with status 307
       expect(result).toBeDefined();
       expect(result!.status).toBe(307);
-
-      const location = result!.headers.get("location");
-      expect(location).toContain("/sign-in");
+      expect(result!.headers.get("location")).toContain("/sign-in");
     });
 
     it("includes callbackUrl in redirect", () => {
       const req = mockRequest("/dashboard/leafs", false);
       const result = capturedCallback!(req);
 
-      const location = result!.headers.get("location");
-      expect(location).toContain("callbackUrl=%2Fdashboard%2Fleafs");
+      expect(result!.headers.get("location")).toContain(
+        "callbackUrl=%2Fdashboard%2Fleafs",
+      );
     });
 
     it("does not redirect authenticated users", () => {
@@ -128,10 +112,55 @@ describe("middleware", () => {
       const req = mockRequest("/dashboard/leafs/abc-123", false);
       const result = capturedCallback!(req);
 
-      const location = result!.headers.get("location");
-      expect(location).toContain(
+      expect(result!.headers.get("location")).toContain(
         "callbackUrl=%2Fdashboard%2Fleafs%2Fabc-123",
       );
+    });
+  });
+
+  describe("/api/* default-deny", () => {
+    it("returns a 401 (not a redirect) for an anonymous data API call", () => {
+      const req = mockRequest("/api/viz/results", false);
+      const result = capturedCallback!(req);
+
+      expect(result).toBeDefined();
+      expect(result!.status).toBe(401);
+      // Must NOT be the HTML sign-in redirect meant for page routes.
+      expect(result!.headers.get("location")).toBeNull();
+    });
+
+    it("allows an authenticated /api/* call through", () => {
+      const req = mockRequest("/api/viz/results", true);
+      expect(capturedCallback!(req)).toBeUndefined();
+    });
+
+    it("allowlists /api/auth/* (sign-in handshake) anonymously", () => {
+      const req = mockRequest("/api/auth/session", false);
+      expect(capturedCallback!(req)).toBeUndefined();
+    });
+
+    it("allowlists /api/viz/bundle/* (public author bundle) anonymously", () => {
+      const req = mockRequest("/api/viz/bundle/abc/index.html", false);
+      expect(capturedCallback!(req)).toBeUndefined();
+    });
+
+    it("does NOT allowlist /api/viz/results via a loose /api/viz prefix (BG-07)", () => {
+      const req = mockRequest("/api/viz/results", false);
+      const result = capturedCallback!(req);
+      expect(result!.status).toBe(401);
+    });
+
+    it("does NOT treat a /api/viz/bundle-lookalike segment as allowlisted", () => {
+      // "/api/viz/bundlexyz" shares the string prefix but not the segment.
+      const req = mockRequest("/api/viz/bundlexyz", false);
+      const result = capturedCallback!(req);
+      expect(result!.status).toBe(401);
+    });
+
+    it("denies an anonymous upload", () => {
+      const req = mockRequest("/api/upload", false);
+      const result = capturedCallback!(req);
+      expect(result!.status).toBe(401);
     });
   });
 });

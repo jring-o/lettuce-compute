@@ -51,6 +51,18 @@ type betaEnv struct {
 
 // setupBetaServer creates HTTP and gRPC servers wired with all repos including
 // checkpoint support (which setupAlphaServer lacks).
+// e2eAdminViewer injects an ADMIN leaf.Viewer, mirroring the router's
+// requireAuth+leafViewer wrappers for an operator caller. handleCreate now
+// binds creator_id to the caller (★BG-11d-write) and honors an explicit body
+// creator_id only for an ADMIN, so these unauthenticated lifecycle harnesses
+// wrap create with it to keep controlling the leaf's owner via the request body.
+func e2eAdminViewer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := leaf.WithViewer(r.Context(), leaf.Viewer{IsAdmin: true, Authed: true})
+		next(w, r.WithContext(ctx))
+	}
+}
+
 func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	t.Helper()
 
@@ -129,7 +141,7 @@ func setupBetaServer(t *testing.T) (*betaEnv, func()) {
 	identityHandler.RegisterRoutes(mux)
 
 	// Protected routes registered without auth middleware for test convenience.
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	mux.HandleFunc("POST /api/v1/leafs", e2eAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", leafHandler.HandleDelete)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", leafHandler.HandleActivate)

@@ -166,12 +166,21 @@ func (h *LeafHandler) HandleDeleteVersion(w http.ResponseWriter, r *http.Request
 	if av == nil {
 		return
 	}
+	// Thread BOTH path ids into the repo: authOwner authorized {leaf_id}, so the
+	// delete must act on a version OF THAT LEAF. Deleting by version_id alone
+	// (the prior bug) let an owner of leaf A purge a version of victim leaf B
+	// (BG-11c).
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
 	versionID, err := types.ParseID(r.PathValue("version_id"))
 	if err != nil {
 		apierror.WriteError(w, apierror.ValidationError("invalid version_id: must be a valid UUID", nil))
 		return
 	}
-	if err := av.DeleteVersion(r.Context(), versionID); err != nil {
+	if err := av.DeleteVersion(r.Context(), leafID, versionID); err != nil {
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}

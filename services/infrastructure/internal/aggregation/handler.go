@@ -24,8 +24,12 @@ func NewAggregationHandler(engine *Engine, logger *slog.Logger) *AggregationHand
 	}
 }
 
-// RegisterRoutes registers public aggregation routes on the given mux.
-// The POST (mutation) route is registered in the router with auth wrappers.
+// RegisterRoutes is retained for test harnesses that drive the aggregation
+// endpoints unauthenticated. Production does NOT call it: the router registers
+// both the GET (read) and POST (recompute) under authOwner, because the
+// aggregate is leaf CONTENTS — owner-only regardless of the leaf's visibility
+// (BG-11a). Registering the GET here without a wrapper is what left it
+// anonymous; the router now binds HandleGetAggregate under authOwner instead.
 func (h *AggregationHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/aggregate", h.handleGetAggregate)
 	// Deprecated alias (removed in v0.10).
@@ -35,6 +39,12 @@ func (h *AggregationHandler) RegisterRoutes(mux *http.ServeMux) {
 // HandleAggregate handles POST /api/v1/leafs/{leaf_id}/aggregate (exported for auth wrapping).
 func (h *AggregationHandler) HandleAggregate(w http.ResponseWriter, r *http.Request) {
 	h.handleAggregate(w, r)
+}
+
+// HandleGetAggregate handles GET /api/v1/leafs/{leaf_id}/aggregate (exported for
+// auth wrapping — the router binds it under authOwner, BG-11a).
+func (h *AggregationHandler) HandleGetAggregate(w http.ResponseWriter, r *http.Request) {
+	h.handleGetAggregate(w, r)
 }
 
 // aggregateRequest is the optional POST body.

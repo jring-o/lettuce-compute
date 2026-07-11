@@ -163,7 +163,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	mux.HandleFunc("GET /api/v1/head", headHandler.HandleGetHeadInfo)
 
 	// Protected routes (no auth middleware for test convenience).
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	mux.HandleFunc("POST /api/v1/leafs", e2eAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", leafHandler.HandleDelete)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", leafHandler.HandleActivate)
@@ -182,7 +182,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	mux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", analysisHandler.HandleVolunteerBreakdown)
 
 	// Deprecated project aliases.
-	mux.HandleFunc("POST /api/v1/projects", leafHandler.HandleCreate)
+	mux.HandleFunc("POST /api/v1/projects", e2eAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("GET /api/v1/projects", leafHandler.HandleListDeprecated)
 	mux.HandleFunc("GET /api/v1/projects/{leaf_id}", leafHandler.HandleGetDeprecated)
 

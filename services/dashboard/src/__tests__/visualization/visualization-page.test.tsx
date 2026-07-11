@@ -83,6 +83,7 @@ function makeResult(overrides: Partial<Result> = {}): Result {
 const defaultProps = {
   vizBundleUrl: "https://example.com/bundle.tar.gz",
   vizOrigin: "https://viz.example.com",
+  platformUrl: "https://app.example.com",
   leafSlug: "nbody-sim",
   leafId: "leaf-1",
   workUnits: [

@@ -787,7 +787,7 @@ func TestAuditGCPinPruneAndDelete(t *testing.T) {
 	vDel := createArtifactVersion(t, pool, f2.leafID, f2.userID, "v-del", now)
 	a2 := enqueueTestAudit(t, auditRepo, f2, nil, &vDel)
 
-	if err := leafRepo.DeleteVersion(ctx, vDel); err != nil {
+	if err := leafRepo.DeleteVersion(ctx, f2.leafID, vDel); err != nil {
 		t.Fatalf("DeleteVersion must NOT be blocked by an open audit: %v", err)
 	}
 	if _, err := leafRepo.GetVersionByID(ctx, vDel); err == nil {

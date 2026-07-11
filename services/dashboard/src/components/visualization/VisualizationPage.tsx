@@ -8,6 +8,7 @@ import type { WorkUnitSummary, Result } from "@/types/infrastructure";
 interface VisualizationPageProps {
   vizBundleUrl: string;
   vizOrigin: string;
+  platformUrl: string;
   leafSlug: string;
   leafId: string;
   workUnits: WorkUnitSummary[];
@@ -18,6 +19,7 @@ interface VisualizationPageProps {
 export function VisualizationPage({
   vizBundleUrl,
   vizOrigin,
+  platformUrl,
   leafSlug,
   leafId,
   workUnits,
@@ -103,6 +105,7 @@ export function VisualizationPage({
           <VizIframe
             vizBundleUrl={vizBundleUrl}
             vizOrigin={vizOrigin}
+            platformUrl={platformUrl}
             leafSlug={leafSlug}
             resultOutputData={currentResult?.output_data ?? null}
           />

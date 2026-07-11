@@ -1,4 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
+
+import { requireLeafAccess } from "@/lib/authz-routes";
 import { infrastructureClient } from "@/lib/infrastructure-client";
 
 export async function GET(request: NextRequest) {
@@ -13,6 +15,12 @@ export async function GET(request: NextRequest) {
       { status: 400 },
     );
   }
+
+  // A result's output_data is leaf CONTENTS — owner-only regardless of the
+  // leaf's visibility (BG-07). Gate on the target leaf before touching the
+  // admin-keyed listResults, through the SAME predicate the server actions use.
+  const access = await requireLeafAccess(leafId);
+  if (!access.ok) return access.response;
 
   try {
     // No validation_status filter: the viz replays any submitted result's

@@ -32,8 +32,11 @@ func setupHandlerServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	// Protected routes are now registered by the router with auth wrappers.
-	// In integration tests, register them directly without auth.
-	mux.HandleFunc("POST /api/v1/leafs", handler.HandleCreate)
+	// In integration tests, register them directly without auth. Create binds
+	// creator_id to the caller (★BG-11d-write); these tests drive it as an
+	// operator (an ADMIN viewer), so an explicit body creator_id is honored
+	// (create-on-behalf) — the router injects the real viewer in production.
+	mux.HandleFunc("POST /api/v1/leafs", withAdminViewer(handler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", handler.HandleUpdate)
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", handler.HandleDelete)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", handler.HandleActivate)
@@ -48,6 +51,17 @@ func setupHandlerServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) 
 		poolCleanup()
 	}
 	return ts, pool, cleanup
+}
+
+// withAdminViewer injects an ADMIN Viewer into the request context, mirroring
+// what the router's requireAuth+leafViewer wrappers do for an operator caller.
+// handleCreate honors an explicit body creator_id for an ADMIN (create-on-
+// behalf), so the create tests keep controlling the leaf's owner.
+func withAdminViewer(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := WithViewer(r.Context(), Viewer{IsAdmin: true, Authed: true})
+		next(w, r.WithContext(ctx))
+	}
 }
 
 func doRequest(t *testing.T, method, url string, body any) *http.Response {

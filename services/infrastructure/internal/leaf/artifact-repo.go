@@ -197,11 +197,31 @@ func (r *PgxRepository) SetCurrentVersion(ctx context.Context, leafID, versionID
 	return nil
 }
 
-// DeleteVersion removes one version, refusing if it is current or live-pinned.
-func (r *PgxRepository) DeleteVersion(ctx context.Context, id types.ID) error {
+// DeleteVersion removes one version of leafID, refusing if it is current or
+// live-pinned. Every statement is scoped `AND leaf_id = leafID`, so a version
+// that belongs to a DIFFERENT leaf is invisible here: the existence check
+// returns NotFound before the current-version / live-pin guards run, and the
+// guards themselves cannot observe another leaf's state. This is the object
+// scoping behind the authOwner wrapper on the route — the wrapper authorizes
+// the path {leaf_id}, and this makes the SQL act on that same leaf and no
+// other (BG-11c).
+func (r *PgxRepository) DeleteVersion(ctx context.Context, leafID, id types.ID) error {
+	// Existence-within-leaf first: a version id whose leaf_id != leafID is
+	// NotFound, and we never consult its current/pin state (no cross-leaf oracle).
+	var exists bool
+	if err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM leaf_artifact_versions WHERE id = $1 AND leaf_id = $2)`,
+		id, leafID).Scan(&exists); err != nil {
+		return apierror.Internal("failed to check artifact version", err)
+	}
+	if !exists {
+		return apierror.NotFound("artifact_version", id.String())
+	}
+
 	var isCurrent bool
 	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM leafs WHERE current_artifact_version_id = $1)`, id).Scan(&isCurrent); err != nil {
+		`SELECT EXISTS(SELECT 1 FROM leafs WHERE id = $2 AND current_artifact_version_id = $1)`,
+		id, leafID).Scan(&isCurrent); err != nil {
 		return apierror.Internal("failed to check current-version usage", err)
 	}
 	if isCurrent {
@@ -210,14 +230,18 @@ func (r *PgxRepository) DeleteVersion(ctx context.Context, id types.ID) error {
 
 	var livePinned bool
 	if err := r.pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM work_units WHERE pinned_artifact_version_id = $1 AND `+sqlNonTerminalPinFilter+`)`, id).Scan(&livePinned); err != nil {
+		`SELECT EXISTS(
+			SELECT 1 FROM work_units
+			WHERE pinned_artifact_version_id = $1 AND leaf_id = $2 AND `+sqlNonTerminalPinFilter+`)`,
+		id, leafID).Scan(&livePinned); err != nil {
 		return apierror.Internal("failed to check work-unit pins", err)
 	}
 	if livePinned {
 		return apierror.Conflict("cannot delete a version still pinned by in-flight work units", nil)
 	}
 
-	tag, err := r.pool.Exec(ctx, `DELETE FROM leaf_artifact_versions WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM leaf_artifact_versions WHERE id = $1 AND leaf_id = $2`, id, leafID)
 	if err != nil {
 		return apierror.Internal("failed to delete artifact version", err)
 	}

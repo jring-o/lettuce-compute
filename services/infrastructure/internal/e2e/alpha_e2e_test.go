@@ -138,7 +138,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	// middleware (see server.router), while LeafHandler.RegisterRoutes now only
 	// exposes the read-only GET routes. The e2e harness drives them directly
 	// (unauthenticated) to exercise the full lifecycle.
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	mux.HandleFunc("POST /api/v1/leafs", e2eAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", leafHandler.HandleDelete)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", leafHandler.HandleConfigure)

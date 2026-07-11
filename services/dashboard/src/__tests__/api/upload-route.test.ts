@@ -1,8 +1,12 @@
 // --- Mocks ---
 
-const mockAuth = jest.fn();
-jest.mock("@/lib/auth", () => ({
-  auth: () => mockAuth(),
+// The upload route is gated by requireLeafAccess (the shared leaf-ownership
+// route adapter). We mock that seam so these tests exercise the ROUTE's
+// behavior given an allow/deny verdict; requireLeafAccess itself is covered in
+// authz-routes.test.ts.
+const mockRequireLeafAccess = jest.fn();
+jest.mock("@/lib/authz-routes", () => ({
+  requireLeafAccess: (...args: unknown[]) => mockRequireLeafAccess(...args),
 }));
 
 const mockSaveFile = jest.fn();
@@ -72,11 +76,25 @@ function makeRequest(formData: FormData): NextRequest {
   );
 }
 
+// A denied verdict the way requireLeafAccess returns it: { ok: false, response }.
+function denied(status: number, code: string) {
+  return {
+    ok: false,
+    response: {
+      status,
+      _jsonData: { error: { code, message: "denied" } },
+    },
+  };
+}
+
+const allowed = {
+  ok: true as const,
+  session: { user: { id: "user-1", role: "USER" } },
+};
+
 beforeEach(() => {
   jest.clearAllMocks();
-  mockAuth.mockResolvedValue({
-    user: { id: "user-1", email: "test@example.com" },
-  });
+  mockRequireLeafAccess.mockResolvedValue(allowed);
   mockSaveFile.mockResolvedValue({
     fileId: "file-uuid-123",
     storageKey: "leafs/proj-1/CODE_ARTIFACT/app.bin",
@@ -86,30 +104,48 @@ beforeEach(() => {
 });
 
 describe("POST /api/upload", () => {
-  it("returns 401 when not authenticated", async () => {
-    mockAuth.mockResolvedValue(null);
+  it("passes the form leaf_id to requireLeafAccess", async () => {
     const file = createMockFile("app.bin", "binary-content");
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
-    const response = await POST(makeRequest(fd));
-    expect(response.status).toBe(401);
-    expect((response as unknown as Record<string, unknown>)._jsonData).toEqual({
-      error: { code: "UNAUTHENTICATED", message: "You must be signed in." },
-    });
+    await POST(makeRequest(fd));
+
+    expect(mockRequireLeafAccess).toHaveBeenCalledWith("leaf-1");
   });
 
-  it("returns 401 when session has no user id", async () => {
-    mockAuth.mockResolvedValue({ user: {} });
+  it("returns the adapter's 401 when unauthenticated (and never saves)", async () => {
+    mockRequireLeafAccess.mockResolvedValue(denied(401, "UNAUTHENTICATED"));
     const file = createMockFile("app.bin", "binary-content");
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(401);
+    expect(mockSaveFile).not.toHaveBeenCalled();
+  });
+
+  it("returns the adapter's 403 when the caller does not own the leaf (BG-11d)", async () => {
+    mockRequireLeafAccess.mockResolvedValue(denied(403, "FORBIDDEN"));
+    const file = createMockFile("app.bin", "binary-content");
+    const fd = createFormData({ file, leaf_id: "someone-elses-leaf" });
+
+    const response = await POST(makeRequest(fd));
+    expect(response.status).toBe(403);
+    expect(mockSaveFile).not.toHaveBeenCalled();
+  });
+
+  it("returns the adapter's 400 when leaf_id is missing", async () => {
+    mockRequireLeafAccess.mockResolvedValue(denied(400, "VALIDATION_ERROR"));
+    const file = createMockFile("app.bin", "binary-content");
+    const fd = createFormData({ file });
+
+    const response = await POST(makeRequest(fd));
+    expect(response.status).toBe(400);
+    expect(mockRequireLeafAccess).toHaveBeenCalledWith(null);
+    expect(mockSaveFile).not.toHaveBeenCalled();
   });
 
   it("returns 400 when no file is provided", async () => {
-    const fd = new FormData();
-    fd.set("platform", "linux_amd64");
+    const fd = createFormData({ leaf_id: "leaf-1", platform: "linux_amd64" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(400);
@@ -120,7 +156,7 @@ describe("POST /api/upload", () => {
 
   it("returns 400 for invalid platform", async () => {
     const file = createMockFile("app.bin", "binary-content");
-    const fd = createFormData({ file, platform: "invalid_platform" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "invalid_platform" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(400);
@@ -150,7 +186,7 @@ describe("POST /api/upload", () => {
     expect(data.platform).toBe("linux_amd64");
   });
 
-  it("calls saveFile with correct arguments", async () => {
+  it("calls saveFile with the leaf, file type, and the session user", async () => {
     const file = createMockFile("app.bin", "binary-content");
     const fd = createFormData({
       file,
@@ -172,13 +208,13 @@ describe("POST /api/upload", () => {
 
   it("defaults file_type to CODE_ARTIFACT when not specified", async () => {
     const file = createMockFile("app.bin", "binary-content");
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
     await POST(makeRequest(fd));
 
     expect(mockSaveFile).toHaveBeenCalledWith(
       expect.any(File),
-      expect.any(String),
+      "leaf-1",
       "CODE_ARTIFACT",
       "user-1",
     );
@@ -186,7 +222,7 @@ describe("POST /api/upload", () => {
 
   it("returns null for platform when not specified", async () => {
     const file = createMockFile("data.csv", "col1,col2");
-    const fd = createFormData({ file });
+    const fd = createFormData({ file, leaf_id: "leaf-1" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(201);
@@ -206,7 +242,7 @@ describe("POST /api/upload", () => {
 
     for (const platform of validPlatforms) {
       jest.clearAllMocks();
-      mockAuth.mockResolvedValue({ user: { id: "user-1" } });
+      mockRequireLeafAccess.mockResolvedValue(allowed);
       mockSaveFile.mockResolvedValue({
         fileId: "file-uuid",
         storageKey: "key",
@@ -215,7 +251,7 @@ describe("POST /api/upload", () => {
       });
 
       const file = createMockFile("app.bin", "content");
-      const fd = createFormData({ file, platform });
+      const fd = createFormData({ file, leaf_id: "leaf-1", platform });
 
       const response = await POST(makeRequest(fd));
       expect(response.status).toBe(201);
@@ -225,7 +261,7 @@ describe("POST /api/upload", () => {
   it("returns 400 when saveFile throws", async () => {
     mockSaveFile.mockRejectedValue(new Error("File exceeds size limit of 500 MB"));
     const file = createMockFile("huge.bin", "x");
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(400);
@@ -239,7 +275,7 @@ describe("POST /api/upload", () => {
   it("returns generic error message for non-Error throws", async () => {
     mockSaveFile.mockRejectedValue("unknown failure");
     const file = createMockFile("app.bin", "content");
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(400);
@@ -252,27 +288,12 @@ describe("POST /api/upload", () => {
   it("returns 400 when file has zero size", async () => {
     const file = createMockFile("empty.bin", "");
     Object.defineProperty(file, "size", { value: 0 });
-    const fd = createFormData({ file, platform: "linux_amd64" });
+    const fd = createFormData({ file, leaf_id: "leaf-1", platform: "linux_amd64" });
 
     const response = await POST(makeRequest(fd));
     expect(response.status).toBe(400);
     expect((response as unknown as Record<string, unknown>)._jsonData).toEqual({
       error: { code: "VALIDATION_ERROR", message: "File is required." },
     });
-  });
-
-  it("generates a UUID for leaf_id when not provided", async () => {
-    const file = createMockFile("app.bin", "binary-content");
-    const fd = createFormData({ file, platform: "linux_amd64" });
-    // No leaf_id in form data
-
-    await POST(makeRequest(fd));
-
-    expect(mockSaveFile).toHaveBeenCalledTimes(1);
-    // The second argument to saveFile should be a UUID string (generated by randomUUID)
-    const leafIdArg = mockSaveFile.mock.calls[0][1] as string;
-    expect(leafIdArg).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-    );
   });
 });

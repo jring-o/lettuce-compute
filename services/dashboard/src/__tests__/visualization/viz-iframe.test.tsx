@@ -1,5 +1,5 @@
 import { render, act, cleanup } from "@testing-library/react";
-import { VizIframe } from "@/components/visualization/VizIframe";
+import { VizIframe, resolveVizOrigin } from "@/components/visualization/VizIframe";
 
 describe("VizIframe", () => {
   // base64url-encode the way the component does (btoa + url-safe substitutions).
@@ -7,16 +7,76 @@ describe("VizIframe", () => {
     btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
   const VIZ_ORIGIN = "https://viz.example.com";
+  const PLATFORM_URL = "https://app.example.com";
 
   const defaultProps = {
     vizBundleUrl: "https://example.com/bundle.tar.gz",
     vizOrigin: VIZ_ORIGIN,
+    platformUrl: PLATFORM_URL,
     leafSlug: "nbody-sim",
     resultOutputData: null as Record<string, unknown> | null,
   };
 
   afterEach(() => {
     cleanup();
+  });
+
+  // --- BG-08: origin isolation is the security property ---
+
+  describe("resolveVizOrigin", () => {
+    it("returns the parsed origin when viz and app origins differ", () => {
+      expect(resolveVizOrigin(VIZ_ORIGIN, PLATFORM_URL)).toBe(VIZ_ORIGIN);
+    });
+
+    it("normalizes to scheme+host+port (drops any path)", () => {
+      expect(resolveVizOrigin("https://viz.example.com/some/path", PLATFORM_URL)).toBe(
+        "https://viz.example.com",
+      );
+    });
+
+    it("fails closed when VIZ_ORIGIN is empty", () => {
+      expect(resolveVizOrigin("", PLATFORM_URL)).toBeNull();
+    });
+
+    it("fails closed when VIZ_ORIGIN is unparseable", () => {
+      expect(resolveVizOrigin("not a url", PLATFORM_URL)).toBeNull();
+    });
+
+    it("fails closed when VIZ_ORIGIN origin equals the app origin", () => {
+      expect(resolveVizOrigin(PLATFORM_URL, PLATFORM_URL)).toBeNull();
+      // Same host, different path is still the same origin → closed.
+      expect(resolveVizOrigin("https://app.example.com/viz", PLATFORM_URL)).toBeNull();
+    });
+
+    it("fails closed when the app origin only differs by port (distinct origin honored)", () => {
+      // Different port IS a distinct origin, so this is allowed.
+      expect(resolveVizOrigin("https://app.example.com:8443", PLATFORM_URL)).toBe(
+        "https://app.example.com:8443",
+      );
+    });
+
+    it("fails closed when PLATFORM_URL is missing/unparseable (can't prove distinctness)", () => {
+      expect(resolveVizOrigin(VIZ_ORIGIN, "")).toBeNull();
+      expect(resolveVizOrigin(VIZ_ORIGIN, "nonsense")).toBeNull();
+    });
+  });
+
+  describe("fail-closed rendering", () => {
+    it("renders NO iframe and an unavailable message when VIZ_ORIGIN is empty", () => {
+      render(<VizIframe {...defaultProps} vizOrigin="" />);
+      expect(document.querySelector("iframe")).not.toBeInTheDocument();
+      expect(
+        document.querySelector('[data-testid="viz-unavailable"]'),
+      ).toBeInTheDocument();
+    });
+
+    it("renders NO iframe when VIZ_ORIGIN equals the app origin", () => {
+      render(<VizIframe {...defaultProps} vizOrigin={PLATFORM_URL} />);
+      expect(document.querySelector("iframe")).not.toBeInTheDocument();
+      expect(
+        document.querySelector('[data-testid="viz-unavailable"]'),
+      ).toBeInTheDocument();
+    });
   });
 
   it("renders a sandboxed iframe (allow-scripts + allow-same-origin)", () => {

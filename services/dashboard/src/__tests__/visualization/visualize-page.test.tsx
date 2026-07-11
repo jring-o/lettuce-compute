@@ -28,6 +28,20 @@ jest.mock("lucide-react", () => ({
   ArrowLeft: () => <span data-testid="arrow-left-icon" />,
 }));
 
+// The visualize page is now owner/admin-gated (results are owner-only
+// contents, §1.3). Mock auth() + the shared ownership verdict; default to the
+// leaf's owner so the existing "renders viz" expectations hold, and assert the
+// gate for anonymous / non-owner callers explicitly below.
+const mockAuth = jest.fn();
+jest.mock("@/lib/auth", () => ({
+  auth: () => mockAuth(),
+}));
+
+const mockLeafOwnershipVerdict = jest.fn();
+jest.mock("@/lib/authz", () => ({
+  leafOwnershipVerdict: (...args: unknown[]) => mockLeafOwnershipVerdict(...args),
+}));
+
 const mockGetLeaf = jest.fn();
 const mockListWorkUnits = jest.fn();
 const mockListResults = jest.fn();
@@ -159,6 +173,9 @@ function makeParams(slug: string, searchParams: Record<string, string> = {}) {
 describe("VisualizePage (server component)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: an authenticated owner of the leaf (creator_id "user-1").
+    mockAuth.mockResolvedValue({ user: { id: "user-1", role: "USER" } });
+    mockLeafOwnershipVerdict.mockResolvedValue({ allowed: true });
   });
 
   it('shows "This leaf does not include visualization" when binaries.viz is missing', async () => {
@@ -238,6 +255,34 @@ describe("VisualizePage (server component)", () => {
       "NEXT_NOT_FOUND",
     );
     expect(mockNotFound).toHaveBeenCalled();
+  });
+
+  it("calls notFound() for an anonymous caller (results are owner-only)", async () => {
+    mockGetLeaf.mockResolvedValue(makeLeaf());
+    mockAuth.mockResolvedValue(null);
+
+    await expect(VisualizePage(makeParams("nbody-sim"))).rejects.toThrow(
+      "NEXT_NOT_FOUND",
+    );
+    expect(mockNotFound).toHaveBeenCalled();
+    // A denied caller never reaches the contents reads.
+    expect(mockListResults).not.toHaveBeenCalled();
+  });
+
+  it("calls notFound() for a non-owner caller (no results leak)", async () => {
+    mockGetLeaf.mockResolvedValue(makeLeaf());
+    mockAuth.mockResolvedValue({ user: { id: "intruder", role: "USER" } });
+    mockLeafOwnershipVerdict.mockResolvedValue({
+      allowed: false,
+      denial: { code: "FORBIDDEN", message: "no" },
+    });
+
+    await expect(VisualizePage(makeParams("nbody-sim"))).rejects.toThrow(
+      "NEXT_NOT_FOUND",
+    );
+    expect(mockNotFound).toHaveBeenCalled();
+    expect(mockListWorkUnits).not.toHaveBeenCalled();
+    expect(mockListResults).not.toHaveBeenCalled();
   });
 
   it("calls notFound() when leaf fetch returns 404", async () => {

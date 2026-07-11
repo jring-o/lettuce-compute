@@ -70,9 +70,13 @@ type ArtifactVersionRepository interface {
 	// must belong to the leaf (else NotFound).
 	SetCurrentVersion(ctx context.Context, leafID, versionID types.ID) error
 
-	// DeleteVersion removes one version (manual purge). Refused (Conflict) if it is
-	// the current version or is pinned by an in-flight (non-terminal) work unit.
-	DeleteVersion(ctx context.Context, id types.ID) error
+	// DeleteVersion removes one version (manual purge) that belongs to leafID.
+	// Refused (Conflict) if it is the current version or is pinned by an
+	// in-flight (non-terminal) work unit. Every statement is scoped to leafID:
+	// a version id whose leaf is not leafID resolves to NotFound and no
+	// cross-leaf state is consulted, so an owner of one leaf can never delete
+	// or probe another leaf's version (BG-11c).
+	DeleteVersion(ctx context.Context, leafID, id types.ID) error
 
 	// PruneVersions enforces a retention policy for one leaf: keep the `keep`
 	// most-recently-published versions, delete the rest — never the current version
