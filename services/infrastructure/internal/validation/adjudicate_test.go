@@ -96,6 +96,20 @@ func TestAdjudicateAudit_Table(t *testing.T) {
 			want:    audit.VerdictInconclusive,
 		},
 
+		// --- unverified-ref key (defense; sampling excludes these — F4/§10.8) ---
+		{
+			// A ref not yet head-verified is unadjudicable exactly like canon-empty. Without an
+			// explicit case the raw-hex default would sha256 the runner bytes against the literal
+			// "unverified-ref:<uuid>" string and fabricate a MISMATCH — slashing an honest submitter
+			// under slice-3 enforcement. It must be INCONCLUSIVE even though the runner bytes hash to
+			// something entirely different from the key string.
+			name:    "unverified-ref key -> INCONCLUSIVE (never a fabricated MISMATCH)",
+			snap:    audit.ComparisonSnapshot{ComparisonMode: leaf.ComparisonExact},
+			key:     "unverified-ref:" + types.NewID().String(),
+			runner:  []byte(`{"anything":1}`),
+			want:    audit.VerdictInconclusive,
+		},
+
 		// --- canon key (EXACT + effective ignore_fields): VALUE-level ---
 		{
 			name:    "canon key: values equal -> MATCH",

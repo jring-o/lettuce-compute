@@ -74,8 +74,8 @@ func TestEmissionCap_UnsetIsInert(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -129,8 +129,8 @@ func TestEmissionCap_SuppressesOneGrantButKeepsWorkEffects(t *testing.T) {
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, leafCredit)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
 	// Both agree (checksum "aaaa"); insertion order fixes agreedResults = [rGranted, rSuppressed].
-	rGranted := stampSubject(makeResult(wuID, volGranted, "aaaa", nil), "did:plc:granted", 30)
-	rSuppressed := stampSubject(makeResult(wuID, volSuppressed, "aaaa", nil), "did:plc:suppressed", 30)
+	rGranted := stampSubject(makeResult(wuID, volGranted, inlineAgreeCk, inlineAgreeData), "did:plc:granted", 30)
+	rSuppressed := stampSubject(makeResult(wuID, volSuppressed, inlineAgreeCk, inlineAgreeData), "did:plc:suppressed", 30)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(rGranted)
@@ -266,8 +266,8 @@ func TestEmissionCap_RepoWithoutCapabilityFallsBackAndWarnsOnce(t *testing.T) {
 		v1 := types.NewID()
 		v2 := types.NewID()
 		wuRepo.addWorkUnit(makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted))
-		resultRepo.addResult(makeResult(wuID, v1, "aaaa", nil))
-		resultRepo.addResult(makeResult(wuID, v2, "aaaa", nil))
+		resultRepo.addResult(makeResult(wuID, v1, inlineAgreeCk, inlineAgreeData))
+		resultRepo.addResult(makeResult(wuID, v2, inlineAgreeCk, inlineAgreeData))
 		volRepo.addVolunteer(makeVolunteer(v1))
 		volRepo.addVolunteer(makeVolunteer(v2))
 		units = append(units, unit{wuID: wuID})
@@ -313,8 +313,8 @@ func TestEmissionCap_CreateCappedHardErrorFailsValidation(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -353,8 +353,8 @@ func TestEmissionCap_RejectAllAttestsZero(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil) // disagree -> no quorum -> rejectAll
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData) // disagree -> no quorum -> rejectAll
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)

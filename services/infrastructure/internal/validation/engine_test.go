@@ -468,6 +468,21 @@ func makeResult(wuID, volID types.ID, checksum string, data json.RawMessage) *re
 	}
 }
 
+// Realistic inline result fixtures (design §10.8, BG-02b). A real inline result's output_checksum
+// is the sha256 of its output bytes (head-verified at submit), so post-slice-5 a fixture meant to be
+// an INLINE result must carry real bytes: a checksum-only result with no bytes is now a ref-only
+// result keyed non-groupingly ("unverified-ref:<uuid>") that corroborates nothing. Two inline
+// results agree iff they carry identical bytes; a distinct body disagrees. These shared fixtures
+// give the suite one honest inline shape (sha256hex lives in adjudicate_test.go).
+var (
+	inlineAgreeData    = json.RawMessage(`{"result":"agree"}`)
+	inlineAgreeCk      = sha256hex(inlineAgreeData)
+	inlineDisagreeData = json.RawMessage(`{"result":"disagree"}`)
+	inlineDisagreeCk   = sha256hex(inlineDisagreeData)
+	inlineThirdData    = json.RawMessage(`{"result":"third"}`)
+	inlineThirdCk      = sha256hex(inlineThirdData)
+)
+
 func makeVolunteer(id types.ID) *volunteer.Volunteer {
 	return &volunteer.Volunteer{
 		ID:       id,
@@ -482,12 +497,12 @@ func TestExactMatch_TwoIdentical_BothAgreed(t *testing.T) {
 	wuID := types.NewID()
 	vol1 := types.NewID()
 	vol2 := types.NewID()
-	checksum := "aaaa"
+	checksum := inlineAgreeCk
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, checksum, nil)
-	r2 := makeResult(wuID, vol2, checksum, nil)
+	r1 := makeResult(wuID, vol1, checksum, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, checksum, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -547,8 +562,8 @@ func TestExactMatch_TwoDifferent_BothRejected(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -700,9 +715,9 @@ func TestQuorum_Redundancy3_TwoMatch_BelowFloor_Rejected(t *testing.T) {
 	// crediting a sub-quorum group.
 	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
-	r3 := makeResult(wuID, vol3, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
+	r3 := makeResult(wuID, vol3, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -754,9 +769,9 @@ func TestQuorum_Target3Quorum2_TwoMatch_Validated(t *testing.T) {
 	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 1.0)
 	proj.ValidationConfig.MinQuorum = 2
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
-	r3 := makeResult(wuID, vol3, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
+	r3 := makeResult(wuID, vol3, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -813,9 +828,9 @@ func TestQuorum_Redundancy3_AllDifferent_AllRejected(t *testing.T) {
 
 	proj := makeLeaf(leafID, 3, 0.67, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
-	r3 := makeResult(wuID, vol3, "cccc", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
+	r3 := makeResult(wuID, vol3, inlineThirdCk, inlineThirdData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -861,7 +876,7 @@ func TestNotEnoughResults_ReturnsNil(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -913,8 +928,8 @@ func TestPending_ActiveAssignmentsRemaining(t *testing.T) {
 	// But there's still an active assignment (a re-try), so we should wait.
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -951,8 +966,8 @@ func TestRejectionRateWarning(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1001,8 +1016,8 @@ func TestCustomMode_ReturnsError(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "CUSTOM", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1030,8 +1045,8 @@ func TestCreditAmount_UsesProjectConfig(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 5.25)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1071,9 +1086,11 @@ func TestNumericTolerance_EmptyOutputData_ReturnsError(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "NUMERIC_TOLERANCE", &epsilon, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	// nil OutputData triggers "empty output data" error in parseNumericOutput.
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	// nil OutputData triggers "empty output data" error in parseNumericOutput. These stay ref-only
+	// (no inline bytes) on purpose — the emptiness IS the case under test — with checksums the
+	// realistic-inline sweep below deliberately leaves untouched.
+	r1 := makeResult(wuID, vol1, "empty-a", nil)
+	r2 := makeResult(wuID, vol2, "empty-b", nil)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1287,10 +1304,10 @@ func TestExactMatch_Tie_NoAgreement(t *testing.T) {
 	// times to prove the outcome does not depend on map iteration order.
 	proj := makeLeaf(leafID, 4, 0.5, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "bbbb", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
-	r3 := makeResult(wuID, vol3, "aaaa", nil)
-	r4 := makeResult(wuID, vol4, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineDisagreeCk, inlineDisagreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
+	r3 := makeResult(wuID, vol3, inlineAgreeCk, inlineAgreeData)
+	r4 := makeResult(wuID, vol4, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1356,7 +1373,7 @@ func TestExactMatch_RedundancyOne_SingleResult_Validated(t *testing.T) {
 	// redundancy=1: single result is automatically the majority (1/1 = 100%).
 	proj := makeLeaf(leafID, 1, 1.0, "EXACT", nil, 3.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1446,8 +1463,8 @@ func TestRACUpsertCalledOnValidation(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 2.5)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1501,8 +1518,8 @@ func TestRACUpsertErrorIsNonFatal(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1580,8 +1597,8 @@ func TestAttestationsCreatedOnValidation(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	// Add execution metadata to results for raw_metrics conversion.
 	r1.ExecutionMetadata = result.ExecutionMetadata{
@@ -1682,9 +1699,9 @@ func TestAttestationsCreatedForRejectedResults(t *testing.T) {
 	proj := makeLeaf(leafID, 3, 0.66, "EXACT", nil, 2.0)
 	proj.ValidationConfig.MinQuorum = 2
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
-	r3 := makeResult(wuID, vol3, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
+	r3 := makeResult(wuID, vol3, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1760,8 +1777,8 @@ func TestAttestationsCreatedOnRejectAll(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "bbbb", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineDisagreeCk, inlineDisagreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1823,8 +1840,8 @@ func TestNilAttestationRepoIsNonFatal(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1911,8 +1928,8 @@ func TestAttestationSkippedWhenVolunteerNotFound(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -1974,8 +1991,8 @@ func TestAttestationCreateErrorIsNonFatal(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -2025,8 +2042,8 @@ func TestNilSignerWithNonNilAttestationRepo(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vol1, "aaaa", nil)
-	r2 := makeResult(wuID, vol2, "aaaa", nil)
+	r1 := makeResult(wuID, vol1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vol2, inlineAgreeCk, inlineAgreeData)
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)

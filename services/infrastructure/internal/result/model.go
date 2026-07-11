@@ -15,6 +15,18 @@ const (
 	ValidationPending   ValidationStatus = "PENDING"
 	ValidationAgreed    ValidationStatus = "AGREED"
 	ValidationDisagreed ValidationStatus = "DISAGREED"
+	// ValidationAwaitingContentVerification holds a ref-only (external output URL)
+	// result before it may vote: the head has not yet fetched and hashed the external
+	// bytes (design doc §10; BG-02b). Held rows are fail-closed everywhere — every
+	// validation_status filter in the repo is positive-form, so a held result cannot
+	// vote, count toward coverage or quorum, be repaired, earn credit, or be attested.
+	ValidationAwaitingContentVerification ValidationStatus = "AWAITING_CONTENT_VERIFICATION"
+	// ValidationContentVerificationFailed is the terminal did-not-become-votable state
+	// for a ref-only result whose fetch pipeline ended without promoting it (reason
+	// code in content_fetch_last_error: fetch failure, size cap, disallowed URL,
+	// holding expiry, unit finalized). Permanently non-votable, same fail-closed
+	// posture as the holding state.
+	ValidationContentVerificationFailed ValidationStatus = "CONTENT_VERIFICATION_FAILED"
 )
 
 // ExecutionMetadata holds self-reported resource metrics from the volunteer.
@@ -87,8 +99,24 @@ type Result struct {
 	// redundancy coverage — the same as-of-submission semantics as the trust
 	// score above. nil = a legacy row created before the standing feature (OK).
 	StandingAtSubmit *string    `json:"standing_at_submit,omitempty"`
-	SubmittedAt      time.Time  `json:"submitted_at"`
-	ValidatedAt        *time.Time `json:"validated_at,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	// VerifiedOutputChecksum is the HEAD-computed sha256 (lowercase hex) of the bytes
+	// the head actually fetched from output_data_ref — the ONLY checksum a ref-only
+	// result may ever vote on (design doc §10.8). Non-nil means "the head hashed these
+	// bytes itself"; nil on every inline result (whose output_checksum is already
+	// head-verified at submit) and on every ref result not yet promoted.
+	VerifiedOutputChecksum *string `json:"verified_output_checksum,omitempty"`
+	// ContentFetchAttempts counts TRANSIENT fetch failures only (§10.6): a successful
+	// fetch always promotes on the served hash and never consumes this budget.
+	ContentFetchAttempts int `json:"content_fetch_attempts,omitempty"`
+	// ContentFetchNextAttemptAt non-nil <=> the row is awaiting a fetch attempt (the
+	// worker-scan predicate; set at submit, advanced on transient retry, cleared on
+	// promotion and on every terminal disposition).
+	ContentFetchNextAttemptAt *time.Time `json:"content_fetch_next_attempt_at,omitempty"`
+	// ContentFetchLastError is the machine reason code (+ detail) of the most recent
+	// fetch failure or terminal disposition.
+	ContentFetchLastError *string    `json:"content_fetch_last_error,omitempty"`
+	SubmittedAt           time.Time  `json:"submitted_at"`
+	ValidatedAt           *time.Time `json:"validated_at,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }

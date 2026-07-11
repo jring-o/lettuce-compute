@@ -22,7 +22,9 @@ type DBTX interface {
 const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_ref,
 	output_checksum, execution_metadata, validation_status,
 	submitted_at, validated_at, created_at, updated_at, artifact_version_id, host_id,
-	trust_subject, trust_score_at_submit, standing_at_submit`
+	trust_subject, trust_score_at_submit, standing_at_submit,
+	verified_output_checksum, content_fetch_attempts, content_fetch_next_attempt_at,
+	content_fetch_last_error`
 
 // prefixedResultColumns is resultColumns with an r. table alias prefix, for
 // queries that JOIN results against another table (e.g. ListByLeaf). Keep it in
@@ -30,7 +32,9 @@ const resultColumns = `id, work_unit_id, volunteer_id, output_data, output_data_
 const prefixedResultColumns = `r.id, r.work_unit_id, r.volunteer_id, r.output_data, r.output_data_ref,
 	r.output_checksum, r.execution_metadata, r.validation_status,
 	r.submitted_at, r.validated_at, r.created_at, r.updated_at, r.artifact_version_id, r.host_id,
-	r.trust_subject, r.trust_score_at_submit, r.standing_at_submit`
+	r.trust_subject, r.trust_score_at_submit, r.standing_at_submit,
+	r.verified_output_checksum, r.content_fetch_attempts, r.content_fetch_next_attempt_at,
+	r.content_fetch_last_error`
 
 func scanResult(row pgx.Row) (*Result, error) {
 	var r Result
@@ -53,6 +57,10 @@ func scanResult(row pgx.Row) (*Result, error) {
 		&r.TrustSubject,
 		&r.TrustScoreAtSubmit,
 		&r.StandingAtSubmit,
+		&r.VerifiedOutputChecksum,
+		&r.ContentFetchAttempts,
+		&r.ContentFetchNextAttemptAt,
+		&r.ContentFetchLastError,
 	)
 	if err != nil {
 		return nil, err
@@ -80,16 +88,20 @@ func (repo *PgxRepository) Create(ctx context.Context, r *Result) error {
 		return apierror.Internal("failed to marshal execution_metadata", err)
 	}
 
+	// verified_output_checksum, content_fetch_attempts, and content_fetch_last_error
+	// are never set at creation (a ref result is inserted HELD with defaults; the
+	// fetch worker owns every later write to them), so only the worker-scan
+	// timestamp rides the INSERT.
 	row := repo.db.QueryRow(ctx, `
 		INSERT INTO results (
 			work_unit_id, volunteer_id, output_data, output_data_ref,
 			output_checksum, execution_metadata, validation_status, artifact_version_id, host_id,
-			trust_subject, trust_score_at_submit, standing_at_submit
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			trust_subject, trust_score_at_submit, standing_at_submit, content_fetch_next_attempt_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING `+resultColumns,
 		r.WorkUnitID, r.VolunteerID, r.OutputData, r.OutputDataRef,
 		r.OutputChecksum, metadataJSON, r.ValidationStatus, r.ArtifactVersionID, r.HostID,
-		r.TrustSubject, r.TrustScoreAtSubmit, r.StandingAtSubmit,
+		r.TrustSubject, r.TrustScoreAtSubmit, r.StandingAtSubmit, r.ContentFetchNextAttemptAt,
 	)
 
 	created, err := scanResult(row)

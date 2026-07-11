@@ -71,9 +71,9 @@ func newValidateFixture(rec standing.Recorder) (engine *Engine, wuID, vMaj1, vMa
 
 	proj := makeLeaf(leafID, 2, 0.6, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, vMaj1, "aaaa", nil)
-	r2 := makeResult(wuID, vMaj2, "aaaa", nil)
-	r3 := makeResult(wuID, vMin, "bbbb", nil) // dissents -> minority -> agreed=false
+	r1 := makeResult(wuID, vMaj1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, vMaj2, inlineAgreeCk, inlineAgreeData)
+	r3 := makeResult(wuID, vMin, inlineDisagreeCk, inlineDisagreeData) // dissents -> minority -> agreed=false
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)
@@ -107,8 +107,8 @@ func newRejectFixture(rec standing.Recorder) (engine *Engine, wuID, v1, v2 types
 
 	proj := makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	r1 := makeResult(wuID, v1, "aaaa", nil)
-	r2 := makeResult(wuID, v2, "bbbb", nil) // disagree -> no quorum -> rejectAll
+	r1 := makeResult(wuID, v1, inlineAgreeCk, inlineAgreeData)
+	r2 := makeResult(wuID, v2, inlineDisagreeCk, inlineDisagreeData) // disagree -> no quorum -> rejectAll
 
 	resultRepo := newMockResultRepo()
 	resultRepo.addResult(r1)

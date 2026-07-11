@@ -22,6 +22,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/bootstrap"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/config"
+	"github.com/lettuce-compute/infrastructure/internal/contentverify"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
 	"github.com/lettuce-compute/infrastructure/internal/custom"
 	"github.com/lettuce-compute/infrastructure/internal/database"
@@ -40,6 +41,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/stats"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
+	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
@@ -399,6 +401,11 @@ func main() {
 	// bounds how many server-issued per-machine host ids one account may hold; a
 	// machine past the cap works in the shared per-account bucket.
 	server.SetHostCapPolicy(volunteerSvc, server.HostCapFromHeadConfig(&cfg.Head))
+	// External-output content verification (design §10, BG-02b) — OFF by default:
+	// with the knob off SubmitResult refuses every output_data_url at the front
+	// door, so no volunteer-claimed checksum can enter the held-verification
+	// pipeline, let alone validation.
+	server.SetContentFetchPolicy(volunteerSvc, cfg.Head.ContentFetchEnabled)
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
 	// AuditService (design §7.3): the trusted-runner claim/submit surface. Registered
@@ -507,6 +514,30 @@ func main() {
 		// count, and the enforcement-horizon aging guard against the maturation window.
 		faultMonitor = faultMonitor.WithEnforcementWatch(cfg.Head.CreditMaturationDays)
 	}
+	// Content-verification health probe (design §10.10) — wired UNCONDITIONALLY, unlike
+	// the audit probe: held ref rows can exist while the content-fetch knob is OFF
+	// (stragglers from an enabled era draining on the 24h holding-expiry lane), and that
+	// is exactly the state the probe's knob-off lane must page about. One aggregate
+	// query per scan; both filters are positive-form (§10.0 item 4).
+	faultMonitor = faultMonitor.WithContentVerificationStats(func(ctx context.Context) (server.ContentVerificationStats, error) {
+		var s server.ContentVerificationStats
+		var oldestSeconds float64
+		err := pool.QueryRow(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE validation_status = 'AWAITING_CONTENT_VERIFICATION')::int,
+				COALESCE(EXTRACT(EPOCH FROM (now() - MIN(created_at)
+					FILTER (WHERE validation_status = 'AWAITING_CONTENT_VERIFICATION'))), 0),
+				COUNT(*) FILTER (WHERE validation_status = 'CONTENT_VERIFICATION_FAILED')::int
+			FROM results
+			WHERE validation_status IN ('AWAITING_CONTENT_VERIFICATION', 'CONTENT_VERIFICATION_FAILED')`,
+		).Scan(&s.Held, &oldestSeconds, &s.FailedTotal)
+		if err != nil {
+			return s, err
+		}
+		s.OldestHeldAge = time.Duration(oldestSeconds * float64(time.Second))
+		s.FetchEnabled = cfg.Head.ContentFetchEnabled
+		return s, nil
+	})
 	staleVolunteerMonitor := server.NewStaleVolunteerMonitor(volunteerRepo, logger)
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)
@@ -550,6 +581,28 @@ func main() {
 		})
 		slog.Info("audit enforcement armed",
 			"maturation_days", cfg.Head.CreditMaturationDays)
+	}
+
+	// Content-verification worker (design §10.6): fetches and hashes external output
+	// references so a ref result can only ever vote on a HEAD-computed checksum
+	// (BG-02b). Constructed unconditionally — see the start-site comment below; the
+	// KNOB gates fetching inside the worker, not the worker itself. The evaluate seam
+	// is a closure over the single transitioner (the browser-submit precedent), so
+	// contentverify never imports the transition machinery.
+	contentVerifyWorker := contentverify.NewWorker(
+		pool,
+		contentverify.NewHTTPClient(),
+		cfg.Head.ContentFetchEnabled,
+		cfg.Head.EffectiveContentFetchMaxBytes(),
+		func(ctx context.Context, workUnitID types.ID) error {
+			_, err := transitioner.Evaluate(ctx, workUnitID)
+			return err
+		},
+		logger,
+	)
+	if cfg.Head.ContentFetchEnabled {
+		slog.Info("external-output content verification armed",
+			"max_fetch_bytes", cfg.Head.EffectiveContentFetchMaxBytes())
 	}
 
 	leadershipMgr := server.NewLeadershipManager(pool, logger)
@@ -598,6 +651,13 @@ func main() {
 		if enforcementWorker != nil {
 			go enforcementWorker.Start(leaderCtx)
 		}
+		// Content-verification sweep (design §10.6) — UNCONDITIONAL like the reclaim
+		// sweep (S4): the worker is also the janitor for held ref rows stranded by a
+		// content-fetch knob flip on→off, which must drain via the 24h holding-expiry
+		// lane without a config change. The KNOB gates fetching per row inside the
+		// worker (off = no network I/O ever); on a head that never enabled fetching it
+		// is one indexed no-row query per tick on the leader.
+		go contentVerifyWorker.Start(leaderCtx)
 		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
 	})
 

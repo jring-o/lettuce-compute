@@ -103,15 +103,21 @@ func TestExactCanonical_RealDifferenceRejected(t *testing.T) {
 // TestExactCanonical_EmptyOutputFallsBackToRawChecksum verifies that when there is no
 // inline output to canonicalize (e.g. EXTERNAL_REFERENCE), EXACT falls back to the raw
 // submitted checksum even though ignore_fields is set.
-func TestExactCanonical_EmptyOutputFallsBackToRawChecksum(t *testing.T) {
+// TestExactCanonical_RefOnlyClaimedChecksumNoLongerGroups is the BG-02b engine-level regression
+// (§10.8): two ref-only results (no inline bytes, not head-verified) that share an identical CLAIMED
+// checksum no longer group — comparisonKey gives each a per-result "unverified-ref:" key — so the
+// unit does NOT validate on the claimed string. Pre-slice-5 this VALIDATED via the empty-output
+// raw-checksum fallback; that fallback was the money hole and is gone. FAILS on pre-fix code (which
+// returned VALIDATED here).
+func TestExactCanonical_RefOnlyClaimedChecksumNoLongerGroups(t *testing.T) {
 	vr, err := runTwoResultsCfg(t, "EXACT", nil,
 		func(c *leaf.ValidationConfig) { c.IgnoreFields = []string{"compute_time_ms"} },
 		nil, "same-checksum", nil, "same-checksum")
 	if err != nil {
 		t.Fatalf("TryValidate: %v", err)
 	}
-	if vr.Outcome != OutcomeValidated {
-		t.Fatalf("Outcome = %q, want VALIDATED (equal raw checksums, no inline output)", vr.Outcome)
+	if vr.Outcome != OutcomeRejected {
+		t.Fatalf("Outcome = %q, want REJECTED (two unverified refs never group on a claimed checksum)", vr.Outcome)
 	}
 }
 

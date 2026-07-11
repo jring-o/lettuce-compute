@@ -88,6 +88,13 @@ type volunteerService struct {
 	// an idle slot evictable at mint time. Zero value = cap off (mints always succeed
 	// — the unit-test default); main.go threads the real policy via SetHostCapPolicy.
 	hostCap HostCapPolicy
+	// contentFetchEnabled is the head-wide external-output content-verification knob
+	// (LETTUCE_HEAD_CONTENT_FETCH_ENABLED, design §10.9). Zero value = off (the
+	// deploy-safety default): with it off SubmitResult refuses every external
+	// output_data_url at the front door — even for an opted-in leaf — so no
+	// volunteer-claimed checksum can reach validation. main.go threads the real value
+	// via SetContentFetchPolicy.
+	contentFetchEnabled bool
 	// now supplies the current time for trust power-suppression checks; overridable in tests.
 	now func() time.Time
 	// transitioner is the SINGLE owner of work-unit redundancy decisions (TODO #50):
@@ -337,6 +344,17 @@ func SetRegistrationPowPolicy(svc lettucev1.VolunteerServiceServer, pow admissio
 func SetHostCapPolicy(svc lettucev1.VolunteerServiceServer, p HostCapPolicy) {
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.hostCap = p
+	}
+}
+
+// SetContentFetchPolicy sets the head-wide external-output content-verification knob
+// (LETTUCE_HEAD_CONTENT_FETCH_ENABLED, design §10.9) on the gRPC volunteer service.
+// The zero value is the deploy-safety default (off — external references are refused
+// at submit for every leaf); main.go threads the real value from HeadConfig via this
+// setter (the SetHostCapPolicy decoupling pattern).
+func SetContentFetchPolicy(svc lettucev1.VolunteerServiceServer, enabled bool) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.contentFetchEnabled = enabled
 	}
 }
 
@@ -1483,13 +1501,15 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// The leaf backing this work unit governs two pre-storage gates, so it is loaded
 	// once here (before opening a transaction) when either applies:
 	//
-	//   1. External-reference gate: an external output (output_data_url) carries a
-	//      volunteer-claimed checksum that the head never verifies against the bytes —
-	//      there is no fetch-and-hash pipeline — so under EXACT comparison that claimed
-	//      checksum would become the agreement key, making "agreement" merely colluders
-	//      repeating a string. Reject an external reference unless the leaf has opted in
-	//      via allow_external_output. The reference client submits inline only, so this
-	//      breaks no shipped volunteer.
+	//   1. External-reference gate: an external output (output_data_url) is accepted only
+	//      when the leaf opted in (allow_external_output), the head knob
+	//      LETTUCE_HEAD_CONTENT_FETCH_ENABLED is on, and the URL passes the D10 allowlist
+	//      shape check. The reference is then HELD (AWAITING_CONTENT_VERIFICATION) while
+	//      the head fetches the URL and hashes the served bytes itself — it never votes on
+	//      the volunteer-claimed checksum (design §10.2/§10.6), which under EXACT comparison
+	//      would otherwise become the agreement key, making "agreement" merely colluders
+	//      repeating a string. With the knob off every reference is refused here, so the
+	//      held pipeline is not even entered.
 	//   2. M3 output cap: enforce the leaf's per-result max_output_size_bytes on the
 	//      INLINE output, so an authenticated, assigned volunteer cannot store output far
 	//      larger than configured (unbounded JSONB storage and memory pressure — the
@@ -1511,10 +1531,22 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
 
-		// Gate 1: external reference requires leaf opt-in.
-		if req.OutputDataUrl != "" && !submitLeaf.ValidationConfig.AllowExternalOutput {
-			return nil, status.Errorf(codes.InvalidArgument,
-				"this leaf accepts inline output_data only; external output_data_url is not permitted")
+		// Gate 1: external reference. Three ordered checks, each failing closed (§10.2):
+		// leaf opt-in, then the head knob, then the D10 URL/allowlist shape. The URL
+		// string is stored verbatim in output_data_ref; the head fetches and hashes the
+		// served bytes before the result may vote.
+		if req.OutputDataUrl != "" {
+			if !submitLeaf.ValidationConfig.AllowExternalOutput {
+				return nil, status.Errorf(codes.InvalidArgument,
+					"this leaf accepts inline output_data only; external output_data_url is not permitted")
+			}
+			if !s.contentFetchEnabled {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"external output verification is disabled on this head; submit inline output_data")
+			}
+			if err := leaf.ValidateExternalOutputURL(req.OutputDataUrl, submitLeaf.ValidationConfig.ExternalOutputHosts); err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "%s", err.Error())
+			}
 		}
 
 		// Gate 2: inline output size cap. MaxOutputSizeBytes is always > 0 for a stored
@@ -1642,6 +1674,23 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	}
 	trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
 
+	// A ref-only submission (external output_data_url) is HELD, not PENDING (§10.2): the
+	// head must fetch the URL and hash the served bytes before the result may vote, so
+	// (1) the row lands AWAITING_CONTENT_VERIFICATION with a fetch scheduled now, and
+	// (2) it contributes +0 to the quorum that flips the unit COMPLETED — a held result
+	// must not complete a unit it cannot yet corroborate. The claimed checksum stays in
+	// output_checksum as a recorded claim; verified_output_checksum stays nil until the
+	// head hashes real bytes. Inline submissions are unchanged (PENDING, +1, no fetch).
+	validationStatus := result.ValidationPending
+	pendingDelta := 1
+	var contentFetchNextAttemptAt *time.Time
+	if req.OutputDataUrl != "" {
+		validationStatus = result.ValidationAwaitingContentVerification
+		pendingDelta = 0
+		heldAt := s.now()
+		contentFetchNextAttemptAt = &heldAt
+	}
+
 	r := &result.Result{
 		WorkUnitID:        workUnitID,
 		VolunteerID:       volunteerID,
@@ -1649,7 +1698,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		OutputDataRef:     outputDataRef,
 		OutputChecksum:    req.OutputChecksumSha256,
 		ExecutionMetadata: result.ExecutionMetadataFromProto(req.Metadata),
-		ValidationStatus:  result.ValidationPending,
+		ValidationStatus:  validationStatus,
 		ArtifactVersionID: artifactVersionID,
 		// Attribute the result to the MACHINE that produced it by copying the host id off
 		// the live copy row (TODO #19), rather than trusting a separately-sent field — so
@@ -1663,6 +1712,9 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		// Effective account standing at submit (see internal/standing): validation counts
 		// only OK-stamped results toward quorum and redundancy coverage.
 		StandingAtSubmit: &standingAtSubmit,
+		// A ref-only submission is held for content verification: schedule the first fetch
+		// attempt now. nil for inline results, which never enter the fetch pipeline.
+		ContentFetchNextAttemptAt: contentFetchNextAttemptAt,
 	}
 
 	// Insert result.
@@ -1704,7 +1756,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
 	}
 
-	if existingCount+1 >= quorum {
+	if existingCount+pendingDelta >= quorum {
 		// Redundancy met: this submit completed the last needed copy. Mark the unit
 		// COMPLETED (a submitted result implies the work ran). The unit was QUEUED
 		// throughout (its copies ran in parallel); the ASSIGNED/RUNNING values are
@@ -1738,7 +1790,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// ready pool. Evicting on full completion clears any stale snapshot/holder; a
 	// partial (redundancy>1) submit converted its hold to a history row at run-start,
 	// so there is nothing to release here for that case (the reconcile owns it).
-	if s.dispatchCache != nil && existingCount+1 >= quorum {
+	if s.dispatchCache != nil && existingCount+pendingDelta >= quorum {
 		s.dispatchCache.onUnitDone(workUnitID)
 	}
 
@@ -1747,7 +1799,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 
 	// Increment batch completed counter when the work unit transitioned to COMPLETED.
 	// Reuse currentWU from the transaction — no need for a second DB fetch.
-	if existingCount+1 >= quorum && s.batchRepo != nil {
+	if existingCount+pendingDelta >= quorum && s.batchRepo != nil {
 		if currentWU.BatchID != nil {
 			_ = s.batchRepo.IncrementCompleted(ctx, *currentWU.BatchID)
 		}
@@ -1793,13 +1845,19 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		"work_unit_id", workUnitID,
 		"result_id", r.ID,
 		"volunteer_id", volunteerID,
-		"completed", existingCount+1 >= quorum,
+		"completed", existingCount+pendingDelta >= quorum,
 		"validation_outcome", validationOutcome)
 
-	return &lettucev1.SubmitResultResponse{
+	resp := &lettucev1.SubmitResultResponse{
 		ResultId: r.ID.String(),
 		Accepted: true,
-	}, nil
+	}
+	// A held (ref-only) result is accepted but not yet votable — surface that in the
+	// response so the volunteer knows the URL will be fetched and verified (§10.2 step 6).
+	if req.OutputDataUrl != "" {
+		resp.Message = "result accepted and held pending external output content verification"
+	}
+	return resp, nil
 }
 
 // StartWork marks a buffered (reserved) work unit as run-started: the volunteer

@@ -184,6 +184,59 @@ func TestHandleListByProject_FilterByValidationStatus(t *testing.T) {
 	}
 }
 
+func TestHandleListByProject_FilterByAwaitingContentVerification(t *testing.T) {
+	leafID := types.NewID()
+
+	repo := &mockResultRepo{results: nil}
+	ts, cleanup := setupTestHandler(repo, &mockLeafRepo{})
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/api/v1/leafs/" + leafID.String() + "/results?validation_status=AWAITING_CONTENT_VERIFICATION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	// The held status must reach the repository as a positive-form filter.
+	if repo.capturedFilters == nil || repo.capturedFilters.ValidationStatus == nil {
+		t.Fatal("expected ValidationStatus filter to be captured")
+	}
+	if *repo.capturedFilters.ValidationStatus != ValidationAwaitingContentVerification {
+		t.Errorf("ValidationStatus = %v, want %v", *repo.capturedFilters.ValidationStatus, ValidationAwaitingContentVerification)
+	}
+}
+
+func TestHandleListByProject_FilterByContentVerificationFailed(t *testing.T) {
+	leafID := types.NewID()
+
+	repo := &mockResultRepo{results: nil}
+	ts, cleanup := setupTestHandler(repo, &mockLeafRepo{})
+	defer cleanup()
+
+	resp, err := http.Get(ts.URL + "/api/v1/leafs/" + leafID.String() + "/results?validation_status=CONTENT_VERIFICATION_FAILED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	if repo.capturedFilters == nil || repo.capturedFilters.ValidationStatus == nil {
+		t.Fatal("expected ValidationStatus filter to be captured")
+	}
+	if *repo.capturedFilters.ValidationStatus != ValidationContentVerificationFailed {
+		t.Errorf("ValidationStatus = %v, want %v", *repo.capturedFilters.ValidationStatus, ValidationContentVerificationFailed)
+	}
+}
+
 func TestHandleListByProject_FilterByWorkUnitID(t *testing.T) {
 	now := time.Now().UTC()
 	leafID := types.NewID()

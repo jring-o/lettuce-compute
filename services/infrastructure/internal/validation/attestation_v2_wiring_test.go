@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"strings"
 	"testing"
 
 	"github.com/lettuce-compute/infrastructure/internal/attestation"
@@ -42,17 +41,19 @@ func v2WiringEngine(t *testing.T, attRepo *mockAttestationRepo, fixtures func(rr
 func TestV2Attestation_FieldsAndDescriptor(t *testing.T) {
 	leafID, wuID := types.NewID(), types.NewID()
 	vol1, vol2, vol3 := types.NewID(), types.NewID(), types.NewID()
-	agreeSum := strings.Repeat("ab", 32) // 64 hex chars
-	dissentSum := strings.Repeat("cd", 32)
+	// Realistic inline shape: output_checksum = sha256(output_data), so the attested checksum the
+	// assertions below check is the head-verified hash of the bytes each result actually carries.
+	agreeSum := inlineAgreeCk
+	dissentSum := inlineDisagreeCk
 
 	var r1ID, r2ID, r3ID types.ID
 	attRepo := newMockAttestationRepo()
 	engine := v2WiringEngine(t, attRepo, func(rr *mockResultRepo, wr *mockWorkUnitRepo, lr *mockLeafRepo, vr *mockVolunteerRepo) {
 		lr.addLeaf(makeLeaf(leafID, 2, 0.6, "EXACT", nil, 1.0))
 		wr.addWorkUnit(makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted))
-		r1 := makeResult(wuID, vol1, agreeSum, nil)
-		r2 := makeResult(wuID, vol2, agreeSum, nil)
-		r3 := makeResult(wuID, vol3, dissentSum, nil)
+		r1 := makeResult(wuID, vol1, agreeSum, inlineAgreeData)
+		r2 := makeResult(wuID, vol2, agreeSum, inlineAgreeData)
+		r3 := makeResult(wuID, vol3, dissentSum, inlineDisagreeData)
 		r1ID, r2ID, r3ID = r1.ID, r2.ID, r3.ID
 		rr.addResult(r1)
 		rr.addResult(r2)
@@ -130,8 +131,8 @@ func TestV2Attestation_FieldsAndDescriptor(t *testing.T) {
 func TestRejectAll_DescriptorCarriesLosingClique(t *testing.T) {
 	leafID, wuID := types.NewID(), types.NewID()
 	vol1, vol2, vol3 := types.NewID(), types.NewID(), types.NewID()
-	cliqueSum := strings.Repeat("ab", 32)
-	dissentSum := strings.Repeat("cd", 32)
+	cliqueSum := inlineAgreeCk
+	dissentSum := inlineDisagreeCk
 
 	attRepo := newMockAttestationRepo()
 	engine := v2WiringEngine(t, attRepo, func(rr *mockResultRepo, wr *mockWorkUnitRepo, lr *mockLeafRepo, vr *mockVolunteerRepo) {
@@ -139,9 +140,9 @@ func TestRejectAll_DescriptorCarriesLosingClique(t *testing.T) {
 		// remain, so the unit rejects this round.
 		lr.addLeaf(makeLeaf(leafID, 2, 1.0, "EXACT", nil, 1.0))
 		wr.addWorkUnit(makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted))
-		rr.addResult(makeResult(wuID, vol1, cliqueSum, nil))
-		rr.addResult(makeResult(wuID, vol2, cliqueSum, nil))
-		rr.addResult(makeResult(wuID, vol3, dissentSum, nil))
+		rr.addResult(makeResult(wuID, vol1, cliqueSum, inlineAgreeData))
+		rr.addResult(makeResult(wuID, vol2, cliqueSum, inlineAgreeData))
+		rr.addResult(makeResult(wuID, vol3, dissentSum, inlineDisagreeData))
 		for i, id := range []types.ID{vol1, vol2, vol3} {
 			v := makeVolunteer(id)
 			v.PublicKey = make([]byte, ed25519.PublicKeySize)

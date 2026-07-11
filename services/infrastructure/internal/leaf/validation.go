@@ -620,6 +620,33 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			validationDetail{Field: "audit_rate", Reason: "out_of_range"})
 	}
 
+	// External output URL allowlist (D10, design §10.3). The opt-in, the comparison mode,
+	// and the allowlist shape are cross-checked here so both create and update are covered
+	// (the update handler re-merges + re-validates). An opted-in leaf MUST declare a
+	// non-empty host allowlist (an empty list matches nothing at submit, so the leaf could
+	// never accept a reference); NUMERIC_TOLERANCE is refused because reference bytes are
+	// hashed and discarded, leaving nothing to compare numerically; and an allowlist without
+	// the opt-in is vestigial config, refused under the alpha no-vestigial policy.
+	if c.AllowExternalOutput {
+		if len(c.ExternalOutputHosts) == 0 {
+			return apierror.ValidationError(
+				"allow_external_output requires a non-empty external_output_hosts allowlist",
+				validationDetail{Field: "external_output_hosts", Reason: "required_non_empty"})
+		}
+		if c.ComparisonMode == ComparisonNumericTolerance {
+			return apierror.ValidationError(
+				"allow_external_output is not permitted with comparison_mode NUMERIC_TOLERANCE: external reference bytes are hashed and discarded, so numeric comparison is impossible",
+				validationDetail{Field: "allow_external_output", Reason: "incompatible_with_numeric_tolerance"})
+		}
+		if err := validateExternalOutputHosts(c.ExternalOutputHosts); err != nil {
+			return err
+		}
+	} else if len(c.ExternalOutputHosts) > 0 {
+		return apierror.ValidationError(
+			"external_output_hosts requires allow_external_output to be set (no vestigial config)",
+			validationDetail{Field: "external_output_hosts", Reason: "requires_opt_in"})
+	}
+
 	// Comparison field-path lists (ignore_fields / compare_fields): each entry must be a
 	// non-empty, reasonably-bounded dotted JSON path. compare_fields only applies to
 	// NUMERIC_TOLERANCE; ignore_fields applies to EXACT (canonical) and NUMERIC_TOLERANCE.
@@ -657,6 +684,76 @@ func validateFieldPaths(field string, paths []string) *apierror.APIError {
 			return apierror.ValidationError(
 				fmt.Sprintf("%s entries must be at most 256 characters", field),
 				validationDetail{Field: field, Reason: "too_long"})
+		}
+	}
+	return nil
+}
+
+// validateExternalOutputHosts checks the external output URL host allowlist (D10,
+// design §10.3): 1-16 entries, each a bare lowercase FQDN. Exact-match semantics
+// (no subdomain wildcarding), so entries must already be lowercase — the submit and
+// fetch gates compare a lowercased URL host against them with no further normalization.
+func validateExternalOutputHosts(hosts []string) *apierror.APIError {
+	if len(hosts) < 1 || len(hosts) > 16 {
+		return apierror.ValidationError(
+			"external_output_hosts must have between 1 and 16 entries",
+			validationDetail{Field: "external_output_hosts", Reason: "out_of_range"})
+	}
+	for _, h := range hosts {
+		if err := validateExternalOutputHost(h); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateExternalOutputHost checks a single allowlist entry is a bare lowercase
+// FQDN: <= 253 chars, >= 2 non-empty dot-separated labels of [a-z0-9-] with no
+// hyphen at a label boundary, and carrying no scheme, port, path, wildcard,
+// userinfo, whitespace, or IP literal (v4 or v6). All of those are refusable now and
+// relaxable later; an IP literal in particular would sidestep the FQDN posture the
+// fetch client's dial guard relies on.
+func validateExternalOutputHost(h string) *apierror.APIError {
+	reject := func(reason string) *apierror.APIError {
+		return apierror.ValidationError(
+			fmt.Sprintf("external_output_hosts entry %q must be a bare lowercase FQDN (no scheme, port, path, wildcard, userinfo, or IP literal)", h),
+			validationDetail{Field: "external_output_hosts", Reason: reason})
+	}
+	if h == "" {
+		return reject("empty_entry")
+	}
+	if len(h) > 253 {
+		return reject("too_long")
+	}
+	if strings.ToLower(h) != h {
+		return reject("not_lowercase")
+	}
+	// Any URL structure or userinfo marker (scheme/port ":", path "/", wildcard "*",
+	// userinfo "@", whitespace) disqualifies a bare FQDN. The ":" also catches every
+	// IPv6 literal, bracketed or not.
+	if strings.ContainsAny(h, "/:*@ \t\r\n") {
+		return reject("not_bare_fqdn")
+	}
+	// An IPv4 dotted-quad passes the label checks below (all-numeric labels are valid
+	// [a-z0-9-]), so refuse IP literals explicitly. IPv6 is already refused by the ":".
+	if net.ParseIP(h) != nil {
+		return reject("ip_literal")
+	}
+	labels := strings.Split(h, ".")
+	if len(labels) < 2 {
+		return reject("not_fqdn")
+	}
+	for _, label := range labels {
+		if label == "" {
+			return reject("empty_label")
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return reject("hyphen_boundary")
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' {
+				return reject("invalid_char")
+			}
 		}
 	}
 	return nil

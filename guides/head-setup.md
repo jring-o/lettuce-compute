@@ -629,6 +629,39 @@ unit if nothing on it was right. Operational notes:
 - Verdicts recorded while enforcement was off are never acted on retroactively; only
   mismatches observed while the switch is on can trigger consequences.
 
+### External output verification (advanced, default off)
+
+A leaf can opt in to accepting results as an **external reference** — a URL to output
+stored elsewhere — instead of inline bytes (`allow_external_output` plus a required
+`external_output_hosts` allowlist in the leaf's validation config). The head never trusts
+a volunteer's claimed checksum for such a result: the submission is held out of
+validation while the head fetches the URL itself (https only, exact-host allowlist, no
+redirects, no proxy) and hashes the served bytes, and only that head-computed hash can
+ever count toward agreement. Two knobs govern the pipeline:
+
+| Key (env) | Default | What it does |
+|-----------|---------|--------------|
+| `content_fetch_enabled` (`LETTUCE_HEAD_CONTENT_FETCH_ENABLED`) | `false` | Master switch. Off refuses every external-reference submission at the front door — even for opted-in leaves — so nothing is ever held or fetched. On accepts references on opted-in leaves, holds each one, and verifies it within roughly one worker tick (30 s). |
+| `content_fetch_max_bytes` (`LETTUCE_HEAD_CONTENT_FETCH_MAX_BYTES`) | `0` → 100 MB | Global ceiling on how many bytes one verification fetch will read. The effective per-fetch cap is the smaller of this and the leaf's `max_output_size_bytes`. A body over the cap fails the result's verification. |
+
+Operational notes:
+
+- A held result frees its redundancy slot while it waits, so the unit may be dispatched
+  to one extra volunteer during the verification window — deliberate, bounded, and
+  visible in the log.
+- Results whose fetch fails (unreachable origin, non-200, over the byte cap, redirect,
+  disallowed address, or a URL that no longer passes the leaf's CURRENT allowlist) end
+  as `CONTENT_VERIFICATION_FAILED` — permanently non-votable, reason-coded in the row's
+  `content_fetch_last_error`, and queryable via
+  `?validation_status=CONTENT_VERIFICATION_FAILED` on the leaf results endpoint.
+- Flipping the switch off with references still held is safe: they stop being fetched
+  and drain through a 24-hour holding-expiry lane (the log warns while any are waiting).
+- A served hash that differs from the volunteer's claim is NOT treated as fraud — the
+  result simply votes on what the origin actually served, and wrong content loses the
+  ordinary agreement vote. Origins that transform bytes in flight (compression,
+  re-serialization) will therefore produce disagreeing results; point the allowlist at
+  storage that serves the exact uploaded bytes.
+
 ### Server-issued host identity & per-account host cap
 
 A **volunteer account** is a volunteer's Ed25519 keypair — credit, trust, result
