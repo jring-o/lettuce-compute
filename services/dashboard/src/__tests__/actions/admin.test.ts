@@ -50,11 +50,19 @@ jest.mock("@/lib/db/schema", () => ({
     createdAt: "created_at_col",
     updatedAt: "updated_at_col",
     deactivatedAt: "deactivated_at_col",
+    tokenVersion: "token_version_col",
   },
 }));
 
 jest.mock("drizzle-orm", () => ({
   eq: jest.fn((...args: unknown[]) => ({ type: "eq", args })),
+  // Capture tagged-template SQL so tests can assert an increment expression was
+  // passed to .set() (e.g. `token_version + 1`).
+  sql: (strings: readonly string[], ...values: unknown[]) => ({
+    type: "sql",
+    text: strings.join("?"),
+    values,
+  }),
 }));
 
 import {
@@ -661,6 +669,19 @@ describe("Admin Server Actions", () => {
       );
     });
 
+    it("bumps token_version so pre-deactivation sessions cannot revive (BG-09)", async () => {
+      mockAuth.mockResolvedValue(adminSession);
+      mockUpdateReturning.mockResolvedValue([{ id: "target-user" }]);
+
+      await reactivateUser("target-user");
+
+      const setArg = mockUpdateSet.mock.calls[0]?.[0] as {
+        tokenVersion?: { type?: string; text?: string };
+      };
+      expect(setArg.tokenVersion?.type).toBe("sql");
+      expect(setArg.tokenVersion?.text).toContain("+ 1");
+    });
+
     it("returns NOT_FOUND when user does not exist", async () => {
       mockAuth.mockResolvedValue(adminSession);
       mockUpdateReturning.mockResolvedValue([]);
@@ -772,6 +793,20 @@ describe("Admin Server Actions", () => {
           passwordHash: "new_hashed_password",
         }),
       );
+    });
+
+    it("bumps token_version so the reset revokes existing sessions (BG-09)", async () => {
+      mockAuth.mockResolvedValue(adminSession);
+      mockUpdateReturning.mockResolvedValue([{ id: "target-user" }]);
+
+      await resetUserPassword("target-user", "newpassword123");
+
+      const setArg = mockUpdateSet.mock.calls[0]?.[0] as {
+        tokenVersion?: { type?: string; text?: string };
+      };
+      expect(setArg.tokenVersion?.type).toBe("sql");
+      // An increment expression, not a literal, so concurrent resets compose.
+      expect(setArg.tokenVersion?.text).toContain("+ 1");
     });
 
     it("rejects password shorter than 8 characters", async () => {
