@@ -20,6 +20,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/montecarlo"
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
@@ -491,10 +492,16 @@ func TestV08_Scenario3_CustomBulkUpload(t *testing.T) {
 	}
 }
 
-// TestV08_Scenario4_ExternalStorageReference tests external storage reference flow.
+// TestV08_Scenario4_ExternalStorageReference tests the external storage reference flow under the
+// slice-5 (BG-02b) contract: with the head content-fetch knob ON and the output host allowlisted,
+// a submitted output_data_url is accepted but HELD (AWAITING_CONTENT_VERIFICATION) with the URL
+// stored verbatim and the work unit not yet completed — the head fetches and hashes the bytes
+// before the result may vote (the verified happy path lives in e2e_bg02b_test.go test (b)).
 func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 	env, cleanup := setupAlphaServer(t)
 	defer cleanup()
+	// External output references require the head-wide content-fetch knob ON (design §10.2).
+	server.SetContentFetchPolicy(env.volunteerSvc, true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -515,9 +522,10 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 		},
 		leaf.ValidationConfig{
 			RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
-			// This leaf exercises the external-reference output path, so it must opt in;
-			// SubmitResult otherwise rejects output_data_url.
+			// This leaf exercises the external-reference output path, so it must opt in AND
+			// allowlist the output host (D10); SubmitResult otherwise rejects output_data_url.
 			AllowExternalOutput: true,
+			ExternalOutputHosts: []string{"storage.example.com"},
 		},
 		leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
 	)
@@ -571,13 +579,14 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 	outputData := []byte(`{"result": "external_computed"}`)
 	hash := sha256.Sum256(outputData)
 	checksum := hex.EncodeToString(hash[:])
+	outputURL := "https://storage.example.com/results/v08-wu-" + wuResp.Assignments[0].WorkUnitId + ".json"
 
 	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
 	submitResp, err := env.grpc.SubmitResult(signFor(t, ctx, pubKey), &lettucev1.SubmitResultRequest{
 		WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
-		OutputDataUrl:        "https://storage.example.com/results/v08-wu-" + wuResp.Assignments[0].WorkUnitId + ".json",
+		OutputDataUrl:        outputURL,
 		OutputChecksumSha256: checksum,
 		Metadata:             &lettucev1.ExecutionMetadata{WallClockSeconds: 10, CpuSecondsUser: 5, CpuCoresUsed: 2},
 	})
@@ -588,17 +597,34 @@ func TestV08_Scenario4_ExternalStorageReference(t *testing.T) {
 		t.Errorf("result not accepted: %s", submitResp.Message)
 	}
 
-	// Verify output_data_ref stored.
+	// New-contract post-submit state (BG-02b, §10.2): the reference is HELD, stored verbatim,
+	// and does not complete the unit until the head fetches + hashes the bytes.
+	var validationStatus string
 	var outputRef *string
 	err = env.pool.QueryRow(ctx,
-		"SELECT output_data_ref FROM results WHERE id = $1",
+		"SELECT validation_status, output_data_ref FROM results WHERE id = $1",
 		submitResp.ResultId,
-	).Scan(&outputRef)
+	).Scan(&validationStatus, &outputRef)
 	if err != nil {
-		t.Fatalf("query output_data_ref: %v", err)
+		t.Fatalf("query result row: %v", err)
 	}
-	if outputRef == nil || *outputRef == "" {
-		t.Error("expected output_data_ref in results table")
+	if validationStatus != "AWAITING_CONTENT_VERIFICATION" {
+		t.Errorf("validation_status = %q, want AWAITING_CONTENT_VERIFICATION (the reference is held)", validationStatus)
+	}
+	if outputRef == nil || *outputRef != outputURL {
+		t.Errorf("output_data_ref = %v, want the submitted URL stored verbatim (%q)", outputRef, outputURL)
+	}
+
+	var unitState string
+	err = env.pool.QueryRow(ctx,
+		"SELECT state FROM work_units WHERE id = $1",
+		wuResp.Assignments[0].WorkUnitId,
+	).Scan(&unitState)
+	if err != nil {
+		t.Fatalf("query work unit state: %v", err)
+	}
+	if unitState == "COMPLETED" || unitState == "VALIDATED" {
+		t.Errorf("work unit state = %q, want not-completed (a held reference contributes +0)", unitState)
 	}
 }
 

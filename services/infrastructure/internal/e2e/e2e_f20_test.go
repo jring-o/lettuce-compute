@@ -13,16 +13,24 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
-// TestF20_ExternalStorageReference tests the external storage reference flow:
-// create leaf with EXTERNAL_REFERENCE → generate work units with input_data_ref →
-// verify gRPC assignment includes input_data_url → submit result with output_data_url.
+// TestF20_ExternalStorageReference tests the external storage reference flow under the slice-5
+// (BG-02b) contract: create leaf with EXTERNAL_REFERENCE input and an external_output_hosts
+// allowlist → generate work units with input_data_ref → verify the gRPC assignment includes
+// input_data_url → submit a result with output_data_url. With the head content-fetch knob ON,
+// the reference is accepted but HELD (AWAITING_CONTENT_VERIFICATION): the URL is stored verbatim
+// in output_data_ref and the work unit does NOT complete until the head fetches and hashes the
+// bytes itself (the verified happy path is exercised end-to-end in e2e_bg02b_test.go test (b)).
 func TestF20_ExternalStorageReference(t *testing.T) {
 	env, cleanup := setupAlphaServer(t)
 	defer cleanup()
+	// External output references require the head-wide content-fetch knob ON (design §10.2);
+	// with it off the submit is refused outright.
+	server.SetContentFetchPolicy(env.volunteerSvc, true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -44,9 +52,11 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 			AgreementThreshold: 1.0,
 			ComparisonMode:     "EXACT",
 			MaxRetries:         3,
-			// This leaf deliberately exercises the external-reference output path, so
-			// it must opt in; SubmitResult otherwise rejects output_data_url.
+			// This leaf deliberately exercises the external-reference output path, so it must
+			// opt in AND allowlist the output host (D10): SubmitResult rejects an output_data_url
+			// whose host is not in external_output_hosts.
 			AllowExternalOutput: true,
+			ExternalOutputHosts: []string{"storage.example.com"},
 		},
 		leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
 	)
@@ -109,6 +119,7 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 	outputData := []byte(`{"result": "computed from external data"}`)
 	hash := sha256.Sum256(outputData)
 	checksum := hex.EncodeToString(hash[:])
+	outputURL := "https://storage.example.com/results/wu-" + wuResp.Assignments[0].WorkUnitId + ".json"
 
 	// Submit with output_data_url instead of inline output_data.
 	ensureRunStart(t, env.pool, env.grpc, ctx, volID, pubKey, wuResp.Assignments[0].WorkUnitId)
@@ -116,7 +127,7 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 		WorkUnitId:           wuResp.Assignments[0].WorkUnitId,
 		VolunteerId:          volID,
 		PublicKey:            pubKey,
-		OutputDataUrl:        "https://storage.example.com/results/wu-" + wuResp.Assignments[0].WorkUnitId + ".json",
+		OutputDataUrl:        outputURL,
 		OutputChecksumSha256: checksum,
 		Metadata:             &lettucev1.ExecutionMetadata{WallClockSeconds: 15, CpuSecondsUser: 10, CpuCoresUsed: 2},
 	})
@@ -128,19 +139,37 @@ func TestF20_ExternalStorageReference(t *testing.T) {
 	}
 	t.Logf("result submitted with output_data_url, result_id=%s", submitResp.ResultId)
 
-	// Verify the stored result has output_data_ref.
+	// New-contract post-submit state (BG-02b, §10.2): the reference is HELD, not straight-to-
+	// storage-and-votable. The row lands AWAITING_CONTENT_VERIFICATION with the URL stored
+	// verbatim in output_data_ref, and the work unit does NOT complete (a held ref contributes
+	// +0 to the quorum). The head fetches and hashes the bytes before the result may vote.
+	var validationStatus string
 	var outputRef *string
 	err = env.pool.QueryRow(ctx,
-		"SELECT output_data_ref FROM results WHERE id = $1",
+		"SELECT validation_status, output_data_ref FROM results WHERE id = $1",
 		submitResp.ResultId,
-	).Scan(&outputRef)
+	).Scan(&validationStatus, &outputRef)
 	if err != nil {
-		t.Fatalf("query result output_data_ref: %v", err)
+		t.Fatalf("query result row: %v", err)
 	}
-	if outputRef == nil || *outputRef == "" {
-		t.Error("expected output_data_ref to be stored in results table")
-	} else {
-		t.Logf("stored output_data_ref = %s", *outputRef)
+	if validationStatus != "AWAITING_CONTENT_VERIFICATION" {
+		t.Errorf("validation_status = %q, want AWAITING_CONTENT_VERIFICATION (the reference is held)", validationStatus)
+	}
+	if outputRef == nil || *outputRef != outputURL {
+		t.Errorf("output_data_ref = %v, want the submitted URL stored verbatim (%q)", outputRef, outputURL)
+	}
+
+	// The work unit must NOT have completed on a held reference.
+	var unitState string
+	err = env.pool.QueryRow(ctx,
+		"SELECT state FROM work_units WHERE id = $1",
+		wuResp.Assignments[0].WorkUnitId,
+	).Scan(&unitState)
+	if err != nil {
+		t.Fatalf("query work unit state: %v", err)
+	}
+	if unitState == "COMPLETED" || unitState == "VALIDATED" {
+		t.Errorf("work unit state = %q, want not-completed (a held reference contributes +0)", unitState)
 	}
 
 	// Verify the stored work unit has input_data_ref.

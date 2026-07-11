@@ -54,6 +54,17 @@ type testEnv struct {
 	grpc       lettucev1.VolunteerServiceClient
 	httpURL    string
 	signingPub ed25519.PublicKey
+	// volunteerSvc is the gRPC volunteer service instance registered on the gRPC server.
+	// Exposed so the content-verification tests (BG-02b, §10.11) can flip the per-service
+	// external-output fetch knob via server.SetContentFetchPolicy; the default (never set)
+	// is the deploy-safety knob-off state.
+	volunteerSvc lettucev1.VolunteerServiceServer
+	// transitioner is a redundancy transitioner built exactly as main.go builds the head's,
+	// over the same repos + validation engine (with the same attestation signer). The
+	// content-verification worker's EvaluateFunc closes over it so a promoted ref is
+	// re-adjudicated identically to a submit-time evaluate; a second transitioner over the
+	// same pool still serializes per unit via the DB advisory lock.
+	transitioner *transition.Transitioner
 }
 
 // setupAlphaServer creates HTTP and gRPC servers wired with all repos including
@@ -158,6 +169,16 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	volunteerSvc := server.NewVolunteerService(pool, "0.6.0-alpha", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 
+	// A transitioner for the content-verification worker's EvaluateFunc, built over the same
+	// repos + validation engine main.go uses (see testEnv.transitioner). The BG-02b tests
+	// (§10.11) construct the worker with this so a promoted ref re-adjudicates the unit through
+	// the real transitioner, producing the same credit/attestation writes as a submit-time
+	// evaluate. Sharing the harness's validationEngine keeps the attestation signer identical,
+	// so the public verify endpoint validates the attestations the worker path produces.
+	contentVerifyTransitioner := transition.NewTransitioner(
+		transition.NewPgxLocker(pool, logger),
+		wuRepo, leafRepo, resultRepo, validationEngine, transition.TrustPolicy{}, logger)
+
 	grpcLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen for gRPC: %v", err)
@@ -174,10 +195,12 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	client := lettucev1.NewVolunteerServiceClient(conn)
 
 	env := &testEnv{
-		pool:       pool,
-		grpc:       client,
-		httpURL:    httpURL,
-		signingPub: signer.PublicKey(),
+		pool:         pool,
+		grpc:         client,
+		httpURL:      httpURL,
+		signingPub:   signer.PublicKey(),
+		volunteerSvc: volunteerSvc,
+		transitioner: contentVerifyTransitioner,
 	}
 
 	cleanup := func() {
