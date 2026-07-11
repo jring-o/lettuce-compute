@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/lettuce-compute/infrastructure/internal/netguard"
 )
 
 // Typed errors that callers can match with errors.Is to distinguish an absent
@@ -46,13 +48,14 @@ type Client struct {
 // used — never the shared http.DefaultClient, which has no timeout. When logger
 // is nil the default slog logger is used.
 //
-// The default client also installs an SSRF dial guard: because PDS endpoints
-// and did:web document URLs are volunteer-controlled, it refuses to connect to
-// loopback, private, link-local, unspecified, or multicast addresses (see
-// ErrDisallowedAddress). A caller that supplies its own httpClient BYPASSES this
-// guard and takes on that responsibility — operators pointing the head at a
-// private or development PDS, and tests using loopback servers, must supply
-// their own client accordingly.
+// The default client also installs the shared SSRF dial guard (internal/netguard):
+// because PDS endpoints and did:web document URLs are volunteer-controlled, it
+// refuses to connect to loopback, private, link-local, unspecified, multicast,
+// CGNAT, NAT64, this-network, or IPv4-compatible-IPv6 addresses (see
+// netguard.ErrDisallowedAddress). A caller that supplies its own httpClient
+// BYPASSES this guard and takes on that responsibility — operators pointing the
+// head at a private or development PDS, and tests using loopback servers, must
+// supply their own client accordingly.
 func NewClient(resolverURL string, httpClient *http.Client, logger *slog.Logger) *Client {
 	if httpClient == nil {
 		httpClient = defaultHTTPClient()
@@ -75,7 +78,7 @@ func defaultHTTPClient() *http.Client {
 			DialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
-				Control:   guardedDialControl,
+				Control:   netguard.DialControl,
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,

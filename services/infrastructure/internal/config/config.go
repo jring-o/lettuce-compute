@@ -399,6 +399,23 @@ type HeadConfig struct {
 	// land inside the maturation window). Override via
 	// LETTUCE_HEAD_AUDIT_ENFORCEMENT_ENABLED.
 	AuditEnforcementEnabled bool `yaml:"audit_enforcement_enabled"`
+
+	// ContentFetchEnabled arms external-output fetch-and-verify (design doc §10;
+	// BG-02b): a result submitted as an external reference (output_data_url) is held
+	// out of validation while the head fetches the URL and hashes the served bytes
+	// itself; only the head-computed hash may ever be a comparison key. OFF by
+	// default — and with it off the front door is closed too: SubmitResult refuses
+	// every external-reference submission outright, for opted-in leaves as well.
+	// Override via LETTUCE_HEAD_CONTENT_FETCH_ENABLED.
+	ContentFetchEnabled bool `yaml:"content_fetch_enabled"`
+	// ContentFetchMaxBytes is the global ceiling on how many bytes one external
+	// output fetch will read, in bytes. Unset (0) resolves to the default 104857600
+	// (100 MB — matching the leaf-side max_output_size_bytes default, so the knob is
+	// a pure operator ceiling, not a silent behavior change). The effective per-fetch
+	// cap is min(leaf max_output_size_bytes, this) — see
+	// EffectiveContentFetchMaxBytes. Override via
+	// LETTUCE_HEAD_CONTENT_FETCH_MAX_BYTES.
+	ContentFetchMaxBytes int64 `yaml:"content_fetch_max_bytes"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -510,6 +527,10 @@ const (
 	// audits are enabled — the sampling economics baseline (one trusted machine per
 	// ~100 volunteer machines).
 	defaultResultAuditRate = 0.01
+	// defaultContentFetchMaxBytes: the global external-output fetch cap, 100 MB —
+	// deliberately equal to the leaf-side max_output_size_bytes default (design doc
+	// §10.9, S6).
+	defaultContentFetchMaxBytes = int64(104857600)
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -792,6 +813,10 @@ func (h HeadConfig) Validate() error {
 		return fmt.Errorf("head.credit_maturation_days must be > 9 when audit enforcement is enabled "+
 			"(worst-case enforcement horizon: 3d root queue + lease retries, plus up to 3 confirmation "+
 			"cycles of 1d queue + lease retries each), got %d", h.CreditMaturationDays)
+	}
+	if h.ContentFetchMaxBytes < 0 {
+		return fmt.Errorf("head.content_fetch_max_bytes must be >= 0 (0 = default %d), got %d",
+			defaultContentFetchMaxBytes, h.ContentFetchMaxBytes)
 	}
 	return nil
 }
@@ -1210,6 +1235,17 @@ func (h HeadConfig) EffectiveResultAuditRate() float64 {
 		return defaultResultAuditRate
 	}
 	return h.ResultAuditRate
+}
+
+// EffectiveContentFetchMaxBytes returns the global external-output fetch byte
+// ceiling: the configured content_fetch_max_bytes, or 100 MB when unset (0). The
+// per-fetch cap is min(leaf max_output_size_bytes, this) — composed at the fetch
+// site (design doc §10.5).
+func (h HeadConfig) EffectiveContentFetchMaxBytes() int64 {
+	if h.ContentFetchMaxBytes <= 0 {
+		return defaultContentFetchMaxBytes
+	}
+	return h.ContentFetchMaxBytes
 }
 
 // StorageConfig defines local filesystem storage settings.

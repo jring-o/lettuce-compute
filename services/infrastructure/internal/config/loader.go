@@ -525,6 +525,20 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.AuditEnforcementEnabled = b
 	}
+	if v := os.Getenv("LETTUCE_HEAD_CONTENT_FETCH_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_CONTENT_FETCH_ENABLED must be a boolean (true/false): %w", err)
+		}
+		cfg.Head.ContentFetchEnabled = b
+	}
+	if v := os.Getenv("LETTUCE_HEAD_CONTENT_FETCH_MAX_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_CONTENT_FETCH_MAX_BYTES must be an integer byte count: %w", err)
+		}
+		cfg.Head.ContentFetchMaxBytes = n
+	}
 	return nil
 }
 

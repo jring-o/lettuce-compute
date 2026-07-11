@@ -162,14 +162,23 @@ type ValidationConfig struct {
 	HomogeneousRedundancy bool `json:"homogeneous_redundancy,omitempty"`
 
 	// AllowExternalOutput permits a volunteer to submit a result as an external
-	// reference (output_data_url) instead of inline bytes. Such a reference carries a
-	// volunteer-claimed output checksum that the head does NOT verify against the
-	// referenced bytes — there is no fetch-and-hash pipeline — so under EXACT
-	// comparison that unverified checksum becomes the agreement key, and "agreement"
-	// degrades to colluders repeating the same string. Enabling this therefore weakens
-	// corroboration for the leaf. Off by default: SubmitResult rejects external-
-	// reference submissions for any leaf that has not opted in.
+	// reference (output_data_url) instead of inline bytes. A reference is held out of
+	// validation while the head fetches the URL and hashes the served bytes itself
+	// (design doc §10; requires the head-wide LETTUCE_HEAD_CONTENT_FETCH_ENABLED knob
+	// — with it off, references are refused at submit even for opted-in leaves). The
+	// opt-in stays required because an external reference is an operator-visible
+	// external dependency with real fetch cost. Off by default. Requires a non-empty
+	// ExternalOutputHosts allowlist and is rejected on NUMERIC_TOLERANCE leaves (ref
+	// bytes are hashed and discarded, so numeric comparison is impossible).
 	AllowExternalOutput bool `json:"allow_external_output,omitempty"`
+	// ExternalOutputHosts is the leaf's URL host allowlist for external output
+	// references (D10): a submitted output_data_url must be https, without userinfo,
+	// on port 443, and its lowercased host must EXACTLY match an entry here —
+	// checked at submit and re-checked at fetch time against the CURRENT config.
+	// Entries are bare lowercase FQDNs (no scheme/port/path/wildcard/IP); 1-16
+	// entries; required non-empty when AllowExternalOutput is set, refused when it
+	// is not (no vestigial config).
+	ExternalOutputHosts []string `json:"external_output_hosts,omitempty"`
 
 	// MinTrustedCorroborators is the per-leaf trust-gate override: how many DISTINCT
 	// trusted subjects the agreeing group must contain to validate. 0 = inherit the head
