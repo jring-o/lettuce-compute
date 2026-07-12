@@ -117,6 +117,29 @@ func (h *LeafHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		req.Visibility = VisibilityPublic
 	}
 
+	// Bind creator_id to the authenticated caller (★BG-11d-write / R1.5). A
+	// non-admin caller may NOT set creator_id from the request body — doing so
+	// would let a direct USER-key caller mint a leaf owned by any user id,
+	// forging the ownership root every authOwner check keys on. Their leaf is
+	// always owned by themselves. An ADMIN may still create-on-behalf by
+	// supplying an explicit creator_id (falling back to their own id). The
+	// caller is read from the Viewer the route wrapper injects; absent it (a
+	// misconfigured route), fail closed.
+	v, ok := ViewerFromContext(r.Context())
+	if !ok || (!v.Authed && !v.IsAdmin) {
+		apierror.WriteError(w, apierror.Unauthorized("authentication required"))
+		return
+	}
+	if v.IsAdmin {
+		if req.CreatorID == nil {
+			callerID := v.UserID
+			req.CreatorID = &callerID
+		}
+	} else {
+		callerID := v.UserID
+		req.CreatorID = &callerID
+	}
+
 	p := &Leaf{
 		Name:         req.Name,
 		Description:  req.Description,

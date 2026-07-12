@@ -3,6 +3,8 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { ArrowLeft } from "lucide-react";
 
+import { auth } from "@/lib/auth";
+import { leafOwnershipVerdict } from "@/lib/authz";
 import { infrastructureClient, InfrastructureApiError } from "@/lib/infrastructure-client";
 import { VisualizationPage } from "@/components/visualization/VisualizationPage";
 
@@ -42,6 +44,20 @@ export default async function VisualizePage({
   }
 
   if (leaf.visibility === "PRIVATE") notFound();
+
+  // Visualization REPLAYS results (output_data), which are leaf CONTENTS —
+  // owner-only regardless of the leaf's visibility (design §1.3; §10 Q1: no
+  // public results in the beta). So this page is owner/admin-only even though
+  // it lives under the public /leafs tree. A non-owner (anonymous included)
+  // gets the same notFound() as a missing leaf — no existence or has-results
+  // leak. If public visualization is wanted later, it is the additive per-leaf
+  // results_visibility opt-in from §4.7, not a return to visibility-by-default.
+  const session = await auth();
+  if (!session?.user?.id) notFound();
+  const verdict = await leafOwnershipVerdict(leaf.id, {
+    user: { id: session.user.id, role: session.user.role },
+  });
+  if (!verdict.allowed) notFound();
 
   // Check for viz bundle
   const vizBundleUrl = leaf.execution_config?.binaries?.viz;
@@ -117,6 +133,7 @@ export default async function VisualizePage({
       <VisualizationPage
         vizBundleUrl={vizBundleUrl}
         vizOrigin={process.env.VIZ_ORIGIN ?? ""}
+        platformUrl={process.env.PLATFORM_URL ?? ""}
         leafSlug={slug}
         leafId={leaf.id}
         workUnits={workUnits}

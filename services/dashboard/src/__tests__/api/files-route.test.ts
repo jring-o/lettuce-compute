@@ -1,12 +1,14 @@
 // --- Mocks ---
 
-const mockAuth = jest.fn();
-jest.mock("@/lib/auth", () => ({
-  auth: () => mockAuth(),
+// The file download route is gated by requireFileAccess (the shared file-owner
+// route adapter). We mock that seam so these tests exercise the ROUTE given an
+// allow/deny verdict; requireFileAccess itself is covered in authz-routes.test.ts.
+const mockRequireFileAccess = jest.fn();
+jest.mock("@/lib/authz-routes", () => ({
+  requireFileAccess: (...args: unknown[]) => mockRequireFileAccess(...args),
 }));
 
 const mockGetFileContent = jest.fn();
-
 jest.mock("@/lib/file-storage", () => ({
   getFileContent: (...args: unknown[]) => mockGetFileContent(...args),
 }));
@@ -48,18 +50,44 @@ jest.mock("next/server", () => {
 import { GET } from "@/app/api/files/[id]/route";
 import { NextRequest } from "next/server";
 
-const authenticatedSession = {
-  user: { id: "user-1", username: "admin", role: "USER" },
-};
+// A denied verdict the way requireFileAccess returns it.
+function denied(status: number, code: string, message: string) {
+  return {
+    ok: false,
+    response: {
+      status,
+      _jsonData: { error: { code, message } },
+    },
+  };
+}
+
+function allowed(fileInfo: Record<string, unknown> = {}) {
+  return {
+    ok: true as const,
+    session: { user: { id: "user-1", role: "USER" } },
+    file: {
+      path: "/data/uploads/file-1/data.csv",
+      filename: "data.csv",
+      contentType: "text/csv",
+      sizeBytes: 11,
+      checksum: "abc",
+      leafId: "leaf-1",
+      uploadedBy: "user-1",
+      ...fileInfo,
+    },
+  };
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockAuth.mockResolvedValue(authenticatedSession);
+  mockRequireFileAccess.mockResolvedValue(allowed());
 });
 
 describe("GET /api/files/[id]", () => {
-  it("returns 401 when not authenticated", async () => {
-    mockAuth.mockResolvedValue(null);
+  it("returns the adapter's 401 when not authenticated (and never reads content)", async () => {
+    mockRequireFileAccess.mockResolvedValue(
+      denied(401, "UNAUTHENTICATED", "You must be signed in."),
+    );
 
     const request = new NextRequest("http://localhost/api/files/file-1");
     const response = await GET(request, {
@@ -70,7 +98,29 @@ describe("GET /api/files/[id]", () => {
     expect(mockGetFileContent).not.toHaveBeenCalled();
   });
 
-  it("returns file content with correct headers", async () => {
+  it("returns 404 when the caller is not authorized (BG-10)", async () => {
+    // requireFileAccess collapses not-owner and not-found into the SAME 404.
+    mockRequireFileAccess.mockResolvedValue(denied(404, "NOT_FOUND", "File not found"));
+
+    const request = new NextRequest("http://localhost/api/files/someone-elses-file");
+    const response = await GET(request, {
+      params: Promise.resolve({ id: "someone-elses-file" }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(mockGetFileContent).not.toHaveBeenCalled();
+  });
+
+  it("gates on the file id from the dynamic route params", async () => {
+    const request = new NextRequest("http://localhost/api/files/specific-uuid");
+    await GET(request, {
+      params: Promise.resolve({ id: "specific-uuid" }),
+    });
+
+    expect(mockRequireFileAccess).toHaveBeenCalledWith("specific-uuid");
+  });
+
+  it("returns file content with correct headers once authorized", async () => {
     const fileBuffer = Buffer.from("hello world");
     mockGetFileContent.mockResolvedValue({
       buffer: fileBuffer,
@@ -94,16 +144,15 @@ describe("GET /api/files/[id]", () => {
     expect(mockGetFileContent).toHaveBeenCalledWith("file-1");
   });
 
-  it("returns 404 when file not found", async () => {
+  it("returns 404 when content vanished after the access check", async () => {
     mockGetFileContent.mockResolvedValue(null);
 
-    const request = new NextRequest("http://localhost/api/files/missing");
+    const request = new NextRequest("http://localhost/api/files/file-1");
     const response = await GET(request, {
-      params: Promise.resolve({ id: "missing" }),
+      params: Promise.resolve({ id: "file-1" }),
     });
 
     expect(response.status).toBe(404);
-    // Check the JSON body was set
     expect((response as unknown as Record<string, unknown>)._jsonData).toEqual({
       error: { code: "NOT_FOUND", message: "File not found" },
     });
@@ -145,27 +194,5 @@ describe("GET /api/files/[id]", () => {
     });
 
     expect(response.body).toBeInstanceOf(Uint8Array);
-  });
-
-  it("passes file id from dynamic route params", async () => {
-    mockGetFileContent.mockResolvedValue(null);
-
-    const request = new NextRequest("http://localhost/api/files/specific-uuid");
-    await GET(request, {
-      params: Promise.resolve({ id: "specific-uuid" }),
-    });
-
-    expect(mockGetFileContent).toHaveBeenCalledWith("specific-uuid");
-  });
-
-  it("throws when getFileContent encounters an error", async () => {
-    mockGetFileContent.mockRejectedValue(new Error("Disk read failure"));
-
-    const request = new NextRequest("http://localhost/api/files/file-err");
-
-    // Route has no try/catch, so the error propagates
-    await expect(
-      GET(request, { params: Promise.resolve({ id: "file-err" }) }),
-    ).rejects.toThrow("Disk read failure");
   });
 });

@@ -30,6 +30,10 @@ export interface FileInfo {
   contentType: string | null;
   sizeBytes: number;
   checksum: string;
+  /** The leaf this file belongs to; authorization keys on its owner. */
+  leafId: string;
+  /** The uploading user, or null for legacy rows uploaded before tracking. */
+  uploadedBy: string | null;
 }
 
 export async function saveFile(
@@ -99,6 +103,8 @@ export async function getFile(fileId: string): Promise<FileInfo | null> {
     contentType: record.contentType,
     sizeBytes: record.sizeBytes,
     checksum: record.checksumSha256,
+    leafId: record.leafId,
+    uploadedBy: record.uploadedBy,
   };
 }
 

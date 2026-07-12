@@ -48,7 +48,9 @@ func setupHeadHandlerServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func
 	// Also register leaf CRUD for creating test leafs.
 	leafHandler := NewLeafHandler(NewPgxRepository(pool), pool, logger)
 	leafHandler.RegisterRoutes(mux)
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	// Create binds creator_id to the caller (★BG-11d-write); drive it as an
+	// operator (admin viewer) so an explicit body creator_id is honored.
+	mux.HandleFunc("POST /api/v1/leafs", withAdminViewer(leafHandler.HandleCreate))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", leafHandler.HandleConfigure)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", leafHandler.HandleActivate)

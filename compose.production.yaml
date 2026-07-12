@@ -197,6 +197,13 @@ services:
       NEXTAUTH_URL: ${PLATFORM_URL}
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
       AUTH_TRUST_HOST: "true"
+      # VIZ_ORIGIN isolates author-controlled visualization bundles onto a
+      # DISTINCT origin from the app (BG-08). It must be a separate host from
+      # PLATFORM_URL (and must NOT share a cookie parent-domain with it). When
+      # unset, empty, or equal to PLATFORM_URL, the dashboard FAILS CLOSED: the
+      # visualization iframe does not render (it would otherwise run untrusted
+      # JS on the app origin). Provision a distinct host to enable visualization
+      # — see guides/head-setup.md.
       VIZ_ORIGIN: ${VIZ_ORIGIN:-}
       NODE_ENV: production
       # Docker auto-sets HOSTNAME to the container id, which makes the Next.js

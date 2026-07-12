@@ -39,8 +39,13 @@ export default async function LeafDetailPage({
   // Only show PUBLIC or UNLISTED leafs
   if (leaf.visibility === "PRIVATE") notFound();
 
-  // Fetch stats, creator, aggregation, and check for visualization data in parallel
-  const [stats, creator, aggregationResp, validatedWus] = await Promise.all([
+  // This page is anonymous-reachable, so it renders leaf METADATA + PUBLIC
+  // STATS only. A leaf's CONTENTS — its aggregate and its results — are
+  // owner-only regardless of visibility (design §1.3, R1.2): the previous
+  // getAggregation() and listWorkUnits(VALIDATED) reads here disclosed the
+  // aggregate and a has-results probe to any anonymous caller and are removed.
+  // The owner sees those on the gated dashboard page (/dashboard/leafs/[slug]).
+  const [stats, creator] = await Promise.all([
     infrastructureClient.getLeafStats(leaf.id).catch(() => null),
     leaf.creator_id
       ? db
@@ -54,13 +59,7 @@ export default async function LeafDetailPage({
           .limit(1)
           .then(([user]) => user ?? null)
       : null,
-    infrastructureClient.getAggregation(leaf.id).catch(() => null),
-    infrastructureClient
-      .listWorkUnits(leaf.id, { state: "VALIDATED", limit: 1 })
-      .catch(() => null),
   ]);
-  const aggregation = aggregationResp?.data ?? null;
-  const hasVisualization = (validatedWus?.data?.length ?? 0) > 0;
 
   const platformUrl = process.env.PLATFORM_URL ?? "http://localhost:3000";
   const serverHost = new URL(platformUrl).hostname;
@@ -72,8 +71,6 @@ export default async function LeafDetailPage({
         stats={stats}
         creator={creator}
         serverHost={serverHost}
-        aggregation={aggregation}
-        hasVisualization={hasVisualization}
       />
     </div>
   );

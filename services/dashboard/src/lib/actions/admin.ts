@@ -1,7 +1,7 @@
 "use server";
 
 import bcrypt from "bcryptjs";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { users } from "@/lib/db/schema";
@@ -149,9 +149,12 @@ export async function reactivateUser(userId: string): Promise<ActionResult<void>
   if (!session) return forbiddenError();
 
   try {
+    // Bump token_version on reactivate too, so any session that predated the
+    // deactivation cannot revive once deactivatedAt is cleared (a reactivated
+    // account must re-authenticate).
     const [updated] = await db
       .update(users)
-      .set({ deactivatedAt: null })
+      .set({ deactivatedAt: null, tokenVersion: sql`${users.tokenVersion} + 1` })
       .where(eq(users.id, userId))
       .returning({ id: users.id });
 
@@ -207,9 +210,13 @@ export async function resetUserPassword(
   const passwordHash = await bcrypt.hash(newPassword, 10);
 
   try {
+    // Bump token_version so a reset revokes the user's existing JWT sessions on
+    // their next request (BG-09: the Node jwt callback rejects a token whose
+    // token_version is behind the DB). Without this, a password reset of a
+    // compromised account leaves the attacker's session valid until maxAge.
     const [updated] = await db
       .update(users)
-      .set({ passwordHash })
+      .set({ passwordHash, tokenVersion: sql`${users.tokenVersion} + 1` })
       .where(eq(users.id, userId))
       .returning({ id: users.id });
 

@@ -135,6 +135,23 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requireAdmin wraps a handler to require the authenticated caller to hold
+// the ADMIN role, returning 403 otherwise. Assumes requireAuth already ran
+// (an anonymous request must be 401 before any admin logic). Unlike the
+// router's authAdmin wrapper this injects no package Caller contexts — it is
+// the minimal gate for operator-only READ surfaces whose handlers need no
+// injected caller (cross-leaf credit analysis, volunteer credit breakdown).
+func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := UserFromContext(r.Context())
+		if user == nil || user.Role != "ADMIN" {
+			apierror.WriteError(w, apierror.Forbidden("administrator access required"))
+			return
+		}
+		next(w, r)
+	}
+}
+
 // requireLeafOwnership wraps a handler to require the authenticated user
 // to be the leaf creator or an admin. Assumes requireAuth already ran.
 func requireLeafOwnership(next http.HandlerFunc, leafRepo leaf.Repository) http.HandlerFunc {

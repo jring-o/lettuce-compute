@@ -25,6 +25,12 @@ export const users = pgTable("users", {
     .notNull()
     .defaultNow(),
   deactivatedAt: timestamp("deactivated_at", { withTimezone: true }),
+  // Session-revocation lever (BG-09). The signed-in JWT carries the value seen
+  // at login; the Node auth() jwt callback re-reads it every request and kills
+  // any token whose version is behind. Bump it to invalidate all of a user's
+  // existing sessions (password reset, "sign out everywhere"). Additive,
+  // defaults 0; legacy rows read as 0.
+  tokenVersion: integer("token_version").notNull().default(0),
 });
 
 export const sessions = pgTable("sessions", {

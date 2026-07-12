@@ -8,6 +8,14 @@ jest.mock("@/lib/infrastructure-client", () => ({
   },
 }));
 
+// The route now gates on requireLeafAccess (result output_data is owner-only,
+// BG-07). Mock that seam: default to allowed so the existing behavior tests
+// hold; the denial is asserted explicitly below.
+const mockRequireLeafAccess = jest.fn();
+jest.mock("@/lib/authz-routes", () => ({
+  requireLeafAccess: (...args: unknown[]) => mockRequireLeafAccess(...args),
+}));
+
 // Mock next/server — NextRequest, NextResponse
 jest.mock("next/server", () => {
   class MockNextResponse {
@@ -52,9 +60,34 @@ import { NextRequest } from "next/server";
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockRequireLeafAccess.mockResolvedValue({
+    ok: true,
+    session: { user: { id: "user-1", role: "USER" } },
+  });
 });
 
 describe("GET /api/viz/results", () => {
+  // --- Authorization (BG-07) ---
+
+  it("returns the adapter's denial and never lists results for a non-owner", async () => {
+    mockRequireLeafAccess.mockResolvedValue({
+      ok: false,
+      response: {
+        status: 403,
+        _jsonData: { error: { code: "FORBIDDEN", message: "no" } },
+      },
+    });
+
+    const request = new NextRequest(
+      "http://localhost/api/viz/results?leafId=leaf-abc&workUnitId=wu-123",
+    );
+    const response = await GET(request);
+
+    expect(response.status).toBe(403);
+    expect(mockListResults).not.toHaveBeenCalled();
+    expect(mockRequireLeafAccess).toHaveBeenCalledWith("leaf-abc");
+  });
+
   // --- Missing params ---
 
   it("returns 400 when leafId is missing", async () => {

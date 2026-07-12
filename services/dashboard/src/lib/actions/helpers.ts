@@ -1,8 +1,6 @@
 import { auth } from "@/lib/auth";
-import {
-  InfrastructureApiError,
-  infrastructureClient,
-} from "@/lib/infrastructure-client";
+import { leafOwnershipVerdict } from "@/lib/authz";
+import { InfrastructureApiError } from "@/lib/infrastructure-client";
 
 export type ActionError = { error: { code: string; message: string } };
 export type ActionResult<T> = { data: T } | ActionError;
@@ -67,36 +65,16 @@ export async function withOwnership<T>(
  * Verifies the current session may act on the given leaf. Returns an
  * ActionError to short-circuit the caller, or null when access is allowed.
  *
- * Fetches the leaf via the (shared service-key) client purely to read its
- * creator_id; the result is not returned to avoid leaking leaf data on
- * unauthorized access. Not-found is collapsed into FORBIDDEN so callers
- * cannot distinguish "missing" from "not yours".
+ * Thin wrapper over the shared `leafOwnershipVerdict` (lib/authz.ts) — the
+ * single ownership predicate the /api/* route adapters also consume — mapped
+ * onto the action-layer ActionError shape. Not-found is collapsed into
+ * FORBIDDEN so callers cannot distinguish "missing" from "not yours".
  */
 export async function assertLeafOwnership(
   leafId: string,
   session: { user: { id: string; role: string } },
 ): Promise<ActionError | null> {
-  let creatorId: string | null;
-  try {
-    const leaf = await infrastructureClient.getLeaf(leafId);
-    creatorId = leaf.creator_id;
-  } catch (err) {
-    // Don't reveal whether the leaf exists; treat any lookup failure as
-    // a denied access for non-admins. Admins still get a real error so
-    // genuine infra outages surface.
-    if (
-      session.user.role !== "ADMIN" &&
-      err instanceof InfrastructureApiError &&
-      err.status === 404
-    ) {
-      return forbiddenError();
-    }
-    return mapInfraError(err);
-  }
-
-  if (session.user.role === "ADMIN" || creatorId === session.user.id) {
-    return null;
-  }
-
-  return forbiddenError();
+  const verdict = await leafOwnershipVerdict(leafId, session);
+  if (verdict.allowed) return null;
+  return { error: verdict.denial };
 }

@@ -114,10 +114,12 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	resultRepo := result.NewPgxRepository(deps.Pool)
 	resultHandler := result.NewResultHandler(resultRepo, leafRepo, deps.Logger)
 
-	// Aggregation routes (GET is public, POST is protected).
+	// Aggregation handler. Both the GET (read) and POST (recompute) routes are
+	// registered below under authOwner — the aggregate is leaf CONTENTS, owner-
+	// only regardless of the leaf's visibility (BG-11a). The handler's
+	// RegisterRoutes (which bound the GET anonymously) is deliberately NOT called.
 	aggEngine := aggregation.NewEngine(resultRepo, wuRepo, leafRepo, deps.Logger)
 	aggHandler := aggregation.NewAggregationHandler(aggEngine, deps.Logger)
-	aggHandler.RegisterRoutes(mux)
 
 	// Stats routes (all public).
 	statsEngine := stats.NewEngine(deps.Pool)
@@ -220,11 +222,22 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		})
 	}
 
+	// Helper: requireAuth + requireAdmin. For operator-only READ surfaces whose
+	// handlers need no injected package Caller (cross-leaf credit analysis and
+	// the volunteer credit breakdown) — a plain ADMIN-role gate that fails
+	// closed with 403 for any non-admin (BG-11b cross-leaf, ★BG-11c).
+	authAdminOnly := func(h http.HandlerFunc) http.HandlerFunc {
+		return requireAuth(requireAdmin(h))
+	}
+
 	// Detailed health (auth required — exposes uptime + DB status).
 	mux.HandleFunc("GET /api/v1/health/detailed", authOnly(HealthDetailedHandler(deps.Pool, deps.StartTime)))
 
-	// Leaf mutations.
-	mux.HandleFunc("POST /api/v1/leafs", authOnly(leafHandler.HandleCreate))
+	// Leaf mutations. Create is authOnly + leafViewer: requireAuth guarantees a
+	// caller, and leafViewer injects that caller's identity so handleCreate can
+	// bind creator_id to it (★BG-11d-write / R1.5) without importing the server
+	// package.
+	mux.HandleFunc("POST /api/v1/leafs", authOnly(leafViewer(leafHandler.HandleCreate)))
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", authOwner(leafHandler.HandleUpdate))
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", authOwner(leafHandler.HandleDelete))
 
@@ -255,12 +268,18 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// Result routes (sensitive reads).
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/results", authOwner(resultHandler.HandleListByLeaf))
 
-	// Aggregation mutation.
+	// Aggregation read + recompute. Both are owner-only: the aggregate is leaf
+	// contents. The GET read (BG-11a) joins the POST's tier; the deprecated
+	// /projects alias gets the identical treatment below.
+	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/aggregate", authOwner(aggHandler.HandleGetAggregate))
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/aggregate", authOwner(aggHandler.HandleAggregate))
 
-	// Credit analysis routes (require auth — researcher/admin).
-	mux.HandleFunc("GET /api/v1/credit/analysis/cross-leaf", authOnly(analysisHandler.HandleCrossLeaf))
-	mux.HandleFunc("GET /api/v1/credit/analysis/{leaf_id}", authOnly(analysisHandler.HandleLeafAnalysis))
+	// Credit analysis routes. Per-leaf analysis is leaf contents → authOwner
+	// (BG-11b). Cross-leaf whole-head economics is an operator concern →
+	// authAdminOnly (BG-11b). The volunteer breakdown alias below is likewise
+	// authAdminOnly (★BG-11c).
+	mux.HandleFunc("GET /api/v1/credit/analysis/cross-leaf", authAdminOnly(analysisHandler.HandleCrossLeaf))
+	mux.HandleFunc("GET /api/v1/credit/analysis/{leaf_id}", authOwner(analysisHandler.HandleLeafAnalysis))
 
 	// Trust administration (operator-only — admin API key). Seed, slash, read, and list
 	// the account-level trust scores that gate quorum power in validation (see
@@ -322,7 +341,7 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// Same handlers, same responses — allows existing clients to migrate gradually.
 	mux.HandleFunc("GET /api/v1/projects/{leaf_id}", leafViewer(leafHandler.HandleGetDeprecated))
 	mux.HandleFunc("GET /api/v1/projects", leafViewer(leafHandler.HandleListDeprecated))
-	mux.HandleFunc("POST /api/v1/projects", authOnly(leafHandler.HandleCreate))
+	mux.HandleFunc("POST /api/v1/projects", authOnly(leafViewer(leafHandler.HandleCreate)))
 	mux.HandleFunc("PUT /api/v1/projects/{leaf_id}", authOwner(leafHandler.HandleUpdate))
 	mux.HandleFunc("DELETE /api/v1/projects/{leaf_id}", authOwner(leafHandler.HandleDelete))
 	mux.HandleFunc("POST /api/v1/projects/{leaf_id}/activate", authOwner(leafHandler.HandleActivate))
@@ -330,7 +349,14 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/projects/{leaf_id}/resume", authOwner(leafHandler.HandleResume))
 	mux.HandleFunc("POST /api/v1/projects/{leaf_id}/archive", authOwner(leafHandler.HandleArchive))
 	mux.HandleFunc("POST /api/v1/projects/{leaf_id}/configure", authOwner(leafHandler.HandleConfigure))
-	mux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", authOnly(analysisHandler.HandleVolunteerBreakdown))
+	// Deprecated aggregate-read alias — same owner-only tier as the canonical
+	// /leafs route (BG-11a).
+	mux.HandleFunc("GET /api/v1/projects/{leaf_id}/aggregate", authOwner(aggHandler.HandleGetAggregate))
+	// Operator-only per-volunteer credit breakdown: per-machine hostnames,
+	// last-seen, and credit timelines — strictly more than the public stats
+	// feed, so ADMIN-only (★BG-11c). The volunteer's own self-view is the
+	// separate Ed25519-authed gRPC GetMyContribution.
+	mux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", authAdminOnly(analysisHandler.HandleVolunteerBreakdown))
 
 	// --- Browser volunteer endpoints (Ed25519 auth, not API key) ---
 	// assignRepo declared above (shared with the work unit handler).

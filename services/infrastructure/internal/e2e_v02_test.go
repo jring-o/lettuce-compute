@@ -58,7 +58,12 @@ func setupE2EServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) {
 	statsHandler.RegisterRoutes(mux)
 	// Mutating routes: production registers these behind auth middleware; the e2e
 	// harness drives them directly (unauthenticated) to exercise the full lifecycle.
-	mux.HandleFunc("POST /api/v1/leafs", leafHandler.HandleCreate)
+	// Create binds creator_id to the caller (★BG-11d-write); inject an admin viewer
+	// so this harness can still set creator_id via the request body.
+	mux.HandleFunc("POST /api/v1/leafs", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(leaf.WithViewer(r.Context(), leaf.Viewer{IsAdmin: true, Authed: true}))
+		leafHandler.HandleCreate(w, r)
+	})
 	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", leafHandler.HandleUpdate)
 	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", leafHandler.HandleDelete)
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", leafHandler.HandleConfigure)
