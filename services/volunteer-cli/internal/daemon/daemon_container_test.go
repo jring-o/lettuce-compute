@@ -34,6 +34,9 @@ func newContainerTestDaemon(mc *mockClient, registry *RuntimeRegistry) *Daemon {
 		RuntimeRegistry: registry,
 		Logger:          logger,
 	})
+	// Legacy Client path builds a head with no per-head runtime trust; grant it so work
+	// flows through the fetcher's per-head trust gate (see grantAllRuntimeTrust).
+	grantAllRuntimeTrust(d.multiClient.Servers())
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
@@ -279,6 +282,9 @@ func TestF16_ThermalPauseResume(t *testing.T) {
 		RuntimeRegistry: registry,
 		Logger:          logger,
 	})
+	// Legacy Client path builds a head with no per-head runtime trust; grant it so work
+	// flows through the fetcher's per-head trust gate (see grantAllRuntimeTrust).
+	grantAllRuntimeTrust(d.multiClient.Servers())
 	d.initialBackoff = 1 * time.Millisecond
 	d.maxBackoff = 16 * time.Millisecond
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
