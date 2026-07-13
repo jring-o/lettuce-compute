@@ -66,6 +66,10 @@ func (m *mockDockerClient) ImageID(ctx context.Context, ref string) (string, err
 	return "", nil
 }
 
+func (m *mockDockerClient) ImageDeclaredVolumes(ctx context.Context, ref string) ([]string, error) {
+	return nil, nil
+}
+
 func (m *mockDockerClient) ImageList(ctx context.Context) ([]runtime.ImageSummary, error) {
 	return nil, nil
 }

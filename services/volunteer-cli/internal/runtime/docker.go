@@ -62,6 +62,11 @@ type DockerClient interface {
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	// ImageID resolves a reference to its content image ID, or "" if not present.
 	ImageID(ctx context.Context, ref string) (string, error)
+	// ImageDeclaredVolumes returns the absolute container paths an image declares as
+	// VOLUME (from its config). The container runtime neutralizes these with bounded
+	// tmpfs mounts so an image VOLUME cannot open a writable, host-backed path that
+	// escapes ReadonlyRootfs and the /work disk watchdog (BG-13b).
+	ImageDeclaredVolumes(ctx context.Context, ref string) ([]string, error)
 	// ImageList returns every cached image (used by the stale-image reaper).
 	ImageList(ctx context.Context) ([]ImageSummary, error)
 	// ImageRemove deletes a cached image by ID. It is non-force, so the backend
@@ -341,6 +346,24 @@ func (d *dockerClientWrapper) ImageID(ctx context.Context, ref string) (string, 
 	return inspect.ID, nil
 }
 
+func (d *dockerClientWrapper) ImageDeclaredVolumes(ctx context.Context, ref string) ([]string, error) {
+	inspect, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("image inspect %s: %w", ref, err)
+	}
+	if inspect.Config == nil || len(inspect.Config.Volumes) == 0 {
+		return nil, nil
+	}
+	vols := make([]string, 0, len(inspect.Config.Volumes))
+	for v := range inspect.Config.Volumes {
+		vols = append(vols, v)
+	}
+	return vols, nil
+}
+
 func (d *dockerClientWrapper) ImageList(ctx context.Context) ([]ImageSummary, error) {
 	summaries, err := d.cli.ImageList(ctx, image.ListOptions{})
 	if err != nil {
@@ -562,7 +585,12 @@ func (d *dockerClientWrapper) ContainerStop(ctx context.Context, containerID str
 }
 
 func (d *dockerClientWrapper) ContainerRemove(ctx context.Context, containerID string) error {
-	if err := d.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+	// BG-13b: RemoveVolumes reclaims the container's ANONYMOUS volumes (those an
+	// image VOLUME declaration creates, plus any we did not explicitly mount).
+	// Without it every such container leaked an unreferenced host-backed volume that
+	// accumulated on the volunteer's disk until the free-space gate tripped. Named
+	// volumes are unaffected (we create none).
+	if err := d.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
 		return fmt.Errorf("container remove: %w", err)
 	}
 	return nil

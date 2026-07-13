@@ -43,6 +43,20 @@ func tarDirectory(dir string) ([]byte, error) {
 			return nil
 		}
 
+		// BG-15c: refuse any non-regular, non-directory entry EXPLICITLY. The
+		// checkpoint dir is leaf-controlled; without this, a planted symlink was only
+		// INCIDENTALLY safe — FileInfoHeader gives a symlink a Size:0 header, then the
+		// os.Open below follows it and io.Copy of the (larger) target aborts the whole
+		// archive with tar "write too long". Skipping it here means a symlink/device/
+		// socket is never followed and never archived into the head-uploaded blob, and
+		// a stray symlink no longer torpedoes an otherwise-valid checkpoint.
+		// (filepath.Walk lstat's, so fi reports the link itself, and Walk never
+		// descends through it.) A checkpoint HARDLINK would tar as a regular file, but
+		// the confined runtimes cannot name a target outside their mount/WASI scope.
+		if !fi.IsDir() && !fi.Mode().IsRegular() {
+			return nil
+		}
+
 		header, err := tar.FileInfoHeader(fi, "")
 		if err != nil {
 			return fmt.Errorf("creating tar header for %s: %w", rel, err)

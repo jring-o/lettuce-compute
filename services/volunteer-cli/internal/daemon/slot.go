@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -38,20 +37,20 @@ const startWorkTimeout = 30 * time.Second
 
 // ExecutionSlot represents a single execution slot that runs one WU at a time.
 type ExecutionSlot struct {
-	ID                int
-	mu                sync.Mutex
-	active            bool
-	wu                *runtime.WorkUnit
-	prep              *runtime.PrepareResult
-	rt                runtime.Runtime
-	conn              *ServerConnection
-	cancel            context.CancelFunc
-	startedAt         time.Time
-	checkpoint        *CheckpointManager
-	resumedFromCkp    bool
-	preserved         *PersistedTask // non-nil if work dir was preserved on shutdown
-	processHandle     ProcessHandle  // for suspend/resume
-	suspended         bool
+	ID             int
+	mu             sync.Mutex
+	active         bool
+	wu             *runtime.WorkUnit
+	prep           *runtime.PrepareResult
+	rt             runtime.Runtime
+	conn           *ServerConnection
+	cancel         context.CancelFunc
+	startedAt      time.Time
+	checkpoint     *CheckpointManager
+	resumedFromCkp bool
+	preserved      *PersistedTask // non-nil if work dir was preserved on shutdown
+	processHandle  ProcessHandle  // for suspend/resume
+	suspended      bool
 	// suspendPending records that a suspend (schedule gate / pause) was requested
 	// while this slot was active but had no process handle yet — the window between
 	// StartSlot marking a re-executed resume active and the runtime registering the
@@ -59,10 +58,10 @@ type ExecutionSlot struct {
 	// handle is attached (see attachProcessHandle); without it a resumed task whose
 	// handle appears after a one-shot SuspendAll would run unfrozen through the whole
 	// off-schedule/pause window.
-	suspendPending    bool
-	pausedAt          time.Time     // when current pause began (zero if not paused)
-	totalPausedDur    time.Duration // accumulated pause time during THIS daemon session
-	fetchedAt         time.Time     // when the WU was fetched from server (from prefetch queue)
+	suspendPending bool
+	pausedAt       time.Time     // when current pause began (zero if not paused)
+	totalPausedDur time.Duration // accumulated pause time during THIS daemon session
+	fetchedAt      time.Time     // when the WU was fetched from server (from prefetch queue)
 
 	// originalStartedAt is the first-ever start time of this work unit, carried across
 	// resumes for reference. startedAt above is the start of the CURRENT session's
@@ -395,7 +394,12 @@ func waitForOrphan(ctx context.Context, prep *runtime.PrepareResult) (*runtime.E
 				// Process completed. Read output from work directory.
 				wallClock := int64(time.Since(start).Seconds())
 				outputPath := filepath.Join(prep.WorkDir, "output.dat")
-				output, _ := os.ReadFile(outputPath)
+				// BG-15c: an orphan-resumed unit's output.dat is leaf-controlled; read
+				// it through the shared symlink-safe, size-capped reader so a planted
+				// symlink cannot exfiltrate its target (and a giant file cannot balloon
+				// daemon RAM). A refusal yields empty output, matching the prior
+				// best-effort semantics rather than crashing the resume.
+				output, _ := runtime.ReadRegularNoFollow(outputPath)
 
 				return &runtime.ExecutionResult{
 					ExitCode:   0,
