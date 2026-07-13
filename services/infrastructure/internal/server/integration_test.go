@@ -71,8 +71,11 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		// This server booted with no DB pool, so it is degraded — and a degraded
+		// head must answer 503 (BG-20): Docker/LB/uptime monitors read the status
+		// CODE. The descriptive JSON body is still asserted below.
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503 (degraded, no DB), got %d", resp.StatusCode)
 		}
 
 		requestID := resp.Header.Get("X-Request-ID")

@@ -44,6 +44,9 @@ func ContextWithTestSigner(ctx context.Context, pub ed25519.PublicKey, priv ed25
 //   - per-pubkey gRPC rate limit: raised far above the 120/min production budget
 //     so a burst of multi-RPC integration calls signed by one volunteer key is
 //     not throttled by the post-auth per-volunteer limiter.
+//   - pre-decode per-IP stream budget (BG-18): raised for the same single-
+//     loopback-IP reason as the per-IP request limit — the tap handle would
+//     otherwise refuse test streams before they are even decoded.
 //
 // This is integration-build-only (see the //go:build integration tag) and is never
 // linked into the production server.
@@ -52,6 +55,7 @@ func SetGRPCSecurityForIntegrationTests() {
 	ed25519ReplayDetectionEnabled = false
 	grpcRateLimit = 1_000_000
 	grpcPerPubkeyRateLimit = 1_000_000
+	grpcStreamRateLimit = 1_000_000
 }
 
 // InstallSharedInMemReplayStoreForTests builds ONE in-memory replay store and

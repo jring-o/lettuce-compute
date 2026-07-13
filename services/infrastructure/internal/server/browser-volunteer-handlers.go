@@ -518,8 +518,9 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 			MaxInflightPerVolunteer: deps.maxInflightPerVolunteer,
 		}
 
-		// Begin transaction for atomic find-assign-record.
-		tx, err := deps.pool.Begin(r.Context())
+		// Begin transaction for atomic find-assign-record (acquire bounded — the
+		// BG-17 backstop; this handler runs on r.Context(), which has no deadline).
+		tx, err := beginTxBounded(r.Context(), deps.pool)
 		if err != nil {
 			deps.logger.Error("failed to begin transaction", "error", err)
 			apierror.WriteError(w, apierror.Internal("internal server error", err))
@@ -547,8 +548,11 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 			return
 		}
 
-		// Fetch leaf once — used for spot-check check and response building.
-		lf, err := deps.leafRepo.GetByID(r.Context(), wu.LeafID)
+		// Fetch leaf once — used for spot-check check and response building. Read on
+		// THIS handler's tx connection (leaf.GetByIDTx), NOT via the pool-backed
+		// deps.leafRepo: a pool read inside the open tx acquires a second connection
+		// while holding one, the pool self-deadlock under concurrent load (BG-17).
+		lf, err := leaf.GetByIDTx(r.Context(), tx, wu.LeafID)
 		if err != nil {
 			deps.logger.Error("failed to get leaf", "error", err)
 			apierror.WriteError(w, apierror.Internal("internal server error", err))
@@ -752,8 +756,20 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			}
 		}
 
-		// Begin transaction.
-		tx, err := deps.pool.Begin(r.Context())
+		// Stamp the account-level trust snapshot BEFORE opening the transaction
+		// (BG-17: trustRepo is pool-backed, and a pool read inside the tx acquires a
+		// second connection while holding one). vol was loaded above, so no extra
+		// read; a suppressed/absent principal is stamped score 0 (fail-closed on
+		// power), but stamping never blocks the submission (fail-open on work).
+		now := time.Now
+		if deps.now != nil {
+			now = deps.now
+		}
+		trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(r.Context(), deps.trustRepo, vol, vol.ID, now(), deps.logger)
+
+		// Begin transaction (acquire bounded — the BG-17 backstop; this handler runs
+		// on r.Context(), which has no deadline).
+		tx, err := beginTxBounded(r.Context(), deps.pool)
 		if err != nil {
 			deps.logger.Error("failed to begin transaction", "error", err)
 			apierror.WriteError(w, apierror.Internal("internal server error", err))
@@ -798,15 +814,6 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		if len(outputRaw) > 0 {
 			outputData = json.RawMessage(outputRaw)
 		}
-
-		// Stamp the account-level trust snapshot (see internal/trust). vol was loaded above, so
-		// no extra read; a suppressed/absent principal is stamped score 0 (fail-closed on power),
-		// but stamping never blocks the submission (fail-open on work).
-		now := time.Now
-		if deps.now != nil {
-			now = deps.now
-		}
-		trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(r.Context(), deps.trustRepo, vol, vol.ID, now(), deps.logger)
 
 		res := &result.Result{
 			WorkUnitID:     workUnitID,
@@ -861,8 +868,11 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 		// spot-check unit), identical to before. It is used here ONLY to drive the batch-completed
 		// counter; the actual validate / reject / wait / dead-letter / supersede decision — and
 		// the COMPLETED state write itself — is delegated to the transitioner after commit.
+		// Read on THIS handler's tx connection (leaf.GetByIDTx), NOT via the
+		// pool-backed deps.leafRepo — a pool read here would acquire a second
+		// connection while the tx holds one (BG-17).
 		quorum := 1
-		completionLeaf, clErr := deps.leafRepo.GetByID(r.Context(), currentWU.LeafID)
+		completionLeaf, clErr := leaf.GetByIDTx(r.Context(), tx, currentWU.LeafID)
 		if clErr == nil {
 			quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
 		}

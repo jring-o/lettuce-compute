@@ -22,6 +22,18 @@ func checkDBHealth(ctx context.Context, pool *pgxpool.Pool) (status, dbStatus st
 	return "healthy", "connected"
 }
 
+// healthStatusCode maps the computed health status to the HTTP status code.
+// Docker healthchecks, load balancers, and uptime monitors read the CODE, not
+// the JSON body, so a degraded head must answer non-2xx (503) or every machine
+// consumer keeps routing traffic to a head whose database is unreachable. The
+// descriptive JSON body is kept either way.
+func healthStatusCode(status string) int {
+	if status == "healthy" {
+		return http.StatusOK
+	}
+	return http.StatusServiceUnavailable
+}
+
 type healthResponse struct {
 	Status   string `json:"status"`
 	Database string `json:"database"`
@@ -46,7 +58,7 @@ func HealthHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		resp := healthResponse{Status: status, Database: dbStatus}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(healthStatusCode(status))
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
@@ -64,7 +76,7 @@ func HealthDetailedHandler(pool *pgxpool.Pool, startTime time.Time) http.Handler
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(healthStatusCode(status))
 		_ = json.NewEncoder(w).Encode(resp)
 	}
 }
