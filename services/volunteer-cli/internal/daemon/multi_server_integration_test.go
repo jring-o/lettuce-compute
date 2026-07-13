@@ -89,11 +89,11 @@ func testMultiServerFullJourney(t *testing.T) {
 	clientB := makeServer("beta", "b2b2b2b2-0000-4000-8000-000000000002", "proj-beta", "vol-beta", trackerB)
 	clientC := makeServer("gamma", "c3c3c3c3-0000-4000-8000-000000000003", "proj-gamma", "vol-gamma", trackerC)
 
-	connections := []*ServerConnection{
+	connections := grantAllRuntimeTrust([]*ServerConnection{
 		{Client: clientA, VolunteerID: "vol-alpha", Name: "server-alpha", Available: true},
 		{Client: clientB, VolunteerID: "vol-beta", Name: "server-beta", Available: true},
 		{Client: clientC, VolunteerID: "vol-gamma", Name: "server-gamma", Available: true},
-	}
+	})
 
 	// Mock runtime that takes ~1.2s to execute so heartbeats have time to fire.
 	var executedWUs sync.Map // work unit ID -> true
@@ -345,11 +345,11 @@ func testMultiServerPartialFailure(t *testing.T) {
 		},
 	}
 
-	connections := []*ServerConnection{
+	connections := grantAllRuntimeTrust([]*ServerConnection{
 		{Client: clientA, VolunteerID: "vol-a", Name: "server-a", Available: true},
 		{Client: clientB, VolunteerID: "vol-b", Name: "server-b", Available: true},
 		{Client: clientC, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
+	})
 
 	mr := &mockRuntime{canHandle: true}
 

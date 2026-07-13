@@ -147,11 +147,13 @@ func (m *Manager) AttachLeaf(leafID, grpcAddr, httpAddr, name string) error {
 
 // AttachServer adds a self-hosted server connection with default TLS settings.
 func (m *Manager) AttachServer(host string, grpcPort, httpPort int) error {
-	return m.AttachServerWithTLS(host, grpcPort, httpPort, false, "")
+	return m.AttachServerWithTLS(host, grpcPort, httpPort, false, "", nil)
 }
 
-// AttachServerWithTLS adds a self-hosted server connection with TLS configuration.
-func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insecure bool, caCertPath string) error {
+// AttachServerWithTLS adds a self-hosted server connection with TLS configuration and the
+// per-head runtime trust the volunteer chose for it (trustedRuntimes: the UPPERCASE opt-ins
+// beyond the always-allowed WASM — e.g. ["CONTAINER"]; nil means WASM-only).
+func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insecure bool, caCertPath string, trustedRuntimes []string) error {
 	if grpcPort <= 0 {
 		grpcPort = 443
 	}
@@ -179,11 +181,12 @@ func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insec
 	}
 
 	m.cfg.Servers = append(m.cfg.Servers, config.ServerConfig{
-		GRPCAddress: grpcAddr,
-		HTTPAddress: httpAddr,
-		Name:        host,
-		Insecure:    insecure,
-		CACertPath:  caCertPath,
+		GRPCAddress:     grpcAddr,
+		HTTPAddress:     httpAddr,
+		Name:            host,
+		Insecure:        insecure,
+		CACertPath:      caCertPath,
+		TrustedRuntimes: trustedRuntimes,
 	})
 
 	return m.cfg.Save(m.cfgPath)

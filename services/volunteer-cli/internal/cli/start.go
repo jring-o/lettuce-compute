@@ -141,8 +141,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// FAILED on the head). native/wasm are always registered; container only when
 	// a backend is detected and initializes.
 	registry, machineManager, machineSetupOK := buildRuntimeRegistry(cfg, logger)
-	advertised := advertisedRuntimes(registry)
-	logger.Info("runtimes available", "advertised", advertised)
+	machineRuntimes := advertisedRuntimes(registry)
+	logger.Info("runtimes available on this machine", "runtimes", machineRuntimes)
 
 	// If we started a Podman machine, stop it on exit. Registered here (right
 	// after setup, before the connect loop) so it also fires on the early
@@ -210,6 +210,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 			headVersion = statusResp.Version
 		}
 
+		// Advertise per-head: only the runtimes this machine can run AND this head is
+		// trusted to run (WASM always; CONTAINER/NATIVE per the attach-time trust choice).
+		advertised := advertisedForServer(registry, srv)
+		logger.Info("advertising runtimes to head", "server", name, "advertised", advertised)
 		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
@@ -345,19 +349,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager, bool) {
 	registry := daemon.NewRuntimeRegistry()
 
-	// SECURITY (BG-12): register native ONLY when the volunteer has explicitly opted
-	// in via allow_native_runtime. Native runs an untrusted leaf binary directly on
-	// the host with no sandbox. This gate — NOT available_runtimes membership, which
-	// is persisted and already lists NATIVE for every onboarded tester (design
-	// re-review R1) — is the load-bearing control: when native is not registered it
-	// is not advertised, an honest head won't dispatch it, and SelectRuntime rejects
-	// a native (or empty) unit even from a malicious head.
-	if cfg.AllowNativeRuntime {
+	// SECURITY (BG-12, per-head trust): build native ONLY when at least one attached head
+	// is trusted to run it (ServerConfig.TrustedRuntimes contains NATIVE — chosen at
+	// attach). Native runs an untrusted leaf binary directly on the host with no sandbox,
+	// so a head must have been explicitly trusted for it. Building it here only makes it
+	// POSSIBLE; advertisedForServer decides which heads hear NATIVE, and the fetcher's
+	// per-head execute gate refuses a native unit from any head not trusted for it (even a
+	// malicious one). A machine with no native-trusted head never constructs the runtime.
+	if anyServerTrusts(cfg.Servers, "NATIVE") {
 		nativeRuntime := runtime.NewNativeRuntime(cfg.DataDir, logger)
 		registry.Register(nativeRuntime)
-		logger.Info("native runtime registered (allow_native_runtime is set)")
+		logger.Info("native runtime registered (at least one attached head is trusted for NATIVE)")
 	} else {
-		logger.Info("native runtime NOT registered (allow_native_runtime is false; native leaves will be refused)")
+		logger.Info("native runtime NOT registered (no attached head is trusted for NATIVE; native leaves will be refused)")
 	}
 
 	// Always register WASM runtime (wazero is embedded, no external dependencies).
@@ -368,7 +372,7 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 	// Register container runtime if configured.
 	var machineManager *runtime.PodmanMachineManager
 	machineSetupOK := false
-	if containsRuntime(cfg.AvailableRuntimes, "CONTAINER") {
+	if anyServerTrusts(cfg.Servers, "CONTAINER") {
 		// Honor the operator's configured backend preference (container_backend).
 		// When set to "docker", Docker is chosen if present so large images use
 		// host storage instead of a Podman-machine VM. Empty = auto (Podman first).
@@ -439,6 +443,39 @@ func advertisedRuntimes(registry *daemon.RuntimeRegistry) []string {
 	out := make([]string, 0, len(names))
 	for _, n := range names {
 		out = append(out, strings.ToUpper(n))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// anyServerTrusts reports whether any configured head is trusted to run the given runtime
+// kind on this machine. Used to decide whether to CONSTRUCT a runtime at all — a machine
+// with no head trusted for native never builds the native runtime, and container-backend
+// setup is skipped unless a head is trusted for CONTAINER.
+func anyServerTrusts(servers []config.ServerConfig, runtimeKind string) bool {
+	for _, s := range servers {
+		if s.TrustsRuntime(runtimeKind) {
+			return true
+		}
+	}
+	return false
+}
+
+// advertisedForServer returns the UPPERCASE runtimes to advertise to a specific head: the
+// intersection of what this machine can actually run (the built registry) and what the
+// volunteer trusts this head to run (srv.EffectiveTrustedRuntimes). A backend-less machine
+// never advertises CONTAINER even to a head trusted for it; a head not trusted for NATIVE
+// never hears NATIVE even on a native-capable machine.
+func advertisedForServer(registry *daemon.RuntimeRegistry, srv config.ServerConfig) []string {
+	capable := make(map[string]bool)
+	for _, n := range registry.AvailableRuntimes() {
+		capable[strings.ToUpper(n)] = true
+	}
+	var out []string
+	for _, r := range srv.EffectiveTrustedRuntimes() {
+		if capable[r] {
+			out = append(out, r)
+		}
 	}
 	sort.Strings(out)
 	return out

@@ -163,8 +163,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 		// runs more than one task when the machine genuinely has room, and the
 		// operator can raise max_concurrent_tasks explicitly if desired.
 
-		// Runtimes: always NATIVE; add CONTAINER if Podman or Docker available.
-		c.AvailableRuntimes = []string{"NATIVE"}
+		// Runtimes: WASM is the always-available sandboxed default; add CONTAINER when a
+		// Docker/Podman backend is present. NATIVE is never enabled here — it is a per-head
+		// trust opt-in chosen at `attach` (or later via `heads trust`).
+		c.AvailableRuntimes = []string{"WASM"}
 		backend := detectContainerBackendFunc(rtdetect.BundledPodmanPath())
 		if backend.Backend != rtdetect.BackendNone {
 			c.AvailableRuntimes = append(c.AvailableRuntimes, "CONTAINER")
@@ -266,7 +268,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 		// Step 5: Runtimes
 		fmt.Println("\n=== Step 5: Runtimes ===")
-		c.AvailableRuntimes = []string{"NATIVE"}
+		// WASM is the always-available sandboxed default; CONTAINER is offered below when a
+		// backend is present. NATIVE is a per-head trust opt-in chosen at `attach`, never here.
+		c.AvailableRuntimes = []string{"WASM"}
 		fmt.Print("Checking for container runtime... ")
 		backend := detectContainerBackendFunc(rtdetect.BundledPodmanPath())
 		if backend.Backend != rtdetect.BackendNone {

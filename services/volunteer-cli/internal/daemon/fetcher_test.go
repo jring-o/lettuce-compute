@@ -50,6 +50,17 @@ func newFetcherTestDaemon(servers []*ServerConnection) *Daemon {
 		userPauseCh:      make(chan bool, 1),
 	}
 
+	// Per-head runtime trust defaults to "trust the fetch-path runtimes" for fetch tests
+	// unless a test set it explicitly. A non-nil TrustedRuntimes (including an empty slice)
+	// opts out of this backfill, so a gate test can make a head WASM-only with
+	// TrustedRuntimes: []string{}. The fetch-path mockRuntime reports Name()=="native", so
+	// trusting NATIVE lets work flow through the per-head execute gate.
+	for _, srv := range servers {
+		if srv.Config.TrustedRuntimes == nil {
+			srv.Config.TrustedRuntimes = []string{"CONTAINER", "NATIVE"}
+		}
+	}
+
 	// Set up leaf cache so weighted selection works.
 	for _, srv := range servers {
 		leafCache.PopulateForTest(srv.Name, &CachedHeadInfo{
@@ -171,6 +182,56 @@ func TestBufferBatch_SkipsAlreadyHeldUnits(t *testing.T) {
 	}
 	if queue.Len() != 1 {
 		t.Fatalf("queue length = %d, want 1", queue.Len())
+	}
+}
+
+// TestBufferBatch_PerHeadRuntimeTrustGate proves the execute-side per-head trust gate: a work
+// unit whose runtime the head is NOT trusted for is abandoned (never buffered or run), while an
+// identical unit from a head trusted for that runtime is buffered. The fetch-path mockRuntime
+// reports Name()=="native", so a WASM-only head (TrustedRuntimes: []string{}, which opts out of
+// the helper's trust backfill) refuses it and hands it back.
+func TestBufferBatch_PerHeadRuntimeTrustGate(t *testing.T) {
+	trustedMC := &mockClient{}
+	untrustedMC := &mockClient{}
+	servers := []*ServerConnection{
+		{Client: trustedMC, VolunteerID: "vol-1", Name: "trusted", Available: true,
+			Config: config.ServerConfig{TrustedRuntimes: []string{"NATIVE"}}},
+		{Client: untrustedMC, VolunteerID: "vol-1", Name: "untrusted", Available: true,
+			Config: config.ServerConfig{TrustedRuntimes: []string{}}}, // non-nil => WASM-only
+	}
+	d := newFetcherTestDaemon(servers)
+	queue := NewPreFetchQueue(8, d.logger)
+	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
+
+	leaf := CachedLeafInfo{ID: "leaf-1", Slug: "leaf-1", Name: "Leaf One", State: "ACTIVE"}
+	mkAsg := func(id string) *lettucev1.WorkUnitAssignment {
+		return &lettucev1.WorkUnitAssignment{
+			WorkUnitId:    id,
+			LeafId:        "leaf-1",
+			Runtime:       "native",
+			InputData:     []byte("input"),
+			ExecutionSpec: &lettucev1.ExecutionSpec{},
+		}
+	}
+
+	// Trusted head: the native unit is buffered.
+	pushedTrusted := fetcher.bufferBatch(context.Background(), servers[0], leaf,
+		[]*lettucev1.WorkUnitAssignment{mkAsg("00000000-0000-4000-8000-000000000001")})
+	if pushedTrusted != 1 {
+		t.Fatalf("trusted head: bufferBatch pushed %d, want 1", pushedTrusted)
+	}
+	if got := trustedMC.getAbandonCalls(); got != 0 {
+		t.Errorf("trusted head: AbandonWorkUnit calls = %d, want 0", got)
+	}
+
+	// Untrusted (WASM-only) head: the native unit is refused and abandoned back to the head.
+	pushedUntrusted := fetcher.bufferBatch(context.Background(), servers[1], leaf,
+		[]*lettucev1.WorkUnitAssignment{mkAsg("00000000-0000-4000-8000-000000000002")})
+	if pushedUntrusted != 0 {
+		t.Fatalf("untrusted head: bufferBatch pushed %d, want 0 (native not trusted -> abandoned)", pushedUntrusted)
+	}
+	if got := untrustedMC.getAbandonCalls(); got != 1 {
+		t.Fatalf("untrusted head: AbandonWorkUnit calls = %d, want 1", got)
 	}
 }
 

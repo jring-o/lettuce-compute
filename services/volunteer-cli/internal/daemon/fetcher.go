@@ -674,6 +674,20 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			f.abandonWorkUnit(ctx, head, wu, selErr.Error())
 			continue
 		}
+
+		// Per-head runtime trust (execute-side backstop): even if this machine CAN run the
+		// selected runtime, only run it for a head the volunteer trusted for that runtime
+		// kind at attach — WASM is always trusted. An honest head never dispatches an
+		// untrusted runtime (we don't advertise it to that head; see advertisedForServer),
+		// so this only fires for a malicious/compromised head. Abandon WITHOUT tripping the
+		// per-runtime circuit breaker, which is global and would otherwise wrongly pause the
+		// runtime for OTHER attached heads that do trust it.
+		if !head.Config.TrustsRuntime(rt.Name()) {
+			f.logger.Warn("fetcher: head not trusted for this runtime; abandoning unit",
+				"work_unit_id", wu.ID, "runtime", rt.Name(), "head", head.Name)
+			f.abandonWorkUnit(ctx, head, wu, "runtime not trusted for this head")
+			continue
+		}
 		f.logger.Debug("fetcher: selected runtime", "work_unit_id", wu.ID, "runtime_type", fmt.Sprintf("%T", rt))
 
 		f.logger.Debug("fetcher: preparing work unit", "work_unit_id", wu.ID)
