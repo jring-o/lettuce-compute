@@ -51,6 +51,19 @@ func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 		t.Error("wasm must always be registered")
 	}
 
+	// The exact R1 upgrade scenario: available_runtimes STILL contains NATIVE (as a
+	// persisted pre-release config would) but allow_native_runtime is false. Native
+	// must NOT be registered. This is the case that fails on a build gating native on
+	// available_runtimes membership — that build would (wrongly) register native here.
+	upgraded := config.Defaults()
+	upgraded.DataDir = t.TempDir()
+	upgraded.AvailableRuntimes = []string{"NATIVE", "WASM"}
+	upgraded.AllowNativeRuntime = false
+	regUpgraded, _, _ := buildRuntimeRegistry(upgraded, logger)
+	if regUpgraded.GetRuntime("native") != nil {
+		t.Error("native must NOT be registered for an upgraded config that lists NATIVE in available_runtimes without allow_native_runtime (R1: the gate must not key on available_runtimes membership)")
+	}
+
 	// Native ON only with the explicit opt-in.
 	on := config.Defaults()
 	on.DataDir = t.TempDir()
