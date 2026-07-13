@@ -64,6 +64,22 @@ func TestScreen(t *testing.T) {
 		// this range too but classify as unspecified/loopback first — both blocked.
 		{"ipv4-compatible", "[::93.184.216.34]:443", false},
 		{"ipv4-compatible private", "[::10.0.0.1]:443", false},
+
+		// IPv6-transition ranges (BG-02d): each embeds an IPv4 address a configured
+		// tunnel can reach internally. Blocked regardless of whether a tunnel is present.
+		// 6to4 2002::/16 encodes the IPv4 in octets 3–6: 2002:7f00:1:: == 127.0.0.1.
+		{"6to4 loopback", "[2002:7f00:1::]:443", false},
+		{"6to4 metadata", "[2002:a9fe:a9fe::]:80", false}, // 169.254.169.254
+		{"6to4 arbitrary", "[2002:c0a8:1::1]:443", false}, // 192.168.0.1
+		// Teredo 2001:0::/32.
+		{"teredo", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]:443", false},
+		{"teredo low", "[2001:0::1]:443", false},
+		// RFC8215 local-use NAT64 64:ff9b:1::/48 (distinct from the well-known /96).
+		{"nat64 local-use", "[64:ff9b:1::7f00:1]:443", false},
+		{"nat64 local-use high", "[64:ff9b:1:ffff::1]:443", false},
+		// A public IPv6 address just OUTSIDE the transition ranges stays allowed.
+		{"public below 6to4", "[2001:db8::1]:443", true}, // documentation range, not blocked here
+		{"public above 6to4", "[2003::1]:443", true},     // just past 2002::/16
 	}
 
 	for _, tc := range cases {

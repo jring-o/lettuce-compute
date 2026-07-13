@@ -12,7 +12,11 @@
 // CGNAT 100.64.0.0/10 (a real internal-services range on cloud hosts that IsPrivate
 // misses), NAT64 64:ff9b::/96 (a DNS64/NAT64 host maps it onto arbitrary IPv4 including
 // loopback), 0.0.0.0/8 "this network" beyond the unspecified 0.0.0.0 itself, and the
-// deprecated IPv4-compatible IPv6 range ::/96.
+// deprecated IPv4-compatible IPv6 range ::/96. It also refuses the IPv6-transition
+// ranges that embed an IPv4 address a tunnel can reach internally: 6to4 2002::/16
+// (its 3rd–6th octets ARE the IPv4, so 2002:7f00:1:: is 127.0.0.1), Teredo
+// 2001:0::/32, and RFC8215 local-use NAT64 64:ff9b:1::/48 (the design-local NAT64
+// prefix alongside the well-known 64:ff9b::/96).
 package netguard
 
 import (
@@ -35,8 +39,11 @@ var blockedNets = []struct {
 }{
 	{mustCIDR("100.64.0.0/10"), "carrier-grade NAT"},
 	{mustCIDR("64:ff9b::/96"), "NAT64"},
+	{mustCIDR("64:ff9b:1::/48"), "NAT64 local-use"},
 	{mustCIDR("0.0.0.0/8"), "this-network"},
 	{mustCIDR("::/96"), "IPv4-compatible IPv6"},
+	{mustCIDR("2002::/16"), "6to4"},
+	{mustCIDR("2001:0::/32"), "Teredo"},
 }
 
 func mustCIDR(s string) *net.IPNet {

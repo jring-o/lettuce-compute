@@ -87,6 +87,44 @@ func validateBinaryChecksums(c *ExecutionConfig) *apierror.APIError {
 // Supports: repo, repo:tag, registry/repo:tag, registry/repo@sha256:digest
 var ociImageRefRegex = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*(:[a-zA-Z0-9][\w.-]{0,127}|@sha256:[a-f0-9]{64})?$`)
 
+// validateImageRegistryHost rejects a container image reference whose registry
+// authority is an internal address (BG-14d). The registry is the first
+// '/'-separated component, but only when it looks like a registry authority — it
+// contains '.' or ':' (a domain or host:port) or is "localhost". A bare first
+// component (e.g. "ubuntu", "library/ubuntu") means the default public registry
+// (docker.io), which has nothing internal to screen. This screens IP LITERALS
+// only; a registry hostname that RESOLVES to an internal address is closed by the
+// daemon's pre-pull screen, mirroring validateBinaryURL's head/daemon split.
+func validateImageRegistryHost(imageRef string) error {
+	if binaryURLAllowInsecure {
+		return nil // local-dev registries (localhost:5000) are allowed in this mode
+	}
+	slash := strings.IndexByte(imageRef, '/')
+	if slash < 0 {
+		return nil // no registry component — single-name image on the default registry
+	}
+	first := imageRef[:slash]
+	if first != "localhost" && !strings.ContainsAny(first, ".:") {
+		return nil // a plain path component, not a registry authority
+	}
+	// first is the registry authority: "host", "host:port", or "[ipv6]:port".
+	host := first
+	if h, _, err := net.SplitHostPort(first); err == nil {
+		host = h
+	} else if strings.HasPrefix(first, "[") && strings.HasSuffix(first, "]") {
+		host = first[1 : len(first)-1] // bracketed IPv6 literal with no port
+	}
+	if host == "localhost" {
+		return fmt.Errorf("registry host %q is not allowed", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := netguard.DisallowedIPReason(ip); reason != "" {
+			return fmt.Errorf("registry host %s points at an internal address (%s)", ip, reason)
+		}
+	}
+	return nil
+}
+
 // sha256HexRegex matches a lowercase hex SHA-256 digest (exactly 64 hex chars).
 var sha256HexRegex = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -353,10 +391,23 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 			return apierror.ValidationError("image or dockerfile is required when runtime is CONTAINER",
 				validationDetail{Field: "image", Reason: "required_for_container"})
 		}
-		if c.Image != nil && !ociImageRefRegex.MatchString(*c.Image) {
-			return apierror.ValidationError(
-				fmt.Sprintf("invalid OCI image reference: %q", *c.Image),
-				validationDetail{Field: "image", Reason: "invalid_oci_reference"})
+		if c.Image != nil {
+			if !ociImageRefRegex.MatchString(*c.Image) {
+				return apierror.ValidationError(
+					fmt.Sprintf("invalid OCI image reference: %q", *c.Image),
+					validationDetail{Field: "image", Reason: "invalid_oci_reference"})
+			}
+			// BG-14d: the container image pull egresses through the Docker/Podman engine,
+			// OUTSIDE the volunteer daemon's netguard dial screen, so a registry authority
+			// like 169.254.169.254/repo would let the engine dial cloud metadata. Screen
+			// the registry host here (IP literals) as the head-side layer; a registry
+			// hostname that RESOLVES to an internal address is closed by the daemon's
+			// pre-pull screen, same defense-in-depth split as validateBinaryURL (BG-14).
+			if err := validateImageRegistryHost(*c.Image); err != nil {
+				return apierror.ValidationError(
+					fmt.Sprintf("image registry: %s", err),
+					validationDetail{Field: "image", Reason: "registry_internal_address"})
+			}
 		}
 	}
 
