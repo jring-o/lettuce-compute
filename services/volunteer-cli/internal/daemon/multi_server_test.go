@@ -49,9 +49,9 @@ func TestMultiServerSingleServer(t *testing.T) {
 	d := NewDaemon(DaemonConfig{
 		Config: cfg,
 		PubKey: pub, PrivKey: priv,
-		Servers: []*ServerConnection{{
+		Servers: grantAllRuntimeTrust([]*ServerConnection{{
 			Client: mc, VolunteerID: "vol-single", Name: "single-server", Available: true,
-		}},
+		}}),
 		Runtime: mr,
 		Logger:  logger,
 	})
@@ -97,11 +97,11 @@ func TestMultiServerSubmitToCorrectServer(t *testing.T) {
 		},
 	}
 
-	connections := []*ServerConnection{
+	connections := grantAllRuntimeTrust([]*ServerConnection{
 		{Client: serverA, VolunteerID: "vol-a", Name: "server-a", Available: true},
 		{Client: serverB, VolunteerID: "vol-b", Name: "server-b", Available: true},
 		{Client: serverC, VolunteerID: "vol-c", Name: "server-c", Available: true},
-	}
+	})
 
 	mr := &mockRuntime{canHandle: true}
 
@@ -177,9 +177,9 @@ func TestMultiServerHistoryTracksServer(t *testing.T) {
 	d := NewDaemon(DaemonConfig{
 		Config: cfg,
 		PubKey: pub, PrivKey: priv,
-		Servers: []*ServerConnection{{
+		Servers: grantAllRuntimeTrust([]*ServerConnection{{
 			Client: serverA, VolunteerID: "vol-hist", Name: "my-server", Available: true,
-		}},
+		}}),
 		Runtime: &mockRuntime{canHandle: true},
 		Logger:  logger,
 	})
@@ -225,10 +225,10 @@ func TestMultiServerHeartbeatToCorrectServer(t *testing.T) {
 		},
 	}
 
-	connections := []*ServerConnection{
+	connections := grantAllRuntimeTrust([]*ServerConnection{
 		{Client: serverA, VolunteerID: "vol-a", Name: "server-a", Available: true},
 		{Client: serverB, VolunteerID: "vol-b", Name: "server-b", Available: true},
-	}
+	})
 
 	mr := &mockRuntime{
 		canHandle: true,

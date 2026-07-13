@@ -103,6 +103,66 @@ func TestExplicitOptInEnablesNative(t *testing.T) {
 	}
 }
 
+// TestMigrateServerRuntimeTrust covers the per-head-trust migration that runs in Load: a
+// config written before per-head trust existed backfills each server's TrustedRuntimes from
+// the legacy global available_runtimes / allow_native_runtime, so an upgraded volunteer
+// keeps EXACTLY today's posture — and NATIVE never appears from available_runtimes
+// membership alone (design re-review R1). A server that already carries an explicit
+// trusted_runtimes list is left untouched.
+func TestMigrateServerRuntimeTrust(t *testing.T) {
+	cases := []struct {
+		name                           string
+		yaml                           string
+		wantNative, wantCont, wantWasm bool
+	}{
+		{
+			name:       "R1 upgrade: NATIVE in available_runtimes, no allow_native_runtime -> native OFF",
+			yaml:       "servers:\n  - grpc_address: h1:443\navailable_runtimes:\n  - NATIVE\n  - WASM\n",
+			wantNative: false, wantCont: false, wantWasm: true,
+		},
+		{
+			name:       "preserve global native-on: allow_native_runtime true -> native trusted per head",
+			yaml:       "servers:\n  - grpc_address: h1:443\nallow_native_runtime: true\n",
+			wantNative: true, wantCont: false, wantWasm: true,
+		},
+		{
+			name:       "container carried over from legacy available_runtimes",
+			yaml:       "servers:\n  - grpc_address: h1:443\navailable_runtimes:\n  - WASM\n  - CONTAINER\n",
+			wantNative: false, wantCont: true, wantWasm: true,
+		},
+		{
+			name:       "explicit per-head trusted_runtimes wins over legacy globals",
+			yaml:       "servers:\n  - grpc_address: h1:443\n    trusted_runtimes:\n      - CONTAINER\nallow_native_runtime: true\n",
+			wantNative: false, wantCont: true, wantWasm: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(cfg.Servers) != 1 {
+				t.Fatalf("expected 1 server, got %d", len(cfg.Servers))
+			}
+			s := cfg.Servers[0]
+			if got := s.TrustsRuntime("NATIVE"); got != tc.wantNative {
+				t.Errorf("TrustsRuntime(NATIVE) = %v, want %v", got, tc.wantNative)
+			}
+			if got := s.TrustsRuntime("CONTAINER"); got != tc.wantCont {
+				t.Errorf("TrustsRuntime(CONTAINER) = %v, want %v", got, tc.wantCont)
+			}
+			if got := s.TrustsRuntime("WASM"); got != tc.wantWasm {
+				t.Errorf("TrustsRuntime(WASM) = %v, want %v (WASM is always trusted)", got, tc.wantWasm)
+			}
+		})
+	}
+}
+
 func TestSaveLoadRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

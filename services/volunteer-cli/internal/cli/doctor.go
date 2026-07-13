@@ -101,11 +101,18 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	containerUsable := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
 
-	advertised := []string{"NATIVE", "WASM"}
+	// Machine capability, honestly derived (BG-12-doctor): WASM always; CONTAINER when a
+	// backend is usable; NATIVE only when at least one head is trusted for it. Which heads
+	// actually receive each runtime is per-head trust — shown in the Heads section and by
+	// `heads list`.
+	machineRuntimes := []string{"WASM"}
 	if containerUsable {
-		advertised = append(advertised, "CONTAINER")
+		machineRuntimes = append(machineRuntimes, "CONTAINER")
 	}
-	rep.add(docInfo, "runtimes", fmt.Sprintf("this volunteer can run: %v", advertised), "")
+	if anyServerTrusts(cfg.Servers, "NATIVE") {
+		machineRuntimes = append(machineRuntimes, "NATIVE")
+	}
+	rep.add(docInfo, "runtimes", fmt.Sprintf("this machine can run: %v (runtime trust is per-head — see `heads list`)", machineRuntimes), "")
 
 	caps := volunteerCaps{
 		maxMemoryMB:     cfg.ResourceLimits.MaxMemoryMB,

@@ -164,6 +164,18 @@ type ServerConfig struct {
 	KeyPath         string          `yaml:"key,omitempty" json:"key,omitempty"`                           // optional client key for mTLS
 	Weight          int             `yaml:"weight,omitempty" json:"weight,omitempty"`                     // head-level weight, default 100
 	LeafPreferences LeafPreferences `yaml:"leaf_preferences,omitempty" json:"leaf_preferences,omitempty"` // per-leaf config
+
+	// TrustedRuntimes records how far this volunteer's trust in THIS head extends —
+	// which runtime kinds the head may run on this machine, UPPERCASE
+	// ("WASM"/"CONTAINER"/"NATIVE"). A head is a single operator's trust domain:
+	// attaching to it IS the trust decision, and this field is what that decision chose
+	// (see the attach/init consent prompt). WASM is always safe (a sealed sandbox) and
+	// is implicitly trusted even when absent from this list — see EffectiveTrustedRuntimes.
+	// CONTAINER and NATIVE are explicit opt-ins. A nil/empty value marks a config that
+	// predates per-head trust; Load migrates those from the legacy global
+	// available_runtimes / allow_native_runtime so an upgraded volunteer keeps exactly
+	// today's posture (native stays off unless it was globally enabled).
+	TrustedRuntimes []string `yaml:"trusted_runtimes,omitempty" json:"trusted_runtimes,omitempty"`
 }
 
 // DisplayName returns the server's Name, falling back to GRPCAddress if Name is empty.
@@ -172,6 +184,38 @@ func (s ServerConfig) DisplayName() string {
 		return s.Name
 	}
 	return s.GRPCAddress
+}
+
+// EffectiveTrustedRuntimes returns the UPPERCASE runtime kinds this head is trusted to
+// run on this machine, always including WASM (the sandbox is safe without trusting the
+// operator). Runtime capability (does the machine actually have a container backend,
+// etc.) is a SEPARATE gate applied when the registry is built — this method answers only
+// "does the volunteer trust this head to run X", never "can this machine run X".
+func (s ServerConfig) EffectiveTrustedRuntimes() []string {
+	out := []string{"WASM"}
+	for _, r := range s.TrustedRuntimes {
+		u := strings.ToUpper(strings.TrimSpace(r))
+		if u == "" || u == "WASM" {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+// TrustsRuntime reports whether this head is trusted to run the given runtime kind
+// (case-insensitive) on this machine. WASM is always trusted.
+func (s ServerConfig) TrustsRuntime(runtime string) bool {
+	want := strings.ToUpper(strings.TrimSpace(runtime))
+	if want == "" {
+		return false
+	}
+	for _, r := range s.EffectiveTrustedRuntimes() {
+		if r == want {
+			return true
+		}
+	}
+	return false
 }
 
 // LeafPreferences controls which leafs a volunteer computes on a given server.
@@ -299,7 +343,44 @@ func Load(path string) (*Config, error) {
 	// (issue #51). Re-scan strictly to collect those keys and surface them as
 	// non-fatal advisories — the config still loads with the recognized keys.
 	cfg.deprecatedKeyWarnings = detectUnknownKeys(data)
+	cfg.migrateServerRuntimeTrust()
 	return cfg, nil
+}
+
+// migrateServerRuntimeTrust backfills per-head TrustedRuntimes for any server written
+// before per-head runtime trust existed, so an upgraded volunteer keeps EXACTLY today's
+// posture. Runtime enablement used to be two GLOBAL knobs — available_runtimes (WASM
+// always; CONTAINER opt-in) and allow_native_runtime (BG-12: native OFF unless explicitly
+// true) — which this maps onto the per-head field. A server that already carries an
+// explicit TrustedRuntimes (a config written by this version, or one set at attach) is
+// left untouched. WASM is implicit and never stored. The migration is idempotent: a
+// WASM-only head resolves to an empty opt-in list and is simply recomputed identically on
+// the next load.
+func (c *Config) migrateServerRuntimeTrust() {
+	for i := range c.Servers {
+		if len(c.Servers[i].TrustedRuntimes) > 0 {
+			continue // already per-head
+		}
+		var trusted []string
+		if containsFold(c.AvailableRuntimes, "CONTAINER") {
+			trusted = append(trusted, "CONTAINER")
+		}
+		if c.AllowNativeRuntime {
+			trusted = append(trusted, "NATIVE")
+		}
+		c.Servers[i].TrustedRuntimes = trusted
+	}
+}
+
+// containsFold reports whether list contains want, case-insensitively and ignoring
+// surrounding whitespace.
+func containsFold(list []string, want string) bool {
+	for _, s := range list {
+		if strings.EqualFold(strings.TrimSpace(s), want) {
+			return true
+		}
+	}
+	return false
 }
 
 // DeprecatedKeyWarnings returns non-fatal advisories about keys found in the

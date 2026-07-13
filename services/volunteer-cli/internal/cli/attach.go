@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"fmt"
 	"log/slog"
+	"os"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/project"
@@ -17,6 +19,7 @@ func newAttachCmd() *cobra.Command {
 		leafID     string
 		insecure   bool
 		caCertPath string
+		trust      string
 	)
 
 	cmd := &cobra.Command{
@@ -38,7 +41,7 @@ Examples:
 
 			// Case 1: attach --server <host>
 			if server != "" {
-				return attachServer(cmd, mgr, server, grpcPort, httpPort, leafID, insecure, caCertPath, logger)
+				return attachServer(cmd, mgr, server, grpcPort, httpPort, leafID, insecure, caCertPath, trust, logger)
 			}
 
 			// Case 2: attach <leaf-id> (on first configured server)
@@ -56,11 +59,12 @@ Examples:
 	cmd.Flags().StringVar(&leafID, "leaf", "", "leaf ID on the server")
 	cmd.Flags().BoolVar(&insecure, "insecure", false, "disable TLS (development only)")
 	cmd.Flags().StringVar(&caCertPath, "ca-cert", "", "path to CA certificate for server verification")
+	cmd.Flags().StringVar(&trust, "trust", "", "runtimes to trust this head to run: comma list of container,native (wasm is always allowed). Omit to be prompted interactively")
 
 	return cmd
 }
 
-func attachServer(cmd *cobra.Command, mgr *project.Manager, host string, grpcPort, httpPort int, leafID string, insecure bool, caCertPath string, logger *slog.Logger) error {
+func attachServer(cmd *cobra.Command, mgr *project.Manager, host string, grpcPort, httpPort int, leafID string, insecure bool, caCertPath, trust string, logger *slog.Logger) error {
 	if grpcPort <= 0 {
 		grpcPort = 443
 	}
@@ -105,10 +109,22 @@ func attachServer(cmd *cobra.Command, mgr *project.Manager, host string, grpcPor
 		}
 		fmt.Printf("Attached to leaf %s on %s. gRPC: %s, HTTP: %s.\n", leafID, host, grpcAddr, httpAddr)
 	} else {
-		if err := mgr.AttachServerWithTLS(host, grpcPort, httpPort, insecure, caCertPath); err != nil {
+		// Per-head runtime trust: attaching a head is the trust decision, and this records
+		// how far it extends. Use the --trust flag when given (non-interactive), else prompt.
+		var trusted []string
+		if cmd.Flags().Changed("trust") {
+			t, perr := parseTrustRuntimes(trust)
+			if perr != nil {
+				return perr
+			}
+			trusted = t
+		} else {
+			trusted = promptRuntimeTrust(bufio.NewScanner(os.Stdin), host, containerBackendAvailable())
+		}
+		if err := mgr.AttachServerWithTLS(host, grpcPort, httpPort, insecure, caCertPath, trusted); err != nil {
 			return err
 		}
-		fmt.Printf("Attached to %s. gRPC: %s, HTTP: %s. The daemon will include this in its work pool on next startup.\n", host, grpcAddr, httpAddr)
+		fmt.Printf("Attached to %s (may run: %s). gRPC: %s, HTTP: %s. The daemon will include this in its work pool on next startup.\n", host, trustSummary(trusted), grpcAddr, httpAddr)
 	}
 	return nil
 }

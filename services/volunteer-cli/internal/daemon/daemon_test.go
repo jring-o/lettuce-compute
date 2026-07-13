@@ -139,6 +139,20 @@ func (m *mockClient) getStartWorkCalls() int {
 	return m.startWorkCalls
 }
 
+// grantAllRuntimeTrust makes each test server trust all runtime kinds, so tests that are NOT
+// about the per-head runtime trust gate (multi-server routing, integration journeys) let native
+// work flow through the fetcher's execute gate. Real servers always carry per-head trust from
+// config; inline test literals usually omit it. Returns the slice so it can wrap a literal
+// in-place. A server that already set TrustedRuntimes (e.g. a gate test) is left untouched.
+func grantAllRuntimeTrust(conns []*ServerConnection) []*ServerConnection {
+	for _, c := range conns {
+		if c != nil && c.Config.TrustedRuntimes == nil {
+			c.Config.TrustedRuntimes = []string{"CONTAINER", "NATIVE"}
+		}
+	}
+	return conns
+}
+
 // --- Mock runtime ---
 
 type mockRuntime struct {
