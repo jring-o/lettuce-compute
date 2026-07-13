@@ -27,7 +27,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lettuce-compute/infrastructure/internal/netguard"
+	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // Machine reason codes stamped into results.content_fetch_last_error. The code is

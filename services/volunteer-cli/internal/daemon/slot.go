@@ -36,9 +36,6 @@ var (
 // reclaimed by the head's deadline/lapsed-reservation sweep.
 const startWorkTimeout = 30 * time.Second
 
-// defaultWUMemoryMB is the conservative memory estimate for WUs that don't specify MaxMemoryMB.
-const defaultWUMemoryMB = 512
-
 // ExecutionSlot represents a single execution slot that runs one WU at a time.
 type ExecutionSlot struct {
 	ID                int
@@ -541,17 +538,16 @@ func (sm *SlotManager) StopAll() {
 	}
 }
 
-// TotalActiveMemoryMB returns the sum of MaxMemoryMB across all active slots' WUs.
-func (sm *SlotManager) TotalActiveMemoryMB() int {
+// TotalActiveMemoryMB returns the sum of booked memory across all active slots' WUs.
+// BG-16: books each unit at BookedMemMB (the same clamped number each runtime
+// enforces), so admission and enforcement share one denominator. memCeilingMB is the
+// volunteer's configured budget (config.ResourceLimits.MaxMemoryMB).
+func (sm *SlotManager) TotalActiveMemoryMB(memCeilingMB int) int {
 	total := 0
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
 		if slot.active && slot.wu != nil {
-			mem := int(slot.wu.ExecutionSpec.MaxMemoryMB)
-			if mem <= 0 {
-				mem = defaultWUMemoryMB
-			}
-			total += mem
+			total += runtime.BookedMemMB(int(slot.wu.ExecutionSpec.MaxMemoryMB), memCeilingMB)
 		}
 		slot.mu.Unlock()
 	}

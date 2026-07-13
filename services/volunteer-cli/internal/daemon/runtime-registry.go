@@ -28,9 +28,14 @@ func (r *RuntimeRegistry) Register(rt runtime.Runtime) {
 // SelectRuntime picks the runtime for a work unit based on wu.Runtime.
 // Returns an error if no matching runtime is registered or it can't handle the spec.
 func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, error) {
+	// SECURITY (BG-12): refuse an empty or unknown runtime UNCONDITIONALLY — never
+	// fall back to native even when native is registered. The old empty->native
+	// default let a (malicious or buggy) head omit the field to steer a unit onto the
+	// least-isolated backend; leaf creation already requires a runtime, so only such
+	// a head ever sends "".
 	name := strings.ToLower(wu.Runtime)
 	if name == "" {
-		name = "native"
+		return nil, fmt.Errorf("work unit has no runtime specified; refusing to run it")
 	}
 	rt, ok := r.runtimes[name]
 	if !ok {

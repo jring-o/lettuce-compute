@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,34 @@ import (
 	"time"
 )
 
+// TestCopyCapped is the BG-16d exit test (j) mechanism: a download is refused once it
+// exceeds the size cap. native (downloadFile) and wasm (downloadToFile) both stream
+// their artifact through copyCapped, so an infinite/oversized artifact URL cannot
+// fill the volunteer's disk during the download.
+func TestCopyCapped(t *testing.T) {
+	// Under the cap: copies fully.
+	var buf bytes.Buffer
+	n, err := copyCapped(&buf, bytes.NewReader(make([]byte, 100)), 1000)
+	if err != nil {
+		t.Fatalf("copyCapped under cap: %v", err)
+	}
+	if n != 100 || buf.Len() != 100 {
+		t.Errorf("copyCapped copied %d bytes (buf %d), want 100", n, buf.Len())
+	}
+
+	// Over the cap: refused.
+	buf.Reset()
+	if _, err := copyCapped(&buf, bytes.NewReader(make([]byte, 2000)), 1000); err == nil {
+		t.Error("copyCapped accepted input larger than the cap; want an error")
+	}
+
+	// Exactly at the cap: allowed.
+	buf.Reset()
+	if _, err := copyCapped(&buf, bytes.NewReader(make([]byte, 1000)), 1000); err != nil {
+		t.Errorf("copyCapped at exactly the cap: %v, want nil", err)
+	}
+}
+
 func TestDownloadExternalData_HappyPath(t *testing.T) {
 	payload := []byte("hello external data")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -18,7 +47,7 @@ func TestDownloadExternalData_HappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	data, checksum, err := DownloadExternalData(context.Background(), srv.URL, 1024)
+	data, checksum, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +68,7 @@ func TestDownloadExternalData_NonOKStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 1024)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 1024)
 	if err == nil {
 		t.Fatal("expected error for non-200 status")
 	}
@@ -56,7 +85,7 @@ func TestDownloadExternalData_OversizedResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 50)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 50)
 	if err == nil {
 		t.Fatal("expected error for oversized response")
 	}
@@ -69,7 +98,7 @@ func TestDownloadExternalData_ContentLengthExceedsMax(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 100)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 100)
 	if err == nil {
 		t.Fatal("expected error for content-length exceeding max")
 	}
@@ -85,7 +114,7 @@ func TestDownloadExternalData_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, _, err := DownloadExternalData(ctx, srv.URL, 1024)
+	_, _, err := DownloadExternalDataWithClient(ctx, srv.Client(), srv.URL, 1024)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -108,7 +137,7 @@ func TestDownloadExternalData_RedirectChain(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	data, _, err := DownloadExternalData(context.Background(), srv.URL+"/start", 1024)
+	data, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL+"/start", 1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

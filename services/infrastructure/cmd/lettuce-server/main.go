@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/admission"
@@ -83,6 +84,14 @@ func main() {
 	// deployments are attributable to a specific head.
 	logger := logging.NewLogger(cfg.Log.Level, cfg.Log.Format).With("head_instance_id", instanceID.String())
 	logging.SetDefault(logger)
+
+	// SSRF escape-hatch guard (BG-14): LETTUCE_BINARY_URL_ALLOW_INSECURE disables the
+	// https-required / no-internal-IP screen on leaf binary/module/viz/input URLs. It
+	// exists only for local dev and integration tests; a production head must never
+	// set it. Warn loudly at boot when it is active so it can never be on unnoticed.
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("LETTUCE_BINARY_URL_ALLOW_INSECURE"))); v == "1" || v == "true" || v == "yes" {
+		logger.Warn("SECURITY: LETTUCE_BINARY_URL_ALLOW_INSECURE is set — leaf URL SSRF screening (https-required, no internal IPs) is DISABLED. This must NEVER be set in production; unset it unless this is a local dev/test head.")
+	}
 
 	// Apply the operator-tuned NoDeadline reclaim ceiling so it actually changes
 	// the deadline_seconds stamped on NoDeadline work units (eager generation, the

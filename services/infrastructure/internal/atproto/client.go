@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lettuce-compute/infrastructure/internal/netguard"
+	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // Typed errors that callers can match with errors.Is to distinguish an absent

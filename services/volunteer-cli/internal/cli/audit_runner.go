@@ -216,19 +216,24 @@ func wireRuntimeResourceLimits(registry *daemon.RuntimeRegistry, cfg *config.Con
 	if !ok {
 		return pg
 	}
-	nr.SetCommandModifier(func(cmd *exec.Cmd) error {
+	perUnitLimits := func(declaredMemMB int) *config.ResourceLimits {
+		l := *limits
+		l.MaxMemoryMB = runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB)
+		return &l
+	}
+	nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int) error {
 		if pg != nil {
 			pg.ConfigureCommand(cmd)
 		}
-		return limiter.Apply(cmd, limits)
+		return limiter.Apply(cmd, perUnitLimits(declaredMemMB))
 	})
-	nr.SetProcessNotifier(func(pid int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, declaredMemMB int) (func(), error) {
 		if pg != nil {
 			if err := pg.Add(pid); err != nil {
 				logger.Warn("failed to add process to group", "pid", pid, "error", err)
 			}
 		}
-		return limiter.Enforce(pid, limits)
+		return limiter.Enforce(pid, perUnitLimits(declaredMemMB))
 	})
 	return pg
 }

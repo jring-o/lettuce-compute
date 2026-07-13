@@ -345,12 +345,24 @@ func runStart(cmd *cobra.Command, args []string) error {
 func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager, bool) {
 	registry := daemon.NewRuntimeRegistry()
 
-	// Always register native runtime.
-	nativeRuntime := runtime.NewNativeRuntime(cfg.DataDir, logger)
-	registry.Register(nativeRuntime)
+	// SECURITY (BG-12): register native ONLY when the volunteer has explicitly opted
+	// in via allow_native_runtime. Native runs an untrusted leaf binary directly on
+	// the host with no sandbox. This gate — NOT available_runtimes membership, which
+	// is persisted and already lists NATIVE for every onboarded tester (design
+	// re-review R1) — is the load-bearing control: when native is not registered it
+	// is not advertised, an honest head won't dispatch it, and SelectRuntime rejects
+	// a native (or empty) unit even from a malicious head.
+	if cfg.AllowNativeRuntime {
+		nativeRuntime := runtime.NewNativeRuntime(cfg.DataDir, logger)
+		registry.Register(nativeRuntime)
+		logger.Info("native runtime registered (allow_native_runtime is set)")
+	} else {
+		logger.Info("native runtime NOT registered (allow_native_runtime is false; native leaves will be refused)")
+	}
 
 	// Always register WASM runtime (wazero is embedded, no external dependencies).
 	wasmRuntime := runtime.NewWasmRuntime(cfg.DataDir, logger)
+	wasmRuntime.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB) // BG-16 booked-memory clamp
 	registry.Register(wasmRuntime)
 
 	// Register container runtime if configured.
@@ -396,6 +408,10 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 			} else {
 				cr.SetMaxCPUCores(cfg.ResourceLimits.MaxCPUCores)
 				cr.SetMaxGPUVRAMPct(cfg.ResourceLimits.MaxGPUVRAMPct)
+				// BG-16 booked memory/disk clamps + BG-13 hardening knobs from config.
+				cr.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB)
+				cr.SetDiskCeilingMB(cfg.ResourceLimits.MaxDiskGB * 1024)
+				cr.SetHardeningConfig(cfg.ResourceLimits.MaxPids, cfg.ContainerCapAdd, cfg.ContainerGPURelaxUser)
 				gpus := runtime.DetectGPUs()
 				if len(gpus) > 0 {
 					cr.SetGPUs(gpus)

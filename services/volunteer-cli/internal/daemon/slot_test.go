@@ -312,7 +312,8 @@ func TestSlotManager_TotalActiveMemoryMB(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	total := sm.TotalActiveMemoryMB()
+	// Ceiling 0 = no clamp, so booked == declared and the sum is 2048+4096.
+	total := sm.TotalActiveMemoryMB(0)
 	if total != 6144 {
 		t.Errorf("TotalActiveMemoryMB = %d, want 6144", total)
 	}

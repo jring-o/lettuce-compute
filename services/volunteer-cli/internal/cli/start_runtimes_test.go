@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
@@ -24,5 +25,51 @@ func TestAdvertisedRuntimes_UppercasesSortsAndReflectsRegistry(t *testing.T) {
 	want := []string{"NATIVE", "WASM"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("advertisedRuntimes() = %v, want %v (uppercase, sorted, container absent)", got, want)
+	}
+}
+
+// TestBuildRuntimeRegistry_NativeGate is the BG-12 exit test (a / a'): native is
+// registered ONLY when allow_native_runtime is set. A default config — where an
+// upgraded pre-release config also lands, since AllowNativeRuntime's zero value is
+// false — registers wasm but NOT native, so native is never advertised and a
+// native (or empty) work unit is refused downstream. The test would fail on a build
+// that registered native unconditionally or gated it on available_runtimes.
+func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	// Native OFF (the default, and where an upgraded pre-release config lands).
+	off := config.Defaults()
+	off.DataDir = t.TempDir()
+	if off.AllowNativeRuntime {
+		t.Fatal("precondition: Defaults() must have AllowNativeRuntime=false")
+	}
+	regOff, _, _ := buildRuntimeRegistry(off, logger)
+	if regOff.GetRuntime("native") != nil {
+		t.Error("native must NOT be registered when allow_native_runtime is false")
+	}
+	if regOff.GetRuntime("wasm") == nil {
+		t.Error("wasm must always be registered")
+	}
+
+	// The exact R1 upgrade scenario: available_runtimes STILL contains NATIVE (as a
+	// persisted pre-release config would) but allow_native_runtime is false. Native
+	// must NOT be registered. This is the case that fails on a build gating native on
+	// available_runtimes membership — that build would (wrongly) register native here.
+	upgraded := config.Defaults()
+	upgraded.DataDir = t.TempDir()
+	upgraded.AvailableRuntimes = []string{"NATIVE", "WASM"}
+	upgraded.AllowNativeRuntime = false
+	regUpgraded, _, _ := buildRuntimeRegistry(upgraded, logger)
+	if regUpgraded.GetRuntime("native") != nil {
+		t.Error("native must NOT be registered for an upgraded config that lists NATIVE in available_runtimes without allow_native_runtime (R1: the gate must not key on available_runtimes membership)")
+	}
+
+	// Native ON only with the explicit opt-in.
+	on := config.Defaults()
+	on.DataDir = t.TempDir()
+	on.AllowNativeRuntime = true
+	regOn, _, _ := buildRuntimeRegistry(on, logger)
+	if regOn.GetRuntime("native") == nil {
+		t.Error("native must be registered when allow_native_runtime is true")
 	}
 }

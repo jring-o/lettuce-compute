@@ -253,23 +253,32 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cfg.Logger.Warn("failed to create process group, child processes may outlive daemon", "error", pgErr)
 	}
 
-	// Wire resource limiter and process group hooks into any NativeRuntime.
+	// Wire resource limiter and process group hooks into any NativeRuntime. The
+	// limiter is enforced against a PER-UNIT copy of the configured limits whose
+	// memory ceiling is BookedMemMB(declared, configured) — the same clamped number
+	// admission books — so native enforcement matches admission instead of always
+	// capping at the whole configured budget (BG-16).
 	limits := &cfg.Config.ResourceLimits
+	perUnitLimits := func(declaredMemMB int) *config.ResourceLimits {
+		l := *limits
+		l.MaxMemoryMB = runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB)
+		return &l
+	}
 	for _, rt := range registry.runtimes {
 		if nr, ok := rt.(*runtime.NativeRuntime); ok {
-			nr.SetCommandModifier(func(cmd *exec.Cmd) error {
+			nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int) error {
 				if pg != nil {
 					pg.ConfigureCommand(cmd)
 				}
-				return limiter.Apply(cmd, limits)
+				return limiter.Apply(cmd, perUnitLimits(declaredMemMB))
 			})
-			nr.SetProcessNotifier(func(pid int) (func(), error) {
+			nr.SetProcessNotifier(func(pid int, declaredMemMB int) (func(), error) {
 				if pg != nil {
 					if err := pg.Add(pid); err != nil {
 						cfg.Logger.Warn("failed to add process to group", "pid", pid, "error", err)
 					}
 				}
-				return limiter.Enforce(pid, limits)
+				return limiter.Enforce(pid, perUnitLimits(declaredMemMB))
 			})
 		}
 	}
@@ -928,14 +937,15 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 		return true
 	}
 
-	wuMemoryMB := int(wu.ExecutionSpec.MaxMemoryMB)
-	if wuMemoryMB <= 0 {
-		wuMemoryMB = defaultWUMemoryMB
-	}
+	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
+	// enforce — so admission and enforcement share one denominator. A declared 0 is
+	// bounded to the per-task default; a huge declaration is clamped to the budget.
+	maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB
+	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 
 	// 1. Configured memory budget.
-	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
-		activeMemoryMB := d.slotManager.TotalActiveMemoryMB()
+	if maxMemoryMB > 0 {
+		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(maxMemoryMB)
 		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
 			d.logger.Info("canAccommodateWU: exceeds configured memory budget; buffered work waiting for capacity",
 				"work_unit_id", wu.ID, "active_mb", activeMemoryMB, "wu_mb", wuMemoryMB, "max_mb", maxMemoryMB)

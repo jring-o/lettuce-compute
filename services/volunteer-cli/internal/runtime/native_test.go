@@ -60,6 +60,21 @@ func main() {
 }
 `
 
+// envDumpSource writes the child process's entire environment to the output file,
+// one KEY=value per line, so a test can assert which host variables the native
+// runtime did (and did not) pass through.
+const envDumpSource = `package main
+
+import (
+	"os"
+	"strings"
+)
+
+func main() {
+	os.WriteFile(os.Getenv("LETTUCE_OUTPUT_FILE"), []byte(strings.Join(os.Environ(), "\n")), 0644)
+}
+`
+
 // checkpointWriterSource reports the checkpoint env vars to the output file and
 // writes a marker file into the checkpoint directory, so a test can verify the
 // unified checkpoint contract (LETTUCE_CHECKPOINT_DIR plus LETTUCE_CHECKPOINT_FILE
@@ -914,6 +929,68 @@ func TestName(t *testing.T) {
 	}
 }
 
+// TestNativeEnvScrub is the BG-12 exit test (b): an opted-in native leaf's child
+// process must NOT inherit the volunteer's host secrets. AWS_SECRET_ACCESS_KEY and
+// GITHUB_TOKEN are placed in the daemon's own environment; after execution the
+// child's dumped environment must contain neither, while the leaf's own declared
+// vars, the LETTUCE_* handshake vars, and the platform-load-bearing PATH survive.
+func TestNativeEnvScrub(t *testing.T) {
+	// Secrets in the daemon's own environment must not reach the child.
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "super-secret-value")
+	t.Setenv("GITHUB_TOKEN", "ghp_leakedtoken")
+
+	envBin := buildTestBinary(t, "envdump", envDumpSource)
+	envBinData, _ := os.ReadFile(envBin)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(envBinData)
+	}))
+	defer ts.Close()
+
+	dataDir := t.TempDir()
+	nr := NewNativeRuntime(dataDir, newTestLogger())
+	nr.httpClient = ts.Client()
+
+	wu := &WorkUnit{
+		ID:              "4f1c2d3e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+		Runtime:         "native",
+		DeadlineSeconds: 30,
+		EnvVars:         map[string]string{"LEAF_OWN_VAR": "leaf-value"},
+		ExecutionSpec:   nativeSpec(ts.URL+"/binary", envBinData),
+	}
+
+	prep, err := nr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer nr.Cleanup(prep)
+
+	result, err := nr.Execute(context.Background(), wu, prep)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	env := string(result.OutputData)
+	if strings.Contains(env, "AWS_SECRET_ACCESS_KEY") {
+		t.Error("SECURITY: AWS_SECRET_ACCESS_KEY leaked into the native child's environment")
+	}
+	if strings.Contains(env, "GITHUB_TOKEN") {
+		t.Error("SECURITY: GITHUB_TOKEN leaked into the native child's environment")
+	}
+	// The leaf's own declared env var is still delivered.
+	if !strings.Contains(env, "LEAF_OWN_VAR=leaf-value") {
+		t.Error("leaf's declared env var LEAF_OWN_VAR was not delivered")
+	}
+	// The LETTUCE_* handshake vars are still delivered.
+	if !strings.Contains(env, "LETTUCE_OUTPUT_FILE=") {
+		t.Error("LETTUCE_OUTPUT_FILE handshake var missing from child environment")
+	}
+	// PATH is load-bearing for the child to run at all; it must survive the scrub.
+	if !strings.Contains(env, "PATH=") {
+		t.Error("PATH missing from child environment (platform-load-bearing var must be kept)")
+	}
+}
+
 func TestCommandModifier(t *testing.T) {
 	echoBin := buildTestBinary(t, "echo", echoSource)
 	echoBinData, _ := os.ReadFile(echoBin)
@@ -929,7 +1006,7 @@ func TestCommandModifier(t *testing.T) {
 
 	// Set a modifier that adds an env var.
 	modifierCalled := false
-	nr.SetCommandModifier(func(cmd *exec.Cmd) error {
+	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int) error {
 		modifierCalled = true
 		return nil
 	})
@@ -970,7 +1047,7 @@ func TestCommandModifierError(t *testing.T) {
 	nr := NewNativeRuntime(dataDir, newTestLogger())
 	nr.httpClient = ts.Client()
 
-	nr.SetCommandModifier(func(cmd *exec.Cmd) error {
+	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int) error {
 		return fmt.Errorf("resource limit exceeded")
 	})
 
@@ -1261,7 +1338,7 @@ func TestProcessNotifier(t *testing.T) {
 	// Set a notifier that records the PID and returns a cleanup.
 	var notifiedPID int
 	cleanupCalled := false
-	nr.SetProcessNotifier(func(pid int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, _ int) (func(), error) {
 		notifiedPID = pid
 		return func() { cleanupCalled = true }, nil
 	})
@@ -1308,7 +1385,7 @@ func TestProcessNotifierError(t *testing.T) {
 	nr.httpClient = ts.Client()
 
 	// Set a notifier that returns an error.
-	nr.SetProcessNotifier(func(pid int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, _ int) (func(), error) {
 		return nil, fmt.Errorf("cgroup creation failed")
 	})
 
