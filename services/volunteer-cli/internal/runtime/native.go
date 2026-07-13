@@ -473,7 +473,7 @@ func (n *NativeRuntime) downloadFile(ctx context.Context, url, destPath string) 
 	}
 	tmpPath := tmp.Name()
 
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	if _, err := copyCapped(tmp, resp.Body, DefaultMaxArtifactBytes); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("write download: %w", err)

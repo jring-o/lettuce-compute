@@ -362,6 +362,7 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 
 	// Always register WASM runtime (wazero is embedded, no external dependencies).
 	wasmRuntime := runtime.NewWasmRuntime(cfg.DataDir, logger)
+	wasmRuntime.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB) // BG-16 booked-memory clamp
 	registry.Register(wasmRuntime)
 
 	// Register container runtime if configured.
@@ -407,6 +408,10 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 			} else {
 				cr.SetMaxCPUCores(cfg.ResourceLimits.MaxCPUCores)
 				cr.SetMaxGPUVRAMPct(cfg.ResourceLimits.MaxGPUVRAMPct)
+				// BG-16 booked memory/disk clamps + BG-13 hardening knobs from config.
+				cr.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB)
+				cr.SetDiskCeilingMB(cfg.ResourceLimits.MaxDiskGB * 1024)
+				cr.SetHardeningConfig(cfg.ResourceLimits.MaxPids, cfg.ContainerCapAdd, cfg.ContainerGPURelaxUser)
 				gpus := runtime.DetectGPUs()
 				if len(gpus) > 0 {
 					cr.SetGPUs(gpus)

@@ -1440,9 +1440,14 @@ func TestContainerRuntime_PrepareInlineOverExternalURL(t *testing.T) {
 	}
 }
 
-func TestContainerRuntime_ExecuteNoMemoryLimit(t *testing.T) {
+// TestContainerRuntime_DeclaredZeroMemoryIsBounded is the BG-16 exit test (h) for the
+// container path: a unit declaring MaxMemoryMB:0 must NOT get Docker's unlimited-0 —
+// it gets a finite, enforced ceiling equal to BookedMemMB(0, ceiling). This fails on
+// the pre-fix code, which passed Memory:0 (unlimited) for a declared-0 unit.
+func TestContainerRuntime_DeclaredZeroMemoryIsBounded(t *testing.T) {
 	mock := &MockDockerClient{}
 	cr, _ := newTestContainerRuntime(t, mock)
+	cr.SetMemoryCeilingMB(2048) // volunteer's configured budget
 
 	wu := &WorkUnit{
 		ID:            "48b8a0af-008a-4ded-8114-ba19622fa2c0", // was no-mem-limit
@@ -1457,14 +1462,127 @@ func TestContainerRuntime_ExecuteNoMemoryLimit(t *testing.T) {
 
 	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
 
-	_, err = cr.Execute(context.Background(), wu, prep)
-	if err != nil {
+	if _, err = cr.Execute(context.Background(), wu, prep); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	if mock.LastCreateConfig.MemoryBytes != 0 {
-		t.Errorf("MemoryBytes = %d, want 0 (no limit)", mock.LastCreateConfig.MemoryBytes)
+	wantBytes := int64(BookedMemMB(0, 2048)) * 1024 * 1024
+	if wantBytes == 0 {
+		t.Fatal("test precondition: booked memory must be non-zero")
 	}
+	if got := mock.LastCreateConfig.MemoryBytes; got != wantBytes {
+		t.Errorf("MemoryBytes = %d, want %d (declared-0 must be bounded, not unlimited)", got, wantBytes)
+	}
+
+	// A huge declaration is clamped down to the volunteer's configured budget.
+	wuHuge := &WorkUnit{
+		ID:            "48b8a0af-008a-4ded-8114-ba19622fa2c1",
+		ExecutionSpec: ExecutionSpec{Image: "alpine:latest", MaxMemoryMB: 50_000_000},
+	}
+	prepHuge, err := cr.Prepare(context.Background(), wuHuge)
+	if err != nil {
+		t.Fatalf("Prepare(huge): %v", err)
+	}
+	defer cr.Cleanup(prepHuge)
+	os.WriteFile(filepath.Join(prepHuge.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
+	if _, err = cr.Execute(context.Background(), wuHuge, prepHuge); err != nil {
+		t.Fatalf("Execute(huge): %v", err)
+	}
+	if got, want := mock.LastCreateConfig.MemoryBytes, int64(2048)*1024*1024; got != want {
+		t.Errorf("huge-declaration MemoryBytes = %d, want %d (clamped to config ceiling)", got, want)
+	}
+}
+
+// TestContainerRuntime_HardeningPosture is the BG-13 exit test (f/g): a container
+// created for a CPU leaf carries no-new-privileges, CapDrop:ALL, ReadonlyRootfs, a
+// non-zero PidsLimit, a non-root User, and a writable tmpfs /tmp. It fails on the
+// pre-fix code, which set none of these.
+func TestContainerRuntime_HardeningPosture(t *testing.T) {
+	mock := &MockDockerClient{}
+	cr, _ := newTestContainerRuntime(t, mock)
+	cr.SetMemoryCeilingMB(2048)
+	cr.SetHardeningConfig(512, nil, true)
+
+	wu := &WorkUnit{
+		ID:            "48b8a0af-008a-4ded-8114-ba19622fa2c2",
+		ExecutionSpec: ExecutionSpec{Image: "alpine:latest", MaxMemoryMB: 256},
+	}
+	prep, err := cr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer cr.Cleanup(prep)
+	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
+	if _, err = cr.Execute(context.Background(), wu, prep); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	cfg := mock.LastCreateConfig
+	if !containsStr(cfg.SecurityOpt, "no-new-privileges") {
+		t.Errorf("SecurityOpt = %v, want to contain no-new-privileges", cfg.SecurityOpt)
+	}
+	if !containsStr(cfg.CapDrop, "ALL") {
+		t.Errorf("CapDrop = %v, want to contain ALL", cfg.CapDrop)
+	}
+	if !cfg.ReadonlyRootfs {
+		t.Error("ReadonlyRootfs = false, want true")
+	}
+	if cfg.PidsLimit <= 0 {
+		t.Errorf("PidsLimit = %d, want > 0 (fork-bomb cap)", cfg.PidsLimit)
+	}
+	if cfg.User == "" || cfg.User == "root" || cfg.User == "0:0" {
+		t.Errorf("User = %q, want a non-root uid:gid for a CPU leaf", cfg.User)
+	}
+	if _, ok := cfg.TmpfsMounts["/tmp"]; !ok {
+		t.Errorf("TmpfsMounts = %v, want a writable /tmp under the read-only rootfs", cfg.TmpfsMounts)
+	}
+}
+
+// TestContainerRuntime_GPUCarveOut exercises applyHardening directly (Execute's GPU
+// path needs real GPU detection): a GPU leaf keeps the structural protections but,
+// with the carve-out enabled, is NOT forced to a non-root user (device passthrough),
+// while a CPU leaf gets the full lockdown.
+func TestContainerRuntime_GPUCarveOut(t *testing.T) {
+	cr, _ := newTestContainerRuntime(t, &MockDockerClient{})
+	cr.SetHardeningConfig(512, nil, true) // gpuRelaxUser = true
+
+	gpuCfg := &ContainerConfig{}
+	cr.applyHardening(gpuCfg, &WorkUnit{ExecutionSpec: ExecutionSpec{GPURequired: true}})
+	if !containsStr(gpuCfg.SecurityOpt, "no-new-privileges") {
+		t.Errorf("GPU leaf SecurityOpt = %v, want no-new-privileges kept", gpuCfg.SecurityOpt)
+	}
+	if !gpuCfg.ReadonlyRootfs || gpuCfg.PidsLimit <= 0 {
+		t.Error("GPU leaf must keep ReadonlyRootfs and a PID cap")
+	}
+	if gpuCfg.User == nobodyUser {
+		t.Error("GPU carve-out should relax the non-root user, but User was forced to nobody")
+	}
+
+	cpuCfg := &ContainerConfig{}
+	cr.applyHardening(cpuCfg, &WorkUnit{ExecutionSpec: ExecutionSpec{GPURequired: false}})
+	if cpuCfg.User != nobodyUser {
+		t.Errorf("CPU leaf User = %q, want %q", cpuCfg.User, nobodyUser)
+	}
+	if !containsStr(cpuCfg.CapDrop, "ALL") {
+		t.Errorf("CPU leaf CapDrop = %v, want ALL", cpuCfg.CapDrop)
+	}
+
+	// With the carve-out DISABLED, a GPU leaf is hardened like a CPU leaf.
+	cr.SetHardeningConfig(512, nil, false)
+	gpuStrict := &ContainerConfig{}
+	cr.applyHardening(gpuStrict, &WorkUnit{ExecutionSpec: ExecutionSpec{GPURequired: true}})
+	if gpuStrict.User != nobodyUser {
+		t.Errorf("GPU leaf with carve-out disabled: User = %q, want %q", gpuStrict.User, nobodyUser)
+	}
+}
+
+func containsStr(s []string, want string) bool {
+	for _, v := range s {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestContainerRuntime_ExecuteGPUNVIDIA(t *testing.T) {

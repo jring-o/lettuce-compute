@@ -937,14 +937,15 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 		return true
 	}
 
-	wuMemoryMB := int(wu.ExecutionSpec.MaxMemoryMB)
-	if wuMemoryMB <= 0 {
-		wuMemoryMB = defaultWUMemoryMB
-	}
+	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
+	// enforce — so admission and enforcement share one denominator. A declared 0 is
+	// bounded to the per-task default; a huge declaration is clamped to the budget.
+	maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB
+	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 
 	// 1. Configured memory budget.
-	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
-		activeMemoryMB := d.slotManager.TotalActiveMemoryMB()
+	if maxMemoryMB > 0 {
+		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(maxMemoryMB)
 		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
 			d.logger.Info("canAccommodateWU: exceeds configured memory budget; buffered work waiting for capacity",
 				"work_unit_id", wu.ID, "active_mb", activeMemoryMB, "wu_mb", wuMemoryMB, "max_mb", maxMemoryMB)

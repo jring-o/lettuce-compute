@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,34 @@ import (
 	"testing"
 	"time"
 )
+
+// TestCopyCapped is the BG-16d exit test (j) mechanism: a download is refused once it
+// exceeds the size cap. native (downloadFile) and wasm (downloadToFile) both stream
+// their artifact through copyCapped, so an infinite/oversized artifact URL cannot
+// fill the volunteer's disk during the download.
+func TestCopyCapped(t *testing.T) {
+	// Under the cap: copies fully.
+	var buf bytes.Buffer
+	n, err := copyCapped(&buf, bytes.NewReader(make([]byte, 100)), 1000)
+	if err != nil {
+		t.Fatalf("copyCapped under cap: %v", err)
+	}
+	if n != 100 || buf.Len() != 100 {
+		t.Errorf("copyCapped copied %d bytes (buf %d), want 100", n, buf.Len())
+	}
+
+	// Over the cap: refused.
+	buf.Reset()
+	if _, err := copyCapped(&buf, bytes.NewReader(make([]byte, 2000)), 1000); err == nil {
+		t.Error("copyCapped accepted input larger than the cap; want an error")
+	}
+
+	// Exactly at the cap: allowed.
+	buf.Reset()
+	if _, err := copyCapped(&buf, bytes.NewReader(make([]byte, 1000)), 1000); err != nil {
+		t.Errorf("copyCapped at exactly the cap: %v, want nil", err)
+	}
+}
 
 func TestDownloadExternalData_HappyPath(t *testing.T) {
 	payload := []byte("hello external data")

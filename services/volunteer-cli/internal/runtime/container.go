@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,11 @@ type ContainerRuntime struct {
 	maxCPUCores   int              // from config; 0 means no CPU limit
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
+	memCeilingMB  int // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
+	diskCeilingMB int // volunteer's configured disk budget in MB (0 = unset); clamps per-unit BookedDiskMB
+	maxPids       int // fork-bomb PID cap from config (<=0 = built-in default)
+	capAdd        []string
+	gpuRelaxUser  bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
 	httpClient    *http.Client // for viz bundle downloads
 
 	// wantedImages, when set, returns every image ref the volunteer currently
@@ -109,6 +115,70 @@ func (c *ContainerRuntime) SetGPUs(gpus []*GpuDetectionResult) {
 // SetMaxGPUVRAMPct sets the maximum GPU VRAM percentage from config.
 func (c *ContainerRuntime) SetMaxGPUVRAMPct(pct int) {
 	c.maxGPUVRAMPct = pct
+}
+
+// SetMemoryCeilingMB sets the volunteer's configured memory budget
+// (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
+// memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
+func (c *ContainerRuntime) SetMemoryCeilingMB(mb int) { c.memCeilingMB = mb }
+
+// SetDiskCeilingMB sets the volunteer's configured disk budget in MB
+// (config.ResourceLimits.MaxDiskGB * 1024). The /work size watchdog and any
+// StorageOpt quota are driven by BookedDiskMB clamped to this, never by the
+// attacker-declared MaxDiskMB (BG-16c).
+func (c *ContainerRuntime) SetDiskCeilingMB(mb int) { c.diskCeilingMB = mb }
+
+// SetHardeningConfig sets the BG-13 container-hardening knobs from config: the PID
+// cap, the explicit capability re-adds, and whether GPU leaves may relax the
+// non-root/minimal-capability posture that CPU leaves always get.
+func (c *ContainerRuntime) SetHardeningConfig(maxPids int, capAdd []string, gpuRelaxUser bool) {
+	c.maxPids = maxPids
+	c.capAdd = capAdd
+	c.gpuRelaxUser = gpuRelaxUser
+}
+
+// defaultContainerPidsLimit is the fork-bomb PID cap used when max_pids is unset.
+// Generous for compute leaves; blunts a fork bomb.
+const defaultContainerPidsLimit int64 = 512
+
+// nobodyUser is the non-root uid:gid CPU leaves run as (nobody:nogroup).
+const nobodyUser = "65534:65534"
+
+// applyHardening sets the BG-13 security posture on the container config. CPU leaves
+// run fully locked down: no-new-privileges, all capabilities dropped, a read-only
+// rootfs with a small writable tmpfs /tmp, a PID cap, and a non-root user. GPU
+// leaves keep the structural protections (no-new-privileges, read-only rootfs, PID
+// cap) but — when container_gpu_relax_user is set — leave the user and capabilities
+// at the backend default, because device passthrough (/dev/nvidia*, /dev/kfd,
+// /dev/dri/renderD*) commonly needs it. The relaxation is explicit and logged.
+func (c *ContainerRuntime) applyHardening(cfg *ContainerConfig, wu *WorkUnit) {
+	cfg.SecurityOpt = []string{"no-new-privileges"}
+	cfg.ReadonlyRootfs = true
+	// A small writable tmpfs at /tmp lets images that only need scratch space run
+	// under a read-only rootfs; /work and /work/checkpoint stay writable via binds.
+	cfg.TmpfsMounts = map[string]string{"/tmp": "rw,noexec,nosuid,size=64m"}
+	pids := int64(c.maxPids)
+	if pids <= 0 {
+		pids = defaultContainerPidsLimit
+	}
+	cfg.PidsLimit = pids
+
+	if len(c.capAdd) > 0 {
+		cfg.CapAdd = append([]string(nil), c.capAdd...)
+	}
+
+	if wu.ExecutionSpec.GPURequired && c.gpuRelaxUser {
+		// GPU carve-out: keep the structural protections but leave user/caps at the
+		// backend default so the device nodes stay usable.
+		c.logger.Info("container hardening: GPU leaf runs with relaxed user/capabilities (container_gpu_relax_user)",
+			"work_unit_id", wu.ID)
+		return
+	}
+
+	// CPU leaves (and GPU leaves when the carve-out is disabled): drop every
+	// capability and run as a non-root user.
+	cfg.CapDrop = []string{"ALL"}
+	cfg.User = nobodyUser
 }
 
 // Name returns "container".
@@ -354,11 +424,12 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		)
 	}
 
-	// Compute resource limits.
-	var memoryBytes int64
-	if wu.ExecutionSpec.MaxMemoryMB > 0 {
-		memoryBytes = int64(wu.ExecutionSpec.MaxMemoryMB) * 1024 * 1024
-	}
+	// Compute resource limits. SECURITY (BG-16): the memory ceiling is BookedMemMB, so
+	// a declared 0 is bounded to the per-task default (never Docker's unlimited-0) and
+	// a huge declaration is clamped to the volunteer's configured budget. The container
+	// can therefore never exceed what admission booked for it.
+	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.memCeilingMB)
+	memoryBytes := int64(bookedMemMB) * 1024 * 1024
 
 	var cpuQuota, cpuPeriod int64
 	if c.maxCPUCores > 0 {
@@ -391,6 +462,11 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 			"lettuce.leaf-id": wu.LeafID,
 		},
 	}
+
+	// SECURITY (BG-13): apply the hardened container posture (no-new-privileges,
+	// dropped capabilities, read-only rootfs + tmpfs /tmp, PID cap, non-root user),
+	// with the GPU carve-out for leaves that need device passthrough.
+	c.applyHardening(cfg, wu)
 
 	// Configure GPU device passthrough on the container.
 	if selectedGPU != nil {
@@ -464,6 +540,26 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		defer cancel()
 	}
 
+	// BG-16c: bound /work growth at bookedDiskMB — the volunteer's configured disk
+	// ceiling — never at the attacker-declared MaxDiskMB (which the head accepts with
+	// no upper clamp). On overshoot, stop the container and fail the unit at the
+	// config ceiling. The watchdog polls, so a unit can overshoot by up to one
+	// interval's writes before termination — bounded, not zero.
+	bookedDiskMB := BookedDiskMB(int(wu.ExecutionSpec.MaxDiskMB), c.diskCeilingMB)
+	var diskExceeded atomic.Bool
+	stopWatchdog := startDiskWatchdog(waitCtx, int64(bookedDiskMB)*1024*1024,
+		[]string{outputDir, checkpointDir}, func(size int64) {
+			diskExceeded.Store(true)
+			c.logger.Warn("disk watchdog: /work exceeded booked disk budget; stopping container",
+				"work_unit_id", wu.ID, "size_bytes", size, "booked_disk_mb", bookedDiskMB)
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), gracefulShutdownGrace+5*time.Second)
+			defer stopCancel()
+			if stopErr := c.dockerClient.ContainerStop(stopCtx, containerID, gracefulShutdownGrace); stopErr != nil {
+				c.logger.Warn("disk watchdog: container stop failed", "work_unit_id", wu.ID, "container", containerID, "error", stopErr)
+			}
+		})
+	defer stopWatchdog()
+
 	// Wait for container to exit.
 	exitCode, err := c.dockerClient.ContainerWait(waitCtx, containerID)
 	wallClock := time.Since(startTime)
@@ -472,6 +568,11 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	if gpuMetricsCancel != nil {
 		gpuMetricsCancel()
 		<-gpuMetricsDone
+	}
+
+	// If the disk watchdog stopped the container, the unit failed its disk budget.
+	if diskExceeded.Load() {
+		return nil, fmt.Errorf("work unit terminated: exceeded disk budget of %d MB", bookedDiskMB)
 	}
 
 	if err != nil {

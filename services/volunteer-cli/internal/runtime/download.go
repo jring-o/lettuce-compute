@@ -17,6 +17,24 @@ import (
 // DefaultMaxDownloadBytes is the default limit for external data downloads (100 MB).
 const DefaultMaxDownloadBytes int64 = 100 * 1024 * 1024
 
+// DefaultMaxArtifactBytes bounds a native binary / wasm module download (BG-16d):
+// generous for a real compute artifact, but finite so a malicious URL cannot stream
+// unboundedly and fill the volunteer's disk during the download itself.
+const DefaultMaxArtifactBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+// copyCapped copies src to dst but fails if more than maxBytes would be written,
+// reading one byte past the cap to detect the overflow. Returns the byte count.
+func copyCapped(dst io.Writer, src io.Reader, maxBytes int64) (int64, error) {
+	n, err := io.Copy(dst, io.LimitReader(src, maxBytes+1))
+	if err != nil {
+		return n, err
+	}
+	if n > maxBytes {
+		return n, fmt.Errorf("download exceeds maximum size of %d bytes", maxBytes)
+	}
+	return n, nil
+}
+
 // DefaultDownloadTimeout is the default timeout for external data downloads.
 const DefaultDownloadTimeout = 5 * time.Minute
 

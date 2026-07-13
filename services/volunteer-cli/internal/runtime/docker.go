@@ -123,6 +123,18 @@ type ContainerConfig struct {
 	Labels      map[string]string // for identification/cleanup
 	Backend     ContainerBackend  // which container backend is in use
 
+	// BG-13 hardening posture. Empty/zero values leave the corresponding Docker
+	// default in place (so an un-hardened caller is unaffected), but the container
+	// runtime always populates these via applyHardening.
+	SecurityOpt    []string          // e.g. ["no-new-privileges"]
+	CapDrop        []string          // e.g. ["ALL"]
+	CapAdd         []string          // explicit capability re-adds (default none)
+	ReadonlyRootfs bool              // read-only container root filesystem
+	PidsLimit      int64             // max PIDs (fork-bomb cap); <=0 leaves it unset
+	User           string            // container user "uid:gid" (e.g. "65534:65534"); empty = image default
+	TmpfsMounts    map[string]string // container path -> mount options, e.g. {"/tmp": "rw,noexec,nosuid,size=64m"}
+	StorageOpt     map[string]string // backend storage quotas, e.g. {"size": "10240m"} (best-effort; xfs pquota / btrfs)
+
 	// GPU support
 	GPUDeviceIDs   []string        // NVIDIA: GPU device IDs for DeviceRequest
 	GPUCount       int             // NVIDIA: number of GPUs (-1 = all, 0 = none)
@@ -426,6 +438,10 @@ func (d *dockerClientWrapper) ContainerCreate(ctx context.Context, cfg *Containe
 	if cfg.WorkDir != "" {
 		containerCfg.WorkingDir = cfg.WorkDir
 	}
+	// BG-13: run as a non-root user when one is set (CPU leaves).
+	if cfg.User != "" {
+		containerCfg.User = cfg.User
+	}
 
 	hostCfg := &container.HostConfig{
 		Binds:       cfg.Binds,
@@ -435,6 +451,31 @@ func (d *dockerClientWrapper) ContainerCreate(ctx context.Context, cfg *Containe
 			CPUQuota:  cfg.CPUQuota,
 			CPUPeriod: cfg.CPUPeriod,
 		},
+	}
+
+	// BG-13 hardening posture. Each field is applied only when set, so a caller that
+	// does not populate them keeps the previous (unhardened) behavior.
+	if len(cfg.SecurityOpt) > 0 {
+		hostCfg.SecurityOpt = cfg.SecurityOpt
+	}
+	if len(cfg.CapDrop) > 0 {
+		hostCfg.CapDrop = cfg.CapDrop
+	}
+	if len(cfg.CapAdd) > 0 {
+		hostCfg.CapAdd = cfg.CapAdd
+	}
+	if cfg.ReadonlyRootfs {
+		hostCfg.ReadonlyRootfs = true
+	}
+	if cfg.PidsLimit > 0 {
+		pids := cfg.PidsLimit
+		hostCfg.Resources.PidsLimit = &pids
+	}
+	if len(cfg.TmpfsMounts) > 0 {
+		hostCfg.Tmpfs = cfg.TmpfsMounts
+	}
+	if len(cfg.StorageOpt) > 0 {
+		hostCfg.StorageOpt = cfg.StorageOpt
 	}
 
 	// NVIDIA GPU passthrough.

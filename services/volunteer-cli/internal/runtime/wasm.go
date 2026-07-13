@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"net/http"
@@ -26,10 +25,16 @@ var wasmMagic = []byte{0x00, 0x61, 0x73, 0x6D}
 
 // WasmRuntime executes WASM modules using wazero with WASI support.
 type WasmRuntime struct {
-	dataDir    string
-	logger     *slog.Logger
-	httpClient *http.Client // injectable for testing
+	dataDir      string
+	logger       *slog.Logger
+	httpClient   *http.Client // injectable for testing
+	memCeilingMB int          // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
 }
+
+// SetMemoryCeilingMB sets the volunteer's configured memory budget
+// (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
+// memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
+func (w *WasmRuntime) SetMemoryCeilingMB(mb int) { w.memCeilingMB = mb }
 
 // NewWasmRuntime creates a WasmRuntime with the given data directory. Its HTTP
 // client is the shared netguard-guarded one so module/input/viz downloads cannot be
@@ -151,10 +156,15 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	// expires (deadline, cancellation). Without this, only WASI host function
 	// boundaries are checked.
 	runtimeConfig := wazero.NewRuntimeConfig().WithCloseOnContextDone(true)
-	if wu.ExecutionSpec.MaxMemoryMB > 0 {
-		maxPages := uint32(wu.ExecutionSpec.MaxMemoryMB) * 16 // 1 MB = 16 pages (64 KiB each)
-		runtimeConfig = runtimeConfig.WithMemoryLimitPages(maxPages)
-	}
+	// SECURITY (BG-16): enforce a memory page cap UNCONDITIONALLY. A declared 0 no
+	// longer means "unlimited" — BookedMemMB clamps it to the per-task default, and a
+	// huge declaration is clamped down to the volunteer's configured budget, so the
+	// guest's linear memory can never grow past what admission booked. (This bounds
+	// the guest's 32-bit linear memory; wazero's own host-side allocation is a
+	// documented residual — see design §4.1.)
+	bookedMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), w.memCeilingMB)
+	maxPages := uint32(bookedMB) * 16 // 1 MB = 16 pages (64 KiB each)
+	runtimeConfig = runtimeConfig.WithMemoryLimitPages(maxPages)
 
 	r := wazero.NewRuntimeWithConfig(ctx, runtimeConfig)
 	defer r.Close(ctx)
@@ -413,7 +423,7 @@ func (w *WasmRuntime) downloadToFile(ctx context.Context, url, destPath string) 
 	}
 	tmpPath := tmp.Name()
 
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	if _, err := copyCapped(tmp, resp.Body, DefaultMaxArtifactBytes); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("write download: %w", err)
