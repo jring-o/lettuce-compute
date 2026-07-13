@@ -299,11 +299,17 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// Client/VolunteerID for backward compatibility with existing tests.
 	servers := cfg.Servers
 	if len(servers) == 0 && cfg.Client != nil {
+		// Legacy single-Client constructor. This branch is TEST-ONLY: production always
+		// passes Servers (built from config, each carrying the volunteer's per-head runtime
+		// trust). There is no per-head config to consult here, so the synthesized head trusts
+		// all runtime kinds — otherwise the fetcher's per-head trust gate would abandon every
+		// unit and no execution-flow test could run.
 		servers = []*ServerConnection{{
 			Client:      cfg.Client,
 			VolunteerID: cfg.VolunteerID,
 			Name:        "default",
 			Available:   true,
+			Config:      config.ServerConfig{TrustedRuntimes: []string{"CONTAINER", "NATIVE"}},
 		}}
 	}
 	multiClient := NewMultiServerClient(servers, cfg.Logger)

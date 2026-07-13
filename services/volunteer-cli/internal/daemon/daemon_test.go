@@ -258,26 +258,23 @@ func newTestDaemon(mc *mockClient, mr *mockRuntime) *Daemon {
 	d.multiClient.SetBackoff(1*time.Millisecond, 16*time.Millisecond)
 	// Disable the fetcher's inter-request throttle so short-window tests aren't
 	// paced by the 2s production floor. Negative = gate off (see resolveMinInterval).
-	// The legacy single-server (Client) path builds a head with no per-head runtime trust;
-	// grant it all runtimes so execution-flow tests aren't gated by the fetcher's per-head
-	// trust check. Real daemons build heads from config (Config: srv) carrying that trust.
-	grantAllRuntimeTrust(d.multiClient.Servers())
 	return d
 }
 
-// TestNewTestDaemon_GrantsRuntimeTrust is a deterministic (timing-free) guard on the test
-// helper: the legacy single-server daemon path builds a head with no per-head runtime trust,
-// which the per-head execute gate would abandon, so newTestDaemon must grant it. Without this,
-// every execution-flow test (execute cycle, checkpoint restore, container) silently abandons
-// its work at the gate. Real daemons satisfy the gate via Config: srv from the volunteer's config.
-func TestNewTestDaemon_GrantsRuntimeTrust(t *testing.T) {
+// TestLegacyClientDaemon_TrustsRuntimes is a deterministic (timing-free) guard: the legacy
+// single-Client daemon constructor (NewDaemon with cfg.Client and no cfg.Servers — the path all
+// the mock-daemon tests use) must build a head trusted for all runtimes. The per-head execute
+// gate abandons work whose runtime the head isn't trusted for, so without this every
+// execution-flow test (execute cycle, checkpoint restore, container, history) silently abandons
+// its work at the gate and hangs/fails. Real daemons satisfy the gate via Config: srv from config.
+func TestLegacyClientDaemon_TrustsRuntimes(t *testing.T) {
 	d := newTestDaemon(&mockClient{}, &mockRuntime{canHandle: true})
 	servers := d.multiClient.Servers()
 	if len(servers) == 0 {
 		t.Fatal("expected the legacy Client path to build one server")
 	}
 	if !servers[0].Config.TrustsRuntime("native") {
-		t.Error("newTestDaemon server is not trusted for native; execution-flow tests will be gated and hang/fail")
+		t.Error("legacy-Client daemon head is not trusted for native; execution-flow tests will be gated and hang/fail")
 	}
 }
 
@@ -556,12 +553,12 @@ func TestNewDaemon(t *testing.T) {
 		Config:  cfg,
 		PubKey:  pub,
 		PrivKey: priv,
-		Servers: []*ServerConnection{{
+		Servers: grantAllRuntimeTrust([]*ServerConnection{{
 			Client:      mc,
 			VolunteerID: "vol-123",
 			Name:        "test-server",
 			Available:   true,
-		}},
+		}}),
 		Runtime: &mockRuntime{canHandle: true},
 		Logger:  logger,
 	})
