@@ -30,11 +30,76 @@ func TestDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("default LogLevel = %q, want info", cfg.LogLevel)
 	}
-	if len(cfg.AvailableRuntimes) != 2 || cfg.AvailableRuntimes[0] != "NATIVE" || cfg.AvailableRuntimes[1] != "WASM" {
-		t.Errorf("default runtimes = %v, want [NATIVE WASM]", cfg.AvailableRuntimes)
+	// BG-12: WASM is the confined default; NATIVE is no longer a default runtime.
+	if len(cfg.AvailableRuntimes) != 1 || cfg.AvailableRuntimes[0] != "WASM" {
+		t.Errorf("default runtimes = %v, want [WASM]", cfg.AvailableRuntimes)
+	}
+	// BG-12: native must be OFF by default. The zero value governs so that an
+	// upgraded config with no allow_native_runtime key also lands native-off.
+	if cfg.AllowNativeRuntime {
+		t.Error("default AllowNativeRuntime = true, want false (native must be opt-in)")
 	}
 	if cfg.ResourceLimits.MaxGPUVRAMPct != 50 {
 		t.Errorf("default MaxGPUVRAMPct = %d, want 50", cfg.ResourceLimits.MaxGPUVRAMPct)
+	}
+	if cfg.ResourceLimits.MaxPids != 512 {
+		t.Errorf("default MaxPids = %d, want 512", cfg.ResourceLimits.MaxPids)
+	}
+}
+
+// TestUpgradedConfigLeavesNativeOff is the BG-12 / design re-review R1 regression:
+// a volunteer whose on-disk config predates this release still lists NATIVE in
+// available_runtimes and has NO allow_native_runtime key. Loading it must leave
+// AllowNativeRuntime false (native OFF after `lettuce-volunteer update`), because
+// Load starts from Defaults() — where the bool is absent, hence false — and an
+// absent scalar key does not override it. A build that instead gated native on
+// available_runtimes membership would treat this same config as native-ON; that is
+// the exact regression this test guards against.
+func TestUpgradedConfigLeavesNativeOff(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	// Pre-release config body: NATIVE present in available_runtimes, no
+	// allow_native_runtime key anywhere.
+	preRelease := "available_runtimes:\n  - NATIVE\n  - WASM\n"
+	if err := os.WriteFile(path, []byte(preRelease), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AllowNativeRuntime {
+		t.Fatal("upgraded pre-release config yielded AllowNativeRuntime=true; native must be OFF unless allow_native_runtime is explicitly set")
+	}
+	// The persisted available_runtimes still round-trips (it is not stripped),
+	// proving the native gate does NOT — and must not — key on this field.
+	foundNative := false
+	for _, r := range cfg.AvailableRuntimes {
+		if r == "NATIVE" {
+			foundNative = true
+		}
+	}
+	if !foundNative {
+		t.Error("expected persisted available_runtimes to still contain NATIVE (the gate must not depend on it)")
+	}
+}
+
+// TestExplicitOptInEnablesNative is the positive half of R1: allow_native_runtime:
+// true in the on-disk config loads as AllowNativeRuntime true.
+func TestExplicitOptInEnablesNative(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("allow_native_runtime: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.AllowNativeRuntime {
+		t.Fatal("allow_native_runtime: true did not load as AllowNativeRuntime=true")
 	}
 }
 

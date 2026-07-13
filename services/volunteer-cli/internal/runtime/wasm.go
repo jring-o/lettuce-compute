@@ -31,12 +31,14 @@ type WasmRuntime struct {
 	httpClient *http.Client // injectable for testing
 }
 
-// NewWasmRuntime creates a WasmRuntime with the given data directory.
+// NewWasmRuntime creates a WasmRuntime with the given data directory. Its HTTP
+// client is the shared netguard-guarded one so module/input/viz downloads cannot be
+// steered at loopback/metadata/private addresses (BG-14). Tests override httpClient.
 func NewWasmRuntime(dataDir string, logger *slog.Logger) *WasmRuntime {
 	return &WasmRuntime{
 		dataDir:    dataDir,
 		logger:     logger,
-		httpClient: http.DefaultClient,
+		httpClient: NewGuardedHTTPClient(),
 	}
 }
 
@@ -248,10 +250,13 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 		}
 	}
 
-	// Read output: try output.dat first, fall back to stdout.
+	// Read output: try output.dat first, fall back to stdout. SECURITY (BG-15b): read
+	// output.dat only if it is a regular file whose final component is not a symlink,
+	// so a module that points output.dat at a host file (e.g. the volunteer's signing
+	// key) via an escaping symlink in its writable mount exfiltrates nothing.
 	outputPath := filepath.Join(prep.WorkDir, "output.dat")
 	var outputData []byte
-	if data, err := os.ReadFile(outputPath); err == nil {
+	if data, err := readRegularNoFollow(outputPath); err == nil {
 		outputData = data
 	} else if stdoutBuf.Len() > 0 {
 		outputData = stdoutBuf.Bytes()

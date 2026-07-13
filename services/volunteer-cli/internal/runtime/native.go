@@ -19,12 +19,16 @@ import (
 )
 
 // CommandModifier is a function that modifies an exec.Cmd before it is started.
-// Used by S28 to apply OS-level resource limits (cgroups, job objects, setrlimit).
-type CommandModifier func(cmd *exec.Cmd) error
+// Applies OS-level resource limits (cgroups, job objects, setrlimit). declaredMemMB
+// is the work unit's declared memory (MaxMemoryMB, 0 = unspecified); the modifier
+// clamps it to the volunteer's configured ceiling via BookedMemMB and enforces THAT
+// per-unit value, so the number enforced matches the number admission booked (BG-16).
+type CommandModifier func(cmd *exec.Cmd, declaredMemMB int) error
 
-// ProcessNotifier is called by NativeRuntime after cmd.Start() with the child PID.
-// It returns a cleanup function that is called after the process exits.
-type ProcessNotifier func(pid int) (cleanup func(), err error)
+// ProcessNotifier is called by NativeRuntime after cmd.Start() with the child PID and
+// the work unit's declared memory (see CommandModifier). It returns a cleanup
+// function that is called after the process exits.
+type ProcessNotifier func(pid int, declaredMemMB int) (cleanup func(), err error)
 
 // NativeRuntime executes pre-compiled binaries for the volunteer's platform.
 type NativeRuntime struct {
@@ -35,12 +39,14 @@ type NativeRuntime struct {
 	httpClient      *http.Client // injectable for testing
 }
 
-// NewNativeRuntime creates a NativeRuntime with the given data directory.
+// NewNativeRuntime creates a NativeRuntime with the given data directory. Its HTTP
+// client is the shared netguard-guarded one, so binary/input/viz downloads cannot be
+// steered at loopback/metadata/private addresses (BG-14). Tests override httpClient.
 func NewNativeRuntime(dataDir string, logger *slog.Logger) *NativeRuntime {
 	return &NativeRuntime{
 		dataDir:    dataDir,
 		logger:     logger,
-		httpClient: http.DefaultClient,
+		httpClient: NewGuardedHTTPClient(),
 	}
 }
 
@@ -187,8 +193,11 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	// rather than killing it outright. setGracefulShutdown is platform-specific.
 	setGracefulShutdown(cmd, gracefulShutdownGrace)
 
-	// Build environment.
-	env := os.Environ()
+	// Build environment. SECURITY (BG-12): start from an allowlisted subset of the
+	// host environment, NOT os.Environ(), so an untrusted native leaf never inherits
+	// the volunteer's secrets (AWS_*, GITHUB_TOKEN, cloud credentials). The leaf's
+	// own declared vars and the LETTUCE_* handshake vars are layered on top.
+	env := scrubbedHostEnv()
 	for k, v := range wu.EnvVars {
 		env = append(env, k+"="+v)
 	}
@@ -217,9 +226,14 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	}
 	cmd.Env = env
 
-	// Apply command modifier (S28 resource limiter hook).
+	// Per-unit declared memory (0 = unspecified) threaded to the resource limiter so
+	// the enforced ceiling is the clamped, per-unit BookedMemMB — the same number
+	// admission booked — rather than the whole configured budget (BG-16).
+	declaredMemMB := int(wu.ExecutionSpec.MaxMemoryMB)
+
+	// Apply command modifier (resource limiter hook).
 	if n.cmdModifier != nil {
-		if err := n.cmdModifier(cmd); err != nil {
+		if err := n.cmdModifier(cmd, declaredMemMB); err != nil {
 			return nil, fmt.Errorf("command modifier: %w", err)
 		}
 	}
@@ -249,7 +263,7 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	// Apply post-start resource limits (cgroups, job objects).
 	var enforcementCleanup func()
 	if n.processNotifier != nil {
-		cleanup, notifyErr := n.processNotifier(cmd.Process.Pid)
+		cleanup, notifyErr := n.processNotifier(cmd.Process.Pid, declaredMemMB)
 		if notifyErr != nil {
 			cmd.Process.Kill()
 			logFile.Close()
@@ -315,13 +329,16 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	// Apply disk I/O metrics from monitor.
 	applyDiskIOMetrics(diskIOMonitor, &metrics)
 
-	// Read output.
+	// Read output. SECURITY (BG-15): read output.dat only if it is a regular file
+	// whose final component is not a symlink, so a leaf that points output.dat at the
+	// volunteer's signing key exfiltrates nothing. (Native has no isolation to break
+	// once opted in, but all three runtime readers share this guard so none can drift.)
 	var outputData []byte
-	if data, err := os.ReadFile(outputPath); err == nil {
+	if data, err := readRegularNoFollow(outputPath); err == nil {
 		outputData = data
 	} else if limitedWriter.written > 0 {
-		// Fall back to stdout if output.dat doesn't exist.
-		outputData, _ = os.ReadFile(logPath)
+		// Fall back to stdout if output.dat doesn't exist (or was refused).
+		outputData, _ = readRegularNoFollow(logPath)
 	}
 
 	n.logger.Info("execution finished", "work_unit_id", wu.ID, "exit_code", exitCode, "wall_clock_s", wallClock.Seconds())
@@ -499,6 +516,24 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 		return n, err
 	}
 	return len(p), nil // report full write to caller
+}
+
+// scrubbedHostEnv returns only the allowlisted host environment variables (see
+// nativeEnvAllowed), dropping everything else in os.Environ() so an opted-in native
+// leaf never inherits the volunteer's secrets — cloud credentials, tokens, etc.
+// (BG-12). The LETTUCE_* handshake vars and the leaf's own wu.EnvVars are layered on
+// top of this base by the caller.
+func scrubbedHostEnv() []string {
+	all := os.Environ()
+	out := make([]string, 0, len(all))
+	for _, kv := range all {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			if nativeEnvAllowed(kv[:i]) {
+				out = append(out, kv)
+			}
+		}
+	}
+	return out
 }
 
 // binaryKeys returns the keys of a map for logging.

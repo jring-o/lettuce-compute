@@ -18,7 +18,7 @@ func TestDownloadExternalData_HappyPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	data, checksum, err := DownloadExternalData(context.Background(), srv.URL, 1024)
+	data, checksum, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestDownloadExternalData_NonOKStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 1024)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 1024)
 	if err == nil {
 		t.Fatal("expected error for non-200 status")
 	}
@@ -56,7 +56,7 @@ func TestDownloadExternalData_OversizedResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 50)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 50)
 	if err == nil {
 		t.Fatal("expected error for oversized response")
 	}
@@ -69,7 +69,7 @@ func TestDownloadExternalData_ContentLengthExceedsMax(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, _, err := DownloadExternalData(context.Background(), srv.URL, 100)
+	_, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL, 100)
 	if err == nil {
 		t.Fatal("expected error for content-length exceeding max")
 	}
@@ -85,7 +85,7 @@ func TestDownloadExternalData_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, _, err := DownloadExternalData(ctx, srv.URL, 1024)
+	_, _, err := DownloadExternalDataWithClient(ctx, srv.Client(), srv.URL, 1024)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -108,7 +108,7 @@ func TestDownloadExternalData_RedirectChain(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	data, _, err := DownloadExternalData(context.Background(), srv.URL+"/start", 1024)
+	data, _, err := DownloadExternalDataWithClient(context.Background(), srv.Client(), srv.URL+"/start", 1024)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

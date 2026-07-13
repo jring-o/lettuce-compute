@@ -12,6 +12,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // binaryURLAllowInsecure mirrors the well-known LETTUCE_SIGNING_KEY_AUTOGEN dev
@@ -54,11 +55,15 @@ func validateBinaryURL(rawURL string) error {
 	if !strings.Contains(host, ".") {
 		return fmt.Errorf("hostname must be a fully qualified domain name")
 	}
-	// Reject private IP ranges.
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-			return fmt.Errorf("private/internal IP addresses are not allowed")
+	// Reject internal IP ranges. Delegate the whole classification to netguard, so
+	// this covers 0.0.0.0/unspecified (BG-14), CGNAT 100.64/10, NAT64, multicast and
+	// both IPv4/IPv6 forms — a strict superset of the old IsPrivate/IsLoopback/
+	// IsLinkLocalUnicast check. This screens IP LITERALS only; a hostname that
+	// RESOLVES to an internal address (or DNS rebinding) is closed at connect time by
+	// the volunteer daemon's netguard dial screen, which is the load-bearing layer.
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := netguard.DisallowedIPReason(ip); reason != "" {
+			return fmt.Errorf("internal IP addresses are not allowed (%s)", reason)
 		}
 	}
 	return nil
@@ -297,21 +302,35 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 			validationDetail{Field: "runtime", Reason: "invalid_value"})
 	}
 
+	// SSRF defense-in-depth (BG-14 / ★BG-14c): screen EVERY leaf-supplied URL in
+	// Binaries, for EVERY runtime — the platform binaries, the "wasm" module, AND the
+	// "viz"/"wgsl" bundle URLs, which were previously screened only for NATIVE leaves
+	// (the native loop below) and left unscreened for WASM/CONTAINER. Validating the
+	// whole map here means a newly added key can never slip through unscreened. This
+	// is head-side defense-in-depth; the volunteer daemon's connect-time netguard
+	// screen remains the load-bearing layer against hostname-resolves-to-internal.
+	for key, binURL := range c.Binaries {
+		if binURL == "" {
+			continue
+		}
+		if err := validateBinaryURL(binURL); err != nil {
+			return apierror.ValidationError(
+				fmt.Sprintf("binaries[%q]: %s", key, err),
+				validationDetail{Field: "binaries." + key, Reason: "invalid_url"})
+		}
+	}
+
 	// Binaries required when runtime = NATIVE
 	if c.Runtime == RuntimeNative {
 		if len(c.Binaries) == 0 {
 			return apierror.ValidationError("binaries is required when runtime is NATIVE",
 				validationDetail{Field: "binaries", Reason: "required_for_native"})
 		}
-		for platform, binaryURL := range c.Binaries {
-			if err := validateBinaryURL(binaryURL); err != nil {
-				return apierror.ValidationError(
-					fmt.Sprintf("binaries[%q]: %s", platform, err),
-					validationDetail{Field: "binaries." + platform, Reason: "invalid_url"})
-			}
-			// Native code runs directly on volunteer hosts, so integrity is
-			// mandatory: every binary must carry a SHA-256 checksum the
-			// volunteer verifies before execution (fail-closed).
+		for platform := range c.Binaries {
+			// URLs are already screened by the SSRF loop above. Native code runs
+			// directly on volunteer hosts, so integrity is mandatory too: every
+			// binary must carry a SHA-256 checksum the volunteer verifies before
+			// execution (fail-closed).
 			checksum, ok := c.BinaryChecksums[platform]
 			if !ok || checksum == "" {
 				return apierror.ValidationError(
@@ -354,12 +373,7 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 			return apierror.ValidationError("binaries[\"wasm\"] must end in .wasm",
 				validationDetail{Field: "binaries.wasm", Reason: "invalid_extension"})
 		}
-		// Validate URL
-		if err := validateBinaryURL(wasmURL); err != nil {
-			return apierror.ValidationError(
-				fmt.Sprintf("binaries[\"wasm\"]: %s", err),
-				validationDetail{Field: "binaries.wasm", Reason: "invalid_url"})
-		}
+		// The URL itself is SSRF-screened by the Binaries loop above.
 		// No OCI image
 		if c.Image != nil && *c.Image != "" {
 			return apierror.ValidationError("image must be empty when runtime is WASM",
@@ -851,6 +865,15 @@ func ValidateDataConfig(c *DataConfig, taskPattern TaskPattern) *apierror.APIErr
 		if c.ExternalBaseURL == nil || *c.ExternalBaseURL == "" {
 			return apierror.ValidationError("external_base_url is required when transfer_strategy is EXTERNAL_REFERENCE",
 				validationDetail{Field: "external_base_url", Reason: "required_for_external_reference"})
+		}
+		// SSRF defense-in-depth (BG-14 / ★BG-14c): the volunteer fetches input data
+		// from this base URL, so screen it the same way as binary/module URLs — https,
+		// FQDN, and no internal IP literal. The daemon's connect-time screen remains
+		// the load-bearing layer against a hostname that resolves to an internal IP.
+		if err := validateBinaryURL(*c.ExternalBaseURL); err != nil {
+			return apierror.ValidationError(
+				fmt.Sprintf("external_base_url: %s", err),
+				validationDetail{Field: "external_base_url", Reason: "invalid_url"})
 		}
 	}
 

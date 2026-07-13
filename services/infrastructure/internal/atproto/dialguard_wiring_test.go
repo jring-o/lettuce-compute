@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/lettuce-compute/infrastructure/internal/netguard"
+	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // TestDefaultClientRefusesLoopback proves the shared netguard dial screen is actually

@@ -36,7 +36,29 @@ type Config struct {
 
 	AvailableRuntimes []string `yaml:"available_runtimes"`
 
+	// AllowNativeRuntime gates whether the daemon registers the NATIVE runtime,
+	// which runs an untrusted leaf binary directly on the host with no sandbox
+	// (BG-12). It defaults to false and is deliberately ABSENT from Defaults(): a
+	// pre-existing on-disk config has no allow_native_runtime key, so Load's
+	// unmarshal-over-Defaults leaves it false and native stays OFF after an upgrade
+	// unless the volunteer explicitly opts in. It must NOT be gated on
+	// available_runtimes membership — that field is persisted and already lists
+	// NATIVE for every onboarded tester, so gating on it would re-enable native for
+	// the whole existing population after `lettuce-volunteer update`.
+	AllowNativeRuntime bool `yaml:"allow_native_runtime"`
+
 	ContainerBackend string `yaml:"container_backend,omitempty"` // "podman", "docker", or ""
+
+	// ContainerCapAdd lists Linux capabilities to re-add to hardened containers
+	// (BG-13). Default empty: hardened containers run with CapDrop:ALL. Each entry
+	// is an explicit, logged operator choice.
+	ContainerCapAdd []string `yaml:"container_cap_add,omitempty"`
+
+	// ContainerGPURelaxUser, when true (default), lets GPU leaves relax the
+	// non-root-User / minimal-capability posture that CPU leaves always get,
+	// because device passthrough often needs it (BG-13 GPU carve-out). CPU leaves
+	// are hardened regardless of this flag.
+	ContainerGPURelaxUser bool `yaml:"container_gpu_relax_user"`
 
 	GPUOverrides []GPUOverride `yaml:"gpu_overrides,omitempty"`
 
@@ -95,6 +117,7 @@ type ResourceLimits struct {
 	MaxDiskGB        int `yaml:"max_disk_gb" json:"max_disk_gb"`
 	MaxBandwidthMbps int `yaml:"max_bandwidth_mbps" json:"max_bandwidth_mbps"`
 	MaxGPUVRAMPct    int `yaml:"max_gpu_vram_pct" json:"max_gpu_vram_pct"` // 0-100, default 50. 0 = disable GPU tasks
+	MaxPids          int `yaml:"max_pids" json:"max_pids"`                 // max PIDs per container (BG-13 fork-bomb cap); <=0 = built-in default
 }
 
 // GPUOverride allows per-GPU configuration.
@@ -188,6 +211,7 @@ func Defaults() *Config {
 			MaxDiskGB:        10,
 			MaxBandwidthMbps: 0,
 			MaxGPUVRAMPct:    50,
+			MaxPids:          512,
 		},
 		Scheduling: Scheduling{
 			Mode:              "ALWAYS",
@@ -196,7 +220,12 @@ func Defaults() *Config {
 		Leafs: LeafFilter{
 			Mode: "ALL",
 		},
-		AvailableRuntimes: []string{"NATIVE", "WASM"},
+		// WASM is the confined default runtime. NATIVE is opt-in via
+		// allow_native_runtime (BG-12); CONTAINER is added here when a backend is
+		// available. AllowNativeRuntime is intentionally omitted so its zero value
+		// (false) governs, keeping native OFF for upgraded configs.
+		AvailableRuntimes:     []string{"WASM"},
+		ContainerGPURelaxUser: true,
 		Notifications: NotificationConfig{
 			CreditMilestones:         true,
 			CreditMilestoneThreshold: 100,
@@ -425,7 +454,10 @@ func applyKeyComments(m *yaml.Node, comments map[string]string) {
 var topLevelConfigComments = map[string]string{
 	"max_concurrent_tasks": "How many work units run at once - THIS is the workload throttle (the thermal thresholds are not). The buffer target scales with it.",
 	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
-	"available_runtimes":   "Runtimes this volunteer will run. NATIVE and WASM are always available; CONTAINER also needs Docker or Podman.",
+	"available_runtimes":    "Runtimes this volunteer will run. WASM is always available; CONTAINER also needs Docker or Podman. NATIVE is gated separately by allow_native_runtime.",
+	"allow_native_runtime":  "Run untrusted leaf binaries DIRECTLY on this host with no sandbox. Off by default; only enable for leaves you fully trust.",
+	"container_cap_add":     "Linux capabilities to re-add to hardened containers. Default none (containers drop all capabilities).",
+	"container_gpu_relax_user": "Let GPU leaves relax the non-root/minimal-capability container posture when device access needs it. CPU leaves stay fully hardened.",
 	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
 	"scheduling":           "When the volunteer runs.",
 	"thermal":              "Hardware overheating protection. Temperatures in degrees C, NOT workload limits: ALL work freezes above the pause threshold and resumes below the resume threshold.",
@@ -437,6 +469,7 @@ var resourceLimitsComments = map[string]string{
 	"max_disk_gb":        "Disk under the data dir the volunteer may use. Work is not fetched unless at least this much is free.",
 	"max_bandwidth_mbps": "Bandwidth cap in Mbps. 0 = unlimited.",
 	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. 0 disables GPU work entirely.",
+	"max_pids":           "Max simultaneous processes/threads inside a container (fork-bomb cap). 0 uses the built-in default.",
 }
 
 var thermalComments = map[string]string{

@@ -1310,6 +1310,9 @@ func TestContainerRuntime_PrepareExternalInputURL(t *testing.T) {
 
 	mock := &MockDockerClient{}
 	cr, _ := newTestContainerRuntime(t, mock)
+	// Inject the loopback-dialing test client: the production httpClient is the
+	// netguard-guarded one, which refuses 127.0.0.1 (see TestGuardedClientRefusesInternalAddresses).
+	cr.httpClient = srv.Client()
 
 	wu := &WorkUnit{
 		ID:            "e6788bae-8467-46b1-81d0-d7aacbebc860", // was ext-input-1
@@ -1342,6 +1345,7 @@ func TestContainerRuntime_PrepareExternalInputURL_Failure(t *testing.T) {
 
 	mock := &MockDockerClient{}
 	cr, _ := newTestContainerRuntime(t, mock)
+	cr.httpClient = srv.Client() // loopback test client; production client is guarded
 
 	wu := &WorkUnit{
 		ID:            "ed670f18-2d5b-41f1-8ea3-e3388ff21a68", // was ext-input-fail
@@ -1355,6 +1359,51 @@ func TestContainerRuntime_PrepareExternalInputURL_Failure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "download input data") {
 		t.Errorf("error = %q, want to contain 'download input data'", err)
+	}
+}
+
+// TestContainerReadOutput_SymlinkRefused is the BG-15 exit test (c) for the
+// container reader: an output.dat that is a symlink to a host secret (the
+// /work/output bind is host-backed, so a container can create such a link) must be
+// refused — readOutput returns empty, never the secret. Also covers a symlinked
+// fallback entry when output.dat is absent.
+func TestContainerReadOutput_SymlinkRefused(t *testing.T) {
+	cr, _ := newTestContainerRuntime(t, &MockDockerClient{})
+
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "identity.key")
+	secretBytes := []byte("PRIVATE-SIGNING-KEY")
+	if err := os.WriteFile(secret, secretBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: output.dat itself is a symlink to the secret.
+	outDir := t.TempDir()
+	if err := os.Symlink(secret, filepath.Join(outDir, "output.dat")); err != nil {
+		t.Skipf("cannot create symlink on this platform: %v", err)
+	}
+	got, err := cr.readOutput(outDir)
+	if err != nil {
+		t.Fatalf("readOutput: %v", err)
+	}
+	if string(got) == string(secretBytes) {
+		t.Fatal("SECURITY: container readOutput followed a symlinked output.dat to the secret")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected empty output for a symlinked output.dat, got %d bytes", len(got))
+	}
+
+	// Case 2: no output.dat, but the only fallback entry is a symlink to the secret.
+	outDir2 := t.TempDir()
+	if err := os.Symlink(secret, filepath.Join(outDir2, "result.bin")); err != nil {
+		t.Skipf("cannot create symlink on this platform: %v", err)
+	}
+	got2, err := cr.readOutput(outDir2)
+	if err != nil {
+		t.Fatalf("readOutput (fallback): %v", err)
+	}
+	if string(got2) == string(secretBytes) {
+		t.Fatal("SECURITY: container readOutput fallback followed a symlinked entry to the secret")
 	}
 }
 

@@ -42,7 +42,7 @@ func NewContainerRuntime(dataDir string, logger *slog.Logger) (*ContainerRuntime
 		logger:       logger,
 		dockerClient: dc,
 		backend:      BackendDocker,
-		httpClient:   http.DefaultClient,
+		httpClient:   NewGuardedHTTPClient(),
 	}, nil
 }
 
@@ -52,7 +52,7 @@ func NewContainerRuntimeWithClient(dataDir string, logger *slog.Logger, dc Docke
 		dataDir:      dataDir,
 		logger:       logger,
 		dockerClient: dc,
-		httpClient:   http.DefaultClient,
+		httpClient:   NewGuardedHTTPClient(),
 	}
 }
 
@@ -87,7 +87,7 @@ func NewContainerRuntimeForBackend(dataDir string, logger *slog.Logger, backend 
 		logger:       logger,
 		dockerClient: dc,
 		backend:      backend.Backend,
-		httpClient:   http.DefaultClient,
+		httpClient:   NewGuardedHTTPClient(),
 	}, nil
 }
 
@@ -157,7 +157,11 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 			return nil, fmt.Errorf("write input data: %w", err)
 		}
 	} else if wu.InputDataURL != "" {
-		data, _, err := DownloadExternalData(ctx, wu.InputDataURL, DefaultMaxDownloadBytes)
+		// SECURITY (BG-14, design finding #3): the container input path must use the
+		// runtime's netguard-guarded client — the default-image SSRF surface — not an
+		// unscreened default client. Passing c.httpClient routes it through the same
+		// dial screen as every other fetch (and is the test seam).
+		data, _, err := DownloadExternalDataWithClient(ctx, c.httpClient, wu.InputDataURL, DefaultMaxDownloadBytes)
 		if err != nil {
 			return nil, fmt.Errorf("download input data: %w", err)
 		}
@@ -553,15 +557,22 @@ func (c *ContainerRuntime) captureContainerLogs(ctx context.Context, containerID
 	_, _ = io.Copy(logFile, io.LimitReader(logReader, maxLogSize))
 }
 
-// readOutput reads output.dat from the output directory.
-// If output.dat doesn't exist, reads all files in the output directory.
+// readOutput reads output.dat from the output directory. If output.dat doesn't
+// exist, it reads the first regular file in the output directory.
+//
+// SECURITY (BG-15): reads go through readRegularNoFollow, which refuses any entry
+// that is not a regular file — above all a symlink. A container that writes
+// output.dat as a symlink to the volunteer's signing key (the /work/output bind is
+// host-backed) therefore exfiltrates nothing; the link is skipped, on the primary
+// read AND every fallback entry.
 func (c *ContainerRuntime) readOutput(outputDir string) ([]byte, error) {
 	outputPath := filepath.Join(outputDir, "output.dat")
-	if data, err := os.ReadFile(outputPath); err == nil {
+	if data, err := readRegularNoFollow(outputPath); err == nil {
 		return data, nil
 	}
 
-	// Fallback: read all files in output directory.
+	// Fallback: read the first regular file in the output directory (never
+	// descending into subdirectories, and never following a symlinked entry).
 	entries, err := os.ReadDir(outputDir)
 	if err != nil {
 		return nil, nil // empty output
@@ -571,7 +582,7 @@ func (c *ContainerRuntime) readOutput(outputDir string) ([]byte, error) {
 		if entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(outputDir, entry.Name()))
+		data, err := readRegularNoFollow(filepath.Join(outputDir, entry.Name()))
 		if err != nil {
 			continue
 		}

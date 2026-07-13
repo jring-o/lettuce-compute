@@ -79,7 +79,12 @@ func TestRuntimeRegistry_CannotHandle(t *testing.T) {
 	}
 }
 
-func TestRuntimeRegistry_EmptyRuntimeDefaultsToNative(t *testing.T) {
+// TestRuntimeRegistry_EmptyRuntimeRefused is the BG-12 exit test for finding #6:
+// an empty runtime is refused UNCONDITIONALLY — even when native is registered it
+// must NOT fall back to native. This fails on the pre-fix code, which defaulted an
+// empty runtime to native (the "omit the field to get the least-isolated backend"
+// bypass).
+func TestRuntimeRegistry_EmptyRuntimeRefused(t *testing.T) {
 	reg := NewRuntimeRegistry()
 	reg.Register(&mockRuntime{name: "native", canHandle: true})
 
@@ -90,12 +95,24 @@ func TestRuntimeRegistry_EmptyRuntimeDefaultsToNative(t *testing.T) {
 		},
 	}
 
-	rt, err := reg.SelectRuntime(wu)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if _, err := reg.SelectRuntime(wu); err == nil {
+		t.Fatal("expected an empty runtime to be refused, not defaulted to native")
 	}
-	if rt.Name() != "native" {
-		t.Errorf("got runtime %q, want %q", rt.Name(), "native")
+}
+
+// TestRuntimeRegistry_UnknownRuntimeRefused: an unregistered runtime name is
+// refused (a malicious head naming a bogus runtime cannot dodge WASM/container).
+func TestRuntimeRegistry_UnknownRuntimeRefused(t *testing.T) {
+	reg := NewRuntimeRegistry()
+	reg.Register(&mockRuntime{name: "wasm", canHandle: true})
+
+	wu := &runtime.WorkUnit{
+		Runtime:       "definitely-not-a-runtime",
+		ExecutionSpec: runtime.ExecutionSpec{Image: "x"},
+	}
+
+	if _, err := reg.SelectRuntime(wu); err == nil {
+		t.Fatal("expected an unknown runtime to be refused")
 	}
 }
 
