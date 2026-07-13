@@ -37,6 +37,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/paramsweep"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/safego"
 	"github.com/lettuce-compute/infrastructure/internal/server"
 	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
@@ -361,6 +362,14 @@ func main() {
 			slog.Info("per-pubkey gRPC rate limit overridden", "per_min", n)
 		}
 	}
+	// Pre-decode per-IP stream budget (BG-18) — the tap-level flood backstop.
+	// Same NAT'ed-fleet rationale as the request budgets above.
+	if v := os.Getenv("LETTUCE_GRPC_PER_IP_STREAM_LIMIT"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil {
+			server.SetGRPCStreamRateLimit(n)
+			slog.Info("per-IP gRPC stream budget overridden", "per_min", n)
+		}
+	}
 
 	// Create gRPC server and register VolunteerService.
 	grpcServer, grpcRateLimitCleanup := server.NewGRPCServer(tlsCfg, logger, trustedProxies)
@@ -614,60 +623,73 @@ func main() {
 			"max_fetch_bytes", cfg.Head.EffectiveContentFetchMaxBytes())
 	}
 
+	// Every background job below launches through safego.Go (BG-19): a panic in a
+	// ticker loop is recovered and the loop restarted with backoff, instead of one
+	// poison row crash-looping the whole head. The gRPC/HTTP servers keep their own
+	// per-request recovery; their two fail-fast serve goroutines above are the only
+	// intentional bare launches left in this file.
 	leadershipMgr := server.NewLeadershipManager(pool, logger)
-	go leadershipMgr.Run(monitorCtx, instanceID.String(), func(leaderCtx context.Context) {
-		// Each Start/Run blocks (ticker loop) and is started with its own goroutine
-		// on leaderCtx; all stop cleanly when leadership is lost or the head shuts
-		// down (leaderCtx is a child of monitorCtx, cancelled in either case).
-		go faultMonitor.Start(leaderCtx)
-		go staleVolunteerMonitor.Start(leaderCtx)
-		go racUpdater.Start(leaderCtx)
-		go challengeStore.StartCleanup(leaderCtx)
-		go lazyManager.Run(leaderCtx, 30*time.Second)
-		go healthRecorder.Start(leaderCtx)
-		go artifactGC.Start(leaderCtx)
-		if didRecheckWorker != nil {
-			go didRecheckWorker.Start(leaderCtx)
-		}
-		// Registration-admission counter retention sweep (design §4.1) — started only
-		// when the creation cap is on (the machine-enabled wiring idiom): with the knob
-		// off nothing writes the table, so there is nothing to sweep.
-		if cfg.Head.RegistrationCapEnabled {
-			go admission.NewCounterSweeper(pool, logger).Start(leaderCtx)
-		}
-		// Registration proof-of-work challenge sweep — UNCONDITIONAL, unlike the
-		// counter sweep: challenge ISSUANCE works even while enforcement is off
-		// (probe-free clients), so expired rows can accumulate regardless of the knob.
-		go admission.NewChallengeSweeper(pool, logger).Start(leaderCtx)
-		// Audit reclaim sweep (design §7.5) — UNCONDITIONAL like the challenge sweep,
-		// deliberately NOT gated on the audit knob: open audit rows can outlive an
-		// enabled period (operator samples, then flips the knob off), and while OPEN
-		// they pin their artifact versions against the GC prune. The sweep expires
-		// them within the queue lifetime regardless, releasing the pins; on a head
-		// that never enabled audits it is two no-op UPDATEs a minute on the leader.
-		go audit.NewReclaimWorker(auditsRepo, logger).Start(leaderCtx)
-		// Revocation reconciliation sweep (design §8.4) — UNCONDITIONAL like the reclaim
-		// sweep: a clawback whose best-effort in-handler emission failed must still get
-		// its signed revocation attestation, and re-POSTing the clawback endpoint can
-		// never re-reach emission (the adjustment already exists). On a head with no
-		// missing revocations it is one indexed no-row query per sweep on the leader.
-		go attestation.NewRevocationReconciler(revocationEmitter, 10*time.Minute, logger).Run(leaderCtx)
-		// Audit-enforcement sweep (design §9.2-§9.3) — gated on the knob, UNLIKE the
-		// reclaim sweep: with enforcement off, verdicts must stay observe-only
-		// byte-identically, and this worker is the only actor that executes
-		// consequences. Verdicts recorded while the knob was off are stamped
-		// ineligible and stay unactionable even after a later restart with it on.
-		if enforcementWorker != nil {
-			go enforcementWorker.Start(leaderCtx)
-		}
-		// Content-verification sweep (design §10.6) — UNCONDITIONAL like the reclaim
-		// sweep (S4): the worker is also the janitor for held ref rows stranded by a
-		// content-fetch knob flip on→off, which must drain via the 24h holding-expiry
-		// lane without a config change. The KNOB gates fetching per row inside the
-		// worker (off = no network I/O ever); on a head that never enabled fetching it
-		// is one indexed no-row query per tick on the leader.
-		go contentVerifyWorker.Start(leaderCtx)
-		slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
+	safego.Go(monitorCtx, logger, "leadership-manager", func(ctx context.Context) {
+		leadershipMgr.Run(ctx, instanceID.String(), func(leaderCtx context.Context) {
+			// Each Start/Run blocks (ticker loop) and is started with its own goroutine
+			// on leaderCtx; all stop cleanly when leadership is lost or the head shuts
+			// down (leaderCtx is a child of monitorCtx, cancelled in either case).
+			safego.Go(leaderCtx, logger, "fault-monitor", faultMonitor.Start)
+			safego.Go(leaderCtx, logger, "stale-volunteer-monitor", staleVolunteerMonitor.Start)
+			safego.Go(leaderCtx, logger, "rac-updater", racUpdater.Start)
+			safego.Go(leaderCtx, logger, "challenge-store-cleanup", challengeStore.StartCleanup)
+			safego.Go(leaderCtx, logger, "lazy-generation-manager", func(ctx context.Context) {
+				lazyManager.Run(ctx, 30*time.Second)
+			})
+			safego.Go(leaderCtx, logger, "leaf-health-recorder", healthRecorder.Start)
+			safego.Go(leaderCtx, logger, "artifact-gc", artifactGC.Start)
+			if didRecheckWorker != nil {
+				safego.Go(leaderCtx, logger, "did-recheck-worker", didRecheckWorker.Start)
+			}
+			// Registration-admission counter retention sweep (design §4.1) — started only
+			// when the creation cap is on (the machine-enabled wiring idiom): with the knob
+			// off nothing writes the table, so there is nothing to sweep.
+			if cfg.Head.RegistrationCapEnabled {
+				safego.Go(leaderCtx, logger, "registration-counter-sweeper",
+					admission.NewCounterSweeper(pool, logger).Start)
+			}
+			// Registration proof-of-work challenge sweep — UNCONDITIONAL, unlike the
+			// counter sweep: challenge ISSUANCE works even while enforcement is off
+			// (probe-free clients), so expired rows can accumulate regardless of the knob.
+			safego.Go(leaderCtx, logger, "registration-challenge-sweeper",
+				admission.NewChallengeSweeper(pool, logger).Start)
+			// Audit reclaim sweep (design §7.5) — UNCONDITIONAL like the challenge sweep,
+			// deliberately NOT gated on the audit knob: open audit rows can outlive an
+			// enabled period (operator samples, then flips the knob off), and while OPEN
+			// they pin their artifact versions against the GC prune. The sweep expires
+			// them within the queue lifetime regardless, releasing the pins; on a head
+			// that never enabled audits it is two no-op UPDATEs a minute on the leader.
+			safego.Go(leaderCtx, logger, "audit-reclaim-worker",
+				audit.NewReclaimWorker(auditsRepo, logger).Start)
+			// Revocation reconciliation sweep (design §8.4) — UNCONDITIONAL like the reclaim
+			// sweep: a clawback whose best-effort in-handler emission failed must still get
+			// its signed revocation attestation, and re-POSTing the clawback endpoint can
+			// never re-reach emission (the adjustment already exists). On a head with no
+			// missing revocations it is one indexed no-row query per sweep on the leader.
+			safego.Go(leaderCtx, logger, "revocation-reconciler",
+				attestation.NewRevocationReconciler(revocationEmitter, 10*time.Minute, logger).Run)
+			// Audit-enforcement sweep (design §9.2-§9.3) — gated on the knob, UNLIKE the
+			// reclaim sweep: with enforcement off, verdicts must stay observe-only
+			// byte-identically, and this worker is the only actor that executes
+			// consequences. Verdicts recorded while the knob was off are stamped
+			// ineligible and stay unactionable even after a later restart with it on.
+			if enforcementWorker != nil {
+				safego.Go(leaderCtx, logger, "audit-enforcement-worker", enforcementWorker.Start)
+			}
+			// Content-verification sweep (design §10.6) — UNCONDITIONAL like the reclaim
+			// sweep (S4): the worker is also the janitor for held ref rows stranded by a
+			// content-fetch knob flip on→off, which must drain via the 24h holding-expiry
+			// lane without a config change. The KNOB gates fetching per row inside the
+			// worker (off = no network I/O ever); on a head that never enabled fetching it
+			// is one indexed no-row query per tick on the leader.
+			safego.Go(leaderCtx, logger, "content-verification-worker", contentVerifyWorker.Start)
+			slog.Info("singleton background jobs started (leader)", "head_instance_id", instanceID.String())
+		})
 	})
 
 	slog.Info("startup complete",

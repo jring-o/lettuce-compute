@@ -262,10 +262,14 @@ Two head-side knobs are required for a meaningful ceiling run:
   ```bash
   LETTUCE_GRPC_PER_IP_RATE_LIMIT=100000000 \
   LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT=100000000 \
+  LETTUCE_GRPC_PER_IP_STREAM_LIMIT=100000000 \
   ...other env... lettuce-server --config ...
   ```
 
-  (These map to `SetGRPCRateLimits`; a non-positive value leaves the default.)
+  (The first two map to `SetGRPCRateLimits`, the third to
+  `SetGRPCStreamRateLimit` — the pre-decode per-IP stream budget, default
+  600/min, which a single-host swarm would otherwise hit at the tap handle
+  before any request is even decoded. A non-positive value leaves the default.)
 
 - **Set the DB pool to the operator size (~60)** to reproduce the collapse
   threshold the load test originally found — the code default is 25:
@@ -297,6 +301,7 @@ numbers are the contended HandOut, not the drained-pool shed branch:
 # Head launched with a large primed pool, e.g.:
 #   LETTUCE_HEAD_READY_POOL_SIZE=20000 LETTUCE_HEAD_REFILL_BATCH_SIZE=5000 \
 #   LETTUCE_GRPC_PER_IP_RATE_LIMIT=100000000 LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT=100000000 \
+#   LETTUCE_GRPC_PER_IP_STREAM_LIMIT=100000000 \
 #   LETTUCE_DB_MAX_CONNS=60 ...other env... lettuce-server --config ...
 go run ./cmd/swarm-sim \
   --head-grpc=127.0.0.1:9090 --head-http=http://127.0.0.1:8080 \
@@ -321,8 +326,10 @@ bounded by the per-IP limit. The simulator retries **registration** through the
 limiter so the fleet still comes up; steady-state `RequestWorkUnit` numbers
 reflect whatever the limiter allows. For a ceiling/overload run, raise the
 budgets on the head with `LETTUCE_GRPC_PER_IP_RATE_LIMIT` /
-`LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT` (see the ceiling-run recipe above) so the
-shed ratio measures the head's dispatch admission cap, not the per-IP bucket.
+`LETTUCE_GRPC_PER_PUBKEY_RATE_LIMIT` / `LETTUCE_GRPC_PER_IP_STREAM_LIMIT`
+(see the ceiling-run recipe above) so the shed ratio measures the head's
+dispatch admission cap, not the per-IP request bucket or the pre-decode
+per-IP stream budget.
 
 ### Integration smoke test
 

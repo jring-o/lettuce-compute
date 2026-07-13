@@ -23,6 +23,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
+	"github.com/lettuce-compute/infrastructure/internal/safego"
 	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
@@ -524,12 +525,20 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 	}, s.logger)
 	s.dispatchCache = cache
 
-	go cache.runRefiller(ctx, defaultRefillTickInterval)
-	go cache.runFlusher(ctx)
-	go cache.runReconciler(ctx, defaultReconcileInterval)
+	// Launched via safego (BG-19): a panic in any cache loop must not kill the
+	// head; the loop is restarted (with backoff) and resumes from its next tick.
+	safego.Go(ctx, s.logger, "dispatch-cache-refiller", func(ctx context.Context) {
+		cache.runRefiller(ctx, defaultRefillTickInterval)
+	})
+	safego.Go(ctx, s.logger, "dispatch-cache-flusher", cache.runFlusher)
+	safego.Go(ctx, s.logger, "dispatch-cache-reconciler", func(ctx context.Context) {
+		cache.runReconciler(ctx, defaultReconcileInterval)
+	})
 	// TODO #54: the adaptive in-flight budget refresher (a no-op when the quota is disabled
 	// or no reliability repo is wired). Per-replica, like the rest of the cache.
-	go cache.runBudgetRefresher(ctx, defaultBudgetRefreshInterval)
+	safego.Go(ctx, s.logger, "dispatch-cache-budget-refresher", func(ctx context.Context) {
+		cache.runBudgetRefresher(ctx, defaultBudgetRefreshInterval)
+	})
 	s.logger.Info("dispatch cache started",
 		"admission_cap", admissionCap,
 		"maintenance_admission_cap", maintCap,
@@ -1254,8 +1263,8 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 
 	// Begin ONE transaction for the whole batch: amortizes the transaction +
 	// round-trip cost across N units. SKIP LOCKED keeps concurrent multi-row
-	// claims safe.
-	tx, err := s.pool.Begin(ctx)
+	// claims safe. Acquire bounded — the BG-17 backstop.
+	tx, err := beginTxBounded(ctx, s.pool)
 	if err != nil {
 		s.logger.Error("failed to begin transaction", "method", "RequestWorkUnit", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
@@ -1562,8 +1571,42 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		}
 	}
 
-	// Begin transaction.
-	tx, err := s.pool.Begin(ctx)
+	// Every pool-backed read the rest of this handler needs happens BEFORE the
+	// transaction opens (BG-17). A transaction holds one pool connection until
+	// commit/rollback; a pool-backed repository call inside it acquires a SECOND
+	// connection, and under a submit storm N handlers holding N tx connections all
+	// wait for an (N+1)th that only another stuck handler could release — the pool
+	// self-deadlock RequestWorkUnit already fixed (see requestWorkUnitFromDB's
+	// getLeaf). These reads depend only on workUnitID/volunteerID, both known here,
+	// so hoisting them is behavior-neutral; the one read that follows tx state (the
+	// completion leaf) runs on the tx connection via leaf.GetByIDTx below.
+
+	// Stamp the result with the artifact version the volunteer ran (TODO #38): the
+	// unit's pinned version (redundancy>1) else the leaf's current version. Drives
+	// version-homogeneous validation and per-result provenance. Best-effort: a resolve
+	// failure (or an unversioned leaf) leaves it nil — legacy behavior.
+	var artifactVersionID *types.ID
+	if s.artifactVersionRepo != nil {
+		if vid, verr := s.artifactVersionRepo.ResolveWorkUnitVersion(ctx, workUnitID); verr == nil {
+			artifactVersionID = vid
+		}
+	}
+
+	// Stamp the account-level trust snapshot (see internal/trust): the subject resolved for
+	// this volunteer and its quorum-power score AT SUBMIT time. Loading the volunteer row here
+	// is an extra read on the bounded shed ctx, but trust must never block work: a load failure
+	// falls back to the sentinel subject with score 0 rather than failing the submission.
+	var trustVol *volunteer.Volunteer
+	if v, verr := s.volunteerRepo.GetByID(ctx, volunteerID); verr != nil {
+		s.logger.Warn("failed to load volunteer for trust snapshot; stamping sentinel subject with score 0",
+			"volunteer_id", volunteerID, "error", verr)
+	} else {
+		trustVol = v
+	}
+	trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
+
+	// Begin transaction (acquire bounded — the BG-17 backstop).
+	tx, err := beginTxBounded(ctx, s.pool)
 	if err != nil {
 		s.logger.Error("failed to begin transaction", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
@@ -1650,30 +1693,6 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		outputDataRef = &req.OutputDataUrl
 	}
 
-	// Stamp the result with the artifact version the volunteer ran (TODO #38): the
-	// unit's pinned version (redundancy>1) else the leaf's current version. Drives
-	// version-homogeneous validation and per-result provenance. Best-effort: a resolve
-	// failure (or an unversioned leaf) leaves it nil — legacy behavior.
-	var artifactVersionID *types.ID
-	if s.artifactVersionRepo != nil {
-		if vid, verr := s.artifactVersionRepo.ResolveWorkUnitVersion(ctx, workUnitID); verr == nil {
-			artifactVersionID = vid
-		}
-	}
-
-	// Stamp the account-level trust snapshot (see internal/trust): the subject resolved for
-	// this volunteer and its quorum-power score AT SUBMIT time. Loading the volunteer row here
-	// is an extra read on the bounded shed ctx, but trust must never block work: a load failure
-	// falls back to the sentinel subject with score 0 rather than failing the submission.
-	var trustVol *volunteer.Volunteer
-	if v, verr := s.volunteerRepo.GetByID(ctx, volunteerID); verr != nil {
-		s.logger.Warn("failed to load volunteer for trust snapshot; stamping sentinel subject with score 0",
-			"volunteer_id", volunteerID, "error", verr)
-	} else {
-		trustVol = v
-	}
-	trustSubject, trustScore, standingAtSubmit := stampTrustSnapshot(ctx, s.trustRepo, trustVol, volunteerID, s.now(), s.logger)
-
 	// A ref-only submission (external output_data_url) is HELD, not PENDING (§10.2): the
 	// head must fetch the URL and hash the served bytes before the result may vote, so
 	// (1) the row lands AWAITING_CONTENT_VERIFICATION with a fetch scheduled now, and
@@ -1749,9 +1768,11 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// are needed to attempt validation. Resolved through the single source (ResolvePolicy):
 	// for any leaf that only sets redundancy_factor this equals redundancy_factor (2 for a
 	// spot-check unit), identical to before. The actual validate/reject/wait/dead-letter
-	// decision is delegated to the transitioner below.
+	// decision is delegated to the transitioner below. Read on THIS handler's tx
+	// connection (leaf.GetByIDTx), NOT via the pool-backed s.leafRepo — a pool read here
+	// would acquire a second connection while the tx holds one (BG-17).
 	quorum := 1
-	completionLeaf, clErr := s.leafRepo.GetByID(ctx, currentWU.LeafID)
+	completionLeaf, clErr := leaf.GetByIDTx(ctx, tx, currentWU.LeafID)
 	if clErr == nil {
 		quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
 	}

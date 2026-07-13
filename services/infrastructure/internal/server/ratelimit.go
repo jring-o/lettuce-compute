@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"math"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
+	"github.com/lettuce-compute/infrastructure/internal/safego"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -159,7 +161,9 @@ func (s *rateLimitStore) startCleanup(interval, threshold time.Duration, stop <-
 func rateLimitMiddleware(next http.Handler, trustedProxies []*net.IPNet) (http.Handler, func()) {
 	store := newRateLimitStore()
 	stop := make(chan struct{})
-	go store.startCleanup(bucketCleanupInterval, bucketStaleThreshold, stop)
+	safego.Go(context.Background(), nil, "http-ratelimit-reaper", func(context.Context) {
+		store.startCleanup(bucketCleanupInterval, bucketStaleThreshold, stop)
+	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Liveness probe is exempt from rate limiting. The container healthcheck,

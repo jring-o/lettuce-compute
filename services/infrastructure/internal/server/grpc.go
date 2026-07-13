@@ -12,9 +12,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lettuce-compute/infrastructure/internal/logging"
+	"github.com/lettuce-compute/infrastructure/internal/safego"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -60,14 +62,18 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*ne
 	// pattern as the HTTP limiter, with its own store and cleanup goroutine.
 	ipStore := newRateLimitStore()
 	ipStop := make(chan struct{})
-	go ipStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, ipStop)
+	safego.Go(context.Background(), logger, "grpc-ip-ratelimit-reaper", func(context.Context) {
+		ipStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, ipStop)
+	})
 
 	// Post-auth per-pubkey rate limiter. A SECOND store so pubkey buckets are
 	// reaped independently; worst-case live buckets ≈ active fleet size × one
 	// small struct, bounded by the 10-min stale-bucket reaper.
 	pubkeyStore := newRateLimitStore()
 	pubkeyStop := make(chan struct{})
-	go pubkeyStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, pubkeyStop)
+	safego.Go(context.Background(), logger, "grpc-pubkey-ratelimit-reaper", func(context.Context) {
+		pubkeyStore.startCleanup(bucketCleanupInterval, bucketStaleThreshold, pubkeyStop)
+	})
 
 	// Ed25519 request authentication. The interceptor verifies a per-request
 	// signature carried in gRPC metadata and binds the proven public key into the
@@ -100,13 +106,37 @@ func NewGRPCServer(tlsCfg *tls.Config, logger *slog.Logger, trustedProxies []*ne
 		// metadata) so legitimate 100MB checkpoints/outputs are never broken, while
 		// still rejecting grossly oversized messages before they are fully buffered.
 		// Per-leaf output limits are still enforced in SubmitResult; this is the
-		// transport-level backstop. MaxSendMsgSize is raised to match so the server
-		// can return large responses (e.g. checkpoint restore).
+		// transport-level backstop for the bulk methods — everything else gets the
+		// tighter per-method gate below (BG-18). MaxSendMsgSize is raised to match
+		// so the server can return large responses (e.g. checkpoint restore).
 		grpc.MaxRecvMsgSize(grpcMaxMsgSize),
 		grpc.MaxSendMsgSize(grpcMaxMsgSize),
+		// BG-18 transport hardening: per-connection stream cap and keepalive
+		// policy (previously unset — unlimited streams, ping floods unpunished,
+		// dead/idle connections never reaped). See grpc_admission.go.
+		grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             grpcKeepaliveMinPingInterval,
+			PermitWithoutStream: false,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: grpcKeepaliveMaxConnectionIdle,
+			Time:              grpcKeepaliveServerPingTime,
+			Timeout:           grpcKeepaliveServerPingTimeout,
+		}),
+		// BG-18 pre-decode admission: the tap handle refuses a stream BEFORE its
+		// message is read — per-IP stream budget over all methods (including the
+		// request-limiter-exempt in-flight ones) plus an auth-metadata shape
+		// screen for non-public methods, so an unauthenticated flood can no
+		// longer make the server buffer and decode 128 MB bodies. Shares ipStore
+		// (distinct "grpctap:" key prefix) so one reaper bounds both bucket sets.
+		grpc.InTapHandle(grpcTapAdmission(ipStore, trustedProxies, logger)),
 		grpc.ChainUnaryInterceptor(
 			loggingInterceptor(logger),
 			recoveryInterceptor(logger),
+			// BG-18: per-method size gate — before rate-limit/auth so oversized
+			// bodies never reach the auth layer's full-body re-marshal + hash.
+			grpcPerMethodSizeGateInterceptor(logger),
 			grpcRateLimitInterceptor(ipStore, trustedProxies, logger),
 			authIntercept,
 			grpcPerPubkeyRateLimitInterceptor(pubkeyStore, logger),

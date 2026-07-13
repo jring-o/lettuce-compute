@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/config"
@@ -50,8 +51,11 @@ func TestHealthHandler_DegradedWithNilPool(t *testing.T) {
 
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rec.Code)
+	// BG-20: a degraded head must answer 503, not 200 — Docker healthchecks, load
+	// balancers, and uptime monitors read the status CODE, so a 200 with a
+	// "degraded" body reads as healthy to every machine consumer.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 when degraded, got %d", rec.Code)
 	}
 
 	var resp healthResponse
@@ -65,6 +69,57 @@ func TestHealthHandler_DegradedWithNilPool(t *testing.T) {
 	}
 	if resp.Database != "disconnected" {
 		t.Errorf("expected database 'disconnected' with nil pool, got '%s'", resp.Database)
+	}
+}
+
+// TestBG20_HealthDetailedReturns503WhenDegraded locks the same status-code
+// contract on the authed detailed endpoint (the second WriteHeader site).
+func TestBG20_HealthDetailedReturns503WhenDegraded(t *testing.T) {
+	handler := HealthDetailedHandler(nil, time.Now())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health/detailed", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 when degraded, got %d", rec.Code)
+	}
+	var resp healthDetailedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "degraded" {
+		t.Errorf("expected status 'degraded', got '%s'", resp.Status)
+	}
+}
+
+// TestBG20_HealthReturns503WhenDBUnreachable exercises the non-nil-pool degraded
+// path: a real pgxpool aimed at a closed loopback port (pgxpool connects lazily,
+// so construction succeeds and the health probe is what fails).
+func TestBG20_HealthReturns503WhenDBUnreachable(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(),
+		"postgres://nobody:nothing@127.0.0.1:1/lettuce?sslmode=disable&connect_timeout=1")
+	if err != nil {
+		t.Fatalf("failed to build lazy pool: %v", err)
+	}
+	defer pool.Close()
+
+	handler := HealthHandler(pool)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 with unreachable DB, got %d", rec.Code)
+	}
+	var resp healthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != "degraded" || resp.Database != "disconnected" {
+		t.Errorf("expected degraded/disconnected body, got %q/%q", resp.Status, resp.Database)
 	}
 }
 
@@ -109,8 +164,10 @@ func TestHealthDetailedHandler_IncludesAllFields(t *testing.T) {
 
 	handler.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rec.Code)
+	// Nil pool means degraded, and a degraded head answers 503 (BG-20); the
+	// field assertions below are what this test is actually about.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503 (degraded, nil pool), got %d", rec.Code)
 	}
 
 	var resp healthDetailedResponse
