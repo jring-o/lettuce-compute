@@ -17,21 +17,22 @@ import (
 
 // MockDockerClient implements DockerClient for testing without a real Docker daemon.
 type MockDockerClient struct {
-	PingFn             func(ctx context.Context) error
-	InfoFn             func(ctx context.Context) (*EngineInfo, error)
-	ImagePullFn        func(ctx context.Context, ref string) error
-	ImageExistsFn      func(ctx context.Context, ref string) (bool, error)
-	ContainerCreateFn  func(ctx context.Context, cfg *ContainerConfig) (string, error)
-	ContainerStartFn   func(ctx context.Context, containerID string) error
-	ContainerWaitFn    func(ctx context.Context, containerID string) (int64, error)
-	ContainerLogsFn    func(ctx context.Context, containerID string) (io.ReadCloser, error)
-	ContainerInspectFn func(ctx context.Context, containerID string) (*ContainerStats, error)
-	ContainerStopFn    func(ctx context.Context, containerID string, timeout time.Duration) error
-	ContainerRemoveFn  func(ctx context.Context, containerID string) error
-	ImageIDFn          func(ctx context.Context, ref string) (string, error)
-	ImageListFn        func(ctx context.Context) ([]ImageSummary, error)
-	ImageRemoveFn      func(ctx context.Context, imageID string) error
-	ContainerListFn    func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
+	PingFn                 func(ctx context.Context) error
+	InfoFn                 func(ctx context.Context) (*EngineInfo, error)
+	ImagePullFn            func(ctx context.Context, ref string) error
+	ImageExistsFn          func(ctx context.Context, ref string) (bool, error)
+	ContainerCreateFn      func(ctx context.Context, cfg *ContainerConfig) (string, error)
+	ContainerStartFn       func(ctx context.Context, containerID string) error
+	ContainerWaitFn        func(ctx context.Context, containerID string) (int64, error)
+	ContainerLogsFn        func(ctx context.Context, containerID string) (io.ReadCloser, error)
+	ContainerInspectFn     func(ctx context.Context, containerID string) (*ContainerStats, error)
+	ContainerStopFn        func(ctx context.Context, containerID string, timeout time.Duration) error
+	ContainerRemoveFn      func(ctx context.Context, containerID string) error
+	ImageIDFn              func(ctx context.Context, ref string) (string, error)
+	ImageListFn            func(ctx context.Context) ([]ImageSummary, error)
+	ImageRemoveFn          func(ctx context.Context, imageID string) error
+	ImageDeclaredVolumesFn func(ctx context.Context, ref string) ([]string, error)
+	ContainerListFn        func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
@@ -75,6 +76,13 @@ func (m *MockDockerClient) ImageID(ctx context.Context, ref string) (string, err
 func (m *MockDockerClient) ImageList(ctx context.Context) ([]ImageSummary, error) {
 	if m.ImageListFn != nil {
 		return m.ImageListFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *MockDockerClient) ImageDeclaredVolumes(ctx context.Context, ref string) ([]string, error) {
+	if m.ImageDeclaredVolumesFn != nil {
+		return m.ImageDeclaredVolumesFn(ctx, ref)
 	}
 	return nil, nil
 }
@@ -1518,8 +1526,10 @@ func TestContainerRuntime_HardeningPosture(t *testing.T) {
 	}
 
 	cfg := mock.LastCreateConfig
-	if !containsStr(cfg.SecurityOpt, "no-new-privileges") {
-		t.Errorf("SecurityOpt = %v, want to contain no-new-privileges", cfg.SecurityOpt)
+	// BG-13c: the explicit "no-new-privileges:true" form (Podman-compat backends can
+	// be spelling-sensitive to the bare key). Assert the exact value, not a substring.
+	if !containsStr(cfg.SecurityOpt, "no-new-privileges:true") {
+		t.Errorf("SecurityOpt = %v, want to contain no-new-privileges:true", cfg.SecurityOpt)
 	}
 	if !containsStr(cfg.CapDrop, "ALL") {
 		t.Errorf("CapDrop = %v, want to contain ALL", cfg.CapDrop)
@@ -1548,8 +1558,8 @@ func TestContainerRuntime_GPUCarveOut(t *testing.T) {
 
 	gpuCfg := &ContainerConfig{}
 	cr.applyHardening(gpuCfg, &WorkUnit{ExecutionSpec: ExecutionSpec{GPURequired: true}})
-	if !containsStr(gpuCfg.SecurityOpt, "no-new-privileges") {
-		t.Errorf("GPU leaf SecurityOpt = %v, want no-new-privileges kept", gpuCfg.SecurityOpt)
+	if !containsStr(gpuCfg.SecurityOpt, "no-new-privileges:true") {
+		t.Errorf("GPU leaf SecurityOpt = %v, want no-new-privileges:true kept", gpuCfg.SecurityOpt)
 	}
 	if !gpuCfg.ReadonlyRootfs || gpuCfg.PidsLimit <= 0 {
 		t.Error("GPU leaf must keep ReadonlyRootfs and a PID cap")
@@ -1573,6 +1583,88 @@ func TestContainerRuntime_GPUCarveOut(t *testing.T) {
 	cr.applyHardening(gpuStrict, &WorkUnit{ExecutionSpec: ExecutionSpec{GPURequired: true}})
 	if gpuStrict.User != nobodyUser {
 		t.Errorf("GPU leaf with carve-out disabled: User = %q, want %q", gpuStrict.User, nobodyUser)
+	}
+}
+
+// TestContainerRuntime_ImageVolumeNeutralized is the BG-13b guard: an image that
+// declares a VOLUME must NOT get a writable host-backed anonymous volume (which
+// escapes ReadonlyRootfs and the /work disk watchdog and leaks). The runtime instead
+// mounts a bounded tmpfs over each declared VOLUME, while leaving the paths it mounts
+// itself (the /work binds, /tmp) untouched. Fails on the pre-fix code, which never
+// inspected the image and left every declared VOLUME host-backed.
+func TestContainerRuntime_ImageVolumeNeutralized(t *testing.T) {
+	mock := &MockDockerClient{
+		ImageDeclaredVolumesFn: func(ctx context.Context, ref string) ([]string, error) {
+			// One novel scratch VOLUME, plus one that collides with a path we already
+			// bind (must be left to our bind, not double-mounted).
+			return []string{"/data", "/var/lib/scratch/", "/work/output"}, nil
+		},
+	}
+	cr, _ := newTestContainerRuntime(t, mock)
+	cr.SetMemoryCeilingMB(2048)
+	cr.SetHardeningConfig(512, nil, true)
+
+	wu := &WorkUnit{
+		ID:            "48b8a0af-008a-4ded-8114-ba19622fa2c2",
+		ExecutionSpec: ExecutionSpec{Image: "malicious:latest", MaxMemoryMB: 256},
+	}
+	prep, err := cr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer cr.Cleanup(prep)
+	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
+	if _, err = cr.Execute(context.Background(), wu, prep); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	cfg := mock.LastCreateConfig
+	// Each novel declared VOLUME is neutralized with a bounded (size=...) tmpfs.
+	for _, v := range []string{"/data", "/var/lib/scratch"} {
+		opts, ok := cfg.TmpfsMounts[v]
+		if !ok {
+			t.Errorf("declared VOLUME %q not neutralized: TmpfsMounts = %v", v, cfg.TmpfsMounts)
+			continue
+		}
+		if !strings.Contains(opts, "size=") {
+			t.Errorf("VOLUME %q tmpfs %q has no size bound", v, opts)
+		}
+	}
+	// The path we bind ourselves must NOT be overridden by a tmpfs (would conflict).
+	if _, ok := cfg.TmpfsMounts["/work/output"]; ok {
+		t.Errorf("our own mount /work/output was wrongly tmpfs-shadowed: %v", cfg.TmpfsMounts)
+	}
+	// The /tmp tmpfs from applyHardening survives.
+	if _, ok := cfg.TmpfsMounts["/tmp"]; !ok {
+		t.Errorf("applyHardening's /tmp tmpfs was lost: %v", cfg.TmpfsMounts)
+	}
+}
+
+// TestScreenImageRegistry is the BG-14d daemon-side guard: a pull whose registry
+// authority is an internal IP literal (or localhost) is refused before it egresses
+// through the container engine, while a public registry, the default registry, and a
+// digest-pinned public image are allowed.
+func TestScreenImageRegistry(t *testing.T) {
+	for _, ref := range []string{
+		"169.254.169.254/repo:tag",  // cloud metadata
+		"169.254.169.254:5000/repo", // metadata with port
+		"127.0.0.1:5000/repo",       // loopback
+		"10.0.0.1/team/repo",        // private
+		"[::1]:5000/repo",           // ipv6 loopback
+		"localhost:5000/repo",       // localhost
+	} {
+		if err := screenImageRegistry(context.Background(), ref); err == nil {
+			t.Errorf("screenImageRegistry(%q) = nil, want refusal", ref)
+		}
+	}
+	for _, ref := range []string{
+		"ubuntu:22.04",
+		"registry.example.com/team/repo:tag",
+		"ghcr.io/org/img@sha256:" + strings.Repeat("a", 64),
+	} {
+		if err := screenImageRegistry(context.Background(), ref); err != nil {
+			t.Errorf("screenImageRegistry(%q) = %v, want allowed", ref, err)
+		}
 	}
 }
 

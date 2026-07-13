@@ -68,3 +68,29 @@ func TestReadRegularNoFollow_DirectoryRefused(t *testing.T) {
 		t.Fatalf("error = %v, want errNotRegularFile", err)
 	}
 }
+
+// TestReadRegularNoFollow_SizeCapped is the BG-16f guard: the shared reader must NOT
+// pull an oversized leaf-controlled file wholesale into daemon RAM. A file above the
+// cap fails with errOutputTooLarge; a file at/under the cap reads back verbatim. Pre-
+// fix the read ended in a bare io.ReadAll with no cap, so the over-cap case returned
+// the full contents instead of erroring.
+func TestReadRegularNoFollow_SizeCapped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "output.dat")
+	if err := os.WriteFile(path, make([]byte, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cap below the file size: overflow must be an explicit error, not a truncated read.
+	if got, err := readRegularNoFollowLimited(path, 10); !errors.Is(err, errOutputTooLarge) {
+		t.Fatalf("over-cap read: err = %v (got %d bytes), want errOutputTooLarge", err, len(got))
+	}
+	// Cap at/above the file size: full contents, no error, no off-by-one truncation.
+	got, err := readRegularNoFollowLimited(path, 100)
+	if err != nil {
+		t.Fatalf("at-cap read: %v", err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("at-cap read returned %d bytes, want 100", len(got))
+	}
+}

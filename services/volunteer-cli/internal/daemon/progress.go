@@ -1,10 +1,11 @@
 package daemon
 
 import (
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // ReadProgressFile reads the progress percentage from a work unit's progress
@@ -19,7 +20,10 @@ func ReadProgressFile(workDir string) float64 {
 		filepath.Join(workDir, "output", "progress.txt"),
 	}
 	for _, path := range candidates {
-		data, err := os.ReadFile(path)
+		// BG-15c: the progress file is leaf-controlled; read it through the shared
+		// symlink-safe reader rather than a symlink-following os.ReadFile so a
+		// planted symlink is refused (and its target discarded) instead of followed.
+		data, err := runtime.ReadRegularNoFollow(path)
 		if err != nil {
 			continue
 		}

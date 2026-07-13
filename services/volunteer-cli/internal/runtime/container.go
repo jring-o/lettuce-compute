@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // ContainerRuntime executes work units inside Docker containers.
@@ -152,7 +155,10 @@ const nobodyUser = "65534:65534"
 // at the backend default, because device passthrough (/dev/nvidia*, /dev/kfd,
 // /dev/dri/renderD*) commonly needs it. The relaxation is explicit and logged.
 func (c *ContainerRuntime) applyHardening(cfg *ContainerConfig, wu *WorkUnit) {
-	cfg.SecurityOpt = []string{"no-new-privileges"}
+	// BG-13c: the explicit ":true" form. Docker honors the bare "no-new-privileges",
+	// but some Podman-compat backends are spelling-sensitive and only recognize the
+	// key:value form; ":true" is accepted by both.
+	cfg.SecurityOpt = []string{"no-new-privileges:true"}
 	cfg.ReadonlyRootfs = true
 	// A small writable tmpfs at /tmp lets images that only need scratch space run
 	// under a read-only rootfs; /work and /work/checkpoint stay writable via binds.
@@ -179,6 +185,129 @@ func (c *ContainerRuntime) applyHardening(cfg *ContainerConfig, wu *WorkUnit) {
 	// capability and run as a non-root user.
 	cfg.CapDrop = []string{"ALL"}
 	cfg.User = nobodyUser
+}
+
+// cleanContainerPath normalizes a Linux container path (forward-slash, absolute)
+// for set membership — trimming whitespace and any trailing slash. It deliberately
+// does NOT use path/filepath, whose Windows behavior would corrupt a container path
+// on a Windows daemon host.
+func cleanContainerPath(p string) string {
+	p = strings.TrimSpace(p)
+	for len(p) > 1 && strings.HasSuffix(p, "/") {
+		p = strings.TrimSuffix(p, "/")
+	}
+	return p
+}
+
+// ourMountTargets are the container paths the runtime always mounts itself (the
+// /work binds and the /tmp tmpfs). A declared VOLUME at one of these is already
+// backed by our mount, so it is left alone by neutralizeImageVolumes.
+var ourMountTargets = map[string]bool{
+	"/work/input":      true,
+	"/work/output":     true,
+	"/work/checkpoint": true,
+	"/tmp":             true,
+}
+
+// neutralizeImageVolumes replaces every image-declared VOLUME with a bounded tmpfs
+// mount (BG-13b). An image VOLUME is exempt from ReadonlyRootfs, and left alone
+// Docker/OCI backs it with a writable ANONYMOUS host volume that (a) escapes the
+// /work disk watchdog with unbounded writes and (b) leaks onto host storage. A
+// size-bounded tmpfs over each declared path makes those writes RAM-backed and
+// bounded by the container's memory cgroup (BookedMemMB) — never host disk — and
+// stops the engine from creating the anonymous volume at all. Paths we already
+// mount (the /work binds, /tmp) are skipped. Best-effort: an image we cannot
+// inspect logs a warning and relies on RemoveVolumes at cleanup for the leak half.
+func (c *ContainerRuntime) neutralizeImageVolumes(ctx context.Context, cfg *ContainerConfig, bookedMemMB int) {
+	vols, err := c.dockerClient.ImageDeclaredVolumes(ctx, cfg.Image)
+	if err != nil {
+		c.logger.Warn("container: image inspect for declared VOLUMEs failed; disk bounding skipped (RemoveVolumes still reclaims the leak)",
+			"image", cfg.Image, "error", err)
+		return
+	}
+	if len(vols) == 0 {
+		return
+	}
+	if cfg.TmpfsMounts == nil {
+		cfg.TmpfsMounts = map[string]string{}
+	}
+	sizeMB := bookedMemMB
+	if sizeMB <= 0 {
+		sizeMB = 512
+	}
+	// nosuid,nodev harden the mount; no noexec, since a scratch VOLUME may legitimately
+	// need to run helper binaries. The memory cgroup caps the SUM across all tmpfs
+	// mounts and the process, so size= is an upper label, not the true bound.
+	opts := fmt.Sprintf("rw,nosuid,nodev,size=%dm", sizeMB)
+	for _, v := range vols {
+		clean := cleanContainerPath(v)
+		if clean == "" || clean == "/" || ourMountTargets[clean] {
+			continue
+		}
+		if _, already := cfg.TmpfsMounts[clean]; already {
+			continue
+		}
+		cfg.TmpfsMounts[clean] = opts
+		c.logger.Info("container: neutralized image-declared VOLUME with a bounded tmpfs (BG-13b)",
+			"volume", clean, "size_mb", sizeMB, "image", cfg.Image)
+	}
+}
+
+// registryHostFromImage extracts the registry authority host from an OCI image
+// reference, or "" when the reference uses the default public registry (no registry
+// component). Mirrors the head-side validateImageRegistryHost split: the registry is
+// the first '/'-separated component only when it looks like an authority (contains
+// '.'/':' or is "localhost"); a plain first component is a path on the default
+// registry. Any port or IPv6 brackets are stripped.
+func registryHostFromImage(image string) string {
+	slash := strings.IndexByte(image, '/')
+	if slash < 0 {
+		return ""
+	}
+	first := image[:slash]
+	if first != "localhost" && !strings.ContainsAny(first, ".:") {
+		return ""
+	}
+	host := first
+	if h, _, err := net.SplitHostPort(first); err == nil {
+		host = h
+	} else if strings.HasPrefix(first, "[") && strings.HasSuffix(first, "]") {
+		host = first[1 : len(first)-1]
+	}
+	return host
+}
+
+// screenImageRegistry refuses an image pull whose registry authority is an internal
+// address (BG-14d). An IP-literal registry is screened directly against netguard; a
+// registry hostname is resolved and every returned IP screened. A hostname we cannot
+// resolve is allowed through (the engine's own pull will fail if it is truly
+// unreachable) — the concrete literal-metadata-IP attack is closed deterministically.
+// localhost is refused. Best-effort DNS still leaves a TOCTOU/rebinding gap versus the
+// engine's own resolution; the head-side registry screen is the companion layer.
+func screenImageRegistry(ctx context.Context, image string) error {
+	host := registryHostFromImage(image)
+	if host == "" {
+		return nil
+	}
+	if host == "localhost" {
+		return fmt.Errorf("refusing image pull: registry host %q is internal", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := netguard.DisallowedIPReason(ip); reason != "" {
+			return fmt.Errorf("refusing image pull: registry %s is an internal address (%s)", ip, reason)
+		}
+		return nil
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil // transient/unresolvable: let the engine attempt and fail
+	}
+	for _, ipa := range ips {
+		if reason := netguard.DisallowedIPReason(ipa.IP); reason != "" {
+			return fmt.Errorf("refusing image pull: registry %q resolves to an internal address %s (%s)", host, ipa.IP, reason)
+		}
+	}
+	return nil
 }
 
 // Name returns "container".
@@ -262,6 +391,18 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 	exists, err := c.dockerClient.ImageExists(ctx, image)
 	if err != nil {
 		return nil, fmt.Errorf("check image: %w", err)
+	}
+	// SECURITY (BG-14d): a pull egresses through the Docker/Podman engine, OUTSIDE the
+	// daemon's netguard dial screen, so an image reference naming an internal registry
+	// (e.g. 169.254.169.254/repo) would let the engine reach cloud metadata / loopback.
+	// Screen the registry host before any pull. A cached image that needs no pull
+	// performs no egress and is not re-screened. This is the load-bearing daemon layer
+	// (a malicious head can hand any image directly, bypassing the head-side screen).
+	needPull := !(strings.Contains(image, "@sha256:") && exists)
+	if needPull {
+		if err := screenImageRegistry(ctx, image); err != nil {
+			return nil, err
+		}
 	}
 	pulled := false
 	if strings.Contains(image, "@sha256:") {
@@ -467,6 +608,11 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// dropped capabilities, read-only rootfs + tmpfs /tmp, PID cap, non-root user),
 	// with the GPU carve-out for leaves that need device passthrough.
 	c.applyHardening(cfg, wu)
+
+	// SECURITY (BG-13b): replace any image-declared VOLUME with a bounded tmpfs so it
+	// cannot open a writable, host-backed path that escapes ReadonlyRootfs and the
+	// /work disk watchdog. Uses the same bookedMemMB ceiling as the memory limit.
+	c.neutralizeImageVolumes(ctx, cfg, bookedMemMB)
 
 	// Configure GPU device passthrough on the container.
 	if selectedGPU != nil {

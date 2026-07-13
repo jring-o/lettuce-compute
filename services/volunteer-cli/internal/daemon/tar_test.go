@@ -338,3 +338,58 @@ func TestTarDirectoryNotADir(t *testing.T) {
 		t.Errorf("expected 'not a directory' in error, got: %v", err)
 	}
 }
+
+// TestTarDirectory_SymlinkNotFollowed is the BG-15c guard: the checkpoint archiver
+// must not follow a symlink planted in the leaf-controlled checkpoint dir. Before the
+// explicit refusal this was only INCIDENTALLY safe — a followed symlink whose target
+// was larger than its Size:0 tar header aborted the whole archive with "write too
+// long". Now the symlink is skipped: the target's bytes never enter the head-uploaded
+// blob, and an otherwise-valid checkpoint still archives.
+func TestTarDirectory_SymlinkNotFollowed(t *testing.T) {
+	root := t.TempDir()
+
+	// A secret OUTSIDE the checkpoint dir that a symlink target would leak.
+	secret := filepath.Join(root, "identity.key")
+	secretBytes := []byte("PRIVATE-SIGNING-KEY-MUST-NOT-LEAK-INTO-CHECKPOINT")
+	if err := os.WriteFile(secret, secretBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ckpt := filepath.Join(root, "checkpoint")
+	if err := os.MkdirAll(ckpt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A legitimate regular checkpoint file.
+	if err := os.WriteFile(filepath.Join(ckpt, "state.dat"), []byte("real-checkpoint"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A malicious symlink pointing at the secret.
+	if err := os.Symlink(secret, filepath.Join(ckpt, "leak")); err != nil {
+		t.Skipf("cannot create symlink on this platform: %v", err)
+	}
+
+	blob, err := tarDirectory(ckpt)
+	if err != nil {
+		t.Fatalf("tarDirectory aborted on a symlinked entry (want skip): %v", err)
+	}
+	if bytes.Contains(blob, secretBytes) {
+		t.Fatal("SECURITY: the symlink target's secret bytes were archived into the checkpoint blob")
+	}
+
+	// The archive still carries the legitimate file and NOT the symlink entry.
+	tr := tar.NewReader(bytes.NewReader(blob))
+	names := map[string]bool{}
+	for {
+		hdr, e := tr.Next()
+		if e != nil {
+			break
+		}
+		names[hdr.Name] = true
+	}
+	if !names["state.dat"] {
+		t.Errorf("legitimate checkpoint file missing from archive: %v", names)
+	}
+	if names["leak"] {
+		t.Errorf("symlink entry was archived: %v", names)
+	}
+}
