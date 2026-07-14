@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
@@ -2282,18 +2281,21 @@ func (r *PgxWorkUnitRepository) CountTrustStarvedUnits(ctx context.Context, samp
 
 // PgxBatchRepository implements BatchRepository using pgx.
 type PgxBatchRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
 // NewPgxBatchRepository creates a new PgxBatchRepository.
-func NewPgxBatchRepository(pool *pgxpool.Pool) *PgxBatchRepository {
-	return &PgxBatchRepository{pool: pool}
+// Accepts *pgxpool.Pool for normal use or pgx.Tx for transactional use (the
+// generation BatchSink persists a batch row, its work units, and the lazy
+// cursor advance in one transaction).
+func NewPgxBatchRepository(db DBTX) *PgxBatchRepository {
+	return &PgxBatchRepository{db: db}
 }
 
 // Create inserts a new batch. On return, b is populated with DB-generated
 // id and timestamps.
 func (r *PgxBatchRepository) Create(ctx context.Context, b *Batch) error {
-	row := r.pool.QueryRow(ctx, `
+	row := r.db.QueryRow(ctx, `
 		INSERT INTO batches (
 			leaf_id, sequence_number, total_work_units, completed_work_units
 		) VALUES ($1, $2, $3, $4)
@@ -2326,7 +2328,7 @@ func (r *PgxBatchRepository) Create(ctx context.Context, b *Batch) error {
 
 // GetByID retrieves a batch by its UUID.
 func (r *PgxBatchRepository) GetByID(ctx context.Context, id types.ID) (*Batch, error) {
-	row := r.pool.QueryRow(ctx,
+	row := r.db.QueryRow(ctx,
 		"SELECT "+batchColumns+" FROM batches WHERE id = $1", id)
 
 	b, err := scanBatch(row)
@@ -2370,7 +2372,7 @@ func (r *PgxBatchRepository) ListByLeaf(ctx context.Context, projectID types.ID,
 		batchColumns, where, argIdx)
 	args = append(args, pageSize+1)
 
-	rows, err := r.pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, types.PaginationResponse{}, apierror.Internal("failed to list batches", err)
 	}
@@ -2401,7 +2403,7 @@ func (r *PgxBatchRepository) ListByLeaf(ctx context.Context, projectID types.ID,
 
 // IncrementCompleted atomically increments a batch's completed_work_units by 1.
 func (r *PgxBatchRepository) IncrementCompleted(ctx context.Context, batchID types.ID) error {
-	tag, err := r.pool.Exec(ctx,
+	tag, err := r.db.Exec(ctx,
 		"UPDATE batches SET completed_work_units = completed_work_units + 1 WHERE id = $1",
 		batchID,
 	)

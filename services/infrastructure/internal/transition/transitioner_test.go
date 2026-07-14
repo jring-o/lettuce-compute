@@ -70,12 +70,12 @@ func (f fakeComparator) FilterPending(p []*result.Result) []*result.Result { ret
 func (f fakeComparator) Compare(context.Context, *workunit.WorkUnit, *leaf.Leaf, []*result.Result) ([]*result.Result, error) {
 	return f.majority, f.compareErr
 }
-func (f *fakeComparator) ApplyAccept(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy) error {
+func (f *fakeComparator) ApplyAccept(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy, _ int) error {
 	f.acceptCalls++
 	f.lastAcceptVerdict = verdict
 	return nil
 }
-func (f *fakeComparator) ApplyReject(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy) error {
+func (f *fakeComparator) ApplyReject(_ context.Context, _ *workunit.WorkUnit, _ *leaf.Leaf, _ []*result.Result, verdict *ComparisonVerdict, _ RedundancyPolicy, _ int) error {
 	f.rejectCalls++
 	f.lastRejectVerdict = verdict
 	return nil

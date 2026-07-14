@@ -299,16 +299,16 @@ func (e *Engine) Compare(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.
 // mark AGREED/DISAGREED, transition COMPLETED -> VALIDATED, grant credit/RAC, sign
 // attestations, update counters + reliability. The unit must already be COMPLETED (the
 // transitioner marks it so first). The engine half of the transitioner's ActionValidate.
-func (e *Engine) ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending, majority []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) error {
-	_, err := e.acceptResults(ctx, wu, proj, pending, majority, verdict, policy)
+func (e *Engine) ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending, majority []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy, rawPendingCount int) error {
+	_, err := e.acceptResults(ctx, wu, proj, pending, majority, verdict, policy, rawPendingCount)
 	return err
 }
 
 // ApplyReject performs the reject effects: mark all pending DISAGREED, transition
 // COMPLETED -> REJECTED, attest, and requeue (Reassign). The unit must already be COMPLETED.
 // The engine half of the transitioner's ActionReject.
-func (e *Engine) ApplyReject(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) error {
-	_, err := e.rejectAll(ctx, wu, proj, pending, verdict, policy)
+func (e *Engine) ApplyReject(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy, rawPendingCount int) error {
+	_, err := e.rejectAll(ctx, wu, proj, pending, verdict, policy, rawPendingCount)
 	return err
 }
 
@@ -500,7 +500,7 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	policy := transition.ResolvePolicyWithTrust(proj, wu, e.trustPolicy)
 
 	if v.MajorityCount >= quorum && 2*v.MajorityCount > v.Total && v.Ratio >= threshold && v.TrustedMajorityCount >= k {
-		return e.acceptResults(ctx, wu, proj, pending, majorityGroup, v, policy)
+		return e.acceptResults(ctx, wu, proj, pending, majorityGroup, v, policy, len(pending))
 	}
 
 	// Agreement not reached (ratio, floor, or strict-majority gate failed). Check if there
@@ -528,7 +528,7 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	}
 
 	// All assignments completed, no agreement. Reject all.
-	return e.rejectAll(ctx, wu, proj, pending, v, policy)
+	return e.rejectAll(ctx, wu, proj, pending, v, policy, len(pending))
 }
 
 // acceptResults marks majority results as AGREED, minority as DISAGREED,
@@ -537,7 +537,7 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 // attestation quorum descriptor (both are non-nil/resolved on every production path — the
 // transitioner threads its own, and the legacy applyThreshold path self-resolves identical
 // values from the same pure functions).
-func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) (*ValidationResult, error) {
+func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy, rawPendingCount int) (*ValidationResult, error) {
 	majorityIDs := make(map[types.ID]bool)
 	for _, r := range majorityGroup {
 		majorityIDs[r.ID] = true
@@ -718,7 +718,7 @@ func (e *Engine) cappedCreator() (credit.CappedCreator, bool) {
 // LOSING clique when the caller compared (the largest coherent agreeing group that failed
 // the gates — the honest group_size for a rejected unit's attestations); a nil verdict
 // (no production caller) degrades to the empty-majority shape, group_size 0.
-func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy) (*ValidationResult, error) {
+func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, verdict *transition.ComparisonVerdict, policy transition.RedundancyPolicy, rawPendingCount int) (*ValidationResult, error) {
 	ids := make([]types.ID, len(pending))
 	for i, r := range pending {
 		ids[i] = r.ID

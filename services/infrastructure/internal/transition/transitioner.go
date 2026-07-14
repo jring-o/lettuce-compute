@@ -2,6 +2,7 @@ package transition
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"log/slog"
 	"time"
@@ -13,6 +14,14 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/types"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
+
+// ErrStaleSnapshot is returned (wrapped) by a Comparator's ApplyAccept/ApplyReject when the
+// finalization transaction's in-tx PENDING recheck disagrees with the snapshot the decision
+// was made from: a result submitted between the transitioner's snapshot load and the
+// transaction's unit row lock would otherwise be adjudicated by nobody and orphan PENDING
+// under a terminal unit. The whole transaction rolls back; Evaluate retries once with a
+// fresh snapshot (a second staleness propagates — the recovery sweep re-drives later).
+var ErrStaleSnapshot = errors.New("finalization snapshot stale: pending results changed since load")
 
 // Outcome is the terminal-ish result of one Evaluate, for the caller's structured log.
 type Outcome string
@@ -40,11 +49,20 @@ type Comparator interface {
 	// attestation builder can sign the quorum event as it was actually gated (attestation v2
 	// quorum descriptor); both are non-nil/resolved on every transitioner path by
 	// construction (a unit only validates or rejects after a verdict exists).
-	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
+	//
+	// rawPendingCount is the snapshot's RAW count of PENDING results (before the
+	// version-homogeneity filter). The implementation re-counts PENDING on its transaction
+	// connection and aborts with ErrStaleSnapshot when the counts differ — the row lock
+	// serializes the writes; this recheck re-validates the READ, so a submit landing between
+	// snapshot load and the transaction's unit row lock forces a clean retry instead of
+	// silently orphaning its row. Raw-to-raw deliberately: version-heterogeneous rows the
+	// filter excludes exist in both counts, so they can never trip a retry loop.
+	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy, rawPendingCount int) error
 	// ApplyReject performs the reject effects (mark DISAGREED, COMPLETED->REJECTED, requeue).
 	// On a reject the verdict carries the LOSING clique (the largest coherent agreeing group
 	// that failed the gates) — the honest descriptor for the attestations of a rejected unit.
-	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
+	// rawPendingCount as on ApplyAccept.
+	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy, rawPendingCount int) error
 }
 
 // WorkUnitStore is the narrow work-unit repo surface the transitioner needs.
@@ -125,6 +143,15 @@ func (t *Transitioner) Evaluate(ctx context.Context, workUnitID types.ID) (Outco
 	var outcome Outcome
 	err := t.locker.WithUnitLock(ctx, unitLockKey(workUnitID), func() error {
 		o, e := t.decideAndApply(ctx, workUnitID)
+		if errors.Is(e, ErrStaleSnapshot) {
+			// A submit landed between snapshot load and the finalization transaction's
+			// unit row lock; nothing was written. Retry once with a fresh snapshot so the
+			// full result set is adjudicated together. Bounded: a second staleness
+			// propagates the error (the recovery sweep re-drives later), so a submit
+			// storm on one unit costs at most one retry per Evaluate.
+			t.logger.Info("finalization snapshot stale; retrying with fresh snapshot", "work_unit_id", workUnitID)
+			o, e = t.decideAndApply(ctx, workUnitID)
+		}
 		outcome = o
 		return e
 	})
@@ -156,6 +183,10 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 			pending = append(pending, r)
 		}
 	}
+	// The RAW pending count (pre-version-filter) anchors the finalization transaction's
+	// stale-snapshot recheck: the accept/reject tx re-counts PENDING on its own connection
+	// and aborts when the counts differ (see Comparator.ApplyAccept).
+	rawPendingCount := len(pending)
 	pending = t.comparator.FilterPending(pending) // version-homogeneous (never compare across versions)
 
 	live, err := t.wus.CountLiveCopies(ctx, id)
@@ -228,7 +259,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority, snap.Comparison, policy); err != nil {
+		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority, snap.Comparison, policy, rawPendingCount); err != nil {
 			return OutcomeNoop, err
 		}
 		// Over-dispatch hygiene (TODO #50): validate-at-quorum can leave extra copies still
@@ -246,7 +277,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyReject(ctx, wu, lf, pending, snap.Comparison, policy); err != nil {
+		if err := t.comparator.ApplyReject(ctx, wu, lf, pending, snap.Comparison, policy, rawPendingCount); err != nil {
 			return OutcomeNoop, err
 		}
 		return OutcomeRejected, nil

@@ -134,7 +134,15 @@ func countableCopies(s UnitSnapshot) int {
 type Decision struct {
 	Action        Action
 	CompleteFirst bool
-	Reason        string
+	// Reopen marks a WAIT that rests on PHANTOM dispatch headroom: the unit is parked
+	// COMPLETED (or is stranded REJECTED residue), no copy is live, the copy budget has
+	// dispatch headroom left — but no dispatcher can ever use it, because dispatch requires
+	// QUEUED. The executor demotes the unit back to QUEUED (COMPLETED: plain guarded flip
+	// touching no results; REJECTED: the standard Reassign requeue), where the headroom is
+	// real and dispatch supplies exactly the missing corroborators. Never set for QUEUED or
+	// terminal states, and never while a live copy could still re-trigger Evaluate on close.
+	Reopen bool
+	Reason string
 }
 
 // Dispatchable reports whether the dispatcher should hand out ANOTHER copy of this unit
