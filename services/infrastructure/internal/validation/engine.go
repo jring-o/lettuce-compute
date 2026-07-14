@@ -118,8 +118,15 @@ type Engine struct {
 	// result, ever — design doc §9.6). nil disables RepairUnit (it errors). Set via
 	// WithRepairSupport.
 	repairClaimer RepairClaimer
-	signer        *attestation.Signer
-	logger        *slog.Logger
+	// txRunner runs the money-bearing tx phase of accept/reject (marks + state flip +
+	// credit/requeue) inside ONE serialized transaction so partial finalization is
+	// unrepresentable (design §4.1, invariant E1-S). nil (the default) is the passthrough:
+	// the closure runs over the engine's own pool-backed repos with no transaction, no
+	// unit-row lock, and no stale-snapshot recheck — which keeps every mock-based engine test
+	// working unchanged. Set via WithTxRunner (production wires NewPgxFinalizationTxRunner).
+	txRunner FinalizationTxRunner
+	signer   *attestation.Signer
+	logger   *slog.Logger
 }
 
 // NewEngine creates a new validation Engine.
@@ -197,6 +204,18 @@ func (e *Engine) WithResultAudits(enq audit.Enqueuer, enabled bool, headRate flo
 	return e
 }
 
+// WithTxRunner wires the finalization transaction runner that makes accept/reject atomic
+// (design §4.1), returning the engine for chaining (the WithStandingBackpressure pattern). A
+// nil runner (the default — callers that skip it) keeps the passthrough: the accept/reject tx
+// phase runs over the engine's own repos with no transaction, no unit-row lock, and no
+// stale-snapshot recheck, so mock-based tests are byte-for-byte unchanged. Production wires
+// NewPgxFinalizationTxRunner(pool) so the marks, the VALIDATED/REJECTED flip, the ledger rows
+// (and, on reject, the requeue) commit or roll back together.
+func (e *Engine) WithTxRunner(r FinalizationTxRunner) *Engine {
+	e.txRunner = r
+	return e
+}
+
 // TryValidate checks if enough results have arrived for a work unit
 // and runs the comparison algorithm if so.
 // Returns nil if the work unit is not ready for validation or is already validated.
@@ -229,6 +248,12 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 		}
 	}
 
+	// The RAW pending count (BEFORE the version-homogeneity filter) anchors the finalization
+	// transaction's stale-snapshot recheck, exactly as the transitioner threads it on the
+	// production path (transitioner.go). The legacy path is tests-only, but it must pass the
+	// TRUE raw count — not the post-filter len(pending) — so the recheck arithmetic is honest.
+	rawPendingCount := len(pending)
+
 	// Version-homogeneous validation (TODO #38, interacts with #12): never compare
 	// results produced by DIFFERENT artifact versions — a version difference is not a
 	// disagreement. Homogeneous-redundancy pinning means all replicas of a unit run one
@@ -254,9 +279,9 @@ func (e *Engine) TryValidate(ctx context.Context, workUnitID types.ID) (*Validat
 	cfg := proj.ValidationConfig
 	switch cfg.ComparisonMode {
 	case leaf.ComparisonExact:
-		return e.validateExact(ctx, wu, proj, pending)
+		return e.validateExact(ctx, wu, proj, pending, rawPendingCount)
 	case leaf.ComparisonNumericTolerance:
-		return e.validateNumericTolerance(ctx, wu, proj, pending)
+		return e.validateNumericTolerance(ctx, wu, proj, pending, rawPendingCount)
 	case leaf.ComparisonCustom:
 		return nil, fmt.Errorf("custom comparison mode is not implemented in Alpha")
 	default:
@@ -344,12 +369,12 @@ func versionHomogeneousGroup(pending []*result.Result) []*result.Result {
 }
 
 // validateExact groups results by output checksum and applies quorum selection.
-func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) (*ValidationResult, error) {
+func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, rawPendingCount int) (*ValidationResult, error) {
 	majorityGroup, err := e.compareExact(proj, pending)
 	if err != nil {
 		return nil, err
 	}
-	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup)
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, rawPendingCount)
 }
 
 // compareExact is the read-only EXACT comparator: it returns the largest agreeing group of
@@ -363,12 +388,19 @@ func (e *Engine) validateExact(ctx context.Context, wu *workunit.WorkUnit, proj 
 func (e *Engine) compareExact(proj *leaf.Leaf, pending []*result.Result) ([]*result.Result, error) {
 	ignoreFields := proj.ValidationConfig.IgnoreFields
 
-	// Group results by (canonical) checksum.
+	// Group results by (canonical) checksum. §4.3: the comparator is TOTAL over content — a
+	// result whose key cannot be computed (empty / malformed / unreadable output) no longer
+	// aborts the whole comparison (BG-21a). It is EXCLUDED from all groups, so it can never
+	// form or join a majority (a unique singleton key would otherwise let garbage validate on
+	// a quorum-1 leaf). It stays in `pending`, so it lands DISAGREED at accept and counts
+	// toward the verdict Total — one bad input degraded to one bad vote, never a stalled unit.
 	groups := make(map[string][]*result.Result)
 	for _, r := range pending {
 		key, err := comparisonKey(r, ignoreFields)
 		if err != nil {
-			return nil, fmt.Errorf("canonicalize output for result %s: %w", r.ID, err)
+			e.logger.Warn("exact comparison: excluding result with unreadable output from grouping",
+				"work_unit_id", r.WorkUnitID, "result_id", r.ID, "error", err)
+			continue
 		}
 		groups[key] = append(groups[key], r)
 	}
@@ -399,12 +431,12 @@ func (e *Engine) compareExact(proj *leaf.Leaf, pending []*result.Result) ([]*res
 }
 
 // validateNumericTolerance compares numeric output data within epsilon tolerance.
-func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result) (*ValidationResult, error) {
+func (e *Engine) validateNumericTolerance(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, rawPendingCount int) (*ValidationResult, error) {
 	majorityGroup, err := e.compareNumericTolerance(proj, pending)
 	if err != nil {
 		return nil, err
 	}
-	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup)
+	return e.applyThreshold(ctx, wu, proj, pending, majorityGroup, rawPendingCount)
 }
 
 // compareNumericTolerance is the read-only NUMERIC_TOLERANCE comparator: it returns the
@@ -418,22 +450,33 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 	ignoreFields := proj.ValidationConfig.IgnoreFields
 	compareFields := proj.ValidationConfig.CompareFields
 
-	// Flatten all result output data into path -> value maps. Nested objects/arrays
-	// are flattened to dotted/indexed paths; numeric leaves compare within epsilon and
-	// non-numeric leaves compare for equality. ignore_fields are dropped; if
-	// compare_fields is non-empty only matching paths are kept (so a chaotic sim can be
-	// validated on its aggregate science while its raw per-fight trajectory is excluded).
-	parsed := make([]map[string]flatVal, len(pending))
-	for i, r := range pending {
+	// Flatten each result's output into a path -> value map. Nested objects/arrays flatten to
+	// dotted/indexed paths; numeric leaves compare within epsilon and non-numeric leaves for
+	// equality. ignore_fields are dropped; if compare_fields is non-empty only matching paths
+	// are kept (so a chaotic sim can be validated on its aggregate science while its raw
+	// per-fight trajectory is excluded).
+	//
+	// §4.3: the comparator is TOTAL over content. A result whose output cannot be flattened
+	// (empty / malformed / non-finite) no longer aborts the whole comparison (BG-21a); it is
+	// EXCLUDED from clique candidacy entirely — never in the compatibility matrix, so it can
+	// neither join nor form the returned group (a lone excluded row must not validate on a
+	// quorum-1 leaf). It stays in `pending`, lands DISAGREED at accept, and counts toward the
+	// verdict Total. The clique search proceeds over the flattenable rest.
+	var candidates []*result.Result
+	var parsed []map[string]flatVal
+	for _, r := range pending {
 		m, err := flattenOutput(r.OutputData, ignoreFields, compareFields)
 		if err != nil {
-			return nil, fmt.Errorf("parse output_data for result %s: %w", r.ID, err)
+			e.logger.Warn("numeric comparison: excluding result with unreadable output from grouping",
+				"work_unit_id", r.WorkUnitID, "result_id", r.ID, "error", err)
+			continue
 		}
-		parsed[i] = m
+		candidates = append(candidates, r)
+		parsed = append(parsed, m)
 	}
 
-	// Build compatibility matrix.
-	n := len(pending)
+	// Build compatibility matrix over the flattenable candidates only.
+	n := len(candidates)
 	compatible := make([][]bool, n)
 	for i := range compatible {
 		compatible[i] = make([]bool, n)
@@ -451,10 +494,10 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 	// Find the largest clique (all mutually compatible results).
 	clique := findLargestClique(n, compatible)
 
-	// Build majority group from clique indices.
+	// Build majority group from clique indices (mapped back to the candidate results).
 	majorityGroup := make([]*result.Result, len(clique))
 	for i, idx := range clique {
-		majorityGroup[i] = pending[idx]
+		majorityGroup[i] = candidates[idx]
 	}
 
 	return majorityGroup, nil
@@ -466,7 +509,7 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 // routes through internal/transition. It is deliberately kept in lockstep with transition.Decide
 // (per the PR #80 discipline): it builds the SAME subject-level verdict and applies the SAME
 // four gates the production decider does, so the two can never disagree about what validates.
-func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result) (*ValidationResult, error) {
+func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj *leaf.Leaf, pending []*result.Result, majorityGroup []*result.Result, rawPendingCount int) (*ValidationResult, error) {
 	threshold := proj.ValidationConfig.AgreementThreshold
 
 	// min_quorum resolves as in transition.ResolvePolicy (spot-check forces a 2-of-2
@@ -500,7 +543,7 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	policy := transition.ResolvePolicyWithTrust(proj, wu, e.trustPolicy)
 
 	if v.MajorityCount >= quorum && 2*v.MajorityCount > v.Total && v.Ratio >= threshold && v.TrustedMajorityCount >= k {
-		return e.acceptResults(ctx, wu, proj, pending, majorityGroup, v, policy, len(pending))
+		return e.acceptResults(ctx, wu, proj, pending, majorityGroup, v, policy, rawPendingCount)
 	}
 
 	// Agreement not reached (ratio, floor, or strict-majority gate failed). Check if there
@@ -528,7 +571,7 @@ func (e *Engine) applyThreshold(ctx context.Context, wu *workunit.WorkUnit, proj
 	}
 
 	// All assignments completed, no agreement. Reject all.
-	return e.rejectAll(ctx, wu, proj, pending, v, policy, len(pending))
+	return e.rejectAll(ctx, wu, proj, pending, v, policy, rawPendingCount)
 }
 
 // acceptResults marks majority results as AGREED, minority as DISAGREED,
@@ -555,25 +598,7 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 		}
 	}
 
-	// Mark agreed results.
-	if err := e.resultRepo.BatchUpdateValidationStatus(ctx, agreedIDs, result.ValidationAgreed); err != nil {
-		return nil, fmt.Errorf("mark results AGREED: %w", err)
-	}
-
-	// Mark disagreed results.
-	if len(rejectedIDs) > 0 {
-		if err := e.resultRepo.BatchUpdateValidationStatus(ctx, rejectedIDs, result.ValidationDisagreed); err != nil {
-			return nil, fmt.Errorf("mark results DISAGREED: %w", err)
-		}
-	}
-
-	// Transition work unit: COMPLETED → VALIDATED.
-	_, err := e.workUnitRepo.UpdateState(ctx, wu.ID, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateValidated)
-	if err != nil {
-		return nil, fmt.Errorf("transition work unit to VALIDATED: %w", err)
-	}
-
-	// Grant credit for each agreed result.
+	// Credit amount for each agreed result (the leaf's configured amount, floored at 1.0).
 	creditAmount := proj.CreditConfig.CreditPerValidatedWorkUnit
 	if creditAmount <= 0 {
 		creditAmount = 1.0
@@ -582,55 +607,93 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	// attestedAmounts carries the credit ACTUALLY granted per result into createAttestations: a
 	// granted result attests the leaf amount; a result whose grant the emission cap suppressed is
 	// ABSENT (resolving to 0). DISAGREED results are never keyed here, so they attest 0 as before.
+	// creditEntries are the rows actually inserted (drives post-commit RAC + the returned value);
+	// suppressedResults are the cap-suppressed AGREED rows whose WARN fires post-commit.
 	attestedAmounts := make(map[types.ID]float64, len(agreedResults))
-
-	// When an emission cap is configured, route grants through CreateCapped so a suppression is a
-	// non-error branch (design §5.3, audit F3). cappedCreator returns (nil, false) both when no
-	// cap is set — the default, keeping the byte-for-byte legacy Create path below — and when a
-	// cap is set but the repo lacks the capability (it WARNs once and falls back to Create).
-	cc, capEnforced := e.cappedCreator()
-
 	var creditEntries []*credit.LedgerEntry
-	for _, r := range agreedResults {
-		entry := &credit.LedgerEntry{
-			VolunteerID:  r.VolunteerID,
-			LeafID:       wu.LeafID,
-			WorkUnitID:   wu.ID,
-			ResultID:     r.ID,
-			CreditAmount: creditAmount,
+	var suppressedResults []*result.Result
+
+	// TX PHASE (design §4.1): mark AGREED, mark DISAGREED, guarded flip COMPLETED->VALIDATED,
+	// and the per-result credit writes all commit in ONE serialized transaction (production),
+	// so partial finalization is unrepresentable — invariant E1-S. On any error the whole tx
+	// rolls back: the unit stays COMPLETED with its results PENDING and the recovery sweep
+	// re-drives it (the ★E1-1 marks-only strand is unrepresentable). The passthrough default
+	// (no WithTxRunner) runs this over the engine's own repos untxed, so mock tests are unchanged.
+	if err := e.runFinalization(ctx, wu.ID, rawPendingCount, func(stores FinalizationStores) error {
+		if err := stores.Results.BatchUpdateValidationStatus(ctx, agreedIDs, result.ValidationAgreed); err != nil {
+			return fmt.Errorf("mark results AGREED: %w", err)
 		}
-		if capEnforced {
-			inserted, err := cc.CreateCapped(ctx, entry, e.emissionCapPerDay)
-			if err != nil {
-				return nil, fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
+		if len(rejectedIDs) > 0 {
+			if err := stores.Results.BatchUpdateValidationStatus(ctx, rejectedIDs, result.ValidationDisagreed); err != nil {
+				return fmt.Errorf("mark results DISAGREED: %w", err)
 			}
-			if !inserted {
-				// Suppression branch (design §5.3, audit F3/F10): the account's rolling-24h
-				// grants plus this amount would exceed the cap. Grant NOTHING — no ledger row,
-				// no RAC upsert, no attested credit — but leave the result AGREED so every
-				// work-quality effect below (counters, standing, reliability, trust) still
-				// fires. The cap bounds emission, not merit.
-				e.logger.Warn("credit suppressed by daily emission cap",
-					"volunteer_id", r.VolunteerID,
-					"work_unit_id", wu.ID,
-					"result_id", r.ID,
-					"amount", creditAmount,
-					"cap", e.emissionCapPerDay)
-				continue
-			}
-		} else if err := e.creditRepo.Create(ctx, entry); err != nil {
-			return nil, fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
 		}
-		// Update RAC for this volunteer+project. H-7: best-effort — a failure does not
-		// fail validation (credit is already granted), so log at Warn, not Error.
-		if e.racRepo != nil {
-			if err := e.racRepo.Upsert(ctx, r.VolunteerID, wu.LeafID, creditAmount); err != nil {
+		if _, err := stores.WorkUnits.UpdateState(ctx, wu.ID, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateValidated); err != nil {
+			return fmt.Errorf("transition work unit to VALIDATED: %w", err)
+		}
+
+		// The CreateCapped capability is resolved against the TX-SCOPED credits repo so the
+		// rolling-24h SUM reads this transaction's own earlier inserts (design §4.1). cappedCreatorFor
+		// returns (nil, false) both when no cap is set — the default, keeping the byte-for-byte legacy
+		// Create path — and when a cap is set but the repo lacks the capability (WARNs once, falls back).
+		cc, capEnforced := e.cappedCreatorFor(stores.Credits)
+		for _, r := range agreedResults {
+			entry := &credit.LedgerEntry{
+				VolunteerID:  r.VolunteerID,
+				LeafID:       wu.LeafID,
+				WorkUnitID:   wu.ID,
+				ResultID:     r.ID,
+				CreditAmount: creditAmount,
+			}
+			if capEnforced {
+				inserted, err := cc.CreateCapped(ctx, entry, e.emissionCapPerDay)
+				if err != nil {
+					return fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
+				}
+				if !inserted {
+					// Suppression branch (design §5.3, audit F3/F10): the account's rolling-24h
+					// grants plus this amount would exceed the cap. Grant NOTHING — no ledger row,
+					// no RAC upsert, no attested credit — but leave the result AGREED so every
+					// work-quality effect (counters, standing, reliability, trust) still fires. The
+					// cap bounds emission, not merit. The WARN moves post-commit (§4.1).
+					suppressedResults = append(suppressedResults, r)
+					continue
+				}
+			} else if err := stores.Credits.Create(ctx, entry); err != nil {
+				return fmt.Errorf("create credit entry for result %s: %w", r.ID, err)
+			}
+			creditEntries = append(creditEntries, entry)
+			attestedAmounts[r.ID] = creditAmount
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// --- POST-COMMIT best-effort effects (design §4.1): unchanged semantics + order, run over
+	// the engine's own pool-backed repos only AFTER the money tx has committed. A failure here
+	// never rolls back the grant — credit is already durable. ---
+
+	// RAC upserts move here from the credit loop, ONLY for the entries actually granted. H-7:
+	// best-effort — a failure does not fail validation (credit is already granted), so WARN.
+	if e.racRepo != nil {
+		for _, entry := range creditEntries {
+			if err := e.racRepo.Upsert(ctx, entry.VolunteerID, wu.LeafID, entry.CreditAmount); err != nil {
 				e.logger.Warn("failed to update RAC",
-					"volunteer_id", r.VolunteerID, "leaf_id", wu.LeafID, "result_id", r.ID, "error", err)
+					"volunteer_id", entry.VolunteerID, "leaf_id", wu.LeafID, "result_id", entry.ResultID, "error", err)
 			}
 		}
-		creditEntries = append(creditEntries, entry)
-		attestedAmounts[r.ID] = creditAmount
+	}
+
+	// Relocated emission-cap suppression WARNs (were inside the tx phase — moved out so a rolled-
+	// back tx does not emit a misleading "suppressed" line for a grant that never happened).
+	for _, r := range suppressedResults {
+		e.logger.Warn("credit suppressed by daily emission cap",
+			"volunteer_id", r.VolunteerID,
+			"work_unit_id", wu.ID,
+			"result_id", r.ID,
+			"amount", creditAmount,
+			"cap", e.emissionCapPerDay)
 	}
 
 	// Create attestations for agreed results. The amount attested is the credit actually granted
@@ -692,18 +755,19 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 	}, nil
 }
 
-// cappedCreator resolves whether the grant loop must enforce the per-account emission cap.
-// It returns (cc, true) ONLY when a cap is configured AND the credit repository implements
+// cappedCreatorFor resolves whether the grant loop must enforce the per-account emission cap,
+// type-asserting the given credit repository (the TX-SCOPED one during finalization, design
+// §4.1). It returns (cc, true) ONLY when a cap is configured AND cr implements
 // credit.CappedCreator. It returns (nil, false) — the uncapped legacy Create path — in two
 // cases: no cap configured (the default, and the common production state), or a cap configured
 // against a repository that cannot enforce it (a misconfiguration). The misconfiguration is
 // surfaced LOUD but not fatal: it WARNs at most once per engine lifetime (capWarnOnce) and lets
 // the grant proceed uncapped, so a mis-wired cap never silently drops or fails every grant.
-func (e *Engine) cappedCreator() (credit.CappedCreator, bool) {
+func (e *Engine) cappedCreatorFor(cr credit.Repository) (credit.CappedCreator, bool) {
 	if e.emissionCapPerDay <= 0 {
 		return nil, false
 	}
-	cc, ok := e.creditRepo.(credit.CappedCreator)
+	cc, ok := cr.(credit.CappedCreator)
 	if !ok {
 		e.capWarnOnce.Do(func() {
 			e.logger.Warn("emission cap configured but credit repository does not support capped creation")
@@ -724,14 +788,34 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, proj *lea
 		ids[i] = r.ID
 	}
 
-	if err := e.resultRepo.BatchUpdateValidationStatus(ctx, ids, result.ValidationDisagreed); err != nil {
-		return nil, fmt.Errorf("mark all results DISAGREED: %w", err)
+	// TX PHASE (design §4.1): mark all DISAGREED, guarded flip COMPLETED->REJECTED, and the
+	// requeue (Reassign, REJECTED->QUEUED) all commit in ONE serialized transaction. Folding the
+	// requeue into the tx removes the pre-fix strand where a crash between the REJECTED flip and
+	// Reassign left an unreachable REJECTED unit that Decide has no action for. A Reassign error
+	// now ABORTS the whole tx (was log-and-continue): the reject rolls back and the sweep
+	// re-drives it, never a committed-but-unrequeued REJECTED strand.
+	var reassignUpdated *workunit.WorkUnit
+	var reassignRequeued bool
+	if err := e.runFinalization(ctx, wu.ID, rawPendingCount, func(stores FinalizationStores) error {
+		if err := stores.Results.BatchUpdateValidationStatus(ctx, ids, result.ValidationDisagreed); err != nil {
+			return fmt.Errorf("mark all results DISAGREED: %w", err)
+		}
+		if _, err := stores.WorkUnits.UpdateState(ctx, wu.ID, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateRejected); err != nil {
+			return fmt.Errorf("transition work unit to REJECTED: %w", err)
+		}
+		updated, requeued, err := stores.WorkUnits.Reassign(ctx, wu.ID)
+		if err != nil {
+			return fmt.Errorf("reassign rejected work unit: %w", err)
+		}
+		reassignUpdated = updated
+		reassignRequeued = requeued
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
-	_, err := e.workUnitRepo.UpdateState(ctx, wu.ID, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateRejected)
-	if err != nil {
-		return nil, fmt.Errorf("transition work unit to REJECTED: %w", err)
-	}
+	// --- POST-COMMIT best-effort effects (design §4.1): unchanged semantics + order, run over
+	// the engine's own repos only after the reject+requeue tx has committed. ---
 
 	if verdict == nil {
 		verdict = transition.BuildComparisonVerdict(pending, nil, policy.TrustFloor)
@@ -767,14 +851,11 @@ func (e *Engine) rejectAll(ctx context.Context, wu *workunit.WorkUnit, proj *lea
 		)
 	}
 
-	// Reassign or fail the rejected work unit.
-	updated, requeued, err := e.workUnitRepo.Reassign(ctx, wu.ID)
-	if err != nil {
-		e.logger.Error("failed to reassign rejected work unit", "work_unit_id", wu.ID, "error", err)
-	} else if requeued {
-		e.logger.Info("rejected work unit reassigned", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
+	// Requeue outcome logs (the Reassign itself committed inside the tx above).
+	if reassignRequeued {
+		e.logger.Info("rejected work unit reassigned", "work_unit_id", wu.ID, "reassignment_count", reassignUpdated.ReassignmentCount)
 	} else {
-		e.logger.Warn("rejected work unit failed after max reassignments", "work_unit_id", wu.ID, "reassignment_count", updated.ReassignmentCount)
+		e.logger.Warn("rejected work unit failed after max reassignments", "work_unit_id", wu.ID, "reassignment_count", reassignUpdated.ReassignmentCount)
 	}
 
 	return &ValidationResult{

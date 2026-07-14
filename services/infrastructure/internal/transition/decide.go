@@ -270,6 +270,19 @@ func Decide(s UnitSnapshot) Decision {
 	// it finish is strictly better than reaping the unit.
 	moreCopiesPossible := s.LiveCopies > 0 || (dispatchHeadroom && !capsExhausted(s))
 
+	// reopen marks a WAIT that rests on PHANTOM dispatch headroom (★E1-5). A unit parked
+	// COMPLETED (or the pre-fix stranded-REJECTED residue) with no live copy has dispatch
+	// headroom (dispatchHeadroom) and unspent budget (!capsExhausted) — but no dispatcher can
+	// ever draw on it, because dispatch requires QUEUED (Dispatchable). Such a WAIT would
+	// re-park forever; the executor demotes the unit back to QUEUED, where the headroom is
+	// real, and dispatch supplies exactly the missing corroborators. The LiveCopies == 0 term
+	// is deliberate: while ANY copy is live its closure re-triggers Evaluate, so a live copy is
+	// always allowed to finish first. Never set for QUEUED (dispatch handles it directly) or
+	// terminal states (they never re-transition). Both WAIT returns below carry it; every other
+	// return leaves it false.
+	reopen := (s.State == workunit.WorkUnitStateCompleted || s.State == workunit.WorkUnitStateRejected) &&
+		s.LiveCopies == 0 && dispatchHeadroom && !capsExhausted(s)
+
 	// 2. A quorum's worth of results is in, but they do not agree (verdict present, didn't
 	//    pass §1). This gate is DELIBERATELY RAW `pending` (probation results included): it asks
 	//    only whether enough results have physically arrived to attempt a decision — a probation
@@ -282,7 +295,7 @@ func Decide(s UnitSnapshot) Decision {
 			// unit is parked COMPLETED while it waits IFF the target is already covered (no
 			// dispatch headroom) — the observable "COMPLETED while corroborating" state today.
 			// With dispatch headroom (target > quorum) it stays QUEUED so more copies go out.
-			return Decision{Action: ActionWait, CompleteFirst: !dispatchHeadroom,
+			return Decision{Action: ActionWait, CompleteFirst: !dispatchHeadroom, Reopen: reopen,
 				Reason: "threshold unmet; corroborators still possible"}
 		}
 		// No more copies coming and no agreement → reject this round and requeue for a fresh
@@ -294,7 +307,7 @@ func Decide(s UnitSnapshot) Decision {
 
 	// 3. Fewer than quorum results so far.
 	if moreCopiesPossible {
-		return Decision{Action: ActionWait, Reason: "awaiting more results"}
+		return Decision{Action: ActionWait, Reopen: reopen, Reason: "awaiting more results"}
 	}
 	// No live copy, no dispatch headroom left (or budget exhausted), quorum unreachable →
 	// dead-letter (matches DeadLetterIfExhausted: QUEUED, no live copy, pending < quorum,

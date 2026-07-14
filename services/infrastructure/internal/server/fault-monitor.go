@@ -77,6 +77,15 @@ const contentVerifyWarnEvery = 10 * time.Minute
 // fetch worker is dead, or the origin is unreachable).
 const contentVerifyStalledAge = 10 * time.Minute
 
+// unitEvaluator re-drives a single work unit's state decision (validate / reject /
+// requeue / dead-letter). *transition.Transitioner satisfies it; the fault monitor depends
+// on this narrow interface rather than the concrete transitioner so its re-evaluate calls —
+// the post-copy-close decision and the spot-check reclaim re-evaluate (design §4.4) — are
+// unit-testable with a spy.
+type unitEvaluator interface {
+	Evaluate(ctx context.Context, workUnitID types.ID) (transition.Outcome, error)
+}
+
 // FaultMonitor periodically scans for expired and abandoned work units.
 type FaultMonitor struct {
 	workUnitRepo   workunit.WorkUnitRepository
@@ -91,7 +100,9 @@ type FaultMonitor struct {
 	// after a timed-out copy is closed, the fault monitor delegates "requeue vs dead-letter
 	// vs (now) validate-at-quorum" to it. May be nil (tests) -> the legacy direct
 	// DeadLetterIfExhausted path is used, which is behavior-identical for the dead-letter case.
-	transitioner *transition.Transitioner
+	// Held as the narrow unitEvaluator interface (see above) so the re-evaluate calls are
+	// unit-testable; *transition.Transitioner satisfies it.
+	transitioner unitEvaluator
 	logger       *slog.Logger
 	scanInterval time.Duration
 	batchSize    int
@@ -198,17 +209,23 @@ func NewFaultMonitor(
 	transitioner *transition.Transitioner,
 	logger *slog.Logger,
 ) *FaultMonitor {
-	return &FaultMonitor{
+	m := &FaultMonitor{
 		workUnitRepo:    workUnitRepo,
 		assignRepo:      assignRepo,
 		checkpointRepo:  checkpointRepo,
 		leafRepo:        leafRepo,
 		reliabilityRepo: reliabilityRepo,
-		transitioner:    transitioner,
 		logger:          logger,
 		scanInterval:    30 * time.Second,
 		batchSize:       100,
 	}
+	// Assign the transitioner only when non-nil so a typed-nil *transition.Transitioner does
+	// not become a non-nil interface value — the nil-interface fallback to the direct
+	// DeadLetterIfExhausted path (tests / no validation engine) must keep working.
+	if transitioner != nil {
+		m.transitioner = transitioner
+	}
+	return m
 }
 
 // WithStandingPopulation wires the OPTIONAL account-standing read that backs the
@@ -363,8 +380,20 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 	for _, wu := range stuck {
 		if err := m.workUnitRepo.ClearSpotCheck(ctx, wu.ID); err != nil {
 			m.logger.Error("failed to clear spot-check on timed-out work unit", "work_unit_id", wu.ID, "error", err)
-		} else {
-			m.logger.Info("spot-check timed out, accepting single result", "work_unit_id", wu.ID)
+			continue
+		}
+		m.logger.Info("spot-check timed out, accepting single result", "work_unit_id", wu.ID)
+
+		// Re-evaluate now that the spot-check flag is cleared (design §4.4, BG-21d): clearing
+		// drops the resolved quorum to 1, so the unit's single PENDING result can validate.
+		// Without this the unit sat QUEUED forever with one complete, never-credited result.
+		// Best-effort — the same posture the copy-close loop above uses; the recovery sweep's
+		// QUEUED-at-quorum predicate independently backstops a lost re-evaluation.
+		if m.transitioner != nil {
+			if _, err := m.transitioner.Evaluate(ctx, wu.ID); err != nil {
+				m.logger.Warn("failed to re-evaluate work unit after spot-check clear",
+					"work_unit_id", wu.ID, "error", err)
+			}
 		}
 	}
 

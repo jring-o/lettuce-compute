@@ -1924,6 +1924,108 @@ func (r *PgxWorkUnitRepository) FindStuckSpotCheckUnits(ctx context.Context, lim
 	return workUnits, nil
 }
 
+// scanIDRows collects a single-column work-unit-id result set. errCtx names the query for the
+// wrapped Internal error on a scan/iterate failure.
+func scanIDRows(rows pgx.Rows, errCtx string) ([]types.ID, error) {
+	defer rows.Close()
+	var ids []types.ID
+	for rows.Next() {
+		var id types.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, apierror.Internal("failed to scan "+errCtx, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate "+errCtx, err)
+	}
+	return ids, nil
+}
+
+// FindStalledFinalizationUnits returns finalization-stalled COMPLETED/REJECTED units — the
+// recovery sweep's shape-1 candidates (design §4.2). A unit qualifies when its finalization
+// clock is aged past olderThan: completed_at for COMPLETED (stamped once per COMPLETED episode
+// and re-stamped on a re-park after a reopen, so the clock restarts correctly), updated_at for
+// REJECTED (a REJECTED unit is not QUEUED, so no dispatch machinery churns its updated_at). The
+// pre-fix credit-residue shape — a COMPLETED unit with zero PENDING results and at least one
+// AGREED result — is EXCLUDED: its marks committed without the state flip and credit, so
+// re-Evaluate (which loads only PENDING results) cannot repair it; the sweeper reports it via
+// FindFinalizationResidueUnits and skips. Oldest first, LIMIT. Rides idx_wu_stalled.
+func (r *PgxWorkUnitRepository) FindStalledFinalizationUnits(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id FROM work_units wu
+		WHERE wu.state IN ('COMPLETED', 'REJECTED')
+		  AND (CASE WHEN wu.state = 'COMPLETED' THEN COALESCE(wu.completed_at, wu.updated_at)
+		            ELSE wu.updated_at END) < now() - make_interval(secs => $1)
+		  AND NOT (
+		    wu.state = 'COMPLETED'
+		    AND NOT EXISTS (SELECT 1 FROM results r
+		                    WHERE r.work_unit_id = wu.id AND r.validation_status = 'PENDING')
+		    AND EXISTS (SELECT 1 FROM results r
+		                WHERE r.work_unit_id = wu.id AND r.validation_status = 'AGREED')
+		  )
+		ORDER BY (CASE WHEN wu.state = 'COMPLETED' THEN COALESCE(wu.completed_at, wu.updated_at)
+		               ELSE wu.updated_at END) ASC
+		LIMIT $2`,
+		int(olderThan.Seconds()), limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find stalled finalization units", err)
+	}
+	return scanIDRows(rows, "stalled finalization unit")
+}
+
+// FindStalledQueuedAtQuorum returns QUEUED units already holding a quorum's worth of PENDING
+// results whose newest PENDING result is aged past olderThan — the recovery sweep's shape-2
+// candidates (design §4.2, reviews #3/#5). It is deliberately driven FROM the results side and
+// ages on the EVIDENCE (MAX(created_at) of the PENDING results), NOT on work_units.updated_at:
+// dispatch-claim stamping/renewal and expired-claim hygiene bump updated_at with zero progress
+// on the unit, which would age-mask a dispatchable strand precisely in the quiet-pool regime
+// the sweep exists for. The pending count is the RAW count against the shared quorum fragment
+// (effQuorumWuL), mirroring Decide's attempt gate — the sweep asks only "might Evaluate do
+// something," and Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l
+// primary keys so the quorum fragment's per-row column references are resolvable. Oldest
+// evidence first, LIMIT. Rides idx_results_pending_by_unit.
+func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id
+		FROM results r
+		JOIN work_units wu ON wu.id = r.work_unit_id
+		JOIN leafs l ON l.id = wu.leaf_id
+		WHERE r.validation_status = 'PENDING' AND wu.state = 'QUEUED'
+		GROUP BY wu.id, l.id
+		HAVING MAX(r.created_at) < now() - make_interval(secs => $1)
+		   AND COUNT(*) >= `+effQuorumWuL+`
+		ORDER BY MAX(r.created_at) ASC
+		LIMIT $2`,
+		int(olderThan.Seconds()), limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find stalled queued-at-quorum units", err)
+	}
+	return scanIDRows(rows, "stalled queued-at-quorum unit")
+}
+
+// FindFinalizationResidueUnits returns the pre-fix finalization-residue shape excluded by
+// FindStalledFinalizationUnits: COMPLETED units whose results were adjudicated (zero PENDING,
+// at least one AGREED) but whose state flip and credit never landed (a crash between the marks
+// and the flip in the non-atomic pre-fix accept path, design §4.2/★E1-1). Re-Evaluate cannot
+// repair these — the sweeper WARNs one line per unit for operator adjudication (E1 closeout
+// census) and never re-drives them. Oldest first, LIMIT.
+func (r *PgxWorkUnitRepository) FindFinalizationResidueUnits(ctx context.Context, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id FROM work_units wu
+		WHERE wu.state = 'COMPLETED'
+		  AND NOT EXISTS (SELECT 1 FROM results r
+		                  WHERE r.work_unit_id = wu.id AND r.validation_status = 'PENDING')
+		  AND EXISTS (SELECT 1 FROM results r
+		              WHERE r.work_unit_id = wu.id AND r.validation_status = 'AGREED')
+		ORDER BY COALESCE(wu.completed_at, wu.updated_at) ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find finalization residue units", err)
+	}
+	return scanIDRows(rows, "finalization residue unit")
+}
+
 // CloseCopy closes a copy by id with the given outcome (e.g. EXPIRED, ABANDONED),
 // stamping outcome_at = NOW(). Idempotent: only a still-live copy is closed.
 func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, outcome string) error {
@@ -2036,18 +2138,24 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
-// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED,
-// has NO live copy outstanding, its redundancy is still unmet (PENDING results <
+// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED or
+// COMPLETED, has NO live copy outstanding, its redundancy is still unmet (PENDING results <
 // redundancy), AND the total copies ever created has reached its dead-letter ceiling
 // (max_total_copies, defaulting to redundancy + a margin). This is the ONLY cap on
 // requeue (property 6): honest timeouts redispatch with no per-attempt limit, but a
 // hopeless (poison) unit eventually stops burning the volunteer pool. Returns whether
 // the unit was failed.
+//
+// The state guard is `IN ('QUEUED','COMPLETED')` (was QUEUED-only): the rare COMPLETED unit
+// whose version-filtered PENDING set drops below quorum with the copy budget exhausted (the
+// version-heterogeneous edge, design §4.2) must dead-letter in one tick instead of never. The
+// semantic guards below — no live copy, PENDING < quorum, and the total ceiling — carry the
+// meaning; the state list is belt.
 func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
 		FROM leafs l
-		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state = 'QUEUED'
+		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED')
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history h
 		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL

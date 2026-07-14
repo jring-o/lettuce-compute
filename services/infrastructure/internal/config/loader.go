@@ -539,6 +539,27 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.ContentFetchMaxBytes = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_FINALIZATION_SWEEP_INTERVAL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_FINALIZATION_SWEEP_INTERVAL_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.FinalizationSweepIntervalSeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_FINALIZATION_SWEEP_GRACE_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_FINALIZATION_SWEEP_GRACE_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.FinalizationSweepGraceSeconds = n
+	}
+	if v := os.Getenv("LETTUCE_HEAD_FINALIZATION_SWEEP_BATCH"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_FINALIZATION_SWEEP_BATCH must be an integer: %w", err)
+		}
+		cfg.Head.FinalizationSweepBatch = n
+	}
 	return nil
 }
 

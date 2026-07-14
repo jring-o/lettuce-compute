@@ -707,6 +707,15 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			}
 		}
 
+		// Output gate (design §4.3): a browser submission is always inline, so an empty
+		// output can never corroborate anything (EXACT keys it to a non-grouping sentinel;
+		// NUMERIC_TOLERANCE errors on it) and is refused at the door instead of stored as a
+		// dead PENDING row that would only strand its unit.
+		if len(outputRaw) == 0 {
+			apierror.WriteError(w, apierror.ValidationError("output_data must be non-empty JSON", nil))
+			return
+		}
+
 		// Look up volunteer.
 		vol, err := deps.volunteerRepo.GetByPublicKey(r.Context(), []byte(pubKey))
 		if err != nil {
@@ -754,6 +763,17 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 					nil))
 				return
 			}
+
+			// Output gate (design §4.3): enforce at the door exactly what this leaf's own
+			// comparator will later require — non-empty well-formed JSON for every leaf, plus
+			// the NUMERIC_TOLERANCE numeric flatten under the leaf's configured ignore/compare
+			// fields. A malformed, empty, or float64-overflow (1e400) output used to abort the
+			// whole comparison and park its unit COMPLETED forever (BG-21a); refusing it here
+			// surfaces the problem to the client immediately. lf is reused from the size gate.
+			if verr := validation.ValidateSubmittedOutput(lf.ValidationConfig, outputRaw); verr != nil {
+				apierror.WriteError(w, apierror.ValidationError(verr.Error(), nil))
+				return
+			}
 		}
 
 		// Stamp the account-level trust snapshot BEFORE opening the transaction
@@ -798,6 +818,38 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			}
 			deps.logger.Error("failed to check assignment", "error", err)
 			apierror.WriteError(w, apierror.Internal("internal server error", err))
+			return
+		}
+
+		// Load the unit ONCE under the row lock (design §4.1, review #2b): the lock holds for
+		// the whole transaction, so the unit row cannot change under us. This read drives the
+		// submit-door terminal-state check and the later completion-quorum resolution.
+		txWURepo := workunit.NewPgxWorkUnitRepository(tx)
+		currentWU, err := txWURepo.GetByID(r.Context(), workUnitID)
+		if err != nil {
+			deps.logger.Error("failed to load work unit", "error", err)
+			apierror.WriteError(w, apierror.Internal("internal server error", err))
+			return
+		}
+
+		// Submit-door terminal-state check (design §4.1, review #2b): refuse a submit against
+		// an already-finalized unit (VALIDATED/FAILED), closing the caller's live copy
+		// SUPERSEDED (non-punitive), COMMITTING so the supersede persists, and inserting NO
+		// result row that would otherwise sit PENDING under a terminal unit and never be
+		// adjudicated (★E1-6). Both the accept transaction and this submit transaction hold
+		// the unit row lock, so whichever commits second sees the truth.
+		if currentWU.State == workunit.WorkUnitStateValidated || currentWU.State == workunit.WorkUnitStateFailed {
+			if uerr := txAssignRepo.UpdateOutcome(r.Context(), activeAssignment.ID, assignment.OutcomeSuperseded, nil); uerr != nil {
+				deps.logger.Error("failed to supersede live copy on finalized unit", "work_unit_id", workUnitID, "error", uerr)
+				apierror.WriteError(w, apierror.Internal("internal server error", uerr))
+				return
+			}
+			if cerr := tx.Commit(r.Context()); cerr != nil {
+				deps.logger.Error("failed to commit supersede on finalized unit", "work_unit_id", workUnitID, "error", cerr)
+				apierror.WriteError(w, apierror.Internal("internal server error", cerr))
+				return
+			}
+			apierror.WriteError(w, apierror.Conflict("work unit already finalized; result is too late to accept", nil))
 			return
 		}
 
@@ -853,14 +905,8 @@ func handleBrowserSubmitResult(deps *browserVolunteerDeps) http.HandlerFunc {
 			return
 		}
 
-		// Transition work unit to COMPLETED if enough results.
-		txWURepo := workunit.NewPgxWorkUnitRepository(tx)
-		currentWU, err := txWURepo.GetByID(r.Context(), workUnitID)
-		if err != nil {
-			deps.logger.Error("failed to load work unit", "error", err)
-			apierror.WriteError(w, apierror.Internal("internal server error", err))
-			return
-		}
+		// Transition work unit to COMPLETED if enough results. The unit was loaded once under
+		// the row lock above (currentWU); reuse it here rather than re-reading it.
 
 		// The COMPLETED threshold is the unit's effective QUORUM (TODO #50) — how many results
 		// are needed to attempt validation — resolved through the single source (ResolvePolicy);

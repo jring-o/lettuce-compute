@@ -33,6 +33,9 @@ func TestValidateTransition(t *testing.T) {
 		// logic) so dispatch can supply the missing corroborators. Taken only by the
 		// transitioner's reopen arm.
 		{"COMPLETED → QUEUED", WorkUnitStateCompleted, WorkUnitStateQueued},
+		// The widened dead-letter edge: DeadLetterIfExhausted accepts COMPLETED units
+		// (version-heterogeneous edge) — the chart mirrors what the SQL can do.
+		{"COMPLETED → FAILED", WorkUnitStateCompleted, WorkUnitStateFailed},
 		{"REJECTED → QUEUED", WorkUnitStateRejected, WorkUnitStateQueued},
 		{"REJECTED → FAILED", WorkUnitStateRejected, WorkUnitStateFailed},
 		{"EXPIRED → QUEUED", WorkUnitStateExpired, WorkUnitStateQueued},

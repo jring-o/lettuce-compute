@@ -32,6 +32,10 @@ const (
 	OutcomeValidated    Outcome = "VALIDATED"
 	OutcomeRejected     Outcome = "REJECTED"
 	OutcomeDeadLettered Outcome = "FAILED"
+	// OutcomeReopened is returned when the reopen arm demotes a phantom-headroom park back to
+	// QUEUED (COMPLETED via a plain guarded flip, or the stranded-REJECTED residue via
+	// Reassign) so dispatch can supply the missing corroborators (★E1-5, §4.2).
+	OutcomeReopened Outcome = "REOPENED"
 )
 
 // Comparator is the validation-engine surface the transitioner orchestrates: a read-only
@@ -69,6 +73,15 @@ type Comparator interface {
 type WorkUnitStore interface {
 	GetByID(ctx context.Context, id types.ID) (*workunit.WorkUnit, error)
 	MarkCompleted(ctx context.Context, id types.ID) error
+	// UpdateState performs a guarded state transition (WHERE id AND state = from). The reopen
+	// arm uses it for the COMPLETED -> QUEUED demotion: a plain flip that touches no results
+	// (the repo applies no requeue business logic on that edge; every UpdateState clears the
+	// dispatch-claim columns, so the reopened unit is immediately claimable).
+	UpdateState(ctx context.Context, id types.ID, from, to workunit.WorkUnitState) (*workunit.WorkUnit, error)
+	// Reassign returns an EXPIRED/REJECTED unit to QUEUED with the standard requeue business
+	// logic (reassignment-count bump, claim clear). The reopen arm uses it to complete the
+	// requeue a pre-fix crash interrupted on a stranded-REJECTED residue unit.
+	Reassign(ctx context.Context, id types.ID) (*workunit.WorkUnit, bool, error)
 	CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	// CountProbationLiveCopies returns the live copies whose HOLDER's CURRENT effective standing
 	// is not OK (BG-24b) — the probation-held copies Decide EXCLUDES from redundancy coverage so
@@ -294,6 +307,9 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		return OutcomeNoop, nil
 
 	default: // ActionWait
+		if d.Reopen {
+			return t.reopen(ctx, id, wu.State)
+		}
 		if d.CompleteFirst {
 			if err := t.wus.MarkCompleted(ctx, id); err != nil {
 				return OutcomeNoop, err
@@ -301,6 +317,36 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		}
 		return OutcomeWaiting, nil
 	}
+}
+
+// reopen executes the phantom-headroom progress arm (★E1-5, §4.2): a WAIT that rests on
+// dispatch headroom no dispatcher can use because the unit is not QUEUED. It demotes the unit
+// back to QUEUED so dispatch supplies the missing corroborators. Best-effort — a Conflict or
+// error is logged and reported as a plain WAITING so the sweep re-drives on the next tick.
+//
+//   - COMPLETED -> QUEUED: a plain guarded flip (no requeue business logic; the PENDING rows
+//     keep holding their redundancy slots and keep counting toward coverage).
+//   - REJECTED -> QUEUED: the standard Reassign requeue, completing exactly what a pre-fix
+//     crash interrupted (this residue class is unreachable once §4.1 requeues in-tx).
+func (t *Transitioner) reopen(ctx context.Context, id types.ID, state workunit.WorkUnitState) (Outcome, error) {
+	switch state {
+	case workunit.WorkUnitStateCompleted:
+		if _, err := t.wus.UpdateState(ctx, id, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateQueued); err != nil {
+			t.logger.Warn("failed to reopen parked COMPLETED unit; sweep will re-drive", "work_unit_id", id, "error", err)
+			return OutcomeWaiting, nil
+		}
+	case workunit.WorkUnitStateRejected:
+		if _, _, err := t.wus.Reassign(ctx, id); err != nil {
+			t.logger.Warn("failed to requeue stranded REJECTED unit; sweep will re-drive", "work_unit_id", id, "error", err)
+			return OutcomeWaiting, nil
+		}
+	default:
+		// Decide only sets Reopen for COMPLETED/REJECTED; any other state here is a defensive
+		// no-op rather than an illegal transition attempt.
+		return OutcomeWaiting, nil
+	}
+	t.logger.Info("reopened parked work unit for dispatch", "work_unit_id", id, "state", string(state))
+	return OutcomeReopened, nil
 }
 
 // unitLockKey hashes a work-unit id to the int64 advisory-lock key space (mirrors the FNV-64a

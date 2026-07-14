@@ -416,6 +416,25 @@ type HeadConfig struct {
 	// EffectiveContentFetchMaxBytes. Override via
 	// LETTUCE_HEAD_CONTENT_FETCH_MAX_BYTES.
 	ContentFetchMaxBytes int64 `yaml:"content_fetch_max_bytes"`
+
+	// --- Finalization recovery sweep (E1 §4.2/§7.2) ---
+	//
+	// The recovery sweep is a leader-gated, UNCONDITIONAL reconciler (no enable knob, matching
+	// the revocation-reconciler precedent) that re-drives finalization-stalled work units
+	// through the idempotent transitioner — the standing re-scan half of finalization liveness.
+	// A strand is invisible for at most grace + interval before the sweep re-drives it.
+
+	// FinalizationSweepIntervalSeconds is the sweep ticker cadence. Unset (0) resolves to the
+	// default 60. Override via LETTUCE_HEAD_FINALIZATION_SWEEP_INTERVAL_SECONDS.
+	FinalizationSweepIntervalSeconds int `yaml:"finalization_sweep_interval_seconds"`
+	// FinalizationSweepGraceSeconds is the minimum age before a COMPLETED / REJECTED /
+	// QUEUED-at-quorum unit is re-driven — headroom for the natural in-flight Evaluate to land
+	// first. Unset (0) resolves to the default 300. Override via
+	// LETTUCE_HEAD_FINALIZATION_SWEEP_GRACE_SECONDS.
+	FinalizationSweepGraceSeconds int `yaml:"finalization_sweep_grace_seconds"`
+	// FinalizationSweepBatch is the maximum units re-driven per tick (oldest first). Unset (0)
+	// resolves to the default 100. Override via LETTUCE_HEAD_FINALIZATION_SWEEP_BATCH.
+	FinalizationSweepBatch int `yaml:"finalization_sweep_batch"`
 }
 
 // Layer-1 defaults and the stale-volunteer threshold both delays and the lease
@@ -531,6 +550,16 @@ const (
 	// deliberately equal to the leaf-side max_output_size_bytes default (design doc
 	// §10.9, S6).
 	defaultContentFetchMaxBytes = int64(104857600)
+
+	// --- Finalization recovery-sweep defaults (E1 §4.2/§7.2) ---
+	// defaultFinalizationSweepIntervalSeconds: re-scan every minute on the leader.
+	defaultFinalizationSweepIntervalSeconds = 60
+	// defaultFinalizationSweepGraceSeconds: a unit must sit stalled for 5 minutes before the
+	// sweep re-drives it, leaving headroom for the natural in-flight Evaluate to land first.
+	defaultFinalizationSweepGraceSeconds = 300
+	// defaultFinalizationSweepBatch: re-drive up to 100 units per tick (oldest first) — drains
+	// any plausible alpha backlog in a single tick.
+	defaultFinalizationSweepBatch = 100
 
 	// --- Layer 3 scale-out defaults ---
 	defaultClaimLeaseSeconds = 120
@@ -817,6 +846,21 @@ func (h HeadConfig) Validate() error {
 	if h.ContentFetchMaxBytes < 0 {
 		return fmt.Errorf("head.content_fetch_max_bytes must be >= 0 (0 = default %d), got %d",
 			defaultContentFetchMaxBytes, h.ContentFetchMaxBytes)
+	}
+	// Finalization recovery-sweep knobs reject only NEGATIVE raw values; a raw 0 means
+	// "unset -> use the (positive) default", mirroring the other worker-cadence knobs, so a
+	// minimal config that omits them stays valid.
+	if h.FinalizationSweepIntervalSeconds < 0 {
+		return fmt.Errorf("head.finalization_sweep_interval_seconds must be >= 0 (0 = default %d), got %d",
+			defaultFinalizationSweepIntervalSeconds, h.FinalizationSweepIntervalSeconds)
+	}
+	if h.FinalizationSweepGraceSeconds < 0 {
+		return fmt.Errorf("head.finalization_sweep_grace_seconds must be >= 0 (0 = default %d), got %d",
+			defaultFinalizationSweepGraceSeconds, h.FinalizationSweepGraceSeconds)
+	}
+	if h.FinalizationSweepBatch < 0 {
+		return fmt.Errorf("head.finalization_sweep_batch must be >= 0 (0 = default %d), got %d",
+			defaultFinalizationSweepBatch, h.FinalizationSweepBatch)
 	}
 	return nil
 }
@@ -1246,6 +1290,33 @@ func (h HeadConfig) EffectiveContentFetchMaxBytes() int64 {
 		return defaultContentFetchMaxBytes
 	}
 	return h.ContentFetchMaxBytes
+}
+
+// EffectiveFinalizationSweepIntervalSeconds returns the recovery-sweep ticker cadence in
+// seconds, default 60 (unset/0 -> default).
+func (h HeadConfig) EffectiveFinalizationSweepIntervalSeconds() int {
+	if h.FinalizationSweepIntervalSeconds <= 0 {
+		return defaultFinalizationSweepIntervalSeconds
+	}
+	return h.FinalizationSweepIntervalSeconds
+}
+
+// EffectiveFinalizationSweepGraceSeconds returns the minimum age (seconds) before a stalled
+// unit is re-driven, default 300 (unset/0 -> default).
+func (h HeadConfig) EffectiveFinalizationSweepGraceSeconds() int {
+	if h.FinalizationSweepGraceSeconds <= 0 {
+		return defaultFinalizationSweepGraceSeconds
+	}
+	return h.FinalizationSweepGraceSeconds
+}
+
+// EffectiveFinalizationSweepBatch returns the max units re-driven per tick, default 100
+// (unset/0 -> default).
+func (h HeadConfig) EffectiveFinalizationSweepBatch() int {
+	if h.FinalizationSweepBatch <= 0 {
+		return defaultFinalizationSweepBatch
+	}
+	return h.FinalizationSweepBatch
 }
 
 // StorageConfig defines local filesystem storage settings.

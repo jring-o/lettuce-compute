@@ -27,7 +27,11 @@ var validTransitions = map[WorkUnitState][]WorkUnitState{
 	// — a plain state flip that touches no results (the PENDING rows keep holding their
 	// redundancy slots) — and dispatch supplies exactly the missing corroborators. No
 	// requeue business logic runs on this edge (nothing was adjudicated).
-	WorkUnitStateCompleted: {WorkUnitStateValidated, WorkUnitStateRejected, WorkUnitStateQueued},
+	// COMPLETED -> FAILED mirrors DeadLetterIfExhausted's widened state guard (the raw
+	// SQL dead-letter can now park a COMPLETED unit whose version-filtered pending set
+	// sits below quorum with the budget spent); the chart stays honest about every edge
+	// the database can take, exactly as QUEUED -> FAILED always was.
+	WorkUnitStateCompleted: {WorkUnitStateValidated, WorkUnitStateRejected, WorkUnitStateQueued, WorkUnitStateFailed},
 	WorkUnitStateRejected:  {WorkUnitStateQueued, WorkUnitStateFailed},
 	WorkUnitStateExpired:   {WorkUnitStateQueued, WorkUnitStateFailed},
 	// VALIDATED has exactly ONE outbound edge: the audit-enforcement demotion (design doc

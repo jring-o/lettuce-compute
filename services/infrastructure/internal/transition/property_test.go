@@ -207,3 +207,83 @@ func TestProperty_DefaultEquivalence(t *testing.T) {
 		}
 	}
 }
+
+// randReopenSnapshot is randSnapshot broadened to also generate the REJECTED state, which the
+// reopen arm handles but the base generator omits — so the Reopen property tests exercise all
+// five states the decider sees. Overriding State after construction is safe: the comparison
+// verdict depends only on the pending set, not on the state.
+func randReopenSnapshot(r *rand.Rand) UnitSnapshot {
+	s := randSnapshot(r, false)
+	states := []workunit.WorkUnitState{
+		workunit.WorkUnitStateQueued,
+		workunit.WorkUnitStateCompleted,
+		workunit.WorkUnitStateRejected,
+		workunit.WorkUnitStateValidated,
+		workunit.WorkUnitStateFailed,
+	}
+	s.State = states[r.Intn(len(states))]
+	return s
+}
+
+// TestProperty_ReopenImpliesPhantomHeadroomWait: Reopen is set only on a WAIT that rests on
+// phantom dispatch headroom — a COMPLETED or REJECTED unit with no live copy, dispatch headroom
+// under target, and an unspent copy budget (★E1-5, §4.2).
+func TestProperty_ReopenImpliesPhantomHeadroomWait(t *testing.T) {
+	r := rand.New(rand.NewSource(8))
+	for i := 0; i < propIters; i++ {
+		s := randReopenSnapshot(r)
+		d := Decide(s)
+		if !d.Reopen {
+			continue
+		}
+		if d.Action != ActionWait {
+			t.Fatalf("Reopen set on non-WAIT action %v: %+v", d.Action, s)
+		}
+		if s.State != workunit.WorkUnitStateCompleted && s.State != workunit.WorkUnitStateRejected {
+			t.Fatalf("Reopen set on state %v: %+v", s.State, s)
+		}
+		if s.LiveCopies != 0 {
+			t.Fatalf("Reopen set with %d live copies: %+v", s.LiveCopies, s)
+		}
+		if countableCopies(s) >= s.Policy.TargetCopies {
+			t.Fatalf("Reopen set without dispatch headroom (countable %d >= target %d): %+v",
+				countableCopies(s), s.Policy.TargetCopies, s)
+		}
+		if capsExhausted(s) {
+			t.Fatalf("Reopen set with caps exhausted: %+v policy=%+v", s, s.Policy)
+		}
+	}
+}
+
+// TestProperty_ReopenNeverForQueuedOrTerminal: the reopen flag is never set for a QUEUED unit
+// (dispatch handles it directly) or a terminal one (VALIDATED/FAILED never re-transition).
+func TestProperty_ReopenNeverForQueuedOrTerminal(t *testing.T) {
+	r := rand.New(rand.NewSource(9))
+	for i := 0; i < propIters; i++ {
+		s := randReopenSnapshot(r)
+		switch s.State {
+		case workunit.WorkUnitStateQueued, workunit.WorkUnitStateValidated, workunit.WorkUnitStateFailed:
+			if Decide(s).Reopen {
+				t.Fatalf("Reopen set for state %v: %+v", s.State, s)
+			}
+		}
+	}
+}
+
+// TestProperty_ReopenedSnapshotIsDispatchable is the reopen arm's whole point: a snapshot Decide
+// wants to reopen becomes Dispatchable once demoted to QUEUED — the phantom headroom becomes
+// real headroom a dispatcher can use.
+func TestProperty_ReopenedSnapshotIsDispatchable(t *testing.T) {
+	r := rand.New(rand.NewSource(10))
+	for i := 0; i < propIters; i++ {
+		s := randReopenSnapshot(r)
+		if !Decide(s).Reopen {
+			continue
+		}
+		q := s
+		q.State = workunit.WorkUnitStateQueued
+		if !Dispatchable(q) {
+			t.Fatalf("reopened snapshot not Dispatchable when QUEUED: %+v policy=%+v", q, q.Policy)
+		}
+	}
+}
