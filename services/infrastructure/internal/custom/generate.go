@@ -16,8 +16,7 @@ func Generate(
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo workunit.WorkUnitRepository,
-	batchRepo workunit.BatchRepository,
+	sink workunit.BatchSink,
 ) (*workunit.GenerateResult, error) {
 	return nil, &apierror.APIError{
 		Code:    "INVALID_PATTERN_FOR_GENERATE",

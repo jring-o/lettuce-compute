@@ -110,7 +110,7 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, logger)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, generate.NewPgxBatchSink(pool, logger), logger)
 	resultHandler := result.NewResultHandler(resultRepo, leafRepo, logger)
 	statsEngine := stats.NewEngine(pool)
 	statsHandler := stats.NewStatsHandler(statsEngine, leafRepo, logger)

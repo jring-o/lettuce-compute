@@ -17,8 +17,7 @@ func stubGenerator(name string) workunit.GenerateFunc {
 		proj *leaf.Leaf,
 		parameterSpace map[string]interface{},
 		batchSize int,
-		wuRepo workunit.WorkUnitRepository,
-		batchRepo workunit.BatchRepository,
+		sink workunit.BatchSink,
 	) (*workunit.GenerateResult, error) {
 		return &workunit.GenerateResult{
 			BatchIDs:         []types.ID{types.NewID()},
@@ -32,7 +31,7 @@ func TestRouter_ParameterSweep(t *testing.T) {
 	r := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
 	proj := &leaf.Leaf{TaskPattern: leaf.PatternParameterSweep}
 
-	result, err := r.Generate(context.Background(), proj, nil, 10, nil, nil)
+	result, err := r.Generate(context.Background(), proj, nil, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -45,7 +44,7 @@ func TestRouter_MapReduce(t *testing.T) {
 	r := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
 	proj := &leaf.Leaf{TaskPattern: leaf.PatternMapReduce}
 
-	result, err := r.Generate(context.Background(), proj, nil, 10, nil, nil)
+	result, err := r.Generate(context.Background(), proj, nil, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -58,7 +57,7 @@ func TestRouter_MonteCarlo(t *testing.T) {
 	r := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
 	proj := &leaf.Leaf{TaskPattern: leaf.PatternMonteCarlo}
 
-	result, err := r.Generate(context.Background(), proj, nil, 10, nil, nil)
+	result, err := r.Generate(context.Background(), proj, nil, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -71,7 +70,7 @@ func TestRouter_Custom(t *testing.T) {
 	r := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
 	proj := &leaf.Leaf{TaskPattern: leaf.PatternCustom}
 
-	result, err := r.Generate(context.Background(), proj, nil, 10, nil, nil)
+	result, err := r.Generate(context.Background(), proj, nil, 10, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -84,7 +83,7 @@ func TestRouter_UnknownPattern(t *testing.T) {
 	r := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
 	proj := &leaf.Leaf{TaskPattern: "UNKNOWN"}
 
-	_, err := r.Generate(context.Background(), proj, nil, 10, nil, nil)
+	_, err := r.Generate(context.Background(), proj, nil, 10, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown pattern")
 	}

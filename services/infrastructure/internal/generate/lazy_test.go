@@ -232,12 +232,95 @@ func makeParamSweepProject() *leaf.Leaf {
 	}
 }
 
-func newTestLazyManager(wuRepo workunit.WorkUnitRepository, batchRepo workunit.BatchRepository, leafRepo leaf.Repository) *LazyManager {
-	router := NewRouter(stubGenerator("param_sweep"), stubGenerator("map_reduce"), stubGenerator("monte_carlo"), stubGenerator("custom"), slog.Default())
-	return NewLazyManager(router, wuRepo, batchRepo, leafRepo, slog.Default())
+// fakeGenStore is a GenerationStore over the in-memory mock repos: it persists batches through a
+// RepoBatchSink and applies cursor advances / exhaustion stamps to the mock leaf repo, guarded on
+// total_generated exactly like the production pgx store (so the unit tests exercise the same
+// advance/guard/exhaustion logic without a database).
+type fakeGenStore struct {
+	inner    *workunit.RepoBatchSink
+	leafRepo *mockLeafRepo
+}
+
+func newFakeGenStore(wuRepo workunit.WorkUnitRepository, batchRepo workunit.BatchRepository, leafRepo *mockLeafRepo) *fakeGenStore {
+	return &fakeGenStore{inner: workunit.NewRepoBatchSink(wuRepo, batchRepo), leafRepo: leafRepo}
+}
+
+func (s *fakeGenStore) NextSequenceNumber(ctx context.Context, leafID types.ID) (int, error) {
+	return s.inner.NextSequenceNumber(ctx, leafID)
+}
+
+func (s *fakeGenStore) PersistBatch(ctx context.Context, batch *workunit.Batch, wus []*workunit.WorkUnit, cursor *workunit.GenerationCursorAdvance) error {
+	if err := s.inner.PersistBatch(ctx, batch, wus, nil); err != nil {
+		return err
+	}
+	if cursor != nil {
+		ok, err := s.applyCursor(cursor.LeafID, cursor.Cursor, cursor.ExpectedPrevTotalGenerated)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrCursorConflict
+		}
+	}
+	return nil
+}
+
+func (s *fakeGenStore) UpdateGenerationCursor(ctx context.Context, leafID types.ID, cursor []byte, expectedPrevTotalGenerated int64) (bool, error) {
+	return s.applyCursor(leafID, cursor, expectedPrevTotalGenerated)
+}
+
+// applyCursor mirrors the guarded UPDATE: it writes only when the leaf's CURRENT cursor
+// total_generated equals expectedPrev.
+func (s *fakeGenStore) applyCursor(leafID types.ID, cursor []byte, expectedPrev int64) (bool, error) {
+	p, ok := s.leafRepo.leafs[leafID]
+	if !ok {
+		return false, nil
+	}
+	current := loadCursor(p.GenerationCursor)
+	if int64(current.TotalGenerated) != expectedPrev {
+		return false, nil
+	}
+	p.GenerationCursor = append([]byte(nil), cursor...)
+	return true, nil
+}
+
+// emittingGenerator is a GenerateFunc that emits exactly `count` work units through the sink in
+// one batch (so the wrapping cursor-advancing sink actually advances the cursor). count 0 emits
+// nothing (no batch), modelling an exhausted window.
+func emittingGenerator(name string, count int) workunit.GenerateFunc {
+	return func(ctx context.Context, proj *leaf.Leaf, parameterSpace map[string]interface{}, batchSize int, sink workunit.BatchSink) (*workunit.GenerateResult, error) {
+		if count == 0 {
+			return &workunit.GenerateResult{Status: name}, nil
+		}
+		seq, err := sink.NextSequenceNumber(ctx, proj.ID)
+		if err != nil {
+			return nil, err
+		}
+		batch := &workunit.Batch{LeafID: proj.ID, SequenceNumber: seq, TotalWorkUnits: count}
+		wus := make([]*workunit.WorkUnit, count)
+		for i := range wus {
+			wus[i] = &workunit.WorkUnit{LeafID: proj.ID, State: workunit.WorkUnitStateCreated}
+		}
+		if err := sink.PersistBatch(ctx, batch, wus, nil); err != nil {
+			return nil, err
+		}
+		return &workunit.GenerateResult{BatchIDs: []types.ID{batch.ID}, WorkUnitsCreated: count, Status: name}, nil
+	}
+}
+
+func newTestLazyManager(wuRepo workunit.WorkUnitRepository, batchRepo workunit.BatchRepository, leafRepo *mockLeafRepo) *LazyManager {
+	router := NewRouter(emittingGenerator("param_sweep", 1), emittingGenerator("map_reduce", 1), emittingGenerator("monte_carlo", 1), emittingGenerator("custom", 1), slog.Default())
+	store := newFakeGenStore(wuRepo, batchRepo, leafRepo)
+	return NewLazyManager(router, wuRepo, store, leafRepo, slog.Default())
 }
 
 // --- Tests ---
+
+// cursorOf reads the leaf's durable generation_cursor column (where the reworked manager now
+// persists progress — no longer inside splitting_config).
+func cursorOf(leafRepo *mockLeafRepo, id types.ID) *GenerationCursor {
+	return loadCursor(leafRepo.leafs[id].GenerationCursor)
+}
 
 func TestCheckAndGenerate_FiniteMonteCarlo(t *testing.T) {
 	// 1000 trials, batch_size=100, threshold=50.
@@ -249,26 +332,23 @@ func TestCheckAndGenerate_FiniteMonteCarlo(t *testing.T) {
 	batchRepo := &mockBatchRepo{}
 	mgr := newTestLazyManager(wuRepo, batchRepo, leafRepo)
 
-	// Generate first batch. Since stub returns 1 work unit, it will be < lazy_batch_size,
-	// meaning exhausted should be set to true (since not ongoing).
+	// The emitting generator returns 1 work unit, which is < lazy_batch_size (100), so the leaf
+	// exhausts (it is finite / non-ongoing).
 	generated, err := mgr.CheckAndGenerate(context.Background(), proj.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if generated != 1 { // stub generator returns 1
+	if generated != 1 {
 		t.Errorf("expected 1 generated, got %d", generated)
 	}
 
-	// Verify cursor was updated.
-	updated := leafRepo.leafs[proj.ID]
-	cursor := loadCursor(updated.DataConfig.SplittingConfig)
+	cursor := cursorOf(leafRepo, proj.ID)
 	if cursor.TotalGenerated != 1 {
 		t.Errorf("expected total_generated=1, got %d", cursor.TotalGenerated)
 	}
 	if cursor.LastSeedOffset != 1 {
 		t.Errorf("expected last_seed_offset=1, got %d", cursor.LastSeedOffset)
 	}
-	// Stub returns 1, which is < lazy_batch_size=100, so exhausted for finite leaf.
 	if !cursor.GenerationExhausted {
 		t.Error("expected generation_exhausted=true for finite leaf")
 	}
@@ -291,9 +371,8 @@ func TestCheckAndGenerate_OngoingMonteCarlo(t *testing.T) {
 		t.Errorf("expected 1 generated, got %d", generated)
 	}
 
-	// Ongoing leaf: even though stub returns < batch_size, NOT exhausted.
-	updated := leafRepo.leafs[proj.ID]
-	cursor := loadCursor(updated.DataConfig.SplittingConfig)
+	// Ongoing leaf: even though the tick produced < batch_size, it is NOT exhausted.
+	cursor := cursorOf(leafRepo, proj.ID)
 	if cursor.GenerationExhausted {
 		t.Error("expected generation_exhausted=false for ongoing leaf")
 	}
@@ -316,9 +395,8 @@ func TestCheckAndGenerate_ParamSweepCursor(t *testing.T) {
 		t.Errorf("expected 1 generated, got %d", generated)
 	}
 
-	// Verify cursor advances for param sweep.
-	updated := leafRepo.leafs[proj.ID]
-	cursor := loadCursor(updated.DataConfig.SplittingConfig)
+	// Verify the parameter-sweep offset advances.
+	cursor := cursorOf(leafRepo, proj.ID)
 	if cursor.LastGeneratedOffset != 1 {
 		t.Errorf("expected last_generated_offset=1, got %d", cursor.LastGeneratedOffset)
 	}
@@ -348,6 +426,40 @@ func TestCheckAndGenerate_CustomSkipped(t *testing.T) {
 	}
 	if generated != 0 {
 		t.Errorf("expected 0 generated for custom pattern, got %d", generated)
+	}
+}
+
+func TestCheckAndGenerate_LazyMapReduceSkipped(t *testing.T) {
+	// A pre-migration lazy MAP_REDUCE row (create/update now rejects the config) must be
+	// skipped-and-WARNed by the manager rather than generating (design §4.10, BG-22b).
+	strategy := "by_line_count"
+	proj := &leaf.Leaf{
+		ID:          types.NewID(),
+		State:       leaf.StateActive,
+		TaskPattern: leaf.PatternMapReduce,
+		DataConfig: leaf.DataConfig{
+			GenerationMode:    leaf.GenerationModeLazy,
+			LazyThreshold:     50,
+			LazyBatchSize:     100,
+			SplittingStrategy: &strategy,
+		},
+	}
+
+	leafRepo := newMockLeafRepo()
+	leafRepo.leafs[proj.ID] = proj
+	wuRepo := newMockWURepo()
+	batchRepo := &mockBatchRepo{}
+	mgr := newTestLazyManager(wuRepo, batchRepo, leafRepo)
+
+	generated, err := mgr.CheckAndGenerate(context.Background(), proj.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if generated != 0 {
+		t.Errorf("expected 0 generated for lazy map_reduce, got %d", generated)
+	}
+	if cursorOf(leafRepo, proj.ID).TotalGenerated != 0 {
+		t.Error("expected no cursor advance for skipped lazy map_reduce")
 	}
 }
 
@@ -381,14 +493,12 @@ func TestCheckAndGenerate_AboveThreshold(t *testing.T) {
 	batchRepo := &mockBatchRepo{}
 	mgr := newTestLazyManager(wuRepo, batchRepo, leafRepo)
 
-	// scanProjects won't call CheckAndGenerate since count >= threshold.
-	// But CheckAndGenerate itself doesn't check threshold — scanProjects does.
-	// Verify CheckAndGenerate works regardless.
+	// CheckAndGenerate itself doesn't check threshold — scanProjects does — so a direct call
+	// still generates.
 	generated, err := mgr.CheckAndGenerate(context.Background(), proj.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// CheckAndGenerate generates even when called directly (threshold check is in scanProjects).
 	if generated != 1 {
 		t.Errorf("expected 1 generated, got %d", generated)
 	}
@@ -396,11 +506,8 @@ func TestCheckAndGenerate_AboveThreshold(t *testing.T) {
 
 func TestCheckAndGenerate_ExhaustedSkip(t *testing.T) {
 	proj := makeMonteCarloProject(false, 1000)
-	// Pre-set cursor as exhausted.
-	proj.DataConfig.SplittingConfig["_cursor"] = map[string]any{
-		"generation_exhausted": true,
-		"total_generated":      1000,
-	}
+	// Pre-set the durable cursor as exhausted.
+	proj.GenerationCursor = []byte(`{"generation_exhausted":true,"total_generated":1000,"last_seed_offset":1000}`)
 
 	leafRepo := newMockLeafRepo()
 	leafRepo.leafs[proj.ID] = proj
@@ -414,6 +521,33 @@ func TestCheckAndGenerate_ExhaustedSkip(t *testing.T) {
 	}
 	if generated != 0 {
 		t.Errorf("expected 0 generated for exhausted leaf, got %d", generated)
+	}
+}
+
+func TestCheckAndGenerate_MonteCarloPreCheckExhausts(t *testing.T) {
+	// The cursor already covers the declared total N: the manager stamps exhausted WITHOUT
+	// invoking the generator (design §4.6 pre-check).
+	proj := makeMonteCarloProject(false, 200)
+	proj.GenerationCursor = []byte(`{"total_generated":200,"last_seed_offset":200}`)
+
+	leafRepo := newMockLeafRepo()
+	leafRepo.leafs[proj.ID] = proj
+	wuRepo := newMockWURepo()
+	batchRepo := &mockBatchRepo{}
+	mgr := newTestLazyManager(wuRepo, batchRepo, leafRepo)
+
+	generated, err := mgr.CheckAndGenerate(context.Background(), proj.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if generated != 0 {
+		t.Errorf("expected 0 generated when N already covered, got %d", generated)
+	}
+	if !cursorOf(leafRepo, proj.ID).GenerationExhausted {
+		t.Error("expected generation_exhausted=true after pre-check")
+	}
+	if wuRepo.bulkCreated != 0 {
+		t.Errorf("expected the generator NOT to run, but %d units were created", wuRepo.bulkCreated)
 	}
 }
 
@@ -437,22 +571,18 @@ func TestCheckAndGenerate_EagerProjectSkipped(t *testing.T) {
 }
 
 func TestLoadCursor_Empty(t *testing.T) {
-	cursor := loadCursor(nil)
-	if cursor.TotalGenerated != 0 || cursor.GenerationExhausted {
-		t.Error("expected empty cursor from nil config")
+	if c := loadCursor(nil); c.TotalGenerated != 0 || c.GenerationExhausted {
+		t.Error("expected empty cursor from nil column")
+	}
+	if c := loadCursor([]byte(`{}`)); c.TotalGenerated != 0 || c.GenerationExhausted {
+		t.Error("expected empty cursor from {} column")
 	}
 }
 
-func TestLoadCursor_FromConfig(t *testing.T) {
-	config := map[string]any{
-		"_cursor": map[string]any{
-			"last_generated_offset": float64(500),
-			"last_seed_offset":      float64(300),
-			"total_generated":       float64(800),
-			"generation_exhausted":  true,
-		},
-	}
-	cursor := loadCursor(config)
+func TestLoadCursor_FromColumn(t *testing.T) {
+	// Unknown keys (e.g. an obsolete field from a migrated pre-fix cursor) are ignored.
+	raw := []byte(`{"last_generated_offset":500,"last_seed_offset":300,"total_generated":800,"generation_exhausted":true,"obsolete_migrated_key":7}`)
+	cursor := loadCursor(raw)
 	if cursor.LastGeneratedOffset != 500 {
 		t.Errorf("expected last_generated_offset=500, got %d", cursor.LastGeneratedOffset)
 	}
@@ -467,38 +597,33 @@ func TestLoadCursor_FromConfig(t *testing.T) {
 	}
 }
 
-func TestSaveCursor_RoundTrip(t *testing.T) {
+func TestBuildParameterSpace_MonteCarlo(t *testing.T) {
+	// num_trials is NO LONGER overwritten with lazy_batch_size; it becomes the per-tick window
+	// min(LazyBatchSize, remaining). With 950 already generated of 1000, remaining is 50.
 	proj := makeMonteCarloProject(false, 1000)
-	cursor := &GenerationCursor{
-		LastSeedOffset:      500,
-		TotalGenerated:      500,
-		GenerationExhausted: false,
+	cursor := &GenerationCursor{LastSeedOffset: 950}
+
+	params := buildParameterSpace(proj, cursor)
+	if params["seed_offset"] != 950 {
+		t.Errorf("expected seed_offset=950, got %v", params["seed_offset"])
+	}
+	if params["num_trials"] != 50 { // min(lazy_batch_size=100, remaining=50)
+		t.Errorf("expected num_trials=50 (min of batch, remaining), got %v", params["num_trials"])
 	}
 
-	saveCursor(proj, cursor)
-	loaded := loadCursor(proj.DataConfig.SplittingConfig)
-
-	if loaded.LastSeedOffset != 500 {
-		t.Errorf("expected last_seed_offset=500, got %d", loaded.LastSeedOffset)
-	}
-	if loaded.TotalGenerated != 500 {
-		t.Errorf("expected total_generated=500, got %d", loaded.TotalGenerated)
-	}
-	if loaded.GenerationExhausted {
-		t.Error("expected generation_exhausted=false")
+	// Mid-run, remaining exceeds the batch: request a full batch.
+	full := buildParameterSpace(proj, &GenerationCursor{LastSeedOffset: 100})
+	if full["num_trials"] != 100 {
+		t.Errorf("expected num_trials=100 when remaining >= batch, got %v", full["num_trials"])
 	}
 }
 
-func TestBuildParameterSpace_MonteCarlo(t *testing.T) {
-	proj := makeMonteCarloProject(false, 1000)
-	cursor := &GenerationCursor{LastSeedOffset: 500}
-
-	params := buildParameterSpace(proj, cursor)
-	if params["seed_offset"] != 500 {
-		t.Errorf("expected seed_offset=500, got %v", params["seed_offset"])
-	}
-	if params["num_trials"] != 100 { // lazy_batch_size
-		t.Errorf("expected num_trials=100, got %v", params["num_trials"])
+func TestBuildParameterSpace_MonteCarloOngoing(t *testing.T) {
+	// An ongoing MC leaf requests a full batch every tick (num_trials bounds nothing).
+	proj := makeMonteCarloProject(true, 0)
+	params := buildParameterSpace(proj, &GenerationCursor{LastSeedOffset: 999999})
+	if params["num_trials"] != 100 {
+		t.Errorf("expected num_trials=100 for ongoing leaf, got %v", params["num_trials"])
 	}
 }
 
@@ -554,16 +679,11 @@ func TestScanProjects_FiltersLazyOnly(t *testing.T) {
 	// Run scanProjects directly.
 	mgr.scanProjects(context.Background())
 
-	// Only the lazy leaf should have a cursor (meaning generation ran).
-	updatedLazy := leafRepo.leafs[lazyProj.ID]
-	cursor := loadCursor(updatedLazy.DataConfig.SplittingConfig)
-	if cursor.TotalGenerated == 0 {
+	// Only the lazy leaf should have advanced its cursor (meaning generation ran).
+	if cursorOf(leafRepo, lazyProj.ID).TotalGenerated == 0 {
 		t.Error("expected lazy leaf to have generated work units")
 	}
-
-	updatedEager := leafRepo.leafs[eagerProj.ID]
-	eagerCursor := loadCursor(updatedEager.DataConfig.SplittingConfig)
-	if eagerCursor.TotalGenerated != 0 {
+	if cursorOf(leafRepo, eagerProj.ID).TotalGenerated != 0 {
 		t.Error("expected eager leaf to NOT have generated work units")
 	}
 }
@@ -583,10 +703,9 @@ func TestScanProjects_ThresholdGating(t *testing.T) {
 
 	mgr.scanProjects(context.Background())
 
-	// Project should NOT have been generated (above threshold).
-	updated := leafRepo.leafs[proj.ID]
-	cursor := loadCursor(updated.DataConfig.SplittingConfig)
-	if cursor.TotalGenerated != 0 {
-		t.Errorf("expected no generation when above threshold, got total_generated=%d", cursor.TotalGenerated)
+	// Leaf should NOT have been generated (above threshold).
+	if cursorOf(leafRepo, proj.ID).TotalGenerated != 0 {
+		t.Errorf("expected no generation when above threshold, got total_generated=%d",
+			cursorOf(leafRepo, proj.ID).TotalGenerated)
 	}
 }

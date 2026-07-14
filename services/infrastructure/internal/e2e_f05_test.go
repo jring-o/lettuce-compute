@@ -74,7 +74,7 @@ func setupF05Server(t *testing.T) (
 
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 	batchRepo := workunit.NewPgxBatchRepository(pool)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, logger)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, workunit.NewRepoBatchSink(wuRepo, batchRepo), logger)
 
 	mux := http.NewServeMux()
 	leafHandler.RegisterRoutes(mux)

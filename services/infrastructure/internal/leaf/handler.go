@@ -492,7 +492,7 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ApplyDataConfigDefaults(&merged)
-		if apiErr := ValidateDataConfig(&merged, p.TaskPattern); apiErr != nil {
+		if apiErr := ValidateDataConfig(&merged, p.TaskPattern, p.IsOngoing); apiErr != nil {
 			apierror.WriteError(w, apiErr)
 			return
 		}

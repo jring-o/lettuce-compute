@@ -132,7 +132,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)
 	headHandler := leaf.NewHeadHandler(headCfg, pool, logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, logger)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, generate.NewPgxBatchSink(pool, logger), logger)
 	resultHandler := result.NewResultHandler(resultRepo, leafRepo, logger)
 	statsEngine := stats.NewEngine(pool)
 	statsHandler := stats.NewStatsHandler(statsEngine, leafRepo, logger)

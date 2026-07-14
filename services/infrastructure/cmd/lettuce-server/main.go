@@ -572,7 +572,10 @@ func main() {
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
-	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, batchRepo, leafRepo, logger)
+	// The lazy generation store persists each batch AND its cursor advance in one transaction
+	// (design §4.8), so a crash or leadership-failover overlap cannot duplicate or lose ordinals.
+	genSink := generate.NewPgxBatchSink(pool, logger)
+	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, genSink, leafRepo, logger)
 	healthRecorder := health.NewRecorder(pool, stats.NewEngine(pool), leafRepo, logger)
 
 	// Optional DID-binding re-check worker (leader-only): re-verifies bindings on a TTL

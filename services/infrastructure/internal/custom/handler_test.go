@@ -531,7 +531,7 @@ func TestHandleBulkUpload_ReturnsWorkUnitIDs(t *testing.T) {
 func TestGenerate_ReturnsRedirectError(t *testing.T) {
 	proj := makeCustomProject()
 
-	_, err := Generate(context.Background(), proj, nil, 0, nil, nil)
+	_, err := Generate(context.Background(), proj, nil, 0, nil)
 	if err == nil {
 		t.Fatal("expected error from Generate for custom pattern")
 	}

@@ -15,15 +15,46 @@ import (
 )
 
 // GenerateFunc is the signature for pattern-specific work unit generators.
-// It breaks the import cycle between workunit and generator packages.
+// It breaks the import cycle between workunit and generator packages. Generators persist
+// each batch through the BatchSink (not raw repos), so a batch's rows — and, on the lazy
+// path, its cursor advance — commit atomically (design §4.8, invariant E1-G).
 type GenerateFunc func(
 	ctx context.Context,
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo WorkUnitRepository,
-	batchRepo BatchRepository,
+	sink BatchSink,
 ) (*GenerateResult, error)
+
+// GenerationCursorAdvance carries a lazy-generation cursor advance that MUST commit atomically
+// with the batch it accounts for (design §4.8, BG-22c / E1-3). The production BatchSink applies
+// it as a guarded UPDATE inside the same transaction as the batch's units. The guard key is
+// ExpectedPrevTotalGenerated: the cursor's total_generated must advance monotonically on every
+// batch, whatever pattern-specific fields the cursor also carries, so a concurrent second writer
+// (a leadership-failover overlap) matches zero rows and its whole transaction aborts instead of
+// double-emitting. Cursor is the full replacement cursor JSON, not a delta.
+type GenerationCursorAdvance struct {
+	LeafID                     types.ID
+	Cursor                     []byte
+	ExpectedPrevTotalGenerated int64
+}
+
+// BatchSink persists one generated batch — the batch row, its work units, and their
+// CREATED->QUEUED transition — as a single atomic unit, optionally advancing the leaf's
+// generation cursor in the same transaction (cursor != nil, the lazy path). It replaces the
+// three raw per-batch repo calls the generators used to make separately, so no batch can leave
+// stranded CREATED units (E1-G withholding half) and no committed units can lack their cursor
+// advance (E1-G duplication half). NextSequenceNumber resolves the leaf's next batch sequence
+// number (the once-per-generation read the three writes never covered).
+type BatchSink interface {
+	// NextSequenceNumber returns the next batch sequence_number for the leaf (max existing + 1).
+	NextSequenceNumber(ctx context.Context, leafID types.ID) (int, error)
+	// PersistBatch creates batch, wires each work unit to it, bulk-inserts them, transitions
+	// them CREATED->QUEUED, and (when cursor != nil) advances the leaf's generation cursor —
+	// all atomically. On return batch.ID is populated. A non-nil cursor whose guard fails
+	// (a concurrent writer advanced first) aborts the whole batch.
+	PersistBatch(ctx context.Context, batch *Batch, wus []*WorkUnit, cursor *GenerationCursorAdvance) error
+}
 
 // GenerateResult is returned after successfully generating work units.
 type GenerateResult struct {
@@ -39,6 +70,7 @@ type WorkUnitHandler struct {
 	leafRepo   leaf.Repository
 	assignRepo assignment.Repository // optional; enables closing assignment outcomes on requeue
 	generate   GenerateFunc
+	sink       BatchSink // eager-generation persistence seam (design §4.8); per-batch atomic
 	logger     *slog.Logger
 }
 
@@ -51,12 +83,16 @@ func (h *WorkUnitHandler) SetAssignmentRepo(r assignment.Repository) {
 	h.assignRepo = r
 }
 
-// NewWorkUnitHandler creates a new WorkUnitHandler.
+// NewWorkUnitHandler creates a new WorkUnitHandler. sink is the per-batch atomic persistence
+// seam the eager /generate path drives (design §4.8): each generated batch and its work units
+// commit together, so a crashed multi-batch eager run leaves earlier complete batches QUEUED
+// (resumable) rather than stranded CREATED.
 func NewWorkUnitHandler(
 	wuRepo WorkUnitRepository,
 	batchRepo BatchRepository,
 	leafRepo leaf.Repository,
 	generate GenerateFunc,
+	sink BatchSink,
 	logger *slog.Logger,
 ) *WorkUnitHandler {
 	return &WorkUnitHandler{
@@ -64,6 +100,7 @@ func NewWorkUnitHandler(
 		batchRepo: batchRepo,
 		leafRepo:  leafRepo,
 		generate:  generate,
+		sink:      sink,
 		logger:    logger,
 	}
 }
@@ -371,7 +408,7 @@ func (h *WorkUnitHandler) handleGenerate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := h.generate(r.Context(), proj, parameterSpace, req.BatchSize, h.wuRepo, h.batchRepo)
+	result, err := h.generate(r.Context(), proj, parameterSpace, req.BatchSize, h.sink)
 	if err != nil {
 		l.Error("failed to generate work units", "error", err, "leaf_id", leafID)
 		apierror.WriteError(w, apierror.FromError(err))

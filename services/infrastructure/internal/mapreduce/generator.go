@@ -16,13 +16,17 @@ import (
 // Generate creates map-phase work units by splitting input data according to
 // the project's splitting_strategy. Each chunk becomes one work unit with the
 // chunk data in input_data (inline) or input_data_ref (external).
+//
+// Map-reduce is EAGER-only: the whole input is present at leaf creation, so there is no
+// not-yet-known tail for laziness to defer. Lazy generation_mode is rejected for MAP_REDUCE at
+// leaf create/update (design §4.10, BG-22b); this generator therefore always emits the full
+// chunk set, batch-by-batch, through the atomic sink.
 func Generate(
 	ctx context.Context,
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo workunit.WorkUnitRepository,
-	batchRepo workunit.BatchRepository,
+	sink workunit.BatchSink,
 ) (*workunit.GenerateResult, error) {
 	if proj.TaskPattern != leaf.PatternMapReduce {
 		return nil, apierror.ValidationError(
@@ -128,7 +132,7 @@ func Generate(
 	}
 
 	// Determine starting sequence number.
-	nextSeqNum, err := generate.ResolveNextSequenceNumber(ctx, proj.ID, batchRepo)
+	nextSeqNum, err := sink.NextSequenceNumber(ctx, proj.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -142,12 +146,9 @@ func Generate(
 		batchChunks := chunks[start:end]
 
 		batch := &workunit.Batch{
-			LeafID:      proj.ID,
+			LeafID:         proj.ID,
 			SequenceNumber: nextSeqNum + batchIdx,
 			TotalWorkUnits: len(batchChunks),
-		}
-		if err := batchRepo.Create(ctx, batch); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("create batch %d", batchIdx), err)
 		}
 
 		wus := make([]*workunit.WorkUnit, len(batchChunks))
@@ -158,8 +159,7 @@ func Generate(
 			}
 
 			wu := &workunit.WorkUnit{
-				LeafID:        proj.ID,
-				BatchID:          &batch.ID,
+				LeafID:           proj.ID,
 				State:            workunit.WorkUnitStateCreated,
 				Priority:         workunit.WorkUnitPriorityNormal,
 				CodeArtifactRef:  codeArtifactRef,
@@ -177,12 +177,9 @@ func Generate(
 			wus[i] = wu
 		}
 
-		if err := wuRepo.BulkCreate(ctx, wus); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("bulk create work units for batch %d", batchIdx), err)
-		}
-
-		if _, err := wuRepo.BulkTransitionByBatch(ctx, batch.ID, workunit.WorkUnitStateCreated, workunit.WorkUnitStateQueued); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("transition batch %d to queued", batchIdx), err)
+		// One atomic write: batch row + units + CREATED->QUEUED transition (design §4.8).
+		if err := sink.PersistBatch(ctx, batch, wus, nil); err != nil {
+			return nil, err
 		}
 
 		result.BatchIDs = append(result.BatchIDs, batch.ID)

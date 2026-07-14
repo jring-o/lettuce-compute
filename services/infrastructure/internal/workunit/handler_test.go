@@ -74,7 +74,8 @@ func setupHandlerServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) 
 
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 	batchRepo := workunit.NewPgxBatchRepository(pool)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, logger)
+	genSink := workunit.NewRepoBatchSink(wuRepo, batchRepo)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, genSink, logger)
 
 	mux := http.NewServeMux()
 	leafHandler.RegisterRoutes(mux)

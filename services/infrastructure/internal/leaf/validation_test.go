@@ -1158,6 +1158,7 @@ func TestValidateDataConfig(t *testing.T) {
 	tests := []struct {
 		name        string
 		taskPattern TaskPattern
+		isOngoing   bool
 		modify      func(c *DataConfig)
 		wantErr     bool
 		errMsg      string
@@ -1643,8 +1644,31 @@ func TestValidateDataConfig(t *testing.T) {
 			errMsg:  "lazy_batch_size",
 		},
 		{
-			name:        "lazy valid for monte_carlo",
+			name:        "lazy valid for finite monte_carlo with num_trials",
 			taskPattern: PatternMonteCarlo,
+			modify: func(c *DataConfig) {
+				c.GenerationMode = "lazy"
+				c.LazyThreshold = 50
+				c.LazyBatchSize = 500
+				c.SplittingConfig = map[string]any{"num_trials": float64(1000)}
+			},
+			wantErr: false,
+		},
+		{
+			name:        "lazy finite monte_carlo requires num_trials",
+			taskPattern: PatternMonteCarlo,
+			modify: func(c *DataConfig) {
+				c.GenerationMode = "lazy"
+				c.LazyThreshold = 50
+				c.LazyBatchSize = 500
+			},
+			wantErr: true,
+			errMsg:  "num_trials",
+		},
+		{
+			name:        "lazy ongoing monte_carlo valid without num_trials",
+			taskPattern: PatternMonteCarlo,
+			isOngoing:   true,
 			modify: func(c *DataConfig) {
 				c.GenerationMode = "lazy"
 				c.LazyThreshold = 50
@@ -1653,7 +1677,7 @@ func TestValidateDataConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:        "lazy valid for map_reduce",
+			name:        "lazy rejected for map_reduce",
 			taskPattern: PatternMapReduce,
 			modify: func(c *DataConfig) {
 				s := "by_line_count"
@@ -1662,7 +1686,8 @@ func TestValidateDataConfig(t *testing.T) {
 				c.LazyThreshold = 50
 				c.LazyBatchSize = 500
 			},
-			wantErr: false,
+			wantErr: true,
+			errMsg:  "MAP_REDUCE",
 		},
 	}
 
@@ -1670,7 +1695,7 @@ func TestValidateDataConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := validConfig()
 			tt.modify(c)
-			err := ValidateDataConfig(c, tt.taskPattern)
+			err := ValidateDataConfig(c, tt.taskPattern, tt.isOngoing)
 			assertValidationResult(t, err, tt.wantErr, tt.errMsg)
 		})
 	}

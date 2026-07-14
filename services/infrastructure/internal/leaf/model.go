@@ -1,6 +1,7 @@
 package leaf
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -368,6 +369,15 @@ type Leaf struct {
 	// path, where assignments build from ExecutionConfig directly. Owned by
 	// ArtifactVersionRepository.SetCurrentVersion; never written by Update.
 	CurrentArtifactVersionID *types.ID `json:"current_artifact_version_id,omitempty"`
+	// GenerationCursor is the durable lazy-generation cursor for this leaf (design
+	// §4.8, BG-22c): how far generation has advanced into the declared parameter
+	// space (seed/combination offset, total generated, exhaustion). It is scanned
+	// from the dedicated leafs.generation_cursor jsonb column (migration 00026) and
+	// is written ONLY by the generation path's guarded, optimistic cursor advance —
+	// never by Update. An empty/zero value ({} or nil) means "not yet generated".
+	// Held opaque here (the generate package owns its schema) so an owner config
+	// edit cannot roll it back.
+	GenerationCursor json.RawMessage `json:"generation_cursor,omitempty"`
 }
 
 // SortField specifies which column to sort by.

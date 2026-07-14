@@ -58,7 +58,7 @@ func CanActivate(p *Leaf) error {
 	if err := ValidateFaultToleranceConfig(&p.FaultToleranceConfig); err != nil {
 		failures = append(failures, configFailure{Config: "fault_tolerance_config", Reason: err.Error()})
 	}
-	if err := ValidateDataConfig(&p.DataConfig, p.TaskPattern); err != nil {
+	if err := ValidateDataConfig(&p.DataConfig, p.TaskPattern, p.IsOngoing); err != nil {
 		failures = append(failures, configFailure{Config: "data_config", Reason: err.Error()})
 	}
 

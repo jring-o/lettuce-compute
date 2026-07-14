@@ -742,7 +742,7 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 	lazyMgr := generate.NewLazyManager(
 		patternRouter,
 		workunit.NewPgxWorkUnitRepository(env.pool),
-		workunit.NewPgxBatchRepository(env.pool),
+		generate.NewPgxBatchSink(env.pool, logger),
 		leaf.NewPgxRepository(env.pool),
 		logger,
 	)
@@ -758,20 +758,27 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 		t.Logf("lazy manager generated %d work units", generated)
 	}
 
-	// Verify cursor was updated.
+	// Verify the cursor advanced — in the dedicated generation_cursor column (migration 00026,
+	// design E1 §4.8), NOT inside owner-editable splitting_config (the pre-fix location this
+	// test used to assert; BG-22c moved it so owner config edits can no longer clobber it).
 	updatedProj, err := leaf.NewPgxRepository(env.pool).GetByID(ctx, proj.ID)
 	if err != nil {
 		t.Fatalf("get updated leaf: %v", err)
 	}
-	cursor := updatedProj.DataConfig.SplittingConfig["_cursor"]
-	if cursor == nil {
-		t.Error("expected cursor in splitting_config after lazy generation")
+	if _, stale := updatedProj.DataConfig.SplittingConfig["_cursor"]; stale {
+		t.Error("splitting_config must no longer carry a _cursor key (moved to generation_cursor)")
+	}
+	var cursor struct {
+		LastSeedOffset int `json:"last_seed_offset"`
+		TotalGenerated int `json:"total_generated"`
+	}
+	if err := json.Unmarshal(updatedProj.GenerationCursor, &cursor); err != nil {
+		t.Fatalf("decode generation_cursor: %v", err)
+	}
+	if cursor.TotalGenerated == 0 {
+		t.Error("expected generation_cursor.total_generated to advance after lazy generation")
 	} else {
-		cursorMap, ok := cursor.(map[string]any)
-		if ok {
-			seedOffset := cursorMap["last_seed_offset"]
-			t.Logf("cursor seed_offset = %v, total_generated = %v", seedOffset, cursorMap["total_generated"])
-		}
+		t.Logf("cursor seed_offset = %d, total_generated = %d", cursor.LastSeedOffset, cursor.TotalGenerated)
 	}
 
 	// Verify leaf does NOT transition to COMPLETED (is_ongoing=true).

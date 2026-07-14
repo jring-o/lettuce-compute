@@ -37,8 +37,7 @@ func (r *Router) Generate(
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo workunit.WorkUnitRepository,
-	batchRepo workunit.BatchRepository,
+	sink workunit.BatchSink,
 ) (*workunit.GenerateResult, error) {
 	r.logger.InfoContext(ctx, "dispatching work unit generation",
 		"leaf_id", proj.ID,
@@ -50,25 +49,25 @@ func (r *Router) Generate(
 		if r.paramSweep == nil {
 			return nil, apierror.ValidationError("parameter_sweep generator not configured", nil)
 		}
-		return r.paramSweep(ctx, proj, parameterSpace, batchSize, wuRepo, batchRepo)
+		return r.paramSweep(ctx, proj, parameterSpace, batchSize, sink)
 
 	case leaf.PatternMapReduce:
 		if r.mapReduce == nil {
 			return nil, apierror.ValidationError("map_reduce generator not configured", nil)
 		}
-		return r.mapReduce(ctx, proj, parameterSpace, batchSize, wuRepo, batchRepo)
+		return r.mapReduce(ctx, proj, parameterSpace, batchSize, sink)
 
 	case leaf.PatternMonteCarlo:
 		if r.monteCarlo == nil {
 			return nil, apierror.ValidationError("monte_carlo generator not configured", nil)
 		}
-		return r.monteCarlo(ctx, proj, parameterSpace, batchSize, wuRepo, batchRepo)
+		return r.monteCarlo(ctx, proj, parameterSpace, batchSize, sink)
 
 	case leaf.PatternCustom:
 		if r.custom == nil {
 			return nil, apierror.ValidationError("custom generator not configured", nil)
 		}
-		return r.custom(ctx, proj, parameterSpace, batchSize, wuRepo, batchRepo)
+		return r.custom(ctx, proj, parameterSpace, batchSize, sink)
 
 	default:
 		return nil, apierror.ValidationError(

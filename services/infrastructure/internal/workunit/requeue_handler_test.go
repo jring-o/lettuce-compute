@@ -51,7 +51,7 @@ func newRequeueRequest(t *testing.T, leafID, wuID types.ID) (*httptest.ResponseR
 }
 
 func newRequeueHandler(repo WorkUnitRepository) *WorkUnitHandler {
-	return NewWorkUnitHandler(repo, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewWorkUnitHandler(repo, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // TestHandleRequeue_QueuedUnitAbandonsLiveCopies verifies the per-copy requeue of
