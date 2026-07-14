@@ -346,7 +346,7 @@ func TestGenerate(t *testing.T) {
 			wuRepo := &mockWURepo{}
 			batchRepo := &mockBatchRepo{}
 
-			result, err := Generate(context.Background(), proj, tt.paramSpace, tt.batchSize, wuRepo, batchRepo)
+			result, err := Generate(context.Background(), proj, tt.paramSpace, tt.batchSize, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 
 			if tt.wantErr {
 				if err == nil {
@@ -384,6 +384,93 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
+// --- Ordinal-derived seed identity (design §4.5, BG-22) ---
+
+func TestGenerateSeed_HashDependsOnOrdinal(t *testing.T) {
+	leafID := types.NewID()
+	// Same LOCAL index (0) but different seed offsets => different global ordinals => the hash
+	// seeds must differ. Pre-fix (offset absent from the preimage) they were identical, which is
+	// exactly the BG-22 duplication.
+	if generateSeed("hash", 0, leafID) == generateSeed("hash", 100, leafID) {
+		t.Error("hash seed must differ when the ordinal (offset+index) differs")
+	}
+}
+
+func TestGenerateSeed_SequentialIsOrdinal(t *testing.T) {
+	leafID := types.NewID()
+	for _, ord := range []int{0, 1, 42, 1000} {
+		if got := generateSeed("sequential", ord, leafID); got != int64(ord) {
+			t.Errorf("sequential seed for ordinal %d = %d, want %d", ord, got, ord)
+		}
+	}
+}
+
+func TestGenerateSeed_HashDeterministicForOrdinal(t *testing.T) {
+	leafID := types.NewID()
+	if generateSeed("hash", 7, leafID) != generateSeed("hash", 7, leafID) {
+		t.Error("hash seed must be deterministic for a fixed (leaf, ordinal)")
+	}
+}
+
+// TestGenerate_HashTicksDisjoint proves two lazy hash ticks (distinct seed_offset) emit disjoint
+// seed AND trial_index sets — the generator-level BG-22 fix (red pre-fix: both ticks emitted the
+// identical batch).
+func TestGenerate_HashTicksDisjoint(t *testing.T) {
+	proj := testProject()
+
+	run := func(seedOffset int) ([]int64, []int) {
+		wuRepo := &mockWURepo{}
+		params := map[string]interface{}{
+			"num_trials":    float64(10),
+			"seed_strategy": "hash",
+			"seed_offset":   float64(seedOffset),
+		}
+		if _, err := Generate(context.Background(), proj, params, 100, workunit.NewRepoBatchSink(wuRepo, &mockBatchRepo{})); err != nil {
+			t.Fatalf("generate at offset %d: %v", seedOffset, err)
+		}
+		seeds := make([]int64, 0, len(wuRepo.created))
+		idxs := make([]int, 0, len(wuRepo.created))
+		for _, wu := range wuRepo.created {
+			var p trialParams
+			if err := json.Unmarshal(wu.Parameters, &p); err != nil {
+				t.Fatal(err)
+			}
+			seeds = append(seeds, p.Seed)
+			idxs = append(idxs, p.TrialIndex)
+		}
+		return seeds, idxs
+	}
+
+	seeds0, idx0 := run(0)
+	seeds10, idx10 := run(10)
+
+	seedSet := map[int64]bool{}
+	for _, s := range seeds0 {
+		seedSet[s] = true
+	}
+	for _, s := range seeds10 {
+		if seedSet[s] {
+			t.Errorf("hash seed %d emitted by both ticks (must be disjoint)", s)
+		}
+	}
+
+	idxSet := map[int]bool{}
+	for _, i := range idx0 {
+		idxSet[i] = true
+	}
+	for _, i := range idx10 {
+		if idxSet[i] {
+			t.Errorf("trial_index %d emitted by both ticks (must be disjoint)", i)
+		}
+	}
+	// Trial identities are the global ordinals: tick 0 => 0..9, tick 1 => 10..19.
+	for i, got := range idx10 {
+		if got != 10+i {
+			t.Errorf("second tick trial_index[%d]=%d, want %d", i, got, 10+i)
+		}
+	}
+}
+
 func TestGenerate_HashDeterministic(t *testing.T) {
 	proj := testProject()
 	params := map[string]interface{}{
@@ -393,14 +480,14 @@ func TestGenerate_HashDeterministic(t *testing.T) {
 
 	wuRepo1 := &mockWURepo{}
 	batchRepo1 := &mockBatchRepo{}
-	_, err := Generate(context.Background(), proj, params, 100, wuRepo1, batchRepo1)
+	_, err := Generate(context.Background(), proj, params, 100, workunit.NewRepoBatchSink(wuRepo1, batchRepo1))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	wuRepo2 := &mockWURepo{}
 	batchRepo2 := &mockBatchRepo{}
-	_, err = Generate(context.Background(), proj, params, 100, wuRepo2, batchRepo2)
+	_, err = Generate(context.Background(), proj, params, 100, workunit.NewRepoBatchSink(wuRepo2, batchRepo2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +509,7 @@ func TestGenerate_NumTrialsOne(t *testing.T) {
 
 	result, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": float64(1),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -441,7 +528,7 @@ func TestGenerate_NumTrialsNonNumeric(t *testing.T) {
 
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": "one hundred",
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for string num_trials")
 	}
@@ -458,7 +545,7 @@ func TestGenerate_SeedStrategyNonString(t *testing.T) {
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials":    float64(10),
 		"seed_strategy": float64(42),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for non-string seed_strategy")
 	}
@@ -474,7 +561,7 @@ func TestGenerate_BatchCreateError(t *testing.T) {
 
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": float64(10),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when batch create fails")
 	}
@@ -487,7 +574,7 @@ func TestGenerate_BulkCreateError(t *testing.T) {
 
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": float64(10),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when bulk create fails")
 	}
@@ -500,7 +587,7 @@ func TestGenerate_BulkTransitionError(t *testing.T) {
 
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": float64(10),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when bulk transition fails")
 	}
@@ -513,7 +600,7 @@ func TestGenerate_ListByProjectError(t *testing.T) {
 
 	_, err := Generate(context.Background(), proj, map[string]interface{}{
 		"num_trials": float64(10),
-	}, 100, wuRepo, batchRepo)
+	}, 100, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when ListByLeaf fails")
 	}

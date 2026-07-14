@@ -28,6 +28,14 @@ func TestValidateTransition(t *testing.T) {
 		{"RUNNING → EXPIRED", WorkUnitStateRunning, WorkUnitStateExpired},
 		{"COMPLETED → VALIDATED", WorkUnitStateCompleted, WorkUnitStateValidated},
 		{"COMPLETED → REJECTED", WorkUnitStateCompleted, WorkUnitStateRejected},
+		// The recovery REOPEN edge: a COMPLETED unit whose straggler copies all died
+		// without submitting is demoted back to QUEUED (plain flip, no requeue business
+		// logic) so dispatch can supply the missing corroborators. Taken only by the
+		// transitioner's reopen arm.
+		{"COMPLETED → QUEUED", WorkUnitStateCompleted, WorkUnitStateQueued},
+		// The widened dead-letter edge: DeadLetterIfExhausted accepts COMPLETED units
+		// (version-heterogeneous edge) — the chart mirrors what the SQL can do.
+		{"COMPLETED → FAILED", WorkUnitStateCompleted, WorkUnitStateFailed},
 		{"REJECTED → QUEUED", WorkUnitStateRejected, WorkUnitStateQueued},
 		{"REJECTED → FAILED", WorkUnitStateRejected, WorkUnitStateFailed},
 		{"EXPIRED → QUEUED", WorkUnitStateExpired, WorkUnitStateQueued},
@@ -57,7 +65,6 @@ func TestValidateTransition(t *testing.T) {
 		{"VALIDATED → COMPLETED", WorkUnitStateValidated, WorkUnitStateCompleted},
 		{"FAILED → QUEUED", WorkUnitStateFailed, WorkUnitStateQueued},
 		{"CREATED → RUNNING", WorkUnitStateCreated, WorkUnitStateRunning},
-		{"COMPLETED → QUEUED", WorkUnitStateCompleted, WorkUnitStateQueued},
 		{"VALIDATED → FAILED", WorkUnitStateValidated, WorkUnitStateFailed},
 		{"FAILED → VALIDATED", WorkUnitStateFailed, WorkUnitStateValidated},
 	}

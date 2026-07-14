@@ -452,6 +452,12 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ValidationConfig != nil {
 		raw := rawReq["validation_config"]
+		// Refuse keys removed from ValidationConfig on the RAW block before the typed merge
+		// drops them silently (E1-C config honesty — e.g. max_success_copies, design §4.9).
+		if apiErr := RejectRemovedValidationConfigKeys(raw); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
 		merged := p.ValidationConfig
 		if err := json.Unmarshal(raw, &merged); err != nil {
 			apierror.WriteError(w, apierror.ValidationError("invalid validation_config", nil))
@@ -486,7 +492,7 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ApplyDataConfigDefaults(&merged)
-		if apiErr := ValidateDataConfig(&merged, p.TaskPattern); apiErr != nil {
+		if apiErr := ValidateDataConfig(&merged, p.TaskPattern, p.IsOngoing); apiErr != nil {
 			apierror.WriteError(w, apiErr)
 			return
 		}

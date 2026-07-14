@@ -9,7 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
@@ -39,7 +38,7 @@ const workUnitColumns = `id, leaf_id, batch_id, state, priority,
 	reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 	flagged_for_review, spot_check, last_checkpoint_at, last_checkpoint_sequence,
 	created_at, updated_at, hr_class,
-	target_copies, min_quorum, max_error_copies, max_success_copies`
+	target_copies, min_quorum, max_error_copies`
 
 // scanWorkUnit scans a work unit row into a WorkUnit struct.
 // The column order must match workUnitColumns.
@@ -77,7 +76,6 @@ func scanWorkUnit(row pgx.Row) (*WorkUnit, error) {
 		&wu.TargetCopies,
 		&wu.MinQuorum,
 		&wu.MaxErrorCopies,
-		&wu.MaxSuccessCopies,
 	)
 	return &wu, err
 }
@@ -157,7 +155,7 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 			assigned_volunteer_id, assigned_at, started_at, completed_at, validated_at,
 			reassignment_count, max_reassignments, max_total_copies, last_heartbeat_at,
 			flagged_for_review, spot_check,
-			target_copies, min_quorum, max_error_copies, max_success_copies
+			target_copies, min_quorum, max_error_copies
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, $8,
@@ -165,7 +163,7 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 			$12, $13, $14, $15, $16,
 			$17, $18, $19, $20,
 			$21, $22,
-			$23, $24, $25, $26
+			$23, $24, $25
 		) RETURNING `+workUnitColumns,
 		wu.LeafID, wu.BatchID, wu.State, wu.Priority,
 		wu.InputData, wu.InputDataRef, wu.CodeArtifactRef, wu.Parameters,
@@ -173,7 +171,7 @@ func (r *PgxWorkUnitRepository) Create(ctx context.Context, wu *WorkUnit) error 
 		wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 		wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 		wu.FlaggedForReview, wu.SpotCheck,
-		wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
+		wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies,
 	)
 
 	result, err := scanWorkUnit(row)
@@ -415,7 +413,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 		"assigned_volunteer_id", "assigned_at", "started_at", "completed_at", "validated_at",
 		"reassignment_count", "max_reassignments", "max_total_copies", "last_heartbeat_at",
 		"flagged_for_review", "spot_check",
-		"target_copies", "min_quorum", "max_error_copies", "max_success_copies",
+		"target_copies", "min_quorum", "max_error_copies",
 	}
 
 	rows := make([][]any, len(wus))
@@ -431,7 +429,7 @@ func (r *PgxWorkUnitRepository) BulkCreate(ctx context.Context, wus []*WorkUnit)
 			wu.AssignedVolunteerID, wu.AssignedAt, wu.StartedAt, wu.CompletedAt, wu.ValidatedAt,
 			wu.ReassignmentCount, wu.MaxReassignments, wu.MaxTotalCopies, wu.LastHeartbeatAt,
 			wu.FlaggedForReview, wu.SpotCheck,
-			wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies, wu.MaxSuccessCopies,
+			wu.TargetCopies, wu.MinQuorum, wu.MaxErrorCopies,
 		}
 	}
 
@@ -486,7 +484,7 @@ const prefixedWorkUnitColumns = `wu.id, wu.leaf_id, wu.batch_id, wu.state, wu.pr
 	wu.reassignment_count, wu.max_reassignments, wu.max_total_copies, wu.last_heartbeat_at,
 	wu.flagged_for_review, wu.spot_check, wu.last_checkpoint_at, wu.last_checkpoint_sequence,
 	wu.created_at, wu.updated_at, wu.hr_class,
-	wu.target_copies, wu.min_quorum, wu.max_error_copies, wu.max_success_copies`
+	wu.target_copies, wu.min_quorum, wu.max_error_copies`
 
 // scanDispatchCandidate scans the prefixedWorkUnitColumns set (column order matching
 // the const above) into a WorkUnit. Shared by FindDispatchableBatch /
@@ -500,7 +498,7 @@ func scanDispatchWorkUnit(rows pgx.Rows, wu *WorkUnit, extra ...any) error {
 		&wu.ReassignmentCount, &wu.MaxReassignments, &wu.MaxTotalCopies, &wu.LastHeartbeatAt,
 		&wu.FlaggedForReview, &wu.SpotCheck, &wu.LastCheckpointAt, &wu.LastCheckpointSequence,
 		&wu.CreatedAt, &wu.UpdatedAt, &wu.HRClass,
-		&wu.TargetCopies, &wu.MinQuorum, &wu.MaxErrorCopies, &wu.MaxSuccessCopies,
+		&wu.TargetCopies, &wu.MinQuorum, &wu.MaxErrorCopies,
 	}
 	dst = append(dst, extra...)
 	return rows.Scan(dst...)
@@ -1925,6 +1923,108 @@ func (r *PgxWorkUnitRepository) FindStuckSpotCheckUnits(ctx context.Context, lim
 	return workUnits, nil
 }
 
+// scanIDRows collects a single-column work-unit-id result set. errCtx names the query for the
+// wrapped Internal error on a scan/iterate failure.
+func scanIDRows(rows pgx.Rows, errCtx string) ([]types.ID, error) {
+	defer rows.Close()
+	var ids []types.ID
+	for rows.Next() {
+		var id types.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, apierror.Internal("failed to scan "+errCtx, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate "+errCtx, err)
+	}
+	return ids, nil
+}
+
+// FindStalledFinalizationUnits returns finalization-stalled COMPLETED/REJECTED units — the
+// recovery sweep's shape-1 candidates (design §4.2). A unit qualifies when its finalization
+// clock is aged past olderThan: completed_at for COMPLETED (stamped once per COMPLETED episode
+// and re-stamped on a re-park after a reopen, so the clock restarts correctly), updated_at for
+// REJECTED (a REJECTED unit is not QUEUED, so no dispatch machinery churns its updated_at). The
+// pre-fix credit-residue shape — a COMPLETED unit with zero PENDING results and at least one
+// AGREED result — is EXCLUDED: its marks committed without the state flip and credit, so
+// re-Evaluate (which loads only PENDING results) cannot repair it; the sweeper reports it via
+// FindFinalizationResidueUnits and skips. Oldest first, LIMIT. Rides idx_wu_stalled.
+func (r *PgxWorkUnitRepository) FindStalledFinalizationUnits(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id FROM work_units wu
+		WHERE wu.state IN ('COMPLETED', 'REJECTED')
+		  AND (CASE WHEN wu.state = 'COMPLETED' THEN COALESCE(wu.completed_at, wu.updated_at)
+		            ELSE wu.updated_at END) < now() - make_interval(secs => $1)
+		  AND NOT (
+		    wu.state = 'COMPLETED'
+		    AND NOT EXISTS (SELECT 1 FROM results r
+		                    WHERE r.work_unit_id = wu.id AND r.validation_status = 'PENDING')
+		    AND EXISTS (SELECT 1 FROM results r
+		                WHERE r.work_unit_id = wu.id AND r.validation_status = 'AGREED')
+		  )
+		ORDER BY (CASE WHEN wu.state = 'COMPLETED' THEN COALESCE(wu.completed_at, wu.updated_at)
+		               ELSE wu.updated_at END) ASC
+		LIMIT $2`,
+		int(olderThan.Seconds()), limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find stalled finalization units", err)
+	}
+	return scanIDRows(rows, "stalled finalization unit")
+}
+
+// FindStalledQueuedAtQuorum returns QUEUED units already holding a quorum's worth of PENDING
+// results whose newest PENDING result is aged past olderThan — the recovery sweep's shape-2
+// candidates (design §4.2, reviews #3/#5). It is deliberately driven FROM the results side and
+// ages on the EVIDENCE (MAX(created_at) of the PENDING results), NOT on work_units.updated_at:
+// dispatch-claim stamping/renewal and expired-claim hygiene bump updated_at with zero progress
+// on the unit, which would age-mask a dispatchable strand precisely in the quiet-pool regime
+// the sweep exists for. The pending count is the RAW count against the shared quorum fragment
+// (effQuorumWuL), mirroring Decide's attempt gate — the sweep asks only "might Evaluate do
+// something," and Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l
+// primary keys so the quorum fragment's per-row column references are resolvable. Oldest
+// evidence first, LIMIT. Rides idx_results_pending_by_unit.
+func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id
+		FROM results r
+		JOIN work_units wu ON wu.id = r.work_unit_id
+		JOIN leafs l ON l.id = wu.leaf_id
+		WHERE r.validation_status = 'PENDING' AND wu.state = 'QUEUED'
+		GROUP BY wu.id, l.id
+		HAVING MAX(r.created_at) < now() - make_interval(secs => $1)
+		   AND COUNT(*) >= `+effQuorumWuL+`
+		ORDER BY MAX(r.created_at) ASC
+		LIMIT $2`,
+		int(olderThan.Seconds()), limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find stalled queued-at-quorum units", err)
+	}
+	return scanIDRows(rows, "stalled queued-at-quorum unit")
+}
+
+// FindFinalizationResidueUnits returns the pre-fix finalization-residue shape excluded by
+// FindStalledFinalizationUnits: COMPLETED units whose results were adjudicated (zero PENDING,
+// at least one AGREED) but whose state flip and credit never landed (a crash between the marks
+// and the flip in the non-atomic pre-fix accept path, design §4.2/★E1-1). Re-Evaluate cannot
+// repair these — the sweeper WARNs one line per unit for operator adjudication (E1 closeout
+// census) and never re-drives them. Oldest first, LIMIT.
+func (r *PgxWorkUnitRepository) FindFinalizationResidueUnits(ctx context.Context, limit int) ([]types.ID, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT wu.id FROM work_units wu
+		WHERE wu.state = 'COMPLETED'
+		  AND NOT EXISTS (SELECT 1 FROM results r
+		                  WHERE r.work_unit_id = wu.id AND r.validation_status = 'PENDING')
+		  AND EXISTS (SELECT 1 FROM results r
+		              WHERE r.work_unit_id = wu.id AND r.validation_status = 'AGREED')
+		ORDER BY COALESCE(wu.completed_at, wu.updated_at) ASC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, apierror.Internal("failed to find finalization residue units", err)
+	}
+	return scanIDRows(rows, "finalization residue unit")
+}
+
 // CloseCopy closes a copy by id with the given outcome (e.g. EXPIRED, ABANDONED),
 // stamping outcome_at = NOW(). Idempotent: only a still-live copy is closed.
 func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, outcome string) error {
@@ -2021,15 +2121,12 @@ func (r *PgxWorkUnitRepository) MarkCompleted(ctx context.Context, id types.ID) 
 }
 
 // CountErrorCopies returns the unit's wasted-work tally: copies that ended EXPIRED or ABANDONED
-// plus DISAGREED results — the max_error_copies cap probe (TODO #50).
+// plus DISAGREED results — the max_error_copies cap probe (TODO #50). It embeds the shared
+// errorCopiesSQL fragment so the count has exactly one definition, the same one the
+// dead-letter executor and RefundCopyBudget use.
 func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID types.ID) (int, error) {
 	var n int
-	if err := r.db.QueryRow(ctx, `
-		SELECT
-		  (SELECT COUNT(*) FROM work_unit_assignment_history
-		   WHERE work_unit_id = $1 AND outcome IN ('EXPIRED', 'ABANDONED'))
-		  + (SELECT COUNT(*) FROM results
-		     WHERE work_unit_id = $1 AND validation_status = 'DISAGREED')`,
+	if err := r.db.QueryRow(ctx, `SELECT `+errorCopiesSQL("$1"),
 		workUnitID,
 	).Scan(&n); err != nil {
 		return 0, apierror.Internal("failed to count error copies", err)
@@ -2037,18 +2134,43 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
-// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED,
-// has NO live copy outstanding, its redundancy is still unmet (PENDING results <
-// redundancy), AND the total copies ever created has reached its dead-letter ceiling
-// (max_total_copies, defaulting to redundancy + a margin). This is the ONLY cap on
-// requeue (property 6): honest timeouts redispatch with no per-attempt limit, but a
-// hopeless (poison) unit eventually stops burning the volunteer pool. Returns whether
-// the unit was failed.
+// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED or
+// COMPLETED, has NO live copy outstanding, its redundancy is still unmet (PENDING results <
+// quorum), AND its copy budget is spent: EITHER the total copies ever created has reached its
+// dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR — when the owner
+// configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED) have reached
+// max_error_copies. Returns whether the unit was failed.
+//
+// The ceiling disjunct MIRRORS transition.capsExhausted (decide.go) field-for-field:
+// `total >= effMaxTotal OR (effMaxError > 0 AND errors >= effMaxError)`, built from the shared
+// effMaxErrorWuL / errorCopiesSQL fragments so the SQL executor and the Go decider can never
+// resolve a different cap or count a different error tally. Wiring this disjunct is BG-27
+// (design §4.9): before it, MaxErrorCopies was resolved and decided in Go but executed by no
+// SQL, so `Decide` said ActionDeadLetter while this executor matched 0 rows and the poison unit
+// stayed QUEUED and dispatchable until the (much larger) total ceiling. The `effMaxError > 0`
+// guard is load-bearing: 0 = unlimited, and a raw `errors >= 0` would dead-letter every unit.
+//
+// The state guard is `IN ('QUEUED','COMPLETED')` (was QUEUED-only): the rare COMPLETED unit
+// whose version-filtered PENDING set drops below quorum with the copy budget exhausted (the
+// version-heterogeneous edge, design §4.2) must dead-letter in one tick instead of never. The
+// semantic guards below — no live copy, PENDING < quorum, and a spent budget — carry the
+// meaning; the state list is belt.
+//
+// Adversarial trade-off armed by the error disjunct (design §4.9, review #4): errorCopiesSQL
+// counts ABANDONED history rows, and abandon is a free authenticated call that closes the
+// caller's own live copy, so an owner-set small cap becomes an abandon-driven unit-kill lever —
+// an attacker whose accounts receive copies and abandon them can drive a unit to FAILED at cost
+// ≈ reservations. Bounded by dispatch randomness (volunteers cannot choose which unit they get,
+// so only randomly-landed units are killable); the kill is FAILED + flagged_for_review, so it
+// is operator-visible by construction (the tripwire); and it is recoverable — RefundCopyBudget
+// rematerializes a fresh budget and requeues. The validation floor (leaf/validation.go refuses
+// 0 < max_error_copies < target_copies) keeps an honest owner from setting a cap that honest
+// churn alone could trip.
 func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
 		FROM leafs l
-		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state = 'QUEUED'
+		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED')
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history h
 		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
@@ -2058,9 +2180,14 @@ func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workU
 		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
 		  ) < `+effQuorumWuL+`
 		  AND (
-		    SELECT COUNT(*) FROM work_unit_assignment_history h2
-		    WHERE h2.work_unit_id = wu.id
-		  ) >= `+effMaxTotalWuL+``,
+		    (
+		      SELECT COUNT(*) FROM work_unit_assignment_history h2
+		      WHERE h2.work_unit_id = wu.id
+		    ) >= `+effMaxTotalWuL+`
+		    OR (
+		      `+effMaxErrorWuL+` > 0 AND `+errorCopiesSQL("wu.id")+` >= `+effMaxErrorWuL+`
+		    )
+		  )`,
 		workUnitID,
 	)
 	if err != nil {
@@ -2102,11 +2229,12 @@ func (r *PgxWorkUnitRepository) Reassign(ctx context.Context, id types.ID) (*Wor
 //	max_total_copies = <copies ever created> + maxTotal
 //	max_error_copies = <error copies so far> + maxError   (only when maxError > 0)
 //
-// The two count subqueries are inlined verbatim from CountTotalCopies and
-// CountErrorCopies so the refund reads exactly the same tallies the dead-letter probe
-// does. maxError == 0 means the resolved error ceiling is unlimited (0 = unlimited): the
-// CASE leaves max_error_copies untouched, because materializing count+0 would CREATE a
-// finite error ceiling that never existed.
+// The copy count is inlined from CountTotalCopies and the error count embeds the shared
+// errorCopiesSQL fragment (the same one CountErrorCopies and the dead-letter probe use), so
+// the refund reads exactly the tallies the dead-letter probe reads. maxError == 0 means the
+// resolved error ceiling is unlimited (0 = unlimited): the CASE leaves max_error_copies
+// untouched, because materializing count+0 would CREATE a finite error ceiling that never
+// existed.
 //
 // Guarded WHERE state = 'REJECTED': it runs only on the demotion / resume path before the
 // unit is requeued, never after it is QUEUED, so a leadership-failover double-sweep cannot
@@ -2121,12 +2249,7 @@ func (r *PgxWorkUnitRepository) RefundCopyBudget(ctx context.Context, id types.I
 			max_total_copies = (
 				SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1
 			) + $2,
-			max_error_copies = CASE WHEN $3 > 0 THEN (
-				(SELECT COUNT(*) FROM work_unit_assignment_history
-				 WHERE work_unit_id = $1 AND outcome IN ('EXPIRED', 'ABANDONED'))
-				+ (SELECT COUNT(*) FROM results
-				   WHERE work_unit_id = $1 AND validation_status = 'DISAGREED')
-			) + $3 ELSE max_error_copies END,
+			max_error_copies = CASE WHEN $3 > 0 THEN `+errorCopiesSQL("$1")+` + $3 ELSE max_error_copies END,
 			updated_at = now()
 		WHERE id = $1 AND state = 'REJECTED'`,
 		id, maxTotal, maxError,
@@ -2282,18 +2405,21 @@ func (r *PgxWorkUnitRepository) CountTrustStarvedUnits(ctx context.Context, samp
 
 // PgxBatchRepository implements BatchRepository using pgx.
 type PgxBatchRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
 // NewPgxBatchRepository creates a new PgxBatchRepository.
-func NewPgxBatchRepository(pool *pgxpool.Pool) *PgxBatchRepository {
-	return &PgxBatchRepository{pool: pool}
+// Accepts *pgxpool.Pool for normal use or pgx.Tx for transactional use (the
+// generation BatchSink persists a batch row, its work units, and the lazy
+// cursor advance in one transaction).
+func NewPgxBatchRepository(db DBTX) *PgxBatchRepository {
+	return &PgxBatchRepository{db: db}
 }
 
 // Create inserts a new batch. On return, b is populated with DB-generated
 // id and timestamps.
 func (r *PgxBatchRepository) Create(ctx context.Context, b *Batch) error {
-	row := r.pool.QueryRow(ctx, `
+	row := r.db.QueryRow(ctx, `
 		INSERT INTO batches (
 			leaf_id, sequence_number, total_work_units, completed_work_units
 		) VALUES ($1, $2, $3, $4)
@@ -2326,7 +2452,7 @@ func (r *PgxBatchRepository) Create(ctx context.Context, b *Batch) error {
 
 // GetByID retrieves a batch by its UUID.
 func (r *PgxBatchRepository) GetByID(ctx context.Context, id types.ID) (*Batch, error) {
-	row := r.pool.QueryRow(ctx,
+	row := r.db.QueryRow(ctx,
 		"SELECT "+batchColumns+" FROM batches WHERE id = $1", id)
 
 	b, err := scanBatch(row)
@@ -2370,7 +2496,7 @@ func (r *PgxBatchRepository) ListByLeaf(ctx context.Context, projectID types.ID,
 		batchColumns, where, argIdx)
 	args = append(args, pageSize+1)
 
-	rows, err := r.pool.Query(ctx, query, args...)
+	rows, err := r.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, types.PaginationResponse{}, apierror.Internal("failed to list batches", err)
 	}
@@ -2401,7 +2527,7 @@ func (r *PgxBatchRepository) ListByLeaf(ctx context.Context, projectID types.ID,
 
 // IncrementCompleted atomically increments a batch's completed_work_units by 1.
 func (r *PgxBatchRepository) IncrementCompleted(ctx context.Context, batchID types.ID) error {
-	tag, err := r.pool.Exec(ctx,
+	tag, err := r.db.Exec(ctx,
 		"UPDATE batches SET completed_work_units = completed_work_units + 1 WHERE id = $1",
 		batchID,
 	)

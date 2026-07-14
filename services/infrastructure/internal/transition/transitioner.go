@@ -2,6 +2,7 @@ package transition
 
 import (
 	"context"
+	"errors"
 	"hash/fnv"
 	"log/slog"
 	"time"
@@ -14,6 +15,14 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
+// ErrStaleSnapshot is returned (wrapped) by a Comparator's ApplyAccept/ApplyReject when the
+// finalization transaction's in-tx PENDING recheck disagrees with the snapshot the decision
+// was made from: a result submitted between the transitioner's snapshot load and the
+// transaction's unit row lock would otherwise be adjudicated by nobody and orphan PENDING
+// under a terminal unit. The whole transaction rolls back; Evaluate retries once with a
+// fresh snapshot (a second staleness propagates — the recovery sweep re-drives later).
+var ErrStaleSnapshot = errors.New("finalization snapshot stale: pending results changed since load")
+
 // Outcome is the terminal-ish result of one Evaluate, for the caller's structured log.
 type Outcome string
 
@@ -23,6 +32,10 @@ const (
 	OutcomeValidated    Outcome = "VALIDATED"
 	OutcomeRejected     Outcome = "REJECTED"
 	OutcomeDeadLettered Outcome = "FAILED"
+	// OutcomeReopened is returned when the reopen arm demotes a phantom-headroom park back to
+	// QUEUED (COMPLETED via a plain guarded flip, or the stranded-REJECTED residue via
+	// Reassign) so dispatch can supply the missing corroborators (★E1-5, §4.2).
+	OutcomeReopened Outcome = "REOPENED"
 )
 
 // Comparator is the validation-engine surface the transitioner orchestrates: a read-only
@@ -40,17 +53,35 @@ type Comparator interface {
 	// attestation builder can sign the quorum event as it was actually gated (attestation v2
 	// quorum descriptor); both are non-nil/resolved on every transitioner path by
 	// construction (a unit only validates or rejects after a verdict exists).
-	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
+	//
+	// rawPendingCount is the snapshot's RAW count of PENDING results (before the
+	// version-homogeneity filter). The implementation re-counts PENDING on its transaction
+	// connection and aborts with ErrStaleSnapshot when the counts differ — the row lock
+	// serializes the writes; this recheck re-validates the READ, so a submit landing between
+	// snapshot load and the transaction's unit row lock forces a clean retry instead of
+	// silently orphaning its row. Raw-to-raw deliberately: version-heterogeneous rows the
+	// filter excludes exist in both counts, so they can never trip a retry loop.
+	ApplyAccept(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending, majority []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy, rawPendingCount int) error
 	// ApplyReject performs the reject effects (mark DISAGREED, COMPLETED->REJECTED, requeue).
 	// On a reject the verdict carries the LOSING clique (the largest coherent agreeing group
 	// that failed the gates) — the honest descriptor for the attestations of a rejected unit.
-	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy) error
+	// rawPendingCount as on ApplyAccept.
+	ApplyReject(ctx context.Context, wu *workunit.WorkUnit, lf *leaf.Leaf, pending []*result.Result, verdict *ComparisonVerdict, policy RedundancyPolicy, rawPendingCount int) error
 }
 
 // WorkUnitStore is the narrow work-unit repo surface the transitioner needs.
 type WorkUnitStore interface {
 	GetByID(ctx context.Context, id types.ID) (*workunit.WorkUnit, error)
 	MarkCompleted(ctx context.Context, id types.ID) error
+	// UpdateState performs a guarded state transition (WHERE id AND state = from). The reopen
+	// arm uses it for the COMPLETED -> QUEUED demotion: a plain flip that touches no results
+	// (the repo applies no requeue business logic on that edge; every UpdateState clears the
+	// dispatch-claim columns, so the reopened unit is immediately claimable).
+	UpdateState(ctx context.Context, id types.ID, from, to workunit.WorkUnitState) (*workunit.WorkUnit, error)
+	// Reassign returns an EXPIRED/REJECTED unit to QUEUED with the standard requeue business
+	// logic (reassignment-count bump, claim clear). The reopen arm uses it to complete the
+	// requeue a pre-fix crash interrupted on a stranded-REJECTED residue unit.
+	Reassign(ctx context.Context, id types.ID) (*workunit.WorkUnit, bool, error)
 	CountLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
 	// CountProbationLiveCopies returns the live copies whose HOLDER's CURRENT effective standing
 	// is not OK (BG-24b) — the probation-held copies Decide EXCLUDES from redundancy coverage so
@@ -125,6 +156,15 @@ func (t *Transitioner) Evaluate(ctx context.Context, workUnitID types.ID) (Outco
 	var outcome Outcome
 	err := t.locker.WithUnitLock(ctx, unitLockKey(workUnitID), func() error {
 		o, e := t.decideAndApply(ctx, workUnitID)
+		if errors.Is(e, ErrStaleSnapshot) {
+			// A submit landed between snapshot load and the finalization transaction's
+			// unit row lock; nothing was written. Retry once with a fresh snapshot so the
+			// full result set is adjudicated together. Bounded: a second staleness
+			// propagates the error (the recovery sweep re-drives later), so a submit
+			// storm on one unit costs at most one retry per Evaluate.
+			t.logger.Info("finalization snapshot stale; retrying with fresh snapshot", "work_unit_id", workUnitID)
+			o, e = t.decideAndApply(ctx, workUnitID)
+		}
 		outcome = o
 		return e
 	})
@@ -156,6 +196,10 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 			pending = append(pending, r)
 		}
 	}
+	// The RAW pending count (pre-version-filter) anchors the finalization transaction's
+	// stale-snapshot recheck: the accept/reject tx re-counts PENDING on its own connection
+	// and aborts when the counts differ (see Comparator.ApplyAccept).
+	rawPendingCount := len(pending)
 	pending = t.comparator.FilterPending(pending) // version-homogeneous (never compare across versions)
 
 	live, err := t.wus.CountLiveCopies(ctx, id)
@@ -228,7 +272,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority, snap.Comparison, policy); err != nil {
+		if err := t.comparator.ApplyAccept(ctx, wu, lf, pending, majority, snap.Comparison, policy, rawPendingCount); err != nil {
 			return OutcomeNoop, err
 		}
 		// Over-dispatch hygiene (TODO #50): validate-at-quorum can leave extra copies still
@@ -246,7 +290,7 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		if err := t.wus.MarkCompleted(ctx, id); err != nil {
 			return OutcomeNoop, err
 		}
-		if err := t.comparator.ApplyReject(ctx, wu, lf, pending, snap.Comparison, policy); err != nil {
+		if err := t.comparator.ApplyReject(ctx, wu, lf, pending, snap.Comparison, policy, rawPendingCount); err != nil {
 			return OutcomeNoop, err
 		}
 		return OutcomeRejected, nil
@@ -263,6 +307,9 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		return OutcomeNoop, nil
 
 	default: // ActionWait
+		if d.Reopen {
+			return t.reopen(ctx, id, wu.State)
+		}
 		if d.CompleteFirst {
 			if err := t.wus.MarkCompleted(ctx, id); err != nil {
 				return OutcomeNoop, err
@@ -270,6 +317,36 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 		}
 		return OutcomeWaiting, nil
 	}
+}
+
+// reopen executes the phantom-headroom progress arm (★E1-5, §4.2): a WAIT that rests on
+// dispatch headroom no dispatcher can use because the unit is not QUEUED. It demotes the unit
+// back to QUEUED so dispatch supplies the missing corroborators. Best-effort — a Conflict or
+// error is logged and reported as a plain WAITING so the sweep re-drives on the next tick.
+//
+//   - COMPLETED -> QUEUED: a plain guarded flip (no requeue business logic; the PENDING rows
+//     keep holding their redundancy slots and keep counting toward coverage).
+//   - REJECTED -> QUEUED: the standard Reassign requeue, completing exactly what a pre-fix
+//     crash interrupted (this residue class is unreachable once §4.1 requeues in-tx).
+func (t *Transitioner) reopen(ctx context.Context, id types.ID, state workunit.WorkUnitState) (Outcome, error) {
+	switch state {
+	case workunit.WorkUnitStateCompleted:
+		if _, err := t.wus.UpdateState(ctx, id, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateQueued); err != nil {
+			t.logger.Warn("failed to reopen parked COMPLETED unit; sweep will re-drive", "work_unit_id", id, "error", err)
+			return OutcomeWaiting, nil
+		}
+	case workunit.WorkUnitStateRejected:
+		if _, _, err := t.wus.Reassign(ctx, id); err != nil {
+			t.logger.Warn("failed to requeue stranded REJECTED unit; sweep will re-drive", "work_unit_id", id, "error", err)
+			return OutcomeWaiting, nil
+		}
+	default:
+		// Decide only sets Reopen for COMPLETED/REJECTED; any other state here is a defensive
+		// no-op rather than an illegal transition attempt.
+		return OutcomeWaiting, nil
+	}
+	t.logger.Info("reopened parked work unit for dispatch", "work_unit_id", id, "state", string(state))
+	return OutcomeReopened, nil
 }
 
 // unitLockKey hashes a work-unit id to the int64 advisory-lock key space (mirrors the FNV-64a

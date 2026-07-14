@@ -30,9 +30,6 @@ func TestResolvePolicy_DefaultsReproduceRedundancyFactor(t *testing.T) {
 		if p.MaxTotalCopies != r+defaultCopyRetryMargin {
 			t.Errorf("r=%d: MaxTotalCopies = %d, want %d", r, p.MaxTotalCopies, r+defaultCopyRetryMargin)
 		}
-		if p.MaxSuccessCopies != r {
-			t.Errorf("r=%d: MaxSuccessCopies = %d, want target %d", r, p.MaxSuccessCopies, r)
-		}
 		if p.MaxErrorCopies != 0 {
 			t.Errorf("r=%d: MaxErrorCopies = %d, want 0 (unlimited)", r, p.MaxErrorCopies)
 		}

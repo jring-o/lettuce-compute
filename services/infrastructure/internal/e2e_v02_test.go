@@ -47,7 +47,7 @@ func setupE2EServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, func()) {
 
 	wuRepo := workunit.NewPgxWorkUnitRepository(pool)
 	batchRepo := workunit.NewPgxBatchRepository(pool)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, logger)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, adaptGenerate, workunit.NewRepoBatchSink(wuRepo, batchRepo), logger)
 
 	statsEngine := stats.NewEngine(pool)
 	statsHandler := stats.NewStatsHandler(statsEngine, leafRepo, logger)

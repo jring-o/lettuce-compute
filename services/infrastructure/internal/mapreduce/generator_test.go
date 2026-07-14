@@ -187,7 +187,7 @@ func TestGenerate_InlineByLineCount(t *testing.T) {
 		"input_data": inputData,
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestGenerate_ExternalReference(t *testing.T) {
 		"input_data_ref": "https://storage.example.com/dataset.csv",
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestGenerate_ExternalRefWithInlineData(t *testing.T) {
 		"input_data_ref": "https://storage.example.com/dataset.csv",
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestGenerate_MissingInputData(t *testing.T) {
 
 	params := map[string]interface{}{}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for missing input data")
 	}
@@ -309,7 +309,7 @@ func TestGenerate_NotMapReduce(t *testing.T) {
 		"input_data": "data\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for non-MAP_REDUCE project")
 	}
@@ -334,7 +334,7 @@ func TestGenerate_BatchSizing(t *testing.T) {
 		"input_data": inputData,
 	}
 
-	result, err := Generate(ctx, proj, params, 20, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 20, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestGenerate_MissingSplittingStrategy(t *testing.T) {
 		"input_data": "data\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for missing splitting_strategy")
 	}
@@ -388,7 +388,7 @@ func TestGenerate_InvalidSplittingStrategy(t *testing.T) {
 		"input_data": "data\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for invalid splitting_strategy")
 	}
@@ -406,7 +406,7 @@ func TestGenerate_EmptySplittingStrategy(t *testing.T) {
 		"input_data": "data\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for empty splitting_strategy")
 	}
@@ -422,7 +422,7 @@ func TestGenerate_InputDataRefNonString(t *testing.T) {
 		"input_data_ref": 12345, // not a string
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for non-string input_data_ref")
 	}
@@ -442,7 +442,7 @@ func TestGenerate_BulkCreateError(t *testing.T) {
 		"input_data": "line1\nline2\nline3\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when BulkCreate fails")
 	}
@@ -462,7 +462,7 @@ func TestGenerate_TransitionError(t *testing.T) {
 		"input_data": "line1\nline2\n",
 	}
 
-	_, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when transition fails")
 	}

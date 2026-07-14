@@ -1569,6 +1569,23 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 					"output_data size %d bytes exceeds leaf max_output_size_bytes %d", len(req.OutputData), maxOut)
 			}
 		}
+
+		// Gate 3: inline output content validation (design §4.3). Enforce at the door
+		// exactly what this leaf's own comparator will later require of an inline output:
+		// non-empty well-formed JSON for every leaf, plus — for a NUMERIC_TOLERANCE leaf —
+		// the same numeric flatten under the leaf's configured ignore_fields/compare_fields.
+		// A malformed, empty, or float64-overflow (1e400) output used to abort the whole
+		// comparison and park its unit COMPLETED forever (BG-21a); refusing it here surfaces
+		// the problem to the submitting client immediately as InvalidArgument instead of as a
+		// mystery DISAGREED at validation time. Inline only: a ref-only submission
+		// (output_data_url) carries no inline bytes and is owned by the content-verification
+		// pipeline. The empty-inline-and-no-URL case is already refused near the top of the
+		// handler ("either output_data or output_data_url must be provided").
+		if req.OutputDataUrl == "" {
+			if verr := validation.ValidateSubmittedOutput(submitLeaf.ValidationConfig, req.OutputData); verr != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "%s", verr.Error())
+			}
+		}
 	}
 
 	// Every pool-backed read the rest of this handler needs happens BEFORE the
@@ -1626,6 +1643,22 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
+	// Load the unit ONCE under the row lock (design §4.1, review #2b). We hold this lock
+	// for the whole transaction, so the unit row cannot change under us: the result insert
+	// does not touch it, and the COMPLETED write below only advances a QUEUED/ASSIGNED/
+	// RUNNING unit — never a terminal one. This single read serves (i) the live-copy
+	// fast-path terminal check below, (ii) the no-copy grace-path terminal check, and
+	// (iii) the later completion-quorum resolution (no second GetByID). A missing unit is
+	// NotFound, preserving the grace path's prior behavior.
+	submitUnit, wuErr := txWURepo.GetByID(ctx, workUnitID)
+	if wuErr != nil {
+		if wuAPIErr, ok := wuErr.(*apierror.APIError); ok && wuAPIErr.HTTPStatus == 404 {
+			return nil, status.Errorf(codes.NotFound, "work unit not found")
+		}
+		s.logger.Error("failed to load work unit for submit", "error", wuErr)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
+
 	// Verify an OPEN copy exists for this volunteer.
 	activeAssignment, err := txAssignRepo.FindActiveByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
 	if err != nil {
@@ -1647,15 +1680,9 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		// The result then corroborates like any other; uq_results_work_unit_volunteer
 		// prevents a double count. The unit row is already locked FOR UPDATE above, so
 		// this races safely against a concurrent finalize.
-		graceWU, wuErr := txWURepo.GetByID(ctx, workUnitID)
-		if wuErr != nil {
-			if wuAPIErr, ok := wuErr.(*apierror.APIError); ok && wuAPIErr.HTTPStatus == 404 {
-				return nil, status.Errorf(codes.NotFound, "work unit not found")
-			}
-			s.logger.Error("failed to load work unit for late-result grace", "error", wuErr)
-			return nil, status.Errorf(codes.Internal, "internal error")
-		}
-		if graceWU.State == workunit.WorkUnitStateValidated || graceWU.State == workunit.WorkUnitStateFailed {
+		// Reuse the unit loaded once under the row lock above. The grace path keeps its
+		// existing terminal-state refusal (there is no live copy to close here).
+		if submitUnit.State == workunit.WorkUnitStateValidated || submitUnit.State == workunit.WorkUnitStateFailed {
 			return nil, status.Errorf(codes.FailedPrecondition, "work unit already finalized; result is too late to accept")
 		}
 
@@ -1672,6 +1699,27 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 			"copy_id", latest.ID,
 			"prior_outcome", string(*latest.Outcome),
 		)
+	}
+
+	// Submit-door terminal-state check — the live-copy fast path (design §4.1, review #2b).
+	// If the unit already finalized (VALIDATED/FAILED), close the caller's still-live copy
+	// SUPERSEDED (non-punitive), COMMIT so the supersede persists, and refuse — inserting NO
+	// result row that would otherwise sit PENDING under a terminal unit and never be
+	// adjudicated (★E1-6). Both the accept transaction and this submit transaction hold the
+	// unit row lock, so whichever commits second sees the truth; the door no longer relies on
+	// the post-commit ExpireLiveCopies supersede winning a race. The grace path above already
+	// refused terminal units (it has no live copy to close), so reaching this branch with a
+	// terminal unit means we hold a live copy to supersede.
+	if submitUnit.State == workunit.WorkUnitStateValidated || submitUnit.State == workunit.WorkUnitStateFailed {
+		if err := txAssignRepo.UpdateOutcome(ctx, activeAssignment.ID, assignment.OutcomeSuperseded, nil); err != nil {
+			s.logger.Error("failed to supersede live copy on finalized unit", "work_unit_id", workUnitID, "error", err)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			s.logger.Error("failed to commit supersede on finalized unit", "work_unit_id", workUnitID, "error", err)
+			return nil, status.Errorf(codes.Internal, "internal error")
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "work unit already finalized; result is too late to accept")
 	}
 
 	// Count existing PENDING results to determine if work unit should transition to COMPLETED.
@@ -1755,14 +1803,10 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Determine when to transition to COMPLETED.
-	// Read the leaf's redundancy_factor so WUs with redundancy > 1 wait for all results.
-	// For spot-check WUs, always require at least 2 results.
-	currentWU, err := txWURepo.GetByID(ctx, workUnitID)
-	if err != nil {
-		s.logger.Error("failed to load work unit", "error", err)
-		return nil, status.Errorf(codes.Internal, "internal error")
-	}
+	// Determine when to transition to COMPLETED, reusing the unit loaded once under the row
+	// lock above (submitUnit): our lock holds for the whole transaction and the result insert
+	// does not touch the unit row, so a second GetByID here would be redundant. For a leaf
+	// with redundancy > 1 the unit waits for all results; a spot-check unit requires 2.
 
 	// The COMPLETED threshold is the unit's effective QUORUM (TODO #50) — how many results
 	// are needed to attempt validation. Resolved through the single source (ResolvePolicy):
@@ -1772,9 +1816,9 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	// connection (leaf.GetByIDTx), NOT via the pool-backed s.leafRepo — a pool read here
 	// would acquire a second connection while the tx holds one (BG-17).
 	quorum := 1
-	completionLeaf, clErr := leaf.GetByIDTx(ctx, tx, currentWU.LeafID)
+	completionLeaf, clErr := leaf.GetByIDTx(ctx, tx, submitUnit.LeafID)
 	if clErr == nil {
-		quorum = transition.ResolvePolicy(completionLeaf, currentWU).MinQuorum
+		quorum = transition.ResolvePolicy(completionLeaf, submitUnit).MinQuorum
 	}
 
 	if existingCount+pendingDelta >= quorum {
@@ -1819,10 +1863,10 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 	_ = s.volunteerRepo.UpdateLastSeen(ctx, volunteerID)
 
 	// Increment batch completed counter when the work unit transitioned to COMPLETED.
-	// Reuse currentWU from the transaction — no need for a second DB fetch.
+	// Reuse submitUnit from the transaction — no need for a second DB fetch.
 	if existingCount+pendingDelta >= quorum && s.batchRepo != nil {
-		if currentWU.BatchID != nil {
-			_ = s.batchRepo.IncrementCompleted(ctx, *currentWU.BatchID)
+		if submitUnit.BatchID != nil {
+			_ = s.batchRepo.IncrementCompleted(ctx, *submitUnit.BatchID)
 		}
 	}
 

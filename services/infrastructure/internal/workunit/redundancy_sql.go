@@ -52,12 +52,50 @@ func effMaxTotalSQL(wu, l string) string {
 	END)`
 }
 
+// effMaxErrorSQL: the error-copy ceiling. Per-unit override (wu.max_error_copies > 0), else
+// leaf config ((l.validation_config->>'max_error_copies')::int > 0), else 0 = unlimited.
+// Mirrors RedundancyPolicy.MaxErrorCopies (transition/policy.go) field-for-field — note there
+// is NO target-derived default (unlike effMaxTotalSQL): 0 means "only the total ceiling bounds
+// errors," exactly as ResolvePolicy leaves it. The dead-letter executor guards the disjunct on
+// `> 0` so an absent cap never dead-letters (a raw `errors >= 0` would fire immediately). This
+// is the SQL twin whose ABSENCE was BG-27: MaxErrorCopies was resolved and decided in Go but
+// executed by no SQL, so the executor could never enforce the owner's configured cap.
+func effMaxErrorSQL(wu, l string) string {
+	return `(CASE
+		WHEN ` + wu + `.max_error_copies > 0 THEN ` + wu + `.max_error_copies
+		WHEN COALESCE((` + l + `.validation_config->>'max_error_copies')::int, 0) > 0
+			THEN (` + l + `.validation_config->>'max_error_copies')::int
+		ELSE 0
+	END)`
+}
+
+// errorCopiesSQL: the unit's wasted-work tally — the copies that ended EXPIRED or ABANDONED
+// (history rows) PLUS the results marked DISAGREED. This is the EXACT expression
+// CountErrorCopies runs, the max_error_copies probe (the RedundancyPolicy.MaxErrorCopies
+// budget in UnitSnapshot.ErrorCopies). It is written ONCE here and embedded by
+// CountErrorCopies, RefundCopyBudget's error-count arm, and DeadLetterIfExhausted's error
+// disjunct so the count has a single definition (the same discipline countableCoverageSQL has:
+// the drift BG-27 exposed came from an executor that never embedded a shared fragment at all).
+//
+// unitID is the work-unit id column/placeholder expression in scope ("wu.id", "$1", ...). The
+// internal aliases are ec_-prefixed so an embedding never collides with a host query's aliases,
+// following countableLiveCopiesSQL's prefix idiom.
+func errorCopiesSQL(unitID string) string {
+	return `(
+		(SELECT COUNT(*) FROM work_unit_assignment_history ec_h
+		 WHERE ec_h.work_unit_id = ` + unitID + ` AND ec_h.outcome IN ('EXPIRED', 'ABANDONED'))
+		+ (SELECT COUNT(*) FROM results ec_r
+		   WHERE ec_r.work_unit_id = ` + unitID + ` AND ec_r.validation_status = 'DISAGREED')
+	)`
+}
+
 // Precomputed fragments for the common wu/l alias pair (used by every query except
 // ClaimDispatchableBatch's inner select, which builds its own with effTargetSQL("wu2","l2")).
 var (
 	effTargetWuL   = effTargetSQL("wu", "l")
 	effQuorumWuL   = effQuorumSQL("wu", "l")
 	effMaxTotalWuL = effMaxTotalSQL("wu", "l")
+	effMaxErrorWuL = effMaxErrorSQL("wu", "l")
 )
 
 // --- Trust-gate dispatch (trusted-corroborator reservation) ---

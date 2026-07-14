@@ -1,6 +1,7 @@
 package leaf
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -789,10 +790,31 @@ func TestValidateValidationConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "max_success_copies below quorum rejected",
-			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 3; c.MaxSuccessCopies = 2 },
+			name:    "max_error_copies below target rejected",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 2; c.MaxErrorCopies = 2 },
 			wantErr: true,
-			errMsg:  "max_success_copies must be at least min_quorum",
+			errMsg:  "max_error_copies must be at least target_copies",
+		},
+		{
+			name:    "max_error_copies equal to target ok",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 2; c.MaxErrorCopies = 3 },
+			wantErr: false,
+		},
+		{
+			name:    "max_error_copies above target ok",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 2; c.MaxErrorCopies = 9 },
+			wantErr: false,
+		},
+		{
+			name:    "max_error_copies unset (0) ok — unlimited",
+			modify:  func(c *ValidationConfig) { c.TargetCopies = 3; c.MinQuorum = 2; c.MaxErrorCopies = 0 },
+			wantErr: false,
+		},
+		{
+			name:    "max_error_copies below derived target (redundancy_factor) rejected",
+			modify:  func(c *ValidationConfig) { c.RedundancyFactor = 3; c.MaxErrorCopies = 2 },
+			wantErr: true,
+			errMsg:  "max_error_copies must be at least target_copies",
 		},
 		{
 			name:    "caps unset (0) ok — defaults",
@@ -926,6 +948,42 @@ func TestValidateValidationConfig(t *testing.T) {
 			tt.modify(c)
 			err := ValidateValidationConfig(c)
 			assertValidationResult(t, err, tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+// TestRejectRemovedValidationConfigKeys covers the raw-block probe that keeps a removed config
+// key from being silently dropped (E1-C config honesty). max_success_copies was removed in
+// migration 00025; leaf create/update decodes validation_config with a plain json.Unmarshal, so
+// without this probe an explicit max_success_copies would vanish before validation could see it.
+func TestRejectRemovedValidationConfigKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{name: "empty block rejects nothing", raw: "", wantErr: false},
+		{name: "no removed keys ok", raw: `{"redundancy_factor":2,"max_error_copies":3}`, wantErr: false},
+		{name: "explicit non-zero max_success_copies rejected", raw: `{"max_success_copies":5}`, wantErr: true},
+		{name: "explicit zero max_success_copies rejected", raw: `{"max_success_copies":0}`, wantErr: true},
+		{name: "malformed block deferred to typed unmarshal", raw: `{not json`, wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var raw json.RawMessage
+			if tt.raw != "" {
+				raw = json.RawMessage(tt.raw)
+			}
+			err := RejectRemovedValidationConfigKeys(raw)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected rejection for %q, got nil", tt.raw)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected rejection for %q: %v", tt.raw, err)
+			}
+			if tt.wantErr && err != nil && !strings.Contains(err.Message, "max_success_copies is no longer supported") {
+				t.Errorf("message = %q, want it to mention max_success_copies removal", err.Message)
+			}
 		})
 	}
 }
@@ -1100,6 +1158,7 @@ func TestValidateDataConfig(t *testing.T) {
 	tests := []struct {
 		name        string
 		taskPattern TaskPattern
+		isOngoing   bool
 		modify      func(c *DataConfig)
 		wantErr     bool
 		errMsg      string
@@ -1585,8 +1644,31 @@ func TestValidateDataConfig(t *testing.T) {
 			errMsg:  "lazy_batch_size",
 		},
 		{
-			name:        "lazy valid for monte_carlo",
+			name:        "lazy valid for finite monte_carlo with num_trials",
 			taskPattern: PatternMonteCarlo,
+			modify: func(c *DataConfig) {
+				c.GenerationMode = "lazy"
+				c.LazyThreshold = 50
+				c.LazyBatchSize = 500
+				c.SplittingConfig = map[string]any{"num_trials": float64(1000)}
+			},
+			wantErr: false,
+		},
+		{
+			name:        "lazy finite monte_carlo requires num_trials",
+			taskPattern: PatternMonteCarlo,
+			modify: func(c *DataConfig) {
+				c.GenerationMode = "lazy"
+				c.LazyThreshold = 50
+				c.LazyBatchSize = 500
+			},
+			wantErr: true,
+			errMsg:  "num_trials",
+		},
+		{
+			name:        "lazy ongoing monte_carlo valid without num_trials",
+			taskPattern: PatternMonteCarlo,
+			isOngoing:   true,
 			modify: func(c *DataConfig) {
 				c.GenerationMode = "lazy"
 				c.LazyThreshold = 50
@@ -1595,7 +1677,7 @@ func TestValidateDataConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:        "lazy valid for map_reduce",
+			name:        "lazy rejected for map_reduce",
 			taskPattern: PatternMapReduce,
 			modify: func(c *DataConfig) {
 				s := "by_line_count"
@@ -1604,7 +1686,8 @@ func TestValidateDataConfig(t *testing.T) {
 				c.LazyThreshold = 50
 				c.LazyBatchSize = 500
 			},
-			wantErr: false,
+			wantErr: true,
+			errMsg:  "MAP_REDUCE",
 		},
 	}
 
@@ -1612,7 +1695,7 @@ func TestValidateDataConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := validConfig()
 			tt.modify(c)
-			err := ValidateDataConfig(c, tt.taskPattern)
+			err := ValidateDataConfig(c, tt.taskPattern, tt.isOngoing)
 			assertValidationResult(t, err, tt.wantErr, tt.errMsg)
 		})
 	}

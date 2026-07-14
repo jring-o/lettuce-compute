@@ -1,6 +1,7 @@
 package leaf
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/internal/types"
@@ -129,16 +130,17 @@ type ValidationConfig struct {
 	TargetCopies int `json:"target_copies,omitempty"`
 	MinQuorum    int `json:"min_quorum,omitempty"`
 
-	// MaxTotalCopies / MaxErrorCopies / MaxSuccessCopies are the hard caps that bound a
-	// non-converging unit (TODO #50, reconciling #40). All 0 = the documented default:
-	//   MaxTotalCopies   0 -> target_copies + a retry margin (the dead-letter ceiling,
-	//                         previously only the inert per-WU column EffectiveMaxTotalCopies)
-	//   MaxErrorCopies   0 -> unlimited (only MaxTotalCopies bounds errors, as today)
-	//   MaxSuccessCopies 0 -> target_copies (dispatch already stops at target today)
+	// MaxTotalCopies / MaxErrorCopies are the hard caps that bound a non-converging unit
+	// (TODO #50, reconciling #40). Both 0 = the documented default:
+	//   MaxTotalCopies 0 -> target_copies + a retry margin (the dead-letter ceiling,
+	//                       previously only the inert per-WU column EffectiveMaxTotalCopies)
+	//   MaxErrorCopies 0 -> unlimited (only MaxTotalCopies bounds errors, as today); when set
+	//                       it must be >= target_copies (validation floor, design §4.9)
 	// Stamped per-unit at generation; resolved through transition.RedundancyPolicy.
-	MaxTotalCopies   int `json:"max_total_copies,omitempty"`
-	MaxErrorCopies   int `json:"max_error_copies,omitempty"`
-	MaxSuccessCopies int `json:"max_success_copies,omitempty"`
+	// (max_success_copies was removed in migration 00025: a success ceiling had no coherent
+	// semantics and was read by nothing — leaf create/update now rejects the key. Design §4.9.)
+	MaxTotalCopies int `json:"max_total_copies,omitempty"`
+	MaxErrorCopies int `json:"max_error_copies,omitempty"`
 
 	// IgnoreFields lists output JSON field paths to EXCLUDE from result comparison —
 	// volatile provenance like a wall-clock "compute_time_ms" that legitimately differs
@@ -367,6 +369,15 @@ type Leaf struct {
 	// path, where assignments build from ExecutionConfig directly. Owned by
 	// ArtifactVersionRepository.SetCurrentVersion; never written by Update.
 	CurrentArtifactVersionID *types.ID `json:"current_artifact_version_id,omitempty"`
+	// GenerationCursor is the durable lazy-generation cursor for this leaf (design
+	// §4.8, BG-22c): how far generation has advanced into the declared parameter
+	// space (seed/combination offset, total generated, exhaustion). It is scanned
+	// from the dedicated leafs.generation_cursor jsonb column (migration 00026) and
+	// is written ONLY by the generation path's guarded, optimistic cursor advance —
+	// never by Update. An empty/zero value ({} or nil) means "not yet generated".
+	// Held opaque here (the generate package owns its schema) so an owner config
+	// edit cannot roll it back.
+	GenerationCursor json.RawMessage `json:"generation_cursor,omitempty"`
 }
 
 // SortField specifies which column to sort by.

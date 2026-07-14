@@ -49,17 +49,21 @@ func scanLeaf(row pgx.Row) (*Leaf, error) {
 		&p.CreatedAt,
 		&p.UpdatedAt,
 		&p.CurrentArtifactVersionID,
+		&p.GenerationCursor,
 	)
 	return &p, err
 }
 
 // leafColumns is the standard column list for SELECT queries.
+// generation_cursor is the durable lazy-generation cursor (migration 00026); it is read
+// on every leaf load but written ONLY by UpdateGenerationCursorTx, never by Update — that
+// isolation is the point (owner config edits can no longer clobber generation state).
 const leafColumns = `id, name, slug, description, research_area,
 	creator_id, creator_public_key, state, task_pattern,
 	execution_config, validation_config, fault_tolerance_config,
 	data_config, credit_config, resource_requirements,
 	is_ongoing, visibility, stats_cache_seconds, created_at, updated_at,
-	current_artifact_version_id`
+	current_artifact_version_id, generation_cursor`
 
 // Create inserts a new leaf. The slug is generated automatically from the name.
 // On return, p is populated with the DB-generated id, slug, and timestamps.
@@ -136,6 +140,37 @@ func GetByIDTx(ctx context.Context, db rowQuerier, id types.ID) (*Leaf, error) {
 		return nil, apierror.Internal("failed to get leaf", err)
 	}
 	return p, nil
+}
+
+// execQuerier is the minimal write surface (Exec) shared by *pgxpool.Pool and pgx.Tx, so the
+// generation cursor advance can run either standalone on the pool (the exhaustion-flag write)
+// or inside the batch's own transaction (the atomic per-batch advance) via the same code.
+type execQuerier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// UpdateGenerationCursorTx performs the guarded, optimistic advance of a leaf's
+// generation_cursor (design §4.8, BG-22c / E1-3) using the supplied executor, which may be a
+// *pgxpool.Pool or an open pgx.Tx. The advance succeeds only when the row's CURRENT
+// total_generated equals expectedPrevTotalGenerated; otherwise it affects zero rows and returns
+// (false, nil) — another writer advanced concurrently (e.g. a leadership-failover overlap), and
+// the caller must abort its work rather than double-emit. total_generated is THE guard key: every
+// pattern generator's cursor delta MUST advance it monotonically, whatever pattern-specific
+// fields the cursor also carries, so no future generator can opt out of the guard by omission.
+// The ::bigint cast gives costless headroom over int32. cursor is the full replacement cursor
+// JSON (not a delta); this function never merges.
+func UpdateGenerationCursorTx(ctx context.Context, db execQuerier, leafID types.ID, cursor []byte, expectedPrevTotalGenerated int64) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE leafs
+		SET generation_cursor = $2
+		WHERE id = $1
+		  AND COALESCE((generation_cursor->>'total_generated')::bigint, 0) = $3`,
+		leafID, cursor, expectedPrevTotalGenerated,
+	)
+	if err != nil {
+		return false, apierror.Internal("failed to update generation cursor", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // GetBySlug retrieves a leaf by slug and creator_id.

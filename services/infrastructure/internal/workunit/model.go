@@ -59,19 +59,19 @@ type WorkUnit struct {
 	// default from the leaf's redundancy_factor (EffectiveMaxTotalCopies). Floor only,
 	// no upper cap — a timed-out copy is otherwise redispatched without per-attempt cap.
 	MaxTotalCopies           int              `json:"max_total_copies"`
-	// TargetCopies / MinQuorum / MaxErrorCopies / MaxSuccessCopies are the explicit
-	// redundancy knobs (TODO #50, migration 00010), stamped per-unit at generation like
-	// MaxTotalCopies. 0 means "derive from the leaf's validation_config exactly as today":
+	// TargetCopies / MinQuorum / MaxErrorCopies are the explicit redundancy knobs
+	// (TODO #50, migration 00010), stamped per-unit at generation like MaxTotalCopies.
+	// 0 means "derive from the leaf's validation_config exactly as today":
 	//   TargetCopies      0 -> redundancy_factor   (how many copies to dispatch)
 	//   MinQuorum         0 -> redundancy_factor   (how many agreeing results validate)
 	//   MaxErrorCopies    0 -> unlimited           (only MaxTotalCopies bounds errors)
-	//   MaxSuccessCopies  0 -> TargetCopies         (dispatch stops at target)
 	// The Effective* helpers below resolve the 0 sentinel; all redundancy arithmetic in
 	// the head reads these via the transition.RedundancyPolicy, never re-derives them.
+	// (max_success_copies was removed in migration 00025: a success ceiling had no
+	// coherent semantics and was read by nothing — design §4.9.)
 	TargetCopies             int              `json:"target_copies"`
 	MinQuorum                int              `json:"min_quorum"`
 	MaxErrorCopies           int              `json:"max_error_copies"`
-	MaxSuccessCopies         int              `json:"max_success_copies"`
 	LastHeartbeatAt          *time.Time       `json:"last_heartbeat_at,omitempty"`
 	FlaggedForReview         bool             `json:"flagged_for_review"`
 	SpotCheck                bool             `json:"spot_check"`

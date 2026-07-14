@@ -306,7 +306,7 @@ func (e *Engine) applyRepair(
 	}
 	inserted := false
 	actualGranted := 0.0
-	if cc, capEnforced := e.cappedCreator(); capEnforced {
+	if cc, capEnforced := e.cappedCreatorFor(e.creditRepo); capEnforced {
 		ins, err := cc.CreateCapped(ctx, entry, e.emissionCapPerDay)
 		if err != nil {
 			if !isAlreadyGrantedConflict(err) {

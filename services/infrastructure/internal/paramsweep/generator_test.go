@@ -418,6 +418,106 @@ func TestResolveDeadlineSeconds_NoDeadline(t *testing.T) {
 	}
 }
 
+// --- Windowed decode equivalence + lazy pacing (design §4.7, BG-22 sub) ---
+
+// TestWindowedDecode_EqualsCartesianProduct pins the load-bearing property: the O(1)-memory
+// odometer decode yields exactly the same combination at every index as the materialized
+// CartesianProduct — window(i) ≡ full-product[i] across a grid of spaces. The science depends on
+// it.
+func TestWindowedDecode_EqualsCartesianProduct(t *testing.T) {
+	spaces := []map[string][]interface{}{
+		{"a": {1, 2, 3}, "b": {"x", "y"}},
+		{"a": {1, 2}, "b": {10, 20, 30}, "c": {true, false}},
+		{"only": {1, 2, 3, 4, 5}},
+		{"z": {9, 8}, "a": {1, 2, 3}, "m": {"p", "q", "r", "s"}},
+	}
+	for si, sp := range spaces {
+		full := CartesianProduct(sp)
+		keys := sortedKeys(sp)
+		if got := totalCombinations(keys, sp); got != len(full) {
+			t.Fatalf("space %d: totalCombinations=%d, len(product)=%d", si, got, len(full))
+		}
+		for i := range full {
+			got := decodeCombination(keys, sp, i)
+			if fmt.Sprint(got) != fmt.Sprint(full[i]) {
+				t.Errorf("space %d index %d: decode=%v, product=%v", si, i, got, full[i])
+			}
+		}
+	}
+}
+
+// TestGenerate_LazyTickPacing proves a lazy tick (an _offset is present) emits EXACTLY
+// min(batchSize, remaining) work units in ONE batch — the pacing fix. Pre-fix, the tick flooded
+// the entire remaining space in a single tick regardless of batchSize.
+func TestGenerate_LazyTickPacing(t *testing.T) {
+	proj := newTestProject()
+	// 10 x 10 = 100 combinations.
+	vals := make([]interface{}, 10)
+	for i := range vals {
+		vals[i] = float64(i)
+	}
+
+	// Fresh window from offset 0, batchSize 25 => exactly 25, one batch.
+	wuRepo := &mockWorkUnitRepo{}
+	batchRepo := &mockBatchRepo{}
+	result, err := Generate(context.Background(), proj, map[string]interface{}{
+		"x": vals, "y": vals, "_offset": float64(0),
+	}, 25, workunit.NewRepoBatchSink(wuRepo, batchRepo))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.WorkUnitsCreated != 25 {
+		t.Errorf("lazy tick must emit exactly min(batch,remaining)=25, got %d", result.WorkUnitsCreated)
+	}
+	if len(result.BatchIDs) != 1 {
+		t.Errorf("lazy tick must emit exactly one batch, got %d", len(result.BatchIDs))
+	}
+
+	// Short tail: 6 combos, offset 4, batch 25 => min(25, 2) = 2.
+	wuRepo2 := &mockWorkUnitRepo{}
+	result2, err := Generate(context.Background(), proj, map[string]interface{}{
+		"x": []interface{}{1.0, 2.0, 3.0}, "y": []interface{}{10.0, 20.0}, "_offset": float64(4),
+	}, 25, workunit.NewRepoBatchSink(wuRepo2, &mockBatchRepo{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result2.WorkUnitsCreated != 2 {
+		t.Errorf("short-tail lazy tick must emit min(batch,remaining)=2, got %d", result2.WorkUnitsCreated)
+	}
+}
+
+// TestGenerate_LazyWindowMatchesProductSlice checks the emitted lazy window equals the
+// corresponding slice of the full product (order and content).
+func TestGenerate_LazyWindowMatchesProductSlice(t *testing.T) {
+	proj := newTestProject()
+	space := map[string][]interface{}{
+		"x": {1.0, 2.0, 3.0, 4.0},
+		"y": {10.0, 20.0, 30.0},
+	}
+	full := CartesianProduct(space)
+
+	offset, batch := 5, 4
+	wuRepo := &mockWorkUnitRepo{}
+	_, err := Generate(context.Background(), proj, map[string]interface{}{
+		"x": space["x"], "y": space["y"], "_offset": float64(offset),
+	}, batch, workunit.NewRepoBatchSink(wuRepo, &mockBatchRepo{}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(wuRepo.bulkCreated) != batch {
+		t.Fatalf("expected %d units, got %d", batch, len(wuRepo.bulkCreated))
+	}
+	for i, wu := range wuRepo.bulkCreated {
+		var got map[string]interface{}
+		if err := json.Unmarshal(wu.Parameters, &got); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(full[offset+i]) {
+			t.Errorf("window[%d]=%v, want full-product[%d]=%v", i, got, offset+i, full[offset+i])
+		}
+	}
+}
+
 // --- Mock-based Generate tests (unit level) ---
 
 // mockWorkUnitRepo implements workunit.WorkUnitRepository for testing.
@@ -606,7 +706,7 @@ func TestGenerate_BasicSweep(t *testing.T) {
 		"pressure":    []interface{}{1.0, 2.0, 3.0},
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -665,7 +765,7 @@ func TestGenerate_BatchSplitting(t *testing.T) {
 		"y": vals,
 	}
 
-	result, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -718,7 +818,7 @@ func TestGenerate_LargeSpaceWarning(t *testing.T) {
 		"y": vals,
 	}
 
-	result, err := Generate(ctx, proj, params, generate.MaxBatchSize, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, generate.MaxBatchSize, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -739,7 +839,7 @@ func TestGenerate_DefaultBatchSize(t *testing.T) {
 		"x": []interface{}{1.0, 2.0},
 	}
 
-	result, err := Generate(ctx, proj, params, 0, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 0, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -754,7 +854,7 @@ func TestGenerate_EmptyParams(t *testing.T) {
 	wuRepo := &mockWorkUnitRepo{}
 	batchRepo := &mockBatchRepo{}
 
-	_, err := Generate(ctx, proj, map[string]interface{}{}, 10, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, map[string]interface{}{}, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error for empty params")
 	}
@@ -774,7 +874,7 @@ func TestGenerate_BulkCreateError(t *testing.T) {
 		"x": []interface{}{1.0, 2.0},
 	}
 
-	_, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when BulkCreate fails")
 	}
@@ -791,7 +891,7 @@ func TestGenerate_ParametersSerialized(t *testing.T) {
 		"beta":  []interface{}{"yes"},
 	}
 
-	_, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -832,7 +932,7 @@ func TestGenerate_TransitionsCreatedToQueued(t *testing.T) {
 		"x": []interface{}{1.0, 2.0},
 	}
 
-	result, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -859,7 +959,7 @@ func TestGenerate_TransitionError(t *testing.T) {
 		"x": []interface{}{1.0},
 	}
 
-	_, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	_, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err == nil {
 		t.Fatal("expected error when transition fails")
 	}
@@ -878,7 +978,7 @@ func TestGenerate_WithOffset_SkipsCombinations(t *testing.T) {
 		"_offset": float64(4),
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -899,7 +999,7 @@ func TestGenerate_WithOffset_BeyondTotalReturnsEmpty(t *testing.T) {
 		"_offset": float64(5),
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -922,7 +1022,7 @@ func TestGenerate_WithOffset_Zero_NoSkip(t *testing.T) {
 		"_offset": float64(0),
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -943,7 +1043,7 @@ func TestGenerate_WithOffset_StrippedFromParams(t *testing.T) {
 		"_offset": float64(0),
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

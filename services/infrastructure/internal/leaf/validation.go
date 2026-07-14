@@ -1,6 +1,7 @@
 package leaf
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -535,6 +536,42 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 	return nil
 }
 
+// removedValidationConfigKeys probes an incoming validation_config JSON body for fields the
+// head no longer supports. The pointer distinguishes an explicitly-sent key (including an
+// explicit "max_success_copies": 0) from an absent one, so a stale client is told the field is
+// gone rather than having it silently dropped by the typed unmarshal (E1-C: accepted-and-
+// ignored is not a state).
+type removedValidationConfigKeys struct {
+	MaxSuccessCopies *int `json:"max_success_copies"`
+}
+
+// RejectRemovedValidationConfigKeys returns a ValidationError when raw — the caller's
+// validation_config JSON block — carries a field that has been removed from ValidationConfig.
+// It must read the RAW bytes: the typed ValidationConfig no longer has the field, and leaf
+// create/update decodes validation_config with a plain json.Unmarshal (no DisallowUnknownFields),
+// so an unknown key is silently dropped before any typed validation could see it. Callers pass
+// the raw block through this before the typed merge.
+//
+// max_success_copies was removed in migration 00025: a success ceiling has no coherent semantics
+// (design §4.9) and was read by nothing, so accepting it would be dishonest config surface. raw
+// may be empty (no block supplied), which rejects nothing; a malformed block is surfaced by the
+// caller's own typed unmarshal, so a parse error here is ignored rather than double-reported.
+func RejectRemovedValidationConfigKeys(raw json.RawMessage) *apierror.APIError {
+	if len(raw) == 0 {
+		return nil
+	}
+	var probe removedValidationConfigKeys
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil
+	}
+	if probe.MaxSuccessCopies != nil {
+		return apierror.ValidationError(
+			"max_success_copies is no longer supported; success ceilings have no coherent semantics (see release notes)",
+			validationDetail{Field: "max_success_copies", Reason: "removed"})
+	}
+	return nil
+}
+
 // ValidateValidationConfig validates result validation configuration.
 func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 	// Redundancy factor: head-owned, no upper bound. Must be at least 1.
@@ -578,18 +615,18 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			"max_total_copies must be at least target_copies (a lower ceiling can never reach redundancy)",
 			validationDetail{Field: "max_total_copies", Reason: "below_target"})
 	}
-	if c.MaxSuccessCopies < 0 {
-		return apierror.ValidationError("max_success_copies must be at least min_quorum",
-			validationDetail{Field: "max_success_copies", Reason: "out_of_range"})
-	}
-	if c.MaxSuccessCopies > 0 && c.MaxSuccessCopies < effQuorum {
-		return apierror.ValidationError(
-			"max_success_copies must be at least min_quorum (fewer successes can never reach quorum)",
-			validationDetail{Field: "max_success_copies", Reason: "below_quorum"})
-	}
 	if c.MaxErrorCopies < 0 {
 		return apierror.ValidationError("max_error_copies must be at least 1",
 			validationDetail{Field: "max_error_copies", Reason: "out_of_range"})
+	}
+	// Error cap floor (design §4.9, BG-27): a cap below target_copies can be tripped by honest
+	// churn alone (one expiry per target slot) — that is never what a poison-unit-stopping owner
+	// means, so reject it and keep the stored value honest rather than silently ineffective. The
+	// cap stays opt-in (0 = unlimited). This mirrors the max_total_copies floor above.
+	if c.MaxErrorCopies > 0 && c.MaxErrorCopies < effTarget {
+		return apierror.ValidationError(
+			"max_error_copies must be at least target_copies (a lower cap can be tripped by honest churn alone)",
+			validationDetail{Field: "max_error_copies", Reason: "below_target"})
 	}
 
 	// Agreement threshold: 0.0-1.0.
@@ -893,8 +930,10 @@ func DeadlineAdequacyWarnings(p *Leaf) []string {
 	return warnings
 }
 
-// ValidateDataConfig validates data transfer and splitting configuration.
-func ValidateDataConfig(c *DataConfig, taskPattern TaskPattern) *apierror.APIError {
+// ValidateDataConfig validates data transfer and splitting configuration. isOngoing is the
+// leaf's ongoing flag, needed to enforce the lazy-generation config-honesty rules (a finite —
+// non-ongoing — lazy Monte Carlo leaf must declare its total; design §4.6, E1-C).
+func ValidateDataConfig(c *DataConfig, taskPattern TaskPattern, isOngoing bool) *apierror.APIError {
 	// Transfer strategy
 	switch c.TransferStrategy {
 	case TransferInline, TransferExternalReference:
@@ -984,15 +1023,17 @@ func ValidateDataConfig(c *DataConfig, taskPattern TaskPattern) *apierror.APIErr
 	}
 
 	// Lazy generation config validation.
-	if err := validateLazyGenerationConfig(c, taskPattern); err != nil {
+	if err := validateLazyGenerationConfig(c, taskPattern, isOngoing); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// validateLazyGenerationConfig validates generation_mode, lazy_threshold, and lazy_batch_size.
-func validateLazyGenerationConfig(c *DataConfig, taskPattern TaskPattern) *apierror.APIError {
+// validateLazyGenerationConfig validates generation_mode, lazy_threshold, and lazy_batch_size,
+// and enforces the lazy-generation config-honesty rules: map-reduce cannot be lazy (§4.10), and a
+// finite lazy Monte Carlo leaf must declare its total (§4.6) so "finite" is falsifiable (E1-C).
+func validateLazyGenerationConfig(c *DataConfig, taskPattern TaskPattern, isOngoing bool) *apierror.APIError {
 	switch c.GenerationMode {
 	case GenerationModeEager, "":
 		// valid (eager is default)
@@ -1001,6 +1042,13 @@ func validateLazyGenerationConfig(c *DataConfig, taskPattern TaskPattern) *apier
 			return apierror.ValidationError(
 				"lazy generation is not supported for custom pattern; use the /work-units/bulk endpoint",
 				validationDetail{Field: "generation_mode", Reason: "unsupported_for_custom"})
+		}
+		// Map-reduce is eager-only (design §4.10, BG-22b): the full input is present at leaf
+		// creation, so there is no not-yet-known tail for laziness to defer.
+		if taskPattern == PatternMapReduce {
+			return apierror.ValidationError(
+				"lazy generation is not supported for MAP_REDUCE leaves: the full input is present at creation, so there is no not-yet-known tail for laziness to defer; use eager generation",
+				validationDetail{Field: "generation_mode", Reason: "unsupported_for_map_reduce"})
 		}
 		if c.LazyThreshold < 1 || c.LazyThreshold > 10000 {
 			return apierror.ValidationError(
@@ -1011,6 +1059,18 @@ func validateLazyGenerationConfig(c *DataConfig, taskPattern TaskPattern) *apier
 			return apierror.ValidationError(
 				"lazy_batch_size must be between 1 and 100000",
 				validationDetail{Field: "lazy_batch_size", Reason: "out_of_range"})
+		}
+		// A finite (non-ongoing) lazy Monte Carlo leaf must declare splitting_config.num_trials
+		// (>= 1): it is the target N against which exhaustion is decided. Without it, "finite" is
+		// unfalsifiable — the leaf would never exhaust (design §4.6, E1-C). Ongoing MC leaves
+		// legitimately never exhaust and need no total.
+		if taskPattern == PatternMonteCarlo && !isOngoing {
+			n, ok := monteCarloNumTrials(c)
+			if !ok || n < 1 {
+				return apierror.ValidationError(
+					"splitting_config.num_trials (>= 1) is required for a finite (non-ongoing) lazy monte_carlo leaf: it is the total against which generation exhaustion is decided",
+					validationDetail{Field: "splitting_config.num_trials", Reason: "required_for_finite_lazy_monte_carlo"})
+			}
 		}
 	default:
 		return apierror.ValidationError(
@@ -1123,6 +1183,23 @@ func validateByRecordConfig(config map[string]any) *apierror.APIError {
 		}
 	}
 	return nil
+}
+
+// monteCarloNumTrials reads splitting_config.num_trials as an int, reporting whether it is present
+// and numeric. Used by the finite-lazy-MC config-honesty check (design §4.6).
+func monteCarloNumTrials(c *DataConfig) (int, bool) {
+	if c.SplittingConfig == nil {
+		return 0, false
+	}
+	v, ok := c.SplittingConfig["num_trials"]
+	if !ok {
+		return 0, false
+	}
+	n, err := toFloat64ForValidation(v)
+	if err != nil {
+		return 0, false
+	}
+	return int(n), true
 }
 
 // validateMonteCarloDataConfig validates data_config fields specific to Monte Carlo leafs.

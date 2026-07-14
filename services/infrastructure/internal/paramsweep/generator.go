@@ -176,29 +176,70 @@ func CartesianProduct(params map[string][]interface{}) []map[string]interface{} 
 	return combinations
 }
 
-// Generate orchestrates parameter sweep work unit generation:
-// validate batch_size → parse parameter space → compute Cartesian product →
-// split into batches → create Batch + BulkCreate work units → bulk transition
-// CREATED → QUEUED.
+// sortedKeys returns the parameter keys in the deterministic (alphabetical) order the
+// odometer decode uses — the same order CartesianProduct enumerates, so window(i..j) under
+// the decoder equals full-product[i..j].
+func sortedKeys(params map[string][]interface{}) []string {
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// totalCombinations computes the size of the full Cartesian product from the per-key value
+// counts alone (∏ len(values_k)) — no materialization.
+func totalCombinations(keys []string, params map[string][]interface{}) int {
+	total := 1
+	for _, k := range keys {
+		total *= len(params[k])
+	}
+	return total
+}
+
+// decodeCombination recovers the combination at global index `index` in the full product by
+// positional odometer decode: rightmost key varies fastest, matching CartesianProduct's forward
+// odometer (which increments the last key first). This is the O(1)-memory replacement for
+// materializing the whole product and slicing it — the science depends on this yielding exactly
+// full-product[index].
+func decodeCombination(keys []string, params map[string][]interface{}, index int) map[string]interface{} {
+	combo := make(map[string]interface{}, len(keys))
+	idx := index
+	for j := len(keys) - 1; j >= 0; j-- {
+		k := keys[j]
+		radix := len(params[k])
+		combo[k] = params[k][idx%radix]
+		idx /= radix
+	}
+	return combo
+}
+
+// Generate orchestrates parameter sweep work unit generation: validate batch_size → parse
+// parameter space → compute the total product size from lengths → generate combinations by
+// odometer decode (never materializing the product) → persist each batch atomically through the
+// sink.
 //
-// Supports an optional "_offset" key in parameterSpace for lazy generation.
-// When set, the Cartesian product is computed starting at that index, generating
-// up to batchSize work units from the offset position.
+// Pacing (design §4.7): an optional "_offset" key marks the LAZY path. When present, exactly one
+// window of min(batchSize, total-offset) combinations is generated in ONE batch (true top-up
+// pacing — the pre-fix code flooded the entire remaining space in a single tick). When absent
+// (eager), the full remaining space is generated batch-by-batch. Memory is O(batch) either way.
 func Generate(
 	ctx context.Context,
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo workunit.WorkUnitRepository,
-	batchRepo workunit.BatchRepository,
+	sink workunit.BatchSink,
 ) (*workunit.GenerateResult, error) {
 	batchSize = generate.ClampBatchSize(batchSize)
 
-	// Extract _offset if present (used for lazy generation).
+	// Extract _offset if present (marks the lazy path).
 	offset := 0
+	lazy := false
 	cleanParams := make(map[string]interface{}, len(parameterSpace))
 	for k, v := range parameterSpace {
 		if k == "_offset" {
+			lazy = true
 			if n, ok := toFloat64(v); ok {
 				offset = int(n)
 			}
@@ -213,76 +254,76 @@ func Generate(
 		return nil, err
 	}
 
-	// Compute all combinations.
-	combinations := CartesianProduct(expanded)
-	totalCombinations := len(combinations)
-	if totalCombinations == 0 {
+	// Deterministic key order + total size, computed from lengths alone (no materialization).
+	keys := sortedKeys(expanded)
+	total := totalCombinations(keys, expanded)
+	if total == 0 {
 		return nil, apierror.ValidationError("parameter space produced no combinations", nil)
 	}
 
-	// Apply offset: skip to the starting position.
-	if offset >= totalCombinations {
+	if total > largeSpaceThreshold {
+		slog.WarnContext(ctx, "large parameter space",
+			"leaf_id", proj.ID,
+			"combinations", total,
+		)
+	}
+
+	// Exhaustion: offset at or past the end generates nothing.
+	if offset >= total {
 		return &workunit.GenerateResult{
 			Status: "complete",
 		}, nil
 	}
-	combinations = combinations[offset:]
-	remaining := len(combinations)
+
+	// Window to generate this call: one batch-sized window on the lazy path, the whole remainder
+	// on the eager path.
+	remaining := total - offset
+	need := remaining
+	if lazy {
+		need = min(batchSize, remaining)
+	}
 
 	// Resolve work unit field defaults from project.
 	codeArtifactRef := generate.ResolveCodeArtifactRef(proj)
 	deadlineSeconds := generate.ResolveDeadlineSeconds(proj)
 	maxReassignments := proj.FaultToleranceConfig.MaxReassignments
 
-	// Split into batches.
-	numBatches := (remaining + batchSize - 1) / batchSize
+	numBatches := (need + batchSize - 1) / batchSize
 
 	result := &workunit.GenerateResult{
 		BatchIDs: make([]types.ID, 0, numBatches),
 		Status:   "complete",
 	}
 
-	if totalCombinations > largeSpaceThreshold {
-		slog.WarnContext(ctx, "large parameter space",
-			"leaf_id", proj.ID,
-			"combinations", totalCombinations,
-		)
-	}
-
-	// Determine starting sequence number by querying existing batches.
-	nextSeqNum, err := generate.ResolveNextSequenceNumber(ctx, proj.ID, batchRepo)
+	nextSeqNum, err := sink.NextSequenceNumber(ctx, proj.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
-		start := batchIdx * batchSize
-		end := start + batchSize
-		if end > remaining {
-			end = remaining
+		batchStart := batchIdx * batchSize // relative to the `need` window
+		batchEnd := batchStart + batchSize
+		if batchEnd > need {
+			batchEnd = need
 		}
-		batchCombinations := combinations[start:end]
+		batchCount := batchEnd - batchStart
 
-		// Create batch record.
 		batch := &workunit.Batch{
-			LeafID:      proj.ID,
+			LeafID:         proj.ID,
 			SequenceNumber: nextSeqNum + batchIdx,
-			TotalWorkUnits: len(batchCombinations),
-		}
-		if err := batchRepo.Create(ctx, batch); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("create batch %d", batchIdx), err)
+			TotalWorkUnits: batchCount,
 		}
 
-		// Build work units for this batch.
-		wus := make([]*workunit.WorkUnit, len(batchCombinations))
-		for i, combo := range batchCombinations {
+		wus := make([]*workunit.WorkUnit, batchCount)
+		for i := 0; i < batchCount; i++ {
+			// Global combination index into the full product (window base = offset).
+			combo := decodeCombination(keys, expanded, offset+batchStart+i)
 			params, err := json.Marshal(combo)
 			if err != nil {
 				return nil, apierror.Internal("failed to marshal parameters", err)
 			}
 			wus[i] = &workunit.WorkUnit{
-				LeafID:        proj.ID,
-				BatchID:          &batch.ID,
+				LeafID:           proj.ID,
 				State:            workunit.WorkUnitStateCreated,
 				Priority:         workunit.WorkUnitPriorityNormal,
 				CodeArtifactRef:  codeArtifactRef,
@@ -292,18 +333,13 @@ func Generate(
 			}
 		}
 
-		// Bulk insert work units.
-		if err := wuRepo.BulkCreate(ctx, wus); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("bulk create work units for batch %d", batchIdx), err)
-		}
-
-		// Transition all CREATED work units in this batch to QUEUED.
-		if err := bulkTransitionToQueued(ctx, proj.ID, batch.ID, wuRepo); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("transition batch %d to queued", batchIdx), err)
+		// One atomic write: batch row + units + CREATED->QUEUED transition (design §4.8).
+		if err := sink.PersistBatch(ctx, batch, wus, nil); err != nil {
+			return nil, err
 		}
 
 		result.BatchIDs = append(result.BatchIDs, batch.ID)
-		result.WorkUnitsCreated += len(batchCombinations)
+		result.WorkUnitsCreated += batchCount
 	}
 
 	slog.InfoContext(ctx, "parameter sweep generated",
@@ -313,12 +349,4 @@ func Generate(
 	)
 
 	return result, nil
-}
-
-
-// bulkTransitionToQueued transitions all CREATED work units in a batch to QUEUED
-// in a single bulk UPDATE.
-func bulkTransitionToQueued(ctx context.Context, leafID, batchID types.ID, wuRepo workunit.WorkUnitRepository) error {
-	_, err := wuRepo.BulkTransitionByBatch(ctx, batchID, workunit.WorkUnitStateCreated, workunit.WorkUnitStateQueued)
-	return err
 }

@@ -256,6 +256,18 @@ func main() {
 		unitLocker,
 		wuRepo, leafRepo, resultRepo, validationEngine, trustPolicy, logger)
 
+	// Finalization recovery sweeper (E1 §4.2): a leader-gated, unconditional reconciler that
+	// re-drives finalization-stalled work units through the idempotent transitioner — the
+	// standing re-scan half of finalization liveness. It reads the two strand-shape candidate
+	// queries off wuRepo and calls transitioner.Evaluate per unit. Started in the leader block
+	// below, beside the revocation reconciler.
+	recoverySweeper := transition.NewRecoverySweeper(
+		wuRepo, transitioner,
+		time.Duration(cfg.Head.EffectiveFinalizationSweepIntervalSeconds())*time.Second,
+		time.Duration(cfg.Head.EffectiveFinalizationSweepGraceSeconds())*time.Second,
+		cfg.Head.EffectiveFinalizationSweepBatch(),
+		logger)
+
 	// Parse trusted reverse-proxy networks for trust-aware client-IP extraction.
 	// (Config validation already verified these parse; this cannot fail here.)
 	trustedProxies, err := cfg.Server.ParsedTrustedProxies()
@@ -560,7 +572,10 @@ func main() {
 	racUpdater := credit.NewRACUpdater(racRepo, logger)
 	artifactGC := server.NewArtifactVersionGC(leafRepo, cfg.Head.EffectiveArtifactRetentionKeep(), logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
-	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, batchRepo, leafRepo, logger)
+	// The lazy generation store persists each batch AND its cursor advance in one transaction
+	// (design §4.8), so a crash or leadership-failover overlap cannot duplicate or lose ordinals.
+	genSink := generate.NewPgxBatchSink(pool, logger)
+	lazyManager := generate.NewLazyManager(patternRouter, wuRepo, genSink, leafRepo, logger)
 	healthRecorder := health.NewRecorder(pool, stats.NewEngine(pool), leafRepo, logger)
 
 	// Optional DID-binding re-check worker (leader-only): re-verifies bindings on a TTL
@@ -673,6 +688,11 @@ func main() {
 			// missing revocations it is one indexed no-row query per sweep on the leader.
 			safego.Go(leaderCtx, logger, "revocation-reconciler",
 				attestation.NewRevocationReconciler(revocationEmitter, 10*time.Minute, logger).Run)
+			// Finalization recovery sweep (E1 §4.2) — UNCONDITIONAL like the revocation
+			// reconciler: it is a correctness reconciler for finalization liveness (a
+			// crashed/lost post-commit Evaluate must still re-drive), and on a healthy head it
+			// is two indexed near-empty queries per interval on the leader.
+			safego.Go(leaderCtx, logger, "finalization-recovery-sweeper", recoverySweeper.Run)
 			// Audit-enforcement sweep (design §9.2-§9.3) — gated on the knob, UNLIKE the
 			// reclaim sweep: with enforcement off, verdicts must stay observe-only
 			// byte-identically, and this worker is the only actor that executes

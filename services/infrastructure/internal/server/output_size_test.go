@@ -82,6 +82,20 @@ func grpcServiceForSizeTest(t *testing.T, maxOutput int64) (*volunteerService, e
 	return svc, pub, vol.ID, wuID
 }
 
+// jsonBytesOfSize returns a valid JSON object whose encoding is exactly n bytes. The size
+// gate tests below need a payload that clears the submit door's content gate (design §4.3,
+// which rejects non-empty-but-malformed inline output): a raw make([]byte, n) is all-zero
+// bytes and is no longer a valid submission, so the size gate must be exercised with real
+// JSON. n must be >= len(`{"d":""}`) == 8.
+func jsonBytesOfSize(t *testing.T, n int) []byte {
+	t.Helper()
+	const overhead = len(`{"d":""}`)
+	if n < overhead {
+		t.Fatalf("jsonBytesOfSize: n=%d too small (min %d)", n, overhead)
+	}
+	return []byte(`{"d":"` + strings.Repeat("a", n-overhead) + `"}`)
+}
+
 func grpcSubmitReq(pub ed25519.PublicKey, volID, wuID types.ID, output []byte) *lettucev1.SubmitResultRequest {
 	sum := sha256.Sum256(output)
 	return &lettucev1.SubmitResultRequest{
@@ -118,7 +132,7 @@ func TestSubmitResult_GRPC_AcceptsOutputWithinLimit(t *testing.T) {
 	const maxOut = 1024
 	svc, pub, volID, wuID := grpcServiceForSizeTest(t, maxOut)
 
-	output := make([]byte, maxOut) // exactly at the cap — allowed
+	output := jsonBytesOfSize(t, maxOut) // valid JSON exactly at the cap — allowed
 	req := grpcSubmitReq(pub, volID, wuID, output)
 	ctx := contextWithGRPCAuthPublicKey(context.Background(), pub)
 
@@ -138,7 +152,7 @@ func TestSubmitResult_GRPC_ZeroMaxIsUnlimited(t *testing.T) {
 	// MaxOutputSizeBytes == 0 means "unlimited" per the config semantics.
 	svc, pub, volID, wuID := grpcServiceForSizeTest(t, 0)
 
-	output := make([]byte, 5*1024*1024) // 5MB, would exceed any small cap
+	output := jsonBytesOfSize(t, 5*1024*1024) // valid 5MB JSON, would exceed any small cap
 	req := grpcSubmitReq(pub, volID, wuID, output)
 	ctx := contextWithGRPCAuthPublicKey(context.Background(), pub)
 
@@ -215,7 +229,7 @@ func TestBrowserSubmitResult_AcceptsOutputWithinLimit(t *testing.T) {
 	deps, pub, wuID := browserDepsForSizeTest(t, maxOut)
 	handler := handleBrowserSubmitResult(deps)
 
-	output := make([]byte, maxOut) // at the cap — allowed
+	output := jsonBytesOfSize(t, maxOut) // valid JSON at the cap — allowed
 	body := browserSubmitBody(t, wuID, output)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/volunteers/submit-result", strings.NewReader(body))
 	req = req.WithContext(ContextWithEd25519PubKey(req.Context(), pub))
@@ -236,7 +250,7 @@ func TestBrowserSubmitResult_ZeroMaxIsUnlimited(t *testing.T) {
 	deps, pub, wuID := browserDepsForSizeTest(t, 0)
 	handler := handleBrowserSubmitResult(deps)
 
-	output := make([]byte, 5*1024*1024) // 5MB, exceeds any small cap
+	output := jsonBytesOfSize(t, 5*1024*1024) // valid 5MB JSON, exceeds any small cap
 	body := browserSubmitBody(t, wuID, output)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/volunteers/submit-result", strings.NewReader(body))
 	req = req.WithContext(ContextWithEd25519PubKey(req.Context(), pub))

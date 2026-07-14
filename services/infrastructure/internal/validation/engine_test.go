@@ -1077,7 +1077,13 @@ func TestCreditAmount_UsesProjectConfig(t *testing.T) {
 	}
 }
 
-func TestNumericTolerance_EmptyOutputData_ReturnsError(t *testing.T) {
+// TestNumericTolerance_EmptyOutputData_DegradesToRejected verifies §4.3 comparator degradation:
+// a stored result whose output cannot be flattened (nil OutputData) is EXCLUDED from grouping
+// rather than aborting the whole comparison (BG-21a — one bad input must be one bad vote, never a
+// parked-forever unit). With BOTH rows empty there is no honest majority, so the unit REJECTS
+// (both DISAGREED) — a clean verdict with no error. (The submit door, ValidateSubmittedOutput,
+// separately refuses such output up front; this exercises the already-stored path.)
+func TestNumericTolerance_EmptyOutputData_DegradesToRejected(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 	vol1 := types.NewID()
@@ -1086,9 +1092,8 @@ func TestNumericTolerance_EmptyOutputData_ReturnsError(t *testing.T) {
 
 	proj := makeLeaf(leafID, 2, 1.0, "NUMERIC_TOLERANCE", &epsilon, 1.0)
 	wu := makeWorkUnit(wuID, leafID, workunit.WorkUnitStateCompleted)
-	// nil OutputData triggers "empty output data" error in parseNumericOutput. These stay ref-only
-	// (no inline bytes) on purpose — the emptiness IS the case under test — with checksums the
-	// realistic-inline sweep below deliberately leaves untouched.
+	// nil OutputData cannot be flattened; both rows are excluded from clique candidacy. They stay
+	// ref-only (no inline bytes) on purpose — the emptiness IS the case under test.
 	r1 := makeResult(wuID, vol1, "empty-a", nil)
 	r2 := makeResult(wuID, vol2, "empty-b", nil)
 
@@ -1102,15 +1107,33 @@ func TestNumericTolerance_EmptyOutputData_ReturnsError(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
+	volRepo := newMockVolunteerRepo()
+	volRepo.addVolunteer(makeVolunteer(vol1))
+	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	_, err := engine.TryValidate(context.Background(), wuID)
-	if err == nil {
-		t.Fatal("expected error for nil OutputData in numeric_tolerance mode")
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
+
+	vr, err := engine.TryValidate(context.Background(), wuID)
+	if err != nil {
+		t.Fatalf("TryValidate: unexpected error (comparator must degrade, not abort): %v", err)
+	}
+	if vr.Outcome != OutcomeRejected {
+		t.Fatalf("Outcome = %q, want REJECTED (both rows excluded -> no majority)", vr.Outcome)
+	}
+	if len(vr.RejectedResults) != 2 {
+		t.Errorf("RejectedResults = %d, want 2 (both unreadable rows DISAGREED)", len(vr.RejectedResults))
+	}
+	if r1.ValidationStatus != result.ValidationDisagreed || r2.ValidationStatus != result.ValidationDisagreed {
+		t.Errorf("statuses = (%s, %s), want both DISAGREED", r1.ValidationStatus, r2.ValidationStatus)
 	}
 }
 
-func TestNumericTolerance_MalformedJSON_ReturnsError(t *testing.T) {
+// TestNumericTolerance_MalformedJSON_DegradesToRejected verifies §4.3 degradation with a MIXED
+// set: one malformed row (excluded) plus one honest row. The malformed row can never join or form
+// a group; the lone honest row is a singleton that cannot reach the 2-of-2 quorum, so the unit
+// REJECTS (both DISAGREED) with no error — the malformed row no longer aborts the comparison and
+// strands the honest corroborator's work forever (BG-21a).
+func TestNumericTolerance_MalformedJSON_DegradesToRejected(t *testing.T) {
 	leafID := types.NewID()
 	wuID := types.NewID()
 	vol1 := types.NewID()
@@ -1132,11 +1155,21 @@ func TestNumericTolerance_MalformedJSON_ReturnsError(t *testing.T) {
 	leafRepo := newMockLeafRepo()
 	leafRepo.addLeaf(proj)
 
-	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, newMockVolunteerRepo(), newMockAssignmentRepo(), nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
+	volRepo := newMockVolunteerRepo()
+	volRepo.addVolunteer(makeVolunteer(vol1))
+	volRepo.addVolunteer(makeVolunteer(vol2))
 
-	_, err := engine.TryValidate(context.Background(), wuID)
-	if err == nil {
-		t.Fatal("expected error for malformed JSON OutputData in numeric_tolerance mode")
+	engine := NewEngine(resultRepo, wuRepo, leafRepo, newMockCreditRepo(), nil, volRepo, newMockAssignmentRepo(), nil, nil, nil, testLogger(), nil, transition.TrustPolicy{})
+
+	vr, err := engine.TryValidate(context.Background(), wuID)
+	if err != nil {
+		t.Fatalf("TryValidate: unexpected error (comparator must degrade, not abort): %v", err)
+	}
+	if vr.Outcome != OutcomeRejected {
+		t.Fatalf("Outcome = %q, want REJECTED (lone honest row cannot reach quorum 2)", vr.Outcome)
+	}
+	if len(vr.RejectedResults) != 2 {
+		t.Errorf("RejectedResults = %d, want 2", len(vr.RejectedResults))
 	}
 }
 
@@ -1207,29 +1240,35 @@ func TestParseNumericOutput_RejectsNaN(t *testing.T) {
 	}
 }
 
-// TestNumericTolerance_Inf_From1e400_DoesNotValidate verifies that huge-magnitude
-// JSON numbers (1e400) which decode to ±Inf do NOT validate/agree. They are
-// rejected at parse time, so TryValidate returns an error and no work unit is
-// validated — identical to the malformed-output behavior.
+// TestNumericTolerance_Inf_From1e400_DoesNotValidate verifies that huge-magnitude JSON numbers
+// (1e400, which decode to +Inf) do NOT validate. Under §4.3 the non-finite rows are EXCLUDED from
+// grouping (not aborted), so with both rows non-finite there is no majority and the unit REJECTS
+// with no error — the unit is never parked forever on one poisoned output (BG-21a).
 func TestNumericTolerance_Inf_From1e400_DoesNotValidate(t *testing.T) {
 	vr, err := runNumericTwoResults(t, 0.01,
 		json.RawMessage(`{"x": 1e400}`),
 		json.RawMessage(`{"x": 1e400}`),
 	)
-	if err == nil {
-		t.Fatalf("expected error for non-finite (+Inf from 1e400) output, got vr=%+v", vr)
+	if err != nil {
+		t.Fatalf("TryValidate: unexpected error (comparator must degrade, not abort): %v", err)
+	}
+	if vr.Outcome == OutcomeValidated {
+		t.Fatalf("Outcome = %q, want NOT VALIDATED for non-finite (+Inf) output", vr.Outcome)
 	}
 }
 
-// TestNumericTolerance_NegInf_From1eNeg400_DoesNotValidate verifies -Inf is also
-// rejected. (-1e400 decodes to -Inf.)
+// TestNumericTolerance_NegInf_DoesNotValidate verifies -Inf (from -1e400) is likewise excluded and
+// the unit does not validate.
 func TestNumericTolerance_NegInf_DoesNotValidate(t *testing.T) {
 	vr, err := runNumericTwoResults(t, 0.01,
 		json.RawMessage(`{"x": -1e400}`),
 		json.RawMessage(`{"x": -1e400}`),
 	)
-	if err == nil {
-		t.Fatalf("expected error for non-finite (-Inf from -1e400) output, got vr=%+v", vr)
+	if err != nil {
+		t.Fatalf("TryValidate: unexpected error (comparator must degrade, not abort): %v", err)
+	}
+	if vr.Outcome == OutcomeValidated {
+		t.Fatalf("Outcome = %q, want NOT VALIDATED for non-finite (-Inf) output", vr.Outcome)
 	}
 }
 

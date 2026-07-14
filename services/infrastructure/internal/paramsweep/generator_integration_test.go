@@ -128,7 +128,7 @@ func TestIntegration_Generate_BasicSweep(t *testing.T) {
 		"pressure":    []interface{}{1.0, 2.0, 3.0},
 	}
 
-	result, err := Generate(ctx, proj, params, 10000, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestIntegration_Generate_BatchSplitting(t *testing.T) {
 		"y": vals,
 	}
 
-	result, err := Generate(ctx, proj, params, 10, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, 10, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestIntegration_Generate_LargeSpaceWarning(t *testing.T) {
 		"y": vals,
 	}
 
-	result, err := Generate(ctx, proj, params, generate.MaxBatchSize, wuRepo, batchRepo)
+	result, err := Generate(ctx, proj, params, generate.MaxBatchSize, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestIntegration_Generate_SequenceNumbers(t *testing.T) {
 	params1 := map[string]interface{}{
 		"x": []interface{}{1.0, 2.0},
 	}
-	result1, err := Generate(ctx, proj, params1, 10000, wuRepo, batchRepo)
+	result1, err := Generate(ctx, proj, params1, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("first generate failed: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestIntegration_Generate_SequenceNumbers(t *testing.T) {
 	params2 := map[string]interface{}{
 		"y": []interface{}{3.0, 4.0, 5.0},
 	}
-	result2, err := Generate(ctx, proj, params2, 10000, wuRepo, batchRepo)
+	result2, err := Generate(ctx, proj, params2, 10000, workunit.NewRepoBatchSink(wuRepo, batchRepo))
 	if err != nil {
 		t.Fatalf("second generate failed: %v", err)
 	}

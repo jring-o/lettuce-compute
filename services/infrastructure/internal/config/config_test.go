@@ -1202,6 +1202,112 @@ func TestDIDBindingEnvOverrideInvalidBool(t *testing.T) {
 	}
 }
 
+// TestFinalizationSweepDefaults verifies the recovery-sweep Effective accessors on a
+// zero-valued HeadConfig (unset -> documented defaults) and that explicit values pass through.
+func TestFinalizationSweepDefaults(t *testing.T) {
+	h := HeadConfig{}
+	if got := h.EffectiveFinalizationSweepIntervalSeconds(); got != 60 {
+		t.Errorf("EffectiveFinalizationSweepIntervalSeconds() = %d, want 60", got)
+	}
+	if got := h.EffectiveFinalizationSweepGraceSeconds(); got != 300 {
+		t.Errorf("EffectiveFinalizationSweepGraceSeconds() = %d, want 300", got)
+	}
+	if got := h.EffectiveFinalizationSweepBatch(); got != 100 {
+		t.Errorf("EffectiveFinalizationSweepBatch() = %d, want 100", got)
+	}
+
+	h2 := HeadConfig{
+		FinalizationSweepIntervalSeconds: 15,
+		FinalizationSweepGraceSeconds:    45,
+		FinalizationSweepBatch:           250,
+	}
+	if got := h2.EffectiveFinalizationSweepIntervalSeconds(); got != 15 {
+		t.Errorf("EffectiveFinalizationSweepIntervalSeconds() = %d, want 15", got)
+	}
+	if got := h2.EffectiveFinalizationSweepGraceSeconds(); got != 45 {
+		t.Errorf("EffectiveFinalizationSweepGraceSeconds() = %d, want 45", got)
+	}
+	if got := h2.EffectiveFinalizationSweepBatch(); got != 250 {
+		t.Errorf("EffectiveFinalizationSweepBatch() = %d, want 250", got)
+	}
+}
+
+// TestFinalizationSweepValidate covers the recovery-sweep knob Validate rules: raw 0 is the
+// unset->default sentinel and must pass; negatives are rejected.
+func TestFinalizationSweepValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     HeadConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "all unset ok", cfg: HeadConfig{Name: "x"}, wantErr: false},
+		{
+			name:    "valid explicit knobs",
+			cfg:     HeadConfig{Name: "x", FinalizationSweepIntervalSeconds: 30, FinalizationSweepGraceSeconds: 120, FinalizationSweepBatch: 50},
+			wantErr: false,
+		},
+		{
+			name:    "negative interval rejected",
+			cfg:     HeadConfig{Name: "x", FinalizationSweepIntervalSeconds: -1},
+			wantErr: true,
+			errMsg:  "finalization_sweep_interval_seconds must be >= 0",
+		},
+		{
+			name:    "negative grace rejected",
+			cfg:     HeadConfig{Name: "x", FinalizationSweepGraceSeconds: -1},
+			wantErr: true,
+			errMsg:  "finalization_sweep_grace_seconds must be >= 0",
+		},
+		{
+			name:    "negative batch rejected",
+			cfg:     HeadConfig{Name: "x", FinalizationSweepBatch: -1},
+			wantErr: true,
+			errMsg:  "finalization_sweep_batch must be >= 0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want it to contain %q", err.Error(), tt.errMsg)
+				}
+			}
+		})
+	}
+}
+
+// TestFinalizationSweepEnvOverrides threads the recovery-sweep env knobs through Load.
+func TestFinalizationSweepEnvOverrides(t *testing.T) {
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_FINALIZATION_SWEEP_INTERVAL_SECONDS", "90")
+	t.Setenv("LETTUCE_HEAD_FINALIZATION_SWEEP_GRACE_SECONDS", "600")
+	t.Setenv("LETTUCE_HEAD_FINALIZATION_SWEEP_BATCH", "42")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Head.FinalizationSweepIntervalSeconds != 90 {
+		t.Errorf("FinalizationSweepIntervalSeconds = %d, want 90", cfg.Head.FinalizationSweepIntervalSeconds)
+	}
+	if cfg.Head.FinalizationSweepGraceSeconds != 600 {
+		t.Errorf("FinalizationSweepGraceSeconds = %d, want 600", cfg.Head.FinalizationSweepGraceSeconds)
+	}
+	if cfg.Head.FinalizationSweepBatch != 42 {
+		t.Errorf("FinalizationSweepBatch = %d, want 42", cfg.Head.FinalizationSweepBatch)
+	}
+}
+
 // TestTrustGateDefaults verifies the trust-gate defaults on a zero-valued HeadConfig:
 // the gate is off, and the Effective accessors return the documented head defaults
 // (K=1, floor/W=25).

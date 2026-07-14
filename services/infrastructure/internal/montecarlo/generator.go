@@ -28,16 +28,21 @@ type trialParams struct {
 }
 
 // Generate creates Monte Carlo work units, one per trial, each with a unique seed.
+// Every unit's seed AND stamped trial_index derive from a GLOBAL ordinal = seedOffset + local
+// position (design §4.5): the seed offset — the lazy tick's base — enters the derivation, so
+// consecutive lazy ticks emit disjoint seeds and trial identities (the BG-22 duplication fix).
 // Seeds are generated according to the seed_strategy:
-//   - "sequential": seeds are seed_offset, seed_offset+1, ..., seed_offset+N-1
-//   - "hash": seeds are SHA-256(leaf_id + trial_index) truncated to int64
+//   - "sequential": seed = ordinal (seed_offset, seed_offset+1, ...)
+//   - "hash": seed = SHA-256(leaf_id + ordinal) truncated to a non-negative int64
+//
+// Eager generation always runs with seed_offset 0, so ordinal == local index and behavior is
+// byte-identical to before for both strategies.
 func Generate(
 	ctx context.Context,
 	proj *leaf.Leaf,
 	parameterSpace map[string]interface{},
 	batchSize int,
-	wuRepo workunit.WorkUnitRepository,
-	batchRepo workunit.BatchRepository,
+	sink workunit.BatchSink,
 ) (*workunit.GenerateResult, error) {
 	if proj.TaskPattern != leaf.PatternMonteCarlo {
 		return nil, apierror.ValidationError(
@@ -84,7 +89,7 @@ func Generate(
 		Status:   "complete",
 	}
 
-	nextSeqNum, err := generate.ResolveNextSequenceNumber(ctx, proj.ID, batchRepo)
+	nextSeqNum, err := sink.NextSequenceNumber(ctx, proj.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -98,30 +103,28 @@ func Generate(
 		batchCount := end - start
 
 		batch := &workunit.Batch{
-			LeafID:      proj.ID,
+			LeafID:         proj.ID,
 			SequenceNumber: nextSeqNum + batchIdx,
 			TotalWorkUnits: batchCount,
-		}
-		if err := batchRepo.Create(ctx, batch); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("create batch %d", batchIdx), err)
 		}
 
 		wus := make([]*workunit.WorkUnit, batchCount)
 		for i := 0; i < batchCount; i++ {
-			trialIndex := start + i
-			seed := generateSeed(seedStrategy, seedOffset, trialIndex, proj.ID)
+			// ordinal is the global trial index: the lazy tick's seed_offset plus the position
+			// within this generation. Both the seed and the stamped trial_index derive from it.
+			ordinal := seedOffset + start + i
+			seed := generateSeed(seedStrategy, ordinal, proj.ID)
 
 			params, err := json.Marshal(trialParams{
 				Seed:       seed,
-				TrialIndex: trialIndex,
+				TrialIndex: ordinal,
 			})
 			if err != nil {
 				return nil, apierror.Internal("failed to marshal trial parameters", err)
 			}
 
 			wus[i] = &workunit.WorkUnit{
-				LeafID:        proj.ID,
-				BatchID:          &batch.ID,
+				LeafID:           proj.ID,
 				State:            workunit.WorkUnitStateCreated,
 				Priority:         workunit.WorkUnitPriorityNormal,
 				CodeArtifactRef:  codeArtifactRef,
@@ -132,12 +135,10 @@ func Generate(
 			}
 		}
 
-		if err := wuRepo.BulkCreate(ctx, wus); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("bulk create work units for batch %d", batchIdx), err)
-		}
-
-		if _, err := wuRepo.BulkTransitionByBatch(ctx, batch.ID, workunit.WorkUnitStateCreated, workunit.WorkUnitStateQueued); err != nil {
-			return nil, apierror.Internal(fmt.Sprintf("transition batch %d to queued", batchIdx), err)
+		// One atomic write: batch row + units + CREATED->QUEUED transition (design §4.8). The
+		// sink wires each unit's batch_id and populates batch.ID on return.
+		if err := sink.PersistBatch(ctx, batch, wus, nil); err != nil {
+			return nil, err
 		}
 
 		result.BatchIDs = append(result.BatchIDs, batch.ID)
@@ -154,15 +155,18 @@ func Generate(
 	return result, nil
 }
 
-// generateSeed produces a seed for the given trial index based on the strategy.
-func generateSeed(strategy string, offset, trialIndex int, leafID types.ID) int64 {
+// generateSeed produces a seed for the given global ordinal based on the strategy.
+// For "hash" the seed is sha256(leaf_id ":" ordinal) truncated to a non-negative int64 — the
+// ordinal (which includes the seed offset) enters the hash preimage, so lazy ticks at different
+// offsets produce different seed sets (BG-22). For "sequential" the seed is the ordinal itself
+// (arithmetically identical to the old offset+trialIndex).
+func generateSeed(strategy string, ordinal int, leafID types.ID) int64 {
 	if strategy == "hash" {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", leafID.String(), trialIndex)))
-		seed := int64(binary.BigEndian.Uint64(h[:8]) & 0x7FFFFFFFFFFFFFFF)
-		return seed
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", leafID.String(), ordinal)))
+		return int64(binary.BigEndian.Uint64(h[:8]) & 0x7FFFFFFFFFFFFFFF)
 	}
 	// sequential
-	return int64(offset) + int64(trialIndex)
+	return int64(ordinal)
 }
 
 // mergeConfig creates a merged config map, preferring request values over project defaults.

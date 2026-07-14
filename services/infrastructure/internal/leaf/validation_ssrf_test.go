@@ -65,7 +65,7 @@ func TestSSRFURLScreening(t *testing.T) {
 			MaxOutputSizeBytes: 104857600,
 		}
 	}
-	err := ValidateDataConfig(extData("https://169.254.169.254/data"), PatternParameterSweep)
+	err := ValidateDataConfig(extData("https://169.254.169.254/data"), PatternParameterSweep, false)
 	if err == nil {
 		t.Error("ValidateDataConfig accepted an internal external_base_url")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "external_base_url") {

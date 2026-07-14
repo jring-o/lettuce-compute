@@ -106,7 +106,11 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	batchRepo := workunit.NewPgxBatchRepository(deps.Pool)
 	assignRepo := assignment.NewPgxRepository(deps.Pool)
 	patternRouter := generate.NewRouter(adaptParamSweep, adaptMapReduce, adaptMonteCarlo, custom.Generate, deps.Logger)
-	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, deps.Logger)
+	// The eager /generate path persists each batch atomically through the transactional sink
+	// (design §4.8): a crashed multi-batch run leaves earlier complete batches QUEUED, not
+	// stranded CREATED.
+	genSink := generate.NewPgxBatchSink(deps.Pool, deps.Logger)
+	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, genSink, deps.Logger)
 	// Enables operator requeue to close the prior volunteer's assignment outcome.
 	wuHandler.SetAssignmentRepo(assignRepo)
 

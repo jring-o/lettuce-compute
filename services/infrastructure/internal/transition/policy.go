@@ -49,9 +49,6 @@ type RedundancyPolicy struct {
 	// produce a DISAGREED result), the unit dead-letters even if MaxTotalCopies is not hit.
 	// 0 = unlimited (today's behavior — only MaxTotalCopies bounds errors).
 	MaxErrorCopies int
-	// MaxSuccessCopies bounds over-dispatch: the dispatcher stops creating copies once this
-	// many successful (agreeing) results exist. Defaults to TargetCopies.
-	MaxSuccessCopies int
 	// SpotCheck mirrors wu.spot_check: a single-copy unit randomly promoted to require a
 	// 2-of-2 corroboration. When set, TargetCopies and MinQuorum are both forced to 2.
 	SpotCheck bool
@@ -138,15 +135,6 @@ func ResolvePolicy(lf *leaf.Leaf, wu *workunit.WorkUnit) RedundancyPolicy {
 	p.MaxErrorCopies = wu.MaxErrorCopies
 	if p.MaxErrorCopies <= 0 {
 		p.MaxErrorCopies = vc.MaxErrorCopies
-	}
-
-	// Success / over-dispatch ceiling: per-unit override, else leaf config, else target.
-	p.MaxSuccessCopies = wu.MaxSuccessCopies
-	if p.MaxSuccessCopies <= 0 {
-		p.MaxSuccessCopies = vc.MaxSuccessCopies
-	}
-	if p.MaxSuccessCopies <= 0 {
-		p.MaxSuccessCopies = target
 	}
 
 	return p
