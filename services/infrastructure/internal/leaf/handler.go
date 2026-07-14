@@ -527,6 +527,21 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		p.ResourceRequirements = merged
 	}
 
+	// An is_ongoing flip changes WHICH DataConfig rules apply — a finite (non-ongoing) lazy
+	// Monte Carlo leaf must declare splitting_config.num_trials, the total its exhaustion is
+	// decided against — so the stored block must be re-validated against the new lifecycle
+	// even when the request carries no data_config (★BG-22e: without this, PATCH
+	// {"is_ongoing": false} on an ongoing lazy MC leaf with no num_trials lands the exact
+	// state the validation rule declares impossible, and the leaf generates forever). When
+	// req.DataConfig is present, its own block above already validated with the new
+	// p.IsOngoing (applied before the config merges).
+	if req.IsOngoing != nil && req.DataConfig == nil {
+		if apiErr := ValidateDataConfig(&p.DataConfig, p.TaskPattern, p.IsOngoing); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+	}
+
 	// Validate updated metadata.
 	if req.Name != nil || req.Description != nil || req.Visibility != nil || req.ResearchArea != nil {
 		if apiErr := ValidateMetadata(p); apiErr != nil {

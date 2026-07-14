@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
 // sweep runs one tick of the §10.6 pipeline. Any tx/scan error aborts the tick (the
@@ -157,6 +158,30 @@ func (w *Worker) apply(ctx context.Context, tx pgx.Tx, snap rowSnapshot, d dispo
 		return promotedUnit{}, false
 
 	case actionPromote:
+		// Terminal-unit door (★BG-21h): decide() checked the CLAIM-TIME unit state, but a
+		// fetch adds up to its full per-row deadline between that read and this write, and
+		// the claim locks only the results row — so the unit can finalize (VALIDATE or
+		// dead-letter) in the window, and an unguarded promotion would land a PENDING row
+		// under a terminal unit that nothing can ever adjudicate: post-commit Evaluate
+		// no-ops on terminal states and every recovery-sweep shape excludes them. Mirror
+		// the submit door's under-lock check: take the work_units row lock — the same
+		// serializer the finalization tx and both submit surfaces use — and re-decide on
+		// the state read UNDER it. If the finalization committed first, the locked read
+		// sees the terminal state and the row terminates UNIT_FINALIZED (exactly decide()'s
+		// own fetch-time rule for a claim-time-terminal unit); if this promotion wins the
+		// lock instead, the finalization tx queues behind this tick's commit and its in-tx
+		// PENDING recheck then sees the promoted row and retries with it included.
+		var unitState workunit.WorkUnitState
+		if err := tx.QueryRow(ctx,
+			`SELECT state FROM work_units WHERE id = $1 FOR UPDATE`,
+			snap.workUnitID).Scan(&unitState); err != nil {
+			w.logger.Error("content verification: promote unit-state recheck failed",
+				"error", err, "result_id", snap.resultID, "work_unit_id", snap.workUnitID)
+			return promotedUnit{}, false
+		}
+		if unitState == workunit.WorkUnitStateValidated || unitState == workunit.WorkUnitStateFailed {
+			return w.applyTerminal(ctx, tx, snap, terminal(CodeUnitFinalized, ""))
+		}
 		// Overwrite output_checksum with the head's own hash so EVERY downstream reader
 		// — comparisonKey AND the attestation builder — votes on the verified value.
 		tag, err := tx.Exec(ctx, `
@@ -203,28 +228,36 @@ func (w *Worker) apply(ctx context.Context, tx pgx.Tx, snap rowSnapshot, d dispo
 		return promotedUnit{}, false
 
 	case actionTerminal:
-		tag, err := tx.Exec(ctx, `
-			UPDATE results SET
-				validation_status = 'CONTENT_VERIFICATION_FAILED',
-				content_fetch_next_attempt_at = NULL,
-				content_fetch_last_error = $2,
-				updated_at = now()
-			WHERE id = $1 AND validation_status = 'AWAITING_CONTENT_VERIFICATION'`,
-			snap.resultID, d.lastError)
-		if err != nil {
-			w.logger.Error("content verification: terminal update failed",
-				"error", err, "result_id", snap.resultID)
-			return promotedUnit{}, false
-		}
-		if tag.RowsAffected() == 0 {
-			return promotedUnit{}, false
-		}
-		w.logger.Warn("external output verification failed",
-			"reason", d.reasonCode, "result_id", snap.resultID,
-			"volunteer_id", snap.volunteerID, "work_unit_id", snap.workUnitID,
-			"leaf_id", snap.leafID, "host", hostOf(snap.outputDataRef))
+		return w.applyTerminal(ctx, tx, snap, d)
+	}
+	return promotedUnit{}, false
+}
+
+// applyTerminal writes a terminal (CONTENT_VERIFICATION_FAILED) disposition on the claim tx.
+// Shared by the actionTerminal case and the promote path's terminal-unit door (★BG-21h),
+// which downgrades a promotion to terminal(CodeUnitFinalized) when the under-lock re-check
+// finds the unit already finalized.
+func (w *Worker) applyTerminal(ctx context.Context, tx pgx.Tx, snap rowSnapshot, d disposition) (promotedUnit, bool) {
+	tag, err := tx.Exec(ctx, `
+		UPDATE results SET
+			validation_status = 'CONTENT_VERIFICATION_FAILED',
+			content_fetch_next_attempt_at = NULL,
+			content_fetch_last_error = $2,
+			updated_at = now()
+		WHERE id = $1 AND validation_status = 'AWAITING_CONTENT_VERIFICATION'`,
+		snap.resultID, d.lastError)
+	if err != nil {
+		w.logger.Error("content verification: terminal update failed",
+			"error", err, "result_id", snap.resultID)
 		return promotedUnit{}, false
 	}
+	if tag.RowsAffected() == 0 {
+		return promotedUnit{}, false
+	}
+	w.logger.Warn("external output verification failed",
+		"reason", d.reasonCode, "result_id", snap.resultID,
+		"volunteer_id", snap.volunteerID, "work_unit_id", snap.workUnitID,
+		"leaf_id", snap.leafID, "host", hostOf(snap.outputDataRef))
 	return promotedUnit{}, false
 }
 

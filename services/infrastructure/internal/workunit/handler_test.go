@@ -295,6 +295,61 @@ func TestHandlerGenerateSuccess(t *testing.T) {
 	}
 }
 
+// TestHandlerGenerateRejectedForLazyLeaf (★BG-22d): the manual generate endpoint has no
+// cursor — on a lazy leaf it would generate from offset 0, re-emitting ordinals the lazy
+// manager's durable cursor has already emitted, with byte-identical seeds and trial indices
+// (no DB uniqueness stops the duplicates). A lazy leaf must be refused with a pointer to the
+// manager; no batch and no work units may be created.
+func TestHandlerGenerateRejectedForLazyLeaf(t *testing.T) {
+	ts, pool, cleanup := setupHandlerServer(t)
+	defer cleanup()
+
+	p := createProjectInState(t, ts, pool, leaf.StateConfiguring)
+
+	// Flip the leaf to lazy generation (PARAMETER_SWEEP supports lazy).
+	lazyData := map[string]any{
+		"data_config": map[string]any{
+			"generation_mode": "lazy",
+			"lazy_threshold":  50,
+			"lazy_batch_size": 100,
+			"splitting_config": map[string]any{
+				"temperature": []any{1.0, 2.0, 3.0},
+			},
+		},
+	}
+	resp := doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p.ID.String(), lazyData)
+	requireStatus(t, resp, http.StatusOK, "set lazy data_config")
+	resp.Body.Close()
+
+	url := fmt.Sprintf("%s/api/v1/leafs/%s/work-units/generate", ts.URL, p.ID)
+	resp = doRequest(t, "POST", url, workunit.GenerateRequest{
+		ParameterSpace: map[string]interface{}{"temperature": []interface{}{1.0, 2.0, 3.0}},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("generate on a lazy leaf: status = %d, want 409 Conflict (LAZY_GENERATION_MANAGED): %s",
+			resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Contains(body, []byte("LAZY_GENERATION_MANAGED")) {
+		t.Errorf("refusal body missing LAZY_GENERATION_MANAGED code: %s", body)
+	}
+
+	// Nothing was generated: no work units, no batch rows.
+	var wus, batches int
+	if err := pool.QueryRow(t.Context(), `SELECT COUNT(*) FROM work_units WHERE leaf_id = $1`, p.ID).Scan(&wus); err != nil {
+		t.Fatalf("count work units: %v", err)
+	}
+	if err := pool.QueryRow(t.Context(), `SELECT COUNT(*) FROM batches WHERE leaf_id = $1`, p.ID).Scan(&batches); err != nil {
+		t.Fatalf("count batches: %v", err)
+	}
+	if wus != 0 || batches != 0 {
+		t.Fatalf("lazy leaf generated anyway: %d work units, %d batches (duplicate-trial vector)", wus, batches)
+	}
+}
+
 func TestHandlerGenerateActiveProject(t *testing.T) {
 	ts, pool, cleanup := setupHandlerServer(t)
 	defer cleanup()

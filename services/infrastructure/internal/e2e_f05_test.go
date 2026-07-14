@@ -117,7 +117,8 @@ func setupF05Server(t *testing.T) (
 	attestationRepo := attestation.NewPgxRepository(pool)
 	_, signKey, _ := ed25519.GenerateKey(rand.Reader)
 	signer := attestation.NewSigner(signKey)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{}).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) // prod-shaped: atomic finalization, as main.go wires it (★BG-21e)
 	volunteerSvc := server.NewVolunteerService(pool, "0.3.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 

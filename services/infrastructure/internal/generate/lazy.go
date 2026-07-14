@@ -156,7 +156,18 @@ func (m *LazyManager) CheckAndGenerate(ctx context.Context, projectID types.ID) 
 	// covered, stamp exhausted WITHOUT invoking the generator. This also covers the N%batch==0
 	// edge (the tick after a final full batch generates nothing).
 	if proj.TaskPattern == leaf.PatternMonteCarlo && !proj.IsOngoing {
-		if n, ok := storedNumTrials(proj); ok && n-cursor.LastSeedOffset <= 0 {
+		n, ok := storedNumTrials(proj)
+		if !ok {
+			// A finite lazy MC leaf with no readable num_trials has no total to exhaust
+			// against — generating would emit a full batch every tick FOREVER (★BG-22e).
+			// Create/update validation rejects this state; a row that reached it anyway
+			// (e.g. a pre-fix is_ongoing flip) is skipped-and-WARNed, the same posture as
+			// the lazy MAP_REDUCE guard above, instead of silently never exhausting.
+			m.logger.WarnContext(ctx, "lazy manager: skipping finite MONTE_CARLO leaf with no readable splitting_config.num_trials; exhaustion is undecidable — set num_trials or is_ongoing",
+				"leaf_id", proj.ID)
+			return 0, nil
+		}
+		if n-cursor.LastSeedOffset <= 0 {
 			return 0, m.markExhausted(ctx, proj.ID, cursor)
 		}
 	}
@@ -342,6 +353,8 @@ func perTickNumTrials(proj *leaf.Leaf, cursor *GenerationCursor) int {
 	}
 	n, ok := storedNumTrials(proj)
 	if !ok {
+		// Unreachable via CheckAndGenerate (a finite MC leaf with no readable num_trials is
+		// skipped-and-WARNed before generation — ★BG-22e); defensive for any future caller.
 		return batch
 	}
 	remaining := n - cursor.LastSeedOffset

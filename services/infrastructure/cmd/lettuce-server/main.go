@@ -233,7 +233,14 @@ func main() {
 	// sampling hook only when LETTUCE_HEAD_RESULT_AUDIT_ENABLED is set; leafRepo doubles
 	// as the artifact-version resolver so a sampled audit pins the exec config the
 	// winner actually ran.
+	// WithTxRunner is the finalization ATOMICITY wiring (E1 §4.1, BG-21/★BG-21e): without it
+	// the engine runs the non-transactional passthrough and the marks, the VALIDATED flip, and
+	// the credit rows commit as separate autocommits — a crash between them loses credit or
+	// strands the unit unrepairably. NewVolunteerService refuses to build a pool-backed service
+	// over an engine without a runner, so removing this line fails the head at boot (and the
+	// wiring meta-test in main_test.go fails in CI).
 	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, reliabilityRepo, attestationSigner, logger, trustRepo, trustPolicy).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)).
 		WithStandingBackpressure(standingRecorder).
 		WithEmissionCap(cfg.Head.MaxDailyCreditPerAccount).
 		WithTrustedRunners(auditRunnersRepo).

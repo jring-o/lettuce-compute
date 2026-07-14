@@ -216,6 +216,15 @@ func (e *Engine) WithTxRunner(r FinalizationTxRunner) *Engine {
 	return e
 }
 
+// HasTxRunner reports whether a finalization transaction runner is wired — i.e. whether
+// accept/reject runs atomically rather than through the mock-friendly passthrough. The
+// production transitioner constructor (server.NewVolunteerService) refuses a pool-backed
+// engine without one, because a deployed head on the passthrough is exactly ★BG-21e: every
+// atomicity guarantee silently absent while all the mechanism's own tests stay green.
+func (e *Engine) HasTxRunner() bool {
+	return e.txRunner != nil
+}
+
 // TryValidate checks if enough results have arrived for a work unit
 // and runs the comparison algorithm if so.
 // Returns nil if the work unit is not ready for validation or is already validated.

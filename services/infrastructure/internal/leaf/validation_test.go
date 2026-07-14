@@ -966,6 +966,13 @@ func TestRejectRemovedValidationConfigKeys(t *testing.T) {
 		{name: "no removed keys ok", raw: `{"redundancy_factor":2,"max_error_copies":3}`, wantErr: false},
 		{name: "explicit non-zero max_success_copies rejected", raw: `{"max_success_copies":5}`, wantErr: true},
 		{name: "explicit zero max_success_copies rejected", raw: `{"max_success_copies":0}`, wantErr: true},
+		// Hardening note (d): the probe must be KEY-PRESENCE, not a typed pointer — a typed
+		// *int probe fails the whole unmarshal on a type-mismatched value and the guard fails
+		// OPEN (key silently dropped by the typed merge, 200 returned, accepted-and-ignored).
+		{name: "string-typed max_success_copies rejected (type mismatch must not fail open)", raw: `{"max_success_copies":"5"}`, wantErr: true},
+		{name: "float-typed max_success_copies rejected", raw: `{"max_success_copies":5.5}`, wantErr: true},
+		{name: "object-typed max_success_copies rejected", raw: `{"max_success_copies":{"v":5}}`, wantErr: true},
+		{name: "null max_success_copies rejected (the key itself is gone)", raw: `{"max_success_copies":null}`, wantErr: true},
 		{name: "malformed block deferred to typed unmarshal", raw: `{not json`, wantErr: false},
 	}
 	for _, tt := range tests {

@@ -239,6 +239,17 @@ func newTransitioner(pool *pgxpool.Pool, wuRepo workunit.WorkUnitRepository, lea
 	if validationEngine == nil {
 		return nil
 	}
+	// Finalization-atomicity boot assertion (★BG-21e): a pool-backed service is the
+	// production shape, and a production engine running the mock-friendly passthrough
+	// (no FinalizationTxRunner) finalizes NON-atomically — marks, the VALIDATED flip, and
+	// the credit rows as separate autocommits. That exact gap shipped once because every
+	// test hand-wired the runner while main.go did not, so this is enforced where pool and
+	// engine meet: fail construction (and therefore head boot) instead of running open.
+	// Mock-based tests keep the passthrough by passing a nil pool.
+	if pool != nil && !validationEngine.HasTxRunner() {
+		panic("validation engine has no FinalizationTxRunner: a pool-backed head must wire " +
+			".WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) or finalization is not atomic (★BG-21e)")
+	}
 	var locker transition.Locker = transition.NoopLocker{}
 	if pool != nil {
 		locker = transition.NewPgxLocker(pool, logger)

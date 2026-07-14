@@ -189,13 +189,27 @@ func sortedKeys(params map[string][]interface{}) []string {
 }
 
 // totalCombinations computes the size of the full Cartesian product from the per-key value
-// counts alone (∏ len(values_k)) — no materialization.
-func totalCombinations(keys []string, params map[string][]interface{}) int {
+// counts alone (∏ len(values_k)) — no materialization. The product is overflow-checked
+// (hardening note (e)): ~64 two-value parameters overflow int64, and an overflowed total of
+// 0/negative would flow into the `offset >= total` exhaustion early-return — a lazy tick would
+// then emit zero units and markExhausted would stamp the leaf complete-with-zero-units,
+// SILENTLY (the pre-windowing code at least panicked loudly in make()). Any space whose true
+// size exceeds int64 is incompletable regardless, so refusing it loses no real coverage.
+func totalCombinations(keys []string, params map[string][]interface{}) (int, error) {
 	total := 1
 	for _, k := range keys {
-		total *= len(params[k])
+		n := len(params[k])
+		if n == 0 {
+			return 0, nil
+		}
+		if total > math.MaxInt/n {
+			return 0, apierror.ValidationError(
+				"parameter space too large: the combination count overflows a 64-bit integer; remove parameters or values",
+				map[string]string{"reason": "combination_count_overflow"})
+		}
+		total *= n
 	}
-	return total
+	return total, nil
 }
 
 // decodeCombination recovers the combination at global index `index` in the full product by
@@ -256,7 +270,10 @@ func Generate(
 
 	// Deterministic key order + total size, computed from lengths alone (no materialization).
 	keys := sortedKeys(expanded)
-	total := totalCombinations(keys, expanded)
+	total, err := totalCombinations(keys, expanded)
+	if err != nil {
+		return nil, err
+	}
 	if total == 0 {
 		return nil, apierror.ValidationError("parameter space produced no combinations", nil)
 	}

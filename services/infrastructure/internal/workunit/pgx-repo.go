@@ -1979,11 +1979,16 @@ func (r *PgxWorkUnitRepository) FindStalledFinalizationUnits(ctx context.Context
 // ages on the EVIDENCE (MAX(created_at) of the PENDING results), NOT on work_units.updated_at:
 // dispatch-claim stamping/renewal and expired-claim hygiene bump updated_at with zero progress
 // on the unit, which would age-mask a dispatchable strand precisely in the quiet-pool regime
-// the sweep exists for. The pending count is the RAW count against the shared quorum fragment
-// (effQuorumWuL), mirroring Decide's attempt gate — the sweep asks only "might Evaluate do
-// something," and Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l
-// primary keys so the quorum fragment's per-row column references are resolvable. Oldest
-// evidence first, LIMIT. Rides idx_results_pending_by_unit.
+// the sweep exists for. The pending count is the VERSION-HOMOGENEOUS count against the shared
+// quorum fragment (effQuorumWuL), mirroring Decide's attempt gate — Decide only ever sees the
+// filtered count (validation.FilterPending), so a selector counting RAW rows would re-select a
+// version-heterogeneous unit whose filtered count sits below quorum and re-drive it into WAIT
+// every tick forever (★BG-21g); such a unit is not a strand — its filtered coverage leaves
+// dispatch headroom, and dispatch (whose coverage count now agrees, countablePendingResultsSQL)
+// supplies the missing corroborator. The sweep asks only "might Evaluate do something," and
+// Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l primary keys so
+// the quorum fragment's per-row column references are resolvable. Oldest evidence first,
+// LIMIT. Rides idx_results_pending_by_unit.
 func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT wu.id
@@ -1993,7 +1998,7 @@ func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, o
 		WHERE r.validation_status = 'PENDING' AND wu.state = 'QUEUED'
 		GROUP BY wu.id, l.id
 		HAVING MAX(r.created_at) < now() - make_interval(secs => $1)
-		   AND COUNT(*) >= `+effQuorumWuL+`
+		   AND `+versionHomogeneousPendingSQL("wu.id")+` >= `+effQuorumWuL+`
 		ORDER BY MAX(r.created_at) ASC
 		LIMIT $2`,
 		int(olderThan.Seconds()), limit)
@@ -2134,12 +2139,12 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
-// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED or
-// COMPLETED, has NO live copy outstanding, its redundancy is still unmet (PENDING results <
-// quorum), AND its copy budget is spent: EITHER the total copies ever created has reached its
-// dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR — when the owner
-// configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED) have reached
-// max_error_copies. Returns whether the unit was failed.
+// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED, COMPLETED,
+// or REJECTED, has NO live copy outstanding, its redundancy is still unmet (version-homogeneous
+// PENDING results < quorum), AND its copy budget is spent: EITHER the total copies ever created
+// has reached its dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR —
+// when the owner configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED)
+// have reached max_error_copies. Returns whether the unit was failed.
 //
 // The ceiling disjunct MIRRORS transition.capsExhausted (decide.go) field-for-field:
 // `total >= effMaxTotal OR (effMaxError > 0 AND errors >= effMaxError)`, built from the shared
@@ -2150,11 +2155,22 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 // stayed QUEUED and dispatchable until the (much larger) total ceiling. The `effMaxError > 0`
 // guard is load-bearing: 0 = unlimited, and a raw `errors >= 0` would dead-letter every unit.
 //
-// The state guard is `IN ('QUEUED','COMPLETED')` (was QUEUED-only): the rare COMPLETED unit
-// whose version-filtered PENDING set drops below quorum with the copy budget exhausted (the
-// version-heterogeneous edge, design §4.2) must dead-letter in one tick instead of never. The
-// semantic guards below — no live copy, PENDING < quorum, and a spent budget — carry the
-// meaning; the state list is belt.
+// The pending probe embeds versionHomogeneousPendingSQL, NOT a raw COUNT (★BG-21g): Decide's
+// dead-letter gate reads the version-FILTERED pending count, so a raw probe reads HIGHER on a
+// version-heterogeneous set and refuses the exact unit Decide told it to fail — the BG-27
+// decider-says/executor-noops pathology recreated through the count instead of the cap. The
+// same divergence gated BOTH ceiling disjuncts (hardening note (f)); one shared count closes
+// both.
+//
+// The state guard is `IN ('QUEUED','COMPLETED','REJECTED')`: COMPLETED for the unit whose
+// version-filtered PENDING set drops below quorum with the copy budget exhausted (the
+// version-heterogeneous edge, design §4.2), REJECTED for pre-fix stranded-REJECTED residue
+// whose budget is already spent (★BG-21f) — Decide routes that snapshot to ActionDeadLetter
+// (reopen requires headroom), and a QUEUED/COMPLETED-only executor matched 0 rows, so the
+// shape-1 sweep re-selected the unit every tick forever (REJECTED ages on updated_at, which
+// nothing bumps). validTransitions has always declared REJECTED -> FAILED. The semantic
+// guards below — no live copy, PENDING < quorum, and a spent budget — carry the meaning; the
+// state list is belt.
 //
 // Adversarial trade-off armed by the error disjunct (design §4.9, review #4): errorCopiesSQL
 // counts ABANDONED history rows, and abandon is a free authenticated call that closes the
@@ -2170,15 +2186,12 @@ func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workU
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
 		FROM leafs l
-		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED')
+		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED', 'REJECTED')
 		  AND NOT EXISTS (
 		    SELECT 1 FROM work_unit_assignment_history h
 		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
 		  )
-		  AND (
-		    SELECT COUNT(*) FROM results res
-		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		  ) < `+effQuorumWuL+`
+		  AND `+versionHomogeneousPendingSQL("wu.id")+` < `+effQuorumWuL+`
 		  AND (
 		    (
 		      SELECT COUNT(*) FROM work_unit_assignment_history h2

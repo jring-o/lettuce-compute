@@ -310,7 +310,9 @@ func Decide(s UnitSnapshot) Decision {
 		return Decision{Action: ActionWait, Reopen: reopen, Reason: "awaiting more results"}
 	}
 	// No live copy, no dispatch headroom left (or budget exhausted), quorum unreachable →
-	// dead-letter (matches DeadLetterIfExhausted: QUEUED, no live copy, pending < quorum,
-	// total >= ceiling).
+	// dead-letter (matches DeadLetterIfExhausted: QUEUED/COMPLETED/REJECTED, no live copy,
+	// version-homogeneous pending < quorum, total >= ceiling). The REJECTED arm is the
+	// stranded-REJECTED residue whose budget is already spent (★BG-21f): reopen requires
+	// headroom, so this is the only exit that state has left.
 	return Decision{Action: ActionDeadLetter, Reason: "redundancy unmet; copy budget exhausted"}
 }
