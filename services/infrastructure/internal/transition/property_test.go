@@ -32,7 +32,6 @@ func randSnapshot(r *rand.Rand, forceEqualTargetQuorum bool) UnitSnapshot {
 		AgreementThreshold: threshold,
 		MaxTotalCopies:     maxTotal,
 		MaxErrorCopies:     maxError,
-		MaxSuccessCopies:   target,
 	}
 
 	states := []workunit.WorkUnitState{

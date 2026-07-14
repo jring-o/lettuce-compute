@@ -13,3 +13,13 @@ var (
 	EffTrustKSQL     = effTrustKSQL
 	EffTrustFloorSQL = effTrustFloorSQL
 )
+
+// EffMaxErrorSQL / ErrorCopiesSQL expose the two error-cap SQL-fragment builders the dead-letter
+// executor embeds (BG-27, design §4.9), so the external golden parity test can build the exact
+// same expressions and assert they evaluate identically to transition.ResolvePolicy's
+// MaxErrorCopies and PgxWorkUnitRepository.CountErrorCopies — the SQL<->Go pin whose absence WAS
+// BG-27 (only the Go resolution, never the SQL execution, had ever been pinned).
+var (
+	EffMaxErrorSQL = effMaxErrorSQL
+	ErrorCopiesSQL = errorCopiesSQL
+)

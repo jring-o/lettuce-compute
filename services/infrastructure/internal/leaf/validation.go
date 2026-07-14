@@ -1,6 +1,7 @@
 package leaf
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math"
@@ -535,6 +536,42 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 	return nil
 }
 
+// removedValidationConfigKeys probes an incoming validation_config JSON body for fields the
+// head no longer supports. The pointer distinguishes an explicitly-sent key (including an
+// explicit "max_success_copies": 0) from an absent one, so a stale client is told the field is
+// gone rather than having it silently dropped by the typed unmarshal (E1-C: accepted-and-
+// ignored is not a state).
+type removedValidationConfigKeys struct {
+	MaxSuccessCopies *int `json:"max_success_copies"`
+}
+
+// RejectRemovedValidationConfigKeys returns a ValidationError when raw — the caller's
+// validation_config JSON block — carries a field that has been removed from ValidationConfig.
+// It must read the RAW bytes: the typed ValidationConfig no longer has the field, and leaf
+// create/update decodes validation_config with a plain json.Unmarshal (no DisallowUnknownFields),
+// so an unknown key is silently dropped before any typed validation could see it. Callers pass
+// the raw block through this before the typed merge.
+//
+// max_success_copies was removed in migration 00025: a success ceiling has no coherent semantics
+// (design §4.9) and was read by nothing, so accepting it would be dishonest config surface. raw
+// may be empty (no block supplied), which rejects nothing; a malformed block is surfaced by the
+// caller's own typed unmarshal, so a parse error here is ignored rather than double-reported.
+func RejectRemovedValidationConfigKeys(raw json.RawMessage) *apierror.APIError {
+	if len(raw) == 0 {
+		return nil
+	}
+	var probe removedValidationConfigKeys
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil
+	}
+	if probe.MaxSuccessCopies != nil {
+		return apierror.ValidationError(
+			"max_success_copies is no longer supported; success ceilings have no coherent semantics (see release notes)",
+			validationDetail{Field: "max_success_copies", Reason: "removed"})
+	}
+	return nil
+}
+
 // ValidateValidationConfig validates result validation configuration.
 func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 	// Redundancy factor: head-owned, no upper bound. Must be at least 1.
@@ -578,18 +615,18 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			"max_total_copies must be at least target_copies (a lower ceiling can never reach redundancy)",
 			validationDetail{Field: "max_total_copies", Reason: "below_target"})
 	}
-	if c.MaxSuccessCopies < 0 {
-		return apierror.ValidationError("max_success_copies must be at least min_quorum",
-			validationDetail{Field: "max_success_copies", Reason: "out_of_range"})
-	}
-	if c.MaxSuccessCopies > 0 && c.MaxSuccessCopies < effQuorum {
-		return apierror.ValidationError(
-			"max_success_copies must be at least min_quorum (fewer successes can never reach quorum)",
-			validationDetail{Field: "max_success_copies", Reason: "below_quorum"})
-	}
 	if c.MaxErrorCopies < 0 {
 		return apierror.ValidationError("max_error_copies must be at least 1",
 			validationDetail{Field: "max_error_copies", Reason: "out_of_range"})
+	}
+	// Error cap floor (design §4.9, BG-27): a cap below target_copies can be tripped by honest
+	// churn alone (one expiry per target slot) — that is never what a poison-unit-stopping owner
+	// means, so reject it and keep the stored value honest rather than silently ineffective. The
+	// cap stays opt-in (0 = unlimited). This mirrors the max_total_copies floor above.
+	if c.MaxErrorCopies > 0 && c.MaxErrorCopies < effTarget {
+		return apierror.ValidationError(
+			"max_error_copies must be at least target_copies (a lower cap can be tripped by honest churn alone)",
+			validationDetail{Field: "max_error_copies", Reason: "below_target"})
 	}
 
 	// Agreement threshold: 0.0-1.0.

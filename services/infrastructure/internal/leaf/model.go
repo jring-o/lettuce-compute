@@ -129,16 +129,17 @@ type ValidationConfig struct {
 	TargetCopies int `json:"target_copies,omitempty"`
 	MinQuorum    int `json:"min_quorum,omitempty"`
 
-	// MaxTotalCopies / MaxErrorCopies / MaxSuccessCopies are the hard caps that bound a
-	// non-converging unit (TODO #50, reconciling #40). All 0 = the documented default:
-	//   MaxTotalCopies   0 -> target_copies + a retry margin (the dead-letter ceiling,
-	//                         previously only the inert per-WU column EffectiveMaxTotalCopies)
-	//   MaxErrorCopies   0 -> unlimited (only MaxTotalCopies bounds errors, as today)
-	//   MaxSuccessCopies 0 -> target_copies (dispatch already stops at target today)
+	// MaxTotalCopies / MaxErrorCopies are the hard caps that bound a non-converging unit
+	// (TODO #50, reconciling #40). Both 0 = the documented default:
+	//   MaxTotalCopies 0 -> target_copies + a retry margin (the dead-letter ceiling,
+	//                       previously only the inert per-WU column EffectiveMaxTotalCopies)
+	//   MaxErrorCopies 0 -> unlimited (only MaxTotalCopies bounds errors, as today); when set
+	//                       it must be >= target_copies (validation floor, design §4.9)
 	// Stamped per-unit at generation; resolved through transition.RedundancyPolicy.
-	MaxTotalCopies   int `json:"max_total_copies,omitempty"`
-	MaxErrorCopies   int `json:"max_error_copies,omitempty"`
-	MaxSuccessCopies int `json:"max_success_copies,omitempty"`
+	// (max_success_copies was removed in migration 00025: a success ceiling had no coherent
+	// semantics and was read by nothing — leaf create/update now rejects the key. Design §4.9.)
+	MaxTotalCopies int `json:"max_total_copies,omitempty"`
+	MaxErrorCopies int `json:"max_error_copies,omitempty"`
 
 	// IgnoreFields lists output JSON field paths to EXCLUDE from result comparison —
 	// volatile provenance like a wall-clock "compute_time_ms" that legitimately differs

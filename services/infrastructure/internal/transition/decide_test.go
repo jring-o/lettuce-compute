@@ -13,7 +13,6 @@ func pol(target, quorum, maxTotal int) RedundancyPolicy {
 		MinQuorum:          quorum,
 		AgreementThreshold: 1.0,
 		MaxTotalCopies:     maxTotal,
-		MaxSuccessCopies:   target,
 	}
 }
 
@@ -91,7 +90,7 @@ func TestDecide_Table(t *testing.T) {
 		{
 			name: "max_error_copies hit, no live copy, quorum unmet → dead-letter",
 			s: UnitSnapshot{State: q, Policy: RedundancyPolicy{TargetCopies: 2, MinQuorum: 2,
-				AgreementThreshold: 1.0, MaxTotalCopies: 100, MaxErrorCopies: 2, MaxSuccessCopies: 2},
+				AgreementThreshold: 1.0, MaxTotalCopies: 100, MaxErrorCopies: 2},
 				LiveCopies: 0, TotalCopies: 2, ErrorCopies: 2, PendingCount: 0},
 			want: ActionDeadLetter,
 		},
@@ -121,7 +120,7 @@ func TestDecide_AgreeingGroupFloor(t *testing.T) {
 	// min_quorum (3), so the floor blocks validation. With the target fully collected and no
 	// more copies possible, the round is rejected (a fresh set will be requeued) rather than
 	// validated — the Phase 0 hardening of the previously-vacuous min_quorum.
-	p := RedundancyPolicy{TargetCopies: 3, MinQuorum: 3, AgreementThreshold: 0.6, MaxTotalCopies: 9, MaxSuccessCopies: 3}
+	p := RedundancyPolicy{TargetCopies: 3, MinQuorum: 3, AgreementThreshold: 0.6, MaxTotalCopies: 9}
 	s := UnitSnapshot{State: workunit.WorkUnitStateCompleted, Policy: p, LiveCopies: 0, TotalCopies: 3,
 		PendingCount: 3, Comparison: verdict(2, 3)}
 	if got := Decide(s).Action; got != ActionReject {
@@ -139,7 +138,7 @@ func TestDecide_TargetOverQuorum_MajorityValidates(t *testing.T) {
 	// The supported way to accept a majority: an explicit min_quorum below target. Here
 	// target 3 / min_quorum 2 with threshold 0.6 validates a 2-of-3 group (floor 2>=2, strict
 	// majority 2*2>3, ratio 0.67>=0.6).
-	p := RedundancyPolicy{TargetCopies: 3, MinQuorum: 2, AgreementThreshold: 0.6, MaxTotalCopies: 9, MaxSuccessCopies: 3}
+	p := RedundancyPolicy{TargetCopies: 3, MinQuorum: 2, AgreementThreshold: 0.6, MaxTotalCopies: 9}
 	s := UnitSnapshot{State: workunit.WorkUnitStateCompleted, Policy: p, LiveCopies: 0, TotalCopies: 3,
 		PendingCount: 3, Comparison: verdict(2, 3)}
 	if got := Decide(s).Action; got != ActionValidate {
@@ -151,7 +150,7 @@ func TestDecide_StrictMajority(t *testing.T) {
 	// Threshold 0.5 with a 2-of-4 split: the ratio (0.5) and the floor (2>=2) are met, but the
 	// agreeing group is not a STRICT majority (2*2 is not > 4), so the unit does not validate.
 	// This is the runtime guard that protects legacy rows whose threshold slipped to 0.5.
-	p := RedundancyPolicy{TargetCopies: 4, MinQuorum: 2, AgreementThreshold: 0.5, MaxTotalCopies: 10, MaxSuccessCopies: 4}
+	p := RedundancyPolicy{TargetCopies: 4, MinQuorum: 2, AgreementThreshold: 0.5, MaxTotalCopies: 10}
 	s := UnitSnapshot{State: workunit.WorkUnitStateCompleted, Policy: p, LiveCopies: 0, TotalCopies: 4,
 		PendingCount: 4, Comparison: verdict(2, 4)}
 	if got := Decide(s).Action; got != ActionReject {
@@ -162,7 +161,7 @@ func TestDecide_StrictMajority(t *testing.T) {
 func TestDecide_TieNeverValidates(t *testing.T) {
 	// A tie is reported by the comparator as a zero-size agreeing group (MajorityCount 0). It
 	// must never validate; with more copies possible it waits, otherwise it rejects.
-	p := RedundancyPolicy{TargetCopies: 4, MinQuorum: 2, AgreementThreshold: 0.5, MaxTotalCopies: 10, MaxSuccessCopies: 4}
+	p := RedundancyPolicy{TargetCopies: 4, MinQuorum: 2, AgreementThreshold: 0.5, MaxTotalCopies: 10}
 	s := UnitSnapshot{State: workunit.WorkUnitStateCompleted, Policy: p, LiveCopies: 0, TotalCopies: 4,
 		PendingCount: 4, Comparison: &ComparisonVerdict{MajorityCount: 0, Total: 4, Ratio: 0}}
 	if got := Decide(s).Action; got == ActionValidate {
