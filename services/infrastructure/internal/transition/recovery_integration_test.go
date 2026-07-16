@@ -597,19 +597,25 @@ func TestSweepVersionHeterogeneous_NoLivelock(t *testing.T) {
 		t.Fatalf("after corroborator: state = %s, want VALIDATED", got)
 	}
 
-	// The v1 row is the DELIBERATE version-residue exception (design §4.1 named residual,
-	// hardening backlog: result-level SUPERSEDED status): exactly one PENDING row remains
-	// under the terminal unit, and it is the version-excluded one. Tagged here explicitly so
-	// the whole-suite E1-S invariant's zero-orphan clause stays meaningful everywhere else.
-	var residue int
+	// The v1 row was design §4.1's DELIBERATE version-residue exception (exactly one PENDING
+	// row under the terminal unit). The accept writer now disposes the version-excluded
+	// remainder to SUPERSEDED in the finalization tx (the residual's promotion after the E1
+	// RUN-3 closeout), so the E1-S zero-orphan clause holds unconditionally: no PENDING
+	// survives, and the v1 row is SUPERSEDED — never compared, so not an error signal.
+	var residue, superseded int
 	if err := pool.QueryRow(ctx, `
-		SELECT count(*) FROM results r
-		WHERE r.work_unit_id = $1 AND r.validation_status = 'PENDING' AND r.artifact_version_id = $2`,
-		wu, v1).Scan(&residue); err != nil {
+		SELECT count(*) FILTER (WHERE r.validation_status = 'PENDING'),
+		       count(*) FILTER (WHERE r.validation_status = 'SUPERSEDED')
+		FROM results r
+		WHERE r.work_unit_id = $1 AND r.artifact_version_id = $2`,
+		wu, v1).Scan(&residue, &superseded); err != nil {
 		t.Fatalf("residue query: %v", err)
 	}
-	if residue != 1 {
-		t.Errorf("version-residue rows = %d, want exactly 1 (the v1 row)", residue)
+	if residue != 0 {
+		t.Errorf("version-residue PENDING rows = %d, want 0 (the accept tx disposes the remainder)", residue)
+	}
+	if superseded != 1 {
+		t.Errorf("version-residue SUPERSEDED rows = %d, want exactly 1 (the v1 row, disposed not orphaned)", superseded)
 	}
 }
 
