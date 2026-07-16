@@ -206,6 +206,25 @@ func finChecksum(a byte) string {
 	return string(s)
 }
 
+// finSeedHistory inserts an assignment-history copy row: outcome "" is a live copy (outcome
+// NULL); a non-empty outcome (EXPIRED/ABANDONED) is a closed error copy.
+func finSeedHistory(t *testing.T, pool *pgxpool.Pool, wuID, volID types.ID, outcome string) {
+	t.Helper()
+	var err error
+	if outcome == "" {
+		_, err = pool.Exec(context.Background(),
+			`INSERT INTO work_unit_assignment_history (work_unit_id, volunteer_id, assigned_at) VALUES ($1, $2, now())`,
+			wuID, volID)
+	} else {
+		_, err = pool.Exec(context.Background(),
+			`INSERT INTO work_unit_assignment_history (work_unit_id, volunteer_id, assigned_at, outcome, outcome_at) VALUES ($1, $2, now(), $3, now())`,
+			wuID, volID, outcome)
+	}
+	if err != nil {
+		t.Fatalf("seed history (%q): %v", outcome, err)
+	}
+}
+
 // --- assertions ---
 
 func finUnitState(t *testing.T, pool *pgxpool.Pool, id types.ID) string {
@@ -492,6 +511,59 @@ func TestRejectRequeueAtomic(t *testing.T) {
 	if after := finReassignCount(t, pool, wu); after != before+1 {
 		t.Errorf("reassignment_count = %d, want %d", after, before+1)
 	}
+	finAssertE1S(t, pool)
+}
+
+// TestDeadLetterDisposesBelowQuorumPending (★BG-21i): a unit that dead-letters while holding
+// a below-quorum PENDING result must not leave that row PENDING under the FAILED unit — that
+// is a permanent E1-S orphan no recovery shape can ever see (every sweep predicate excludes
+// terminal units and Evaluate no-ops on them). The disposal is SUPERSEDED (migration 00027),
+// not DISAGREED: the row was never compared against anything, so it is not an error signal.
+// Driven through the PRODUCTION path — the real transitioner's ActionDeadLetter arm over the
+// real executor — with the whole-DB E1-S invariant asserted at the end. Pre-fix (55e99fb) the
+// row survives PENDING under FAILED and finAssertE1S fails.
+func TestDeadLetterDisposesBelowQuorumPending(t *testing.T) {
+	pool, cleanup := finSetupTestDB(t)
+	defer cleanup()
+	st := finNewStack(t, pool)
+	ctx := context.Background()
+
+	user := finSeedUser(t, pool)
+	lf := finSeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+	// quorum 2, max_total_copies 2: one volunteer submitted (1 PENDING, below quorum), the
+	// other two copies EXPIRED — budget spent, nothing live, quorum unreachable.
+	wu := finSeedWorkUnit(t, pool, lf, "QUEUED", 2, 2, 2)
+	res := finSeedResult(t, pool, wu, finSeedVolunteer(t, pool), finChecksum('b'), "PENDING")
+	finSeedHistory(t, pool, wu, finSeedVolunteer(t, pool), "EXPIRED")
+	finSeedHistory(t, pool, wu, finSeedVolunteer(t, pool), "EXPIRED")
+
+	outcome, err := st.transitioner.Evaluate(ctx, wu)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if outcome != transition.OutcomeDeadLettered {
+		t.Fatalf("Evaluate outcome = %q, want FAILED (dead-letter)", outcome)
+	}
+	if got := finUnitState(t, pool, wu); got != "FAILED" {
+		t.Fatalf("state = %s, want FAILED", got)
+	}
+	if got := finStatusCount(t, pool, wu, "PENDING"); got != 0 {
+		t.Fatalf("PENDING under the FAILED unit = %d, want 0 (disposal must be atomic with the flip)", got)
+	}
+	if got := finStatusCount(t, pool, wu, "SUPERSEDED"); got != 1 {
+		t.Fatalf("SUPERSEDED = %d, want 1 (the below-quorum row, disposed not orphaned)", got)
+	}
+	// SUPERSEDED is not an error signal: the wasted-work tally still counts only the two
+	// EXPIRED copies, exactly as before the disposal.
+	if got, err := st.wuRepo.CountErrorCopies(ctx, wu); err != nil {
+		t.Fatalf("CountErrorCopies: %v", err)
+	} else if got != 2 {
+		t.Errorf("error copies = %d, want 2 (a SUPERSEDED result must not count as an error)", got)
+	}
+	if got := finCreditRows(t, pool, wu); got != 0 {
+		t.Errorf("credit rows = %d, want 0 (nothing validated)", got)
+	}
+	_ = res
 	finAssertE1S(t, pool)
 }
 

@@ -496,6 +496,18 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			apierror.WriteError(w, apiErr)
 			return
 		}
+		// generation_mode is IMMUTABLE once the leaf has generated anything (★BG-22f): the
+		// eager path never advances the cursor and the lazy path owns it, so a flip in either
+		// direction re-emits already-generated ordinals as byte-identical duplicate trials —
+		// the ★BG-22d harm reached without the guarded endpoint. Refused, not reconciled:
+		// see CanChangeGenerationMode.
+		if EffectiveGenerationMode(merged.GenerationMode) != EffectiveGenerationMode(p.DataConfig.GenerationMode) {
+			if err := CanChangeGenerationMode(r.Context(), h.pool, p.ID, p.GenerationCursor); err != nil {
+				l.Info("generation_mode change rejected", "leaf_id", p.ID, "error", err)
+				apierror.WriteError(w, apierror.FromError(err))
+				return
+			}
+		}
 		p.DataConfig = merged
 	}
 	if req.CreditConfig != nil {

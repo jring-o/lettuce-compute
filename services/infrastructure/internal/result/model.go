@@ -27,6 +27,14 @@ const (
 	// holding expiry, unit finalized). Permanently non-votable, same fail-closed
 	// posture as the holding state.
 	ValidationContentVerificationFailed ValidationStatus = "CONTENT_VERIFICATION_FAILED"
+	// ValidationSuperseded marks a result whose work unit reached a terminal state
+	// before the result was ever adjudicated — the dead-letter disposal (★BG-21i,
+	// migration 00027): a below-quorum PENDING row must not survive its unit's FAILED
+	// flip (it would orphan PENDING-under-terminal forever), but it was never compared
+	// against anything either, so it is NOT an error signal — unlike DISAGREED it feeds
+	// no error-copy count and no reliability penalty. The result-status analogue of a
+	// copy's SUPERSEDED assignment outcome.
+	ValidationSuperseded ValidationStatus = "SUPERSEDED"
 )
 
 // ExecutionMetadata holds self-reported resource metrics from the volunteer.

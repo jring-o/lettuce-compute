@@ -217,6 +217,30 @@ func Decide(s UnitSnapshot) Decision {
 	p := s.Policy
 	pending := s.PendingCount
 
+	// 0. A REJECTED unit can never validate or reject IN PLACE: validTransitions gives it
+	//    exactly two exits (QUEUED via requeue, FAILED via dead-letter), and MarkCompleted
+	//    deliberately no-ops on it — so deciding Validate/Reject here sends the executor into
+	//    a MarkCompleted-noop → ApplyAccept/ApplyReject Conflict that the recovery sweep
+	//    re-selects and retries every tick forever (★BG-21j; a REJECTED unit accumulates
+	//    PENDING results through the grace-submit door, or as pre-fix residue). Route it
+	//    explicitly:
+	//      - a live copy may still land a result → plain WAIT (its close re-triggers Evaluate);
+	//      - budget spent below quorum, nothing live → dead-letter (the ★BG-21f arm, verbatim);
+	//      - otherwise → reopen (the executor's Reassign → QUEUED), where the SAME pending
+	//        results re-adjudicate under a state with legal edges. Unlike the COMPLETED reopen
+	//        (phantom headroom), this arm deliberately ignores dispatch headroom: the point is
+	//        not more copies — a REJECTED unit at/above quorum needs no headroom at all — it is
+	//        that adjudication is only legal from QUEUED/COMPLETED.
+	if s.State == workunit.WorkUnitStateRejected {
+		if s.LiveCopies > 0 {
+			return Decision{Action: ActionWait, Reason: "rejected: live copy may still finish"}
+		}
+		if pending < p.MinQuorum && capsExhausted(s) {
+			return Decision{Action: ActionDeadLetter, Reason: "redundancy unmet; copy budget exhausted"}
+		}
+		return Decision{Action: ActionWait, Reopen: true, Reason: "rejected unit requeues for re-adjudication"}
+	}
+
 	// 1. Quorum agreement — validate as soon as a quorum's worth of results is in and they
 	//    agree, WITHOUT waiting for the remaining target copies (the validate-at-quorum win).
 	//    The caller computes Comparison iff PendingCount >= MinQuorum, so a non-nil verdict
@@ -271,16 +295,16 @@ func Decide(s UnitSnapshot) Decision {
 	moreCopiesPossible := s.LiveCopies > 0 || (dispatchHeadroom && !capsExhausted(s))
 
 	// reopen marks a WAIT that rests on PHANTOM dispatch headroom (★E1-5). A unit parked
-	// COMPLETED (or the pre-fix stranded-REJECTED residue) with no live copy has dispatch
-	// headroom (dispatchHeadroom) and unspent budget (!capsExhausted) — but no dispatcher can
-	// ever draw on it, because dispatch requires QUEUED (Dispatchable). Such a WAIT would
-	// re-park forever; the executor demotes the unit back to QUEUED, where the headroom is
-	// real, and dispatch supplies exactly the missing corroborators. The LiveCopies == 0 term
-	// is deliberate: while ANY copy is live its closure re-triggers Evaluate, so a live copy is
-	// always allowed to finish first. Never set for QUEUED (dispatch handles it directly) or
-	// terminal states (they never re-transition). Both WAIT returns below carry it; every other
-	// return leaves it false.
-	reopen := (s.State == workunit.WorkUnitStateCompleted || s.State == workunit.WorkUnitStateRejected) &&
+	// COMPLETED with no live copy has dispatch headroom (dispatchHeadroom) and unspent budget
+	// (!capsExhausted) — but no dispatcher can ever draw on it, because dispatch requires
+	// QUEUED (Dispatchable). Such a WAIT would re-park forever; the executor demotes the unit
+	// back to QUEUED, where the headroom is real, and dispatch supplies exactly the missing
+	// corroborators. The LiveCopies == 0 term is deliberate: while ANY copy is live its
+	// closure re-triggers Evaluate, so a live copy is always allowed to finish first. Never
+	// set for QUEUED (dispatch handles it directly) or terminal states (they never
+	// re-transition); REJECTED has its own reopen rule in §0, which does NOT require headroom
+	// (★BG-21j). Both WAIT returns below carry it; every other return leaves it false.
+	reopen := s.State == workunit.WorkUnitStateCompleted &&
 		s.LiveCopies == 0 && dispatchHeadroom && !capsExhausted(s)
 
 	// 2. A quorum's worth of results is in, but they do not agree (verdict present, didn't

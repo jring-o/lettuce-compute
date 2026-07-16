@@ -471,6 +471,52 @@ func TestDeadLetterRejectedState_ExhaustedBudget(t *testing.T) {
 	}
 }
 
+// TestRejectedAtQuorumConvergesNoSpin (★BG-21j): a REJECTED unit holding a quorum's worth of
+// agreeing PENDING results (grace-window submits landing under a stranded REJECTED unit, or
+// pre-fix residue). Pre-fix, Decide returned ActionValidate for it, MarkCompleted no-oped
+// (its guard is QUEUED/ASSIGNED/RUNNING), ApplyAccept conflicted ("expected COMPLETED"), and
+// the shape-1 sweep re-selected the unit and logged the failure every tick FOREVER — the
+// ★BG-21f spin recreated one shape over. Post-fix, Decide routes REJECTED through the reopen
+// arm: one sweep requeues it (Reassign → QUEUED, results untouched), and the next Evaluate
+// adjudicates the same results under a state with legal edges.
+func TestRejectedAtQuorumConvergesNoSpin(t *testing.T) {
+	pool, cleanup := e1SetupTestDB(t)
+	defer cleanup()
+	st := e1NewStack(t, pool, 0, 100)
+	ctx := context.Background()
+	user := e1SeedUser(t, pool)
+	lf := e1SeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+
+	agree := e1Checksum('b')
+	wu := e1SeedWorkUnit(t, pool, lf, "REJECTED", 2, 2, 0, 8, false)
+	e1SeedResult(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600)
+	e1SeedResult(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600)
+	before := e1ReassignCount(t, pool, wu)
+
+	// Tick 1: shape-1 selects the aged REJECTED unit; the reopen arm requeues it.
+	st.sweeper.RunOnce(ctx)
+	if got := e1UnitState(t, pool, wu); got != "QUEUED" {
+		t.Fatalf("after sweep tick 1: state = %s, want QUEUED (pre-fix spin: stays REJECTED with a conflict WARN every tick)", got)
+	}
+	if after := e1ReassignCount(t, pool, wu); after != before+1 {
+		t.Errorf("reassignment_count = %d, want %d (the standard Reassign requeue)", after, before+1)
+	}
+	if got := e1CreditRows(t, pool, wu); got != 0 {
+		t.Fatalf("credit rows after the requeue alone = %d, want 0", got)
+	}
+
+	// The SAME pending results now adjudicate under QUEUED: validate + credit.
+	if _, err := st.transitioner.Evaluate(ctx, wu); err != nil {
+		t.Fatalf("Evaluate after requeue: %v", err)
+	}
+	if got := e1UnitState(t, pool, wu); got != "VALIDATED" {
+		t.Fatalf("after re-adjudication: state = %s, want VALIDATED", got)
+	}
+	if got := e1CreditRows(t, pool, wu); got != 2 {
+		t.Errorf("credit rows = %d, want 2 (one per agreeing result)", got)
+	}
+}
+
 // TestSweepVersionHeterogeneous_NoLivelock (★BG-21g): a QUEUED unit whose raw PENDING count
 // meets quorum but whose version-homogeneous count does not (two results from different
 // artifact versions; target == quorum == 2). Decide only ever sees the FILTERED count, so

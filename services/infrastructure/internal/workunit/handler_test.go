@@ -350,6 +350,92 @@ func TestHandlerGenerateRejectedForLazyLeaf(t *testing.T) {
 	}
 }
 
+// TestModeFlipDoesNotReemitOrdinals (★BG-22f): generation_mode is IMMUTABLE once the leaf
+// has generated anything. Eager emission never advances leafs.generation_cursor, so an
+// eager→lazy flip would hand the lazy manager cursor offset 0 and re-emit the already-emitted
+// ordinals as byte-identical duplicate trials (no DB uniqueness on trial identity); the
+// symmetric lazy→eager flip re-arms the manual generate endpoint to re-emit [0,cursor).
+// Pre-fix (55e99fb) both flips return 200. Post-fix: 409 GENERATION_MODE_IMMUTABLE in both
+// directions, and a mode chosen BEFORE any generation still flips freely.
+func TestModeFlipDoesNotReemitOrdinals(t *testing.T) {
+	ts, pool, cleanup := setupHandlerServer(t)
+	defer cleanup()
+
+	lazyBlock := map[string]any{
+		"data_config": map[string]any{
+			"generation_mode": "lazy",
+			"lazy_threshold":  50,
+			"lazy_batch_size": 100,
+			"splitting_config": map[string]any{
+				"temperature": []any{1.0, 2.0, 3.0},
+			},
+		},
+	}
+
+	// (a) Eager leaf that HAS generated: the eager→lazy flip is refused and nothing new is
+	// emitted.
+	p := createProjectInState(t, ts, pool, leaf.StateConfiguring)
+	gen := generateWorkUnits(t, ts, p.ID, map[string]interface{}{
+		"temperature": []interface{}{1.0, 2.0, 3.0},
+	})
+	if gen.WorkUnitsCreated != 3 {
+		t.Fatalf("eager generation created %d units, want 3", gen.WorkUnitsCreated)
+	}
+	resp := doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p.ID.String(), lazyBlock)
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("eager→lazy flip on a generated leaf: status = %d, want 409 GENERATION_MODE_IMMUTABLE: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Contains(body, []byte("GENERATION_MODE_IMMUTABLE")) {
+		t.Errorf("refusal body missing GENERATION_MODE_IMMUTABLE code: %s", body)
+	}
+	var count int
+	if err := pool.QueryRow(t.Context(), `SELECT COUNT(*) FROM work_units WHERE leaf_id = $1`, p.ID).Scan(&count); err != nil {
+		t.Fatalf("count work units: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("work units after the refused flip = %d, want the original 3 (no re-emission)", count)
+	}
+
+	// (b) Lazy leaf whose cursor has advanced: the lazy→eager flip is refused too — it would
+	// re-arm the manual generate endpoint (whose lazy 409 no longer fires) to re-emit
+	// [0,cursor). The cursor is stamped directly: only the lazy manager writes it in
+	// production, and this test exercises the guard, not the manager.
+	p2 := createProjectInState(t, ts, pool, leaf.StateConfiguring)
+	resp = doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p2.ID.String(), lazyBlock)
+	requireStatus(t, resp, http.StatusOK, "pre-generation eager→lazy flip (must be free)")
+	resp.Body.Close()
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE leafs SET generation_cursor = '{"last_generated_offset":3,"total_generated":3}' WHERE id = $1`,
+		p2.ID); err != nil {
+		t.Fatalf("stamp advanced cursor: %v", err)
+	}
+	resp = doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p2.ID.String(), map[string]any{
+		"data_config": map[string]any{"generation_mode": "eager"},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("lazy→eager flip with an advanced cursor: status = %d, want 409: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	// (c) Control: with NO generation and an empty cursor, the mode flips freely in both
+	// directions (choose-before-you-generate stays unrestricted).
+	p3 := createProjectInState(t, ts, pool, leaf.StateConfiguring)
+	resp = doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p3.ID.String(), lazyBlock)
+	requireStatus(t, resp, http.StatusOK, "eager→lazy before any generation")
+	resp.Body.Close()
+	resp = doRequest(t, "PUT", ts.URL+"/api/v1/leafs/"+p3.ID.String(), map[string]any{
+		"data_config": map[string]any{"generation_mode": "eager"},
+	})
+	requireStatus(t, resp, http.StatusOK, "lazy→eager before any generation")
+	resp.Body.Close()
+}
+
 func TestHandlerGenerateActiveProject(t *testing.T) {
 	ts, pool, cleanup := setupHandlerServer(t)
 	defer cleanup()

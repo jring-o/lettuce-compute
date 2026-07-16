@@ -349,6 +349,19 @@ func TestDecideExecutorAgreement_VersionHeterogeneousPending(t *testing.T) {
 			}
 			wantDL := transition.Decide(snap).Action == transition.ActionDeadLetter
 
+			// The exported fragment must read the same number the production filter yields —
+			// the SQL<->Go pin for the shared count itself. Pinned BEFORE the executor runs:
+			// a fired dead-letter disposes the pending set to SUPERSEDED (★BG-21i), after
+			// which both sides correctly read zero.
+			var sqlFiltered int
+			if err := pool.QueryRow(ctx, `SELECT `+workunit.VersionHomogeneousPendingSQL("$1"), wuID).Scan(&sqlFiltered); err != nil {
+				t.Fatalf("evaluate versionHomogeneousPendingSQL: %v", err)
+			}
+			if sqlFiltered != len(filtered) {
+				t.Fatalf("versionHomogeneousPendingSQL=%d, FilterPending=%d — the SQL twin drifted from the Go filter",
+					sqlFiltered, len(filtered))
+			}
+
 			gotDL, err := repo.DeadLetterIfExhausted(ctx, wuID)
 			if err != nil {
 				t.Fatalf("DeadLetterIfExhausted: %v", err)
@@ -361,16 +374,18 @@ func TestDecideExecutorAgreement_VersionHeterogeneousPending(t *testing.T) {
 			if gotDL != c.wantFailed {
 				t.Fatalf("unexpected outcome: executor.affected=%v want=%v", gotDL, c.wantFailed)
 			}
-
-			// The exported fragment must read the same number the production filter yields —
-			// the SQL<->Go pin for the shared count itself.
-			var sqlFiltered int
-			if err := pool.QueryRow(ctx, `SELECT `+workunit.VersionHomogeneousPendingSQL("$1"), wuID).Scan(&sqlFiltered); err != nil {
-				t.Fatalf("evaluate versionHomogeneousPendingSQL: %v", err)
-			}
-			if sqlFiltered != len(filtered) {
-				t.Fatalf("versionHomogeneousPendingSQL=%d, FilterPending=%d — the SQL twin drifted from the Go filter",
-					sqlFiltered, len(filtered))
+			if gotDL {
+				// The fired dead-letter must dispose EVERY surviving PENDING row (both
+				// versions) to SUPERSEDED — no PENDING under terminal (★BG-21i).
+				var orphans int
+				if err := pool.QueryRow(ctx,
+					`SELECT COUNT(*) FROM results WHERE work_unit_id = $1 AND validation_status = 'PENDING'`,
+					wuID).Scan(&orphans); err != nil {
+					t.Fatalf("count surviving PENDING: %v", err)
+				}
+				if orphans != 0 {
+					t.Fatalf("dead-letter left %d PENDING rows under the FAILED unit", orphans)
+				}
 			}
 		})
 	}
