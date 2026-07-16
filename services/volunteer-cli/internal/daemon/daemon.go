@@ -712,11 +712,23 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 			)
 			return
 		}
+		if errors.Is(result.Err, errStartWorkDropped) {
+			// The slot never executed: run-start reported the unit is no longer ours,
+			// so the head already re-staged it via its lapsed-reservation / deadline
+			// sweep. Abandoning would earn a FailedPrecondition (no live copy for this
+			// volunteer) — nothing to submit and nothing to abandon, just drop it.
+			d.logger.Info("slot dropped at run-start; unit no longer reserved for this volunteer, head re-staged it",
+				"work_unit_id", wu.ID,
+				"slot", result.SlotID,
+			)
+			return
+		}
 		d.logger.Error("slot execution failed",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
 			"error", result.Err,
 		)
+		d.abandonUnit(wu, conn, "execution failed: "+result.Err.Error())
 		return
 	}
 
@@ -731,6 +743,7 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 			"slot", result.SlotID,
 			"exit_code", result.Result.ExitCode,
 		)
+		d.abandonUnit(wu, conn, fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode))
 		return
 	}
 
@@ -1549,6 +1562,32 @@ func (d *Daemon) abandonItem(item *PreFetchItem, reason string) {
 		return
 	}
 	d.logger.Info("abandoned un-run work unit back to head", "work_unit_id", item.WU.ID, "reason", reason)
+}
+
+// abandonUnit closes this volunteer's live copy (RESERVED or RUNNING) of a locally
+// failed unit — non-zero exit, deadline-exceeded, runtime failure — back to the head
+// as ABANDONED. AbandonWorkUnit is the protocol's only failure signal (SubmitResult
+// carries no status), so without it a failed unit strands until the head's fault-monitor
+// deadline sweep closes it EXPIRED — a full deadline window of latency per failure.
+// Abandoning requeues it immediately, and ABANDONED copies feed the max_error_copies
+// dead-letter ceiling. Detached context with a short timeout so it still reaches the
+// head during shutdown drain, when the run context is already cancelled.
+func (d *Daemon) abandonUnit(wu *runtime.WorkUnit, conn *ServerConnection, reason string) {
+	if wu == nil || conn == nil || conn.Client == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := conn.Client.AbandonWorkUnit(ctx, &lettucev1.AbandonWorkUnitRequest{
+		WorkUnitId:  wu.ID,
+		VolunteerId: conn.VolunteerID,
+		PublicKey:   d.pubKey,
+		Reason:      reason,
+	}); err != nil {
+		d.logger.Warn("failed to abandon failed work unit", "work_unit_id", wu.ID, "error", err)
+		return
+	}
+	d.logger.Info("abandoned failed work unit back to head", "work_unit_id", wu.ID, "reason", reason)
 }
 
 // restoreCheckpoint downloads and extracts a checkpoint for a work unit.

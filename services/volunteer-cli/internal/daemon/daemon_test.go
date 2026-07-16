@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -1508,5 +1509,110 @@ func TestNewSlotManager_ClampsToOne(t *testing.T) {
 	sm2 := NewSlotManager(-5, logger)
 	if len(sm2.slots) != 1 {
 		t.Errorf("NewSlotManager(-5) slots = %d, want 1", len(sm2.slots))
+	}
+}
+
+// handleSlotResultTestConn builds a ServerConnection carrying mc so handleSlotResult's
+// abandon/submit calls land on the mock (the conn's client, not the daemon's).
+func handleSlotResultTestConn(mc *mockClient) *ServerConnection {
+	return &ServerConnection{
+		Name:        "test",
+		VolunteerID: "vol-1",
+		Client:      mc,
+		Config:      config.ServerConfig{GRPCAddress: "localhost:50051"},
+	}
+}
+
+// A locally failed unit must be abandoned so the head closes this volunteer's live copy
+// immediately, rather than stranding it until the deadline sweep.
+func TestHandleSlotResult_NonZeroExitAbandons(t *testing.T) {
+	d := newSlotTestDaemon()
+	mc := &mockClient{}
+	result := SlotResult{
+		WU:     &runtime.WorkUnit{ID: "wu-x", LeafID: "leaf-1"},
+		Conn:   handleSlotResultTestConn(mc),
+		Result: &runtime.ExecutionResult{ExitCode: 2},
+	}
+	d.handleSlotResult(context.Background(), result)
+
+	if got := mc.getAbandonCalls(); got != 1 {
+		t.Fatalf("abandon calls = %d, want 1", got)
+	}
+	if got := mc.getSubmitCalls(); got != 0 {
+		t.Fatalf("submit calls = %d, want 0", got)
+	}
+	if mc.lastAbandonReq == nil {
+		t.Fatal("lastAbandonReq is nil")
+	}
+	if mc.lastAbandonReq.WorkUnitId != "wu-x" {
+		t.Fatalf("abandon WorkUnitId = %q, want %q", mc.lastAbandonReq.WorkUnitId, "wu-x")
+	}
+	if !strings.Contains(mc.lastAbandonReq.Reason, "exit code 2") {
+		t.Fatalf("abandon reason = %q, want it to mention exit code 2", mc.lastAbandonReq.Reason)
+	}
+}
+
+// A runtime failure (result.Err set) must also be abandoned, carrying the error text.
+func TestHandleSlotResult_ExecFailureAbandons(t *testing.T) {
+	d := newSlotTestDaemon()
+	mc := &mockClient{}
+	result := SlotResult{
+		WU:   &runtime.WorkUnit{ID: "wu-x", LeafID: "leaf-1"},
+		Conn: handleSlotResultTestConn(mc),
+		Err:  errors.New("boom"),
+	}
+	d.handleSlotResult(context.Background(), result)
+
+	if got := mc.getAbandonCalls(); got != 1 {
+		t.Fatalf("abandon calls = %d, want 1", got)
+	}
+	if got := mc.getSubmitCalls(); got != 0 {
+		t.Fatalf("submit calls = %d, want 0", got)
+	}
+	if mc.lastAbandonReq == nil {
+		t.Fatal("lastAbandonReq is nil")
+	}
+	if !strings.Contains(mc.lastAbandonReq.Reason, "boom") {
+		t.Fatalf("abandon reason = %q, want it to contain \"boom\"", mc.lastAbandonReq.Reason)
+	}
+}
+
+// A graceful stop (context.Canceled) preserves work for resume — it is not a failure,
+// so it must neither submit nor abandon.
+func TestHandleSlotResult_CancelledPreservesNoAbandon(t *testing.T) {
+	d := newSlotTestDaemon()
+	mc := &mockClient{}
+	result := SlotResult{
+		WU:   &runtime.WorkUnit{ID: "wu-x", LeafID: "leaf-1"},
+		Conn: handleSlotResultTestConn(mc),
+		Err:  context.Canceled,
+	}
+	d.handleSlotResult(context.Background(), result)
+
+	if got := mc.getAbandonCalls(); got != 0 {
+		t.Fatalf("abandon calls = %d, want 0", got)
+	}
+	if got := mc.getSubmitCalls(); got != 0 {
+		t.Fatalf("submit calls = %d, want 0", got)
+	}
+}
+
+// A run-start drop means the unit is no longer ours and the head already re-staged it;
+// abandoning would earn a FailedPrecondition, so it must neither submit nor abandon.
+func TestHandleSlotResult_StartWorkDroppedNoAbandon(t *testing.T) {
+	d := newSlotTestDaemon()
+	mc := &mockClient{}
+	result := SlotResult{
+		WU:   &runtime.WorkUnit{ID: "wu-x", LeafID: "leaf-1"},
+		Conn: handleSlotResultTestConn(mc),
+		Err:  errStartWorkDropped,
+	}
+	d.handleSlotResult(context.Background(), result)
+
+	if got := mc.getAbandonCalls(); got != 0 {
+		t.Fatalf("abandon calls = %d, want 0", got)
+	}
+	if got := mc.getSubmitCalls(); got != 0 {
+		t.Fatalf("submit calls = %d, want 0", got)
 	}
 }
