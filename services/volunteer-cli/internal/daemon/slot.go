@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -332,6 +333,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Warn("run-start StartWork failed; dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "error", swErr)
 			cancelExec()
+			sm.killDroppedOrphan(slot, wu, prep)
 			execErr = errStartWorkDropped
 			return
 		}
@@ -339,6 +341,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Info("run-start denied (unit reassigned or reservation lapsed); dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "message", swResp.GetMessage())
 			cancelExec()
+			sm.killDroppedOrphan(slot, wu, prep)
 			execErr = errStartWorkDropped
 			return
 		}
@@ -361,7 +364,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 	if prep.OrphanPID > 0 {
 		// Orphan resume: process is already running (we resumed it from frozen).
 		// Poll until it exits instead of starting a new one.
-		execResult, execErr = waitForOrphan(execCtx, prep)
+		execResult, execErr = waitForOrphan(execCtx, wu, prep)
 	} else {
 		execResult, execErr = rt.Execute(execCtx, wu, prep)
 	}
@@ -377,10 +380,42 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 // avoid calling real system APIs.
 var isProcessAliveFunc = isProcessAlive
 
+// stopProcessFunc is the function used to terminate a PID. It defaults to the
+// platform-specific StopProcess. Tests override this to avoid signalling real
+// processes.
+var stopProcessFunc = StopProcess
+
+// killDroppedOrphan terminates a resumed orphan whose reservation lapsed at
+// run-start. A normal (non-orphan) drop has no process yet and is a no-op here;
+// only a resumed orphan (OrphanPID > 0) was already unfrozen and would otherwise
+// burn CPU unmonitored after runSlot deletes its work dir.
+func (sm *SlotManager) killDroppedOrphan(slot *ExecutionSlot, wu *runtime.WorkUnit, prep *runtime.PrepareResult) {
+	if prep == nil || prep.OrphanPID <= 0 {
+		return
+	}
+	sm.logger.Info("terminating resumed orphan whose reservation lapsed at run-start",
+		"work_unit_id", wu.ID, "slot", slot.ID, "pid", prep.OrphanPID)
+	if err := stopProcessFunc(prep.OrphanPID); err != nil {
+		sm.logger.Warn("failed to kill resumed orphan on run-start drop",
+			"work_unit_id", wu.ID, "slot", slot.ID, "pid", prep.OrphanPID, "error", err)
+	}
+}
+
 // waitForOrphan polls a previously-frozen orphan process until it exits or the
 // context is cancelled. Used when resuming processes from a previous "tray quit"
 // session — the process is already running, we just need to wait for it to finish.
-func waitForOrphan(ctx context.Context, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
+func waitForOrphan(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
+	// Bound the resume by the unit's deadline the same way Execute bounds a fresh run
+	// (native.go): a full deadline window per resume session, so a hung resumed process
+	// can't occupy the slot until the next daemon restart. The head's per-copy clock
+	// stays authoritative — this is a local resource bound, not the protocol clock.
+	// 0 means unbounded.
+	if wu.DeadlineSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(wu.DeadlineSeconds)*time.Second)
+		defer cancel()
+	}
+
 	start := time.Now()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -388,6 +423,17 @@ func waitForOrphan(ctx context.Context, prep *runtime.PrepareResult) (*runtime.E
 	for {
 		select {
 		case <-ctx.Done():
+			// Split on the cancellation cause. A deadline means the unit is out of time:
+			// nothing else will reap this process (we are not its parent), so kill it and
+			// fail. A plain cancel is daemon shutdown/stop — leave the process
+			// running-frozen so the preserve/resume path can adopt it again next session.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				if err := stopProcessFunc(prep.OrphanPID); err != nil {
+					slog.Warn("failed to kill orphan process after deadline",
+						"work_unit_id", wu.ID, "pid", prep.OrphanPID, "error", err)
+				}
+				return nil, fmt.Errorf("orphan resume: deadline (%ds) exceeded, process killed: %w", wu.DeadlineSeconds, context.DeadlineExceeded)
+			}
 			return nil, ctx.Err()
 		case <-ticker.C:
 			if !isProcessAliveFunc(prep.OrphanPID) {
@@ -397,9 +443,14 @@ func waitForOrphan(ctx context.Context, prep *runtime.PrepareResult) (*runtime.E
 				// BG-15c: an orphan-resumed unit's output.dat is leaf-controlled; read
 				// it through the shared symlink-safe, size-capped reader so a planted
 				// symlink cannot exfiltrate its target (and a giant file cannot balloon
-				// daemon RAM). A refusal yields empty output, matching the prior
-				// best-effort semantics rather than crashing the resume.
-				output, _ := runtime.ReadRegularNoFollow(outputPath)
+				// daemon RAM). A refusal (symlink/size) or a missing file is now a
+				// failure, not a fabricated empty success: a crashed or killed orphan
+				// must not submit stale-or-nil output as a valid result. A present-but-
+				// empty file still succeeds — the head adjudicates content.
+				output, err := runtime.ReadRegularNoFollow(outputPath)
+				if err != nil {
+					return nil, fmt.Errorf("orphan resume: output.dat missing or unreadable after process exit: %w", err)
+				}
 
 				return &runtime.ExecutionResult{
 					ExitCode:   0,

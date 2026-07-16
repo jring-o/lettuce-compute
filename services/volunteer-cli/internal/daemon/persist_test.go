@@ -2,6 +2,7 @@
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -374,11 +375,12 @@ func TestWaitForOrphan_ProcessExitsImmediately(t *testing.T) {
 		WorkDir:   dir,
 		OrphanPID: 12345,
 	}
+	wu := &runtime.WorkUnit{ID: "wu-orphan-immediate", DeadlineSeconds: 0}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := waitForOrphan(ctx, prep)
+	result, err := waitForOrphan(ctx, wu, prep)
 	if err != nil {
 		t.Fatalf("waitForOrphan error: %v", err)
 	}
@@ -399,10 +401,19 @@ func TestWaitForOrphan_ContextCancelled(t *testing.T) {
 	isProcessAliveFunc = func(pid int) bool { return true }
 	defer func() { isProcessAliveFunc = origIsAlive }()
 
+	// A plain cancel (daemon shutdown/stop) must NOT kill the orphan — it stays
+	// running-frozen for the preserve/resume path. Record any StopProcess call so we
+	// can assert it did not happen.
+	var stopCalls int
+	origStop := stopProcessFunc
+	stopProcessFunc = func(pid int) error { stopCalls++; return nil }
+	defer func() { stopProcessFunc = origStop }()
+
 	prep := &runtime.PrepareResult{
 		WorkDir:   t.TempDir(),
 		OrphanPID: 12345,
 	}
+	wu := &runtime.WorkUnit{ID: "wu-orphan-cancel", DeadlineSeconds: 0}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -410,12 +421,15 @@ func TestWaitForOrphan_ContextCancelled(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := waitForOrphan(ctx, prep)
+	_, err := waitForOrphan(ctx, wu, prep)
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
 	}
 	if err != context.Canceled {
 		t.Errorf("expected context.Canceled, got %v", err)
+	}
+	if stopCalls != 0 {
+		t.Errorf("stopProcessFunc called %d times on plain cancel, want 0 (must preserve for resume)", stopCalls)
 	}
 }
 
@@ -439,11 +453,12 @@ func TestWaitForOrphan_ProcessExitsAfterPolls(t *testing.T) {
 		WorkDir:   dir,
 		OrphanPID: 999,
 	}
+	wu := &runtime.WorkUnit{ID: "wu-orphan-polls", DeadlineSeconds: 0}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := waitForOrphan(ctx, prep)
+	result, err := waitForOrphan(ctx, wu, prep)
 	if err != nil {
 		t.Fatalf("waitForOrphan error: %v", err)
 	}
@@ -456,7 +471,9 @@ func TestWaitForOrphan_ProcessExitsAfterPolls(t *testing.T) {
 }
 
 func TestWaitForOrphan_NoOutputFile(t *testing.T) {
-	// No output.dat in work dir â€” should still return a result with nil output.
+	// No output.dat in work dir. A gone orphan with no readable output is a FAILURE,
+	// not a fabricated empty success (BG-26): it must return a non-nil error and nil
+	// result rather than submitting stale-or-nil output as a valid result.
 	dir := t.TempDir()
 
 	origIsAlive := isProcessAliveFunc
@@ -467,16 +484,124 @@ func TestWaitForOrphan_NoOutputFile(t *testing.T) {
 		WorkDir:   dir,
 		OrphanPID: 777,
 	}
+	wu := &runtime.WorkUnit{ID: "wu-orphan-no-output", DeadlineSeconds: 0}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := waitForOrphan(ctx, prep)
-	if err != nil {
-		t.Fatalf("waitForOrphan error: %v", err)
+	result, err := waitForOrphan(ctx, wu, prep)
+	if err == nil {
+		t.Fatal("expected non-nil error when output.dat is missing after process exit")
 	}
-	if result.OutputData != nil {
-		t.Errorf("OutputData = %v, want nil when no output.dat", result.OutputData)
+	if result != nil {
+		t.Errorf("expected nil result on missing output.dat, got %+v", result)
+	}
+}
+
+func TestWaitForOrphan_DeadlineKillsAndFails(t *testing.T) {
+	// A resumed orphan that outlives its deadline must be killed and fail (BG-26 defect
+	// A), not loop forever occupying the slot until the next daemon restart.
+	origIsAlive := isProcessAliveFunc
+	isProcessAliveFunc = func(pid int) bool { return true } // never exits on its own
+	defer func() { isProcessAliveFunc = origIsAlive }()
+
+	var stopCalls int
+	var stoppedPID int
+	origStop := stopProcessFunc
+	stopProcessFunc = func(pid int) error { stopCalls++; stoppedPID = pid; return nil }
+	defer func() { stopProcessFunc = origStop }()
+
+	prep := &runtime.PrepareResult{
+		WorkDir:   t.TempDir(),
+		OrphanPID: 4242,
+	}
+	wu := &runtime.WorkUnit{ID: "wu-orphan-deadline", DeadlineSeconds: 1}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	result, err := waitForOrphan(ctx, wu, prep)
+	elapsed := time.Since(start)
+
+	if elapsed > 3*time.Second {
+		t.Errorf("waitForOrphan took %v, want it to fail on the 1s deadline (within ~3s)", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected non-nil error when deadline exceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected errors.Is(err, context.DeadlineExceeded), got %v", err)
+	}
+	if result != nil {
+		t.Errorf("expected nil result on deadline, got %+v", result)
+	}
+	if stopCalls != 1 {
+		t.Errorf("stopProcessFunc called %d times, want exactly 1", stopCalls)
+	}
+	if stoppedPID != prep.OrphanPID {
+		t.Errorf("stopProcessFunc called with PID %d, want %d", stoppedPID, prep.OrphanPID)
+	}
+}
+
+func TestRunSlot_OrphanDroppedAtRunStartIsKilled(t *testing.T) {
+	// A resumed orphan dropped at run-start (StartWork Ok=false) has already been
+	// unfrozen; runSlot must kill it before the deferred cleanup deletes its work dir
+	// (BG-26b), otherwise it burns CPU unmonitored with its work dir gone.
+	logger := newTestLogger()
+	sm := NewSlotManager(1, logger)
+	d := newSlotTestDaemon()
+
+	// Defensive: keep the (fake) process reported alive and record any kill so the drop
+	// path can never touch a real process.
+	origIsAlive := isProcessAliveFunc
+	isProcessAliveFunc = func(pid int) bool { return true }
+	defer func() { isProcessAliveFunc = origIsAlive }()
+
+	var stopCalls int
+	var stoppedPID int
+	origStop := stopProcessFunc
+	stopProcessFunc = func(pid int) error { stopCalls++; stoppedPID = pid; return nil }
+	defer func() { stopProcessFunc = origStop }()
+
+	conn := &ServerConnection{
+		Name:        "test",
+		VolunteerID: "vol-1",
+		Config:      config.ServerConfig{GRPCAddress: "localhost:50051"},
+		Client: &mockClient{
+			startWorkFn: func(ctx context.Context, req *lettucev1.StartWorkRequest) (*lettucev1.StartWorkResponse, error) {
+				return &lettucev1.StartWorkResponse{Ok: false, Message: "reassigned"}, nil
+			},
+		},
+	}
+
+	item := &PreFetchItem{
+		WU:        &runtime.WorkUnit{ID: "wu-orphan-drop", LeafID: "leaf-1", Runtime: "native"},
+		WUResp:    &lettucev1.WorkUnitAssignment{},
+		Prep:      &runtime.PrepareResult{WorkDir: t.TempDir(), OrphanPID: 4242},
+		Runtime:   &mockRuntime{canHandle: true},
+		Conn:      conn,
+		FetchedAt: time.Now(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	slotID := <-sm.available
+	sm.StartSlot(ctx, slotID, item, d)
+
+	result, err := sm.WaitForCompletion(ctx)
+	if err != nil {
+		t.Fatalf("WaitForCompletion: %v", err)
+	}
+	if !errors.Is(result.Err, errStartWorkDropped) {
+		t.Errorf("result.Err = %v, want errStartWorkDropped", result.Err)
+	}
+	if stopCalls != 1 {
+		t.Errorf("stopProcessFunc called %d times, want exactly 1 (orphan killed on drop)", stopCalls)
+	}
+	if stoppedPID != 4242 {
+		t.Errorf("stopProcessFunc called with PID %d, want 4242", stoppedPID)
 	}
 }
 
