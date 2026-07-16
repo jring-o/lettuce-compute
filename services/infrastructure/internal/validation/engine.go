@@ -637,6 +637,36 @@ func (e *Engine) acceptResults(ctx context.Context, wu *workunit.WorkUnit, proj 
 				return fmt.Errorf("mark results DISAGREED: %w", err)
 			}
 		}
+		// Version-excluded remainder disposal (design R1 §4.1's named residual, promoted after
+		// the E1 RUN-3 closeout): pending carries only the version-homogeneous FILTERED rows, so
+		// a cross-version straggler is in neither agreedIDs nor rejectedIDs and would survive the
+		// VALIDATED flip PENDING forever — Evaluate no-ops on terminal states and every recovery
+		// shape excludes them (the ★BG-21i orphan class through this writer; reachable in
+		// ordinary operation because browser/WASM submissions carry no artifact_version_id while
+		// gRPC submissions stamp it, so mixed-population quorums are version-heterogeneous
+		// routinely). Whatever is STILL PENDING after the marks above is exactly that remainder —
+		// the unit-row lock plus the raw-count recheck pin the tx's row set to the decision
+		// snapshot — and it is disposed to SUPERSEDED in the same transaction, mirroring the
+		// dead-letter disposal: never compared, so not an error signal (feeds neither
+		// errorCopiesSQL nor reliability). rawPendingCount == len(pending) means no row was
+		// excluded (every legacy/homogeneous call), so the common path pays no extra query.
+		if rawPendingCount > len(pending) {
+			all, err := stores.Results.ListByWorkUnit(ctx, wu.ID)
+			if err != nil {
+				return fmt.Errorf("list results for version-residue disposal: %w", err)
+			}
+			var excludedIDs []types.ID
+			for _, r := range all {
+				if r.ValidationStatus == result.ValidationPending {
+					excludedIDs = append(excludedIDs, r.ID)
+				}
+			}
+			if len(excludedIDs) > 0 {
+				if err := stores.Results.BatchUpdateValidationStatus(ctx, excludedIDs, result.ValidationSuperseded); err != nil {
+					return fmt.Errorf("supersede version-excluded results: %w", err)
+				}
+			}
+		}
 		if _, err := stores.WorkUnits.UpdateState(ctx, wu.ID, workunit.WorkUnitStateCompleted, workunit.WorkUnitStateValidated); err != nil {
 			return fmt.Errorf("transition work unit to VALIDATED: %w", err)
 		}

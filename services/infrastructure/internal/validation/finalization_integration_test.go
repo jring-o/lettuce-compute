@@ -567,6 +567,94 @@ func TestDeadLetterDisposesBelowQuorumPending(t *testing.T) {
 	finAssertE1S(t, pool)
 }
 
+// TestAcceptDisposesVersionExcludedPending (design R1 §4.1's named residual, promoted after the
+// E1 RUN-3 closeout): a unit that VALIDATEs on a version-homogeneous quorum while holding a
+// cross-version PENDING straggler must not leave that row PENDING under the VALIDATED unit —
+// the accept writer was the last terminal transition that did not dispose its remainder
+// (Evaluate no-ops on terminal states and every recovery shape excludes them, so the row was a
+// permanent E1-S orphan). The disposal is SUPERSEDED, not DISAGREED: the straggler was never
+// compared against anything. Driven through the production path — the real transitioner over
+// the real engine + tx runner. Pre-fix the straggler survives PENDING and finAssertE1S fails.
+func TestAcceptDisposesVersionExcludedPending(t *testing.T) {
+	pool, cleanup := finSetupTestDB(t)
+	defer cleanup()
+	st := finNewStack(t, pool)
+	ctx := context.Background()
+
+	user := finSeedUser(t, pool)
+	lf := finSeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+	wu := finSeedWorkUnit(t, pool, lf, "COMPLETED", 2, 2, 8)
+
+	// One published artifact version. The straggler carries it; the two agreeing rows carry
+	// the nil/legacy stamp — versionHomogeneousGroup keeps the larger (unstamped) group and
+	// excludes the straggler from comparison. This mix arises in ordinary operation: browser
+	// submissions carry no artifact_version_id while gRPC submissions stamp it.
+	verID := types.NewID()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO leaf_artifact_versions (id, leaf_id, version_label, runtime_type, execution_config)
+		VALUES ($1, $2, 'v1', 'NATIVE', '{}')`, verID, lf); err != nil {
+		t.Fatalf("seed artifact version: %v", err)
+	}
+	straggler := finSeedResult(t, pool, wu, finSeedVolunteer(t, pool), finChecksum('z'), "PENDING")
+	if _, err := pool.Exec(ctx, `UPDATE results SET artifact_version_id = $2 WHERE id = $1`, straggler, verID); err != nil {
+		t.Fatalf("stamp straggler version: %v", err)
+	}
+	agree := finChecksum('b')
+	finSeedResult(t, pool, wu, finSeedVolunteer(t, pool), agree, "PENDING")
+	finSeedResult(t, pool, wu, finSeedVolunteer(t, pool), agree, "PENDING")
+
+	outcome, err := st.transitioner.Evaluate(ctx, wu)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if outcome != transition.OutcomeValidated {
+		t.Fatalf("outcome = %q, want VALIDATED (the two same-version rows agree at quorum)", outcome)
+	}
+	if got := finUnitState(t, pool, wu); got != "VALIDATED" {
+		t.Fatalf("state = %s, want VALIDATED", got)
+	}
+
+	if got := finStatusCount(t, pool, wu, "PENDING"); got != 0 {
+		t.Fatalf("PENDING under the VALIDATED unit = %d, want 0 (disposal must be atomic with the flip)", got)
+	}
+	if got := finStatusCount(t, pool, wu, "SUPERSEDED"); got != 1 {
+		t.Fatalf("SUPERSEDED = %d, want 1 (the version-excluded straggler, disposed not orphaned)", got)
+	}
+	if got := finStatusCount(t, pool, wu, "AGREED"); got != 2 {
+		t.Fatalf("AGREED = %d, want 2", got)
+	}
+	if got := finStatusCount(t, pool, wu, "DISAGREED"); got != 0 {
+		t.Fatalf("DISAGREED = %d, want 0 (a never-compared row must not become an error signal)", got)
+	}
+	// Credit goes to the agreeing quorum only; the superseded straggler earns nothing and
+	// costs nothing.
+	if got := finCreditRows(t, pool, wu); got != 2 {
+		t.Errorf("credit rows = %d, want 2 (one per agreeing result)", got)
+	}
+	var stragglerCredits int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM credit_ledger WHERE result_id = $1`, straggler).Scan(&stragglerCredits); err != nil {
+		t.Fatalf("count straggler credits: %v", err)
+	}
+	if stragglerCredits != 0 {
+		t.Errorf("straggler credit rows = %d, want 0", stragglerCredits)
+	}
+	if got, err := st.wuRepo.CountErrorCopies(ctx, wu); err != nil {
+		t.Fatalf("CountErrorCopies: %v", err)
+	} else if got != 0 {
+		t.Errorf("error copies = %d, want 0 (SUPERSEDED must not count as an error)", got)
+	}
+
+	// The unit is terminal and clean: re-Evaluate no-ops and the whole-DB invariant holds
+	// with no version-residue exception.
+	if o2, err := st.transitioner.Evaluate(ctx, wu); err != nil {
+		t.Fatalf("re-Evaluate: %v", err)
+	} else if o2 != transition.OutcomeNoop {
+		t.Fatalf("re-Evaluate outcome = %q, want noop (terminal)", o2)
+	}
+	finAssertE1S(t, pool)
+}
+
 // finLoadPending loads the PENDING results of a unit in insertion order.
 func finLoadPending(t *testing.T, ctx context.Context, repo *result.PgxRepository, wuID types.ID) []*result.Result {
 	t.Helper()
