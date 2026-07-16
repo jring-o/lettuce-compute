@@ -693,18 +693,35 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 	requireStatus(t, resp, http.StatusOK, "activate")
 	resp.Body.Close()
 
-	// Generate initial batch of 20 work units.
+	// The manual generate endpoint is REFUSED for lazy leaves (★BG-22d): it has no cursor, so
+	// it would emit ordinals from offset 0 that the lazy manager's durable cursor later
+	// re-emits — byte-identical duplicate trials. The lazy manager owns ALL generation here.
 	genReq := workunit.GenerateRequest{
 		ParameterSpace: map[string]interface{}{
 			"num_trials": float64(20),
 		},
 	}
 	resp = httpReq(t, "POST", leafURL+"/work-units/generate", genReq)
-	requireStatus(t, resp, http.StatusAccepted, "generate initial batch")
-	var genResp workunit.GenerateResponse
-	decodeJSON(t, resp, &genResp)
-	if genResp.WorkUnitsCreated != 20 {
-		t.Fatalf("initial work_units_created = %d, want 20", genResp.WorkUnitsCreated)
+	requireStatus(t, resp, http.StatusConflict, "manual generate on a lazy leaf must be refused")
+	resp.Body.Close()
+
+	// Create lazy manager with real generators; the INITIAL batch comes from it too (a fresh
+	// ACTIVE lazy leaf has 0 QUEUED < threshold, so the first tick generates from cursor 0).
+	logger := slog.Default()
+	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
+	lazyMgr := generate.NewLazyManager(
+		patternRouter,
+		workunit.NewPgxWorkUnitRepository(env.pool),
+		generate.NewPgxBatchSink(env.pool, logger),
+		leaf.NewPgxRepository(env.pool),
+		logger,
+	)
+	initial, err := lazyMgr.CheckAndGenerate(ctx, proj.ID)
+	if err != nil {
+		t.Fatalf("initial lazy CheckAndGenerate: %v", err)
+	}
+	if initial != 20 {
+		t.Fatalf("initial lazy tick generated %d work units, want lazy_batch_size = 20", initial)
 	}
 
 	// Register volunteer and process 15 work units (QUEUED drops to 5, below threshold of 10).
@@ -735,17 +752,6 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 	}
 
 	time.Sleep(500 * time.Millisecond)
-
-	// Create lazy manager with real generators and trigger check.
-	logger := slog.Default()
-	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
-	lazyMgr := generate.NewLazyManager(
-		patternRouter,
-		workunit.NewPgxWorkUnitRepository(env.pool),
-		generate.NewPgxBatchSink(env.pool, logger),
-		leaf.NewPgxRepository(env.pool),
-		logger,
-	)
 
 	// Trigger lazy check — QUEUED count is 5 (20 - 15 processed), below threshold of 10.
 	generated, err := lazyMgr.CheckAndGenerate(ctx, proj.ID)

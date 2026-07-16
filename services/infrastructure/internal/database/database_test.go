@@ -279,7 +279,7 @@ func TestRunMigrations_VerifySchema(t *testing.T) {
 		{"comparison_mode", []string{"EXACT", "NUMERIC_TOLERANCE", "CUSTOM"}},
 		{"runtime_type", []string{"NATIVE", "CONTAINER", "WASM", "SCRIPT"}},
 		{"leaf_visibility", []string{"PUBLIC", "UNLISTED", "PRIVATE"}},
-		{"validation_status", []string{"PENDING", "AGREED", "DISAGREED", "AWAITING_CONTENT_VERIFICATION", "CONTENT_VERIFICATION_FAILED"}},
+		{"validation_status", []string{"PENDING", "AGREED", "DISAGREED", "AWAITING_CONTENT_VERIFICATION", "CONTENT_VERIFICATION_FAILED", "SUPERSEDED"}},
 		{"assignment_outcome", []string{"COMPLETED", "EXPIRED", "ABANDONED", "REJECTED", "SUPERSEDED"}},
 	}
 

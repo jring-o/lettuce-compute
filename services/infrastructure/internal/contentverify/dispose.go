@@ -19,10 +19,13 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
-// rowSnapshot is one claimed AWAITING_CONTENT_VERIFICATION row plus the CURRENT unit
-// state and leaf config read in the same claim JOIN (§10.6 step 1) — so the fetch-time
-// re-check and the finalized-unit check both see the leaf owner's and the unit's latest
-// state, never a stale copy. It is the ONLY thing decide() reads about a row.
+// rowSnapshot is one claimed AWAITING_CONTENT_VERIFICATION row plus the unit state and
+// leaf config read in the same claim JOIN (§10.6 step 1). It is the ONLY thing decide()
+// reads about a row. NOTE unitState is CLAIM-TIME state: the fetch window (up to the
+// per-row deadline) runs between the claim and the apply pass, so decide()'s
+// finalized-unit check is a fast path only — the promote write re-checks the unit state
+// under the work_units row lock (★BG-21h, sweep.go apply), because a unit that finalizes
+// mid-fetch would otherwise take a PENDING row it can never adjudicate.
 type rowSnapshot struct {
 	resultID        types.ID
 	workUnitID      types.ID

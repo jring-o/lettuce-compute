@@ -6,13 +6,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
+	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/workunit"
 )
 
@@ -243,6 +247,173 @@ func TestDecideExecutorAgreement_DeadLetter(t *testing.T) {
 					gotDL, s.wantFailed, snap.State, snap.ErrorCopies, s.maxError, snap.TotalCopies, s.maxTotal)
 			}
 		})
+	}
+}
+
+// TestDecideExecutorAgreement_VersionHeterogeneousPending (★BG-21g) extends the agreement
+// grid to a snapshot the original grid could not express: raw PENDING ≠ version-homogeneous
+// PENDING. Decide reads the FILTERED count (the transitioner applies validation.FilterPending
+// before building the snapshot — replicated here through the real engine), so for a unit with
+// two different-version PENDING results (filtered 1 < quorum 2), zero live copies, and a spent
+// budget, Decide says ActionDeadLetter. Pre-fix the executor's quorum probe counted RAW rows
+// (2 >= 2 -> refuse) and disagreed — the decider-says/executor-noops pathology through the
+// count instead of the cap, which also gated BOTH ceiling disjuncts (hardening note (f)). A
+// budget-open control pins the other direction (both sides refuse: WAIT with real headroom).
+func TestDecideExecutorAgreement_VersionHeterogeneousPending(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	userID := ecUser(t, pool)
+	leafID := ecLeaf(t, pool, userID, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+	leafRepo := leaf.NewPgxRepository(pool)
+	repo := workunit.NewPgxWorkUnitRepository(pool)
+	resultRepo := result.NewPgxRepository(pool)
+	lf, err := leafRepo.GetByID(ctx, leafID)
+	if err != nil {
+		t.Fatalf("load leaf: %v", err)
+	}
+	v1 := ecArtifactVersion(t, pool, leafID, "v1")
+	v2 := ecArtifactVersion(t, pool, leafID, "v2")
+	// The real production filter (the exact function the transitioner runs before Decide).
+	filter := validation.NewEngine(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil, transition.TrustPolicy{})
+
+	cases := []struct {
+		name       string
+		maxTotal   int  // per-unit ceiling; expired copies seeded to match when spent
+		spent      bool // whether to burn the budget (2 EXPIRED copies)
+		wantFailed bool
+	}{
+		{"het pending at raw quorum, budget spent -> dead-letter", 2, true, true},
+		{"het pending at raw quorum, budget open -> wait (not dead-letter)", 8, false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			wuID := ecWorkUnit(t, pool, leafID, func(wu *workunit.WorkUnit) {
+				wu.MaxTotalCopies = c.maxTotal
+			})
+			if _, err := pool.Exec(ctx, `UPDATE work_units SET state = 'QUEUED' WHERE id = $1`, wuID); err != nil {
+				t.Fatalf("queue unit: %v", err)
+			}
+			ecResultVersioned(t, pool, wuID, ecVolunteer(t, pool), "PENDING", v1)
+			ecResultVersioned(t, pool, wuID, ecVolunteer(t, pool), "PENDING", v2)
+			if c.spent {
+				ecHistory(t, pool, wuID, ecVolunteer(t, pool), "EXPIRED")
+				ecHistory(t, pool, wuID, ecVolunteer(t, pool), "EXPIRED")
+			}
+
+			// Build the snapshot the way the TRANSITIONER does: raw rows loaded, then the
+			// version-homogeneity filter applied before the count Decide sees.
+			all, err := resultRepo.ListByWorkUnit(ctx, wuID)
+			if err != nil {
+				t.Fatalf("list results: %v", err)
+			}
+			var pending []*result.Result
+			for _, r := range all {
+				if r.ValidationStatus == result.ValidationPending {
+					pending = append(pending, r)
+				}
+			}
+			if len(pending) != 2 {
+				t.Fatalf("raw pending = %d, want 2", len(pending))
+			}
+			filtered := filter.FilterPending(pending)
+			if len(filtered) != 1 {
+				t.Fatalf("version-homogeneous pending = %d, want 1 (two versions split 1/1)", len(filtered))
+			}
+
+			wu, err := repo.GetByID(ctx, wuID)
+			if err != nil {
+				t.Fatalf("GetByID: %v", err)
+			}
+			live, err := repo.CountLiveCopies(ctx, wuID)
+			if err != nil {
+				t.Fatalf("CountLiveCopies: %v", err)
+			}
+			total, err := repo.CountTotalCopies(ctx, wuID)
+			if err != nil {
+				t.Fatalf("CountTotalCopies: %v", err)
+			}
+			errC, err := repo.CountErrorCopies(ctx, wuID)
+			if err != nil {
+				t.Fatalf("CountErrorCopies: %v", err)
+			}
+			snap := transition.UnitSnapshot{
+				State:        wu.State,
+				Policy:       transition.ResolvePolicy(lf, wu),
+				LiveCopies:   live,
+				TotalCopies:  total,
+				ErrorCopies:  errC,
+				PendingCount: len(filtered),
+			}
+			wantDL := transition.Decide(snap).Action == transition.ActionDeadLetter
+
+			// The exported fragment must read the same number the production filter yields —
+			// the SQL<->Go pin for the shared count itself. Pinned BEFORE the executor runs:
+			// a fired dead-letter disposes the pending set to SUPERSEDED (★BG-21i), after
+			// which both sides correctly read zero.
+			var sqlFiltered int
+			if err := pool.QueryRow(ctx, `SELECT `+workunit.VersionHomogeneousPendingSQL("$1"), wuID).Scan(&sqlFiltered); err != nil {
+				t.Fatalf("evaluate versionHomogeneousPendingSQL: %v", err)
+			}
+			if sqlFiltered != len(filtered) {
+				t.Fatalf("versionHomogeneousPendingSQL=%d, FilterPending=%d — the SQL twin drifted from the Go filter",
+					sqlFiltered, len(filtered))
+			}
+
+			gotDL, err := repo.DeadLetterIfExhausted(ctx, wuID)
+			if err != nil {
+				t.Fatalf("DeadLetterIfExhausted: %v", err)
+			}
+			if wantDL != gotDL {
+				t.Fatalf("decide<->executor DISAGREE on a version-heterogeneous set: Decide=DeadLetter(%v) executor.affected(%v)\n"+
+					"snapshot: state=%s live=%d total=%d error=%d rawPending=2 filteredPending=%d maxTotal=%d",
+					wantDL, gotDL, snap.State, live, total, errC, len(filtered), c.maxTotal)
+			}
+			if gotDL != c.wantFailed {
+				t.Fatalf("unexpected outcome: executor.affected=%v want=%v", gotDL, c.wantFailed)
+			}
+			if gotDL {
+				// The fired dead-letter must dispose EVERY surviving PENDING row (both
+				// versions) to SUPERSEDED — no PENDING under terminal (★BG-21i).
+				var orphans int
+				if err := pool.QueryRow(ctx,
+					`SELECT COUNT(*) FROM results WHERE work_unit_id = $1 AND validation_status = 'PENDING'`,
+					wuID).Scan(&orphans); err != nil {
+					t.Fatalf("count surviving PENDING: %v", err)
+				}
+				if orphans != 0 {
+					t.Fatalf("dead-letter left %d PENDING rows under the FAILED unit", orphans)
+				}
+			}
+		})
+	}
+}
+
+// ecArtifactVersion inserts an artifact-version row for the leaf (★BG-21g seeding).
+func ecArtifactVersion(t *testing.T, pool *pgxpool.Pool, leafID types.ID, label string) types.ID {
+	t.Helper()
+	var id types.ID
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO leaf_artifact_versions (leaf_id, version_label, runtime_type, execution_config)
+		VALUES ($1, $2, 'NATIVE', '{}') RETURNING id`,
+		leafID, label).Scan(&id); err != nil {
+		t.Fatalf("insert artifact version %q: %v", label, err)
+	}
+	return id
+}
+
+// ecResultVersioned is ecResult plus an artifact_version_id stamp (★BG-21g seeding).
+func ecResultVersioned(t *testing.T, pool *pgxpool.Pool, wuID, volID types.ID, status string, versionID types.ID) {
+	t.Helper()
+	ecChecksumSeq++
+	checksum := fmt.Sprintf("%064d", ecChecksumSeq)
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO results (work_unit_id, volunteer_id, output_data, output_checksum, execution_metadata, validation_status, artifact_version_id)
+		 VALUES ($1, $2, '{"x":1}'::jsonb, $3, '{}'::jsonb, $4, $5)`,
+		wuID, volID, checksum, status, versionID); err != nil {
+		t.Fatalf("insert versioned %s result: %v", status, err)
 	}
 }
 

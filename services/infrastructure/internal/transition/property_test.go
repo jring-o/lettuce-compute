@@ -224,9 +224,12 @@ func randReopenSnapshot(r *rand.Rand) UnitSnapshot {
 	return s
 }
 
-// TestProperty_ReopenImpliesPhantomHeadroomWait: Reopen is set only on a WAIT that rests on
-// phantom dispatch headroom — a COMPLETED or REJECTED unit with no live copy, dispatch headroom
-// under target, and an unspent copy budget (★E1-5, §4.2).
+// TestProperty_ReopenImpliesPhantomHeadroomWait: Reopen is set only on a WAIT with no live
+// copy, and its state-specific rule holds. COMPLETED: phantom dispatch headroom — headroom
+// under target and an unspent copy budget (★E1-5, §4.2). REJECTED: adjudication is illegal in
+// place, so reopen fires for ANY non-dead-letter shape regardless of headroom (★BG-21j) — the
+// only REJECTED snapshots that do NOT reopen are live-copy WAITs and the dead-letter shape
+// (filtered pending below quorum with the budget spent).
 func TestProperty_ReopenImpliesPhantomHeadroomWait(t *testing.T) {
 	r := rand.New(rand.NewSource(8))
 	for i := 0; i < propIters; i++ {
@@ -244,12 +247,44 @@ func TestProperty_ReopenImpliesPhantomHeadroomWait(t *testing.T) {
 		if s.LiveCopies != 0 {
 			t.Fatalf("Reopen set with %d live copies: %+v", s.LiveCopies, s)
 		}
-		if countableCopies(s) >= s.Policy.TargetCopies {
-			t.Fatalf("Reopen set without dispatch headroom (countable %d >= target %d): %+v",
-				countableCopies(s), s.Policy.TargetCopies, s)
+		switch s.State {
+		case workunit.WorkUnitStateCompleted:
+			if countableCopies(s) >= s.Policy.TargetCopies {
+				t.Fatalf("COMPLETED Reopen set without dispatch headroom (countable %d >= target %d): %+v",
+					countableCopies(s), s.Policy.TargetCopies, s)
+			}
+			if capsExhausted(s) {
+				t.Fatalf("COMPLETED Reopen set with caps exhausted: %+v policy=%+v", s, s.Policy)
+			}
+		case workunit.WorkUnitStateRejected:
+			if s.PendingCount < s.Policy.MinQuorum && capsExhausted(s) {
+				t.Fatalf("REJECTED Reopen set on the dead-letter shape (pending %d < quorum %d, caps exhausted): %+v",
+					s.PendingCount, s.Policy.MinQuorum, s)
+			}
 		}
-		if capsExhausted(s) {
-			t.Fatalf("Reopen set with caps exhausted: %+v policy=%+v", s, s.Policy)
+	}
+}
+
+// TestProperty_RejectedNeverValidatesOrRejectsInPlace (★BG-21j): Decide never returns
+// ActionValidate or ActionReject for a REJECTED unit — there is no legal edge for either
+// (MarkCompleted no-ops on REJECTED and ApplyAccept/ApplyReject demand COMPLETED), so such a
+// decision could only send the executor into the conflict-and-retry spin the recovery sweep
+// re-selects forever. Every REJECTED decision is WAIT (live copy), WAIT+Reopen (requeue for
+// re-adjudication), or DeadLetter (budget spent below quorum).
+func TestProperty_RejectedNeverValidatesOrRejectsInPlace(t *testing.T) {
+	r := rand.New(rand.NewSource(11))
+	for i := 0; i < propIters; i++ {
+		s := randReopenSnapshot(r)
+		s.State = workunit.WorkUnitStateRejected
+		d := Decide(s)
+		if d.Action == ActionValidate || d.Action == ActionReject {
+			t.Fatalf("REJECTED unit decided %v (no legal edge; executor would conflict forever): %+v", d.Action, s)
+		}
+		if d.Action == ActionWait && s.LiveCopies == 0 && !d.Reopen {
+			t.Fatalf("REJECTED unit parked in a WAIT with no live copy and no reopen (would never converge): %+v", s)
+		}
+		if d.Action == ActionDeadLetter && !(s.PendingCount < s.Policy.MinQuorum && capsExhausted(s)) {
+			t.Fatalf("REJECTED unit dead-lettered outside the exhausted-below-quorum shape: %+v", s)
 		}
 	}
 }
@@ -269,9 +304,12 @@ func TestProperty_ReopenNeverForQueuedOrTerminal(t *testing.T) {
 	}
 }
 
-// TestProperty_ReopenedSnapshotIsDispatchable is the reopen arm's whole point: a snapshot Decide
-// wants to reopen becomes Dispatchable once demoted to QUEUED — the phantom headroom becomes
-// real headroom a dispatcher can use.
+// TestProperty_ReopenedSnapshotIsDispatchable is the reopen arm's whole point: a snapshot
+// Decide wants to reopen makes PROGRESS once demoted to QUEUED — either it is Dispatchable
+// (the phantom headroom becomes real headroom a dispatcher can use), or it already holds a
+// quorum's worth of PENDING results and the next Evaluate can adjudicate it in place (the
+// ★BG-21j REJECTED-at-quorum shape, which needs no further copies at all). A reopen that
+// yields neither would just re-park the unit under a different state name.
 func TestProperty_ReopenedSnapshotIsDispatchable(t *testing.T) {
 	r := rand.New(rand.NewSource(10))
 	for i := 0; i < propIters; i++ {
@@ -281,8 +319,8 @@ func TestProperty_ReopenedSnapshotIsDispatchable(t *testing.T) {
 		}
 		q := s
 		q.State = workunit.WorkUnitStateQueued
-		if !Dispatchable(q) {
-			t.Fatalf("reopened snapshot not Dispatchable when QUEUED: %+v policy=%+v", q, q.Policy)
+		if !Dispatchable(q) && q.PendingCount < q.Policy.MinQuorum {
+			t.Fatalf("reopened snapshot neither Dispatchable nor adjudicable when QUEUED: %+v policy=%+v", q, q.Policy)
 		}
 	}
 }

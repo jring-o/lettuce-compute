@@ -89,7 +89,8 @@ func setupCheckpointServer(t *testing.T) (
 	batchRepo := workunit.NewPgxBatchRepository(pool)
 	creditRepo := credit.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger, nil, transition.TrustPolicy{})
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger, nil, transition.TrustPolicy{}).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) // prod-shaped: atomic finalization, as main.go wires it (★BG-21e)
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, transition.TrustPolicy{})
 	lettucev1.RegisterVolunteerServiceServer(grpcServer, volunteerSvc)
 

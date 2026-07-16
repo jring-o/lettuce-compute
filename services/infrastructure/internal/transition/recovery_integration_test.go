@@ -409,6 +409,210 @@ func TestSweepShape2_ImmuneToClaimChurn(t *testing.T) {
 	}
 }
 
+// e1SeedArtifactVersion inserts an immutable artifact-version row for the leaf (the version
+// key results are stamped with and validation groups by).
+func e1SeedArtifactVersion(t *testing.T, pool *pgxpool.Pool, leafID types.ID, label string) types.ID {
+	t.Helper()
+	var id types.ID
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO leaf_artifact_versions (leaf_id, version_label, runtime_type, execution_config)
+		VALUES ($1, $2, 'NATIVE', '{}') RETURNING id`,
+		leafID, label).Scan(&id); err != nil {
+		t.Fatalf("seed artifact version %q: %v", label, err)
+	}
+	return id
+}
+
+// e1SeedResultVersioned is e1SeedResult plus an artifact_version_id stamp, for
+// version-heterogeneous pending sets (★BG-21g).
+func e1SeedResultVersioned(t *testing.T, pool *pgxpool.Pool, wuID, volID types.ID, checksum, status string, agoSecs int, versionID types.ID) types.ID {
+	t.Helper()
+	id := types.NewID()
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO results (
+			id, work_unit_id, volunteer_id, output_data, output_checksum,
+			execution_metadata, validation_status, created_at, artifact_version_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, now() - make_interval(secs => $8), $9)`,
+		id, wuID, volID, json.RawMessage(`{"answer":42}`), checksum,
+		json.RawMessage(e1ExecMeta), status, agoSecs, versionID,
+	); err != nil {
+		t.Fatalf("seed versioned result: %v", err)
+	}
+	return id
+}
+
+// TestDeadLetterRejectedState_ExhaustedBudget (★BG-21f): a pre-fix stranded REJECTED unit
+// whose copy budget is already spent cannot reopen (reopen requires headroom) — Decide routes
+// it to ActionDeadLetter, and the executor must be able to take the REJECTED -> FAILED edge
+// validTransitions has always declared. Pre-fix the DeadLetterIfExhausted state guard was
+// QUEUED/COMPLETED-only, so the executor matched 0 rows and the shape-1 sweep re-selected the
+// unit every tick forever (REJECTED ages on updated_at, which nothing bumps) — the BG-27
+// decider-says/executor-noops pathology recreated for a state. One sweep must converge it.
+func TestDeadLetterRejectedState_ExhaustedBudget(t *testing.T) {
+	pool, cleanup := e1SetupTestDB(t)
+	defer cleanup()
+	st := e1NewStack(t, pool, 0, 100)
+	ctx := context.Background()
+	user := e1SeedUser(t, pool)
+	lf := e1SeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+
+	// max_total_copies = 2, two closed EXPIRED copies -> budget exhausted; no pending, no live.
+	wu := e1SeedWorkUnit(t, pool, lf, "REJECTED", 2, 2, 0, 2, false)
+	e1SeedHistory(t, pool, wu, e1SeedVolunteer(t, pool), "EXPIRED")
+	e1SeedHistory(t, pool, wu, e1SeedVolunteer(t, pool), "EXPIRED")
+
+	st.sweeper.RunOnce(ctx)
+
+	if got := e1UnitState(t, pool, wu); got != "FAILED" {
+		t.Fatalf("after sweep: state = %s, want FAILED (stranded-REJECTED + exhausted budget must dead-letter, not spin)", got)
+	}
+	if !e1UnitFlagged(t, pool, wu) {
+		t.Error("dead-lettered unit not flagged_for_review")
+	}
+}
+
+// TestRejectedAtQuorumConvergesNoSpin (★BG-21j): a REJECTED unit holding a quorum's worth of
+// agreeing PENDING results (grace-window submits landing under a stranded REJECTED unit, or
+// pre-fix residue). Pre-fix, Decide returned ActionValidate for it, MarkCompleted no-oped
+// (its guard is QUEUED/ASSIGNED/RUNNING), ApplyAccept conflicted ("expected COMPLETED"), and
+// the shape-1 sweep re-selected the unit and logged the failure every tick FOREVER — the
+// ★BG-21f spin recreated one shape over. Post-fix, Decide routes REJECTED through the reopen
+// arm: one sweep requeues it (Reassign → QUEUED, results untouched), and the next Evaluate
+// adjudicates the same results under a state with legal edges.
+func TestRejectedAtQuorumConvergesNoSpin(t *testing.T) {
+	pool, cleanup := e1SetupTestDB(t)
+	defer cleanup()
+	st := e1NewStack(t, pool, 0, 100)
+	ctx := context.Background()
+	user := e1SeedUser(t, pool)
+	lf := e1SeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+
+	agree := e1Checksum('b')
+	wu := e1SeedWorkUnit(t, pool, lf, "REJECTED", 2, 2, 0, 8, false)
+	e1SeedResult(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600)
+	e1SeedResult(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600)
+	before := e1ReassignCount(t, pool, wu)
+
+	// Tick 1: shape-1 selects the aged REJECTED unit; the reopen arm requeues it.
+	st.sweeper.RunOnce(ctx)
+	if got := e1UnitState(t, pool, wu); got != "QUEUED" {
+		t.Fatalf("after sweep tick 1: state = %s, want QUEUED (pre-fix spin: stays REJECTED with a conflict WARN every tick)", got)
+	}
+	if after := e1ReassignCount(t, pool, wu); after != before+1 {
+		t.Errorf("reassignment_count = %d, want %d (the standard Reassign requeue)", after, before+1)
+	}
+	if got := e1CreditRows(t, pool, wu); got != 0 {
+		t.Fatalf("credit rows after the requeue alone = %d, want 0", got)
+	}
+
+	// The SAME pending results now adjudicate under QUEUED: validate + credit.
+	if _, err := st.transitioner.Evaluate(ctx, wu); err != nil {
+		t.Fatalf("Evaluate after requeue: %v", err)
+	}
+	if got := e1UnitState(t, pool, wu); got != "VALIDATED" {
+		t.Fatalf("after re-adjudication: state = %s, want VALIDATED", got)
+	}
+	if got := e1CreditRows(t, pool, wu); got != 2 {
+		t.Errorf("credit rows = %d, want 2 (one per agreeing result)", got)
+	}
+}
+
+// TestSweepVersionHeterogeneous_NoLivelock (★BG-21g): a QUEUED unit whose raw PENDING count
+// meets quorum but whose version-homogeneous count does not (two results from different
+// artifact versions; target == quorum == 2). Decide only ever sees the FILTERED count, so
+// pre-fix the three SQL counts diverged from it and livelocked the unit: the shape-2 selector
+// re-selected it on the raw count every tick, Evaluate WAITed on the filtered count, and the
+// dispatch coverage read raw 2 >= target 2 so the missing corroborator was never dispatched.
+// Post-fix all three read the version-homogeneous count: the selector skips the unit, dispatch
+// sees real headroom, and a fresh same-version corroborator converges it.
+func TestSweepVersionHeterogeneous_NoLivelock(t *testing.T) {
+	pool, cleanup := e1SetupTestDB(t)
+	defer cleanup()
+	st := e1NewStack(t, pool, 0, 100)
+	ctx := context.Background()
+	user := e1SeedUser(t, pool)
+	lf := e1SeedLeaf(t, pool, user, `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`)
+
+	v1 := e1SeedArtifactVersion(t, pool, lf, "v1")
+	v2 := e1SeedArtifactVersion(t, pool, lf, "v2")
+
+	agree := e1Checksum('b')
+	wu := e1SeedWorkUnit(t, pool, lf, "QUEUED", 2, 2, 0, 8, false)
+	e1SeedResultVersioned(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600, v1)
+	e1SeedResultVersioned(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 600, v2)
+
+	// (a) The shape-2 selector must NOT treat the unit as at-quorum: its version-homogeneous
+	// count is 1 < 2. olderThan 0 means age can never be the reason for exclusion — the count
+	// is the only discriminator. Pre-fix the raw COUNT(*) = 2 selected it (forever).
+	ids, err := st.wuRepo.FindStalledQueuedAtQuorum(ctx, 0, 100)
+	if err != nil {
+		t.Fatalf("FindStalledQueuedAtQuorum: %v", err)
+	}
+	for _, id := range ids {
+		if id == wu {
+			t.Fatalf("shape-2 selector selected the version-heterogeneous unit (raw count) — the sweep would re-drive it into WAIT every tick")
+		}
+	}
+
+	// (b) Dispatch must see the REAL headroom Decide's WAIT is resting on: countable coverage
+	// is 1 (the version-homogeneous group), not the raw 2, so the unit is stageable and the
+	// missing corroborator can actually be supplied. Pre-fix coverage read 2 >= target 2 and
+	// the unit was never dispatched again. ProbationCoverage carries the complement (the
+	// version-excluded row) so the dispatch cache reaches the same countable number.
+	cands, err := st.wuRepo.FindDispatchableBatch(ctx, 100, nil, nil)
+	if err != nil {
+		t.Fatalf("FindDispatchableBatch: %v", err)
+	}
+	var cand *workunit.DispatchCandidate
+	for i := range cands {
+		if cands[i].WorkUnit.ID == wu {
+			cand = &cands[i]
+		}
+	}
+	if cand == nil {
+		t.Fatal("version-heterogeneous unit is not dispatchable: coverage still counts the version-excluded row, so the missing corroborator can never be supplied (livelock)")
+	}
+	if got := cand.ActiveAssignments - cand.ProbationCoverage; got != 1 {
+		t.Errorf("countable coverage (active %d - probation %d) = %d, want 1 (the version-homogeneous group)",
+			cand.ActiveAssignments, cand.ProbationCoverage, got)
+	}
+
+	// (c) Evaluate holds a plain WAIT (filtered 1 < quorum 2, real headroom) — no spin driver.
+	if outcome, err := st.transitioner.Evaluate(ctx, wu); err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	} else if outcome != transition.OutcomeWaiting {
+		t.Fatalf("Evaluate outcome = %q, want WAITING", outcome)
+	}
+	if got := e1UnitState(t, pool, wu); got != "QUEUED" {
+		t.Fatalf("after Evaluate: state = %s, want QUEUED", got)
+	}
+
+	// Convergence: the dispatched corroborator lands on v2 — the version-homogeneous group
+	// reaches quorum and the unit validates around the version-excluded row.
+	e1SeedResultVersioned(t, pool, wu, e1SeedVolunteer(t, pool), agree, "PENDING", 1, v2)
+	if _, err := st.transitioner.Evaluate(ctx, wu); err != nil {
+		t.Fatalf("Evaluate after corroborator: %v", err)
+	}
+	if got := e1UnitState(t, pool, wu); got != "VALIDATED" {
+		t.Fatalf("after corroborator: state = %s, want VALIDATED", got)
+	}
+
+	// The v1 row is the DELIBERATE version-residue exception (design §4.1 named residual,
+	// hardening backlog: result-level SUPERSEDED status): exactly one PENDING row remains
+	// under the terminal unit, and it is the version-excluded one. Tagged here explicitly so
+	// the whole-suite E1-S invariant's zero-orphan clause stays meaningful everywhere else.
+	var residue int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM results r
+		WHERE r.work_unit_id = $1 AND r.validation_status = 'PENDING' AND r.artifact_version_id = $2`,
+		wu, v1).Scan(&residue); err != nil {
+		t.Fatalf("residue query: %v", err)
+	}
+	if residue != 1 {
+		t.Errorf("version-residue rows = %d, want exactly 1 (the v1 row)", residue)
+	}
+}
+
 // TestDeadLetterCompletedState: a COMPLETED unit with zero PENDING, >= 1 DISAGREED (so NOT the
 // residue shape), no live copy, and an exhausted copy budget dead-letters in one Evaluate —
 // red on the old QUEUED-only DeadLetterIfExhausted guard.

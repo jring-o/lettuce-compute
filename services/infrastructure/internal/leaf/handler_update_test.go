@@ -109,3 +109,82 @@ func TestHandleUpdate_RejectsCompareFieldsWrongMode(t *testing.T) {
 		t.Fatalf("status = 200, want 4xx (compare_fields requires NUMERIC_TOLERANCE); body=%s", rec.Body.String())
 	}
 }
+
+// newLazyMonteCarloTestLeaf is an ONGOING lazy Monte Carlo leaf with NO num_trials — a legal
+// configuration (an ongoing leaf never exhausts and needs no total), and the launchpad for the
+// ★BG-22e bypass: flipping is_ongoing to false makes num_trials load-bearing.
+func newLazyMonteCarloTestLeaf() *Leaf {
+	id := types.NewID()
+	return &Leaf{
+		ID:          id,
+		Name:        "Lazy MC Lifecycle",
+		Description: "finite-flip validation leaf for tests",
+		State:       StateActive,
+		TaskPattern: PatternMonteCarlo,
+		IsOngoing:   true,
+		ValidationConfig: ValidationConfig{
+			RedundancyFactor:   2,
+			AgreementThreshold: 1.0,
+			ComparisonMode:     ComparisonExact,
+			MaxRetries:         3,
+		},
+		DataConfig: DataConfig{
+			TransferStrategy:   TransferInline,
+			AggregationFormat:  AggregationJSON,
+			MaxInputSizeBytes:  1048576,
+			MaxOutputSizeBytes: 104857600,
+			GenerationMode:     GenerationModeLazy,
+			LazyThreshold:      50,
+			LazyBatchSize:      100,
+			SplittingConfig:    map[string]any{"seed_strategy": "hash"}, // no num_trials
+		},
+	}
+}
+
+// TestHandleUpdate_IsOngoingFlipRevalidatesDataConfig (★BG-22e): PATCH {"is_ongoing": false}
+// with NO data_config block must re-run ValidateDataConfig against the new lifecycle — a
+// finite lazy Monte Carlo leaf must declare splitting_config.num_trials, the total exhaustion
+// is decided against. Pre-fix the flip was applied unconditionally and validation only ran
+// when the request carried a data_config block, so this request landed the leaf in the exact
+// state validation declares impossible and it generated full batches forever.
+func TestHandleUpdate_IsOngoingFlipRevalidatesDataConfig(t *testing.T) {
+	lf := newLazyMonteCarloTestLeaf()
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: slog.Default()}
+
+	rec := doUpdate(t, h, lf.ID, `{"is_ongoing":false}`)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("status = 200, want 4xx: a finite lazy monte_carlo leaf with no num_trials never exhausts; body=%s", rec.Body.String())
+	}
+}
+
+// TestHandleUpdate_IsOngoingFlipAcceptedWithDeclaredTotal: the same flip is fine when the
+// stored config already declares the total (the rule binds on the invalid combination only).
+func TestHandleUpdate_IsOngoingFlipAcceptedWithDeclaredTotal(t *testing.T) {
+	lf := newLazyMonteCarloTestLeaf()
+	lf.DataConfig.SplittingConfig["num_trials"] = float64(1000)
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: slog.Default()}
+
+	rec := doUpdate(t, h, lf.ID, `{"is_ongoing":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (num_trials declared, flip is legal); body=%s", rec.Code, rec.Body.String())
+	}
+	if lf.IsOngoing != false {
+		t.Error("is_ongoing flip not persisted")
+	}
+}
+
+// TestHandleUpdate_IsOngoingFlipWithNumTrialsInSameRequest: supplying the missing total in
+// the same PATCH satisfies the rule — the data_config block validates against the NEW
+// is_ongoing because the flip is applied before the config merges.
+func TestHandleUpdate_IsOngoingFlipWithNumTrialsInSameRequest(t *testing.T) {
+	lf := newLazyMonteCarloTestLeaf()
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: slog.Default()}
+
+	rec := doUpdate(t, h, lf.ID, `{"is_ongoing":false,"data_config":{"splitting_config":{"seed_strategy":"hash","num_trials":500}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (total supplied in the same request); body=%s", rec.Code, rec.Body.String())
+	}
+	if lf.IsOngoing != false {
+		t.Error("is_ongoing flip not persisted")
+	}
+}

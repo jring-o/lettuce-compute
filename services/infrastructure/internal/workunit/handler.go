@@ -374,6 +374,23 @@ func (h *WorkUnitHandler) handleGenerate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Lazy leaves are generated ONLY by the head's lazy generation manager (★BG-22d): its
+	// durable cursor is what guarantees each ordinal is emitted exactly once. This endpoint
+	// generates from the request/splitting_config with NO cursor — on a lazy leaf that has
+	// already emitted [0, cursor) it would re-emit those ordinals from offset 0 with
+	// byte-identical seeds and trial indices (there is no unique constraint on trial
+	// identity, so the duplicates insert cleanly and burn real volunteer compute).
+	if proj.DataConfig.GenerationMode == leaf.GenerationModeLazy {
+		apierror.WriteError(w, apierror.Conflict(
+			"work units for a lazy leaf are generated automatically by the head's lazy generation manager; manual generation would re-emit already-generated trials",
+			map[string]string{
+				"code":            "LAZY_GENERATION_MANAGED",
+				"generation_mode": proj.DataConfig.GenerationMode,
+			},
+		))
+		return
+	}
+
 	var req GenerateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))

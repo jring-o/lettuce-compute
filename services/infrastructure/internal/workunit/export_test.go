@@ -23,3 +23,8 @@ var (
 	EffMaxErrorSQL = effMaxErrorSQL
 	ErrorCopiesSQL = errorCopiesSQL
 )
+
+// VersionHomogeneousPendingSQL exposes the version-homogeneous pending-count fragment
+// (★BG-21g) so the external decide<->executor agreement test can assert it equals the count
+// the transitioner feeds Decide (validation.FilterPending) on version-heterogeneous sets.
+var VersionHomogeneousPendingSQL = versionHomogeneousPendingSQL

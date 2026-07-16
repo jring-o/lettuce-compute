@@ -75,6 +75,52 @@ func CanActivate(p *Leaf) error {
 
 // CanDelete checks whether a leaf may be deleted.
 // Active leafs and leafs with credit history cannot be deleted.
+// EffectiveGenerationMode normalizes a stored/requested generation_mode: the empty string is
+// eager (the default the validator and the lazy manager both already treat it as).
+func EffectiveGenerationMode(mode string) string {
+	if mode == "" {
+		return GenerationModeEager
+	}
+	return mode
+}
+
+// CanChangeGenerationMode gates a generation_mode flip on the leaf never having generated
+// (★BG-22f): once ANY work unit exists — or the generation cursor has ever advanced — the two
+// modes' bookkeeping is irreconcilable and a flip re-emits ordinals as duplicate trials.
+// Eager emission never advances leafs.generation_cursor (the eager path passes a nil cursor
+// advance), so an eager→lazy flip hands the lazy manager cursor offset 0 and it re-emits
+// [0,batch)… with byte-identical seeds and trial indices; the symmetric lazy→eager flip
+// re-arms the manual generate endpoint (whose lazy 409 no longer fires) to re-emit
+// [0,cursor). There is no unique constraint on trial identity, so duplicates insert cleanly
+// and burn real volunteer compute. Reconciling the cursor from emitted rows is not reliably
+// possible (eager emission is re-runnable and stamps no ordinal for every pattern), so the
+// honest surface is immutability-after-first-generation: pick the mode before generating —
+// the same posture as the endpoint's LAZY_GENERATION_MANAGED refusal and the
+// execution_config.runtime ACTIVE-state guard.
+func CanChangeGenerationMode(ctx context.Context, pool *pgxpool.Pool, leafID types.ID, generationCursor []byte) error {
+	cursor := string(generationCursor)
+	if cursor != "" && cursor != "{}" && cursor != "null" {
+		return apierror.Conflict(
+			"generation_mode cannot be changed after work units have been generated: the generation cursor has advanced, and switching modes would re-emit already-generated trials",
+			map[string]string{"code": "GENERATION_MODE_IMMUTABLE"},
+		)
+	}
+	var hasUnits bool
+	if err := pool.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM work_units WHERE leaf_id = $1)",
+		leafID,
+	).Scan(&hasUnits); err != nil {
+		return apierror.Internal("failed to check generated work units", err)
+	}
+	if hasUnits {
+		return apierror.Conflict(
+			"generation_mode cannot be changed after work units have been generated: switching modes would re-emit already-generated trials as duplicates",
+			map[string]string{"code": "GENERATION_MODE_IMMUTABLE"},
+		)
+	}
+	return nil
+}
+
 func CanDelete(ctx context.Context, pool *pgxpool.Pool, leafID types.ID, currentState LeafState) error {
 	if currentState == StateActive {
 		return apierror.Conflict(

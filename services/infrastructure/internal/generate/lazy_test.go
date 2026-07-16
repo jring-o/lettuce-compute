@@ -463,6 +463,46 @@ func TestCheckAndGenerate_LazyMapReduceSkipped(t *testing.T) {
 	}
 }
 
+// TestCheckAndGenerate_FiniteMonteCarloNoNumTrialsSkipped (★BG-22e): a finite (non-ongoing)
+// lazy Monte Carlo leaf with no readable num_trials has no total to exhaust against —
+// pre-fix, perTickNumTrials silently fell back to a full batch and the leaf generated forever
+// (GenerationExhausted could never trip). Create/update validation rejects the state; a row
+// that reached it anyway (the pre-fix is_ongoing-flip bypass) must be skipped-and-WARNed, the
+// lazy MAP_REDUCE posture, not silently generated.
+func TestCheckAndGenerate_FiniteMonteCarloNoNumTrialsSkipped(t *testing.T) {
+	proj := makeMonteCarloProject(false, 1000)
+	delete(proj.DataConfig.SplittingConfig, "num_trials")
+
+	leafRepo := newMockLeafRepo()
+	leafRepo.leafs[proj.ID] = proj
+	wuRepo := newMockWURepo()
+	batchRepo := &mockBatchRepo{}
+	mgr := newTestLazyManager(wuRepo, batchRepo, leafRepo)
+
+	generated, err := mgr.CheckAndGenerate(context.Background(), proj.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if generated != 0 {
+		t.Errorf("expected 0 generated for a finite MC leaf with no num_trials (undecidable exhaustion), got %d", generated)
+	}
+	if cursorOf(leafRepo, proj.ID).TotalGenerated != 0 {
+		t.Error("expected no cursor advance for the skipped leaf")
+	}
+
+	// The ONGOING flavor of the same config is legal and generates a full-batch tick.
+	ongoing := makeMonteCarloProject(true, 1000)
+	delete(ongoing.DataConfig.SplittingConfig, "num_trials")
+	leafRepo.leafs[ongoing.ID] = ongoing
+	generated, err = mgr.CheckAndGenerate(context.Background(), ongoing.ID)
+	if err != nil {
+		t.Fatalf("unexpected error (ongoing): %v", err)
+	}
+	if generated == 0 {
+		t.Error("ongoing MC with no num_trials must still generate (num_trials bounds nothing there)")
+	}
+}
+
 func TestCheckAndGenerate_NotActive(t *testing.T) {
 	proj := makeMonteCarloProject(false, 1000)
 	proj.State = leaf.StatePaused

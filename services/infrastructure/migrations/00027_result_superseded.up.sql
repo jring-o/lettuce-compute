@@ -1,0 +1,23 @@
+-- 00027_result_superseded.up.sql
+-- Result-level SUPERSEDED validation status (★BG-21i / hardening backlog (b)).
+--
+-- A work unit that dead-letters (FAILED, copy budget spent below quorum) can hold PENDING
+-- results that were never adjudicated — a lone below-quorum submission whose remaining copies
+-- all expired. Before this value existed, the dead-letter executor flipped the unit FAILED
+-- and left those rows PENDING under a terminal unit forever: invisible to every recovery
+-- sweep shape (all exclude terminal units), never re-evaluated (the transitioner no-ops on
+-- terminal states), and a standing violation of the E1-S invariant ("no PENDING result under
+-- a VALIDATED/FAILED unit").
+--
+-- SUPERSEDED is the honest disposal: the result was neither agreed nor disagreed — it was
+-- never compared against anything — the unit's fate simply overtook it. It is deliberately
+-- NOT an error signal: every error tally (errorCopiesSQL: EXPIRED/ABANDONED copies +
+-- DISAGREED results) and every reliability/standing consequence keys on DISAGREED, which a
+-- SUPERSEDED row never was. This mirrors the copy-level SUPERSEDED assignment outcome
+-- (validate-at-quorum closing the over-dispatch extras).
+--
+-- Every validation_status filter in the repo is positive-form (the 00022 down migration
+-- documents this), so the new value is inert everywhere except the writers that stamp it
+-- (the dead-letter executor) and the one enumerating read surface (the results list
+-- ?validation_status= filter, extended in the same change).
+ALTER TYPE public.validation_status ADD VALUE IF NOT EXISTS 'SUPERSEDED';

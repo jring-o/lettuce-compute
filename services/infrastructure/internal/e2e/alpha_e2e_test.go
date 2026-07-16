@@ -105,7 +105,8 @@ func setupAlphaServer(t *testing.T) (*testEnv, func()) {
 	attestationRepo := attestation.NewPgxRepository(pool)
 
 	// Validation engine with signer.
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{}).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) // prod-shaped: atomic finalization, as main.go wires it (★BG-21e)
 
 	// HTTP server with all endpoints.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)

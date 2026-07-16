@@ -536,21 +536,19 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 	return nil
 }
 
-// removedValidationConfigKeys probes an incoming validation_config JSON body for fields the
-// head no longer supports. The pointer distinguishes an explicitly-sent key (including an
-// explicit "max_success_copies": 0) from an absent one, so a stale client is told the field is
-// gone rather than having it silently dropped by the typed unmarshal (E1-C: accepted-and-
-// ignored is not a state).
-type removedValidationConfigKeys struct {
-	MaxSuccessCopies *int `json:"max_success_copies"`
-}
-
 // RejectRemovedValidationConfigKeys returns a ValidationError when raw — the caller's
 // validation_config JSON block — carries a field that has been removed from ValidationConfig.
 // It must read the RAW bytes: the typed ValidationConfig no longer has the field, and leaf
 // create/update decodes validation_config with a plain json.Unmarshal (no DisallowUnknownFields),
 // so an unknown key is silently dropped before any typed validation could see it. Callers pass
 // the raw block through this before the typed merge.
+//
+// The probe is KEY-PRESENCE over map[string]json.RawMessage, deliberately not a typed pointer
+// (hardening note (d)): a typed probe like `*int` fails the whole unmarshal on a type-mismatched
+// value ({"max_success_copies":"5"}) and the guard would fail OPEN — key silently dropped, 200
+// returned, accepted-and-ignored (the exact E1-C state this guard exists to prevent). Presence
+// of the key rejects regardless of its value's type, null included: whatever the value, the
+// client asked for a field that no longer exists.
 //
 // max_success_copies was removed in migration 00025: a success ceiling has no coherent semantics
 // (design §4.9) and was read by nothing, so accepting it would be dishonest config surface. raw
@@ -560,11 +558,11 @@ func RejectRemovedValidationConfigKeys(raw json.RawMessage) *apierror.APIError {
 	if len(raw) == 0 {
 		return nil
 	}
-	var probe removedValidationConfigKeys
-	if err := json.Unmarshal(raw, &probe); err != nil {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
 		return nil
 	}
-	if probe.MaxSuccessCopies != nil {
+	if _, present := keys["max_success_copies"]; present {
 		return apierror.ValidationError(
 			"max_success_copies is no longer supported; success ceilings have no coherent semantics (see release notes)",
 			validationDetail{Field: "max_success_copies", Reason: "removed"})

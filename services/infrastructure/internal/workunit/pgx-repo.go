@@ -20,6 +20,11 @@ type DBTX interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
+	// Begin opens a transaction (a savepoint when the receiver is already a pgx.Tx). The
+	// dead-letter executor needs it to take the work_units row lock BEFORE its guard/disposal
+	// snapshot (★BG-21i) — the same lock-then-read discipline the finalization tx and the
+	// submit/promote doors use.
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // defaultClaimLeaseSeconds is the fallback dispatch-claim lease (seconds) used by
@@ -1979,11 +1984,16 @@ func (r *PgxWorkUnitRepository) FindStalledFinalizationUnits(ctx context.Context
 // ages on the EVIDENCE (MAX(created_at) of the PENDING results), NOT on work_units.updated_at:
 // dispatch-claim stamping/renewal and expired-claim hygiene bump updated_at with zero progress
 // on the unit, which would age-mask a dispatchable strand precisely in the quiet-pool regime
-// the sweep exists for. The pending count is the RAW count against the shared quorum fragment
-// (effQuorumWuL), mirroring Decide's attempt gate — the sweep asks only "might Evaluate do
-// something," and Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l
-// primary keys so the quorum fragment's per-row column references are resolvable. Oldest
-// evidence first, LIMIT. Rides idx_results_pending_by_unit.
+// the sweep exists for. The pending count is the VERSION-HOMOGENEOUS count against the shared
+// quorum fragment (effQuorumWuL), mirroring Decide's attempt gate — Decide only ever sees the
+// filtered count (validation.FilterPending), so a selector counting RAW rows would re-select a
+// version-heterogeneous unit whose filtered count sits below quorum and re-drive it into WAIT
+// every tick forever (★BG-21g); such a unit is not a strand — its filtered coverage leaves
+// dispatch headroom, and dispatch (whose coverage count now agrees, countablePendingResultsSQL)
+// supplies the missing corroborator. The sweep asks only "might Evaluate do something," and
+// Evaluate recomputes the full countable/trust arithmetic. GROUP BY the wu/l primary keys so
+// the quorum fragment's per-row column references are resolvable. Oldest evidence first,
+// LIMIT. Rides idx_results_pending_by_unit.
 func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, olderThan time.Duration, limit int) ([]types.ID, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT wu.id
@@ -1993,7 +2003,7 @@ func (r *PgxWorkUnitRepository) FindStalledQueuedAtQuorum(ctx context.Context, o
 		WHERE r.validation_status = 'PENDING' AND wu.state = 'QUEUED'
 		GROUP BY wu.id, l.id
 		HAVING MAX(r.created_at) < now() - make_interval(secs => $1)
-		   AND COUNT(*) >= `+effQuorumWuL+`
+		   AND `+versionHomogeneousPendingSQL("wu.id")+` >= `+effQuorumWuL+`
 		ORDER BY MAX(r.created_at) ASC
 		LIMIT $2`,
 		int(olderThan.Seconds()), limit)
@@ -2134,12 +2144,29 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 	return n, nil
 }
 
-// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED or
-// COMPLETED, has NO live copy outstanding, its redundancy is still unmet (PENDING results <
-// quorum), AND its copy budget is spent: EITHER the total copies ever created has reached its
-// dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR — when the owner
-// configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED) have reached
-// max_error_copies. Returns whether the unit was failed.
+// DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED, COMPLETED,
+// or REJECTED, has NO live copy outstanding, its redundancy is still unmet (version-homogeneous
+// PENDING results < quorum), AND its copy budget is spent: EITHER the total copies ever created
+// has reached its dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR —
+// when the owner configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED)
+// have reached max_error_copies. In the SAME transaction, every surviving PENDING result of the
+// failed unit is disposed to SUPERSEDED (★BG-21i): a below-quorum PENDING row that outlived the
+// terminal flip would sit PENDING under FAILED forever — invisible to every recovery shape,
+// never adjudicated, the exact orphan class the E1-S invariant forbids. SUPERSEDED, not
+// DISAGREED: the row was never compared against anything, so it is not an error signal — it
+// feeds neither errorCopiesSQL nor any reliability penalty; the unit's fate simply overtook it
+// (the result-status analogue of a copy's SUPERSEDED outcome). Returns whether the unit was
+// failed.
+//
+// The transaction takes the work_units row lock BEFORE the guarded flip — the same
+// lock-then-read discipline as the finalization tx and the submit/promote doors — so the
+// guard's pending count and the disposal sweep are evaluated on a snapshot taken UNDER the
+// serializer: a submit racing this dead-letter either commits first (and the fresh post-lock
+// count sees its row — quorum met means the guard refuses) or queues behind the lock (and the
+// door then refuses against the committed FAILED state). A single unlocked statement would
+// re-check its WHERE on the new row version after a lock wait but re-run its count subqueries
+// against the ORIGINAL snapshot — the ★E1-6 window shape, reopened through the one writer that
+// skipped the discipline.
 //
 // The ceiling disjunct MIRRORS transition.capsExhausted (decide.go) field-for-field:
 // `total >= effMaxTotal OR (effMaxError > 0 AND errors >= effMaxError)`, built from the shared
@@ -2150,11 +2177,22 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 // stayed QUEUED and dispatchable until the (much larger) total ceiling. The `effMaxError > 0`
 // guard is load-bearing: 0 = unlimited, and a raw `errors >= 0` would dead-letter every unit.
 //
-// The state guard is `IN ('QUEUED','COMPLETED')` (was QUEUED-only): the rare COMPLETED unit
-// whose version-filtered PENDING set drops below quorum with the copy budget exhausted (the
-// version-heterogeneous edge, design §4.2) must dead-letter in one tick instead of never. The
-// semantic guards below — no live copy, PENDING < quorum, and a spent budget — carry the
-// meaning; the state list is belt.
+// The pending probe embeds versionHomogeneousPendingSQL, NOT a raw COUNT (★BG-21g): Decide's
+// dead-letter gate reads the version-FILTERED pending count, so a raw probe reads HIGHER on a
+// version-heterogeneous set and refuses the exact unit Decide told it to fail — the BG-27
+// decider-says/executor-noops pathology recreated through the count instead of the cap. The
+// same divergence gated BOTH ceiling disjuncts (hardening note (f)); one shared count closes
+// both.
+//
+// The state guard is `IN ('QUEUED','COMPLETED','REJECTED')`: COMPLETED for the unit whose
+// version-filtered PENDING set drops below quorum with the copy budget exhausted (the
+// version-heterogeneous edge, design §4.2), REJECTED for pre-fix stranded-REJECTED residue
+// whose budget is already spent (★BG-21f) — Decide routes that snapshot to ActionDeadLetter
+// (reopen requires headroom), and a QUEUED/COMPLETED-only executor matched 0 rows, so the
+// shape-1 sweep re-selected the unit every tick forever (REJECTED ages on updated_at, which
+// nothing bumps). validTransitions has always declared REJECTED -> FAILED. The semantic
+// guards below — no live copy, PENDING < quorum, and a spent budget — carry the meaning; the
+// state list is belt.
 //
 // Adversarial trade-off armed by the error disjunct (design §4.9, review #4): errorCopiesSQL
 // counts ABANDONED history rows, and abandon is a free authenticated call that closes the
@@ -2167,33 +2205,57 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 // 0 < max_error_copies < target_copies) keeps an honest owner from setting a cap that honest
 // churn alone could trip.
 func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workUnitID types.ID) (bool, error) {
-	tag, err := r.db.Exec(ctx, `
-		UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
-		FROM leafs l
-		WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED')
-		  AND NOT EXISTS (
-		    SELECT 1 FROM work_unit_assignment_history h
-		    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
-		  )
-		  AND (
-		    SELECT COUNT(*) FROM results res
-		    WHERE res.work_unit_id = wu.id AND res.validation_status = 'PENDING'
-		  ) < `+effQuorumWuL+`
-		  AND (
-		    (
-		      SELECT COUNT(*) FROM work_unit_assignment_history h2
-		      WHERE h2.work_unit_id = wu.id
-		    ) >= `+effMaxTotalWuL+`
-		    OR (
-		      `+effMaxErrorWuL+` > 0 AND `+errorCopiesSQL("wu.id")+` >= `+effMaxErrorWuL+`
-		    )
-		  )`,
-		workUnitID,
-	)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
+		return false, apierror.Internal("failed to begin dead-letter transaction", err)
+	}
+	// No-op after Commit; on any early return it releases the row lock.
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// The hard serializer, taken BEFORE the guard snapshot (see the doc comment above).
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM work_units WHERE id = $1 FOR UPDATE`, workUnitID); err != nil {
+		return false, apierror.Internal("failed to lock work unit for dead-letter", err)
+	}
+
+	// Flip + disposal as one data-modifying-CTE statement on the post-lock snapshot: the flip
+	// and the SUPERSEDED sweep commit or vanish together, and no PENDING row can survive the
+	// terminal transition.
+	var failed, superseded int
+	if err := tx.QueryRow(ctx, `
+		WITH failed AS (
+			UPDATE work_units wu SET state = 'FAILED', flagged_for_review = true
+			FROM leafs l
+			WHERE wu.id = $1 AND l.id = wu.leaf_id AND wu.state IN ('QUEUED', 'COMPLETED', 'REJECTED')
+			  AND NOT EXISTS (
+			    SELECT 1 FROM work_unit_assignment_history h
+			    WHERE h.work_unit_id = wu.id AND h.outcome IS NULL
+			  )
+			  AND `+versionHomogeneousPendingSQL("wu.id")+` < `+effQuorumWuL+`
+			  AND (
+			    (
+			      SELECT COUNT(*) FROM work_unit_assignment_history h2
+			      WHERE h2.work_unit_id = wu.id
+			    ) >= `+effMaxTotalWuL+`
+			    OR (
+			      `+effMaxErrorWuL+` > 0 AND `+errorCopiesSQL("wu.id")+` >= `+effMaxErrorWuL+`
+			    )
+			  )
+			RETURNING wu.id
+		), disposed AS (
+			UPDATE results res SET validation_status = 'SUPERSEDED', updated_at = now()
+			FROM failed f
+			WHERE res.work_unit_id = f.id AND res.validation_status = 'PENDING'
+			RETURNING res.id
+		)
+		SELECT (SELECT COUNT(*) FROM failed), (SELECT COUNT(*) FROM disposed)`,
+		workUnitID,
+	).Scan(&failed, &superseded); err != nil {
 		return false, apierror.Internal("failed to dead-letter work unit", err)
 	}
-	return tag.RowsAffected() > 0, nil
+	if err := tx.Commit(ctx); err != nil {
+		return false, apierror.Internal("failed to commit dead-letter transaction", err)
+	}
+	return failed > 0, nil
 }
 
 // Reassign returns an EXPIRED or REJECTED work unit to QUEUED for further

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -434,7 +435,11 @@ func TestWindowedDecode_EqualsCartesianProduct(t *testing.T) {
 	for si, sp := range spaces {
 		full := CartesianProduct(sp)
 		keys := sortedKeys(sp)
-		if got := totalCombinations(keys, sp); got != len(full) {
+		got, err := totalCombinations(keys, sp)
+		if err != nil {
+			t.Fatalf("space %d: totalCombinations error: %v", si, err)
+		}
+		if got != len(full) {
 			t.Fatalf("space %d: totalCombinations=%d, len(product)=%d", si, got, len(full))
 		}
 		for i := range full {
@@ -483,6 +488,29 @@ func TestGenerate_LazyTickPacing(t *testing.T) {
 	}
 	if result2.WorkUnitsCreated != 2 {
 		t.Errorf("short-tail lazy tick must emit min(batch,remaining)=2, got %d", result2.WorkUnitsCreated)
+	}
+}
+
+// TestGenerate_CombinationCountOverflowIsLoud (hardening note (e)): ~63 two-value parameters
+// overflow the int64 combination product to a NEGATIVE total; pre-fix that flowed into the
+// `offset >= total` exhaustion early-return, so a lazy tick emitted zero units, returned
+// status "complete", and markExhausted stamped the leaf complete-with-zero-units SILENTLY
+// (64 params wrap to exactly 0, which at least errored). Any such space is incompletable
+// regardless, so the only correct answer is a loud validation error.
+func TestGenerate_CombinationCountOverflowIsLoud(t *testing.T) {
+	proj := newTestProject()
+	space := map[string]interface{}{"_offset": float64(0)}
+	for i := 0; i < 63; i++ {
+		space[fmt.Sprintf("p%02d", i)] = []interface{}{0.0, 1.0}
+	}
+
+	result, err := Generate(context.Background(), proj, space, 100,
+		workunit.NewRepoBatchSink(&mockWorkUnitRepo{}, &mockBatchRepo{}))
+	if err == nil {
+		t.Fatalf("expected a combination-count overflow error, got result=%+v (a lazy tick would silently stamp exhausted-with-zero-units)", result)
+	}
+	if !strings.Contains(err.Error(), "overflow") {
+		t.Errorf("error = %v, want it to name the overflow", err)
 	}
 }
 

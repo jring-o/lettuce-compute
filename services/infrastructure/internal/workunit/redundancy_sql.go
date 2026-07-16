@@ -203,12 +203,45 @@ func countableLiveCopiesSQL(unitID string) string {
 		  AND ` + standingExprSQL("clc_v") + ` = 'OK')`
 }
 
-// countablePendingResultsSQL counts the unit's PENDING results that COUNT toward coverage —
-// those stamped OK at submit (standing_at_submit NULL [legacy = OK] or 'OK').
+// versionHomogeneousPendingSQL is the VERSION-HOMOGENEOUS pending count — the SQL twin of the
+// filter the transitioner applies before Decide sees a pending count (validation.FilterPending /
+// versionHomogeneousGroup: results are never compared across artifact versions, so the count
+// that feeds every quorum/coverage decision is the size of the LARGEST single-version group,
+// with NULL/legacy versions forming their own group and ties broken by the smallest version
+// key, NULL first). Every SQL consumer of "how many PENDING results does this unit hold" —
+// the dead-letter executor's quorum probe, the recovery sweep's shape-2 selector, and (via
+// countablePendingResultsSQL) the dispatch coverage — embeds this expression, NOT a raw
+// COUNT(*): a raw count over a version-heterogeneous pending set reads HIGHER than the count
+// Decide acts on, and the divergence livelocks the unit (★BG-21g: Decide WAITs on the filtered
+// count, dispatch sees raw coverage met so never sends the missing corroborator, the sweep
+// re-selects on the raw count forever, and dead-letter's raw probe refuses the very unit
+// Decide told it to fail). COLLATE "C" pins the tie-break to byte order, exactly Go's k < bestKey.
+func versionHomogeneousPendingSQL(unitID string) string {
+	return `(SELECT COALESCE((
+		SELECT COUNT(*)
+		FROM results vh_r
+		WHERE vh_r.work_unit_id = ` + unitID + ` AND vh_r.validation_status = 'PENDING'
+		GROUP BY vh_r.artifact_version_id
+		ORDER BY COUNT(*) DESC, COALESCE(vh_r.artifact_version_id::text, '') COLLATE "C" ASC
+		LIMIT 1), 0))`
+}
+
+// countablePendingResultsSQL counts the unit's PENDING results that COUNT toward coverage:
+// the rows of the unit's version-homogeneous group (the SAME largest-raw-group selection as
+// versionHomogeneousPendingSQL — chosen by RAW size, mirroring how the transitioner filters
+// by version FIRST and discounts standing WITHIN the filtered slice) that were stamped OK at
+// submit (standing_at_submit NULL [legacy = OK] or 'OK'). Version-excluded rows cover nothing:
+// they can never corroborate the group that will decide the unit, so counting them (the ★BG-21g
+// pre-fix raw count) made dispatch believe a heterogeneous unit was covered and starved it of
+// the copies Decide was waiting for.
 func countablePendingResultsSQL(unitID string) string {
-	return `(SELECT COUNT(*) FROM results cpr_r
+	return `(SELECT COALESCE((
+		SELECT COUNT(*) FILTER (WHERE cpr_r.standing_at_submit IS NULL OR cpr_r.standing_at_submit = 'OK')
+		FROM results cpr_r
 		WHERE cpr_r.work_unit_id = ` + unitID + ` AND cpr_r.validation_status = 'PENDING'
-		  AND (cpr_r.standing_at_submit IS NULL OR cpr_r.standing_at_submit = 'OK'))`
+		GROUP BY cpr_r.artifact_version_id
+		ORDER BY COUNT(*) DESC, COALESCE(cpr_r.artifact_version_id::text, '') COLLATE "C" ASC
+		LIMIT 1), 0))`
 }
 
 // countableCoverageSQL is the single coverage number every redundancy headroom comparison
@@ -218,14 +251,16 @@ func countableCoverageSQL(unitID string) string {
 }
 
 // nonCountableCoverageSQL is the COMPLEMENT of countableCoverageSQL over the same rows: the
-// unit's live copies held by a non-OK account PLUS its PENDING results stamped non-OK. The
+// unit's live copies held by a non-OK account PLUS its PENDING results that do not count —
+// non-OK stamps within the version-homogeneous group AND every version-excluded row. The
 // two volunteer-agnostic refill queries emit it per candidate (DispatchCandidate.
 // ProbationCoverage) so the in-memory dispatch cache can subtract it from its RAW
 // live+pending seed and reach the SAME countable coverage the SQL headroom uses — the
 // cache's forced-replication parity. Its live arm INNER-joins volunteers (a NULL-holder row
 // has no standing and is NOT non-OK, so it is excluded here exactly as it is INCLUDED as
-// countable above), so countableCoverageSQL(u) + nonCountableCoverageSQL(u) equals the raw
-// live+pending count for every unit.
+// countable above); its pending arm is written as raw-minus-countable so the identity
+// countableCoverageSQL(u) + nonCountableCoverageSQL(u) = raw live+pending holds BY
+// CONSTRUCTION for every unit, version-heterogeneous or not (★BG-21g).
 func nonCountableCoverageSQL(unitID string) string {
 	return `(
 		(SELECT COUNT(*)
@@ -233,8 +268,8 @@ func nonCountableCoverageSQL(unitID string) string {
 		 JOIN volunteers ncl_v ON ncl_v.id = ncl_h.volunteer_id
 		 WHERE ncl_h.work_unit_id = ` + unitID + ` AND ncl_h.outcome IS NULL
 		   AND ` + standingExprSQL("ncl_v") + ` <> 'OK')
-		+ (SELECT COUNT(*) FROM results ncp_r
-		   WHERE ncp_r.work_unit_id = ` + unitID + ` AND ncp_r.validation_status = 'PENDING'
-		     AND ncp_r.standing_at_submit IS NOT NULL AND ncp_r.standing_at_submit <> 'OK')
+		+ ((SELECT COUNT(*) FROM results ncp_r
+		    WHERE ncp_r.work_unit_id = ` + unitID + ` AND ncp_r.validation_status = 'PENDING')
+		   - ` + countablePendingResultsSQL(unitID) + `)
 	)`
 }

@@ -91,7 +91,8 @@ func setupHostIssuanceServer(t *testing.T, capPerAccount int) (*pgxpool.Pool, le
 	resultRepo := result.NewPgxRepository(pool)
 	batchRepo := workunit.NewPgxBatchRepository(pool)
 	creditRepo := credit.NewPgxRepository(pool)
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger, nil, transition.TrustPolicy{})
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, nil, volunteerRepo, assignRepo, nil, nil, nil, logger, nil, transition.TrustPolicy{}).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) // prod-shaped: atomic finalization, as main.go wires it (★BG-21e)
 	svc := server.NewVolunteerService(pool, "0.9.0-test", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, nil, validationEngine, logger, transition.TrustPolicy{})
 	server.SetHostCapPolicy(svc, server.HostCapPolicy{PerAccount: capPerAccount, ActiveWindow: 30 * 24 * time.Hour})
 

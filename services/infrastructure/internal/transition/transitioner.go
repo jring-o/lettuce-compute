@@ -326,8 +326,10 @@ func (t *Transitioner) decideAndApply(ctx context.Context, id types.ID) (Outcome
 //
 //   - COMPLETED -> QUEUED: a plain guarded flip (no requeue business logic; the PENDING rows
 //     keep holding their redundancy slots and keep counting toward coverage).
-//   - REJECTED -> QUEUED: the standard Reassign requeue, completing exactly what a pre-fix
-//     crash interrupted (this residue class is unreachable once §4.1 requeues in-tx).
+//   - REJECTED -> QUEUED: the standard Reassign requeue. Covers both the pre-fix
+//     crash-interrupted residue AND a REJECTED unit that accumulated results (grace-window
+//     submits) — adjudication is only legal from QUEUED/COMPLETED, so the results
+//     re-adjudicate after the requeue instead of conflicting in place forever (★BG-21j).
 func (t *Transitioner) reopen(ctx context.Context, id types.ID, state workunit.WorkUnitState) (Outcome, error) {
 	switch state {
 	case workunit.WorkUnitStateCompleted:

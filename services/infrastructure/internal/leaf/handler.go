@@ -496,6 +496,18 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			apierror.WriteError(w, apiErr)
 			return
 		}
+		// generation_mode is IMMUTABLE once the leaf has generated anything (★BG-22f): the
+		// eager path never advances the cursor and the lazy path owns it, so a flip in either
+		// direction re-emits already-generated ordinals as byte-identical duplicate trials —
+		// the ★BG-22d harm reached without the guarded endpoint. Refused, not reconciled:
+		// see CanChangeGenerationMode.
+		if EffectiveGenerationMode(merged.GenerationMode) != EffectiveGenerationMode(p.DataConfig.GenerationMode) {
+			if err := CanChangeGenerationMode(r.Context(), h.pool, p.ID, p.GenerationCursor); err != nil {
+				l.Info("generation_mode change rejected", "leaf_id", p.ID, "error", err)
+				apierror.WriteError(w, apierror.FromError(err))
+				return
+			}
+		}
 		p.DataConfig = merged
 	}
 	if req.CreditConfig != nil {
@@ -525,6 +537,21 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.ResourceRequirements = merged
+	}
+
+	// An is_ongoing flip changes WHICH DataConfig rules apply — a finite (non-ongoing) lazy
+	// Monte Carlo leaf must declare splitting_config.num_trials, the total its exhaustion is
+	// decided against — so the stored block must be re-validated against the new lifecycle
+	// even when the request carries no data_config (★BG-22e: without this, PATCH
+	// {"is_ongoing": false} on an ongoing lazy MC leaf with no num_trials lands the exact
+	// state the validation rule declares impossible, and the leaf generates forever). When
+	// req.DataConfig is present, its own block above already validated with the new
+	// p.IsOngoing (applied before the config merges).
+	if req.IsOngoing != nil && req.DataConfig == nil {
+		if apiErr := ValidateDataConfig(&p.DataConfig, p.TaskPattern, p.IsOngoing); apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
 	}
 
 	// Validate updated metadata.

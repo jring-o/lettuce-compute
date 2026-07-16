@@ -120,7 +120,8 @@ func setupTwoReplicas(t *testing.T) (*scaleoutEnv, func()) {
 	attestationRepo := attestation.NewPgxRepository(pool)
 	checkpointRepo := checkpoint.NewPgxRepository(pool, storageDir)
 
-	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{})
+	validationEngine := validation.NewEngine(resultRepo, wuRepo, leafRepo, creditRepo, racRepo, volunteerRepo, assignRepo, attestationRepo, nil, signer, logger, nil, transition.TrustPolicy{}).
+		WithTxRunner(validation.NewPgxFinalizationTxRunner(pool)) // prod-shaped: atomic finalization, as main.go wires it (★BG-21e)
 
 	headCfg := &config.HeadConfig{
 		Name:        "test-head",
