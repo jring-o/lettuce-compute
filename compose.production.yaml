@@ -1,7 +1,20 @@
+# Bounded log rotation for every service (BG-29). Without an explicit logging
+# key Docker's default json-file driver grows one unbounded log file per
+# container until the host disk fills; 50MB x 5 files caps each container at
+# 250MB while keeping enough history for incident forensics. Applied per
+# service via the YAML anchor below (the logging key is not inheritable any
+# other way in compose).
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
@@ -24,6 +37,7 @@ services:
   redis:
     image: docker.io/library/redis:7-alpine
     restart: unless-stopped
+    logging: *default-logging
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -43,6 +57,7 @@ services:
         VERSION: ${LETTUCE_VERSION:-dev}
     init: true
     restart: unless-stopped
+    logging: *default-logging
     # Graceful shutdown budget (BG-32/BG-32b): the head drains its servers for up
     # to 30s, then joins its background jobs for up to 10s before closing the DB
     # pool. Docker's default 10s grace SIGKILLed a healthy drain mid-flush; 45s
@@ -186,6 +201,7 @@ services:
       target: production
     init: true
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       infrastructure:
         condition: service_healthy
@@ -227,12 +243,14 @@ services:
   registry:
     image: registry:2
     restart: unless-stopped
+    logging: *default-logging
     volumes:
       - registry_data:/var/lib/registry
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - dashboard
       - infrastructure

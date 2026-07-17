@@ -6,7 +6,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	// Imported for its handler funcs only (pprof.Index etc., wired admin-gated
+	// below). Its init() registers on http.DefaultServeMux, which this server
+	// never serves, so that side effect is inert.
+	"net/http/pprof"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -237,6 +242,34 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// Detailed health (auth required — exposes uptime + DB status).
 	mux.HandleFunc("GET /api/v1/health/detailed", authOnly(HealthDetailedHandler(deps.Pool, deps.StartTime)))
 
+	// Operator observability: Prometheus scrape + pprof (BG-29; both ADMIN-only).
+	//
+	// TOPOLOGY — these routes are deliberately registered OUTSIDE /api/v1/. The
+	// shipped Caddyfile proxies ONLY /api/v1/* (plus gRPC and a few static
+	// prefixes) to the head; every other path falls through to the dashboard,
+	// and the infrastructure service publishes no host ports. So /metrics and
+	// /debug/pprof/ are unreachable from the internet in the shipped topology —
+	// only processes on the compose-internal network (e.g. a Prometheus scraper
+	// sidecar) reach them, at http://infrastructure:8080/metrics. They are STILL
+	// admin-gated (ADMIN role / admin API key) so a deploy that exposes the
+	// head's HTTP port directly does not silently expose runtime internals.
+	metricsHandler := MetricsHandler()
+	mux.HandleFunc("GET /metrics", authAdminOnly(metricsHandler.ServeHTTP))
+
+	// Runtime profiling, same non-proxied path space and the same admin gate.
+	// The subtree route serves the named profiles (heap, goroutine, allocs, …)
+	// through pprof.Index; the four fixed handlers are not name-addressable
+	// through Index and need their own routes (more-specific patterns win).
+	// The exact no-slash pattern exists so ServeMux's automatic 301 →
+	// /debug/pprof/ (which would fire BEFORE the admin gate) never answers an
+	// anonymous probe.
+	mux.HandleFunc("GET /debug/pprof", authAdminOnly(pprof.Index))
+	mux.HandleFunc("GET /debug/pprof/", authAdminOnly(pprof.Index))
+	mux.HandleFunc("GET /debug/pprof/cmdline", authAdminOnly(pprof.Cmdline))
+	mux.HandleFunc("GET /debug/pprof/profile", authAdminOnly(pprof.Profile))
+	mux.HandleFunc("GET /debug/pprof/symbol", authAdminOnly(pprof.Symbol))
+	mux.HandleFunc("GET /debug/pprof/trace", authAdminOnly(pprof.Trace))
+
 	// Leaf mutations. Create is authOnly + leafViewer: requireAuth guarantees a
 	// caller, and leafViewer injects that caller's identity so handleCreate can
 	// bind creator_id to it (★BG-11d-write / R1.5) without importing the server
@@ -463,12 +496,22 @@ func requestLoggingMiddleware(next http.Handler, logger *slog.Logger, trustedPro
 
 		next.ServeHTTP(rw, r)
 
+		elapsed := time.Since(start)
+		// BG-29: this middleware already observes method, duration, and status
+		// for every HTTP request, so the Prometheus request metrics feed here —
+		// the gRPC twin lives in loggingInterceptor. No path label, and the
+		// method is folded to the standard set: see the cardinality notes in
+		// metrics.go.
+		methodLabel := httpMethodLabel(r.Method)
+		httpRequestsTotal.WithLabelValues(methodLabel, strconv.Itoa(rw.statusCode)).Inc()
+		httpRequestDuration.WithLabelValues(methodLabel).Observe(elapsed.Seconds())
+
 		l := logging.LoggerFromContext(r.Context(), logger)
 		attrs := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.statusCode,
-			"duration_ms", time.Since(start).Milliseconds(),
+			"duration_ms", elapsed.Milliseconds(),
 		}
 		// Audit trail: log user identity on mutation requests.
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {

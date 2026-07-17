@@ -367,6 +367,58 @@ docker compose -f compose.production.yaml logs -f                 # all services
 docker compose -f compose.production.yaml logs -f infrastructure  # one service
 ```
 
+Every service's container log is rotation-bounded in `compose.production.yaml`
+(json-file driver, 50 MB × 5 files per container), so logs cannot fill the host
+disk. Adjust the `x-default-logging` anchor at the top of the compose file if
+you want more or less history.
+
+### Metrics & profiling
+
+The head exports Prometheus metrics at `GET /metrics` and Go runtime profiles
+at `GET /debug/pprof/`, both on its HTTP port (8080). Two access properties to
+understand:
+
+- **Not reachable from the internet in the shipped topology.** Caddy proxies
+  only `/api/v1/*` (and gRPC) to the head, and the infrastructure service
+  publishes no host ports — so `https://your-domain.com/metrics` hits the
+  dashboard's 404, not the head. A scraper must run inside the compose network
+  and target `http://infrastructure:8080/metrics`.
+- **Admin-authenticated regardless.** Both endpoints require the admin API key
+  (`Authorization: Bearer $LETTUCE_ADMIN_API_KEY`), so a deploy that exposes
+  port 8080 directly still does not expose runtime internals. Give your
+  Prometheus scrape job the admin key via `authorization: { credentials: ... }`.
+
+Quick manual check from the server:
+
+```bash
+docker compose -f compose.production.yaml exec caddy \
+  wget -qO- --header "Authorization: Bearer $LETTUCE_ADMIN_API_KEY" \
+  http://infrastructure:8080/metrics | head -50
+```
+
+What is exported (all families prefixed `lettuce_`, plus standard Go runtime
+and process collectors):
+
+| Family | What it tells you |
+|--------|-------------------|
+| `lettuce_grpc_requests_total{method,code}` / `lettuce_grpc_request_duration_seconds{method}` | Volunteer gRPC traffic: rate, error mix, latency per RPC. `code="ResourceExhausted"` is the shed/backpressure signal. |
+| `lettuce_http_requests_total{method,status}` / `lettuce_http_request_duration_seconds{method}` | REST/dashboard traffic rate, status mix, latency. |
+| `lettuce_dispatch_ready_pool_size` | Work-unit reservations staged in the in-memory dispatch cache. Persistently 0 under load = dispatch starvation (volunteers polling faster than the refiller can stage). |
+| `lettuce_dispatch_pending_reservation_writes` / `lettuce_dispatch_pending_spot_check_writes` | Async flush-queue depth. Sustained growth = the flusher cannot keep up with hand-out volume. |
+| `lettuce_dispatch_shed_total{site}` | Load-shed refusals by site (`request_work_ready_pool`, `submit_result_db_slot`, …). Any sustained rate means volunteers are being turned away — the head is saturated. |
+| `lettuce_db_pool_acquired_conns` / `_idle_conns` / `_max_conns` | Postgres pool pressure. `acquired` pinned at `max` = pool exhaustion. |
+
+`/debug/pprof/` (same admin gate) serves the standard Go profiles — heap,
+goroutine, allocs, plus `/debug/pprof/profile` (30s CPU) and
+`/debug/pprof/trace`. For an out-of-memory or high-CPU incident:
+
+```bash
+# From inside the compose network (e.g. the caddy container as above):
+wget -qO heap.pb.gz    --header "Authorization: Bearer $LETTUCE_ADMIN_API_KEY" http://infrastructure:8080/debug/pprof/heap
+wget -qO profile.pb.gz --header "Authorization: Bearer $LETTUCE_ADMIN_API_KEY" "http://infrastructure:8080/debug/pprof/profile?seconds=30"
+# Then copy the files off the server and open with: go tool pprof <file>
+```
+
 ### Update to the latest version
 
 ```bash
