@@ -191,7 +191,7 @@ func TestF01_FullServerLifecycle(t *testing.T) {
 
 		done := make(chan struct{})
 		go func() {
-			server.GracefulShutdown(ctx, httpServer, grpcServer, nil, 5*time.Second)
+			server.GracefulShutdown(ctx, httpServer, grpcServer, 5*time.Second)
 			close(done)
 		}()
 

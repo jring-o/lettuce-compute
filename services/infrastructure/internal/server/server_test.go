@@ -1178,7 +1178,7 @@ func TestGracefulShutdown_ContextCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		GracefulShutdown(ctx, httpServer, grpcSrv, nil, 5*time.Second)
+		GracefulShutdown(ctx, httpServer, grpcSrv, 5*time.Second)
 		close(done)
 	}()
 
