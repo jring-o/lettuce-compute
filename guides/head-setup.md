@@ -104,9 +104,25 @@ docker compose down       # stop, keep the database
 docker compose down -v    # stop and wipe all data
 ```
 
-> The `make` targets (`make up`, `make down`, `make logs`, `make reset`, `make rebuild`)
-> are shortcuts for this **development** stack. Production always uses the explicit
-> `-f compose.production.yaml` flag shown below.
+> **The `make` targets are shortcuts for this development stack.** The repo-root
+> `make dev-up`, `make dev-down`, `make dev-logs`, `make dev-rebuild`, and
+> `make dev-reset` each run `docker compose -f compose.yaml -p lettuce-dev …` under a
+> dedicated **`lettuce-dev`** Compose project name. That dedicated project name is
+> deliberate: it structurally isolates the dev stack from any production stack in the
+> same directory, so a `make` target can never touch your production containers or
+> volumes. `make dev-reset` asks for confirmation (type `dev`) before it wipes the
+> database.
+>
+> **One-time migration.** If you ran this dev stack before under the old default
+> project name (a bare `docker compose up` with no `-p`), stop those old containers and
+> volumes once with a bare `docker compose down` (add `-v` to also wipe the old data)
+> **before** your first `make dev-up`, so the old project's containers don't linger
+> alongside the new `lettuce-dev` ones. The bare `docker compose down` / `down -v`
+> commands shown just above stay correct for that old default project and for anyone
+> not using `make`.
+>
+> There are deliberately **no production `make` targets** — production always uses the
+> explicit `-f compose.production.yaml` flag shown below.
 
 > **Note.** The dev stack doesn't create a dashboard login account (it has no admin
 > email/password configured), so dashboard sign-in is a production feature. Local mode
@@ -300,8 +316,12 @@ production compose file mounts `./keys` read-only at `/keys` and loads
 The `chown`/`chmod` matter: the head's container runs as the non-root user
 **uid/gid 10001** (deliberately not 1000, so it can never accidentally match the
 first host user), and the key must be readable by that uid and nobody else.
-`10001:10001` with mode `600` is the supported layout — future releases will
-enforce the key's permissions at boot.
+`10001:10001` with mode `600` is the supported layout, and the head now **enforces
+it at boot**: it refuses to start when the key is group- or other-readable (any mode
+beyond `600`) or owned by a different uid, failing with an error that names the
+problem ("insecure permissions" or "not owned by") and prints the fix. If you hit
+that, run `sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key`
+and restart.
 
 Back this key up somewhere safe. If you lose it, new attestations will carry a different
 signer identity and every previously published attestation stops verifying.
@@ -501,27 +521,76 @@ safe — the migration runner takes an internal advisory lock, so exactly one
 replica applies them and the others wait; see
 [guides/migrations.md](migrations.md)).
 
-**Upgrading across the container-hardening release** (non-root containers,
-resource limits, Redis password) needs three one-time steps before `up -d`:
+**Upgrading across the container-hardening + secrets-hardening releases**
+(non-root containers, resource limits, a required Redis password, boot-time
+secret validation, and enforced signing-key permissions) is **one combined
+deploy** on the production head. Work through this checklist **before** you run
+`up -d`:
+
+1. **Add a Redis password to `.env`.** The compose file now requires it, and it
+   must clear the new 32-character floor for generated secrets — `openssl rand
+   -hex 32` satisfies both:
+
+   ```bash
+   echo "REDIS_PASSWORD=$(openssl rand -hex 32)" >> .env
+   ```
+
+2. **Fix the signing-key ownership and mode.** The head container runs as uid
+   10001 (non-root), and the head now **enforces the key's permissions at boot** —
+   it refuses to start if the key is group/other-readable or owned by another uid:
+
+   ```bash
+   sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key
+   ```
+
+3. **Hand the dashboard data volume to the `node` user.** The dashboard container
+   now runs as the `node` user (uid 1000); an existing `dashboard_data` volume
+   created by an older (root) image keeps root ownership, so chown it once:
+
+   ```bash
+   docker compose -f compose.production.yaml run --rm --no-deps --user root dashboard \
+     chown -R node:node /app/data
+   ```
+
+4. **Audit `.env` for placeholder and weak secrets — rotate them first.** The head
+   now **refuses to boot** on any secret that is a known placeholder or under its
+   length floor, failing with a `boot secret validation: <VARIABLE>` error that
+   names the offending variable. Blocklisted (case-insensitive) stems include
+   `change-me`, `changeme`, `generate-with`, `replace-with`, `placeholder`, and
+   `not-for-production`. The length floors are **32 characters** for the generated
+   machine secrets (`LETTUCE_ADMIN_API_KEY`, `DASHBOARD_API_KEY`, `REDIS_PASSWORD`,
+   `NEXTAUTH_SECRET`) and **12 characters** for the human passwords
+   (`LETTUCE_ADMIN_PASSWORD`, and `POSTGRES_PASSWORD` only when the database host is
+   not on a private/loopback network — the bundled topology is private, so its DB
+   password is not floored). Generate replacements with `openssl rand -base64 32`
+   (or `-hex 32` for a value that rides inside a URL, like `REDIS_PASSWORD`) and
+   update `.env` **before** upgrading. Two rotation ripples to know:
+
+   - Rotating `DASHBOARD_API_KEY` makes the head **re-mint** a dashboard key on the
+     next boot; older non-placeholder key rows are **not** auto-revoked.
+   - Rotating `LETTUCE_ADMIN_PASSWORD` does **not** change an already-created admin
+     — bootstrap is create-only. Reset an existing admin's password from the
+     dashboard instead (or, for a locked-out placeholder admin, use the SQL runbook
+     in the [troubleshooting](#troubleshooting) table below).
+
+   Two related boot-time actions also happen automatically on a production boot: the
+   head **auto-revokes** any API key whose value is a known placeholder (it logs a
+   WARN and mints a fresh `DASHBOARD_API_KEY`), and it **refuses to boot** if a
+   role-ADMIN user still carries a known placeholder password, failing with
+   `refusing to start: admin user "..." still has a known placeholder password`.
+   Rotate those before the upgrade too.
+
+After the first `up -d`, confirm the head came up clean. Both of these greps should
+print nothing:
 
 ```bash
-# 1. The compose file now requires a Redis password — add it to .env:
-echo "REDIS_PASSWORD=$(openssl rand -hex 32)" >> .env
-
-# 2. The head container now runs as uid 10001 (non-root) and must be able to
-#    read the signing key it mounts:
-sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key
-
-# 3. The dashboard container now runs as the 'node' user (uid 1000); an
-#    existing dashboard_data volume created by an older (root) image keeps
-#    root ownership, so hand it to the new user:
-docker compose -f compose.production.yaml run --rm --no-deps --user root dashboard \
-  chown -R node:node /app/data
+docker compose -f compose.production.yaml logs infrastructure | grep -iE 'permission|denied'
+docker compose -f compose.production.yaml logs infrastructure | grep -i 'boot secret validation'
 ```
 
-After the first `up -d`, confirm the head came up clean:
-`docker compose -f compose.production.yaml logs infrastructure | grep -iE 'permission|denied'`
-should print nothing, and `/api/v1/health` should answer healthy.
+The first confirms no file-permission failure (signing key or dashboard volume); the
+second confirms no secret was rejected at boot. Then check `/api/v1/health` answers
+healthy.
 
 ### Work dispatch tuning
 
@@ -981,13 +1050,67 @@ keyed on the proxy IP and the whole fleet is throttled together.
 
 ### Back up
 
+Two things need backing up, and they are not equivalent. The database can be dumped
+and restored routinely; the signing key is a single irreplaceable file.
+
 ```bash
 # Database
 docker compose -f compose.production.yaml exec postgres \
   pg_dump -U lettuce lettuce > backup.sql
-
-# Signing key — store keys/signing.key somewhere safe and private
 ```
+
+#### Signing key — backup & restore
+
+`keys/signing.key` is the head's Ed25519 attestation signing key. It is the **one
+file whose loss cannot be recovered from a database backup**: it defines the head's
+signer identity, and consumers verify every credit attestation against its public
+half.
+
+**Back it up.** Copy `keys/signing.key` to **offline, encrypted media or a secrets
+manager**, stored at file mode `0600`. Never commit it to the repository and never
+bake it into an image.
+
+**Record its public identity (verify step).** Before you file the backup — and again
+after any restore — print the public key and keep the output:
+
+```bash
+openssl pkey -in keys/signing.key -pubout
+```
+
+That printed public key **is** the head's signer identity. If the value after a
+restore is byte-identical to the value you recorded before the backup, the correct
+key is in place; if it differs, you have restored the wrong file.
+
+**Restore on a rebuilt host.** After provisioning a fresh server and cloning the repo:
+
+1. Place the backed-up file at `keys/signing.key`, next to `compose.production.yaml`.
+2. Fix ownership and mode (the head enforces both at boot):
+
+   ```bash
+   sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key
+   ```
+
+3. Bring the stack up:
+
+   ```bash
+   docker compose -f compose.production.yaml up -d
+   ```
+
+4. Confirm the head loaded the restored key — look for this line in the log:
+
+   ```bash
+   docker compose -f compose.production.yaml logs infrastructure | grep 'attestation signing key loaded'
+   ```
+
+5. Run the verify step above and confirm the printed public key matches what you
+   recorded before the backup.
+
+**If you lose this key, it is gone.** The head deliberately **never auto-regenerates
+the signing key in production** — it fails to boot on a missing key rather than
+quietly minting a new one. Recreating the key produces a **new signer identity**:
+every attestation signed before the loss stops verifying against the new key, and
+there is no way to reconstruct the old one. That is exactly why this file is backed up
+separately from the database.
 
 ### TLS renewal
 
@@ -1005,5 +1128,9 @@ Automatic. Caddy renews certificates before they expire; no action needed.
 | `health` returns `"database":"disconnected"` | Postgres still starting, or `POSTGRES_PASSWORD` contains `/` or `@`. Check `docker compose -f compose.production.yaml logs postgres`. |
 | Can't sign in to the dashboard | Check the bootstrap log lines from Step 10. Bootstrap only runs when no admin exists; to reset, change the password from the dashboard once signed in. |
 | `infrastructure` exits with "signing key file ... does not exist" | You skipped Step 8 or the `keys/signing.key` path is wrong. Generate the key (`openssl genpkey -algorithm ed25519 -out keys/signing.key`) so it lands next to `compose.production.yaml`, then restart. The server fails closed on a missing key by design. |
+| `infrastructure` exits with "signing key file ... insecure permissions" or "not owned by" | The key's host permissions drifted (it is group/other-readable, or owned by a uid other than 10001). The head enforces the key's ownership and mode at boot by design. Run `sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key` and restart. |
+| `infrastructure` exits with `boot secret validation: <VARIABLE>` | That `.env` entry is still a placeholder or is under its length floor. Generate a real value with the generator named in the error (`openssl rand -base64 32`, or `-hex 32` for a URL-embedded secret), update `.env`, and `up -d` again. Note: changing `DASHBOARD_API_KEY` re-mints the dashboard key on the next boot, and `LETTUCE_ADMIN_PASSWORD` applies only to a not-yet-created admin. |
+| `infrastructure` exits with `refusing to start: admin user ... placeholder password` | The admin row in Postgres still carries the publicly-known placeholder password from a first boot with an unedited `.env`. Rotate it without the head: generate a bcrypt hash with `docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-new-strong-password'`, then `docker compose -f compose.production.yaml exec postgres psql -U lettuce -d lettuce -c "UPDATE users SET password_hash='<the-hash>' WHERE role='ADMIN' AND email='<your-admin-email>';"`, then start the head and sign in with the new password. |
+| `dashboard` container exits immediately with `boot secret validation: NEXTAUTH_SECRET` | Under `NODE_ENV=production` the dashboard refuses to start when `NEXTAUTH_SECRET` is missing, a placeholder, or shorter than 32 characters. Generate one with `openssl rand -base64 32`, put it in `.env`, and `up -d dashboard`. |
 | Browser console: `No 'Access-Control-Allow-Origin' header` on API calls | `LETTUCE_CORS_ORIGINS` is empty. By design it now fails closed — set it to your `PLATFORM_URL` (already pre-filled in `.env.example`) and restart `infrastructure`. In the bundled deploy the dashboard and `/api/v1/*` share the same origin, so CORS is only required if a different host (e.g. `viz.your-domain.com` or a separate admin UI) calls the API from a browser. |
 | Rate-limit responses count all requests as one client | `LETTUCE_TRUSTED_PROXIES` is unset or wrong. The bundled `compose.production.yaml` already trusts Docker/RFC1918 ranges so per-client limiting works behind Caddy — only set this in `.env` if your reverse proxy sits on a different network. |
