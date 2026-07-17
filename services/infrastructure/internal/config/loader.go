@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -23,6 +24,18 @@ func Load(path string) (*Config, error) {
 	}
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("config validation: %w", err)
+	}
+	// BG-30 boot-time secret gate: refuse to boot a production head on a committed
+	// placeholder / empty / too-short value for any secret the head reads. In a dev
+	// head (LETTUCE_SIGNING_KEY_AUTOGEN) every such violation is a warning instead.
+	// The "boot secret validation:" prefix is a pinned contract (the head-setup
+	// troubleshooting guide references it) — do not reword it.
+	warnings, err := ValidateBootSecrets(cfg, os.Getenv)
+	for _, w := range warnings {
+		slog.Warn(w)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("boot secret validation: %w", err)
 	}
 	return cfg, nil
 }

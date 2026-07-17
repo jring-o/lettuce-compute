@@ -10,6 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// TestMain sets a valid, non-placeholder LETTUCE_ADMIN_API_KEY for the whole
+// config test binary. The BG-30 boot secret gate (config.Load -> ValidateBootSecrets)
+// makes an EMPTY admin key fatal in every posture, and clearLettuceEnv deliberately
+// does NOT clear this variable, so every existing Load()-based test keeps passing
+// without carrying its own admin-key fixture. It sets NOTHING else — the signing
+// posture stays whatever the environment provides (production unless a test or the
+// CI job sets LETTUCE_SIGNING_KEY_AUTOGEN), so posture-dependent tests set it
+// explicitly (see secrets_test.go).
+func TestMain(m *testing.M) {
+	os.Setenv("LETTUCE_ADMIN_API_KEY", strings.Repeat("A", 44))
+	os.Exit(m.Run())
+}
+
 // parseIP parses s into a net.IP, failing the test on error.
 func parseIP(t *testing.T, s string) net.IP {
 	t.Helper()
@@ -83,6 +96,10 @@ func clearLettuceEnv(t *testing.T) {
 
 func TestLoadValidConfig(t *testing.T) {
 	clearLettuceEnv(t)
+	// This fixture uses a short DB password on a public host, which the BG-30 boot
+	// secret gate flags. It exercises config PARSING, not the secret posture, so pin
+	// the dev posture explicitly (the gate then warns instead of failing).
+	t.Setenv("LETTUCE_SIGNING_KEY_AUTOGEN", "true")
 	path := writeTestConfig(t, `
 server:
   http_addr: ":3000"
