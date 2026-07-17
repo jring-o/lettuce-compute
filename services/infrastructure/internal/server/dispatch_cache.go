@@ -530,6 +530,13 @@ type dispatchCache struct {
 	// blocks hand-outs.
 	heldMu      sync.Mutex
 	heldReports map[types.ID]heldReport
+
+	// flusherDone is closed by runFlusher after its final best-effort flush on
+	// shutdown. Drained() exposes it so the shutdown tail can wait for the final
+	// flush to finish BEFORE closing the pool (BG-32) — closing first would fail
+	// the flush and drop freshly handed-out reservations back to the lease-expiry
+	// recovery path.
+	flusherDone chan struct{}
 }
 
 // heldReport is a MACHINE's most recently reported client-buffer contents (the work units
@@ -594,6 +601,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		leafRefillSignal:     make(chan struct{}, 1),
 		pendingLeafRefills:   make(map[types.ID]struct{}),
 		heldReports:          make(map[types.ID]heldReport),
+		flusherDone:          make(chan struct{}),
 	}
 }
 
@@ -2229,9 +2237,25 @@ func (c *dispatchCache) readyContainsLocked(id types.ID) bool {
 
 // --- flusher -----------------------------------------------------------------
 
+// shutdownFlushTimeout bounds the flusher's final best-effort flush. The
+// shutdown tail waits on Drained() before closing the pool, so an unreachable
+// database must not be able to hold that join (and thus pool.Close) hostage
+// beyond the shutdown budget.
+const shutdownFlushTimeout = 5 * time.Second
+
+// Drained is closed once the flusher has completed its final best-effort flush
+// after context cancellation. The shutdown tail waits on it before pool.Close()
+// so the final flush runs against a live pool (BG-32). If the flusher dies
+// without reaching its shutdown path the channel never closes — callers must
+// bound their wait.
+func (c *dispatchCache) Drained() <-chan struct{} {
+	return c.flusherDone
+}
+
 // runFlusher is the background goroutine that drains pendingWrites to Postgres in
 // batched multi-row UPDATEs. It flushes every flushInterval or whenever the queue
-// reaches flushBatchSize. Returns when ctx is done (with a final best-effort flush).
+// reaches flushBatchSize. Returns when ctx is done (with a final best-effort flush,
+// signalled via Drained).
 func (c *dispatchCache) runFlusher(ctx context.Context) {
 	c.logger.Info("dispatch cache flusher starting",
 		"flush_interval", c.cfg.flushInterval, "flush_batch_size", c.cfg.flushBatchSize)
@@ -2242,8 +2266,13 @@ func (c *dispatchCache) runFlusher(ctx context.Context) {
 		case <-ctx.Done():
 			c.logger.Info("dispatch cache flusher stopping")
 			// Best-effort final flush so freshly handed-out reservations are durable.
-			c.flushOnce(context.Background())
-			c.flushSpotChecksOnce(context.Background())
+			// Bounded (not context.Background) so a dead database cannot stall the
+			// shutdown join that waits on Drained().
+			flushCtx, cancel := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+			c.flushOnce(flushCtx)
+			c.flushSpotChecksOnce(flushCtx)
+			cancel()
+			close(c.flusherDone)
 			return
 		case <-ticker.C:
 			c.flushOnce(ctx)

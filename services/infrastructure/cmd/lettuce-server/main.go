@@ -494,8 +494,10 @@ func main() {
 	// (claim-on-refill), so this MUST run everywhere — gating it would starve a
 	// non-leader replica of work. After this, RequestWorkUnit serves reservations
 	// from the cache with zero DB I/O on the hot path and sheds with
-	// ResourceExhausted under overload.
-	server.StartDispatchCache(volunteerSvc, monitorCtx)
+	// ResourceExhausted under overload. The returned channel signals the cache's
+	// final shutdown flush; the shutdown tail joins on it before pool.Close()
+	// (BG-32).
+	cacheDrained := server.StartDispatchCache(volunteerSvc, monitorCtx)
 
 	// SINGLETON (leader-only): jobs that double-act or pollute derived data if run
 	// on every replica. A Postgres advisory lock elects exactly one leader; the
@@ -726,7 +728,16 @@ func main() {
 		"head_instance_id", instanceID.String(),
 	)
 
-	// Wait for graceful shutdown.
-	server.GracefulShutdown(ctx, httpServer, grpcServer, pool, 30*time.Second)
-	monitorCancel()
+	// Wait for graceful shutdown: drain the servers, then stop the background
+	// jobs and close the pool IN THAT ORDER (BG-32/BG-32b) — the leadership
+	// manager's dedicated advisory-lock connection and the dispatch cache's
+	// final reservation flush both need the pool alive until the bounded join
+	// completes; see StopBackgroundAndClosePool. compose.production.yaml's
+	// stop_grace_period must comfortably exceed the 30s server drain plus this
+	// 10s join so Docker never SIGKILLs a healthy drain.
+	server.GracefulShutdown(ctx, httpServer, grpcServer, 30*time.Second)
+	server.StopBackgroundAndClosePool(monitorCancel, map[string]<-chan struct{}{
+		"dispatch-cache-flusher": cacheDrained,
+		"leadership-manager":     leadershipMgr.Done(),
+	}, 10*time.Second, pool)
 }

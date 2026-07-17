@@ -43,6 +43,11 @@ services:
         VERSION: ${LETTUCE_VERSION:-dev}
     init: true
     restart: unless-stopped
+    # Graceful shutdown budget (BG-32/BG-32b): the head drains its servers for up
+    # to 30s, then joins its background jobs for up to 10s before closing the DB
+    # pool. Docker's default 10s grace SIGKILLed a healthy drain mid-flush; 45s
+    # comfortably covers the 30s + 10s budget.
+    stop_grace_period: 45s
     # Horizontal scale-out: the head is stateless behind Caddy, so the replica
     # count is one number. Set HEAD_REPLICAS in .env (default 1). Each replica
     # auto-generates a distinct LETTUCE_HEAD_INSTANCE_ID at boot (do NOT pin one

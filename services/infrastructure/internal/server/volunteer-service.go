@@ -431,10 +431,17 @@ func isConflictErr(err error) bool {
 // claims units on this head's instance id (claim-on-refill), so two replicas never
 // double-hand the same QUEUED unit. With no instance id configured the refill is
 // claim-free, which is correct for a single replica.
-func StartDispatchCache(svc lettucev1.VolunteerServiceServer, ctx context.Context) {
+//
+// The returned channel is closed once the cache's flusher has completed its final
+// best-effort flush after ctx is cancelled; the shutdown tail waits on it before
+// closing the pool (BG-32). For a non-concrete svc it is already closed.
+func StartDispatchCache(svc lettucev1.VolunteerServiceServer, ctx context.Context) <-chan struct{} {
 	if vs, ok := svc.(*volunteerService); ok {
-		vs.StartDispatchCache(ctx)
+		return vs.StartDispatchCache(ctx)
 	}
+	done := make(chan struct{})
+	close(done)
+	return done
 }
 
 func defaultInt(v, def int) int {
@@ -463,7 +470,10 @@ func defaultFloat(v, def float64) float64 {
 // claims expire after the claim lease and become re-claimable. main.go calls it
 // once per process at startup. With no instance id configured the refill is
 // claim-free — the correct single-replica behaviour.
-func (s *volunteerService) StartDispatchCache(ctx context.Context) {
+//
+// The returned channel is the cache's Drained() signal: closed once the flusher
+// has run its final best-effort flush after ctx cancellation.
+func (s *volunteerService) StartDispatchCache(ctx context.Context) <-chan struct{} {
 	admissionCap := s.dispatchCfg.DispatchAdmissionCap
 	if admissionCap <= 0 {
 		// Derive max(1, MaxConns/2) from the pool so the cache's DB ops cannot
@@ -559,6 +569,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) {
 		"scale_out", cfg.scaleOutEnabled(),
 		"head_instance_id", cfg.headID,
 		"claim_lease_seconds", claimLeaseSeconds)
+	return cache.Drained()
 }
 
 func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {

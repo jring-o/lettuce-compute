@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -47,6 +48,13 @@ type LeadershipManager struct {
 	logger       *slog.Logger
 	lockKey      int64
 	pollInterval time.Duration
+
+	// runDone is closed once Run has returned for good (its context cancelled),
+	// meaning the dedicated advisory-lock connection has been released back to
+	// the pool. The shutdown tail waits on Done() before pool.Close() — closing
+	// first deadlocks on that held connection (BG-32b).
+	runDone  chan struct{}
+	doneOnce sync.Once
 }
 
 // NewLeadershipManager builds a LeadershipManager bound to the shared pool.
@@ -56,7 +64,15 @@ func NewLeadershipManager(pool *pgxpool.Pool, logger *slog.Logger) *LeadershipMa
 		logger:       logger,
 		lockKey:      advisoryLockKey(singletonJobsLockName),
 		pollInterval: defaultLeadershipPollInterval,
+		runDone:      make(chan struct{}),
 	}
+}
+
+// Done is closed once Run has returned with its context cancelled — i.e. the
+// manager no longer holds a dedicated pool connection. If Run never reaches
+// that state the channel never closes, so callers must bound their wait.
+func (m *LeadershipManager) Done() <-chan struct{} {
+	return m.runDone
 }
 
 // Run blocks until ctx is cancelled, repeatedly attempting to become the
@@ -70,6 +86,15 @@ func NewLeadershipManager(pool *pgxpool.Pool, logger *slog.Logger) *LeadershipMa
 // handed and return promptly (it must NOT block). Those goroutines must observe
 // the context's cancellation to stop when leadership is lost.
 func (m *LeadershipManager) Run(ctx context.Context, instanceID string, runLeaderJobs func(leaderCtx context.Context)) {
+	defer func() {
+		// Signal shutdown-join completion only when Run is done for good (ctx
+		// cancelled). A panic mid-run unwinds through here too, but its restart
+		// (safego) may hold a fresh lock connection — the ctx guard keeps Done()
+		// honest in that case.
+		if ctx.Err() != nil {
+			m.doneOnce.Do(func() { close(m.runDone) })
+		}
+	}()
 	m.logger.Info("leadership manager starting", "instance_id", instanceID, "poll_interval", m.pollInterval)
 
 	for {
