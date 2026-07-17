@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
-	"strings"
+	"strconv"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -13,29 +13,30 @@ import (
 	"github.com/lettuce-compute/infrastructure/migrations"
 )
 
-// Session timeouts for the MIGRATION connection only (never the serving pool).
+// Execution bound for the MIGRATION connection only (never the serving pool).
 // Boot-time DDL such as ALTER TABLE takes ACCESS EXCLUSIVE: on a busy table it
 // queues behind long-running queries and blocks every query behind it for as
-// long as it waits, and a wedged migration also holds golang-migrate's advisory
-// lock, stalling the other replicas' boots. With these limits a contended or
-// runaway migration fails fast (boot exits with an actionable error and the
-// operator retries off-peak) instead of freezing traffic. Migrations that
-// legitimately need more than migrationStatementTimeout are maintenance-window
-// migrations — see guides/migrations.md.
-const (
-	// migrationLockTimeout aborts a migration statement that waits longer than
-	// this to acquire a database lock (applied server-side via lock_timeout).
-	migrationLockTimeout = "5s"
-	// migrationStatementTimeoutMs bounds each migration statement's execution
-	// (golang-migrate's x-statement-timeout, in milliseconds).
-	migrationStatementTimeoutMs = 60000
-)
+// long as it waits. golang-migrate's x-statement-timeout bounds each migration
+// FILE's execution client-side (a context timeout around the file's single
+// Exec), so a migration wedged in a lock queue — or simply runaway — aborts
+// within the bound and boot exits with an actionable error instead of freezing
+// traffic indefinitely.
+//
+// Deliberately NOT a server-side lock_timeout: that GUC would also govern
+// golang-migrate's own pg_advisory_lock serialization call, which the
+// non-winning replicas of a multi-replica boot BLOCK on by design while the
+// winner applies migrations — a lock_timeout there crash-loops healthy
+// replicas whenever a migration outlives it. The waiters' wait is already
+// transitively bounded by the winner's per-file bound. Migrations that
+// legitimately need longer than this are maintenance-window migrations — see
+// guides/migrations.md.
+const migrationStatementTimeoutMs = 60000
 
-// migrationSessionURL returns databaseURL with the migration-session timeouts
-// applied: golang-migrate's x-statement-timeout (stripped from the URL before
-// it reaches the database driver) and a lock_timeout passed through the
-// standard PostgreSQL `options` startup parameter. Existing query parameters,
-// including a pre-set `options`, are preserved.
+// migrationSessionURL returns databaseURL with golang-migrate's
+// x-statement-timeout applied (the x- parameter is consumed by golang-migrate
+// and stripped from the URL before it reaches the database driver). Existing
+// query parameters are preserved, and a caller-supplied x-statement-timeout
+// wins over the default.
 func migrationSessionURL(databaseURL string) (string, error) {
 	u, err := url.Parse(databaseURL)
 	if err != nil {
@@ -43,13 +44,7 @@ func migrationSessionURL(databaseURL string) (string, error) {
 	}
 	q := u.Query()
 	if q.Get("x-statement-timeout") == "" {
-		q.Set("x-statement-timeout", fmt.Sprintf("%d", migrationStatementTimeoutMs))
-	}
-	lockOpt := "-c lock_timeout=" + migrationLockTimeout
-	if opts := q.Get("options"); opts == "" {
-		q.Set("options", lockOpt)
-	} else if !strings.Contains(opts, "lock_timeout") {
-		q.Set("options", opts+" "+lockOpt)
+		q.Set("x-statement-timeout", strconv.Itoa(migrationStatementTimeoutMs))
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
@@ -71,7 +66,7 @@ Full runbook: guides/migrations.md ("Recovering from a dirty schema")`,
 
 // RunMigrations applies all pending migrations to the database.
 // Uses golang-migrate with embedded SQL files from the migrations/ directory.
-// The migration session runs with fail-fast lock/statement timeouts (see
+// The migration session runs with a fail-fast per-file execution bound (see
 // migrationSessionURL); the serving pool is unaffected.
 func RunMigrations(databaseURL string) error {
 	source, err := iofs.New(migrations.FS, ".")

@@ -17,17 +17,19 @@ the head with `restart: unless-stopped`, the container then restart-loops; every
 error naming the dirty version and pointing here. The head deliberately refuses to run on an
 indeterminate schema — the loop is the alarm, not the problem.
 
-The migration session runs with fail-fast timeouts (serving traffic is unaffected — these apply to
-the migration connection only):
+The migration session runs with a fail-fast execution bound (serving traffic is unaffected — it
+applies to the migration connection only): **each migration file's execution is bounded at 60
+seconds** (golang-migrate's `x-statement-timeout`). Boot-time DDL such as `ALTER TABLE` needs an
+`ACCESS EXCLUSIVE` lock; on a busy table it would otherwise queue behind long-running queries
+*and block every query behind it* for as long as it waits. With the bound, a migration wedged in
+that lock queue — or simply runaway — aborts within 60 seconds (marking the schema dirty) instead
+of freezing traffic indefinitely; retry it off-peak. A migration that legitimately needs longer is
+a *maintenance-window migration* (see the policy below) and should be run with traffic stopped.
 
-- **`lock_timeout=5s`** — boot-time DDL such as `ALTER TABLE` needs an `ACCESS EXCLUSIVE` lock. On
-  a busy table it would otherwise queue behind long-running queries *and block every query behind
-  it* for as long as it waits. With the timeout, a contended migration aborts quickly (marking the
-  schema dirty) instead of freezing traffic; retry it off-peak.
-- **`statement_timeout` of 60s** (via golang-migrate's `x-statement-timeout`) — bounds each
-  migration's execution so a runaway statement cannot wedge boot indefinitely. A migration that
-  legitimately needs longer is a *maintenance-window migration* (see the policy below) and should
-  be run with traffic stopped.
+The bound is deliberately **not** a server-side `lock_timeout`: a session-level `lock_timeout`
+would also govern golang-migrate's own advisory serialization lock, which the non-winning replicas
+of a multi-replica boot block on — healthily, by design — while the winner applies migrations.
+That wait needs no timeout of its own: it is already bounded by the winner's per-file bound.
 
 ## Recovering from a dirty schema
 
@@ -68,8 +70,10 @@ docker compose -f compose.production.yaml exec postgres psql -U lettuce -d lettu
 5. **Restart the head** (`docker compose -f compose.production.yaml up -d infrastructure`). Boot
    re-applies anything still pending — including migration N itself if you set `version = N - 1`.
 
-If the failure was a lock timeout (step 2 shows *nothing* applied), no repair is needed: clear the
-flag with `version = N - 1` and restart when the table is quiet.
+If the failure was the execution bound firing while the migration waited on a table lock, step 2
+will usually show *nothing* applied (each file runs as one implicit transaction, rolled back on
+abort — unless the file itself contains explicit `COMMIT`s): no repair is needed, clear the flag
+with `version = N - 1` and restart when the table is quiet.
 
 ## Policy for writing new migrations
 
