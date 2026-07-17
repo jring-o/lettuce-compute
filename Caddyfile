@@ -64,13 +64,16 @@ your-domain.com {
 	# client IP in X-Forwarded-For; set LETTUCE_TRUSTED_PROXIES (already wired in
 	# compose.production.yaml) so the head buckets per real client, not per proxy.
 	handle /api/v1/* {
-		# Per-request body ceiling: the head itself hard-caps authenticated REST
-		# bodies at 10MB (ed25519 auth reads the body to verify the signature),
-		# so 64MB is comfortably above every legitimate REST request while
-		# stopping unbounded uploads at the proxy. The registry (/v2/*) and
-		# dashboard handles are deliberately uncapped here: image pushes are
-		# multi-GB (and write-gated by basicauth), and the dashboard enforces
-		# its own framework body limits.
+		# Per-request body ceiling. Volunteer-facing (Ed25519-signed) REST
+		# bodies are hard-capped at 10MB by the head itself; the API-key owner
+		# routes have no head-side cap, and the largest of them — bulk
+		# work-unit upload — already tells callers to split oversized batches
+		# into multiple requests, so 64MB is an operational ceiling a
+		# legitimate caller can always chunk under (an oversized upload gets a
+		# 413 from the proxy). The registry (/v2/*) and dashboard handles are
+		# deliberately uncapped here: image pushes are multi-GB (and
+		# write-gated by basicauth), and the dashboard enforces its own
+		# framework body limits.
 		request_body {
 			max_size 64MB
 		}

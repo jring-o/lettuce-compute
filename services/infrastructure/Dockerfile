@@ -12,10 +12,12 @@ FROM golang:1.25-alpine@sha256:56961d79ea8129efddcc0b8643fd8a5416b4e6228cfd477e3
 ARG VERSION=dev
 
 RUN apk add --no-cache make git protobuf
-# Codegen tools are pinned to the exact versions that produced the committed
+# Codegen plugins are pinned to the exact versions that produced the committed
 # generated code (see the headers of proto/lettuce/v1/*.pb.go). The build
 # regenerates that code, so a floating @latest here could silently diverge the
-# built server from the reviewed, committed sources.
+# built server from the reviewed, committed sources. (protoc itself comes from
+# the alpine 3.19 package repo above — bounded by the pinned base image's
+# release branch, not to an exact version.)
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 && \
     go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 

@@ -418,11 +418,14 @@ available memory, and the kernel's global OOM killer remains the backstop.
 
 The bundled deploy runs Postgres on the compose file's private network with
 `sslmode=disable`, which is fine — the traffic never leaves the Docker bridge.
-If you point the head at an **external** Postgres (`LETTUCE_DB_HOST` outside
-the compose network), you **must** set:
+If you point the head at an **external** Postgres, note that the database
+connection settings (`LETTUCE_DB_HOST`, `LETTUCE_DB_SSL_MODE`, credentials)
+are set as literals in `compose.production.yaml` — they are wired to the
+bundled `postgres` service, not to `.env`. Edit the `infrastructure` service's
+environment in the compose file, and set:
 
-```bash
-LETTUCE_DB_SSL_MODE=verify-full
+```yaml
+LETTUCE_DB_SSL_MODE: verify-full
 ```
 
 The permissive modes (`disable`, `allow`, `prefer`) permit a silent plaintext
@@ -430,6 +433,12 @@ downgrade: an on-path attacker can strip TLS and read or modify database
 traffic, including credentials. The head WARNs at boot when it detects a
 permissive mode against a host that is not on a loopback/private network —
 treat that warning as a misconfiguration, not noise.
+
+One related proxy note: requests to `/api/v1/*` through the bundled Caddy carry
+a **64MB request-body ceiling**. The only endpoint that can legitimately
+approach it is bulk work-unit upload with large inline `input_data` — split
+such batches into multiple requests (the endpoint itself enforces splitting
+past 10,000 units; an oversized body gets an HTTP 413 from the proxy).
 
 ### Metrics & profiling
 
@@ -506,7 +515,7 @@ sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key
 # 3. The dashboard container now runs as the 'node' user (uid 1000); an
 #    existing dashboard_data volume created by an older (root) image keeps
 #    root ownership, so hand it to the new user:
-docker compose -f compose.production.yaml run --rm --user root dashboard \
+docker compose -f compose.production.yaml run --rm --no-deps --user root dashboard \
   chown -R node:node /app/data
 ```
 
