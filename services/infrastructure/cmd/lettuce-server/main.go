@@ -113,6 +113,14 @@ func main() {
 		slog.Info("TLS disabled (no certificate configured)")
 	}
 
+	// Transport hygiene (BG-34): a downgrade-able sslmode against a database that
+	// is NOT on a private network is a silent-plaintext hazard. WARN rather than
+	// fail — the bundled compose topology legitimately runs sslmode=disable
+	// against Postgres on the private bridge network, and that stays silent.
+	if warn := cfg.Database.InsecureSSLModeWarning(); warn != "" {
+		slog.Warn(warn)
+	}
+
 	// Connect to database.
 	ctx := context.Background()
 	pool, err := database.ConnectWithRetry(ctx, cfg.Database, 5, 1*time.Second)
@@ -317,7 +325,14 @@ func main() {
 		slog.Info("shared replay + rate-limit store enabled (multi-replica)",
 			"fail_mode", cfg.Head.EffectiveReplayFailMode())
 	} else {
-		slog.Info("no redis configured; using in-process replay cache + rate-limit buckets (single-replica)")
+		// WARN, not Info (BG-34): a replica cannot see HEAD_REPLICAS, so this is
+		// the only signal that a multi-replica fleet has silently lost its
+		// cross-replica replay dedup and rate-limit sharing.
+		slog.Warn("no redis configured; using in-process replay cache + rate-limit buckets — " +
+			"UNSAFE if HEAD_REPLICAS > 1: each replica keeps private replay/rate-limit state, so a " +
+			"replayed signature passes the other replicas and each client gets N× its rate budget. " +
+			"Set LETTUCE_REDIS_URL for multi-replica deploys, and set LETTUCE_HEAD_REQUIRE_SHARED_STORE=1 " +
+			"to make a missing store fatal at boot instead of this warning.")
 	}
 
 	// Optional ATProto DID identity binding. The atproto client — and therefore both

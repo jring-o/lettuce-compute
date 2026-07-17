@@ -37,7 +37,9 @@ jobs:
       LETTUCE_SIGNING_KEY_AUTOGEN: "true"
     services:
       postgres:
-        image: postgres:16
+        # Pinned by digest (BG-31) like every image in this repo — a re-pointed
+        # mutable tag must never silently change what CI tests against.
+        image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
         env:
           POSTGRES_USER: lettuce
           POSTGRES_PASSWORD: lettuce
@@ -50,17 +52,22 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      # Actions are pinned by commit SHA (BG-31): a mutable tag (@vN) can be
+      # re-pointed by a compromised action repo, and whatever it then runs
+      # executes with this workflow's permissions. Update pins deliberately by
+      # editing the SHA (the trailing comment names the release it came from).
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: services/infrastructure/go.mod
           cache-dependency-path: services/infrastructure/go.sum
       - run: go vet ./...
       # Apply the schema before the DB-backed tests run. There is no --migrate-only server
       # flag (migrations only run inside cmd/lettuce-server boot), so use the golang-migrate
-      # CLI directly against the migrations directory.
+      # CLI directly against the migrations directory. Pinned to the module version in
+      # services/infrastructure/go.mod so CI migrates with the same engine the head embeds.
       - name: Apply migrations
-        run: go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest -source "file://migrations" -database "$LETTUCE_TEST_DB_URL" up
+        run: go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 -source "file://migrations" -database "$LETTUCE_TEST_DB_URL" up
       # Run unit AND integration (-tags integration) tests. The integration suite is
       # DB-gated and was previously invisible in CI (no Postgres). -p 1 serializes PACKAGE
       # execution: every DB-backed package shares the one Postgres and setupTestDB does a
@@ -87,8 +94,8 @@ jobs:
     env:
       GOWORK: "off"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: services/volunteer-cli/go.mod
           cache-dependency-path: services/volunteer-cli/go.sum
@@ -110,8 +117,8 @@ jobs:
       run:
         working-directory: services/dashboard
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 20
           cache: npm
@@ -120,3 +127,51 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Deploy-artifact validation (BG-31): before this job, a broken Dockerfile,
+  # compose file, or Caddyfile was first discovered at deploy time, on the
+  # production host. It builds BOTH runtime images exactly as the production
+  # compose does, asserts they dropped root, and validates the production
+  # compose file (with a stub .env) and the Caddyfile with the same pinned
+  # Caddy image the deploy runs.
+  deploy-validate:
+    name: Deploy artifacts (images, compose, Caddyfile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Build infrastructure image
+        run: docker build -t lettuce-infrastructure:ci services/infrastructure
+      - name: Build dashboard image (production target)
+        run: docker build -t lettuce-dashboard:ci --target production services/dashboard
+      - name: Assert non-root runtime users (BG-31)
+        run: |
+          infra_user="$(docker inspect --format '{{.Config.User}}' lettuce-infrastructure:ci)"
+          dash_user="$(docker inspect --format '{{.Config.User}}' lettuce-dashboard:ci)"
+          echo "infrastructure runs as: '${infra_user}'  dashboard runs as: '${dash_user}'"
+          [ "$infra_user" = "lettuce" ] || { echo "FAIL: infrastructure image must run as the non-root 'lettuce' user (uid 10001)"; exit 1; }
+          [ "$dash_user" = "node" ] || { echo "FAIL: dashboard image must run as the non-root 'node' user (uid 1000)"; exit 1; }
+      - name: Validate compose.production.yaml (stub .env)
+        run: |
+          cat > .env <<'EOF'
+          POSTGRES_PASSWORD=ci-stub
+          REDIS_PASSWORD=ci-stub
+          LETTUCE_ADMIN_API_KEY=ci-stub
+          DASHBOARD_API_KEY=ci-stub
+          NEXTAUTH_SECRET=ci-stub
+          LETTUCE_HEAD_NAME=ci-stub
+          PLATFORM_URL=https://ci.example.com
+          REGISTRY_PASS_HASH=ci-stub
+          EOF
+          docker compose -f compose.production.yaml config -q
+      - name: Validate Caddyfile
+        # Runs `caddy validate` in the SAME digest-pinned image the production
+        # compose deploys. The env placeholders ({$REGISTRY_USER} etc.) resolve
+        # at load time, so supply stand-ins (the hash is Caddy's documented
+        # example bcrypt output, not a real credential).
+        run: |
+          docker run --rm \
+            -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -e REGISTRY_USER=ci-stub \
+            -e 'REGISTRY_PASS_HASH=$2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG' \
+            caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

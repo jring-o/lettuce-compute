@@ -10,11 +10,27 @@ x-default-logging: &default-logging
     max-size: "50m"
     max-file: "5"
 
+# Every service also carries (BG-31):
+#   - an image PINNED BY DIGEST — a mutable tag can be re-pointed on the registry
+#     side, silently changing what a production pull deploys; update a pin
+#     deliberately by editing the digest (docker buildx imagetools inspect <tag>);
+#   - mem_limit / pids_limit resource ceilings, so one leaky or runaway service
+#     is OOM-killed and restarted alone instead of taking the whole host (and
+#     every other service) down with it. Defaults are conservative for a small
+#     (~4GB) host and operator-tunable via .env — raise them for bigger hosts;
+#   - a generous nofile ulimit (many distros default the hard limit low enough
+#     to starve a busy proxy/server of file descriptors).
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     restart: unless-stopped
     logging: *default-logging
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+    pids_limit: ${POSTGRES_PIDS_LIMIT:-256}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
@@ -33,12 +49,25 @@ services:
   # With a single replica the head ignores LETTUCE_REDIS_URL only if it is
   # empty; here it is always wired, which is harmless for one replica and means
   # scaling up is a one-number change. No host port is published — only the
-  # infrastructure replicas on this private network reach it.
+  # infrastructure replicas on this private network reach it. The password
+  # (BG-34) is defense-in-depth for exactly that private network: a compromised
+  # neighboring container (SSRF pivot, supply-chain) can no longer read or
+  # poison the replay/rate-limit store anonymously.
   redis:
-    image: docker.io/library/redis:7-alpine
+    image: docker.io/library/redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     restart: unless-stopped
     logging: *default-logging
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    mem_limit: ${REDIS_MEM_LIMIT:-256m}
+    pids_limit: ${REDIS_PIDS_LIMIT:-128}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD is required — set it in .env (generate: openssl rand -hex 32)}"]
+    environment:
+      # Lets the healthcheck's redis-cli authenticate without putting the
+      # password on its command line.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -58,6 +87,12 @@ services:
     init: true
     restart: unless-stopped
     logging: *default-logging
+    mem_limit: ${INFRA_MEM_LIMIT:-1g}
+    pids_limit: ${INFRA_PIDS_LIMIT:-512}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     # Graceful shutdown budget (BG-32/BG-32b): the head drains its servers for up
     # to 30s, then joins its background jobs for up to 10s before closing the DB
     # pool. Docker's default 10s grace SIGKILLed a healthy drain mid-flush; 45s
@@ -111,7 +146,16 @@ services:
       # HEAD_REPLICAS > 1 (without it each replica keeps a private in-process
       # replay cache and per-process rate-limit buckets, so a replayed signature
       # passes a second replica and each client gets N× its rate budget).
-      LETTUCE_REDIS_URL: redis://redis:6379
+      # NOTE: the password rides in the URL, so it must stay URL-safe — generate
+      # it with `openssl rand -hex 32` (hex never needs percent-encoding).
+      LETTUCE_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # Fail-closed switch for the shared store (BG-34): with this set to 1/true
+      # the head REFUSES to boot when no LETTUCE_REDIS_URL is configured (and a
+      # configured-but-unreachable redis is always fatal). Compose cannot derive
+      # it from HEAD_REPLICAS, so set it in .env alongside HEAD_REPLICAS > 1 —
+      # without it a replica that loses its redis config silently degrades to
+      # per-process replay/rate-limit state (replays pass N-1 replicas).
+      LETTUCE_HEAD_REQUIRE_SHARED_STORE: ${LETTUCE_HEAD_REQUIRE_SHARED_STORE:-}
       # What to do when the shared replay store errors (e.g. a redis outage):
       # "open" (default) admits the request with a loud alarm so a redis blip
       # never takes the whole fleet offline or drops completed compute on
@@ -202,6 +246,12 @@ services:
     init: true
     restart: unless-stopped
     logging: *default-logging
+    mem_limit: ${DASHBOARD_MEM_LIMIT:-768m}
+    pids_limit: ${DASHBOARD_PIDS_LIMIT:-256}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       infrastructure:
         condition: service_healthy
@@ -241,16 +291,28 @@ services:
       start_period: 15s
 
   registry:
-    image: registry:2
+    image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
     restart: unless-stopped
     logging: *default-logging
+    mem_limit: ${REGISTRY_MEM_LIMIT:-256m}
+    pids_limit: ${REGISTRY_PIDS_LIMIT:-128}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - registry_data:/var/lib/registry
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: unless-stopped
     logging: *default-logging
+    mem_limit: ${CADDY_MEM_LIMIT:-256m}
+    pids_limit: ${CADDY_PIDS_LIMIT:-256}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       - dashboard
       - infrastructure
