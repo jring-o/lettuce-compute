@@ -30,13 +30,17 @@ your-domain.com {
 				versions h2c
 			}
 			lb_policy round_robin
-			# Active health check so a booting/wedged replica is pulled from
-			# rotation instead of eating its round-robin share. The upstreams
-			# listen on 9090 (gRPC) but health is HTTP on 8080, hence the
-			# explicit port.
-			health_uri /api/v1/health
-			health_port 8080
-			health_interval 10s
+			# Health checking so a booting/wedged replica is pulled from
+			# rotation instead of eating its round-robin share. NOTE: these are
+			# PASSIVE checks (mark an upstream down after a failed attempt) plus
+			# a dial-retry budget (a connection-refused attempt fails over to
+			# another replica before the client sees an error). Caddy's ACTIVE
+			# health checks (health_uri) do not run for dynamic upstreams —
+			# configuring them here would validate and silently do nothing.
+			fail_duration 30s
+			max_fails 1
+			lb_try_duration 5s
+			lb_try_interval 250ms
 		}
 	}
 
@@ -76,11 +80,13 @@ your-domain.com {
 				port 8080
 			}
 			lb_policy round_robin
-			# Active health check (same as the gRPC block; port explicit for
-			# symmetry — these upstreams already listen on 8080).
-			health_uri /api/v1/health
-			health_port 8080
-			health_interval 10s
+			# Passive health checks + dial-retry budget, matching the gRPC
+			# block above (active health_uri checks do not run for dynamic
+			# upstreams — see the note there).
+			fail_duration 30s
+			max_fails 1
+			lb_try_duration 5s
+			lb_try_interval 250ms
 		}
 	}
 
