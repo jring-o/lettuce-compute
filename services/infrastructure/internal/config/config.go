@@ -59,6 +59,15 @@ type HeadConfig struct {
 	// it (favoring strict replay protection). Default "open". Override via
 	// LETTUCE_REPLAY_FAIL_MODE.
 	ReplayFailMode string `yaml:"replay_fail_mode"`
+	// RequireSharedStore, when true, makes a MISSING shared store fatal at boot:
+	// config validation fails when RedisURL is empty (a configured-but-unreachable
+	// Redis is already always fatal at connect). Set it alongside HEAD_REPLICAS > 1:
+	// a replica cannot see the replica count, so without this knob a fleet whose
+	// Redis config is lost silently degrades to per-process replay caches and
+	// rate-limit buckets — a replayed signature then passes every other replica and
+	// each client gets N× its rate budget. Default false (a single-replica head
+	// needs no Redis). Override via LETTUCE_HEAD_REQUIRE_SHARED_STORE.
+	RequireSharedStore bool `yaml:"require_shared_store"`
 	// ClaimLeaseSeconds is how long a per-head dispatch claim is held before it
 	// expires and the unit becomes re-claimable by any replica. The claim of an
 	// actively-held unit is renewed every flush tick, so this is a backstop for a
@@ -669,6 +678,13 @@ func (h HeadConfig) Validate() error {
 	}
 	if h.ReplayFailMode != "" && h.ReplayFailMode != replayFailModeOpen && h.ReplayFailMode != replayFailModeClosed {
 		return fmt.Errorf("head.replay_fail_mode must be %q or %q, got %q", replayFailModeOpen, replayFailModeClosed, h.ReplayFailMode)
+	}
+	// BG-34: the fail-closed shared-store switch. Enforced here (not in main) so
+	// the refusal is a config-validation error with the other boot invariants.
+	if h.RequireSharedStore && strings.TrimSpace(h.RedisURL) == "" {
+		return fmt.Errorf("head.require_shared_store is set but no shared store is configured: " +
+			"set LETTUCE_REDIS_URL (required for correct replay/rate-limit behavior when HEAD_REPLICAS > 1) " +
+			"or unset LETTUCE_HEAD_REQUIRE_SHARED_STORE")
 	}
 	if h.ClaimLeaseSeconds < 0 {
 		return fmt.Errorf("head.claim_lease_seconds must be >= 0, got %d", h.ClaimLeaseSeconds)

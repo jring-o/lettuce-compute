@@ -185,6 +185,13 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("LETTUCE_REPLAY_FAIL_MODE"); v != "" {
 		cfg.Head.ReplayFailMode = v
 	}
+	if v := os.Getenv("LETTUCE_HEAD_REQUIRE_SHARED_STORE"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_REQUIRE_SHARED_STORE must be a boolean (true/false/1/0): %w", err)
+		}
+		cfg.Head.RequireSharedStore = b
+	}
 	if v := os.Getenv("LETTUCE_HEAD_CLAIM_LEASE_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

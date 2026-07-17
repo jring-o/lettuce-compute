@@ -210,6 +210,13 @@ Generate the secret values. Run this four times — once each for `NEXTAUTH_SECR
 openssl rand -base64 32
 ```
 
+Generate the Redis password separately — it rides inside a connection URL, so it
+must be URL-safe (hex always is):
+
+```bash
+openssl rand -hex 32
+```
+
 Generate the registry push password and its hash (you'll need the plaintext to push
 images later, and the hash for `.env`):
 
@@ -223,6 +230,7 @@ Now edit `.env` (`nano .env`) and set every value:
 
 ```bash
 POSTGRES_PASSWORD=<random; avoid / and @ characters>
+REDIS_PASSWORD=<random hex — required; the stack refuses to start without it>
 PLATFORM_URL=https://your-domain.com
 NEXTAUTH_SECRET=<random>
 LETTUCE_ADMIN_API_KEY=<random — save this; you'll use it for every API call>
@@ -240,6 +248,7 @@ REGISTRY_PASS_HASH=<the hash printed by caddy hash-password>
 | Variable | What it's for |
 |----------|---------------|
 | `POSTGRES_PASSWORD` | Database password. Avoid `/` and `@` (they break the connection string). |
+| `REDIS_PASSWORD` | Password for the bundled Redis (the head's shared replay/rate-limit store). **Required** — the compose file refuses to interpolate without it. Use hex (`openssl rand -hex 32`); it is embedded in a URL, so other characters would need percent-encoding. |
 | `PLATFORM_URL` | Your full public URL, with `https://`. Used for auth callbacks and the head's advertised URL. |
 | `NEXTAUTH_SECRET` | Signs dashboard session cookies. |
 | `LETTUCE_ADMIN_API_KEY` | Bootstrap key for authenticated API calls. **Save it** — you'll need it to create leafs. |
@@ -280,11 +289,19 @@ independently verify attestations against this key's public half, see
 ```bash
 mkdir -p keys
 openssl genpkey -algorithm ed25519 -out keys/signing.key
+sudo chown 10001:10001 keys/signing.key
+chmod 600 keys/signing.key
 ```
 
 This writes a PKCS#8 PEM file, which is exactly the format the server reads. The
 production compose file mounts `./keys` read-only at `/keys` and loads
 `/keys/signing.key`.
+
+The `chown`/`chmod` matter: the head's container runs as the non-root user
+**uid/gid 10001** (deliberately not 1000, so it can never accidentally match the
+first host user), and the key must be readable by that uid and nobody else.
+`10001:10001` with mode `600` is the supported layout — future releases will
+enforce the key's permissions at boot.
 
 Back this key up somewhere safe. If you lose it, new attestations will carry a different
 signer identity and every previously published attestation stops verifying.
@@ -372,6 +389,48 @@ Every service's container log is rotation-bounded in `compose.production.yaml`
 disk. Adjust the `x-default-logging` anchor at the top of the compose file if
 you want more or less history.
 
+### Resource limits
+
+Every service in `compose.production.yaml` carries a memory ceiling
+(`mem_limit`) and a process/thread ceiling (`pids_limit`), so one leaky or
+runaway service is OOM-killed and restarted **alone** instead of exhausting the
+host and taking every other service down with it. The defaults are conservative
+for a small (~4 GB) host and tunable from `.env` without editing the compose
+file:
+
+| Service | Memory (default) | PIDs (default) | `.env` overrides |
+|---------|-----------------|----------------|------------------|
+| infrastructure | 1g | 512 | `INFRA_MEM_LIMIT` / `INFRA_PIDS_LIMIT` |
+| postgres | 1g | 256 | `POSTGRES_MEM_LIMIT` / `POSTGRES_PIDS_LIMIT` |
+| dashboard | 768m | 256 | `DASHBOARD_MEM_LIMIT` / `DASHBOARD_PIDS_LIMIT` |
+| redis | 256m | 128 | `REDIS_MEM_LIMIT` / `REDIS_PIDS_LIMIT` |
+| registry | 256m | 128 | `REGISTRY_MEM_LIMIT` / `REGISTRY_PIDS_LIMIT` |
+| caddy | 256m | 256 | `CADDY_MEM_LIMIT` / `CADDY_PIDS_LIMIT` |
+
+On a bigger host, raise the `infrastructure` and `postgres` ceilings first —
+they are the two that grow with fleet size. A service that keeps getting
+OOM-killed (visible as restarts in `docker compose ps` and `137` exit codes in
+`docker inspect`) needs its ceiling raised, not the limit removed. Note the
+ceilings are limits, not reservations — on a 1–2 GB host they simply sit above
+available memory, and the kernel's global OOM killer remains the backstop.
+
+### Database TLS (external Postgres)
+
+The bundled deploy runs Postgres on the compose file's private network with
+`sslmode=disable`, which is fine — the traffic never leaves the Docker bridge.
+If you point the head at an **external** Postgres (`LETTUCE_DB_HOST` outside
+the compose network), you **must** set:
+
+```bash
+LETTUCE_DB_SSL_MODE=verify-full
+```
+
+The permissive modes (`disable`, `allow`, `prefer`) permit a silent plaintext
+downgrade: an on-path attacker can strip TLS and read or modify database
+traffic, including credentials. The head WARNs at boot when it detects a
+permissive mode against a host that is not on a loopback/private network —
+treat that warning as a misconfiguration, not noise.
+
 ### Metrics & profiling
 
 The head exports Prometheus metrics at `GET /metrics` and Go runtime profiles
@@ -428,20 +487,32 @@ docker compose -f compose.production.yaml build dashboard
 docker compose -f compose.production.yaml up -d
 ```
 
-Migrations run automatically on startup. This release adds a migration
-(`00003_dispatch_claims`) that adds nullable `dispatch_claimed_by` /
-`dispatch_claim_expires_at` columns to `work_units` plus a partial index; it
-applies automatically and needs no data migration. These columns carry the
-per-head dispatch claim that makes [horizontal scale-out](#horizontal-scale-out)
-safe. Booting several replicas at once is safe — the migration runner takes an
-internal advisory lock, so exactly one replica applies the migration and the
-others wait.
+Migrations run automatically on startup (booting several replicas at once is
+safe — the migration runner takes an internal advisory lock, so exactly one
+replica applies them and the others wait; see
+[guides/migrations.md](migrations.md)).
 
-> **Volunteers are unaffected by this release.** Horizontal scale-out is entirely
-> head-internal — there is **no change to the volunteer⇄head protocol**. Volunteers
-> keep speaking the same protocol and simply reach a proxy in front of N replicas
-> instead of one head. You do **not** need to update volunteer binaries for this
-> release.
+**Upgrading across the container-hardening release** (non-root containers,
+resource limits, Redis password) needs three one-time steps before `up -d`:
+
+```bash
+# 1. The compose file now requires a Redis password — add it to .env:
+echo "REDIS_PASSWORD=$(openssl rand -hex 32)" >> .env
+
+# 2. The head container now runs as uid 10001 (non-root) and must be able to
+#    read the signing key it mounts:
+sudo chown 10001:10001 keys/signing.key && chmod 600 keys/signing.key
+
+# 3. The dashboard container now runs as the 'node' user (uid 1000); an
+#    existing dashboard_data volume created by an older (root) image keeps
+#    root ownership, so hand it to the new user:
+docker compose -f compose.production.yaml run --rm --user root dashboard \
+  chown -R node:node /app/data
+```
+
+After the first `up -d`, confirm the head came up clean:
+`docker compose -f compose.production.yaml logs infrastructure | grep -iE 'permission|denied'`
+should print nothing, and `/api/v1/health` should answer healthy.
 
 ### Work dispatch tuning
 
@@ -857,6 +928,25 @@ on `SubmitResult`. Set `LETTUCE_REPLAY_FAIL_MODE=closed` to flip to strict rejec
 if you run adversarial workloads. Run Redis with `restart: unless-stopped` (already
 set). A single-replica deploy that leaves `LETTUCE_REDIS_URL` empty never touches this
 path and keeps the in-process cache.
+
+**Authentication.** The bundled Redis requires the `REDIS_PASSWORD` from `.env`
+(`--requirepass`), and the head's `LETTUCE_REDIS_URL` carries it. This is
+defense-in-depth for the private compose network: a compromised neighboring
+container can no longer read or poison the replay/rate-limit store anonymously.
+
+**Fail closed when scaled out.** A replica cannot see `HEAD_REPLICAS`, so a fleet
+whose Redis configuration is lost would otherwise degrade *silently* to
+per-replica replay/rate-limit state (a replayed signature then passes the other
+replicas). Whenever you run more than one replica, also set:
+
+```bash
+LETTUCE_HEAD_REQUIRE_SHARED_STORE=1
+```
+
+in `.env` — the head then refuses to boot with no `LETTUCE_REDIS_URL` configured
+(a configured-but-unreachable Redis is always fatal at boot regardless). With a
+single replica, leave it unset; the head just logs a warning when no Redis is
+configured.
 
 #### Client IP behind the proxy
 

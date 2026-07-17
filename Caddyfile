@@ -1,5 +1,10 @@
 your-domain.com {
 	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	# Site-wide so responses Caddy serves itself (the /api/v1/* API and the
+	# /binaries/* file server, which hands executables to volunteers) refuse
+	# content-type sniffing. The dashboard sets the same value app-side; the
+	# double-set is harmless.
+	header X-Content-Type-Options nosniff
 
 	# gRPC — detect via content-type, proxy to infrastructure over h2c.
 	# Horizontal scale-out: use a dynamic A-record upstream so Caddy re-resolves
@@ -9,6 +14,13 @@ your-domain.com {
 	# scaling HEAD_REPLICAS needs no Caddyfile edit.
 	@grpc header Content-Type application/grpc*
 	handle @grpc {
+		# Per-request body ceiling: every volunteer RPC is unary, and the head's
+		# own gRPC transport cap is 128MB (grpcMaxMsgSize, sized for 100MB
+		# checkpoint/result messages plus framing), so 132MB never truncates a
+		# legitimate call while stopping unbounded streams at the proxy.
+		request_body {
+			max_size 132MB
+		}
 		reverse_proxy {
 			dynamic a {
 				name infrastructure
@@ -18,6 +30,13 @@ your-domain.com {
 				versions h2c
 			}
 			lb_policy round_robin
+			# Active health check so a booting/wedged replica is pulled from
+			# rotation instead of eating its round-robin share. The upstreams
+			# listen on 9090 (gRPC) but health is HTTP on 8080, hence the
+			# explicit port.
+			health_uri /api/v1/health
+			health_port 8080
+			health_interval 10s
 		}
 	}
 
@@ -41,12 +60,27 @@ your-domain.com {
 	# client IP in X-Forwarded-For; set LETTUCE_TRUSTED_PROXIES (already wired in
 	# compose.production.yaml) so the head buckets per real client, not per proxy.
 	handle /api/v1/* {
+		# Per-request body ceiling: the head itself hard-caps authenticated REST
+		# bodies at 10MB (ed25519 auth reads the body to verify the signature),
+		# so 64MB is comfortably above every legitimate REST request while
+		# stopping unbounded uploads at the proxy. The registry (/v2/*) and
+		# dashboard handles are deliberately uncapped here: image pushes are
+		# multi-GB (and write-gated by basicauth), and the dashboard enforces
+		# its own framework body limits.
+		request_body {
+			max_size 64MB
+		}
 		reverse_proxy {
 			dynamic a {
 				name infrastructure
 				port 8080
 			}
 			lb_policy round_robin
+			# Active health check (same as the gRPC block; port explicit for
+			# symmetry — these upstreams already listen on 8080).
+			health_uri /api/v1/health
+			health_port 8080
+			health_interval 10s
 		}
 	}
 
@@ -59,6 +93,7 @@ your-domain.com {
 viz.your-domain.com {
 	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
 	header Content-Security-Policy "frame-ancestors https://your-domain.com"
+	header X-Content-Type-Options nosniff
 	reverse_proxy dashboard:3000
 }
 
