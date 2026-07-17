@@ -26,11 +26,11 @@ proto:
 		proto/lettuce/v1/*.proto
 
 migrate-up:
-	$(GO) run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest \
+	$(GO) run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
 		-source "file://migrations" -database "$(LETTUCE_DATABASE_URL)" up
 
 migrate-down:
-	$(GO) run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest \
+	$(GO) run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1 \
 		-source "file://migrations" -database "$(LETTUCE_DATABASE_URL)" down
 
 clean:

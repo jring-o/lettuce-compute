@@ -175,3 +175,8 @@ jobs:
             -e 'REGISTRY_PASS_HASH=$2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG' \
             caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 \
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Makefile guardrails (BG-35)
+        run: |
+          bad=$(grep -n 'docker compose' Makefile | grep -vE '^[0-9]+:\s*#' | grep -v -- '-f compose.yaml -p lettuce-dev' || true)
+          if [ -n "$bad" ]; then echo "FAIL: repo-root Makefile invokes docker compose without '-f compose.yaml -p lettuce-dev' (BG-35):"; echo "$bad"; exit 1; fi
+          if grep -n '@latest' services/infrastructure/Makefile; then echo "FAIL: services/infrastructure/Makefile must pin the migrate CLI (no @latest)"; exit 1; fi
