@@ -43,6 +43,11 @@ func TestRequireSharedStoreValidate_BG34(t *testing.T) {
 }
 
 func TestRequireSharedStoreEnvOverride_BG34(t *testing.T) {
+	// The success case below configures a throwaway short Redis password, which the
+	// BG-30 boot secret gate flags. This test exercises the require_shared_store
+	// wiring, not the secret posture, so pin the dev posture explicitly (the gate
+	// then warns instead of failing).
+	t.Setenv("LETTUCE_SIGNING_KEY_AUTOGEN", "true")
 	path := writeTestConfig(t, minimalConfig)
 
 	t.Setenv("LETTUCE_HEAD_REQUIRE_SHARED_STORE", "1")

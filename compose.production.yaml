@@ -36,7 +36,7 @@ services:
     environment:
       POSTGRES_DB: lettuce
       POSTGRES_USER: lettuce
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — set it in .env (generate a strong password; avoid / and @)}"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U lettuce -d lettuce"]
       interval: 10s
@@ -132,7 +132,7 @@ services:
       LETTUCE_LOG_LEVEL: info
       LETTUCE_LOG_FORMAT: json
       LETTUCE_SIGNING_PRIVATE_KEY_PATH: /keys/signing.key
-      LETTUCE_ADMIN_API_KEY: ${LETTUCE_ADMIN_API_KEY}
+      LETTUCE_ADMIN_API_KEY: "${LETTUCE_ADMIN_API_KEY:?LETTUCE_ADMIN_API_KEY is required — set it in .env (generate with openssl rand -base64 32); the head refuses placeholder or weak values at boot}"
       LETTUCE_ADMIN_EMAIL: ${LETTUCE_ADMIN_EMAIL:-}
       LETTUCE_ADMIN_PASSWORD: ${LETTUCE_ADMIN_PASSWORD:-}
       DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-}
@@ -266,7 +266,7 @@ services:
       DASHBOARD_API_KEY: ${DASHBOARD_API_KEY}
       PLATFORM_URL: ${PLATFORM_URL}
       NEXTAUTH_URL: ${PLATFORM_URL}
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET:?NEXTAUTH_SECRET is required — set it in .env (generate with openssl rand -base64 32)}"
       AUTH_TRUST_HOST: "true"
       # VIZ_ORIGIN isolates author-controlled visualization bundles onto a
       # DISTINCT origin from the app (BG-08). It must be a separate host from
@@ -319,7 +319,7 @@ services:
       - registry
     environment:
       REGISTRY_USER: ${REGISTRY_USER:-lettuce}
-      REGISTRY_PASS_HASH: ${REGISTRY_PASS_HASH}
+      REGISTRY_PASS_HASH: "${REGISTRY_PASS_HASH:?REGISTRY_PASS_HASH is required — generate with: docker run --rm caddy:2-alpine caddy hash-password --plaintext 'your-password'}"
     ports:
       - "80:80"
       - "443:443"

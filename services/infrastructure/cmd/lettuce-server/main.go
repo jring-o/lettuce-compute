@@ -68,12 +68,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate required admin API key.
+	// LETTUCE_ADMIN_API_KEY still feeds the router's admin bearer token (below), but
+	// its validation — required, non-placeholder, long enough — now lives in the
+	// BG-30 boot secret gate inside config.Load, so there is no emptiness check here.
 	adminAPIKey := os.Getenv("LETTUCE_ADMIN_API_KEY")
-	if adminAPIKey == "" {
-		fmt.Fprintln(os.Stderr, "LETTUCE_ADMIN_API_KEY is required. Generate one with: openssl rand -base64 32")
-		os.Exit(1)
-	}
 
 	// Resolve this head replica's stable instance id ONCE (Layer 3): it is the
 	// dispatch-claim owner, the leadership log identity, and a log dimension.
@@ -139,13 +137,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Bootstrap admin user and dashboard API key (idempotent).
-	if err := bootstrap.AdminUser(ctx, pool, logger); err != nil {
+	// Bootstrap admin user and dashboard API key (idempotent). A production head
+	// (no LETTUCE_SIGNING_KEY_AUTOGEN) refuses to persist a placeholder/short
+	// credential; a dev head warns and proceeds. Same posture flag the config gate
+	// used above (BG-30).
+	production := !cfg.Signing.AutoGenerate
+	if err := bootstrap.AdminUser(ctx, pool, logger, production); err != nil {
 		slog.Error("failed to bootstrap admin user", "error", err)
 		os.Exit(1)
 	}
-	if err := bootstrap.DashboardAPIKey(ctx, pool, logger); err != nil {
+	if err := bootstrap.DashboardAPIKey(ctx, pool, logger, production); err != nil {
 		slog.Error("failed to bootstrap dashboard API key", "error", err)
+		os.Exit(1)
+	}
+	// BG-30b residue sweep: neutralize any credential that was persisted from a
+	// known placeholder before the BG-30 gate existed — revoke placeholder-hash API
+	// keys, and refuse to start if an ADMIN still has a placeholder password. No-op
+	// on a dev head.
+	if err := bootstrap.SweepPlaceholderCredentials(ctx, pool, logger, production); err != nil {
+		slog.Error("placeholder-credential sweep failed", "error", err)
 		os.Exit(1)
 	}
 

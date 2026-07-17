@@ -208,11 +208,11 @@ curl http://localhost:3000/health
 ```
 
 ```bash
-make up       # Start in background
-make logs     # View logs
-make down     # Stop (preserves database)
-make reset    # Stop and reset database
-make rebuild  # Full rebuild (no cache)
+make dev-up       # Start in background
+make dev-logs     # View logs
+make dev-down     # Stop (preserves database)
+make dev-reset    # Stop and reset database (asks for confirmation)
+make dev-rebuild  # Full rebuild (no cache)
 ```
 
 ## License

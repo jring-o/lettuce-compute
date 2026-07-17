@@ -19,9 +19,58 @@ import (
 // outright.
 var weakSSLModes = map[string]bool{"disable": true, "allow": true, "prefer": true}
 
-// sslModeLookupTimeout bounds the single boot-time DNS lookup the warning
-// check performs so a slow resolver can never stall boot.
+// sslModeLookupTimeout bounds the single boot-time DNS lookup the host
+// classification performs so a slow resolver can never stall boot.
 const sslModeLookupTimeout = 5 * time.Second
+
+// classifyDBHost is the SHARED boot-time classification of a database host as
+// confined-to-private vs public-or-unresolvable. Both transport-hygiene checks
+// consult it — the sslmode-downgrade warning (InsecureSSLModeWarning) and the
+// BG-30 weak-DB-password gate (ValidateBootSecrets) — so the two can never
+// diverge on what "on a private network" means. It returns the PUBLIC addresses
+// the host classifies/resolves to (empty when the host is fully private) and a
+// resolve error when a NAME could not be resolved at all. Address classification
+// is netguard's — the head's single source of truth for "not internet-routable"
+// (loopback, RFC1918, ULA, CGNAT, ...). "localhost" is treated as private
+// without a DNS lookup.
+func classifyDBHost(host string) (public []string, resolveErr error) {
+	// localhost is private by definition; skip DNS so the check is hermetic.
+	if host == "localhost" {
+		return nil, nil
+	}
+
+	// IP literal: classify directly, no DNS involved.
+	if ip := net.ParseIP(host); ip != nil {
+		if netguard.DisallowedIPReason(ip) != "" {
+			return nil, nil
+		}
+		return []string{ip.String()}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sslModeLookupTimeout)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, a := range addrs {
+		if netguard.DisallowedIPReason(a.IP) == "" {
+			public = append(public, a.IP.String())
+		}
+	}
+	sort.Strings(public)
+	return public, nil
+}
+
+// hostConfinedToPrivate reports whether EVERY address the database host
+// classifies/resolves to is non-internet-routable. An unresolvable NAME is
+// treated as NOT confined (privacy could not be established) — the same
+// fail-toward-flagging stance the sslmode-downgrade warning takes.
+func hostConfinedToPrivate(host string) bool {
+	public, err := classifyDBHost(host)
+	return err == nil && len(public) == 0
+}
 
 // InsecureSSLModeWarning returns a non-empty operator-facing warning when the
 // configured sslmode permits a plaintext downgrade AND the database host is
@@ -40,33 +89,15 @@ func (d DatabaseConfig) InsecureSSLModeWarning() string {
 		return ""
 	}
 
-	// IP literal: classify directly, no DNS involved.
-	if ip := net.ParseIP(d.Host); ip != nil {
-		if netguard.DisallowedIPReason(ip) != "" {
-			return ""
-		}
-		return d.sslModeWarning([]string{ip.String()})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), sslModeLookupTimeout)
-	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, d.Host)
+	public, err := classifyDBHost(d.Host)
 	if err != nil {
 		return fmt.Sprintf("database ssl_mode %q permits a plaintext downgrade and host %q could not be resolved to confirm it is on a private network (%v); "+
 			"use ssl_mode verify-full (LETTUCE_DB_SSL_MODE=verify-full) for any Postgres not on a loopback/private network — see guides/head-setup.md",
 			d.SSLMode, d.Host, err)
 	}
-
-	var public []string
-	for _, a := range addrs {
-		if netguard.DisallowedIPReason(a.IP) == "" {
-			public = append(public, a.IP.String())
-		}
-	}
 	if len(public) == 0 {
 		return ""
 	}
-	sort.Strings(public)
 	return d.sslModeWarning(public)
 }
 

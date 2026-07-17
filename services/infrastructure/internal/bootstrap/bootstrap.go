@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 
@@ -11,18 +12,35 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/lettuce-compute/infrastructure/internal/apikey"
+	"github.com/lettuce-compute/infrastructure/internal/config"
 )
 
 // AdminUser runs on startup to ensure an admin user exists.
 // If LETTUCE_ADMIN_EMAIL and LETTUCE_ADMIN_PASSWORD are set and no admin
 // user exists in the database, one is created with the given credentials.
 // Idempotent — safe to run on every startup.
-func AdminUser(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
+//
+// production is the BG-30 posture (!cfg.Signing.AutoGenerate). When true, a
+// placeholder or too-short LETTUCE_ADMIN_PASSWORD is refused (returns an error)
+// instead of being persisted as a real login — the persistence-side backstop to
+// the config-load gate. When false (a dev head) the same value only logs a
+// warning and proceeds, so a laptop head still gets its admin user.
+func AdminUser(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, production bool) error {
 	email := os.Getenv("LETTUCE_ADMIN_EMAIL")
 	password := os.Getenv("LETTUCE_ADMIN_PASSWORD")
 	if email == "" || password == "" {
 		logger.Debug("LETTUCE_ADMIN_EMAIL or LETTUCE_ADMIN_PASSWORD not set, skipping admin bootstrap")
 		return nil
+	}
+
+	// BG-30: a placeholder or too-short password must never become a real admin
+	// login. In production refuse; in dev warn and proceed (today's behavior).
+	if config.IsPlaceholderSecret(password) || len(password) < config.MinHumanPasswordLen {
+		if production {
+			return fmt.Errorf("refusing to bootstrap admin user: LETTUCE_ADMIN_PASSWORD is a placeholder or shorter than %d chars — set a strong password and restart", config.MinHumanPasswordLen)
+		}
+		logger.Warn("LETTUCE_ADMIN_PASSWORD is a placeholder or too short; creating the dev admin user anyway (a production head would refuse to boot)",
+			"min_len", config.MinHumanPasswordLen)
 	}
 
 	// Check if any admin user already exists.
@@ -69,11 +87,32 @@ func AdminUser(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) err
 // in the database. If DASHBOARD_API_KEY is set and no matching key exists,
 // one is created for the admin user.
 // Idempotent — safe to run on every startup.
-func DashboardAPIKey(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
+//
+// production is the BG-30 posture (!cfg.Signing.AutoGenerate). When true, a
+// placeholder or too-short DASHBOARD_API_KEY is refused (returns an error) — this
+// REPLACES the former silent skip on the exact "placeholder" value. When false (a
+// dev head) the shipped "placeholder" is still skipped (today's behavior), any
+// other weak value logs a warning and proceeds.
+func DashboardAPIKey(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger, production bool) error {
 	dashKey := os.Getenv("DASHBOARD_API_KEY")
-	if dashKey == "" || dashKey == "placeholder" {
-		logger.Debug("DASHBOARD_API_KEY not set or placeholder, skipping dashboard key bootstrap")
+	if dashKey == "" {
+		logger.Debug("DASHBOARD_API_KEY not set, skipping dashboard key bootstrap")
 		return nil
+	}
+
+	// BG-30: a placeholder or too-short key must never be persisted as a real
+	// dashboard credential. In production refuse; in dev preserve the historical
+	// skip on the exact "placeholder" value and warn-then-proceed on anything else.
+	if config.IsPlaceholderSecret(dashKey) || len(dashKey) < config.MinMachineSecretLen {
+		if production {
+			return fmt.Errorf("refusing to bootstrap dashboard API key: DASHBOARD_API_KEY is a placeholder or shorter than %d chars — mint a real key (openssl rand -base64 32) and restart", config.MinMachineSecretLen)
+		}
+		if dashKey == "placeholder" {
+			logger.Debug("DASHBOARD_API_KEY is the dev placeholder, skipping dashboard key bootstrap")
+			return nil
+		}
+		logger.Warn("DASHBOARD_API_KEY is a placeholder or too short; provisioning the dev dashboard key anyway (a production head would refuse to boot)",
+			"min_len", config.MinMachineSecretLen)
 	}
 
 	// Check if a key with this hash already exists.
