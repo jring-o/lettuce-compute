@@ -11,6 +11,13 @@ import (
 	"os"
 )
 
+// processEUID reports the effective user ID of the head process. It is a
+// package-level seam (matching the daemon's stopProcessFunc pattern) so the
+// owner-mismatch branch of the Unix permission check is unit-testable without
+// chown privileges. os.Geteuid is defined on every platform — it returns -1 on
+// Windows, where checkKeyFilePermissions is a no-op and never calls it.
+var processEUID = os.Geteuid
+
 // LoadSigningKey reads an Ed25519 private key from a file.
 // The file can be PEM-encoded (PRIVATE KEY) or raw 64-byte seed+key.
 //
@@ -20,10 +27,27 @@ import (
 // explaining how to generate one — silently minting a fresh signing identity
 // would invalidate every previously published attestation.
 //
+// Before reading the file, LoadSigningKey enforces its permissions. On Unix the
+// key must be a regular file, mode 0600 or tighter (never group- or
+// world-readable), and owned by the uid the head process runs as; any violation
+// fails closed with host-side remediation, because in the bundled production
+// deploy the key is mounted read-only and the head runs as a non-root uid, so it
+// can never repair the permissions itself. Enforcement is a no-op on Windows,
+// which has no POSIX mode bits (the production head runs in a Linux container).
+//
 // Auto-generation is a development-only convenience and must be explicitly
 // opted into by passing autogen=true. When enabled and the file is missing, a
 // new keypair is generated, written to path, and a LOUD warning is logged.
 func LoadSigningKey(path string, autogen bool) (ed25519.PrivateKey, error) {
+	// Enforce the file's permissions before reading it. A real permission
+	// violation is a hard refusal (fail closed). A not-exist error from the check
+	// (Unix Lstat) or the Windows no-op both fall through to os.ReadFile below,
+	// which is the single place the missing-file case is handled (autogen or
+	// fail-closed) on every platform.
+	if err := checkKeyFilePermissions(path); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -84,6 +108,14 @@ func generateAndSave(path string) (ed25519.PrivateKey, error) {
 
 	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0600); err != nil {
 		return nil, fmt.Errorf("write signing key: %w", err)
+	}
+
+	// Pin the same permission contract that LoadSigningKey enforces on load. The
+	// file was just written 0600 and owned by this process, so this trivially
+	// passes; it is an assertion that fails loudly if the platform ever produced
+	// something looser.
+	if err := checkKeyFilePermissions(path); err != nil {
+		return nil, fmt.Errorf("generated signing key failed its permission check: %w", err)
 	}
 
 	slog.Warn("generated a NEW ephemeral signing key — attestations signed before this will not verify; "+
