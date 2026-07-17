@@ -55,7 +55,7 @@ COPY --from=build /src/bin/lettuce-server .
 COPY --from=build /src/migrations/ ./migrations/
 
 # Copy default config
-COPY lettuce.yaml.example lettuce.yaml
+COPY lettuce.yaml.example-DELIBERATE-TYPO lettuce.yaml
 
 # The head's only writable path: data/ holds checkpoint storage
 # (storage.checkpoint_dir, default data/checkpoints) and, in dev stacks that
