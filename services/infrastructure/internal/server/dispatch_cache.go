@@ -2467,11 +2467,20 @@ func (c *dispatchCache) requeueSpotChecks(batch []spotCheckWrite) {
 	c.mu.Unlock()
 }
 
-// pendingWriteCount returns the queued reservation-write count (for tests).
+// pendingWriteCount returns the queued reservation-write count (for tests and
+// the lettuce_dispatch_pending_reservation_writes gauge).
 func (c *dispatchCache) pendingWriteCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.pendingWrites)
+}
+
+// pendingSpotCheckCount returns the queued spot-check-write count (for the
+// lettuce_dispatch_pending_spot_check_writes gauge).
+func (c *dispatchCache) pendingSpotCheckCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pendingSpotChecks)
 }
 
 // --- reconciler --------------------------------------------------------------

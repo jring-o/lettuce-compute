@@ -545,6 +545,9 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) <-chan struct
 		standingRepo: s.standingRepo,
 	}, s.logger)
 	s.dispatchCache = cache
+	// Point the lettuce_dispatch_* gauges at this cache (BG-29). Store-only —
+	// the gauge families were registered once at package init (see metrics.go).
+	setMetricsDispatchCache(cache)
 
 	// Launched via safego (BG-19): a panic in any cache loop must not kill the
 	// head; the loop is restarted (with backoff) and resumes from its next tick.
@@ -1036,6 +1039,7 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 	if s.dispatchCache != nil {
 		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
 		if shed {
+			dispatchShedTotal.WithLabelValues("request_work_identity").Inc()
 			// H-5: identity-resolve shed (DB-admission saturated on a cold miss) was
 			// emitted at no level. Sampled Warn so the overload is visible.
 			if n := atomic.AddUint64(&s.identityShedLogN, 1); n%shedLogSampleN == 1 {
@@ -1244,6 +1248,7 @@ func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts w
 	// against the DB-pool congestion collapse.
 	if cache.readyLen() == 0 && cache.admissionSaturated() {
 		cache.signalRefill()
+		dispatchShedTotal.WithLabelValues("request_work_ready_pool").Inc()
 		// H-5: hard-backstop cache shed (empty pool + saturated admission) was emitted at
 		// no level. Sampled Warn so a sustained overload is visible without per-request spam.
 		if n := atomic.AddUint64(&s.cacheShedLogN, 1); n%shedLogSampleN == 1 {
@@ -1523,6 +1528,7 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		defer cancel()
 		release, ok := s.dispatchCache.acquire(shedCtx)
 		if !ok {
+			dispatchShedTotal.WithLabelValues("submit_result_db_slot").Inc()
 			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry SubmitResult")
 		}
 		defer release()
@@ -1991,6 +1997,7 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 		defer cancel()
 		release, ok := s.dispatchCache.acquire(shedCtx)
 		if !ok {
+			dispatchShedTotal.WithLabelValues("start_work_db_slot").Inc()
 			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry StartWork")
 		}
 		defer release()
@@ -2284,6 +2291,7 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		defer cancel()
 		release, ok := s.dispatchCache.acquire(shedCtx)
 		if !ok {
+			dispatchShedTotal.WithLabelValues("abandon_db_slot").Inc()
 			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry AbandonWorkUnit")
 		}
 		defer release()
@@ -2448,6 +2456,7 @@ func (s *volunteerService) resolveAuthedVolunteer(ctx context.Context, volunteer
 	if s.dispatchCache != nil {
 		ident, notFound, shed := s.dispatchCache.resolveIdentity(volunteerID)
 		if shed {
+			dispatchShedTotal.WithLabelValues("write_path_identity").Inc()
 			return status.Errorf(codes.ResourceExhausted, "dispatch overloaded; back off and retry")
 		}
 		if notFound {

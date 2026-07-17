@@ -203,10 +203,16 @@ func loggingInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 		start := time.Now()
 		resp, err := handler(ctx, req)
 		st, _ := status.FromError(err)
+		elapsed := time.Since(start)
+		// BG-29: this interceptor already observes method, duration, and status
+		// for every unary call, so the Prometheus request metrics feed here —
+		// no separate instrumentation layer.
+		grpcRequestsTotal.WithLabelValues(info.FullMethod, st.Code().String()).Inc()
+		grpcRequestDuration.WithLabelValues(info.FullMethod).Observe(elapsed.Seconds())
 		attrs := []any{
 			"method", info.FullMethod,
 			"code", st.Code().String(),
-			"duration_ms", time.Since(start).Milliseconds(),
+			"duration_ms", elapsed.Milliseconds(),
 		}
 		if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
 			attrs = append(attrs, "peer_addr", p.Addr.String())

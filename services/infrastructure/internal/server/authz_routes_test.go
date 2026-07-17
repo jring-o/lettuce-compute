@@ -122,6 +122,22 @@ var authzRouteTable = []authzRoute{
 	// only (the volunteer's own self-view is the Ed25519 gRPC path).
 	{method: "GET", pattern: "/api/v1/volunteers/{id}/credit/breakdown", tier: tierAdminOnly, probeAllowed: true, item: "BG-11c"},
 
+	// --- Operator observability (admin-only tier; BG-29) ---
+	// Registered OUTSIDE /api/v1/ so the shipped Caddy topology never proxies
+	// them (see the topology note in router.go); the admin gate is the backstop
+	// for a deploy that exposes the head's HTTP port directly.
+	{method: "GET", pattern: "/metrics", tier: tierAdminOnly, probeAllowed: true, item: "BG-29"},
+	// No-slash twin exists so the mux's automatic 301 → /debug/pprof/ can never
+	// answer an anonymous probe ahead of the admin gate.
+	{method: "GET", pattern: "/debug/pprof", tier: tierAdminOnly, probeAllowed: true, item: "BG-29"},
+	{method: "GET", pattern: "/debug/pprof/", tier: tierAdminOnly, probeAllowed: true, item: "BG-29"},
+	{method: "GET", pattern: "/debug/pprof/cmdline", tier: tierAdminOnly, probeAllowed: true, item: "BG-29"},
+	// profile and trace BLOCK for their sampling window (30s / 1s defaults) —
+	// denials are still probed on every row; only the authorized probe is off.
+	{method: "GET", pattern: "/debug/pprof/profile", tier: tierAdminOnly, item: "BG-29"},
+	{method: "GET", pattern: "/debug/pprof/symbol", tier: tierAdminOnly, probeAllowed: true, item: "BG-29"},
+	{method: "GET", pattern: "/debug/pprof/trace", tier: tierAdminOnly, item: "BG-29"},
+
 	// --- Operator administration (authAdmin wrapper + handler requireAdmin) ---
 	{method: "POST", pattern: "/api/v1/admin/trust", tier: tierAdminGate},
 	{method: "POST", pattern: "/api/v1/admin/trust/slash", tier: tierAdminGate},

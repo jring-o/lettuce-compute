@@ -120,6 +120,9 @@ func main() {
 		slog.Error("failed to connect to database", "error", err)
 		os.Exit(1)
 	}
+	// Point the lettuce_db_pool_* gauges at the serving pool (BG-29); the
+	// admin-gated GET /metrics scrape endpoint is wired in server.NewRouter.
+	server.SetMetricsPool(pool)
 	slog.Info("database connected")
 
 	// Run migrations.
