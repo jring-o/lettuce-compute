@@ -369,8 +369,10 @@ thermal:
 > `poll_interval_seconds` (default 10s) and only sustained load crosses the pause
 > point, so a few-second unit usually finishes before anything triggers. To see it
 > on demand, set low thresholds — e.g. `lettuce-volunteer config set
-> thermal.cpu_pause_threshold 50` and `… config set thermal.cpu_resume_threshold
-> 45` (valid range 30–105, pause > resume) — lower `thermal.poll_interval_seconds`,
+> thermal.cpu_resume_threshold 45` and then `… config set thermal.cpu_pause_threshold
+> 50` (valid range 30–105; set the **resume** threshold first — each `config set` is
+> validated on its own, so lowering the pause threshold below the current resume
+> threshold is rejected) — lower `thermal.poll_interval_seconds`,
 > run a longer CPU-heavy leaf, and **restart the daemon** (config is read at
 > startup, not hot-reloaded). Watch the log for `thermal throttle activated` /
 > `thermal throttle released`.
