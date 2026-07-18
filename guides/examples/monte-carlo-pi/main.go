@@ -83,6 +83,13 @@ func main() {
 		}
 	}
 
+	// Final progress write, unthrottled: a fast trial can finish inside the 5s
+	// throttle window above, and the volunteer's status display expects 100 at
+	// completion. Best-effort like every other progress write.
+	if progressFile != "" {
+		os.WriteFile(progressFile, []byte("100"), 0644)
+	}
+
 	piEstimate := 4.0 * float64(inside) / float64(dartsPerTrial)
 	elapsed := time.Since(start)
 

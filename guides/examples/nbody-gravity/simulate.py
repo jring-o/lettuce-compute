@@ -167,6 +167,16 @@ def run_simulation(params: dict) -> dict:
                 last_progress = now
     compute_time = time.monotonic() - t_start
 
+    # Final progress write, unthrottled: a short simulation can finish inside the
+    # 5s throttle window above, and the volunteer's status display expects 100 at
+    # completion. Best-effort like every other progress write.
+    if progress_file:
+        try:
+            with open(progress_file, "w") as f:
+                f.write("100")
+        except OSError:
+            pass
+
     # Final measurements.
     e_final = total_energy(pos, vel, masses)
     com_final = center_of_mass(pos, masses)
