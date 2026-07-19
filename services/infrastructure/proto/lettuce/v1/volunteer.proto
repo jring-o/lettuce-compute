@@ -44,9 +44,6 @@ service VolunteerService {
   // window lapses before StartWork is reclaimed.
   rpc StartWork(StartWorkRequest) returns (StartWorkResponse);
 
-  // Query status of a specific work unit.
-  rpc GetWorkUnitStatus(GetWorkUnitStatusRequest) returns (GetWorkUnitStatusResponse);
-
   // Get head identity and active leaf discovery info.
   rpc GetHeadInfo(GetHeadInfoRequest) returns (GetHeadInfoResponse);
 
@@ -223,16 +220,12 @@ message StartWorkResponse {
   string message = 2;   // diagnostic; on !ok the volunteer should drop the unit
 }
 
-message GetWorkUnitStatusRequest {
-  string work_unit_id = 1;
-  string volunteer_id = 2;
-}
-
-message GetWorkUnitStatusResponse {
-  string work_unit_id = 1;
-  string state = 2;                 // ASSIGNED, RUNNING, COMPLETED, etc.
-  string message = 3;
-}
+// (GetWorkUnitStatus and its request/response messages were removed in the
+// PB-14 cleanup: the RPC was declared but never implemented server-side — only
+// the embedded Unimplemented stub answered it — and no client ever called it.
+// The volunteer lifecycle needs no status poll: run-start, submit, abandon and
+// the deadline-based reclaim carry all state. Alpha policy: no vestigial
+// surface; head and volunteers ship together.)
 
 // --- v0.9 Checkpointing messages ---
 
