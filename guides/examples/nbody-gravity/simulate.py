@@ -153,7 +153,6 @@ def run_simulation(params: dict) -> dict:
     e_initial = total_energy(pos, vel, masses)
 
     # Integrate.
-    t_start = time.monotonic()
     last_progress = time.time()
     acc = compute_accelerations(pos, masses)
     for step in range(num_steps):
@@ -165,7 +164,6 @@ def run_simulation(params: dict) -> dict:
                 with open(progress_file, "w") as f:
                     f.write(f"{pct:.1f}")
                 last_progress = now
-    compute_time = time.monotonic() - t_start
 
     # Final progress write, unthrottled: a short simulation can finish inside the
     # 5s throttle window above, and the volunteer's status display expects 100 at
@@ -224,7 +222,6 @@ def run_simulation(params: dict) -> dict:
         "ejected_bodies": ejected,
         "closest_encounter": round(min_sep, 6),
         "virial_ratio": round(float(virial_ratio), 4),
-        "compute_time_seconds": round(compute_time, 3),
     }
 
 
