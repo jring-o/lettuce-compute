@@ -57,7 +57,9 @@ func main() {
 		data = append(data, d...)
 	}
 	h := sha256.Sum256(data)
-	out := hex.EncodeToString(h[:])
+	// The head rejects output that is not well-formed JSON (InvalidArgument at
+	// submit), so wrap the digest in a JSON object.
+	out := "{\"result\":\"" + hex.EncodeToString(h[:]) + "\"}"
 	outFile := os.Getenv("LETTUCE_OUTPUT_FILE")
 	if outFile == "" {
 		outFile = "output.dat"
@@ -78,6 +80,13 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	tmpDir := t.TempDir()
+
+	// The test's artifact server is a loopback httptest server, which the
+	// PRODUCTION netguard refuses by default. Use the shipped local-testing
+	// opt-in, scoped to the test head — the same flow guides/first-leaf.md
+	// documents — so this e2e exercises the real guarded client end to end
+	// instead of bypassing it.
+	t.Setenv(volruntime.AllowPrivateArtifactsEnv, "test-server")
 
 	// ---- Build test binary ----
 	testBinPath := buildTestBinary(t, tmpDir)
@@ -100,11 +109,8 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 	// ---- Build and start infrastructure server ----
 	httpPort, grpcPort := findFreePorts(t)
-	serverCmd := startInfraServer(t, tmpDir, dbURL, httpPort, grpcPort)
-	defer func() {
-		serverCmd.Process.Signal(os.Interrupt)
-		serverCmd.Wait()
-	}()
+	_, stopServer := startInfraServer(t, tmpDir, dbURL, httpPort, grpcPort)
+	defer stopServer()
 
 	httpBase := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", grpcPort)
@@ -146,11 +152,17 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 
+	// Resource ceilings must COVER the leafs created below (max_memory_mb: 4096,
+	// max_disk_mb: 10240) or the head's capability matching rejects every hand-out
+	// (`reject tally capability_mismatch`) and the volunteer never receives work.
+	// The old 512 MB / 5 GB fixture values silently failed that gate — invisibly,
+	// because the pre-fix cleanup hang panicked the test before any subtest
+	// verdict line could print.
 	cfg := config.Defaults()
 	cfg.DataDir = volDir
 	cfg.ResourceLimits.MaxCPUCores = 2
-	cfg.ResourceLimits.MaxMemoryMB = 512
-	cfg.ResourceLimits.MaxDiskGB = 5
+	cfg.ResourceLimits.MaxMemoryMB = 4096
+	cfg.ResourceLimits.MaxDiskGB = 12
 	cfg.Servers = []config.ServerConfig{{
 		GRPCAddress: grpcAddr,
 		HTTPAddress: httpBase,
@@ -171,8 +183,11 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 	// Host identity is head-issued (BG-25): register with an empty per-head store so the
 	// head mints an id, then present exactly that id on subsequent work requests.
+	// Advertise NATIVE explicitly: the leafs below are NATIVE, and the default
+	// advertisement (cfg.AvailableRuntimes) is WASM-only, which the head's
+	// capability matching rejects for them.
 	hostStore := identity.NewHostIDStore(filepath.Join(volDir, "host-ids.json"))
-	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath)
+	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath, "NATIVE", "WASM")
 	if err != nil {
 		t.Fatalf("registering: %v", err)
 	}
@@ -194,6 +209,10 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 			t.Fatalf("expected 1 assignment, got %d", len(wuResp.Assignments))
 		}
 		wu := volruntime.WorkUnitFromProto(wuResp.Assignments[0])
+		// The daemon's fetcher stamps the dispatching head on every unit; this
+		// direct-Prepare path does the same so the head-scoped artifact opt-in
+		// (set above) applies.
+		wu.SourceHead = "test-server"
 		t.Logf("Received WU: %s (leaf: %s)", wu.ID, wu.LeafID)
 
 		prep, err := nativeRT.Prepare(ctx, wu)
@@ -256,6 +275,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 			return
 		}
 		wu := volruntime.WorkUnitFromProto(wuResp.Assignments[0])
+		wu.SourceHead = "test-server" // see Scenario1
 		t.Logf("Self-hosted WU: %s (leaf: %s)", wu.ID, wu.LeafID)
 
 		prep, err := nativeRT.Prepare(ctx, wu)
@@ -412,7 +432,11 @@ func newBinServer(t *testing.T, binPath string) *binServer {
 	}
 }
 
-func startInfraServer(t *testing.T, tmpDir, dbURL string, httpPort, grpcPort int) *exec.Cmd {
+// startInfraServer builds and starts a lettuce-server for the test. The second
+// return value stops it: it cancels the command's context (graceful Interrupt on
+// Unix, Kill on Windows) and waits, bounded by WaitDelay. Always call it —
+// typically via defer — so the server can never outlive the test.
+func startInfraServer(t *testing.T, tmpDir, dbURL string, httpPort, grpcPort int) (*exec.Cmd, func()) {
 	t.Helper()
 	parsed, err := url.Parse(dbURL)
 	if err != nil {
@@ -474,7 +498,23 @@ log:
 	cfgPath := filepath.Join(tmpDir, "lettuce.yaml")
 	os.WriteFile(cfgPath, []byte(cfgContent), 0644)
 
-	cmd := exec.Command(serverBin, "-config", cfgPath)
+	// Shutdown must be explicit and bounded: os.Interrupt is not sendable to
+	// another process on Windows (Signal just returns an error), which used to
+	// leave lettuce-server.exe running forever — Wait() blocked in the deferred
+	// cleanup until the test binary's alarm panicked the whole integration run,
+	// and the orphaned server kept a claim on the test database. CommandContext
+	// with a custom Cancel sends the graceful Interrupt where it works (Unix) and
+	// a hard Kill where it does not (Windows); WaitDelay hard-bounds Wait either
+	// way, so the harness can neither hang nor leak the server process.
+	serverCtx, stopServer := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(serverCtx, serverBin, "-config", cfgPath)
+	cmd.Cancel = func() error {
+		if runtime.GOOS == "windows" {
+			return cmd.Process.Kill()
+		}
+		return cmd.Process.Signal(os.Interrupt)
+	}
+	cmd.WaitDelay = 15 * time.Second
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	// The server enforces several startup security requirements; supply test-only
@@ -489,9 +529,13 @@ log:
 		"LETTUCE_BINARY_URL_ALLOW_INSECURE=true",
 	)
 	if err := cmd.Start(); err != nil {
+		stopServer()
 		t.Fatalf("starting server: %v", err)
 	}
-	return cmd
+	return cmd, func() {
+		stopServer()
+		cmd.Wait()
+	}
 }
 
 func waitForHealth(t *testing.T, ctx context.Context, base string) {

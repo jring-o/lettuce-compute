@@ -351,10 +351,25 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	// Graceful stop channel for `lettuce-volunteer stop`: on Windows a per-PID
+	// named event (no cross-process SIGTERM exists there); a nil no-op channel on
+	// Unix, where stop delivers SIGTERM through sigCh above.
+	stopCh, stopErr := daemon.ListenForStopRequests()
+	if stopErr != nil {
+		logger.Warn("graceful stop listener unavailable; 'lettuce-volunteer stop' cannot reach this daemon (stop --force still works)",
+			"error", stopErr)
+	}
+
 	go func() {
-		sig := <-sigCh
-		logger.Info("received signal, shutting down gracefully", "signal", sig)
-		fmt.Fprintf(os.Stderr, "\nReceived %s. Finishing current work unit before exiting...\n", sig)
+		select {
+		case sig := <-sigCh:
+			logger.Info("received signal, shutting down gracefully", "signal", sig)
+			fmt.Fprintf(os.Stderr, "\nReceived %s. Finishing current work unit before exiting...\n", sig)
+		case <-stopCh:
+			logger.Info("received stop request, shutting down gracefully")
+			fmt.Fprintf(os.Stderr, "\nReceived stop request. Finishing current work unit before exiting...\n")
+		}
 		cancel()
 	}()
 
