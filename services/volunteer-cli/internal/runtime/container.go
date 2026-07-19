@@ -349,6 +349,17 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 			return nil, fmt.Errorf("create work dir: %w", err)
 		}
 	}
+	// The hardened container runs as nobody (65534:65534, applyHardening), but these
+	// bind sources are created owned by the volunteer's own uid — 0o755 leaves the
+	// leaf's final output write failing with EACCES on rootless podman AND rootful
+	// engines alike, so every real CPU container unit exited 1. Make the two rw bind
+	// dirs world-writable; a host-side chown to the sandbox uid is not portable
+	// (rootless engines remap uids, Windows/macOS binds cross a VM share). The
+	// data dir's own 0o700 keeps other host users out of the tree, and the dirs
+	// are per-unit and removed at Cleanup.
+	if err := makeSandboxWritable(outputDir, checkpointDir); err != nil {
+		return nil, err
+	}
 
 	// Write input data (inline or external download).
 	if len(wu.InputData) > 0 {
@@ -514,6 +525,12 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
 	if err := os.MkdirAll(checkpointDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create checkpoint dir: %w", err)
+	}
+	// Same sandbox-writability contract as Prepare (see there): the hardened
+	// container's nobody user must be able to write both rw bind dirs, including
+	// on the resumed-unit path that reaches Execute without a fresh Prepare.
+	if err := makeSandboxWritable(outputDir, checkpointDir); err != nil {
+		return nil, err
 	}
 
 	// Build environment variables.
@@ -742,6 +759,19 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// Capture logs to execution.log (capped at 10 MB).
 	c.captureContainerLogs(ctx, containerID, prep.WorkDir)
 
+	// Surface the failure reason on a non-zero exit: the exit code alone told a
+	// leaf author nothing (the PB-23 permission failures were invisible for
+	// exactly this reason). The full stdout/stderr stays in execution.log; the
+	// WARN carries a bounded tail of it.
+	if exitCode != 0 {
+		c.logger.Warn("container exited non-zero",
+			"work_unit_id", wu.ID,
+			"exit_code", int(exitCode),
+			"log_tail", tailOfFile(filepath.Join(prep.WorkDir, "execution.log"), containerLogTailBytes),
+			"log_path", filepath.Join(prep.WorkDir, "execution.log"),
+		)
+	}
+
 	// Inspect container for resource stats.
 	stats, inspectErr := c.dockerClient.ContainerInspect(ctx, containerID)
 	if inspectErr != nil {
@@ -775,12 +805,56 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	}, nil
 }
 
+// makeSandboxWritable makes the given rw bind-source directories writable by the
+// hardened container's non-root user (nobody, 65534:65534). Explicit os.Chmod
+// after MkdirAll so the process umask cannot narrow the mode. World-writable is
+// deliberate: chown-to-sandbox-uid is not portable (rootless engines remap uids;
+// Windows/macOS binds cross a VM share), while the 0o700 data dir above these
+// keeps other host users away from the whole tree.
+func makeSandboxWritable(dirs ...string) error {
+	for _, dir := range dirs {
+		if err := os.Chmod(dir, 0o777); err != nil {
+			return fmt.Errorf("make %s writable for the container user: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // Cleanup removes the work directory. Docker images are preserved for caching.
 func (c *ContainerRuntime) Cleanup(prep *PrepareResult) error {
 	if prep == nil || prep.WorkDir == "" {
 		return nil
 	}
 	return os.RemoveAll(prep.WorkDir)
+}
+
+// containerLogTailBytes bounds the execution-log excerpt attached to the
+// non-zero-exit WARN: enough for a stack trace, small enough for a log line.
+const containerLogTailBytes = 4096
+
+// tailOfFile returns up to the last maxBytes of the file as a string, or a
+// short placeholder when the file is missing/unreadable. Best-effort — used
+// only for diagnostics.
+func tailOfFile(path string, maxBytes int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return "(no captured container log)"
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "(no captured container log)"
+	}
+	if st.Size() > maxBytes {
+		if _, err := f.Seek(-maxBytes, io.SeekEnd); err != nil {
+			return "(no captured container log)"
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil || len(data) == 0 {
+		return "(no captured container log)"
+	}
+	return string(data)
 }
 
 // captureContainerLogs writes container stdout/stderr to execution.log capped at 10 MB.
