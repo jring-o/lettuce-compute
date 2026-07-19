@@ -41,7 +41,10 @@ func IsProcessRunning(pid int) bool {
 	return exitCode == stillActive
 }
 
-// StopProcess sends a terminate signal to the process on Windows.
+// StopProcess forcibly terminates the process on Windows (TerminateProcess:
+// instant, no grace). It is the hard-terminate primitive for compute children
+// (killDroppedOrphan) and `stop --force`; the CLI's graceful stop path is
+// RequestGracefulStop, which signals the daemon's named stop event instead.
 func StopProcess(pid int) error {
 	handle, _, err := procOpenProcess.Call(
 		uintptr(processTerminate),
