@@ -197,6 +197,10 @@ type Daemon struct {
 	// volunteer that's idle on disk space says so instead of only at Debug.
 	diskGateMu     sync.Mutex
 	diskGateWarned bool
+	// unstattableStores records image-store paths whose free space cannot be
+	// determined from this host (see noteUnstattableImageStore), so the
+	// informational log fires once per path per daemon run. Guarded by diskGateMu.
+	unstattableStores map[string]bool
 }
 
 // DaemonConfig holds all dependencies for creating a Daemon.
@@ -1114,6 +1118,18 @@ func (d *Daemon) shouldFetch() bool {
 		if paths, ok := d.imageStorePaths(); ok {
 			for _, path := range paths {
 				if err := d.limiter.CheckDiskSpace(path, fullRequiredMB); err != nil {
+					// Unknown is not "full". The engine can report a store path this
+					// host cannot stat at all — a podman machine's graphroot is a
+					// VM-internal path on Windows/macOS — and treating the stat
+					// failure as 0 MB free kept every CONTAINER-advertising volunteer
+					// on the documented Windows setup idle forever. Match doctor's
+					// verdict (non-blocking "could not be determined"): note it once
+					// and let fetching proceed — a genuinely full store still fails
+					// the pull with ENOSPC, which the abandon path handles.
+					if errors.Is(err, resource.ErrDiskSpaceUnknown) {
+						d.noteUnstattableImageStore(path)
+						continue
+					}
 					d.warnDiskGateOnce("image store", path, fullRequiredMB)
 					return false
 				}
@@ -1123,6 +1139,25 @@ func (d *Daemon) shouldFetch() bool {
 
 	d.clearDiskGateWarning()
 	return true
+}
+
+// noteUnstattableImageStore logs — once per path per daemon run — that the
+// engine-reported image-store path cannot be examined from this host, so the
+// disk gate does not gate on it. INFO, not WARN: on the documented
+// Windows/macOS podman-machine setup this is the normal state of the world.
+func (d *Daemon) noteUnstattableImageStore(path string) {
+	d.diskGateMu.Lock()
+	if d.unstattableStores == nil {
+		d.unstattableStores = make(map[string]bool)
+	}
+	already := d.unstattableStores[path]
+	d.unstattableStores[path] = true
+	d.diskGateMu.Unlock()
+	if already {
+		return
+	}
+	d.logger.Info("image-store free space cannot be determined from this host (engine-internal path); not gating work fetching on it — the engine enforces its own storage limits",
+		"path", path)
 }
 
 // workBufferQueueDepth is the hard ceiling on the number of un-run descriptors

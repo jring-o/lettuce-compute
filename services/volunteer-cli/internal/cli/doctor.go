@@ -384,9 +384,13 @@ func checkImageStore(rep *doctorReport, storePath string, availableMB int64, max
 	fullRequiredMB, _ := daemon.DiskGateThresholds(maxDiskGB)
 
 	if availableMB <= 0 {
+		// Matches the daemon's verdict for the same condition: unknown is not
+		// "full", so fetching is NOT gated on this path (normal on Windows/macOS,
+		// where a podman machine's graphroot is a VM-internal path the host
+		// cannot stat).
 		rep.add(docWarn, "image store",
-			fmt.Sprintf("container images are stored at %s, but its free space could not be determined", storePath),
-			"check that the image-store volume is mounted and readable")
+			fmt.Sprintf("container images are stored at %s, but its free space could not be determined from this host — work fetching is not gated on it", storePath),
+			"the engine enforces its own storage limits; if a big-image pull fails with ENOSPC, free space there or enlarge the Podman-machine disk")
 		return
 	}
 	if availableMB >= int64(fullRequiredMB) {

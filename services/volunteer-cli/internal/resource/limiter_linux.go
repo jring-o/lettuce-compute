@@ -174,7 +174,7 @@ func (l *LinuxLimiter) enforceFallback(pid int, limits *config.ResourceLimits) (
 func (l *LinuxLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
-		return fmt.Errorf("statfs %s: %w", path, err)
+		return fmt.Errorf("%w: statfs %s: %v", ErrDiskSpaceUnknown, path, err)
 	}
 
 	availableMB := (stat.Bavail * uint64(stat.Bsize)) / (1024 * 1024)
