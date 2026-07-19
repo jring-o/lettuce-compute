@@ -1397,13 +1397,54 @@ func (d *Daemon) clearDiskGateWarning() {
 	}
 }
 
+// readinessCounts tallies, per attached head, how many enabled leafs this
+// volunteer can ACTUALLY receive and run — applying the same gates the fetcher
+// applies: a container leaf needs a registered container runtime AND per-head
+// CONTAINER trust; a native-only leaf needs per-head NATIVE trust (native code
+// is always machine-runnable, so trust is its only gate); WASM is always
+// trusted. Counting a leaf the per-head trust would refuse produced the
+// "eligible: 1" line for a volunteer that could never receive work (PB-5).
+func (d *Daemon) readinessCounts() (total, eligible, containerBlocked, trustBlocked int) {
+	hasContainer := d.runtimeRegistry.GetRuntime("container") != nil
+	for _, srv := range d.multiClient.Servers() {
+		for _, lf := range d.enabledLeafs(srv.Name) {
+			total++
+			es := lf.ExecutionSpec
+			if es == nil {
+				// No spec info from the head: don't over-block on unknowns.
+				eligible++
+				continue
+			}
+			needsContainer := es.Image != ""
+			wasmCapable, nativeCapable := false, false
+			for k := range es.Binaries {
+				if strings.EqualFold(k, "wasm") {
+					wasmCapable = true
+				} else {
+					nativeCapable = true
+				}
+			}
+			switch {
+			case needsContainer && !hasContainer:
+				containerBlocked++
+			case needsContainer && !srv.Config.TrustsRuntime("CONTAINER"):
+				trustBlocked++
+			case !needsContainer && nativeCapable && !wasmCapable && !srv.Config.TrustsRuntime("NATIVE"):
+				trustBlocked++
+			default:
+				eligible++
+			}
+		}
+	}
+	return total, eligible, containerBlocked, trustBlocked
+}
+
 // logReadiness logs a one-shot startup banner: the runtimes this volunteer can
 // actually run, free disk vs the configured allowance, and how many of the
-// attached leafs it is eligible for. When nothing is runnable (e.g. every leaf
-// needs a container runtime that isn't installed) it escalates to WARN with the
+// attached leafs it is eligible for (per-head trust included — see
+// readinessCounts). When nothing is runnable it escalates to WARN with the
 // reason and remedy, so a misconfigured volunteer learns why in seconds instead
-// of sitting silently idle. A leaf with a container image requires the container
-// runtime; everything else runs on the always-present native/wasm runtimes.
+// of sitting silently idle.
 func (d *Daemon) logReadiness() {
 	if d.runtimeRegistry == nil || d.multiClient == nil {
 		return
@@ -1414,17 +1455,7 @@ func (d *Daemon) logReadiness() {
 	availableMB := client.DiskAvailableMB(d.cfg.DataDir)
 	allowanceMB := d.cfg.ResourceLimits.MaxDiskGB * 1024
 
-	var totalLeafs, eligibleLeafs, containerBlocked int
-	for _, srv := range d.multiClient.Servers() {
-		for _, lf := range d.enabledLeafs(srv.Name) {
-			totalLeafs++
-			if lf.ExecutionSpec != nil && lf.ExecutionSpec.Image != "" && !hasContainer {
-				containerBlocked++
-				continue
-			}
-			eligibleLeafs++
-		}
-	}
+	totalLeafs, eligibleLeafs, containerBlocked, trustBlocked := d.readinessCounts()
 
 	d.logger.Info("volunteer ready",
 		"runtimes", runtimes,
@@ -1432,15 +1463,20 @@ func (d *Daemon) logReadiness() {
 		"disk_free_mb", availableMB,
 		"disk_allowance_mb", allowanceMB,
 		"eligible_leafs", eligibleLeafs,
+		"trust_blocked_leafs", trustBlocked,
 		"total_leafs", totalLeafs,
 	)
 
 	// "Connected, but you will get no work" — the actionable case worth a WARN.
 	if totalLeafs > 0 && eligibleLeafs == 0 {
-		if containerBlocked == totalLeafs && !hasContainer {
+		switch {
+		case containerBlocked == totalLeafs && !hasContainer:
 			d.logger.Warn("no runnable leafs: every attached leaf needs a container runtime, but none is available here — install Docker or Podman (see the volunteer setup docs), or attach a head that has native leafs",
 				"runtimes", runtimes, "container_leafs", containerBlocked)
-		} else {
+		case trustBlocked > 0:
+			d.logger.Warn("no runnable leafs: the attached leafs need runtimes this volunteer has not trusted their heads to run — opt in per head with 'lettuce-volunteer heads trust <head> <runtime>' if you accept running that head's code",
+				"runtimes", runtimes, "trust_blocked_leafs", trustBlocked, "total_leafs", totalLeafs)
+		default:
 			d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
 				"runtimes", runtimes, "total_leafs", totalLeafs)
 		}

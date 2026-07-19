@@ -497,7 +497,7 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		return true
 	}
 
-	res := evaluateLeafEligibility(resp.GetLeafs(), caps)
+	res := evaluateLeafEligibility(resp.GetLeafs(), caps, srv)
 	detail := fmt.Sprintf("reachable — server %s, db %s; eligible for %d of %d leafs",
 		st.GetVersion(), statusOrUnknown(st.GetDatabaseStatus()), res.eligible, res.total)
 
@@ -508,6 +508,8 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		switch {
 		case res.containerBlocked == res.total && !caps.containerUsable:
 			remedy = "every leaf here needs a container runtime — fix the container check above, or attach a head with native leafs"
+		case res.trustBlocked == res.total:
+			remedy = fmt.Sprintf("every leaf here needs a runtime you have not trusted this head to run — opt in with 'lettuce-volunteer heads trust %s <runtime>' if you accept running its code", name)
 		case res.memoryBlocked > 0:
 			remedy = fmt.Sprintf("raise resource_limits.max_memory_mb (currently %d MB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxMemoryMB)
 		case res.gpuBlocked == res.total:
@@ -549,22 +551,28 @@ type eligibilityResult struct {
 	total            int
 	eligible         int
 	containerBlocked int
+	trustBlocked     int
 	memoryBlocked    int
 	gpuBlocked       int
 	leaves           []leafEligibility
 }
 
 // evaluateLeafEligibility decides, for each leaf the head offers, whether this
-// volunteer can actually run it — applying the same gates the head's dispatcher uses:
-// runtime (a leaf needs the container runtime iff its execution spec carries an
-// image; everything else runs on the always-present native/wasm runtimes), the
+// volunteer can actually run it — applying the same gates the daemon applies:
+// runtime availability (a leaf needs the container runtime iff its execution
+// spec carries an image), PER-HEAD RUNTIME TRUST (the fetcher refuses — and
+// never advertises — CONTAINER/NATIVE work for a head the volunteer has not
+// trusted for that runtime; WASM is always trusted), the
 // execution_config.max_memory_mb ceiling (the gate that silently fires for a
 // default-configured volunteer, #30), and GPU presence
-// (execution_config.gpu_required). A leaf may be blocked by more than one gate; the
-// first that bites is reported (container, then memory, then GPU) and each blocking
-// dimension is tallied so the caller can print the right remedy.
-func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps) eligibilityResult {
+// (execution_config.gpu_required). Ignoring trust counted leafs the volunteer
+// could never receive as "eligible" (PB-5). A leaf may be blocked by more than
+// one gate; the first that bites is reported (container, then trust, then
+// memory, then GPU) and each blocking dimension is tallied so the caller can
+// print the right remedy.
+func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, srv config.ServerConfig) eligibilityResult {
 	var res eligibilityResult
+	head := srv.DisplayName()
 	for _, lf := range leafs {
 		res.total++
 		es := lf.GetExecutionSpec() // nil-safe getters below
@@ -579,11 +587,27 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps) el
 		needsContainer := es.GetImage() != ""
 		leafMemMB := int(es.GetMaxMemoryMb())
 		needsGPU := es.GetGpuRequired()
+		wasmCapable, nativeCapable := false, false
+		for k := range es.GetBinaries() {
+			if strings.EqualFold(k, "wasm") {
+				wasmCapable = true
+			} else {
+				nativeCapable = true
+			}
+		}
 
 		switch {
 		case needsContainer && !caps.containerUsable:
 			res.containerBlocked++
 			res.leaves = append(res.leaves, leafEligibility{name, false, "needs a container runtime"})
+		case needsContainer && !srv.TrustsRuntime("CONTAINER"):
+			res.trustBlocked++
+			res.leaves = append(res.leaves, leafEligibility{name, false,
+				fmt.Sprintf("needs the CONTAINER runtime, which you have not trusted this head to run (opt in: lettuce-volunteer heads trust %s container)", head)})
+		case !needsContainer && nativeCapable && !wasmCapable && !srv.TrustsRuntime("NATIVE"):
+			res.trustBlocked++
+			res.leaves = append(res.leaves, leafEligibility{name, false,
+				fmt.Sprintf("needs the NATIVE runtime, which you have not trusted this head to run (opt in: lettuce-volunteer heads trust %s native)", head)})
 		case leafMemMB > caps.maxMemoryMB:
 			res.memoryBlocked++
 			res.leaves = append(res.leaves, leafEligibility{name, false,
