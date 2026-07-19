@@ -9,8 +9,14 @@ import (
 	"testing"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
+	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 )
+
+// trustingHead is a head config trusted for every runtime, so tests that gate
+// on other dimensions (runtime presence, memory, GPU) aren't confounded by the
+// per-head trust gate.
+var trustingHead = config.ServerConfig{Name: "test-head", TrustedRuntimes: []string{"CONTAINER", "NATIVE"}}
 
 func TestEvaluateLeafEligibility_RuntimeGate(t *testing.T) {
 	leafs := []*lettucev1.LeafInfo{
@@ -20,15 +26,49 @@ func TestEvaluateLeafEligibility_RuntimeGate(t *testing.T) {
 	}
 
 	// Without a usable container runtime, the image leaf is blocked (ample memory).
-	res := evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: false})
+	res := evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: false}, trustingHead)
 	if res.total != 3 || res.eligible != 2 || res.containerBlocked != 1 {
 		t.Errorf("no container: total=%d eligible=%d containerBlocked=%d, want 3/2/1", res.total, res.eligible, res.containerBlocked)
 	}
 
 	// With a usable container runtime, everything is runnable.
-	res = evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: true})
+	res = evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: true}, trustingHead)
 	if res.total != 3 || res.eligible != 3 || res.containerBlocked != 0 {
 		t.Errorf("with container: total=%d eligible=%d containerBlocked=%d, want 3/3/0", res.total, res.eligible, res.containerBlocked)
+	}
+}
+
+// TestEvaluateLeafEligibility_TrustGate is the PB-5 regression test: a leaf the
+// per-head runtime trust would refuse must not be counted eligible. A volunteer
+// whose trust in a head is WASM-only (trust "none" at attach) can never receive
+// that head's NATIVE or CONTAINER work — doctor said "eligible for 1 of 1
+// leafs" anyway, and the volunteer idled with no hint.
+func TestEvaluateLeafEligibility_TrustGate(t *testing.T) {
+	nativeOnly := []*lettucev1.LeafInfo{
+		{Id: "native", Slug: "native-leaf", ExecutionSpec: &lettucev1.ExecutionSpec{Binaries: map[string]string{"linux_amd64": "url"}}},
+	}
+	containerLeaf := []*lettucev1.LeafInfo{
+		{Id: "container", Slug: "container-leaf", ExecutionSpec: &lettucev1.ExecutionSpec{Image: "ghcr.io/x/y:1"}},
+	}
+	wasmLeaf := []*lettucev1.LeafInfo{
+		{Id: "wasm", Slug: "wasm-leaf", ExecutionSpec: &lettucev1.ExecutionSpec{Binaries: map[string]string{"wasm": "url"}}},
+	}
+	caps := volunteerCaps{maxMemoryMB: 16384, containerUsable: true}
+	untrusting := config.ServerConfig{Name: "wasm-only-head"} // no TrustedRuntimes → WASM only
+
+	if res := evaluateLeafEligibility(nativeOnly, caps, untrusting); res.eligible != 0 || res.trustBlocked != 1 {
+		t.Errorf("native leaf, untrusted head: eligible=%d trustBlocked=%d, want 0/1", res.eligible, res.trustBlocked)
+	}
+	if res := evaluateLeafEligibility(containerLeaf, caps, untrusting); res.eligible != 0 || res.trustBlocked != 1 {
+		t.Errorf("container leaf, untrusted head: eligible=%d trustBlocked=%d, want 0/1", res.eligible, res.trustBlocked)
+	}
+	// WASM is always trusted — stays eligible on an untrusting head.
+	if res := evaluateLeafEligibility(wasmLeaf, caps, untrusting); res.eligible != 1 || res.trustBlocked != 0 {
+		t.Errorf("wasm leaf, untrusted head: eligible=%d trustBlocked=%d, want 1/0", res.eligible, res.trustBlocked)
+	}
+	// And trusting the head restores eligibility.
+	if res := evaluateLeafEligibility(nativeOnly, caps, trustingHead); res.eligible != 1 || res.trustBlocked != 0 {
+		t.Errorf("native leaf, trusted head: eligible=%d trustBlocked=%d, want 1/0", res.eligible, res.trustBlocked)
 	}
 }
 
@@ -46,7 +86,7 @@ func TestCountEligibleLeafs_MemoryGate(t *testing.T) {
 
 	// Volunteer limit 2048 MB, has a usable container runtime, no GPU.
 	caps := volunteerCaps{maxMemoryMB: 2048, containerUsable: true, hasGPU: false}
-	res := evaluateLeafEligibility(leafs, caps)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead)
 
 	if res.total != 2 || res.eligible != 1 {
 		t.Fatalf("total=%d eligible=%d, want 2/1 (the 4096 MB leaf gated by memory)", res.total, res.eligible)

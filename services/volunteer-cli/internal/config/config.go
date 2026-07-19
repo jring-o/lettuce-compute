@@ -535,8 +535,8 @@ func applyKeyComments(m *yaml.Node, comments map[string]string) {
 var topLevelConfigComments = map[string]string{
 	"max_concurrent_tasks": "How many work units run at once - THIS is the workload throttle (the thermal thresholds are not). The buffer target scales with it.",
 	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
-	"available_runtimes":    "Runtimes this volunteer will run. WASM is always available; CONTAINER also needs Docker or Podman. NATIVE is gated separately by allow_native_runtime.",
-	"allow_native_runtime":  "Run untrusted leaf binaries DIRECTLY on this host with no sandbox. Off by default; only enable for leaves you fully trust.",
+	"available_runtimes":    "Runtimes this volunteer will run. WASM is always available; CONTAINER also needs Docker or Podman. NATIVE and CONTAINER are enabled per head via trusted_runtimes (set at attach, or with 'heads trust').",
+	"allow_native_runtime":  "LEGACY global native switch: only read once, to seed per-head trusted_runtimes for configs that predate per-head trust. The per-head servers[].trusted_runtimes list is what actually gates NATIVE now.",
 	"container_cap_add":     "Linux capabilities to re-add to hardened containers. Default none (containers drop all capabilities).",
 	"container_gpu_relax_user": "Let GPU leaves relax the non-root/minimal-capability container posture when device access needs it. CPU leaves stay fully hardened.",
 	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
