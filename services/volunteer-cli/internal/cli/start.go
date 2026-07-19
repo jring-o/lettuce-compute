@@ -134,6 +134,27 @@ func runStart(cmd *cobra.Command, args []string) error {
 		cfg.AvailableRuntimes = append(cfg.AvailableRuntimes, "WASM")
 	}
 
+	// Artifact netguard opt-in (loud, off by default): if the operator listed heads
+	// in LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS, say so at startup — once per
+	// head, plus a loud flag for entries that match no configured head (a typo
+	// would otherwise silently keep the guard on and the volunteer idle-looping on
+	// prepare failures, which is exactly the failure mode the knob exists to fix).
+	if optedIn := runtime.PrivateArtifactHeads(); len(optedIn) > 0 {
+		configured := make(map[string]bool)
+		for _, srv := range cfg.Servers {
+			configured[strings.ToLower(srv.DisplayName())] = true
+		}
+		for _, h := range optedIn {
+			if configured[strings.ToLower(h)] {
+				logger.Warn("SECURITY: "+runtime.AllowPrivateArtifactsEnv+" is set — artifact downloads for this head may reach private/loopback addresses",
+					"head", h)
+			} else {
+				logger.Warn(runtime.AllowPrivateArtifactsEnv+" names a head that is not configured; entry has no effect",
+					"head", h)
+			}
+		}
+	}
+
 	// Build the runtime registry up front — before registering with any head — so
 	// we advertise the runtimes this box can ACTUALLY run, not whatever config
 	// lists. A machine that lists CONTAINER but has no working Docker/Podman then
