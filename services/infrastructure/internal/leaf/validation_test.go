@@ -723,6 +723,44 @@ func TestValidateValidationConfig(t *testing.T) {
 			modify: func(c *ValidationConfig) {
 				c.ComparisonMode = "NUMERIC_TOLERANCE"
 				c.NumericTolerance = &tolerance
+				// PB-10: a redundant NUMERIC_TOLERANCE leaf must scope its comparison.
+				c.CompareFields = []string{"result"}
+			},
+			wantErr: false,
+		},
+		{
+			// PB-10: the comparator flattens the whole output JSON, so an unscoped
+			// redundant NUMERIC_TOLERANCE config makes honest volunteers disagree on
+			// nondeterministic fields (timing metadata). Refused at configure.
+			name: "numeric_tolerance without comparison scope rejected on redundant leaf",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				c.CompareFields = nil
+				c.IgnoreFields = nil
+			},
+			wantErr: true,
+			errMsg:  "compare_fields or ignore_fields",
+		},
+		{
+			// PB-10 control: a SINGLE-copy NUMERIC_TOLERANCE leaf (no spot-check) never
+			// compares two results, so no scoping is demanded.
+			name: "numeric_tolerance without scope allowed on single-copy leaf",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				c.RedundancyFactor = 1
+				c.AgreementThreshold = 1.0
+			},
+			wantErr: false,
+		},
+		{
+			// PB-10: ignore_fields alone is a valid scoping choice too.
+			name: "numeric_tolerance with ignore_fields allowed on redundant leaf",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				c.IgnoreFields = []string{"compute_time_ms"}
 			},
 			wantErr: false,
 		},
