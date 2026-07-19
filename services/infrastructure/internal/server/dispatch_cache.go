@@ -430,6 +430,11 @@ type dispatchCache struct {
 	// Pruned of entries older than the interval on the reconcile tick so it cannot grow
 	// unbounded with the lifetime host set. Empty/unused when minSendInterval == 0.
 	lastHandOut map[types.ID]time.Time
+	// lastRefillReturnedCount is how many candidates the most recent COMPLETED
+	// dispatchable query returned (PB-25): the watermark probe's signal for whether a
+	// below-watermark pool has waiting work (actionable) or an empty backlog (the
+	// healthy caught-up state). Guarded by mu.
+	lastRefillReturnedCount int
 	// pendingWrites is the async copy-reservation write queue (each lands as a
 	// RESERVED copy row via FlushReservations).
 	pendingWrites []workunit.FlushReservation
@@ -776,6 +781,14 @@ func (c *dispatchCache) readyLen() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.ready)
+}
+
+// lastRefillReturned returns how many candidates the most recent completed
+// dispatchable query returned (PB-25 — see lastRefillReturnedCount).
+func (c *dispatchCache) lastRefillReturned() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastRefillReturnedCount
 }
 
 // signalRefill nudges the refiller (non-blocking).
@@ -2097,9 +2110,18 @@ func (c *dispatchCache) runRefiller(ctx context.Context, tick time.Duration) {
 	// Prime the pool immediately on start.
 	c.refillOnce(ctx)
 	// FIX 4 observability: count consecutive ticks where the ready pool sits below the
-	// low watermark and emit a rate-limited warning. This is the refill-starvation
+	// low watermark and emit a rate-limited line. This is the refill-starvation
 	// probe the operator currently lacks (the refiller logs nothing after "starting")
 	// and doubles as the FIX-4 acceptance signal.
+	//
+	// PB-25: a ready pool below the watermark is the PERMANENT state of any healthy,
+	// caught-up head (the QUEUED backlog is simply empty), and the unconditional WARN
+	// spammed ~42k lines/day on an idle head — drowning real WARNs, burning the log
+	// cap, and training operators to ignore the level. The line now WARNs only in the
+	// ACTIONABLE case — the last refill DID return dispatchable candidates and the
+	// pool is still starved (demand outpacing refill, admission starvation, pool
+	// ceiling too low) — and is Debug when the dispatchable universe was empty (the
+	// caught-up idle head; nothing an operator can or should act on).
 	const lowTickLogEvery = 8 // ~2s at the default 250ms tick
 	consecutiveLowTicks := 0
 	for {
@@ -2115,9 +2137,14 @@ func (c *dispatchCache) runRefiller(ctx context.Context, tick time.Duration) {
 			if c.readyLen() < c.cfg.lowWatermark {
 				consecutiveLowTicks++
 				if consecutiveLowTicks%lowTickLogEvery == 1 {
-					c.logger.Warn("dispatch cache: ready pool below low watermark",
+					level := slog.LevelDebug
+					if c.lastRefillReturned() > 0 {
+						level = slog.LevelWarn
+					}
+					c.logger.Log(context.Background(), level, "dispatch cache: ready pool below low watermark",
 						"ready_len", c.readyLen(),
 						"low_watermark", c.cfg.lowWatermark,
+						"last_refill_returned", c.lastRefillReturned(),
 						"client_admission_inflight", len(c.admission),
 						"maintenance_admission_inflight", len(c.maintenanceAdmission),
 						"consecutive_low_ticks", consecutiveLowTicks)
@@ -2232,6 +2259,13 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 		c.logger.Warn("dispatch cache: refill failed", "error", err, "leaf_scoped", len(leafIDs) > 0)
 		return
 	}
+	// PB-25: record how much the dispatchable query returned so the watermark probe
+	// can tell a starved pool WITH waiting work (actionable → WARN) from a healthy,
+	// caught-up head whose backlog is simply empty (permanent state → Debug). Only a
+	// completed query updates it; an errored refill keeps the prior signal.
+	c.mu.Lock()
+	c.lastRefillReturnedCount = len(cands)
+	c.mu.Unlock()
 	if len(cands) == 0 {
 		// D-3: nothing came back from the dispatchable query — the operator's signal that
 		// the refiller is healthy but the QUEUED/eligible universe is empty (vs. a DB error,
