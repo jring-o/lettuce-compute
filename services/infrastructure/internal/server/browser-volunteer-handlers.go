@@ -19,6 +19,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/admission"
 	"github.com/lettuce-compute/infrastructure/internal/apierror"
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
+	"github.com/lettuce-compute/infrastructure/internal/generate"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/transition"
@@ -44,6 +45,13 @@ type browserVolunteerDeps struct {
 	// trustRepo snapshots the submitting subject's account-level trust score onto each result
 	// at submit time (see internal/trust). May be nil (tests / no pool); stamping is nil-safe.
 	trustRepo trust.Repository
+	// artifactVersionRepo resolves and pins per-unit artifact versions on the
+	// browser/WASM dispatch path (PB-17), mirroring the cache path's TODO #38
+	// behavior: a unit is pinned to the leaf's current version at its FIRST dispatch
+	// (first-writer-wins) and every subsequent hand-out serves the PINNED version's
+	// artifact config. May be nil (tests / unversioned deployments): the response is
+	// then built from the leaf's current config with no pinning.
+	artifactVersionRepo leaf.ArtifactVersionRepository
 	// now supplies the current time for trust power-suppression checks (overridable in tests).
 	now func() time.Time
 	// transitioner is the SINGLE owner of the work-unit redundancy decision (TODO #50/#66):
@@ -611,6 +619,45 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		_ = deps.volunteerRepo.UpdateLastSeen(r.Context(), vol.ID)
 		_ = deps.volunteerRepo.SetActive(r.Context(), vol.ID, true)
 
+		// Effective artifact config (PB-17). Pre-fix the response mixed a
+		// GENERATION-time artifact reference (code_artifact_url = wu.CodeArtifactRef,
+		// stamped when the unit was generated) with CURRENT-config
+		// execution_spec.binaries — a self-contradictory payload under which every
+		// already-QUEUED browser/WASM unit kept serving the OLD artifact URL forever
+		// after a publish or rollback (the cache/gRPC path picks up new versions
+		// within its ≤30s leaf-snapshot TTL, so the two dispatch paths diverged).
+		// Now, mirroring the cache path: on a versioned leaf the unit is pinned to
+		// the current version at its FIRST dispatch (first-writer-wins, so all
+		// redundant copies run one homogeneous version) and the response — BOTH
+		// code_artifact_url and execution_spec — is built from that effective
+		// config; an unversioned leaf serves the leaf's current config. Runs after
+		// the commit on pool-backed repos (no reads inside the open tx, BG-17).
+		effEC := lf.ExecutionConfig
+		if deps.artifactVersionRepo != nil && lf.CurrentArtifactVersionID != nil {
+			pinned, perr := deps.artifactVersionRepo.EnsureWorkUnitPin(r.Context(), wu.ID, *lf.CurrentArtifactVersionID)
+			if perr != nil {
+				deps.logger.Warn("browser request-work: failed to pin artifact version; serving current config",
+					"work_unit_id", wu.ID, "error", perr)
+			} else if pinned != *lf.CurrentArtifactVersionID {
+				ver, verr := deps.artifactVersionRepo.GetVersionByID(r.Context(), pinned)
+				if verr != nil || ver == nil {
+					deps.logger.Warn("browser request-work: failed to load pinned version; serving current config",
+						"work_unit_id", wu.ID, "version_id", pinned, "error", verr)
+				} else {
+					effEC = ver.ExecutionConfig
+				}
+			}
+		}
+		// The artifact URL a browser volunteer fetches: resolved from the EFFECTIVE
+		// config through the same rule generation uses (first binary by sorted key,
+		// then image), so it always agrees with execution_spec.binaries below. The
+		// generation-time wu.CodeArtifactRef remains only as the fallback for a leaf
+		// whose config no longer carries any artifact.
+		codeArtifactURL := generate.ResolveCodeArtifactRefFromConfig(&effEC)
+		if codeArtifactURL == "" {
+			codeArtifactURL = wu.CodeArtifactRef
+		}
+
 		// Encode input data as base64 if present.
 		var inputDataB64 string
 		if len(wu.InputData) > 0 {
@@ -621,9 +668,9 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		// Env vars may contain researcher secrets (API keys, credentials) that must
 		// not be exposed to untrusted browser volunteers.
 		var safeEnvVars map[string]string
-		if len(lf.ExecutionConfig.EnvVars) > 0 {
+		if len(effEC.EnvVars) > 0 {
 			safeEnvVars = make(map[string]string)
-			for k, v := range lf.ExecutionConfig.EnvVars {
+			for k, v := range effEC.EnvVars {
 				if strings.HasPrefix(k, "LETTUCE_") {
 					safeEnvVars[k] = v
 				}
@@ -633,21 +680,21 @@ func handleBrowserRequestWork(deps *browserVolunteerDeps) http.HandlerFunc {
 		resp := browserRequestWorkResponse{
 			WorkUnitID:      wu.ID.String(),
 			LeafID:          wu.LeafID.String(),
-			Runtime:         lf.ExecutionConfig.Runtime,
+			Runtime:         effEC.Runtime,
 			InputData:       inputDataB64,
 			InputDataURL:    derefString(wu.InputDataRef),
-			CodeArtifactURL: wu.CodeArtifactRef,
+			CodeArtifactURL: codeArtifactURL,
 			ParametersJSON:  string(wu.Parameters),
 			DeadlineSeconds: wu.DeadlineSeconds,
 			EnvVars:         safeEnvVars,
-			RscFpopsEst:     lf.ExecutionConfig.RscFpopsEst,
+			RscFpopsEst:     effEC.RscFpopsEst,
 			ExecutionSpec: browserExecutionSpec{
-				Binaries:      lf.ExecutionConfig.Binaries,
-				GPURequired:   lf.ExecutionConfig.GPURequired,
-				GPUType:       lf.ExecutionConfig.GPUType,
-				MaxMemoryMB:   lf.ExecutionConfig.MaxMemoryMB,
-				MaxDiskMB:     lf.ExecutionConfig.MaxDiskMB,
-				NetworkAccess: lf.ExecutionConfig.NetworkAccess,
+				Binaries:      effEC.Binaries,
+				GPURequired:   effEC.GPURequired,
+				GPUType:       effEC.GPUType,
+				MaxMemoryMB:   effEC.MaxMemoryMB,
+				MaxDiskMB:     effEC.MaxDiskMB,
+				NetworkAccess: effEC.NetworkAccess,
 			},
 		}
 

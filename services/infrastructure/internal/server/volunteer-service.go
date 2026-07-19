@@ -20,6 +20,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/assignment"
 	"github.com/lettuce-compute/infrastructure/internal/checkpoint"
 	"github.com/lettuce-compute/infrastructure/internal/credit"
+	"github.com/lettuce-compute/infrastructure/internal/generate"
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/reliability"
 	"github.com/lettuce-compute/infrastructure/internal/result"
@@ -1427,13 +1428,23 @@ func buildWorkUnitAssignment(wu *workunit.WorkUnit, lf *leaf.Leaf, exec *leaf.Ex
 	if exec != nil {
 		ec = exec
 	}
+	// code_artifact_url is derived from the EFFECTIVE config (PB-17's gRPC half): the
+	// generation-time wu.CodeArtifactRef goes stale across an artifact publish or
+	// rollback, so serving it beside current-config execution_spec.binaries made the
+	// payload self-contradictory. The CLI's runtimes read the binaries map, so this is
+	// consistency hygiene on this path (the browser path was the load-bearing half);
+	// the stamped ref remains the fallback for a config with no artifact left.
+	codeArtifactURL := generate.ResolveCodeArtifactRefFromConfig(ec)
+	if codeArtifactURL == "" {
+		codeArtifactURL = wu.CodeArtifactRef
+	}
 	a := &lettucev1.WorkUnitAssignment{
 		WorkUnitId:      wu.ID.String(),
 		LeafId:          wu.LeafID.String(),
 		Runtime:         ec.Runtime,
 		InputData:       wu.InputData,
 		InputDataUrl:    derefString(wu.InputDataRef),
-		CodeArtifactUrl: wu.CodeArtifactRef,
+		CodeArtifactUrl: codeArtifactURL,
 		ParametersJson:  string(wu.Parameters),
 		DeadlineSeconds: int32(wu.DeadlineSeconds),
 		EnvVars:         ec.EnvVars,

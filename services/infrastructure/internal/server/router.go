@@ -441,6 +441,9 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		validationEngine: deps.ValidationEngine,
 		trustRepo:        trustRepo,
 		now:              time.Now,
+		// PB-17: pin-and-serve per-unit artifact versions on the browser dispatch
+		// path (the same *leaf.PgxRepository implements both leaf interfaces).
+		artifactVersionRepo: leafRepo,
 		// Route the browser/WASM submit path through the same single transitioner the gRPC
 		// volunteer service uses (TODO #66) so it no longer bypasses it with a raw COMPLETED
 		// write + legacy TryValidate. The head trust gate is overlaid identically to the gRPC path.

@@ -69,10 +69,13 @@ func TestFindDispatchableBatch_BulkAndExclude(t *testing.T) {
 	}
 }
 
-// TestFindDispatchableBatch_ExcludesWASM asserts the cache refill never stages a
-// WASM-runtime unit (those are dispatched by the immediate-assign browser path,
-// partitioned by runtime).
-func TestFindDispatchableBatch_ExcludesWASM(t *testing.T) {
+// TestFindDispatchableBatch_StagesWASM asserts the cache refill stages
+// WASM-runtime units alongside every other runtime (PB-11), carrying the runtime
+// so the in-memory capability gate can scope them to WASM-advertising volunteers.
+// The pre-PB-11 exclusion ("WASM is dispatched by the immediate-assign browser
+// path, not the cache") made the CLI's WASI runtime unreachable, because gRPC
+// serves only from the cache.
+func TestFindDispatchableBatch_StagesWASM(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
@@ -83,17 +86,24 @@ func TestFindDispatchableBatch_ExcludesWASM(t *testing.T) {
 	ctx := context.Background()
 
 	nativeWU := mustQueuedWU(t, ctx, repo, nativeLeaf)
-	_ = mustQueuedWU(t, ctx, repo, wasmLeaf)
+	wasmWU := mustQueuedWU(t, ctx, repo, wasmLeaf)
 
 	cands, err := repo.FindDispatchableBatch(ctx, 10, nil, nil)
 	if err != nil {
 		t.Fatalf("FindDispatchableBatch: %v", err)
 	}
-	if len(cands) != 1 {
-		t.Fatalf("expected only the NATIVE unit, got %d candidates", len(cands))
+	if len(cands) != 2 {
+		t.Fatalf("expected both the NATIVE and the WASM unit staged, got %d candidates", len(cands))
 	}
-	if cands[0].WorkUnit.ID != nativeWU.ID {
-		t.Fatalf("WASM unit leaked into the dispatch cache refill")
+	byID := make(map[types.ID]string, len(cands))
+	for _, c := range cands {
+		byID[c.WorkUnit.ID] = c.Runtime
+	}
+	if rt, ok := byID[nativeWU.ID]; !ok || rt != "NATIVE" {
+		t.Fatalf("NATIVE unit missing or mis-labeled (runtime=%q, present=%v)", rt, ok)
+	}
+	if rt, ok := byID[wasmWU.ID]; !ok || rt != "WASM" {
+		t.Fatalf("WASM unit missing from the refill or mis-labeled (runtime=%q, present=%v): the CLI's WASI runtime stays unreachable (PB-11)", rt, ok)
 	}
 }
 

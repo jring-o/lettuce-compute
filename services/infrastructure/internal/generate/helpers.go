@@ -65,18 +65,30 @@ func ClampBatchSize(batchSize int) int {
 // ResolveCodeArtifactRef picks the first available binary from the project's
 // execution config (sorted for determinism), falls back to Image, then placeholder.
 func ResolveCodeArtifactRef(proj *leaf.Leaf) string {
-	if len(proj.ExecutionConfig.Binaries) > 0 {
-		keys := make([]string, 0, len(proj.ExecutionConfig.Binaries))
-		for k := range proj.ExecutionConfig.Binaries {
+	if ref := ResolveCodeArtifactRefFromConfig(&proj.ExecutionConfig); ref != "" {
+		return ref
+	}
+	return PlaceholderArtifactRef
+}
+
+// ResolveCodeArtifactRefFromConfig is ResolveCodeArtifactRef over a bare execution
+// config: the first binary by sorted key, else the image, else "". Dispatch paths
+// use it to derive the artifact URL from the EFFECTIVE (pinned or current) config
+// (PB-17) with the exact rule generation stamps, so the served code_artifact_url
+// always agrees with the served execution_spec.binaries.
+func ResolveCodeArtifactRefFromConfig(ec *leaf.ExecutionConfig) string {
+	if len(ec.Binaries) > 0 {
+		keys := make([]string, 0, len(ec.Binaries))
+		for k := range ec.Binaries {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		return proj.ExecutionConfig.Binaries[keys[0]]
+		return ec.Binaries[keys[0]]
 	}
-	if proj.ExecutionConfig.Image != nil {
-		return *proj.ExecutionConfig.Image
+	if ec.Image != nil {
+		return *ec.Image
 	}
-	return PlaceholderArtifactRef
+	return ""
 }
 
 // ResolveDeadlineSeconds computes the work-unit deadline from the leaf's deadline
