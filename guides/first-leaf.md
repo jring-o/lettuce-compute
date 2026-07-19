@@ -407,11 +407,15 @@ alternative for every command below.
 
 ### Step 1 — Build the image
 
-Tag it with your head's domain so it can be pushed to the head's registry:
+Tag it with your head's domain so it can be pushed to the head's registry. Use an
+**immutable version tag** (`:1.0`), not `:latest`: container leaves must be immutable
+(see the callout above), and the head **rejects `:latest` and untagged images at
+version-publish time** — starting from a pinned tag means the artifact-update flow
+works later without retagging:
 
 ```bash
 cd guides/examples/nbody-gravity
-podman build -t your-domain.com/nbody:latest .
+podman build -t your-domain.com/nbody:1.0 .
 ```
 
 ### Step 2 — Test it locally (recommended)
@@ -427,7 +431,7 @@ podman run --rm \
   -e LETTUCE_PARAMETERS_FILE=/work/input/parameters.json \
   -e LETTUCE_OUTPUT_DIR=/work/output \
   -e LETTUCE_PROGRESS_FILE=/work/output/progress.txt \
-  your-domain.com/nbody:latest
+  your-domain.com/nbody:1.0
 
 cat /tmp/nbody/output/progress.txt   # a number 0-100 (100 when done) — what `status` displays
 cat /tmp/nbody/output/output.json
@@ -440,8 +444,13 @@ head-setup.md, Step 6 (volunteers pull anonymously):
 
 ```bash
 podman login your-domain.com -u lettuce        # password = your REGISTRY password
-podman push your-domain.com/nbody:latest
+podman push your-domain.com/nbody:1.0
 ```
+
+> **Heads-up:** `podman login` prints "Login Succeeded" without actually checking the
+> password (the registry's login ping is anonymous — pulls are public). A typo'd
+> password surfaces only later, as an `authentication required` error at `podman push`.
+> If a push fails that way, re-run `podman login` and re-enter the password.
 
 ### Step 4 — Create the leaf
 
@@ -475,7 +484,7 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
   -d '{
     "execution_config": {
       "runtime": "CONTAINER",
-      "image": "your-domain.com/nbody:latest",
+      "image": "your-domain.com/nbody:1.0",
       "gpu_required": false,
       "max_memory_mb": 512,
       "max_disk_mb": 256,
@@ -500,7 +509,7 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
 ```
 
 > The `image` value is just the registry path **without** the `https://` scheme — e.g.
-> `your-domain.com/nbody:latest`. Volunteers without a container runtime skip container
+> `your-domain.com/nbody:1.0`. Volunteers without a container runtime skip container
 > leafs automatically.
 
 ### Step 6 — Activate and generate work units
