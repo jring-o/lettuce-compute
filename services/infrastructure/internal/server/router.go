@@ -77,6 +77,12 @@ type Dependencies struct {
 	// to the credit admin handler here. Best-effort at the handler; the leader-gated
 	// reconciliation sweep recovers lost emissions.
 	RevocationEmitter credit.RevocationEmitter
+	// DispatchCacheRef is the late-bound handle to the in-process dispatch cache
+	// (PB-9): the router is built before StartDispatchCache runs, so the operator
+	// requeue handler holds this ref (a no-op until the cache is bound) to drop a
+	// requeued unit's stale in-memory dispatch state. nil disables the hook (tests,
+	// deployments that never start the cache).
+	DispatchCacheRef *DispatchCacheRef
 }
 
 // NewRouter creates the HTTP router with all routes and middleware.
@@ -118,6 +124,11 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, genSink, deps.Logger)
 	// Enables operator requeue to close the prior volunteer's assignment outcome.
 	wuHandler.SetAssignmentRepo(assignRepo)
+	// Enables operator requeue to drop the unit's stale in-memory dispatch state
+	// (PB-9); nil-safe no-op until/unless the dispatch cache is started.
+	if deps.DispatchCacheRef != nil {
+		wuHandler.SetDispatchInvalidator(deps.DispatchCacheRef)
+	}
 
 	// Result handler (RegisterRoutes is no-op; all routes are protected).
 	resultRepo := result.NewPgxRepository(deps.Pool)

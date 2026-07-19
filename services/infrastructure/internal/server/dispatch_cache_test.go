@@ -581,13 +581,26 @@ func (c *dispatchCache) stageUnitSets(unitID, leafID types.ID, redundancy, dbAct
 	for _, id := range contributors {
 		subjects = append(subjects, trust.SubjectForVolunteerID(id))
 	}
+	// Benched entries carry a live window (PB-9): stage them as freshly benched (an
+	// outcome moments ago) so the cooldown filter refuses them and the pool-exhausted
+	// fallback is not yet reachable — the pre-PB-9 set semantics for these fixtures.
+	var benchedEntries map[types.ID]benchEntry
+	if len(benched) > 0 {
+		benchedEntries = make(map[types.ID]benchEntry, len(benched))
+		for _, id := range benched {
+			benchedEntries[id] = benchEntry{
+				until:      c.now().Add(time.Hour),
+				fallbackAt: c.now().Add(benchPoolExhaustedGraceSeconds * time.Second),
+			}
+		}
+	}
 	c.mu.Lock()
 	c.ready = append(c.ready, candidate{
 		unit:                &workunit.WorkUnit{ID: unitID, LeafID: leafID, State: workunit.WorkUnitStateQueued},
 		effectiveRedundancy: redundancy,
 		dbActiveCount:       dbActive,
 		contributors:        strSet(subjects),
-		benched:             idSet(benched),
+		benched:             benchedEntries,
 	})
 	c.mu.Unlock()
 }

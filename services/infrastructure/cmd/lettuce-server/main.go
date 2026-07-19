@@ -373,6 +373,11 @@ func main() {
 	revocationEmitter := attestation.NewRevocationEmitter(
 		pool, attestation.NewPgxRepository(pool), attestationSigner, logger)
 
+	// Late-bound dispatch-cache handle (PB-9): the router is built before the cache
+	// exists, so the operator-requeue handler holds this ref; StartDispatchCache
+	// binds the live cache into it below.
+	dispatchCacheRef := server.NewDispatchCacheRef()
+
 	deps := &server.Dependencies{
 		Pool:              pool,
 		Logger:            logger,
@@ -389,6 +394,7 @@ func main() {
 		AtprotoClient:     atprotoClient,
 		AnomalyChecker:    anomalyChecker,
 		RevocationEmitter: revocationEmitter,
+		DispatchCacheRef:  dispatchCacheRef,
 	}
 	router, rateLimitCleanup := server.NewRouter(deps)
 	defer rateLimitCleanup()
@@ -423,6 +429,9 @@ func main() {
 	defer grpcRateLimitCleanup()
 
 	volunteerSvc := server.NewVolunteerService(pool, version, startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, trustPolicy)
+	// PB-9: StartDispatchCache (below) binds the live cache into the router's
+	// late-bound requeue-invalidation handle.
+	server.BindDispatchCacheRef(volunteerSvc, dispatchCacheRef)
 	weights := make(map[string]int32, len(cfg.Head.DefaultLeafWeights))
 	for k, v := range cfg.Head.DefaultLeafWeights {
 		weights[k] = int32(v)

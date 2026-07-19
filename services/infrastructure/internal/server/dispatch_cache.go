@@ -91,7 +91,21 @@ const (
 	// are authoritative, so a stale snapshot costs at most a voided hand-out to a
 	// just-benched account or a briefly-late bench — never a wrong LANDED copy.
 	standingSnapshotTTL = 30 * time.Second
+	// voidBenchTTL bounds how long a flush-conflict bench (voidNonLandedCopy) refuses the
+	// volunteer on the still-staged candidate (PB-9). The SQL landing gates are the
+	// authoritative refusal, so this in-memory bench is a hand-out throttle, not a gate:
+	// it damps the re-offer/void livelock without out-living the SQL cooldown the way the
+	// old unexpiring set did. On expiry the volunteer gets ONE fresh offer; if the SQL
+	// still refuses it, the void re-benches for another interval.
+	voidBenchTTL = 60 * time.Second
 )
+
+// benchPoolExhaustedGraceSeconds is the in-memory mirror of the SQL cooldown's
+// pool-exhausted fallback (workunit.BenchPoolExhaustedGraceSeconds, PB-9): once a
+// benching outcome is older than this grace AND the unit currently has zero active
+// coverage — no fresh volunteer has taken it in all that time — the bench yields so
+// work never strands in a small pool (head-setup.md §Redundancy's promise).
+const benchPoolExhaustedGraceSeconds = workunit.BenchPoolExhaustedGraceSeconds
 
 // candidate is one pre-fetched, ready-to-assign QUEUED unit in the ready pool. It
 // carries everything HandOut + buildWorkUnitAssignment need so a hand-out touches
@@ -125,11 +139,16 @@ type candidate struct {
 	// never removed once added (a result/copy is monotonic coverage), so a candidate
 	// that lingers staged across the submitter's submit still excludes it.
 	contributors map[string]struct{}
-	// benched is the set of volunteers whose recent copy of this unit timed out / was
-	// abandoned within ~one deadline window (a refill-time snapshot). They are given
-	// last refusal so a fresh volunteer gets first crack on a requeue; the DB
-	// reservation is the authoritative cooldown gate, this is the hand-out optimization.
-	benched map[types.ID]struct{}
+	// benched maps volunteers whose recent copy of this unit timed out / was abandoned
+	// mid-run (a refill-time snapshot, plus flush-conflict entries from
+	// voidNonLandedCopy) to their bench window. They are given last refusal so a fresh
+	// volunteer gets first crack on a requeue; the DB reservation is the authoritative
+	// cooldown gate, this is the hand-out optimization. Entries are TIMED (PB-9): the
+	// old unexpiring set out-lived the SQL cooldown whenever the candidate lingered in
+	// the ready pool (it refreshed only on re-stage, which never happens while the unit
+	// sits staged), permanently stranding one-volunteer pools. eligibleLocked reads the
+	// window and the pool-exhausted fallback instead of mere membership.
+	benched map[types.ID]benchEntry
 	// effectiveTrustK is the leaf's resolved trusted-corroborator requirement
 	// (DispatchCandidate.EffectiveTrustK): the number of this unit's redundant results
 	// that must come from TRUSTED subjects. 0 disables the trusted-corroborator
@@ -160,6 +179,24 @@ type candidate struct {
 	// kept separate from the frozen contributors precisely so the reservation does not
 	// re-score a refill-time pending author. Only populated when effectiveTrustK > 0.
 	runStartedSubjects map[string]struct{}
+}
+
+// benchEntry is one volunteer's timed bench on a staged candidate (PB-9): the
+// post-failure cooldown window as the cache last learned it, mirroring the SQL
+// cooldown gate rather than out-living it.
+type benchEntry struct {
+	// until is when the bench lapses — outcome_at + ~one deadline for a refill-time
+	// snapshot entry (the SQL cooldown window), or a short fixed throttle for a
+	// flush-conflict entry (voidBenchTTL). After it, the volunteer is offered the unit
+	// again; the SQL landing stays authoritative either way.
+	until time.Time
+	// fallbackAt is when the pool-exhausted fallback may re-admit the volunteer even
+	// inside the bench window (outcome_at + benchPoolExhaustedGraceSeconds): if the
+	// unit still has zero active coverage by then — no fresh volunteer took it — the
+	// bench yields so work never strands (the SQL cooldown's fallback term is the
+	// authoritative twin). Void entries set fallbackAt == until (no early fallback:
+	// the void does not know the underlying outcome time).
+	fallbackAt time.Time
 }
 
 // heldCopy is one account's in-memory reservation on a unit: when it expires (the lease),
@@ -400,6 +437,17 @@ type dispatchCache struct {
 	// ReserveCopy (land the spot-check copy row). Kept separate from pendingWrites
 	// because it is a different (non-batchable) DB shape.
 	pendingSpotChecks []spotCheckWrite
+	// flushInFlight counts flush batches (reservation AND spot-check) that have been
+	// snapshotted OUT of their pending queue but whose DB landing has not completed
+	// (PB-15). While a batch is in flight its records are in NEITHER the queue nor the
+	// DB, so a forced flush that only drains the queues can return with a racing
+	// StartWork's copy still un-durable — exactly the warm-cache first-run-start
+	// denial observed live. flushAllPendingHeld waits for this to reach zero (via
+	// flushDoneCh) in addition to draining, making the Major-3 guard deterministic.
+	flushInFlight int
+	// flushDoneCh is closed and replaced each time an in-flight flush batch completes
+	// (landed, voided, or requeued), waking flushAllPendingHeld waiters. Guarded by mu.
+	flushDoneCh chan struct{}
 	// trustScores is a TTL snapshot of subject -> current trust score (positively-scored
 	// subjects only; see trust.Repository.AllScores). eligibleLocked reads it — under mu —
 	// to classify the requester and the post-refill live holders for the trusted-
@@ -602,6 +650,56 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		pendingLeafRefills:   make(map[types.ID]struct{}),
 		heldReports:          make(map[types.ID]heldReport),
 		flusherDone:          make(chan struct{}),
+		flushDoneCh:          make(chan struct{}),
+	}
+}
+
+// beginFlushInFlightLocked marks one flush batch as snapshotted-but-not-landed
+// (PB-15). Caller holds mu, having just taken a non-empty batch off a pending queue.
+func (c *dispatchCache) beginFlushInFlightLocked() {
+	c.flushInFlight++
+}
+
+// endFlushInFlight marks one in-flight flush batch complete (landed, voided, or
+// requeued) and wakes every flushAllPendingHeld waiter by rotating flushDoneCh.
+func (c *dispatchCache) endFlushInFlight() {
+	c.mu.Lock()
+	c.flushInFlight--
+	close(c.flushDoneCh)
+	c.flushDoneCh = make(chan struct{})
+	c.mu.Unlock()
+}
+
+// DispatchCacheRef is a late-bound, nil-safe handle to the in-process dispatch
+// cache (PB-9). The HTTP router (and its WorkUnitHandler) is built BEFORE
+// StartDispatchCache creates the cache, so the requeue handler cannot hold the cache
+// directly; it holds this ref instead, which StartDispatchCache points at the live
+// cache once it exists. Every method is a no-op until then (and forever, on a
+// deployment that never starts the cache), so the HTTP surface needs no ordering
+// guarantee.
+type DispatchCacheRef struct {
+	mu    sync.Mutex
+	cache *dispatchCache
+}
+
+// NewDispatchCacheRef builds an unbound ref (see DispatchCacheRef).
+func NewDispatchCacheRef() *DispatchCacheRef {
+	return &DispatchCacheRef{}
+}
+
+func (r *DispatchCacheRef) set(c *dispatchCache) {
+	r.mu.Lock()
+	r.cache = c
+	r.mu.Unlock()
+}
+
+// InvalidateWorkUnit forwards to the bound cache (workunit.DispatchInvalidator).
+func (r *DispatchCacheRef) InvalidateWorkUnit(id types.ID) {
+	r.mu.Lock()
+	c := r.cache
+	r.mu.Unlock()
+	if c != nil {
+		c.InvalidateWorkUnit(id)
 	}
 }
 
@@ -1175,8 +1273,20 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// abandoned is benched for ~one deadline so a fresh volunteer gets first crack. Keyed on
 	// the ACCOUNT, not the subject, by design — the cooldown is a per-account reliability
 	// signal (this account's copy failed), not corroboration distinctness.
-	if _, benched := cand.benched[volunteerID]; benched {
-		return false, rejectBenched
+	//
+	// The bench is TIMED and carries the pool-exhausted fallback (PB-9): it refuses only
+	// while its window is live, and even then it yields once the fallback grace has passed
+	// with the unit still uncovered (zero live coverage — nobody fresh took it), mirroring
+	// the SQL cooldown gate so the in-memory snapshot can never out-live it and strand a
+	// small pool. The exhaustion mirror is conservative on purpose: dbActiveCount folds in
+	// PENDING results the SQL fallback ignores, so this arm may keep refusing where the SQL
+	// would already admit — bounded by `until`, never past the SQL cooldown's own window.
+	if e, benched := cand.benched[volunteerID]; benched {
+		now := c.now()
+		exhausted := cand.dbActiveCount+len(holders) == 0 && now.After(e.fallbackAt)
+		if now.Before(e.until) && !exhausted {
+			return false, rejectBenched
+		}
 	}
 	// Account standing — BENCHED requester (BG-24b): an account the head has BENCHED gets NO
 	// dispatch at all until its bench lapses. The per-ACCOUNT standing twin of the per-unit
@@ -1372,12 +1482,20 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 	c.releaseInMemLocked(unitID, volunteerID)
 	// releaseInMemLocked drops the hold but keeps the candidate staged (for its remaining
 	// redundancy copies), so it is still here to bench.
+	//
+	// The void bench is a short TIMED throttle (PB-9), not a permanent exclusion: the SQL
+	// landing is the authoritative refusal, and an unexpiring entry here out-lived the SQL
+	// cooldown whenever the candidate lingered staged. On expiry the volunteer gets one
+	// fresh offer; a still-standing SQL refusal re-benches it right back here. fallbackAt
+	// == until because the void does not know the underlying outcome time, so no early
+	// pool-exhausted re-admission is attempted from a void entry.
 	for i := range c.ready {
 		if c.ready[i].unit.ID == unitID {
 			if c.ready[i].benched == nil {
-				c.ready[i].benched = make(map[types.ID]struct{})
+				c.ready[i].benched = make(map[types.ID]benchEntry)
 			}
-			c.ready[i].benched[volunteerID] = struct{}{}
+			expiry := c.now().Add(voidBenchTTL)
+			c.ready[i].benched[volunteerID] = benchEntry{until: expiry, fallbackAt: expiry}
 			return
 		}
 	}
@@ -1391,10 +1509,10 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 //
 // This closes the re-stamp window only for entries STILL QUEUED here; an entry
 // already snapshotted into an in-flight flushBatch (copied under mu, written outside
-// the lock) cannot be recalled. For the buffered-abandon path that residual window
-// is backstopped by the prior ClearReservation in PG (cleared BEFORE releaseInMem),
-// so a late landed reservation on the already-cleared/requeued unit is a no-op
-// conflict (not returned by FlushReservations), never a double-reserve.
+// the lock) cannot be recalled. The buffered-abandon path no longer has that
+// residual window at all: AbandonWorkUnit forces flushPendingFor first (PB-7), which
+// drains the queues AND waits out any in-flight batch (PB-15), so by the time it
+// releases the hold there is nothing in flight to re-stamp.
 func (c *dispatchCache) purgePendingForLocked(unitID, volunteerID types.ID) {
 	if len(c.pendingWrites) > 0 {
 		w := c.pendingWrites[:0]
@@ -1436,13 +1554,17 @@ func (c *dispatchCache) hasInMemReservation(unitID, volunteerID types.ID) bool {
 	return ok
 }
 
-// flushPendingFor forces an immediate flush of the pending reservation-write queue so
-// a freshly handed-out reservation is durable in Postgres before StartWork's run-start
-// transaction reads/Assigns the unit. The CALLER (StartWork) already holds an admission
-// slot, so this drains without re-acquiring (avoiding a self-deadlock when
-// admissionCap == 1). It closes the flush race deterministically: after it returns, a
-// landed reservation is durable; an in-memory hold the flush could not land was voided,
-// so StartWork's subsequent in-memory check fails closed.
+// flushPendingFor forces an immediate flush of the pending write queues (reservations
+// AND spot-check landings) so a freshly handed-out reservation is durable in Postgres
+// before StartWork's run-start transaction reads/Assigns the unit — or before an
+// abandon closes it (PB-7). The CALLER already holds an admission slot, so this drains
+// without re-acquiring (avoiding a self-deadlock when admissionCap == 1). It closes
+// the flush race deterministically: after it returns (short of ctx expiry), a landed
+// reservation is durable; an in-memory hold the flush could not land was voided, so
+// the caller's subsequent checks fail closed. Unlike the pre-PB-15 version it also
+// waits out any ticker flush batch already in flight — the window that made the old
+// drain non-deterministic — and drains the spot-check queue, which the old version
+// never touched (the unconditional spot-check variant of the same denial).
 func (c *dispatchCache) flushPendingFor(ctx context.Context) {
 	c.flushAllPendingHeld(ctx)
 }
@@ -1471,6 +1593,34 @@ func (c *dispatchCache) onUnitDone(unitID types.ID) {
 			break
 		}
 	}
+}
+
+// InvalidateWorkUnit drops every trace of a unit from this replica's in-memory
+// dispatch state — its staged candidate (with the candidate's bench/contributor
+// snapshots), every in-memory reservation hold (each release also purges any queued
+// reservation/spot-check write for that holder), and nudges the refiller so the unit
+// is re-staged from a FRESH DB snapshot.
+//
+// This is the operator-requeue hook (PB-9): requeue expires the unit's live copies in
+// Postgres, but the HTTP handler previously had no way to reach this cache, so the
+// staged candidate kept serving its stale refill-time bench/contributor sets and the
+// in-memory holds kept the unit excluded from refill — an operator 200 OK that
+// changed nothing about dispatch until the reconciler happened to catch up.
+func (c *dispatchCache) InvalidateWorkUnit(unitID types.ID) {
+	c.mu.Lock()
+	if holders := c.reservedInMem[unitID]; holders != nil {
+		for acct := range holders {
+			c.releaseInMemLocked(unitID, acct)
+		}
+	}
+	for i := range c.ready {
+		if c.ready[i].unit.ID == unitID {
+			c.ready = append(c.ready[:i], c.ready[i+1:]...)
+			break
+		}
+	}
+	c.mu.Unlock()
+	c.signalRefill()
 }
 
 // onRunStart converts one volunteer's in-memory reservation hold into a RUNNING copy
@@ -2109,7 +2259,7 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			// copies — the cache's forced-replication parity with countableCoverageSQL.
 			probationCoverage: dc.ProbationCoverage,
 			contributors:      strSet(dc.ContributorSubjects),
-			benched:           idSet(dc.BenchedVolunteerIDs),
+			benched:           benchSet(dc.Benched, dc.WorkUnit.DeadlineSeconds),
 			// Trusted-corroborator reservation inputs (SQL twin: DispatchCandidate). K == 0
 			// leaves the reservation inert; the trusted-contributor snapshot is frozen here
 			// (see the candidate field docs) so a pending author's stamped trustedness is
@@ -2289,20 +2439,53 @@ func (c *dispatchCache) flushOnce(ctx context.Context) {
 	c.flushBatch(ctx, true)
 }
 
-// flushAllPendingHeld drains the ENTIRE pending reservation queue (looping over
-// flushBatchSize-sized batches) WITHOUT acquiring the admission semaphore — the
-// caller must already hold an admission slot. StartWork uses this to force a freshly
-// handed-out reservation durable inside the flush window (Major 3) without
-// self-deadlocking against its own held admission slot when admissionCap == 1.
+// flushAllPendingHeld drains the ENTIRE pending write queue — reservations AND
+// spot-check landings — (looping over flushBatchSize-sized batches) WITHOUT acquiring
+// the admission semaphore: the caller must already hold an admission slot. StartWork
+// and the buffered-copy abandon use this to force a freshly handed-out reservation
+// durable inside the flush window (Major 3) without self-deadlocking against their
+// own held admission slot when admissionCap == 1.
+//
+// PB-15: draining the queues alone is NOT deterministic — the ticker flusher removes
+// a batch from its queue BEFORE the DB write lands (and can hold it out for up to the
+// DB timeout while it waits on the maintenance semaphore, which the burst-triggered
+// refill contends for). During that in-flight window the racing record is in neither
+// the queue nor the DB, so the pre-fix drain returned with the copy un-durable and
+// StartWork's Assign denied the run-start ("work unit no longer reserved") — the
+// warm-cache first-StartWork denial observed live. So after draining, this also WAITS
+// (bounded by ctx) until no flush batch is in flight. On return every reservation
+// this cache had accepted is either durable in Postgres or voided (its in-memory
+// hold dropped), exactly the contract the Major-3 guard needs.
+//
+// PB-15 (spot-check half): the spot-check queue was previously drained ONLY by the
+// 100ms ticker, so a warm-cache volunteer's first StartWork on a spot-checked unit
+// was denied unconditionally. It is now drained here too.
 func (c *dispatchCache) flushAllPendingHeld(ctx context.Context) {
 	for {
 		c.mu.Lock()
 		remaining := len(c.pendingWrites)
+		remainingSC := len(c.pendingSpotChecks)
+		inFlight := c.flushInFlight
+		doneCh := c.flushDoneCh
 		c.mu.Unlock()
-		if remaining == 0 {
+		if remaining == 0 && remainingSC == 0 && inFlight == 0 {
 			return
 		}
-		c.flushBatch(ctx, false)
+		if remaining > 0 {
+			c.flushBatch(ctx, false)
+			continue
+		}
+		if remainingSC > 0 {
+			c.flushSpotChecks(ctx, false)
+			continue
+		}
+		// Both queues empty but a snapshotted batch is still landing elsewhere: wait for
+		// it to complete (or ctx to expire — the caller's shed budget bounds the wait).
+		select {
+		case <-doneCh:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -2328,6 +2511,11 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 	if len(c.pendingWrites) == 0 {
 		c.pendingWrites = nil
 	}
+	// PB-15: the batch leaves the queue here but is not durable until FlushReservations
+	// returns; track it so flushAllPendingHeld can wait out the window instead of
+	// returning with a racing StartWork's copy in limbo.
+	c.beginFlushInFlightLocked()
+	defer c.endFlushInFlight()
 	c.mu.Unlock()
 
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
@@ -2394,11 +2582,22 @@ func (c *dispatchCache) requeueWrites(batch []workunit.FlushReservation) {
 	c.mu.Unlock()
 }
 
-// flushSpotChecksOnce drains pending spot-check markings: each is MarkSpotCheck +
+// flushSpotChecksOnce is the ticker entry point for the spot-check flush: it pulls
+// from the maintenance admission budget (FIX 4).
+func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
+	c.flushSpotChecks(ctx, true)
+}
+
+// flushSpotChecks drains pending spot-check markings: each is MarkSpotCheck +
 // ReserveCopy (land the spot-check copy row). The unit stays QUEUED so a second
 // corroborating volunteer can still be dispatched it. Unlike the NORMAL flush, a
 // spot-check that fails to land (the unit is no longer QUEUED) voids the in-memory hold.
-func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
+//
+// When acquireAdmission is true (the ticker) each landing pulls a maintenance
+// admission slot; when false the caller already holds a CLIENT slot
+// (flushAllPendingHeld — the held-slot forced flush, PB-15) and no slot is taken,
+// mirroring flushBatch's held-slot contract.
+func (c *dispatchCache) flushSpotChecks(ctx context.Context, acquireAdmission bool) {
 	c.mu.Lock()
 	if len(c.pendingSpotChecks) == 0 {
 		c.mu.Unlock()
@@ -2414,20 +2613,29 @@ func (c *dispatchCache) flushSpotChecksOnce(ctx context.Context) {
 	if len(c.pendingSpotChecks) == 0 {
 		c.pendingSpotChecks = nil
 	}
+	// PB-15: like the reservation flush, a snapshotted spot-check batch is in neither
+	// the queue nor the DB until it lands; track it so the held-slot forced flush can
+	// wait out the window.
+	c.beginFlushInFlightLocked()
+	defer c.endFlushInFlight()
 	c.mu.Unlock()
 
 	for _, sc := range batch {
 		dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
-		// FIX 4: the spot-check landing (MarkSpotCheck + ReserveCopy + history
-		// row) is part of the flusher goroutine and is correctness-bearing for
-		// spot-check deferral, so it pulls from the SEPARATE maintenance budget. After
-		// FIX 3, Submit/Abandon hold heavier client slots; leaving this on the client
-		// budget would let a write storm starve spot-check landing MORE than at HEAD.
-		release, ok := c.acquireMaintenance(dbCtx)
-		if !ok {
-			cancel()
-			c.requeueSpotChecks([]spotCheckWrite{sc})
-			continue
+		release := func() {}
+		if acquireAdmission {
+			// FIX 4: the spot-check landing (MarkSpotCheck + ReserveCopy + history
+			// row) is part of the flusher goroutine and is correctness-bearing for
+			// spot-check deferral, so it pulls from the SEPARATE maintenance budget. After
+			// FIX 3, Submit/Abandon hold heavier client slots; leaving this on the client
+			// budget would let a write storm starve spot-check landing MORE than at HEAD.
+			var ok bool
+			release, ok = c.acquireMaintenance(dbCtx)
+			if !ok {
+				cancel()
+				c.requeueSpotChecks([]spotCheckWrite{sc})
+				continue
+			}
 		}
 		if err := c.deps.wuRepo.MarkSpotCheck(dbCtx, sc.workUnitID); err != nil {
 			release()
@@ -2756,16 +2964,27 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 	return true
 }
 
-// idSet builds a set from a slice of ids (nil for an empty/absent slice, so an
-// unstaged candidate carries a nil — not empty — map, which membership checks read
-// as "no members" at no allocation cost).
-func idSet(ids []types.ID) map[types.ID]struct{} {
-	if len(ids) == 0 {
+// benchSet builds a candidate's timed bench map from the refill snapshot's
+// per-volunteer benching outcomes (nil for an empty/absent slice, so an unstaged
+// candidate carries a nil — not empty — map, read as "no members" at no allocation
+// cost). Each entry mirrors the SQL cooldown gate exactly (PB-9): the bench lapses
+// one cooldown window (~one deadline, floor 1s — GREATEST(deadline_seconds, 1)) after
+// the benching outcome, and the pool-exhausted fallback may re-admit the volunteer
+// benchPoolExhaustedGraceSeconds after that outcome if the unit is still uncovered.
+func benchSet(benched []workunit.BenchedVolunteer, deadlineSeconds int) map[types.ID]benchEntry {
+	if len(benched) == 0 {
 		return nil
 	}
-	s := make(map[types.ID]struct{}, len(ids))
-	for _, id := range ids {
-		s[id] = struct{}{}
+	cooldown := time.Duration(deadlineSeconds) * time.Second
+	if cooldown < time.Second {
+		cooldown = time.Second
+	}
+	s := make(map[types.ID]benchEntry, len(benched))
+	for _, b := range benched {
+		s[b.VolunteerID] = benchEntry{
+			until:      b.OutcomeAt.Add(cooldown),
+			fallbackAt: b.OutcomeAt.Add(benchPoolExhaustedGraceSeconds * time.Second),
+		}
 	}
 	return s
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -533,6 +534,109 @@ func subjectExprSQL(volAlias string) string {
 	END)`
 }
 
+// BenchPoolExhaustedGraceSeconds is the pool-exhausted fallback grace of the
+// post-failure cooldown (PB-9, the head-setup.md §Redundancy promise): a volunteer
+// whose copy of a unit timed out / was abandoned mid-run is benched for ~one deadline
+// so a fresh volunteer gets first refusal — but once the benching outcome is older
+// than this grace AND the unit currently has ZERO live copies (no fresh volunteer
+// took it in all that time), the bench yields and the volunteer is re-admitted, so a
+// small pool never strands the work. 120s gives fresh volunteers a two-minute first
+// refusal window before the fallback can fire; the effective bench is therefore
+// min(cooldown, time-to-exhaustion-plus-grace). The dispatch cache mirrors the same
+// rule in memory (server.benchEntry).
+const BenchPoolExhaustedGraceSeconds = 120
+
+// cooldownGuardSQL builds the post-failure cooldown guard shared by the three
+// authoritative landing/read gates (FindNextAssignable, FlushReservations,
+// ReserveCopy): refuse the requester a copy of the unit while a recent benching
+// outcome of its own is inside the cooldown window — UNLESS the pool-exhausted
+// fallback applies (see BenchPoolExhaustedGraceSeconds). unitExpr / volExpr are the
+// SQL expressions for the target unit id and requesting volunteer id in the caller's
+// scope; wuAlias is the work_units alias carrying deadline_seconds. The cg_* internal
+// aliases collide with none of the dispatch queries' aliases.
+//
+// A copy benches only if the volunteer actually STARTED it: a graceful return of
+// un-started buffered work (ABANDONED, started_at NULL) is not a reliability signal
+// and does not bench (#59). The clause is keyed on volunteer_id, NOT the trust
+// subject, BY DESIGN: the cooldown is a per-account reliability signal — one device
+// timing out does not bench its siblings bound to the same DID.
+func cooldownGuardSQL(unitExpr, volExpr, wuAlias string) string {
+	return `NOT EXISTS (
+		SELECT 1 FROM work_unit_assignment_history cg_h
+		WHERE cg_h.work_unit_id = ` + unitExpr + ` AND cg_h.volunteer_id = ` + volExpr + `
+		  AND (cg_h.outcome = 'EXPIRED'
+		       OR (cg_h.outcome = 'ABANDONED' AND cg_h.started_at IS NOT NULL))
+		  AND cg_h.outcome_at IS NOT NULL
+		  AND cg_h.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
+		  -- Pool-exhausted fallback (PB-9): the bench holds only while fresh volunteers
+		  -- are (or may still be) covering the unit. Once this benching outcome is older
+		  -- than the fallback grace AND the unit currently has ZERO live copies — nobody
+		  -- else took it in all that time — the bench yields so work never strands.
+		  AND NOT (
+		    cg_h.outcome_at < NOW() - INTERVAL '` + strconv.Itoa(BenchPoolExhaustedGraceSeconds) + ` seconds'
+		    AND NOT EXISTS (
+		      SELECT 1 FROM work_unit_assignment_history cg_lc
+		      WHERE cg_lc.work_unit_id = ` + unitExpr + ` AND cg_lc.outcome IS NULL
+		    )
+		  )
+	)`
+}
+
+// benchedSnapshotSQL builds the refill-time benched-volunteer snapshot for the
+// dispatchable queries: one 'volunteer_id|epoch_of_latest_benching_outcome' text per
+// benched volunteer of the unit aliased by wuAlias. Carrying the outcome time (not
+// just membership) lets the dispatch cache seed TIMED bench entries that mirror the
+// SQL cooldown window instead of out-living it while the candidate sits staged
+// (PB-9's stale-set defect). Parsed by parseBenchTexts. The cb_* internal alias
+// collides with none of the dispatch queries' aliases.
+func benchedSnapshotSQL(wuAlias string) string {
+	return `ARRAY(
+		SELECT cb.volunteer_id::text || '|' || floor(extract(epoch FROM MAX(cb.outcome_at)))::bigint::text
+		 FROM work_unit_assignment_history cb
+		 WHERE cb.work_unit_id = ` + wuAlias + `.id AND cb.volunteer_id IS NOT NULL
+		   AND (cb.outcome = 'EXPIRED'
+		        OR (cb.outcome = 'ABANDONED' AND cb.started_at IS NOT NULL))
+		   AND cb.outcome_at IS NOT NULL
+		   AND cb.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
+		 GROUP BY cb.volunteer_id
+	)`
+}
+
+// BenchedVolunteer is one entry of a DispatchCandidate's benched snapshot: the
+// volunteer and the time of its most recent benching outcome on the unit, from which
+// the cache derives the bench window (outcome + ~one deadline) and the
+// pool-exhausted fallback moment (outcome + BenchPoolExhaustedGraceSeconds).
+type BenchedVolunteer struct {
+	VolunteerID types.ID
+	OutcomeAt   time.Time
+}
+
+// parseBenchTexts parses benchedSnapshotSQL's 'uuid|epoch' texts. Defensive: a
+// malformed entry is dropped rather than failing the whole refill (the parseIDTexts
+// precedent).
+func parseBenchTexts(texts []string) []BenchedVolunteer {
+	if len(texts) == 0 {
+		return nil
+	}
+	out := make([]BenchedVolunteer, 0, len(texts))
+	for _, t := range texts {
+		idPart, epochPart, found := strings.Cut(t, "|")
+		if !found {
+			continue
+		}
+		id, err := types.ParseID(idPart)
+		if err != nil {
+			continue
+		}
+		epoch, err := strconv.ParseInt(epochPart, 10, 64)
+		if err != nil {
+			continue
+		}
+		out = append(out, BenchedVolunteer{VolunteerID: id, OutcomeAt: time.Unix(epoch, 0).UTC()})
+	}
+	return out
+}
+
 // trustedPresentCountSQL builds the scalar subquery that counts the DISTINCT TRUSTED
 // subjects already covering the work unit identified by unitID (a column expression such as
 // "wu.id" or "v.id"), for the trusted-corroborator reservation. A subject counts trusted
@@ -763,27 +867,11 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- reservation arithmetic above neutralize them). With every account OK this is inert.
 		  AND req.effective_standing <> 'BENCHED'
 		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
-		  -- this unit TIMED OUT or was abandoned mid-run is benched for roughly one more
-		  -- deadline so a fresh volunteer gets first refusal; after that cooldown it is
-		  -- eligible again, so a small volunteer pool never strands the work. The cooldown
-		  -- is a RELIABILITY signal, so it benches only a copy the volunteer actually
-		  -- STARTED (started_at set): a graceful return of UN-STARTED buffered work
-		  -- (AbandonWorkUnit on a never-run copy, or the buffer reconciler reaping a dropped
-		  -- prefetch — both close it ABANDONED with started_at NULL) is not unreliable and
-		  -- must not bench, else a dominated pool strands the work it returned (#59).
-		  -- This clause stays keyed on volunteer_id ($9), NOT the trust subject, BY
-		  -- DESIGN: the cooldown is a per-DEVICE/per-account reliability signal — one
-		  -- device timing out does not bench its siblings bound to the same DID — so it is
-		  -- deliberately NOT lifted to subject distinctness.
-		  AND NOT EXISTS (
-		    SELECT 1 FROM work_unit_assignment_history wuah4
-		    WHERE wuah4.work_unit_id = wu.id
-		      AND wuah4.volunteer_id = $9
-		      AND (wuah4.outcome = 'EXPIRED'
-		           OR (wuah4.outcome = 'ABANDONED' AND wuah4.started_at IS NOT NULL))
-		      AND wuah4.outcome_at IS NOT NULL
-		      AND wuah4.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-		  )
+		  -- this unit TIMED OUT or was abandoned mid-run is benched (cooldownGuardSQL,
+		  -- incl. the PB-9 pool-exhausted fallback) so a fresh volunteer gets first
+		  -- refusal without a small pool ever stranding the work. Keyed on volunteer_id
+		  -- ($9), NOT the trust subject, BY DESIGN — see cooldownGuardSQL.
+		  AND `+cooldownGuardSQL("wu.id", "$9", "wu")+`
 		  -- Per-MACHINE inflight cap (TODO #19): this HOST's live copies across all units.
 		  -- Keyed on COALESCE(host_id, volunteer_id) = the requester's effective host id
 		  -- ($14, the account id when no host was reported) so a user's rig and laptop have
@@ -891,12 +979,14 @@ type DispatchCandidate struct {
 	// in-memory mirror of the subject-level distinctness FindNextAssignable
 	// enforces in SQL but FindDispatchableBatch (volunteer-agnostic) cannot.
 	ContributorSubjects []string
-	// BenchedVolunteerIDs is the set of volunteers whose recent copy of this unit
-	// TIMED OUT or was ABANDONED within roughly one deadline window. They are
-	// benched (given last refusal) so a fresh volunteer gets first crack on a
-	// requeue; after the cooldown elapses they are eligible again, so a small
+	// Benched is the set of volunteers whose recent copy of this unit TIMED OUT or
+	// was ABANDONED mid-run within roughly one deadline window, each with the time
+	// of its latest benching outcome. They are benched (given last refusal) so a
+	// fresh volunteer gets first crack on a requeue; the cache derives each entry's
+	// bench window and pool-exhausted fallback moment from OutcomeAt (PB-9), so the
+	// in-memory bench mirrors — never out-lives — the SQL cooldown and a small
 	// volunteer pool never strands the work.
-	BenchedVolunteerIDs []types.ID
+	Benched []BenchedVolunteer
 	// TrustedContributorSubjects is the subset of ContributorSubjects that counts
 	// TRUSTED for the trusted-corroborator reservation at refill time: a live-copy
 	// holder whose subject's CURRENT volunteer_trust score meets the resolved
@@ -983,16 +1073,11 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 				) contribs
 			) AS contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit
-			-- (~one deadline cooldown). Only a STARTED copy benches; a graceful return of
-			-- UN-STARTED buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
-			ARRAY(
-				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
-				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
-				   AND (wuah_b.outcome = 'EXPIRED'
-				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
-				   AND wuah_b.outcome_at IS NOT NULL
-				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-			) AS benched_ids,
+			-- (~one deadline cooldown), each with its latest benching-outcome time so the
+			-- cache can seed TIMED bench entries (PB-9). Only a STARTED copy benches; a
+			-- graceful return of UN-STARTED buffered work (ABANDONED, started_at NULL) is
+			-- not unreliable (#59).
+			`+benchedSnapshotSQL("wu")+` AS benched_ids,
 			-- Trusted contributor subjects: the subset of contributor_subjects that counts
 			-- TRUSTED for the reservation at refill — live-copy holders by their CURRENT
 			-- volunteer_trust score, PENDING-result authors by the STAMPED submission-time
@@ -1069,7 +1154,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
 			ContributorSubjects:        contributorTexts,
-			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
+			Benched:                    parseBenchTexts(benchedTexts),
 			TrustedContributorSubjects: trustedContribTexts,
 			EffectiveTrustK:            trustK,
 			EffectiveTrustFloor:        trustFloor,
@@ -1196,16 +1281,10 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 				) contribs
 			) AS contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit (cooldown
-			-- ~1 deadline). Only a STARTED copy benches; a graceful return of un-started
-			-- buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
-			ARRAY(
-				SELECT DISTINCT wuah_b.volunteer_id::text FROM work_unit_assignment_history wuah_b
-				 WHERE wuah_b.work_unit_id = wu.id AND wuah_b.volunteer_id IS NOT NULL
-				   AND (wuah_b.outcome = 'EXPIRED'
-				        OR (wuah_b.outcome = 'ABANDONED' AND wuah_b.started_at IS NOT NULL))
-				   AND wuah_b.outcome_at IS NOT NULL
-				   AND wuah_b.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-			) AS benched_ids,
+			-- ~1 deadline), each with its latest benching-outcome time so the cache can seed
+			-- TIMED bench entries (PB-9). Only a STARTED copy benches; a graceful return of
+			-- un-started buffered work (ABANDONED, started_at NULL) is not unreliable (#59).
+			`+benchedSnapshotSQL("wu")+` AS benched_ids,
 			-- Trusted contributor subjects + resolved K / floor, exactly as
 			-- FindDispatchableBatch computes them (the trusted subset of the contributors, and
 			-- the SQL twins of transition.TrustPolicy.ResolveTrust), carried out per claimed
@@ -1246,7 +1325,7 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
 			ContributorSubjects:        contributorTexts,
-			BenchedVolunteerIDs:        parseIDTexts(benchedTexts),
+			Benched:                    parseBenchTexts(benchedTexts),
 			TrustedContributorSubjects: trustedContribTexts,
 			EffectiveTrustK:            trustK,
 			EffectiveTrustFloor:        trustFloor,
@@ -1437,18 +1516,10 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		  -- PROBATION account still lands copies (its results just never corroborate). Inert
 		  -- when every account is OK.
 		  AND `+standingExprSQL("vv")+` <> 'BENCHED'
-		  -- Cooldown stays keyed on volunteer_id (per-account reliability signal), NOT the
-		  -- subject, BY DESIGN: one device's timeout does not bench its siblings.
-		  AND NOT EXISTS (
-		    SELECT 1 FROM work_unit_assignment_history hb
-		    WHERE hb.work_unit_id = v.id AND hb.volunteer_id = v.vol
-		      -- Only a STARTED copy benches (reliability signal); a graceful return of
-		      -- un-started buffered work (ABANDONED, started_at NULL) does not (#59).
-		      AND (hb.outcome = 'EXPIRED'
-		           OR (hb.outcome = 'ABANDONED' AND hb.started_at IS NOT NULL))
-		      AND hb.outcome_at IS NOT NULL
-		      AND hb.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-		  )
+		  -- Cooldown (cooldownGuardSQL, incl. the PB-9 pool-exhausted fallback) stays
+		  -- keyed on volunteer_id (per-account reliability signal), NOT the subject, BY
+		  -- DESIGN: one device's timeout does not bench its siblings.
+		  AND `+cooldownGuardSQL("v.id", "v.vol", "wu")+`
 		  -- Feasibility-at-dispatch (authoritative landing): refuse to create a copy this
 		  -- volunteer's stored benchmark says it cannot finish before the unit's deadline,
 		  -- so even a stale/raced in-memory hand-out never run-starts an over-deadline copy.
@@ -1758,20 +1829,10 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		  -- read-side gate and deliberately NOT re-checked here), the BENCHED refusal is a
 		  -- per-reserver landing invariant this gate owns, so it IS re-checked. Inert when OK.
 		  AND `+standingExprSQL("vv")+` <> 'BENCHED'
-		  -- Cooldown stays keyed on volunteer_id ($2, per-account), NOT the subject, BY
-		  -- DESIGN: one device's timeout does not bench its siblings. A volunteer whose
-		  -- recent copy of this unit it STARTED timed out / was
-		  -- abandoned mid-run is benched for ~one deadline so a fresh volunteer gets first
-		  -- crack on the requeue. A graceful return of un-started buffered work (ABANDONED,
-		  -- started_at NULL) is not a reliability signal and does not bench (#59).
-		  AND NOT EXISTS (
-		    SELECT 1 FROM work_unit_assignment_history h
-		    WHERE h.work_unit_id = $1 AND h.volunteer_id = $2
-		      AND (h.outcome = 'EXPIRED'
-		           OR (h.outcome = 'ABANDONED' AND h.started_at IS NOT NULL))
-		      AND h.outcome_at IS NOT NULL
-		      AND h.outcome_at > NOW() - GREATEST(wu.deadline_seconds, 1) * INTERVAL '1 second'
-		  )
+		  -- Cooldown (cooldownGuardSQL, incl. the PB-9 pool-exhausted fallback) stays
+		  -- keyed on volunteer_id ($2, per-account), NOT the subject, BY DESIGN: one
+		  -- device's timeout does not bench its siblings.
+		  AND `+cooldownGuardSQL("$1", "$2", "wu")+`
 		  -- Feasibility-at-dispatch (spot-check landing): refuse a copy this volunteer's
 		  -- stored benchmark says it cannot finish before the unit's deadline. Skipped when
 		  -- benchmark / rsc_fpops_est / deadline is unknown. Mirrors workunit.FeasibleByDeadline.

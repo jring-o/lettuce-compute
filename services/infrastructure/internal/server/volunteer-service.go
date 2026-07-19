@@ -123,6 +123,10 @@ type volunteerService struct {
 	// per-request transaction path (used by the gRPC-plumbing unit tests that never
 	// start the cache goroutines).
 	dispatchCache *dispatchCache
+	// dispatchCacheRef, when bound via BindDispatchCacheRef, is pointed at the cache
+	// by StartDispatchCache so the HTTP router's requeue handler (built earlier) can
+	// invalidate a requeued unit's in-memory dispatch state (PB-9).
+	dispatchCacheRef *DispatchCacheRef
 	// dispatchCfg holds the Layer-2 dispatch-cache knobs captured from SetHeadConfig
 	// so StartDispatchCache can build the cache later.
 	dispatchCfg HeadDispatchConfig
@@ -337,6 +341,17 @@ func SetAdmissionPolicy(svc lettucev1.VolunteerServiceServer, cap admission.CapP
 	}
 }
 
+// BindDispatchCacheRef attaches a late-bound dispatch-cache handle (PB-9) to the
+// gRPC volunteer service. StartDispatchCache points the ref at the cache it builds,
+// after which the HTTP router's operator-requeue handler (which holds the same ref,
+// via Dependencies.DispatchCacheRef) can invalidate a requeued unit's in-memory
+// dispatch state. Follows the SetHeadConfig decoupling pattern.
+func BindDispatchCacheRef(svc lettucev1.VolunteerServiceServer, ref *DispatchCacheRef) {
+	if vs, ok := svc.(*volunteerService); ok {
+		vs.dispatchCacheRef = ref
+	}
+}
+
 // SetRegistrationPowPolicy sets the registration proof-of-work policy (design §4.1)
 // on the gRPC volunteer service. The zero value is the deploy-safety default
 // (enforcement off); main.go fills the real policy — effective difficulty/TTL always
@@ -545,6 +560,11 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) <-chan struct
 		standingRepo: s.standingRepo,
 	}, s.logger)
 	s.dispatchCache = cache
+	// Bind the HTTP-side late-bound handle (PB-9) so the operator requeue handler can
+	// invalidate a requeued unit's in-memory dispatch state from now on.
+	if s.dispatchCacheRef != nil {
+		s.dispatchCacheRef.set(cache)
+	}
 	// Point the lettuce_dispatch_* gauges at this cache (BG-29). Store-only —
 	// the gauge families were registered once at package init (see metrics.go).
 	setMetricsDispatchCache(cache)
@@ -2298,12 +2318,42 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		ctx = shedCtx
 	}
 
+	// Buffered-copy abandon (PB-7): a copy handed out from the dispatch cache is held
+	// IN MEMORY immediately, but its async copy-insert may not have landed yet. A
+	// prepare that fails fast (bad artifact URL, netguard refusal) produces an abandon
+	// INSIDE that flush window; pre-fix the head answered "no live copy found", kept
+	// both the in-memory hold and the queued write, and the orphaned RESERVED row it
+	// later flushed churned the unit for ~a reservation window before redispatch. So,
+	// exactly like StartWork's Major-3 guard: if the cache holds this volunteer's
+	// reservation, force the pending flush first — after it, the copy row is durable
+	// (closable below) or the hold was voided (nothing to close, and nothing left
+	// behind to churn).
+	hadInMemHold := s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID)
+	if hadInMemHold {
+		s.dispatchCache.flushPendingFor(ctx)
+	}
+
 	// Per-copy dispatch: abandoning a unit just closes THIS volunteer's live copy
 	// (RESERVED or RUNNING) as ABANDONED. The work unit stays QUEUED and redispatches
 	// a fresh copy to a distinct volunteer — no per-unit expire/reassign, no cap.
 	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(assignment.OutcomeAbandoned), nil); cerr != nil {
 		if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
-			// No live copy for this volunteer (already lapsed/closed): stale abandon.
+			if hadInMemHold {
+				// The volunteer DID hold this unit, but its reservation never became
+				// durable (the forced flush voided it — e.g. a flush conflict). The
+				// abandon's intent is already satisfied: no copy row exists, the
+				// in-memory hold is gone, and the unit is free to redispatch. Report
+				// success instead of churning the client with a refusal for work the
+				// head itself un-reserved.
+				s.dispatchCache.releaseInMem(workUnitID, volunteerID)
+				s.logger.Info("work unit buffered reservation released on abandon",
+					"work_unit_id", req.WorkUnitId, "volunteer_id", req.VolunteerId, "reason", req.Reason)
+				return &lettucev1.AbandonWorkUnitResponse{
+					Requeued: true,
+					Message:  "buffered reservation released; work unit requeued",
+				}, nil
+			}
+			// No live copy and no in-memory hold (already lapsed/closed): stale abandon.
 			return nil, status.Errorf(codes.FailedPrecondition, "no live copy found for this volunteer and work unit")
 		}
 		s.logger.Error("abandon: failed to close copy", "work_unit_id", req.WorkUnitId, "error", cerr)
