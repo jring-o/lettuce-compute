@@ -25,7 +25,6 @@ const (
 	VolunteerService_RequestWorkUnit_FullMethodName          = "/lettuce.volunteer.v1.VolunteerService/RequestWorkUnit"
 	VolunteerService_SubmitResult_FullMethodName             = "/lettuce.volunteer.v1.VolunteerService/SubmitResult"
 	VolunteerService_StartWork_FullMethodName                = "/lettuce.volunteer.v1.VolunteerService/StartWork"
-	VolunteerService_GetWorkUnitStatus_FullMethodName        = "/lettuce.volunteer.v1.VolunteerService/GetWorkUnitStatus"
 	VolunteerService_GetHeadInfo_FullMethodName              = "/lettuce.volunteer.v1.VolunteerService/GetHeadInfo"
 	VolunteerService_SaveCheckpoint_FullMethodName           = "/lettuce.volunteer.v1.VolunteerService/SaveCheckpoint"
 	VolunteerService_GetCheckpoint_FullMethodName            = "/lettuce.volunteer.v1.VolunteerService/GetCheckpoint"
@@ -70,8 +69,6 @@ type VolunteerServiceClient interface {
 	// submitted by its deadline is reassigned; a reserved unit whose reservation
 	// window lapses before StartWork is reclaimed.
 	StartWork(ctx context.Context, in *StartWorkRequest, opts ...grpc.CallOption) (*StartWorkResponse, error)
-	// Query status of a specific work unit.
-	GetWorkUnitStatus(ctx context.Context, in *GetWorkUnitStatusRequest, opts ...grpc.CallOption) (*GetWorkUnitStatusResponse, error)
 	// Get head identity and active leaf discovery info.
 	GetHeadInfo(ctx context.Context, in *GetHeadInfoRequest, opts ...grpc.CallOption) (*GetHeadInfoResponse, error)
 	// Save a checkpoint for a running work unit.
@@ -154,16 +151,6 @@ func (c *volunteerServiceClient) StartWork(ctx context.Context, in *StartWorkReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StartWorkResponse)
 	err := c.cc.Invoke(ctx, VolunteerService_StartWork_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *volunteerServiceClient) GetWorkUnitStatus(ctx context.Context, in *GetWorkUnitStatusRequest, opts ...grpc.CallOption) (*GetWorkUnitStatusResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetWorkUnitStatusResponse)
-	err := c.cc.Invoke(ctx, VolunteerService_GetWorkUnitStatus_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -257,8 +244,6 @@ type VolunteerServiceServer interface {
 	// submitted by its deadline is reassigned; a reserved unit whose reservation
 	// window lapses before StartWork is reclaimed.
 	StartWork(context.Context, *StartWorkRequest) (*StartWorkResponse, error)
-	// Query status of a specific work unit.
-	GetWorkUnitStatus(context.Context, *GetWorkUnitStatusRequest) (*GetWorkUnitStatusResponse, error)
 	// Get head identity and active leaf discovery info.
 	GetHeadInfo(context.Context, *GetHeadInfoRequest) (*GetHeadInfoResponse, error)
 	// Save a checkpoint for a running work unit.
@@ -304,9 +289,6 @@ func (UnimplementedVolunteerServiceServer) SubmitResult(context.Context, *Submit
 }
 func (UnimplementedVolunteerServiceServer) StartWork(context.Context, *StartWorkRequest) (*StartWorkResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartWork not implemented")
-}
-func (UnimplementedVolunteerServiceServer) GetWorkUnitStatus(context.Context, *GetWorkUnitStatusRequest) (*GetWorkUnitStatusResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetWorkUnitStatus not implemented")
 }
 func (UnimplementedVolunteerServiceServer) GetHeadInfo(context.Context, *GetHeadInfoRequest) (*GetHeadInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetHeadInfo not implemented")
@@ -452,24 +434,6 @@ func _VolunteerService_StartWork_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _VolunteerService_GetWorkUnitStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetWorkUnitStatusRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(VolunteerServiceServer).GetWorkUnitStatus(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: VolunteerService_GetWorkUnitStatus_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(VolunteerServiceServer).GetWorkUnitStatus(ctx, req.(*GetWorkUnitStatusRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _VolunteerService_GetHeadInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetHeadInfoRequest)
 	if err := dec(in); err != nil {
@@ -590,10 +554,6 @@ var VolunteerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartWork",
 			Handler:    _VolunteerService_StartWork_Handler,
-		},
-		{
-			MethodName: "GetWorkUnitStatus",
-			Handler:    _VolunteerService_GetWorkUnitStatus_Handler,
 		},
 		{
 			MethodName: "GetHeadInfo",

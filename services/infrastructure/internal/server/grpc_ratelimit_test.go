@@ -418,7 +418,7 @@ func TestIsRateLimitExempt(t *testing.T) {
 			t.Errorf("%s should be exempt regardless of package path", m)
 		}
 	}
-	limited := []string{"RegisterVolunteer", "RequestWorkUnit", "GetServerStatus", "GetHeadInfo", "GetWorkUnitStatus"}
+	limited := []string{"RegisterVolunteer", "RequestWorkUnit", "GetServerStatus", "GetHeadInfo"}
 	for _, m := range limited {
 		if isRateLimitExempt("/lettuce.v1.VolunteerService/" + m) {
 			t.Errorf("%s must NOT be exempt", m)
