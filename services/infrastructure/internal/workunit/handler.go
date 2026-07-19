@@ -69,9 +69,12 @@ type WorkUnitHandler struct {
 	batchRepo  BatchRepository
 	leafRepo   leaf.Repository
 	assignRepo assignment.Repository // optional; enables closing assignment outcomes on requeue
-	generate   GenerateFunc
-	sink       BatchSink // eager-generation persistence seam (design §4.8); per-batch atomic
-	logger     *slog.Logger
+	// dispatchInvalidator lets requeue drop the unit's stale in-memory dispatch state
+	// (PB-9); optional, nil = no-op.
+	dispatchInvalidator DispatchInvalidator
+	generate            GenerateFunc
+	sink                BatchSink // eager-generation persistence seam (design §4.8); per-batch atomic
+	logger              *slog.Logger
 }
 
 // SetAssignmentRepo wires the assignment-history repository so operator requeue
@@ -81,6 +84,30 @@ type WorkUnitHandler struct {
 // IS NULL exclusion). Optional so existing constructor call sites are unchanged.
 func (h *WorkUnitHandler) SetAssignmentRepo(r assignment.Repository) {
 	h.assignRepo = r
+}
+
+// DispatchInvalidator lets the operator requeue reach the in-process dispatch cache
+// (PB-9): requeue rewrites the unit's DB state, but the cache's staged candidate
+// keeps serving its stale refill-time bench/contributor snapshots — and its
+// in-memory holds keep the unit excluded from refill — until something drops them.
+// Implemented by the server package's dispatch cache; a no-op when unwired.
+type DispatchInvalidator interface {
+	// InvalidateWorkUnit drops the unit's staged candidate and in-memory holds and
+	// requests a re-stage from a fresh DB snapshot.
+	InvalidateWorkUnit(id types.ID)
+}
+
+// SetDispatchInvalidator wires the dispatch cache invalidation hook (PB-9).
+// Optional so existing constructor call sites are unchanged.
+func (h *WorkUnitHandler) SetDispatchInvalidator(inv DispatchInvalidator) {
+	h.dispatchInvalidator = inv
+}
+
+// invalidateDispatch forwards to the wired invalidator, if any.
+func (h *WorkUnitHandler) invalidateDispatch(id types.ID) {
+	if h.dispatchInvalidator != nil {
+		h.dispatchInvalidator.InvalidateWorkUnit(id)
+	}
 }
 
 // NewWorkUnitHandler creates a new WorkUnitHandler. sink is the per-batch atomic persistence
@@ -290,6 +317,11 @@ func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) 
 			apierror.WriteError(w, apierror.FromError(err))
 			return
 		}
+		// PB-9: drop the unit's stale in-memory dispatch state (staged candidate with
+		// its refill-time bench/contributor snapshots, in-memory holds, queued writes)
+		// so the requeue takes effect at dispatch NOW, from a fresh DB snapshot —
+		// instead of after whatever the reconciler eventually notices.
+		h.invalidateDispatch(workUnitID)
 		// Already QUEUED; dispatchable now that its live copies are closed.
 		l.Info("work unit requeued by operator (live copies abandoned)",
 			"work_unit_id", workUnitID, "leaf_id", leafID)
@@ -307,6 +339,9 @@ func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) 
 			apierror.WriteError(w, apierror.FromError(err))
 			return
 		}
+		// PB-9: as in the QUEUED arm — drop stale in-memory dispatch state so the
+		// requeued unit re-stages from a fresh DB snapshot immediately.
+		h.invalidateDispatch(workUnitID)
 		l.Info("work unit requeued by operator",
 			"work_unit_id", workUnitID, "leaf_id", leafID, "requeued", requeued, "state", updated.State)
 		writeJSON(w, http.StatusOK, map[string]any{

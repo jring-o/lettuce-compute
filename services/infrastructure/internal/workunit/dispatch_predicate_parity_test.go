@@ -45,6 +45,11 @@ import (
 // of which floor the scenario resolves.
 const parityTrustedScore = 1000000
 
+// The shared scenario table cannot import this package, so its copy of the
+// pool-exhausted fallback grace (PB-9) is pinned to the production constant here:
+// a drift fails compilation.
+var _ = [1]struct{}{}[BenchPoolExhaustedGraceSeconds-dispatchparity.FallbackGraceSeconds]
+
 // seededParity identifies the freshly seeded rows a single scenario needs.
 type seededParity struct {
 	leafID    types.ID
@@ -281,16 +286,16 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 	if s.SelfPendingResult {
 		insertPendingResult(t, pool, wu.ID, requester)
 	}
+	// The outcome age comes from the SHARED timing rule (CooldownOutcomeAgoSeconds)
+	// so both projections place the benching outcome identically — including the
+	// PB-9 pool-exhausted fallback state (inside the window, past the grace).
 	switch s.Cooldown {
-	case dispatchparity.CooldownExpiredRecent:
-		insertCooldownCopy(t, pool, wu.ID, requester, "EXPIRED", true, 0)
+	case dispatchparity.CooldownExpiredRecent, dispatchparity.CooldownExpiredStale, dispatchparity.CooldownExpiredExhausted:
+		insertCooldownCopy(t, pool, wu.ID, requester, "EXPIRED", true, s.CooldownOutcomeAgoSeconds())
 	case dispatchparity.CooldownStartedAbandon:
-		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", true, 0)
+		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", true, s.CooldownOutcomeAgoSeconds())
 	case dispatchparity.CooldownUnstartedAbandon:
-		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", false, 0)
-	case dispatchparity.CooldownExpiredStale:
-		// outcome_at older than the cooldown window (GREATEST(deadline,1) seconds).
-		insertCooldownCopy(t, pool, wu.ID, requester, "EXPIRED", true, s.DeadlineSeconds+120)
+		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", false, s.CooldownOutcomeAgoSeconds())
 	}
 
 	// Subject (DID) distinctness. Mint ONE DID per scenario and reuse it for the

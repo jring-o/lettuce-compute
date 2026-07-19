@@ -193,9 +193,20 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		dbActive++
 		contributors[paritySubject(types.NewID(), otherDID, dispatchparity.BindingOK)] = struct{}{}
 	}
-	benched := map[types.ID]struct{}{}
+	// Benched entries are TIMED (PB-9), derived from the benching outcome's age exactly
+	// as benchSet derives them from the SQL snapshot — the SQL half seeds the same age
+	// via insertCooldownCopy(outcomeAgoSecs = s.CooldownOutcomeAgoSeconds()).
+	benched := map[types.ID]benchEntry{}
 	if s.Benched() {
-		benched[requester] = struct{}{}
+		outcomeAt := c.now().Add(-time.Duration(s.CooldownOutcomeAgoSeconds()) * time.Second)
+		cooldown := time.Duration(s.DeadlineSeconds) * time.Second
+		if cooldown < time.Second {
+			cooldown = time.Second
+		}
+		benched[requester] = benchEntry{
+			until:      outcomeAt.Add(cooldown),
+			fallbackAt: outcomeAt.Add(benchPoolExhaustedGraceSeconds * time.Second),
+		}
 	}
 
 	// Resolve the candidate's trusted-corroborator requirement (K) and floor through the

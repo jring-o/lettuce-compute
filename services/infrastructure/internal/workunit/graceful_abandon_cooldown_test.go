@@ -150,8 +150,10 @@ func TestFindDispatchableBatch_GracefulBufferReturnNotBenched(t *testing.T) {
 	if cand == nil {
 		t.Fatalf("unit not staged by FindDispatchableBatch after a graceful abandon (it should be re-dispatchable)")
 	}
-	if containsID(cand.BenchedVolunteerIDs, volA) {
-		t.Fatalf("graceful never-started abandoner volA must NOT be in the benched snapshot, got %v", cand.BenchedVolunteerIDs)
+	for _, b := range cand.Benched {
+		if b.VolunteerID == volA {
+			t.Fatalf("graceful never-started abandoner volA must NOT be in the benched snapshot, got %v", cand.Benched)
+		}
 	}
 }
 

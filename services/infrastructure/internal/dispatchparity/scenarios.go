@@ -121,14 +121,46 @@ const (
 	// CooldownExpiredStale: a timeout whose outcome_at is OLDER than the cooldown
 	// window (roughly one deadline). Does NOT bench — the cooldown has elapsed.
 	CooldownExpiredStale
+	// CooldownExpiredExhausted: a timeout INSIDE the cooldown window but older than
+	// the pool-exhausted fallback grace (FallbackGraceSeconds). A bench row exists,
+	// but whether it refuses depends on the unit's current coverage: with ZERO live
+	// copies the fallback re-admits the requester (work never strands, PB-9); with
+	// any live copy the bench holds.
+	CooldownExpiredExhausted
 )
 
-// benches reports whether this cooldown state leaves the requester benched (last
-// refusal) at hand-out time. This is the exact rule the SQL cooldown clauses and
-// FindDispatchableBatch's benched snapshot implement; the Go projection uses it to
-// build the candidate's benched set.
+// FallbackGraceSeconds is the pool-exhausted fallback grace of the post-failure
+// cooldown (PB-9). It MUST equal workunit.BenchPoolExhaustedGraceSeconds — this
+// package cannot import workunit (each layer translates primitives), so the SQL
+// parity half asserts the two constants agree.
+const FallbackGraceSeconds = 120
+
+// CooldownOutcomeAgoSeconds returns how many seconds in the past the requester's
+// benching outcome (outcome_at) should be placed for this scenario's cooldown state
+// — the single timing rule BOTH projections consume (the SQL half seeds a history
+// row this old; the Go half derives the candidate's timed bench entry from it).
+func (s Scenario) CooldownOutcomeAgoSeconds() int {
+	switch s.Cooldown {
+	case CooldownExpiredStale:
+		// Older than the cooldown window (~one deadline): the cooldown has elapsed.
+		return s.DeadlineSeconds + 120
+	case CooldownExpiredExhausted:
+		// Inside the cooldown window but past the fallback grace.
+		return FallbackGraceSeconds + 60
+	default:
+		// A fresh outcome (moments ago): inside both the window and the grace.
+		return 0
+	}
+}
+
+// benches reports whether this cooldown state creates a bench ENTRY for the
+// requester (a benching history row inside the cooldown window). This is the exact
+// membership rule the SQL cooldown clauses and FindDispatchableBatch's benched
+// snapshot implement; the Go projection uses it to build the candidate's timed
+// benched set. Whether an entry actually REFUSES additionally depends on its window
+// and the pool-exhausted fallback (PB-9) — see CooldownExpiredExhausted.
 func (c CooldownState) benches() bool {
-	return c == CooldownExpiredRecent || c == CooldownStartedAbandon
+	return c == CooldownExpiredRecent || c == CooldownStartedAbandon || c == CooldownExpiredExhausted
 }
 
 // Gate identifies one of the four predicate implementations under parity test.
@@ -593,6 +625,21 @@ func Scenarios() []Scenario {
 		with("cooldown_expired_stale_window_elapsed", DimCooldown, func(s *Scenario) {
 			s.Cooldown = CooldownExpiredStale // failure older than the cooldown window
 			s.Eligible = true
+		}),
+		with("cooldown_pool_exhausted_fallback_readmitted", DimCooldown, func(s *Scenario) {
+			// PB-9 (head-setup §Redundancy): a benching outcome older than the fallback
+			// grace, and the unit still has ZERO live copies — no fresh volunteer took it
+			// in all that time. The bench yields so the work does not strand.
+			s.Cooldown = CooldownExpiredExhausted
+			s.Eligible = true
+		}),
+		with("cooldown_pool_exhausted_but_unit_covered_still_benched", DimCooldown, func(s *Scenario) {
+			// Control for the fallback: same aged outcome, but ANOTHER volunteer holds a
+			// live copy — the pool is not exhausted, so the bench holds for the rest of
+			// its window (fresh volunteers keep first refusal).
+			s.Cooldown = CooldownExpiredExhausted
+			s.OtherLiveCopies = 1 // TargetCopies=2 → headroom remains; refusal is the bench
+			s.Eligible = false
 		}),
 
 		// --- per-machine in-flight cap ---------------------------------------

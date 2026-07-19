@@ -219,3 +219,60 @@ func TestHandleRequeue_TerminalStateRejected(t *testing.T) {
 		t.Errorf("ExpireLiveCopies must not be called for a terminal unit, got %d", repo.expireCalls)
 	}
 }
+
+// recordingInvalidator captures InvalidateWorkUnit calls (the PB-9 requeue →
+// dispatch-cache invalidation seam).
+type recordingInvalidator struct {
+	calls []types.ID
+}
+
+func (r *recordingInvalidator) InvalidateWorkUnit(id types.ID) { r.calls = append(r.calls, id) }
+
+// TestHandleRequeue_InvalidatesDispatchState (PB-9): the operator requeue must drop
+// the unit's in-memory dispatch state via the wired invalidator — pre-fix the HTTP
+// handler had no path to the dispatch cache at all, so a requeue 200 OK changed
+// nothing about dispatch: the staged candidate kept its stale refill-time bench and
+// contributor snapshots and the in-memory holds kept the unit excluded from refill.
+func TestHandleRequeue_InvalidatesDispatchState(t *testing.T) {
+	leafID := types.NewID()
+	wuID := types.NewID()
+
+	// QUEUED arm.
+	repo := &stubRequeueRepo{
+		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
+			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, nil
+		},
+	}
+	inv := &recordingInvalidator{}
+	h := newRequeueHandler(repo)
+	h.SetDispatchInvalidator(inv)
+	rec, req := newRequeueRequest(t, leafID, wuID)
+	h.HandleRequeue(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("QUEUED requeue status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(inv.calls) != 1 || inv.calls[0] != wuID {
+		t.Fatalf("QUEUED requeue invalidator calls = %v, want exactly [%s]", inv.calls, wuID)
+	}
+
+	// EXPIRED arm.
+	repo = &stubRequeueRepo{
+		getByID: func(_ context.Context, id types.ID) (*WorkUnit, error) {
+			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateExpired}, nil
+		},
+		reassign: func(_ context.Context, id types.ID) (*WorkUnit, bool, error) {
+			return &WorkUnit{ID: wuID, LeafID: leafID, State: WorkUnitStateQueued}, true, nil
+		},
+	}
+	inv = &recordingInvalidator{}
+	h = newRequeueHandler(repo)
+	h.SetDispatchInvalidator(inv)
+	rec, req = newRequeueRequest(t, leafID, wuID)
+	h.HandleRequeue(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("EXPIRED requeue status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(inv.calls) != 1 || inv.calls[0] != wuID {
+		t.Fatalf("EXPIRED requeue invalidator calls = %v, want exactly [%s]", inv.calls, wuID)
+	}
+}
