@@ -360,7 +360,7 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 		// runtime's netguard-guarded client — the default-image SSRF surface — not an
 		// unscreened default client. Passing c.httpClient routes it through the same
 		// dial screen as every other fetch (and is the test seam).
-		data, _, err := DownloadExternalDataWithClient(ctx, c.httpClient, wu.InputDataURL, DefaultMaxDownloadBytes)
+		data, _, err := DownloadExternalDataWithClient(ctx, artifactClientForUnit(c.httpClient, wu, c.logger), wu.InputDataURL, DefaultMaxDownloadBytes)
 		if err != nil {
 			return nil, fmt.Errorf("download input data: %w", err)
 		}
@@ -438,7 +438,7 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 	// Download and extract viz bundle if present. Viz is a dashboard-only concern
 	// (the container never reads it); a bad/missing bundle must NEVER block compute,
 	// so we warn and continue without it. See TODO #39.
-	vizPath, err := PrepareVizBundle(ctx, c.dataDir, workDir, &wu.ExecutionSpec, c.httpClient, c.logger)
+	vizPath, err := PrepareVizBundle(ctx, c.dataDir, workDir, &wu.ExecutionSpec, artifactClientForUnit(c.httpClient, wu, c.logger), c.logger)
 	if err != nil {
 		c.logger.Warn("container.Prepare: viz bundle prep failed; continuing without viz (compute unaffected)",
 			"work_unit_id", wu.ID, "error", err)

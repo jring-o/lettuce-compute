@@ -96,6 +96,16 @@ go build -o lettuce-volunteer ./services/volunteer-cli/cmd/lettuce-volunteer
 
 > `--grpc-port 9090 --insecure` are only valid on `attach`, not `init` — the dev stack
 > serves plain gRPC on 9090 with no TLS. In production both default to 443 over HTTPS.
+>
+> **Fetching locally-hosted leaf artifacts needs two explicit opt-ins.** By default the
+> head refuses `http://` binary URLs at leaf configuration (set
+> `LETTUCE_BINARY_URL_ALLOW_INSECURE=true` on the `infrastructure` service for local
+> testing only), and the volunteer's network guard refuses artifact downloads that
+> resolve to loopback or private-network addresses. To let this local volunteer fetch
+> binaries hosted on your own machine, start it with your head opted in:
+> `LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS=localhost ./lettuce-volunteer start`.
+> The opt-in is scoped to the named head(s) only and WARN-logged on every use — full
+> details and caveats in first-leaf.md → “Testing locally”.
 
 Tear down when you're done:
 

@@ -577,16 +577,43 @@ curl -s -X POST $HEAD/api/v1/leafs/$LEAF_ID/archive -H "Authorization: Bearer $A
 ## Testing locally
 
 The local dry-run stack from head-setup.md (`compose.yaml`) is great for confirming the
-server runs, but it can't do the full leaf flow above, because it has **no Caddy/binaries
-directory, no registry, and no admin user**. To experiment entirely locally you'd need to:
+server runs, but it can't do the full leaf flow above out of the box, because it has **no
+Caddy/binaries directory, no registry, and no admin user** — and both the head and the
+volunteer deliberately refuse plain-HTTP, private-network artifact URLs unless you opt in
+explicitly. To experiment entirely locally:
 
 1. **Create an admin user** so you have a `creator_id`: add `LETTUCE_ADMIN_EMAIL` and
    `LETTUCE_ADMIN_PASSWORD` to the `infrastructure` service in `compose.yaml`, then
    `docker compose up -d`. Look up the ID with the same `psql` query as above (using
    `docker compose` without the `-f compose.production.yaml` flag).
-2. **Host the binary yourself** — e.g. `python3 -m http.server` in a directory, and point
-   `binaries` at `http://<your-ip>:8000/...`.
-3. Use `HEAD="http://localhost:8080"` and the dev admin key
+2. **Host the binary yourself** — e.g. `python3 -m http.server 8000` in a directory, and
+   point `binaries` at `http://<your-ip>:8000/...`.
+3. **Let the head accept plain-HTTP binary URLs.** Leaf configuration refuses `http://`
+   binary URLs by default (`must use https scheme`). For local testing only, add
+   `LETTUCE_BINARY_URL_ALLOW_INSECURE=true` to the `infrastructure` service environment
+   and restart it. The head logs a SECURITY warning at boot while this is set; never set
+   it on a real deployment.
+4. **Let your volunteer fetch artifacts from private/loopback addresses.** The
+   volunteer's network guard screens every artifact download (binary, WASM module,
+   external input, viz bundle) against the resolved IP and refuses loopback and
+   private-network addresses, so a malicious leaf can't probe a volunteer's home
+   network. That includes your `http://<your-ip>:8000/...` URLs. For local testing,
+   start the daemon with your own head explicitly opted in:
+
+   ```bash
+   LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS=localhost lettuce-volunteer start
+   ```
+
+   The value is a comma-separated list of head names exactly as configured at `attach`
+   (shown by `lettuce-volunteer status`; a head attached without a name is listed by
+   its address). Only work dispatched by a listed head is exempted — downloads for
+   every other head keep the full guard — and every exempted download is WARN-logged.
+   There is no wildcard. Checksum verification and download size caps still apply.
+   Don't leave this set when attaching to heads you don't operate yourself.
+5. **For a NATIVE leaf, trust your own head for native execution** (native is a
+   per-head opt-in and off by default): `lettuce-volunteer heads trust localhost native`,
+   or attach with `--trust native`.
+6. Use `HEAD="http://localhost:8080"` and the dev admin key
    `dev-admin-key-not-for-production`.
 
 In practice, most people just run the walkthrough against their real head. When in doubt,

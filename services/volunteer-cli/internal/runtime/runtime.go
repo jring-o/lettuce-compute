@@ -26,6 +26,14 @@ type WorkUnit struct {
 	RscFpopsEst     float64           // estimated FP ops (0 = unknown)
 	ReservedUntilUnix int64           // head-set lease expiry for this buffered unit (0 = unset)
 
+	// SourceHead is the display name of the head this unit was dispatched by
+	// (config server name; gRPC address for an unnamed head). Set by the fetcher
+	// when the unit is received — it is NOT part of the wire assignment — and
+	// consulted by the artifact netguard opt-in (artifact_exemption.go) to scope
+	// private/loopback fetches to explicitly named heads. Persisted with buffered
+	// state so a resumed unit keeps its scope.
+	SourceHead string
+
 	// Checkpoint fields (from RequestWorkUnitResponse)
 	HasCheckpoint             bool  // true if a checkpoint exists for this reassigned WU
 	CheckpointSequence        int32 // sequence number of the latest checkpoint

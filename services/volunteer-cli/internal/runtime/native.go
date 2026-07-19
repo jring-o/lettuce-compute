@@ -111,8 +111,12 @@ func (n *NativeRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResu
 	}
 	n.logger.Debug("native.Prepare: downloading binary", "work_unit_id", wu.ID, "platform", pk, "url", binaryURL, "expected_sha256", expectedChecksum)
 
+	// One client for all of this unit's artifact downloads: guarded, unless the
+	// unit's head carries the explicit private-artifact opt-in (WARN-logged).
+	client := artifactClientForUnit(n.httpClient, wu, n.logger)
+
 	// Download (or reuse a checksum-keyed cached copy) and verify integrity.
-	binaryPath, err := n.ensureBinary(ctx, binaryURL, expectedChecksum)
+	binaryPath, err := n.ensureBinary(ctx, client, binaryURL, expectedChecksum)
 	if err != nil {
 		n.logger.Warn("native.Prepare: binary download/verify failed", "work_unit_id", wu.ID, "error", err)
 		return nil, fmt.Errorf("prepare binary: %w", err)
@@ -140,7 +144,7 @@ func (n *NativeRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResu
 		n.logger.Debug("native.Prepare: wrote input data", "work_unit_id", wu.ID, "size", len(wu.InputData))
 	} else if wu.InputDataURL != "" {
 		inputPath := filepath.Join(workDir, "input.dat")
-		if err := n.downloadFile(ctx, wu.InputDataURL, inputPath); err != nil {
+		if err := n.downloadFile(ctx, client, wu.InputDataURL, inputPath); err != nil {
 			return nil, fmt.Errorf("download input data: %w", err)
 		}
 		result.InputPath = inputPath
@@ -157,7 +161,7 @@ func (n *NativeRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResu
 
 	// Download and extract viz bundle if present.
 	n.logger.Debug("native.Prepare: checking viz bundle", "work_unit_id", wu.ID)
-	vizPath, err := PrepareVizBundle(ctx, n.dataDir, workDir, &wu.ExecutionSpec, n.httpClient, n.logger)
+	vizPath, err := PrepareVizBundle(ctx, n.dataDir, workDir, &wu.ExecutionSpec, client, n.logger)
 	if err != nil {
 		// Viz is a dashboard-only rendering concern; the compute binary never reads
 		// it. A bad/missing viz bundle must NEVER block computation, so we warn and
@@ -368,7 +372,7 @@ func (n *NativeRuntime) Cleanup(prep *PrepareResult) error {
 // and two leafs that legitimately ship the same artifact share one cached copy.
 // After any fresh download the bytes are re-hashed and verified before the file
 // is made executable; a mismatch deletes the download and fails closed.
-func (n *NativeRuntime) ensureBinary(ctx context.Context, url, expectedChecksum string) (string, error) {
+func (n *NativeRuntime) ensureBinary(ctx context.Context, client *http.Client, url, expectedChecksum string) (string, error) {
 	if expectedChecksum == "" {
 		// Defense in depth: callers must pre-check, but never run unverified.
 		return "", fmt.Errorf("no expected checksum: refusing to download unverified native binary")
@@ -405,7 +409,7 @@ func (n *NativeRuntime) ensureBinary(ctx context.Context, url, expectedChecksum 
 	tmp.Close()
 	defer os.Remove(tmpPath) // no-op once renamed away
 
-	if err := n.downloadFile(ctx, url, tmpPath); err != nil {
+	if err := n.downloadFile(ctx, client, url, tmpPath); err != nil {
 		return "", err
 	}
 
@@ -448,14 +452,15 @@ func fileChecksumSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// downloadFile downloads a URL to the given path using atomic write.
-func (n *NativeRuntime) downloadFile(ctx context.Context, url, destPath string) error {
+// downloadFile downloads a URL to the given path using atomic write, through
+// the given per-unit artifact client (see artifactClientForUnit).
+func (n *NativeRuntime) downloadFile(ctx context.Context, client *http.Client, url, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := n.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}

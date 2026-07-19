@@ -647,6 +647,10 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 	}
 	for _, asg := range assignments {
 		wu := runtime.WorkUnitFromProto(asg)
+		// Stamp the dispatching head (display name) on the unit: the artifact
+		// netguard opt-in (runtime/artifact_exemption.go) is scoped per head, and
+		// this is where units and heads meet.
+		wu.SourceHead = head.Name
 		f.logger.Info("fetcher: received work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime)
 
 		// SECURITY (H2): the head supplies the work unit ID, which becomes the

@@ -80,8 +80,12 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 	// we proceed but log a warning rather than fail closed (unlike native).
 	expectedChecksum := strings.ToLower(wu.ExecutionSpec.BinaryChecksums["wasm"])
 
+	// One client for all of this unit's artifact downloads: guarded, unless the
+	// unit's head carries the explicit private-artifact opt-in (WARN-logged).
+	client := artifactClientForUnit(w.httpClient, wu, w.logger)
+
 	// Download or use cached module.
-	modulePath, err := w.ensureModule(ctx, wasmURL, expectedChecksum)
+	modulePath, err := w.ensureModule(ctx, client, wasmURL, expectedChecksum)
 	if err != nil {
 		return nil, fmt.Errorf("prepare wasm module: %w", err)
 	}
@@ -106,7 +110,7 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 		result.InputPath = inputPath
 	} else if wu.InputDataURL != "" {
 		inputPath := filepath.Join(workDir, "input.dat")
-		if err := w.downloadToFile(ctx, wu.InputDataURL, inputPath); err != nil {
+		if err := w.downloadToFile(ctx, client, wu.InputDataURL, inputPath); err != nil {
 			return nil, fmt.Errorf("download input data: %w", err)
 		}
 		result.InputPath = inputPath
@@ -123,7 +127,7 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 	// Download and extract viz bundle if present. Viz is a dashboard-only concern
 	// (the wasm module never reads it); a bad/missing bundle must NEVER block
 	// compute, so we warn and continue without it. See TODO #39.
-	vizPath, err := PrepareVizBundle(ctx, w.dataDir, workDir, &wu.ExecutionSpec, w.httpClient, w.logger)
+	vizPath, err := PrepareVizBundle(ctx, w.dataDir, workDir, &wu.ExecutionSpec, client, w.logger)
 	if err != nil {
 		w.logger.Warn("wasm.Prepare: viz bundle prep failed; continuing without viz (compute unaffected)",
 			"work_unit_id", wu.ID, "error", err)
@@ -303,7 +307,7 @@ func (w *WasmRuntime) Cleanup(prep *PrepareResult) error {
 // no checksum is supplied the module is keyed by URL and only the WASM magic
 // bytes are checked — acceptable because WASM runs sandboxed — but a warning is
 // logged so operators know the artifact was unverified.
-func (w *WasmRuntime) ensureModule(ctx context.Context, url, expectedChecksum string) (string, error) {
+func (w *WasmRuntime) ensureModule(ctx context.Context, client *http.Client, url, expectedChecksum string) (string, error) {
 	cacheDir := filepath.Join(w.dataDir, "wasm-cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", fmt.Errorf("create cache dir: %w", err)
@@ -339,7 +343,7 @@ func (w *WasmRuntime) ensureModule(ctx context.Context, url, expectedChecksum st
 	tmp.Close()
 	defer os.Remove(tmpPath) // no-op once renamed away
 
-	if err := w.downloadToFile(ctx, url, tmpPath); err != nil {
+	if err := w.downloadToFile(ctx, client, url, tmpPath); err != nil {
 		return "", err
 	}
 
@@ -400,13 +404,13 @@ func verifyWasmMagic(path string) error {
 }
 
 // downloadToFile downloads a URL to the given path using atomic write.
-func (w *WasmRuntime) downloadToFile(ctx context.Context, url, destPath string) error {
+func (w *WasmRuntime) downloadToFile(ctx context.Context, client *http.Client, url, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := w.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
