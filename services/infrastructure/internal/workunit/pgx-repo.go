@@ -966,8 +966,8 @@ type DispatchCandidate struct {
 	// enforces in the SQL headroom — forcing full replication around neutralized
 	// copies/results. 0 for an all-OK population, so the cache arithmetic is unchanged.
 	ProbationCoverage int
-	// Runtime is the leaf's execution_config.runtime (used to assert the WASM
-	// partition and for capability matching at hand-out).
+	// Runtime is the leaf's execution_config.runtime (for capability matching at
+	// hand-out; WASM stages like every other runtime since PB-11).
 	Runtime string
 	// ContributorSubjects is the set of trust SUBJECTS (a live-bound DID, else the
 	// per-keypair "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin)
@@ -1026,9 +1026,17 @@ type DispatchCandidate struct {
 //   - excludeIDs (the cache's in-memory-reserved id set) are excluded via
 //     NOT wu.id = ANY($2): a DB-level backstop so two refill ticks cannot re-stage
 //     a unit the cache already handed out but has not yet flushed.
-//   - WASM-runtime leafs are excluded: those are dispatched by the separate
-//     immediate-assign browser path, partitioned from the cache by runtime so there
-//     is exactly one writer per unit.
+//   - WASM-runtime leafs are INCLUDED (PB-11). They used to be excluded ("dispatched
+//     by the immediate-assign browser path, not the cache"), which made the CLI's
+//     fully-working wazero/WASI runtime unreachable: gRPC serves only from the cache,
+//     so a WASM leaf's units sat QUEUED for CLI volunteers forever while the CLI
+//     advertised WASM and counted its leafs eligible. The browser immediate-assign
+//     path still dispatches WASM independently (it reads via FindNextAssignable,
+//     which ignores dispatch claims); the two dispatchers are arbitrated by the SQL
+//     landing gates exactly like two head replicas' caches — per-volunteer
+//     distinctness / cooldown / the live-copy unique are authoritative at landing,
+//     and the residual browser-tx-vs-cache-flush headroom race is bounded to one
+//     extra redundant copy (a wasted-compute corner, never a wrong validation).
 //   - FOR UPDATE OF wu SKIP LOCKED is KEPT (short-lived for a bulk read), the proven
 //     no-double-hand primitive; the refill writes nothing, so the lock is released
 //     at the end of this SELECT's transaction.
@@ -1096,8 +1104,10 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		JOIN leafs l ON wu.leaf_id = l.id
 		WHERE wu.state = 'QUEUED'
 		  AND l.state = 'ACTIVE'
-		  -- WASM is dispatched by the immediate-assign browser path, not the cache.
-		  AND COALESCE(l.execution_config->>'runtime', 'NATIVE') <> 'WASM'
+		  -- All runtimes stage, WASM included (PB-11): the CLI's WASI runtime is served
+		  -- from the cache like every other gRPC dispatch; the browser immediate-assign
+		  -- path independently dispatches WASM via FindNextAssignable (see the function
+		  -- comment for the arbitration rationale).
 		  -- DB-level backstop: never re-stage a unit the cache already holds in memory.
 		  -- Guard the NULL/empty exclude set explicitly: id = ANY(NULL::uuid[]) is NULL
 		  -- (not FALSE), so a bare NOT (id = ANY($2)) would filter out EVERY row whenever
@@ -1105,7 +1115,7 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		  -- empty/absent exclude set a no-op instead.
 		  AND (array_length($2::uuid[], 1) IS NULL OR NOT (wu.id = ANY($2::uuid[])))
 		  -- Optional leaf scope (the on-demand leaf-scoped refill): when $3 is empty the
-		  -- select spans all ACTIVE non-WASM leafs; otherwise it is confined to those
+		  -- select spans all ACTIVE leafs; otherwise it is confined to those
 		  -- leafs so a leaf-filtered requester can be served even when the ready pool is
 		  -- monopolized by a higher-priority/older leaf.
 		  AND (array_length($3::uuid[], 1) IS NULL OR wu.leaf_id = ANY($3::uuid[]))
@@ -1229,8 +1239,10 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			JOIN leafs l2 ON wu2.leaf_id = l2.id
 			WHERE wu2.state = 'QUEUED'
 			  AND l2.state = 'ACTIVE'
-			  -- WASM is dispatched by the immediate-assign browser path, not the cache.
-			  AND COALESCE(l2.execution_config->>'runtime', 'NATIVE') <> 'WASM'
+			  -- All runtimes stage, WASM included (PB-11) — see FindDispatchableBatch. The
+			  -- claim stamped here does NOT hide the unit from the browser immediate-assign
+			  -- path (FindNextAssignable is claim-blind by design), so browser volunteers
+			  -- keep dispatching WASM alongside the cache.
 			  -- DB-level backstop: never re-stage a unit the cache already holds in memory.
 			  AND (array_length($2::uuid[], 1) IS NULL OR NOT (wu2.id = ANY($2::uuid[])))
 			  -- Optional leaf scope (the on-demand leaf-scoped refill).
