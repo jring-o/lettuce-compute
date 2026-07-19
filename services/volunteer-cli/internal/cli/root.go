@@ -27,6 +27,26 @@ func newRootCmd() *cobra.Command {
 		Long:    "Volunteer your computing resources to distributed science via the Lettuce network.",
 		Version: version,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// An explicit --data-dir names an isolated profile: everything the
+			// volunteer persists — config included — lives inside it. Unless
+			// --config points somewhere explicitly, the profile's config is
+			// <data-dir>/config.yaml, never the default profile's
+			// ~/.lettuce/config.yaml (which an isolated run must not read, and
+			// init must not rewrite). The path is made absolute first: the
+			// daemon resolves cached binaries from it while compute children
+			// run in their own working directories, so a relative value breaks
+			// execution far from where it was typed.
+			if cmd.Flags().Changed("data-dir") {
+				abs, err := filepath.Abs(dataDir)
+				if err != nil {
+					return fmt.Errorf("resolving --data-dir: %w", err)
+				}
+				dataDir = abs
+				if !cmd.Flags().Changed("config") {
+					cfgPath = filepath.Join(dataDir, "config.yaml")
+				}
+			}
+
 			// Skip config loading for init command — it creates the config.
 			if cmd.Name() == "init" {
 				return nil
@@ -47,6 +67,11 @@ func newRootCmd() *cobra.Command {
 			}
 			if cmd.Flags().Changed("log-file") {
 				cfg.LogFile = logFile
+			}
+			// A relative data_dir written INTO the config file breaks the same
+			// way a relative flag does; resolve once here for every command.
+			if abs, absErr := filepath.Abs(cfg.DataDir); absErr == nil {
+				cfg.DataDir = abs
 			}
 			return nil
 		},
