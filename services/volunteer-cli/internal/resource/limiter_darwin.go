@@ -52,7 +52,7 @@ func (d *DarwinLimiter) Enforce(pid int, limits *config.ResourceLimits) (func(),
 func (d *DarwinLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
-		return fmt.Errorf("statfs %s: %w", path, err)
+		return fmt.Errorf("%w: statfs %s: %v", ErrDiskSpaceUnknown, path, err)
 	}
 
 	availableMB := (uint64(stat.Bavail) * uint64(stat.Bsize)) / (1024 * 1024)

@@ -178,7 +178,7 @@ func (w *WindowsLimiter) Enforce(pid int, limits *config.ResourceLimits) (func()
 func (w *WindowsLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
-		return fmt.Errorf("invalid path: %w", err)
+		return fmt.Errorf("%w: invalid path %s: %v", ErrDiskSpaceUnknown, path, err)
 	}
 
 	var freeBytes, totalBytes, totalFreeBytes uint64
@@ -189,7 +189,7 @@ func (w *WindowsLimiter) CheckDiskSpace(path string, requiredMB int) error {
 		uintptr(unsafe.Pointer(&totalFreeBytes)),
 	)
 	if ret == 0 {
-		return fmt.Errorf("GetDiskFreeSpaceEx: %w", callErr)
+		return fmt.Errorf("%w: GetDiskFreeSpaceEx %s: %v", ErrDiskSpaceUnknown, path, callErr)
 	}
 
 	availableMB := freeBytes / (1024 * 1024)
