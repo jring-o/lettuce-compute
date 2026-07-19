@@ -93,10 +93,10 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 	}
 
 	// Load the identity keypair — the same account key the daemon authenticates with.
-	pub, priv, err := identity.LoadKeyPair(cfg.KeyFile, cfg.PubKeyFile)
+	pub, priv, err := identity.LoadKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	if err != nil {
-		if identity.KeyPairExists(cfg.KeyFile, cfg.PubKeyFile) {
-			return fmt.Errorf("loading identity: %w\n%s", err, identity.LoadFailureRemedy(err, cfg.KeyFile, cfg.PubKeyFile))
+		if identity.KeyPairExists(cfg.KeyFilePath(), cfg.PubKeyFilePath()) {
+			return fmt.Errorf("loading identity: %w\n%s", err, identity.LoadFailureRemedy(err, cfg.KeyFilePath(), cfg.PubKeyFilePath()))
 		}
 		return fmt.Errorf("loading identity: %w (run 'lettuce-volunteer init' first)", err)
 	}

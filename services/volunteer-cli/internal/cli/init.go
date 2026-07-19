@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -72,11 +71,17 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 	c.DataDir = dataDir
+	// Identity paths are derived from the data dir (KeyFilePath/PubKeyFilePath).
+	// Clear any explicit values a pre-existing config baked in — the old behavior
+	// overwrote them with <data-dir> paths anyway — so the saved profile stays
+	// self-contained under its data dir; and drop the retired host_id_file, which
+	// nothing reads (host identity is head-issued, stored in host-ids.json).
+	c.KeyFile = ""
+	c.PubKeyFile = ""
+	c.HostIDFile = ""
 
-	keyFile := filepath.Join(dataDir, "identity.key")
-	pubKeyFile := filepath.Join(dataDir, "identity.pub")
-	c.KeyFile = keyFile
-	c.PubKeyFile = pubKeyFile
+	keyFile := c.KeyFilePath()
+	pubKeyFile := c.PubKeyFilePath()
 
 	// Step 1: Identity — always generate/load keypair.
 	if identity.KeyPairExists(keyFile, pubKeyFile) {

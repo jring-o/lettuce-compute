@@ -649,10 +649,8 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 	cfg := b.daemon.GetConfig()
 
 	var pubKeyStr string
-	if cfg.PubKeyFile != "" {
-		if pubBytes, err := os.ReadFile(cfg.PubKeyFile); err == nil {
-			pubKeyStr = identity.PublicKeyToBase64URL(pubBytes)
-		}
+	if pubBytes, err := os.ReadFile(cfg.PubKeyFilePath()); err == nil {
+		pubKeyStr = identity.PublicKeyToBase64URL(pubBytes)
 	}
 
 	return ConfigResponse{
@@ -1557,7 +1555,7 @@ func (b *DaemonBridge) RegenerateKeypair() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("generating keypair: %w", err)
 	}
-	if err := identity.SaveKeyPair(cfg.KeyFile, cfg.PubKeyFile, priv, pub); err != nil {
+	if err := identity.SaveKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath(), priv, pub); err != nil {
 		return "", fmt.Errorf("saving keypair: %w", err)
 	}
 	return identity.PublicKeyToBase64URL(pub), nil
@@ -1577,7 +1575,7 @@ func (b *DaemonBridge) SignChallenge(challengeHex string) (*SignChallengeRespons
 	}
 
 	cfg := b.daemon.GetConfig()
-	pub, priv, err := identity.LoadKeyPair(cfg.KeyFile, cfg.PubKeyFile)
+	pub, priv, err := identity.LoadKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	if err != nil {
 		return nil, fmt.Errorf("loading keypair: %w", err)
 	}

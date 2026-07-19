@@ -96,7 +96,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(out, "Local:")
 	checkAccountInfo(rep)
 	checkDataDir(rep, cfg.DataDir)
-	checkIdentity(rep, cfg.KeyFile, cfg.PubKeyFile)
+	checkIdentity(rep, cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	checkDisk(rep, cfg.DataDir, client.DiskAvailableMB(cfg.DataDir), cfg.ResourceLimits.MaxDiskGB)
 	containerUsable := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
@@ -145,7 +145,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 func checkAccountInfo(rep *doctorReport) {
 	rep.add(docInfo, "version", version, "")
 
-	if pub, _, err := identity.LoadKeyPair(cfg.KeyFile, cfg.PubKeyFile); err == nil {
+	if pub, _, err := identity.LoadKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath()); err == nil {
 		rep.add(docInfo, "account key", base64.RawURLEncoding.EncodeToString(pub)+" (Ed25519 identity; same key = same account on every machine)", "")
 	}
 	if cfg.VolunteerID != "" {

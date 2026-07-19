@@ -15,9 +15,14 @@ import (
 
 // Config holds all volunteer CLI configuration.
 type Config struct {
-	DataDir    string `yaml:"data_dir"`
-	KeyFile    string `yaml:"key_file"`
-	PubKeyFile string `yaml:"pubkey_file"`
+	DataDir string `yaml:"data_dir"`
+	// KeyFile / PubKeyFile optionally pin the identity keypair to explicit paths.
+	// Empty (the default) means the keypair lives inside the data dir
+	// (<DataDir>/identity.key|.pub — see KeyFilePath/PubKeyFilePath), so a
+	// profile stays self-contained under its own --data-dir instead of baking in
+	// another profile's absolute paths.
+	KeyFile    string `yaml:"key_file,omitempty"`
+	PubKeyFile string `yaml:"pubkey_file,omitempty"`
 	// HostIDFile is the path of the RETIRED client-generated per-machine host id
 	// (default <DataDir>/host.id). Host identity is now HEAD-ISSUED and stored
 	// per-head in <DataDir>/host-ids.json (see HostIDsPath); this legacy single-file
@@ -245,10 +250,11 @@ func Defaults() *Config {
 	}
 
 	return &Config{
-		DataDir:    dataDir,
-		KeyFile:    filepath.Join(dataDir, "identity.key"),
-		PubKeyFile: filepath.Join(dataDir, "identity.pub"),
-		HostIDFile: filepath.Join(dataDir, "host.id"),
+		// KeyFile/PubKeyFile/HostIDFile stay empty: identity paths are derived
+		// from DataDir at use time (KeyFilePath/PubKeyFilePath), so a profile
+		// created under --data-dir never points at the default profile's files,
+		// and the retired host_id_file is no longer written at all.
+		DataDir: dataDir,
 		ResourceLimits: ResourceLimits{
 			MaxCPUCores:      defaultCores,
 			MaxMemoryMB:      2048,
@@ -295,6 +301,24 @@ func Defaults() *Config {
 		LogMaxAgeDays:      0,
 		ResultCacheMaxMB:   500,
 	}
+}
+
+// KeyFilePath returns the resolved private-key path: the explicit KeyFile when
+// set, otherwise <DataDir>/identity.key.
+func (c *Config) KeyFilePath() string {
+	if c.KeyFile != "" {
+		return c.KeyFile
+	}
+	return filepath.Join(c.DataDir, "identity.key")
+}
+
+// PubKeyFilePath returns the resolved public-key path: the explicit PubKeyFile
+// when set, otherwise <DataDir>/identity.pub.
+func (c *Config) PubKeyFilePath() string {
+	if c.PubKeyFile != "" {
+		return c.PubKeyFile
+	}
+	return filepath.Join(c.DataDir, "identity.pub")
 }
 
 // LogFilePath returns the resolved log file path: the explicit LogFile when
