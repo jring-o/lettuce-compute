@@ -684,6 +684,24 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 			return apierror.ValidationError("numeric_tolerance must be a positive number when comparison_mode is NUMERIC_TOLERANCE",
 				validationDetail{Field: "numeric_tolerance", Reason: "required_and_positive"})
 		}
+		// Comparison scoping required whenever results are actually compared (PB-10).
+		// The NUMERIC_TOLERANCE comparator flattens the ENTIRE output JSON and compares
+		// every leaf, so an unscoped config makes honest volunteers DISAGREE whenever
+		// nondeterministic runtime metadata (a wall-clock field like compute_time_ms)
+		// differs between them — proven live in the Phase 3 campaign: 3/6 units on the
+		// guide's own walkthrough leaf were rejected purely on a 7-vs-8ms timing field,
+		// wasting the redundant compute and re-dispatching futilely. A refusal at
+		// configure time is the only enforcement that reaches the leaf author before
+		// volunteers burn compute; a silent default (e.g. the aggregation output_field)
+		// was rejected because it would NARROW validation to one field behind the
+		// author's back — un-compared fields would validate no matter what they carry.
+		// Only refused when redundant comparison can occur: target_copies >= 2, or
+		// spot-check (which forces a 2-of-2 corroboration on a single-copy leaf).
+		if (effTarget >= 2 || c.SpotCheckEnabled) && len(c.CompareFields) == 0 && len(c.IgnoreFields) == 0 {
+			return apierror.ValidationError(
+				"NUMERIC_TOLERANCE on a redundant leaf requires compare_fields or ignore_fields: the comparator flattens the entire output JSON, so nondeterministic fields (e.g. timing metadata like compute_time_ms) make honest results disagree. Set compare_fields to the science output (recommended), or ignore_fields for the nondeterministic fields.",
+				validationDetail{Field: "compare_fields", Reason: "comparison_scope_required"})
+		}
 	}
 
 	// (CUSTOM mode, and therefore custom_comparator_ref, is rejected above until a runtime
