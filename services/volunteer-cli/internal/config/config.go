@@ -159,10 +159,24 @@ type LeafFilter struct {
 
 // ServerConfig holds connection details for an infrastructure server.
 type ServerConfig struct {
-	GRPCAddress     string          `yaml:"grpc_address" json:"grpc_address"`
-	HTTPAddress     string          `yaml:"http_address,omitempty" json:"http_address,omitempty"`
-	LeafID          string          `yaml:"leaf_id,omitempty" json:"leaf_id,omitempty"`
-	Name            string          `yaml:"name" json:"name"`
+	GRPCAddress string `yaml:"grpc_address" json:"grpc_address"`
+	HTTPAddress string `yaml:"http_address,omitempty" json:"http_address,omitempty"`
+	// LeafID is the RETIRED single-leaf pin of the old one-entry-per-leaf model.
+	// `attach <leaf-id>` used to APPEND a whole duplicate server entry carrying
+	// only this field — the daemon then collapsed the duplicate at startup and
+	// silently discarded the pin (PB-16). The field is retained only so an
+	// existing config still loads; Load migrates it into the same-address head
+	// entry's PinnedLeafIDs and it is never written again.
+	LeafID string `yaml:"leaf_id,omitempty" json:"-"`
+	// PinnedLeafIDs are leaf IDs explicitly attached on THIS head
+	// (`attach <leaf-id>` / `attach --server … --leaf <id>`). A pin makes the
+	// daemon request work for that leaf BY ID even when the head's public
+	// catalog does not list it — UNLISTED/PRIVATE leafs are absent from
+	// GetHeadInfo by design and are reachable only this way. Pins are exempt
+	// from the slug-based leaf_preferences filters (an explicit attach is the
+	// stronger signal, and an unlisted leaf has no slug to filter on anyway).
+	PinnedLeafIDs []string `yaml:"pinned_leaf_ids,omitempty" json:"pinned_leaf_ids,omitempty"`
+	Name          string   `yaml:"name" json:"name"`
 	Insecure        bool            `yaml:"insecure,omitempty" json:"insecure,omitempty"`                 // default false — use TLS
 	CACertPath      string          `yaml:"ca_cert,omitempty" json:"ca_cert,omitempty"`                   // optional CA certificate for server verification
 	CertPath        string          `yaml:"cert,omitempty" json:"cert,omitempty"`                         // optional client cert for mTLS
@@ -373,8 +387,81 @@ func Load(path string) (*Config, error) {
 	// (issue #51). Re-scan strictly to collect those keys and surface them as
 	// non-fatal advisories — the config still loads with the recognized keys.
 	cfg.deprecatedKeyWarnings = detectUnknownKeys(data)
+	// Entry-shape migration first (one entry per head, pins merged), then trust:
+	// the merge keeps the head-level entry's fields, so the trust migration seeds
+	// at most one entry per head from a coherent starting point.
+	cfg.migrateServerEntries()
 	cfg.migrateServerRuntimeTrust()
 	return cfg, nil
+}
+
+// migrateServerEntries normalizes the servers list to ONE entry per gRPC
+// address with explicit leaf pins (PB-16). Two legacy shapes are migrated:
+//
+//   - the retired single-leaf `leaf_id` field becomes a PinnedLeafIDs entry;
+//   - whole duplicate entries for the same address — the old attach flow
+//     APPENDED `{grpc_address, http_address, leaf_id, name}` for every
+//     `attach <leaf-id>` — are merged into the head-level entry: its
+//     connection fields (TLS, trust, weight, preferences) win, and the pins
+//     of every duplicate are unioned. Pre-fix, the daemon collapsed such
+//     duplicates at startup and silently DISCARDED the pin, which made
+//     unlisted leafs permanently unreachable for CLI volunteers.
+//
+// The migration is idempotent and pinned by the next Save (leaf_id is never
+// written again).
+func (c *Config) migrateServerEntries() {
+	if len(c.Servers) == 0 {
+		return
+	}
+	merged := make([]ServerConfig, 0, len(c.Servers))
+	// leafOnly tracks whether a merged entry came from a bare leaf-pin append
+	// (it carried only address/leaf/name), so a later HEAD-LEVEL entry for the
+	// same address can take over the connection fields.
+	leafOnly := make([]bool, 0, len(c.Servers))
+	indexByAddr := make(map[string]int, len(c.Servers))
+
+	for _, s := range c.Servers {
+		wasLeafEntry := s.LeafID != ""
+		if wasLeafEntry {
+			s.PinnedLeafIDs = appendUniqueString(s.PinnedLeafIDs, s.LeafID)
+			s.LeafID = ""
+		}
+		i, seen := indexByAddr[s.GRPCAddress]
+		if !seen {
+			indexByAddr[s.GRPCAddress] = len(merged)
+			merged = append(merged, s)
+			leafOnly = append(leafOnly, wasLeafEntry)
+			continue
+		}
+		if leafOnly[i] && !wasLeafEntry {
+			// The kept entry was a bare leaf pin and this one is the real
+			// head-level entry: adopt its connection fields, keep the union of pins.
+			pins := merged[i].PinnedLeafIDs
+			merged[i] = s
+			for _, p := range pins {
+				merged[i].PinnedLeafIDs = appendUniqueString(merged[i].PinnedLeafIDs, p)
+			}
+			leafOnly[i] = false
+			continue
+		}
+		for _, p := range s.PinnedLeafIDs {
+			merged[i].PinnedLeafIDs = appendUniqueString(merged[i].PinnedLeafIDs, p)
+		}
+	}
+	c.Servers = merged
+}
+
+// appendUniqueString appends s to list unless already present (or empty).
+func appendUniqueString(list []string, s string) []string {
+	if s == "" {
+		return list
+	}
+	for _, e := range list {
+		if e == s {
+			return list
+		}
+	}
+	return append(list, s)
 }
 
 // migrateServerRuntimeTrust backfills per-head TrustedRuntimes for any server written

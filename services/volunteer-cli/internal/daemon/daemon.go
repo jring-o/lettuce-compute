@@ -2229,20 +2229,29 @@ func (d *Daemon) availableServers() []*ServerConnection {
 	return available
 }
 
-// enabledLeafs returns cached leafs filtered by the server's leaf preferences.
+// enabledLeafs returns the leafs the fetcher should poll on a head: the cached
+// public catalog filtered by the server's leaf preferences, PLUS the head's
+// explicitly pinned leafs (attach --leaf, PB-16). Pins are appended even when
+// the catalog does not list them — UNLISTED/PRIVATE leafs are absent from
+// GetHeadInfo by design and are reachable only by requesting them by id — and
+// they bypass the slug-based preference filters (an explicit attach is the
+// stronger signal, and an unlisted leaf has no slug to filter on anyway).
 func (d *Daemon) enabledLeafs(serverName string) []CachedLeafInfo {
 	leafs := d.leafCache.GetLeafs(serverName)
-	if leafs == nil {
-		return nil
-	}
 
 	// Find the server config.
 	var lp config.LeafPreferences
+	var pinned []string
 	for _, srv := range d.cfg.Servers {
 		if srv.DisplayName() == serverName {
 			lp = srv.LeafPreferences
+			pinned = srv.PinnedLeafIDs
 			break
 		}
+	}
+
+	if leafs == nil && len(pinned) == 0 {
+		return nil
 	}
 
 	mode := lp.Mode
@@ -2250,36 +2259,57 @@ func (d *Daemon) enabledLeafs(serverName string) []CachedLeafInfo {
 		mode = "ALL"
 	}
 
+	var result []CachedLeafInfo
 	switch mode {
-	case "ALL":
-		return leafs
 	case "SPECIFIC":
 		enabledSet := make(map[string]bool, len(lp.Enabled))
 		for _, slug := range lp.Enabled {
 			enabledSet[slug] = true
 		}
-		var result []CachedLeafInfo
 		for _, leaf := range leafs {
 			if enabledSet[leaf.Slug] {
 				result = append(result, leaf)
 			}
 		}
-		return result
 	case "BLOCKLIST":
 		disabledSet := make(map[string]bool, len(lp.Disabled))
 		for _, slug := range lp.Disabled {
 			disabledSet[slug] = true
 		}
-		var result []CachedLeafInfo
 		for _, leaf := range leafs {
 			if !disabledSet[leaf.Slug] {
 				result = append(result, leaf)
 			}
 		}
-		return result
-	default:
-		return leafs
+	default: // "ALL" and anything unrecognized
+		result = append(result, leafs...)
 	}
+
+	// Append pins not already present. When the catalog knows the pinned leaf
+	// (a PUBLIC leaf pinned explicitly) its cached info is used; otherwise a
+	// minimal descriptor carries the id — the slug doubles as the id for
+	// selector bookkeeping, and the per-unit prepare/trust gates do the rest.
+	for _, pin := range pinned {
+		already := false
+		for _, leaf := range result {
+			if leaf.ID == pin {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		info := CachedLeafInfo{ID: pin, Slug: pin, Name: pin, State: "ACTIVE"}
+		for _, leaf := range leafs {
+			if leaf.ID == pin {
+				info = leaf
+				break
+			}
+		}
+		result = append(result, info)
+	}
+	return result
 }
 
 // serverBlockedLeafIDs returns the leaf IDs that a server's leaf_preferences

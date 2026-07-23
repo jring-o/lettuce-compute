@@ -270,6 +270,19 @@ echo "Leaf: $LEAF_ID"
 The leaf starts in `DRAFT`. (`research_area` values are slugs — `mathematics`, `physics`,
 `biology`, `chemistry`, `climate`, `computer-science`, `engineering`, `ml-ai`, …)
 
+**`visibility` decides who can find your leaf — and therefore who computes it:**
+
+| Value | Listed publicly? | Who computes it |
+|---|---|---|
+| `PUBLIC` | Yes — in the head's public leaf catalog and on the dashboard. | Every attached volunteer picks it up automatically. This is what you want for most leafs. |
+| `UNLISTED` | No — absent from the catalog; reachable by anyone who has the leaf ID. | Only volunteers that explicitly pin it: `lettuce-volunteer attach <leaf-id>` (or `attach --server <host> --leaf <leaf-id>`). Volunteers that merely attached your head never see it. |
+| `PRIVATE` | No — hidden except to its creator/admins. | Same as UNLISTED on the volunteer side: only an explicit `attach <leaf-id>` reaches it. |
+
+An `UNLISTED` or `PRIVATE` leaf gets **zero** volunteers until each one runs
+`lettuce-volunteer attach <leaf-id>` — share the leaf ID with the people you want
+computing it, and have them restart their daemon after attaching. If you set a
+non-public visibility and wonder why nothing is being computed, this is why.
+
 ### Step 5 — Configure it
 
 Move the leaf to `CONFIGURING`, then set how it runs and how results are validated:
@@ -571,6 +584,23 @@ curl -s "$HEAD/api/v1/leafs/$LEAF_ID/results" \
 # Archive when you're done (after collecting results)
 curl -s -X POST $HEAD/api/v1/leafs/$LEAF_ID/archive -H "Authorization: Bearer $ADMIN_KEY"
 ```
+
+### Why is my leaf getting no volunteers?
+
+Work only flows when a volunteer can *find* the leaf, *run* its runtime, and *fit* its
+resource needs. Check these in order:
+
+1. **Visibility.** An `UNLISTED`/`PRIVATE` leaf is absent from the head's catalog, so
+   volunteers never discover it on their own — each one must run
+   `lettuce-volunteer attach <leaf-id>` (see the visibility table in Step 4) and
+   restart their daemon.
+2. **State.** Only `ACTIVE` leafs dispatch; check `"state"` on
+   `GET /api/v1/leafs/$LEAF_ID` (a `PAUSED` leaf hands out nothing).
+3. **Runtime trust.** NATIVE and CONTAINER runs are per-head opt-ins on the volunteer
+   side (`lettuce-volunteer heads trust <head> …`); a WASM-only volunteer never takes
+   your NATIVE leaf. `lettuce-volunteer doctor` on the volunteer shows what it will run.
+4. **Resource fit.** A volunteer only receives units whose declared memory/disk fit
+   under its configured limits — an oversized `max_memory_mb` silently matches nobody.
 
 ---
 

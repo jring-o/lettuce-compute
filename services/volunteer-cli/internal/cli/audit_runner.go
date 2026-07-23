@@ -136,9 +136,9 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 		defer stopMachineIfDaemonStarted(machineManager, logger)
 	}
 
-	// The audit-runner drives a single head. Collapse duplicate server entries (a head
-	// can appear more than once via per-leaf attaches) and use the first configured one.
-	servers := dedupeServersByAddress(cfg.Servers, logger)
+	// The audit-runner drives a single head: the first configured one. Entries
+	// are one-per-head (config.Load merges legacy duplicates, PB-16).
+	servers := cfg.Servers
 	srv := servers[0]
 	if len(servers) > 1 {
 		logger.Warn("multiple heads configured; audit-runner uses the first", "server", srv.DisplayName())

@@ -127,22 +127,67 @@ func (m *Manager) ListLeafs(ctx context.Context, httpAddress string) ([]LeafSumm
 	return all, nil
 }
 
-// AttachLeaf adds a specific leaf to the server list.
+// AttachLeaf pins a specific leaf on a head. When the head is already attached
+// (an entry with the same gRPC address exists) the pin is MERGED into that
+// entry, keeping its TLS/trust settings — the old behavior of appending a whole
+// second entry dropped those flags and the daemon then collapsed the duplicate
+// at startup, silently discarding the pin (PB-16). When the head is not yet
+// attached a new entry is created carrying the pin.
 func (m *Manager) AttachLeaf(leafID, grpcAddr, httpAddr, name string) error {
-	for _, s := range m.cfg.Servers {
-		if s.GRPCAddress == grpcAddr && s.LeafID == leafID {
-			return fmt.Errorf("already attached to leaf %s on %s", leafID, grpcAddr)
+	for i := range m.cfg.Servers {
+		if m.cfg.Servers[i].GRPCAddress != grpcAddr {
+			continue
 		}
+		for _, p := range m.cfg.Servers[i].PinnedLeafIDs {
+			if p == leafID {
+				return fmt.Errorf("already attached to leaf %s on %s", leafID, grpcAddr)
+			}
+		}
+		m.cfg.Servers[i].PinnedLeafIDs = append(m.cfg.Servers[i].PinnedLeafIDs, leafID)
+		return m.cfg.Save(m.cfgPath)
 	}
 
 	m.cfg.Servers = append(m.cfg.Servers, config.ServerConfig{
-		GRPCAddress: grpcAddr,
-		HTTPAddress: httpAddr,
-		LeafID:      leafID,
-		Name:        name,
+		GRPCAddress:   grpcAddr,
+		HTTPAddress:   httpAddr,
+		PinnedLeafIDs: []string{leafID},
+		Name:          name,
 	})
 
 	return m.cfg.Save(m.cfgPath)
+}
+
+// HasServer reports whether a server entry with the given gRPC address exists.
+func (m *Manager) HasServer(grpcAddr string) bool {
+	for _, s := range m.cfg.Servers {
+		if s.GRPCAddress == grpcAddr {
+			return true
+		}
+	}
+	return false
+}
+
+// ApplyServerFlags updates connection settings on an EXISTING head entry from
+// explicitly-given attach flags (nil = flag not given, leave as configured).
+// Part of the PB-16 fix: `attach --server <host> --leaf <id> --insecure
+// --trust …` on an already-attached head used to drop these flags entirely.
+func (m *Manager) ApplyServerFlags(grpcAddr string, insecure *bool, caCertPath *string, trustedRuntimes []string) error {
+	for i := range m.cfg.Servers {
+		if m.cfg.Servers[i].GRPCAddress != grpcAddr {
+			continue
+		}
+		if insecure != nil {
+			m.cfg.Servers[i].Insecure = *insecure
+		}
+		if caCertPath != nil {
+			m.cfg.Servers[i].CACertPath = *caCertPath
+		}
+		if trustedRuntimes != nil {
+			m.cfg.Servers[i].TrustedRuntimes = trustedRuntimes
+		}
+		return m.cfg.Save(m.cfgPath)
+	}
+	return fmt.Errorf("no configured server with address %s", grpcAddr)
 }
 
 // AttachServerWithTLS adds a self-hosted server connection with TLS configuration and the
@@ -190,21 +235,23 @@ func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insec
 	return m.cfg.Save(m.cfgPath)
 }
 
-// DetachLeaf removes a leaf entry from the server list.
+// DetachLeaf removes a leaf pin from whichever head entry carries it. The head
+// entry itself stays attached (use DetachServer to drop the head).
 func (m *Manager) DetachLeaf(leafID string) error {
-	idx := -1
-	for i, s := range m.cfg.Servers {
-		if s.LeafID == leafID {
-			idx = i
-			break
+	for i := range m.cfg.Servers {
+		pins := m.cfg.Servers[i].PinnedLeafIDs
+		for j, p := range pins {
+			if p != leafID {
+				continue
+			}
+			m.cfg.Servers[i].PinnedLeafIDs = append(pins[:j], pins[j+1:]...)
+			if len(m.cfg.Servers[i].PinnedLeafIDs) == 0 {
+				m.cfg.Servers[i].PinnedLeafIDs = nil
+			}
+			return m.cfg.Save(m.cfgPath)
 		}
 	}
-	if idx < 0 {
-		return fmt.Errorf("leaf %s not found in configured servers", leafID)
-	}
-
-	m.cfg.Servers = append(m.cfg.Servers[:idx], m.cfg.Servers[idx+1:]...)
-	return m.cfg.Save(m.cfgPath)
+	return fmt.Errorf("leaf %s not found in configured servers", leafID)
 }
 
 // DetachServer removes all server entries matching a hostname.

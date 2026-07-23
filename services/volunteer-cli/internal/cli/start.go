@@ -29,36 +29,6 @@ func newStartCmd() *cobra.Command {
 	}
 }
 
-// dedupeServersByAddress collapses configured servers to one entry per gRPC
-// address so the daemon opens exactly one connection per head. When several
-// entries share an address it keeps a single entry, preferring a head-level entry
-// (LeafID == "") over a leaf-scoped one so the surviving connection can serve all
-// of the head's leafs rather than being pinned to one leaf. Collapsed duplicates
-// are logged so the operator can see it happened.
-func dedupeServersByAddress(servers []config.ServerConfig, logger *slog.Logger) []config.ServerConfig {
-	indexByAddr := make(map[string]int, len(servers))
-	result := make([]config.ServerConfig, 0, len(servers))
-	for _, srv := range servers {
-		name := srv.Name
-		if name == "" {
-			name = srv.GRPCAddress
-		}
-		if idx, ok := indexByAddr[srv.GRPCAddress]; ok {
-			// Prefer a head-level (no LeafID) entry so the single connection is not
-			// restricted to one leaf.
-			if result[idx].LeafID != "" && srv.LeafID == "" {
-				result[idx] = srv
-			}
-			logger.Warn("collapsing duplicate server entry; one connection per head",
-				"address", srv.GRPCAddress, "server", name)
-			continue
-		}
-		indexByAddr[srv.GRPCAddress] = len(result)
-		result = append(result, srv)
-	}
-	return result
-}
-
 func runStart(cmd *cobra.Command, args []string) error {
 	// Check if daemon is already running.
 	pid, err := daemon.ReadPID(cfg.DataDir)
@@ -177,17 +147,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connect to all configured servers — one gRPC connection per head address.
-	// Multiple cfg.Servers entries can reference the same head (a plain
-	// `attach --server` plus per-leaf attaches, or a wizard entry plus an attach),
-	// and connecting once per entry would open DUPLICATE connections to the same
-	// head: double the RPC rate (worsening the head's rate-limit shedding) and a
-	// confusing duplicate row in `status` / `leafs list`. Collapse to one entry per
-	// address first. (Per-entry leaf-preference merging across collapsed entries is
-	// TODO #26.)
+	// One entry per head is guaranteed by config.Load's entry migration (PB-16):
+	// legacy duplicate entries — the old attach flow appended one per leaf pin —
+	// are merged at load, with the pins preserved on the surviving entry, so the
+	// startup-time duplicate collapse that used to silently DISCARD leaf pins is
+	// gone.
 	var connections []*daemon.ServerConnection
 	var stateServers []daemon.ServerState
 
-	for _, srv := range dedupeServersByAddress(cfg.Servers, logger) {
+	for _, srv := range cfg.Servers {
 		name := srv.Name
 		if name == "" {
 			name = srv.GRPCAddress
