@@ -3,8 +3,6 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -75,10 +73,18 @@ func (w *WasmRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareResult
 		return nil, fmt.Errorf("no wasm binary URL in execution spec")
 	}
 
-	// SECURITY (C2): verify the module's SHA-256 when the head supplies one.
-	// WASM runs sandboxed (wazero/WASI), so a missing checksum is lower risk —
-	// we proceed but log a warning rather than fail closed (unlike native).
+	// SECURITY (C2, PB-33): a missing checksum fail-closes, exactly like the
+	// native runtime. The wazero/WASI sandbox bounds what a module can DO, but an
+	// unverified artifact is still an anti-substitution hole (a rotated or
+	// compromised artifact at the same URL runs undetected) and an unbounded
+	// compile/alloc input to the host daemon process — and head dispatch now
+	// routes WASM units to the CLI daemon, not only to browsers.
 	expectedChecksum := strings.ToLower(wu.ExecutionSpec.BinaryChecksums["wasm"])
+	if expectedChecksum == "" {
+		w.logger.Warn("wasm.Prepare: missing module checksum, refusing to run unverified WASM module",
+			"work_unit_id", wu.ID, "url", wasmURL)
+		return nil, fmt.Errorf("no binary checksum for wasm module: refusing to execute unverified WASM module")
+	}
 
 	// One client for all of this unit's artifact downloads: guarded, unless the
 	// unit's head carries the explicit private-artifact opt-in (WARN-logged).
@@ -301,28 +307,23 @@ func (w *WasmRuntime) Cleanup(prep *PrepareResult) error {
 
 // ensureModule downloads the WASM module if not cached, returning the cached path.
 //
-// SECURITY (C2): when expectedChecksum is set (lowercase hex SHA-256), the cache
-// is keyed by that content digest so a cache hit can only be bytes that already
-// match, and a fresh download is verified before use (reject on mismatch). When
-// no checksum is supplied the module is keyed by URL and only the WASM magic
-// bytes are checked — acceptable because WASM runs sandboxed — but a warning is
-// logged so operators know the artifact was unverified.
+// SECURITY (C2, PB-33): expectedChecksum (lowercase hex SHA-256) is REQUIRED —
+// Prepare fail-closes before calling here, and this guard is defense-in-depth,
+// mirroring native's ensureBinary. The cache is keyed by the content digest so a
+// cache hit can only be bytes that already match, and a fresh download is
+// verified before use (reject on mismatch).
 func (w *WasmRuntime) ensureModule(ctx context.Context, client *http.Client, url, expectedChecksum string) (string, error) {
+	if expectedChecksum == "" {
+		// Prepare rejects this earlier with work-unit context; kept as an invariant.
+		return "", fmt.Errorf("no expected checksum: refusing to download unverified WASM module")
+	}
+
 	cacheDir := filepath.Join(w.dataDir, "wasm-cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", fmt.Errorf("create cache dir: %w", err)
 	}
 
-	// Cache key: content checksum when known (tamper-proof), else URL hash.
-	var cacheKey string
-	if expectedChecksum != "" {
-		cacheKey = expectedChecksum + ".wasm"
-	} else {
-		h := sha256.Sum256([]byte(url))
-		cacheKey = hex.EncodeToString(h[:]) + ".wasm"
-		w.logger.Warn("wasm module has no checksum in execution spec; proceeding unverified (sandboxed)", "url", url)
-	}
-	cachePath := filepath.Join(cacheDir, cacheKey)
+	cachePath := filepath.Join(cacheDir, expectedChecksum+".wasm")
 
 	// Check cache.
 	if _, err := os.Stat(cachePath); err == nil {
@@ -347,19 +348,17 @@ func (w *WasmRuntime) ensureModule(ctx context.Context, client *http.Client, url
 		return "", err
 	}
 
-	// Verify SHA-256 against the expected digest when present.
-	if expectedChecksum != "" {
-		actual, err := fileChecksumSHA256(tmpPath)
-		if err != nil {
-			return "", fmt.Errorf("checksum wasm module: %w", err)
-		}
-		if actual != expectedChecksum {
-			w.logger.Error("wasm module checksum mismatch, rejecting", "url", url,
-				"expected_sha256", expectedChecksum, "actual_sha256", actual)
-			return "", fmt.Errorf("wasm module checksum mismatch: expected %s, got %s", expectedChecksum, actual)
-		}
-		w.logger.Debug("checksum verified", "expected_sha256", expectedChecksum, "url", url)
+	// Verify SHA-256 against the expected digest.
+	actual, err := fileChecksumSHA256(tmpPath)
+	if err != nil {
+		return "", fmt.Errorf("checksum wasm module: %w", err)
 	}
+	if actual != expectedChecksum {
+		w.logger.Error("wasm module checksum mismatch, rejecting", "url", url,
+			"expected_sha256", expectedChecksum, "actual_sha256", actual)
+		return "", fmt.Errorf("wasm module checksum mismatch: expected %s, got %s", expectedChecksum, actual)
+	}
+	w.logger.Debug("checksum verified", "expected_sha256", expectedChecksum, "url", url)
 
 	// Verify WASM magic bytes before committing.
 	if err := verifyWasmMagic(tmpPath); err != nil {
