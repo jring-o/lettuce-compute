@@ -45,8 +45,9 @@ type ExecutionSpec struct {
 	Binaries map[string]string // platform -> URL (native)
 	// BinaryChecksums maps a platform key in Binaries to the expected lowercase
 	// hex SHA-256 of the artifact at that URL. Runtimes verify downloaded bytes
-	// against this before execution. For native binaries a checksum is required
-	// (fail-closed); for wasm/viz it is verified when present.
+	// against this before execution. For native binaries and WASM modules a
+	// checksum is required (fail-closed, PB-33); for viz it is verified when
+	// present.
 	BinaryChecksums map[string]string
 	Image           string // OCI image (container)
 	GPURequired     bool
