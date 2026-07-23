@@ -143,6 +143,22 @@ jobs:
         run: docker build -t lettuce-infrastructure:ci services/infrastructure
       - name: Build dashboard image (production target)
         run: docker build -t lettuce-dashboard:ci --target production services/dashboard
+      # Build-context hygiene (PB-4): `COPY . .` must not ship host-generated
+      # paths into the image — a host node_modules overwrites the `npm ci`
+      # layer with wrong-platform binaries and makes the context copy
+      # pathologically slow. Plant a sentinel where a host `npm install` would
+      # put one and assert the built image does not contain it
+      # (services/dashboard/.dockerignore keeps it out of the context).
+      - name: Dashboard build-context hygiene (host node_modules stays out of the image)
+        run: |
+          mkdir -p services/dashboard/node_modules
+          touch services/dashboard/node_modules/pb4-sentinel
+          docker build -t lettuce-dashboard:ci-dev --target dev services/dashboard
+          if docker run --rm --entrypoint sh lettuce-dashboard:ci-dev -c 'test -e /app/node_modules/pb4-sentinel'; then
+            echo "FAIL: host node_modules leaked into the image (PB-4) — check services/dashboard/.dockerignore"
+            exit 1
+          fi
+          echo "OK: sentinel excluded from the image"
       - name: Assert non-root runtime users (BG-31)
         run: |
           infra_user="$(docker inspect --format '{{.Config.User}}' lettuce-infrastructure:ci)"
