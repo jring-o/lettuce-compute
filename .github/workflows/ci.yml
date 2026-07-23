@@ -207,6 +207,18 @@ jobs:
           jq -e '.services.dashboard.environment.VIZ_BUNDLE_ALLOWED_ORIGINS == "https://cdn.ci.example.com"' /tmp/rendered.json >/dev/null \
             || { echo "FAIL: VIZ_BUNDLE_ALLOWED_ORIGINS from .env does not reach the dashboard container"; exit 1; }
           echo "OK: all documented knobs render into their services' environments"
+      # The dev stack's dashboard key must reach BOTH services: the dashboard
+      # sends it, and the head's bootstrap provisions it at boot — with it on
+      # only one side, every authed dashboard page (including the public leaf
+      # pages) fails with "invalid API key" on the documented dev stack.
+      - name: Assert dev compose gives the head the dashboard key
+        run: |
+          docker compose -f compose.yaml config --format json > /tmp/dev-rendered.json
+          jq -e '.services.infrastructure.environment.DASHBOARD_API_KEY != null' /tmp/dev-rendered.json >/dev/null \
+            || { echo "FAIL: dev compose does not pass DASHBOARD_API_KEY to the infrastructure service"; exit 1; }
+          jq -e '.services.infrastructure.environment.DASHBOARD_API_KEY == .services.dashboard.environment.DASHBOARD_API_KEY' /tmp/dev-rendered.json >/dev/null \
+            || { echo "FAIL: infrastructure and dashboard disagree on DASHBOARD_API_KEY in the dev compose"; exit 1; }
+          echo "OK: dev compose passes the dashboard key to both services"
       - name: Validate Caddyfile
         # Runs `caddy validate` in the SAME digest-pinned image the production
         # compose deploys. The env placeholders ({$REGISTRY_USER} etc.) resolve
