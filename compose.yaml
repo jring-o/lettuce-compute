@@ -57,6 +57,12 @@ services:
       # exercises the multi-replica code path; harmless with one replica.
       LETTUCE_REDIS_URL: redis://redis:6379
       LETTUCE_ADMIN_API_KEY: dev-admin-key-not-for-production
+      # The dashboard's service key must ALSO reach the head: the head's boot
+      # bootstrap provisions the key it finds here (with the dev-posture WARN),
+      # and without it every dashboard page that calls an authed head API —
+      # including the PUBLIC leaf pages for anonymous visitors — fails with
+      # "invalid API key". Must match the dashboard service's value below.
+      DASHBOARD_API_KEY: dev-dashboard-key-not-for-production
       # The signing key fails closed (fatal) when missing in production. The dev
       # stack mounts no pre-generated key, so explicitly opt into auto-generating
       # an ephemeral key on first boot. NEVER set this in production — a missing
