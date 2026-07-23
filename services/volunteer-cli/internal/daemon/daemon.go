@@ -139,9 +139,10 @@ type Daemon struct {
 	// Cached hardware capabilities (detected once at startup)
 	cachedHW *lettucev1.HardwareCapabilities
 
-	// Podman machine lifecycle (Windows/macOS).
-	machineManager   *runtime.PodmanMachineManager
-	machineStartedBy bool // true if this daemon started the machine
+	// Podman machine lifecycle (Windows/macOS). Whether this process started the
+	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
+	// itself — see runtime.PodmanMachineManager.StartedByThisProcess.
+	machineManager *runtime.PodmanMachineManager
 
 	// Leaf discovery and weighted scheduling.
 	leafCache        *LeafCache
@@ -2123,21 +2124,6 @@ func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
 	return d.machineManager
 }
 
-// SetMachineStartedByDaemon marks that the daemon started the Podman machine,
-// so it can be stopped on daemon shutdown.
-func (d *Daemon) SetMachineStartedByDaemon(started bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.machineStartedBy = started
-}
-
-// MachineStartedByDaemon returns whether the daemon started the Podman machine.
-func (d *Daemon) MachineStartedByDaemon() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.machineStartedBy
-}
-
 // SetSlotManagerForTest injects a SlotManager into the daemon for testing.
 // This allows external test packages (e.g., management) to exercise task
 // visibility and per-task control endpoints without running the full daemon loop.
@@ -2636,6 +2622,10 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 					RscFpopsEst:               pt.RscFpopsEst,
 					CheckpointSequence:        pt.CheckpointSequence,
 					CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+					// Re-stamp the dispatching head from the re-attached connection so
+					// the artifact netguard opt-in keeps its per-head scope on resume
+					// (PB-31; same config-derived name the fetcher stamps).
+					SourceHead: conn.Name,
 				}
 
 				prep := &runtime.PrepareResult{
@@ -2719,6 +2709,9 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			RscFpopsEst:               pt.RscFpopsEst,
 			CheckpointSequence:        pt.CheckpointSequence,
 			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+			// Re-stamp the dispatching head from the re-attached connection so the
+			// artifact netguard opt-in keeps its per-head scope on resume (PB-31).
+			SourceHead: conn.Name,
 			// Don't set HasCheckpoint: the work dir was preserved on shutdown, so the
 			// leaf's checkpoint state is still local in {workDir}/checkpoint and the
 			// re-executed binary picks it up via LETTUCE_CHECKPOINT_DIR — no download
@@ -2844,6 +2837,9 @@ func (d *Daemon) resumePrefetchBuffer(ctx context.Context) {
 			RscFpopsEst:               pt.RscFpopsEst,
 			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
 			ReservedUntilUnix:         pt.ReservedUntilUnix,
+			// Re-stamp the dispatching head from the re-attached connection so the
+			// artifact netguard opt-in keeps its per-head scope on resume (PB-31).
+			SourceHead: conn.Name,
 		}
 		prep := &runtime.PrepareResult{
 			WorkDir:       pt.WorkDir,

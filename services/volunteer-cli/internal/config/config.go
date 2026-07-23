@@ -176,11 +176,17 @@ type ServerConfig struct {
 	// attaching to it IS the trust decision, and this field is what that decision chose
 	// (see the attach/init consent prompt). WASM is always safe (a sealed sandbox) and
 	// is implicitly trusted even when absent from this list — see EffectiveTrustedRuntimes.
-	// CONTAINER and NATIVE are explicit opt-ins. A nil/empty value marks a config that
-	// predates per-head trust; Load migrates those from the legacy global
-	// available_runtimes / allow_native_runtime so an upgraded volunteer keeps exactly
-	// today's posture (native stays off unless it was globally enabled).
-	TrustedRuntimes []string `yaml:"trusted_runtimes,omitempty" json:"trusted_runtimes,omitempty"`
+	// CONTAINER and NATIVE are explicit opt-ins.
+	//
+	// nil vs empty is load-bearing (PB-28): nil (key absent from the file) marks a
+	// config that predates per-head trust, and Load migrates it from the legacy
+	// global available_runtimes / allow_native_runtime so an upgraded volunteer
+	// keeps exactly today's posture. A present-but-EMPTY list ("trusted_runtimes:
+	// []") is an explicit "none": the volunteer deliberately granted this head
+	// WASM only, and the migration must never re-seed over that choice. The yaml
+	// tag therefore has no omitempty — every entry written by this version
+	// records its trust decision explicitly, empty included.
+	TrustedRuntimes []string `yaml:"trusted_runtimes" json:"trusted_runtimes"`
 }
 
 // DisplayName returns the server's Name, falling back to GRPCAddress if Name is empty.
@@ -375,17 +381,21 @@ func Load(path string) (*Config, error) {
 // before per-head runtime trust existed, so an upgraded volunteer keeps EXACTLY today's
 // posture. Runtime enablement used to be two GLOBAL knobs — available_runtimes (WASM
 // always; CONTAINER opt-in) and allow_native_runtime (BG-12: native OFF unless explicitly
-// true) — which this maps onto the per-head field. A server that already carries an
-// explicit TrustedRuntimes (a config written by this version, or one set at attach) is
-// left untouched. WASM is implicit and never stored. The migration is idempotent: a
-// WASM-only head resolves to an empty opt-in list and is simply recomputed identically on
-// the next load.
+// true) — which this maps onto the per-head field. WASM is implicit and never stored.
+//
+// Only a NIL list (key absent from the file) is legacy and migrated. A
+// present-but-empty list is an explicit "WASM only" the volunteer chose at
+// attach or via `heads trust none`; re-seeding it from available_runtimes —
+// which init populates with CONTAINER on any podman/docker host — silently
+// upgraded a deliberate no-trust choice to CONTAINER trust (PB-28). The seeded
+// result is always non-nil so one load pins the migration and a later save
+// records it explicitly.
 func (c *Config) migrateServerRuntimeTrust() {
 	for i := range c.Servers {
-		if len(c.Servers[i].TrustedRuntimes) > 0 {
-			continue // already per-head
+		if c.Servers[i].TrustedRuntimes != nil {
+			continue // an explicit per-head choice, including the empty "WASM only"
 		}
-		var trusted []string
+		trusted := []string{}
 		if containsFold(c.AvailableRuntimes, "CONTAINER") {
 			trusted = append(trusted, "CONTAINER")
 		}

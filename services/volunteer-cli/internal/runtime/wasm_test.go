@@ -124,6 +124,21 @@ func serveWasmBinary(t *testing.T, wasmPath string) (*httptest.Server, *int) {
 	return ts, &requestCount
 }
 
+// wasmSpec builds an ExecutionSpec for the module served at url, declaring the
+// module file's correct SHA-256. A checksum is REQUIRED since PB-33 (Prepare
+// fail-closes without one), so every prepare-path test declares it.
+func wasmSpec(t *testing.T, wasmPath, url string) ExecutionSpec {
+	t.Helper()
+	sum, err := fileChecksumSHA256(wasmPath)
+	if err != nil {
+		t.Fatalf("checksum test wasm binary: %v", err)
+	}
+	return ExecutionSpec{
+		Binaries:        map[string]string{"wasm": url},
+		BinaryChecksums: map[string]string{"wasm": sum},
+	}
+}
+
 func TestWasmRuntime_Name(t *testing.T) {
 	wr := NewWasmRuntime(t.TempDir(), newTestLogger())
 	if wr.Name() != "wasm" {
@@ -196,9 +211,7 @@ func TestWasmRuntime_PrepareAndExecute(t *testing.T) {
 	wu := &WorkUnit{
 		ID:      "412820d8-342d-4df7-83dc-a1123d00afe5", // was test-wu-1
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	// Prepare.
@@ -256,9 +269,7 @@ func TestWasmRuntime_InputData(t *testing.T) {
 		ID:        "ae160889-6372-420b-8ebb-58261e0c0092", // was test-input
 		Runtime:   "wasm",
 		InputData: inputData,
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	prep, err := wr.Prepare(context.Background(), wu)
@@ -289,9 +300,7 @@ func TestWasmRuntime_Parameters(t *testing.T) {
 		ID:             "fc91952e-691c-425b-8408-532a91835201", // was test-params
 		Runtime:        "wasm",
 		ParametersJSON: params,
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	prep, err := wr.Prepare(context.Background(), wu)
@@ -320,9 +329,7 @@ func TestWasmRuntime_StdoutFallback(t *testing.T) {
 	wu := &WorkUnit{
 		ID:      "61fe1c99-971f-4d3a-8d2e-18262ad73626", // was test-stdout
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	prep, err := wr.Prepare(context.Background(), wu)
@@ -348,13 +355,12 @@ func TestWasmRuntime_MemoryLimit(t *testing.T) {
 	wr := NewWasmRuntime(dataDir, newTestLogger())
 	wr.httpClient = ts.Client()
 
+	spec := wasmSpec(t, wasmPath, ts.URL+"/module.wasm")
+	spec.MaxMemoryMB = 1 // Very low; the Go runtime needs more than 1 MB
 	wu := &WorkUnit{
-		ID:      "ef24bd66-b4b1-4b61-873c-8718b38933be", // was test-memlimit
-		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries:    map[string]string{"wasm": ts.URL + "/module.wasm"},
-			MaxMemoryMB: 1, // Very low â€” Go runtime needs more than 1 MB
-		},
+		ID:            "ef24bd66-b4b1-4b61-873c-8718b38933be", // was test-memlimit
+		Runtime:       "wasm",
+		ExecutionSpec: spec,
 	}
 
 	prep, err := wr.Prepare(context.Background(), wu)
@@ -383,9 +389,7 @@ func TestWasmRuntime_Cleanup(t *testing.T) {
 	wu := &WorkUnit{
 		ID:      "c72fe4b6-d204-4293-8825-f56363737ea5", // was test-cleanup
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	prep, err := wr.Prepare(context.Background(), wu)
@@ -427,9 +431,7 @@ func TestWasmRuntime_CachedModule(t *testing.T) {
 	wu := &WorkUnit{
 		ID:      "a01d48dd-60c0-44ab-89aa-e1edd15e2607", // was test-cache-1
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 
 	// First prepare â€” should download.
@@ -446,9 +448,7 @@ func TestWasmRuntime_CachedModule(t *testing.T) {
 	wu2 := &WorkUnit{
 		ID:      "6df51fcc-8066-40cd-8509-ca56e1621942", // was test-cache-2
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 	}
 	prep2, err := wr.Prepare(context.Background(), wu2)
 	if err != nil {
@@ -467,9 +467,11 @@ func TestWasmRuntime_CachedModule(t *testing.T) {
 }
 
 func TestWasmRuntime_InvalidWasm(t *testing.T) {
-	// Serve a non-WASM file.
+	// Serve a non-WASM file. Its checksum is declared CORRECTLY so the download
+	// passes verification and the magic-bytes check is what rejects it.
+	notWasm := []byte("this is not a wasm module")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("this is not a wasm module"))
+		w.Write(notWasm)
 	}))
 	defer ts.Close()
 
@@ -481,7 +483,8 @@ func TestWasmRuntime_InvalidWasm(t *testing.T) {
 		ID:      "e917c45d-0c77-41d7-8378-cc657d2e6e03", // was test-invalid
 		Runtime: "wasm",
 		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/not-wasm.bin"},
+			Binaries:        map[string]string{"wasm": ts.URL + "/not-wasm.bin"},
+			BinaryChecksums: map[string]string{"wasm": checksumSHA256(notWasm)},
 		},
 	}
 
@@ -491,6 +494,43 @@ func TestWasmRuntime_InvalidWasm(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "magic") {
 		t.Errorf("expected magic bytes error, got: %v", err)
+	}
+}
+
+// TestWasmRuntime_PrepareRefusesMissingChecksum is the PB-33 regression test:
+// a WASM work unit whose execution spec carries NO module checksum must be
+// refused at Prepare, exactly like the native runtime — before the fix the
+// module was downloaded, cached by URL, and executed unverified ("proceeding
+// unverified (sandboxed)"). The gate must fire BEFORE any download.
+func TestWasmRuntime_PrepareRefusesMissingChecksum(t *testing.T) {
+	wasmPath := buildTestWasmBinary(t, "echo", wasmEchoSource)
+	ts, requestCount := serveWasmBinary(t, wasmPath)
+
+	dataDir := t.TempDir()
+	wr := NewWasmRuntime(dataDir, newTestLogger())
+	wr.httpClient = ts.Client()
+
+	wu := &WorkUnit{
+		ID:      "b7f1d1a2-5c3e-4f60-9d21-0a9b8c7d6e5f",
+		Runtime: "wasm",
+		ExecutionSpec: ExecutionSpec{
+			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
+			// No BinaryChecksums entry: the unverified case.
+		},
+	}
+
+	_, err := wr.Prepare(context.Background(), wu)
+	if err == nil {
+		t.Fatal("Prepare succeeded on a checksum-less WASM module; must fail closed like native (PB-33)")
+	}
+	if !strings.Contains(err.Error(), "checksum") {
+		t.Errorf("error = %q, want a checksum-refusal error", err)
+	}
+	if *requestCount != 0 {
+		t.Errorf("module was downloaded despite the missing checksum (%d requests); the gate must fire before any fetch", *requestCount)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dataDir, "wasm-cache")); len(entries) != 0 {
+		t.Errorf("unverified module was cached (%d entries); nothing may be committed to the cache", len(entries))
 	}
 }
 
@@ -560,9 +600,7 @@ func TestWasmRuntime_ContextCancellation(t *testing.T) {
 	wu := &WorkUnit{
 		ID:      "97064468-9b0b-4a4e-8a02-b03cafebca80", // was test-cancel
 		Runtime: "wasm",
-		ExecutionSpec: ExecutionSpec{
-			Binaries: map[string]string{"wasm": ts.URL + "/module.wasm"},
-		},
+		ExecutionSpec: wasmSpec(t, wasmPath, ts.URL+"/module.wasm"),
 		DeadlineSeconds: 3, // Short deadline, module sleeps 30s
 	}
 
