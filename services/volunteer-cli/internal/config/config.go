@@ -402,10 +402,13 @@ func Load(path string) (*Config, error) {
 //   - whole duplicate entries for the same address — the old attach flow
 //     APPENDED `{grpc_address, http_address, leaf_id, name}` for every
 //     `attach <leaf-id>` — are merged into the head-level entry: its
-//     connection fields (TLS, trust, weight, preferences) win, and the pins
-//     of every duplicate are unioned. Pre-fix, the daemon collapsed such
-//     duplicates at startup and silently DISCARDED the pin, which made
-//     unlisted leafs permanently unreachable for CLI volunteers.
+//     connection fields (TLS, weight, preferences) win, the pins of every
+//     duplicate are unioned, and TrustedRuntimes is merged trust-aware (see
+//     mergeTrustedRuntimes) so an explicit decision — the empty "none"
+//     included — survives no matter which entry it rode on (PB-28). Pre-fix,
+//     the daemon collapsed such duplicates at startup and silently DISCARDED
+//     the pin, which made unlisted leafs permanently unreachable for CLI
+//     volunteers.
 //
 // The migration is idempotent and pinned by the next Save (leaf_id is never
 // written again).
@@ -435,20 +438,47 @@ func (c *Config) migrateServerEntries() {
 		}
 		if leafOnly[i] && !wasLeafEntry {
 			// The kept entry was a bare leaf pin and this one is the real
-			// head-level entry: adopt its connection fields, keep the union of pins.
+			// head-level entry: adopt its connection fields, keep the union of
+			// pins and the merged trust.
 			pins := merged[i].PinnedLeafIDs
+			trust := merged[i].TrustedRuntimes
 			merged[i] = s
+			merged[i].TrustedRuntimes = mergeTrustedRuntimes(s.TrustedRuntimes, trust)
 			for _, p := range pins {
 				merged[i].PinnedLeafIDs = appendUniqueString(merged[i].PinnedLeafIDs, p)
 			}
 			leafOnly[i] = false
 			continue
 		}
+		merged[i].TrustedRuntimes = mergeTrustedRuntimes(merged[i].TrustedRuntimes, s.TrustedRuntimes)
 		for _, p := range s.PinnedLeafIDs {
 			merged[i].PinnedLeafIDs = appendUniqueString(merged[i].PinnedLeafIDs, p)
 		}
 	}
 	c.Servers = merged
+}
+
+// mergeTrustedRuntimes combines the per-head trust of two entries being merged
+// for the same address (PB-28): an explicit decision (non-nil, the empty
+// "none" included) must never be lost to a legacy nil, and when both entries
+// carry an explicit decision the merge keeps the intersection — the most
+// restrictive reading, so merging duplicates can only ever narrow trust,
+// never widen it. Returns nil only when both inputs are nil (a genuinely
+// legacy head, left for migrateServerRuntimeTrust to seed).
+func mergeTrustedRuntimes(a, b []string) []string {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	out := make([]string, 0, len(a))
+	for _, r := range a {
+		if containsFold(b, strings.TrimSpace(r)) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // appendUniqueString appends s to list unless already present (or empty).
