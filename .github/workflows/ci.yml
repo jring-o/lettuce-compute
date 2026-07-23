@@ -184,8 +184,29 @@ jobs:
           LETTUCE_HEAD_NAME=ci-stub
           PLATFORM_URL=https://ci.example.com
           REGISTRY_PASS_HASH=ci-stub
+          LETTUCE_ARTIFACT_RETENTION=last:2
+          LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED=false
+          LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR=7
+          VIZ_BUNDLE_ALLOWED_ORIGINS=https://cdn.ci.example.com
           EOF
           docker compose -f compose.production.yaml config -q
+      # Every knob documented in .env.example must actually reach the container
+      # environment of the service whose code reads it — a knob the compose
+      # file does not pass through is a silent no-op for the operator who sets
+      # it in .env. Asserted against the rendered config with the stub .env
+      # values above.
+      - name: Assert documented .env knobs reach container environments
+        run: |
+          docker compose -f compose.production.yaml config --format json > /tmp/rendered.json
+          jq -e '.services.infrastructure.environment.LETTUCE_ARTIFACT_RETENTION == "last:2"' /tmp/rendered.json >/dev/null \
+            || { echo "FAIL: LETTUCE_ARTIFACT_RETENTION from .env does not reach the infrastructure container"; exit 1; }
+          jq -e '.services.infrastructure.environment.LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED == "false"' /tmp/rendered.json >/dev/null \
+            || { echo "FAIL: LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED from .env does not reach the infrastructure container"; exit 1; }
+          jq -e '.services.infrastructure.environment.LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR == "7"' /tmp/rendered.json >/dev/null \
+            || { echo "FAIL: LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR from .env does not reach the infrastructure container"; exit 1; }
+          jq -e '.services.dashboard.environment.VIZ_BUNDLE_ALLOWED_ORIGINS == "https://cdn.ci.example.com"' /tmp/rendered.json >/dev/null \
+            || { echo "FAIL: VIZ_BUNDLE_ALLOWED_ORIGINS from .env does not reach the dashboard container"; exit 1; }
+          echo "OK: all documented knobs render into their services' environments"
       - name: Validate Caddyfile
         # Runs `caddy validate` in the SAME digest-pinned image the production
         # compose deploys. The env placeholders ({$REGISTRY_USER} etc.) resolve
