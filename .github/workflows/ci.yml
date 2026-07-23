@@ -126,6 +126,13 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
+      # The dashboard must build with no reach to Google Fonts (PB-24): fonts
+      # are vendored in src/app/fonts and loaded via next/font/local. Black-hole
+      # the font hosts so any reintroduced build-time font fetch (e.g. an import
+      # from next/font/google) fails this job instead of the next air-gapped
+      # image build.
+      - name: Block Google Fonts hosts (build must not fetch fonts)
+        run: printf '127.0.0.1 fonts.googleapis.com\n127.0.0.1 fonts.gstatic.com\n' | sudo tee -a /etc/hosts
       - run: npm run build
 
   # Deploy-artifact validation (BG-31): before this job, a broken Dockerfile,
