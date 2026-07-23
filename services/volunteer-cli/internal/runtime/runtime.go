@@ -30,8 +30,11 @@ type WorkUnit struct {
 	// (config server name; gRPC address for an unnamed head). Set by the fetcher
 	// when the unit is received — it is NOT part of the wire assignment — and
 	// consulted by the artifact netguard opt-in (artifact_exemption.go) to scope
-	// private/loopback fetches to explicitly named heads. Persisted with buffered
-	// state so a resumed unit keeps its scope.
+	// private/loopback fetches to explicitly named heads. It is NOT persisted:
+	// when a persisted unit is resumed it is re-stamped from the server
+	// connection the unit is re-attached to (the same config-derived name the
+	// fetcher stamps), so a resumed unit keeps its opt-in scope without a second
+	// on-disk copy that could drift from the config (PB-31).
 	SourceHead string
 
 	// Checkpoint fields (from RequestWorkUnitResponse)

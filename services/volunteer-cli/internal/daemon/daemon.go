@@ -2636,6 +2636,10 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 					RscFpopsEst:               pt.RscFpopsEst,
 					CheckpointSequence:        pt.CheckpointSequence,
 					CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+					// Re-stamp the dispatching head from the re-attached connection so
+					// the artifact netguard opt-in keeps its per-head scope on resume
+					// (PB-31; same config-derived name the fetcher stamps).
+					SourceHead: conn.Name,
 				}
 
 				prep := &runtime.PrepareResult{
@@ -2719,6 +2723,9 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			RscFpopsEst:               pt.RscFpopsEst,
 			CheckpointSequence:        pt.CheckpointSequence,
 			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
+			// Re-stamp the dispatching head from the re-attached connection so the
+			// artifact netguard opt-in keeps its per-head scope on resume (PB-31).
+			SourceHead: conn.Name,
 			// Don't set HasCheckpoint: the work dir was preserved on shutdown, so the
 			// leaf's checkpoint state is still local in {workDir}/checkpoint and the
 			// re-executed binary picks it up via LETTUCE_CHECKPOINT_DIR — no download
@@ -2844,6 +2851,9 @@ func (d *Daemon) resumePrefetchBuffer(ctx context.Context) {
 			RscFpopsEst:               pt.RscFpopsEst,
 			CheckpointIntervalSeconds: pt.CheckpointIntervalSecs,
 			ReservedUntilUnix:         pt.ReservedUntilUnix,
+			// Re-stamp the dispatching head from the re-attached connection so the
+			// artifact netguard opt-in keeps its per-head scope on resume (PB-31).
+			SourceHead: conn.Name,
 		}
 		prep := &runtime.PrepareResult{
 			WorkDir:       pt.WorkDir,
