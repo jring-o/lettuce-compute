@@ -140,6 +140,11 @@ services:
       LETTUCE_HEAD_DESCRIPTION: ${LETTUCE_HEAD_DESCRIPTION:-}
       LETTUCE_HEAD_URL: ${PLATFORM_URL}
       LETTUCE_CORS_ORIGINS: ${LETTUCE_CORS_ORIGINS:-}
+      # Artifact version retention for the per-leaf GC: "all" (default, never
+      # auto-deletes), "last:N", or "current+previous". The current version and
+      # any version pinned by in-flight work are never deleted. Documented in
+      # .env.example; empty is treated as unset.
+      LETTUCE_ARTIFACT_RETENTION: ${LETTUCE_ARTIFACT_RETENTION:-}
       # --- Horizontal scale-out (Layer 3) ---
       # Shared store for the cross-replica replay dedup + rate-limit buckets.
       # Always wired; with one replica it is harmless. REQUIRED when
@@ -194,6 +199,12 @@ services:
       # by default (~30s); leave unset to keep the default, or set negative to disable.
       LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS: ${LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS:-}
       LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER:-}
+      # --- Reliability-weighted adaptive work quota (TODO #54) --- ON by
+      # default; both OPTIONAL (leave unset to keep the built-in defaults).
+      # Grounds each machine's in-flight buffer in observed throughput instead
+      # of claimed specs. Full description: .env.example and guides/head-setup.md.
+      LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED: ${LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED:-}
+      LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR: ${LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR:-}
       # --- Automatic standing backpressure (BG-24b) --- OFF by default; all OPTIONAL
       # (leave unset to keep the built-in defaults). The machine folds adjudicated
       # results into a decayed per-volunteer rejection rate and auto-manages account
@@ -276,6 +287,12 @@ services:
       # JS on the app origin). Provision a distinct host to enable visualization
       # — see guides/head-setup.md.
       VIZ_ORIGIN: ${VIZ_ORIGIN:-}
+      # Origins the viz-bundle route may fetch tarballs from (comma-separated
+      # scheme://host[:port] entries) — the SSRF/open-proxy allowlist. Unset
+      # defaults to the PLATFORM_URL origin, which covers the documented
+      # ${PLATFORM_URL}/binaries/... bundles; set it only for additional
+      # tarball hosts (e.g. a CDN). Documented in .env.example.
+      VIZ_BUNDLE_ALLOWED_ORIGINS: ${VIZ_BUNDLE_ALLOWED_ORIGINS:-}
       NODE_ENV: production
       # Docker auto-sets HOSTNAME to the container id, which makes the Next.js
       # standalone server bind to that hostname instead of all interfaces.
