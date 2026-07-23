@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 
@@ -486,6 +487,37 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 
 	// Build compatibility matrix over the flattenable candidates only.
 	n := len(candidates)
+
+	// A compared set that is empty for EVERY flattenable candidate is a leaf-config
+	// defect — a compare_fields path present in no output (the classic typo), or
+	// ignore_fields stripping every leaf — not volunteer disagreement (PB-35). The old
+	// behavior fell through to numericMatch's fail-closed empty-set rule and silently
+	// rejected 100% of honest results, burning the copy budget with no diagnostic. Fail
+	// LOUD instead: return a comparator error, which the transitioner treats exactly
+	// like an unparseable output — the unit parks COMPLETED-pending with the misconfig
+	// named in the log, honest results are never marked DISAGREED, and a config fix
+	// resolves the parked units on a later tick. numericMatch keeps its empty-set rule
+	// as defense in depth for MIXED empty/non-empty sets (a genuine content difference).
+	if n >= 2 {
+		allEmpty := true
+		for _, m := range parsed {
+			if len(m) > 0 {
+				allEmpty = false
+				break
+			}
+		}
+		if allEmpty {
+			switch {
+			case len(compareFields) > 0:
+				return nil, fmt.Errorf("compared set is empty for all %d results: compare_fields %v matched no field in any submitted output — likely a mistyped path; fix the leaf's compare_fields (unit parked, honest results preserved)", n, compareFields)
+			case len(ignoreFields) > 0:
+				return nil, fmt.Errorf("compared set is empty for all %d results: ignore_fields %v stripped every field of every submitted output; narrow the leaf's ignore_fields (unit parked, honest results preserved)", n, ignoreFields)
+			default:
+				return nil, fmt.Errorf("compared set is empty for all %d results: the submitted outputs contain no comparable scalar fields", n)
+			}
+		}
+	}
+
 	compatible := make([][]bool, n)
 	for i := range compatible {
 		compatible[i] = make([]bool, n)
@@ -500,6 +532,33 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 		}
 	}
 
+	// Name WHY results disagreed (PB-35): under-scoping (a nondeterministic field left
+	// out of ignore_fields — non-numeric strings and per-element metadata included) used
+	// to surface only as an opaque DISAGREED, leaving the leaf author nothing to act on.
+	// Diagnose from the compatibility matrix, not the clique: the common two-copy
+	// disagreement yields two size-1 cliques, which findLargestClique deliberately
+	// voids as a tie. Log the first incompatible pair's first differing field, once per
+	// comparison pass.
+	if n >= 2 {
+	diagnose:
+		for i := 0; i < n; i++ {
+			for j := i + 1; j < n; j++ {
+				if !compatible[i][j] {
+					field, reason, detail := firstDisagreement(parsed[i], parsed[j], epsilon)
+					e.logger.Warn("numeric comparison: results disagree",
+						"work_unit_id", candidates[i].WorkUnitID,
+						"result_id_a", candidates[i].ID,
+						"result_id_b", candidates[j].ID,
+						"field", field,
+						"reason", reason,
+						"detail", detail,
+						"hint", "if this field is nondeterministic runtime metadata, add it to ignore_fields (or scope compare_fields to the science output)")
+					break diagnose
+				}
+			}
+		}
+	}
+
 	// Find the largest clique (all mutually compatible results).
 	clique := findLargestClique(n, compatible)
 
@@ -510,6 +569,57 @@ func (e *Engine) compareNumericTolerance(proj *leaf.Leaf, pending []*result.Resu
 	}
 
 	return majorityGroup, nil
+}
+
+// firstDisagreement names the first flattened field (deterministically, in sorted path
+// order) on which two compared sets fail to agree, and why — the actionable half of a
+// DISAGREED verdict. Values are embedded in the detail string truncated, never whole
+// outputs.
+func firstDisagreement(a, b map[string]flatVal, epsilon float64) (field, reason, detail string) {
+	if len(a) == 0 || len(b) == 0 {
+		return "", "empty_compared_set", "one result's compared set is empty (its output lacks every compared field)"
+	}
+	paths := make([]string, 0, len(a)+len(b))
+	seen := make(map[string]bool, len(a)+len(b))
+	for p := range a {
+		paths = append(paths, p)
+		seen[p] = true
+	}
+	for p := range b {
+		if !seen[p] {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		va, okA := a[p]
+		vb, okB := b[p]
+		switch {
+		case !okA || !okB:
+			return p, "missing_in_one_output", "field present in one result's output but not the other's"
+		case va.IsNum != vb.IsNum:
+			return p, "type_mismatch", "numeric in one result, non-numeric in the other"
+		case va.IsNum:
+			if delta := math.Abs(va.Num - vb.Num); delta > epsilon {
+				return p, "numeric_delta_exceeds_tolerance", fmt.Sprintf("%g vs %g (delta %g > numeric_tolerance %g)", va.Num, vb.Num, delta, epsilon)
+			}
+		default:
+			if va.Str != vb.Str {
+				return p, "string_mismatch", fmt.Sprintf("%q vs %q (non-numeric fields compare by exact equality)", truncateVal(va.Str), truncateVal(vb.Str))
+			}
+		}
+	}
+	return "", "none", "no per-field difference found (results conflict only through third parties)"
+}
+
+// truncateVal bounds a logged output value so a diagnostic line never embeds a large
+// payload.
+func truncateVal(s string) string {
+	const max = 64
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // applyThreshold applies the agreement gates and performs the validation outcome.
@@ -1472,7 +1582,11 @@ type flatVal struct {
 // Objects nest as dotted paths ("replay.dt"); array elements index as "fights.0.winner".
 // ignoreFields paths are dropped; if compareFields is non-empty ONLY matching paths are
 // kept. Path matching is exact or dot-boundary-prefix (subtree), so "fights" selects all
-// of fights.* and "compute_time_ms" drops just that field.
+// of fights.* and "compute_time_ms" drops just that field. Patterns match both the
+// indexed path and its index-ELIDED form ("fights.compute_time_ms" matches
+// "fights.0.compute_time_ms" in every element) — the contract ignore_fields documents
+// and EXACT's stripFields already honors; NUMERIC_TOLERANCE used to match only the
+// indexed form, which made per-array-element metadata un-ignorable (PB-35).
 //
 // Non-finite numbers (NaN, ±Inf) are rejected as invalid — the same security safeguard as
 // the original flat parser: comparing NaN with math.Abs(va-vb) > epsilon yields false,
@@ -1490,13 +1604,17 @@ func flattenOutput(data json.RawMessage, ignoreFields, compareFields []string) (
 		return nil, fmt.Errorf("unmarshal output: %w", err)
 	}
 	out := make(map[string]flatVal)
-	if err := flattenInto(out, "", v, ignoreFields, compareFields); err != nil {
+	if err := flattenInto(out, "", "", v, ignoreFields, compareFields); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func flattenInto(out map[string]flatVal, path string, v interface{}, ignore, compare []string) error {
+// flattenInto walks v building two paths in lockstep: path carries array indices (the
+// leaf's identity in the flattened map — element order must stay significant), elided
+// skips them (the pattern-matching form stripFields uses, so one ignore/compare entry
+// covers every array element).
+func flattenInto(out map[string]flatVal, path, elided string, v interface{}, ignore, compare []string) error {
 	switch t := v.(type) {
 	case map[string]interface{}:
 		for k, val := range t {
@@ -1504,7 +1622,11 @@ func flattenInto(out map[string]flatVal, path string, v interface{}, ignore, com
 			if path != "" {
 				p = path + "." + k
 			}
-			if err := flattenInto(out, p, val, ignore, compare); err != nil {
+			e := k
+			if elided != "" {
+				e = elided + "." + k
+			}
+			if err := flattenInto(out, p, e, val, ignore, compare); err != nil {
 				return err
 			}
 		}
@@ -1514,15 +1636,15 @@ func flattenInto(out map[string]flatVal, path string, v interface{}, ignore, com
 			if path == "" {
 				p = itoa(i)
 			}
-			if err := flattenInto(out, p, val, ignore, compare); err != nil {
+			if err := flattenInto(out, p, elided, val, ignore, compare); err != nil {
 				return err
 			}
 		}
 	default: // scalar leaf
-		if matchesFieldPath(ignore, path) {
+		if matchesFieldPath(ignore, path) || matchesFieldPath(ignore, elided) {
 			return nil
 		}
-		if len(compare) > 0 && !matchesFieldPath(compare, path) {
+		if len(compare) > 0 && !matchesFieldPath(compare, path) && !matchesFieldPath(compare, elided) {
 			return nil
 		}
 		switch x := v.(type) {

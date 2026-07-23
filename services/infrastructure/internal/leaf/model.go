@@ -158,6 +158,15 @@ type ValidationConfig struct {
 	// per-fight trajectories legitimately diverge across volunteers. Empty = compare all
 	// numeric leaves (minus IgnoreFields). No effect on EXACT.
 	CompareFields []string `json:"compare_fields,omitempty"`
+	// CompareAllFields is the explicit determinism assertion for NUMERIC_TOLERANCE
+	// (PB-36): "every field of my output is deterministic — compare all of them within
+	// numeric_tolerance." It satisfies the redundant-leaf comparison-scoping gate
+	// without naming any field, for leaves whose output carries no runtime metadata at
+	// all. It is an ASSERTION, not a scope: setting it alongside compare_fields or
+	// ignore_fields is rejected (a field list contradicts "all fields"), and it is
+	// rejected outside NUMERIC_TOLERANCE (EXACT with no ignore_fields already compares
+	// the whole output by checksum, so the knob would be vestigial there).
+	CompareAllFields bool `json:"compare_all_fields,omitempty"`
 	// HomogeneousRedundancy, when true, pins every copy of a work unit to volunteers of a
 	// single hardware class (CPU vendor + OS + arch), so bit-for-bit agreement is
 	// achievable even for engines that are not portably deterministic. See dispatch.

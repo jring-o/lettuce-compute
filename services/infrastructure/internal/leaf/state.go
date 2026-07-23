@@ -182,9 +182,14 @@ func TransitionLeaf(ctx context.Context, repo Repository, p *Leaf, targetState L
 		return err
 	}
 
-	// Activation prerequisites only apply when transitioning from CONFIGURING -> ACTIVE.
-	// PAUSED -> ACTIVE (resume) skips this check.
-	if targetState == StateActive && p.State == StateConfiguring {
+	// Activation prerequisites apply on EVERY transition into ACTIVE — first activation
+	// (CONFIGURING -> ACTIVE) and resume (PAUSED -> ACTIVE) alike. Resume used to skip
+	// this check, which let a leaf activated before a validation rule existed re-enter
+	// ACTIVE with a config the rule now refuses (PB-36: pre-gate NUMERIC_TOLERANCE
+	// leaves kept their honest-rejection footgun forever). A paused leaf that passed at
+	// activation still passes here; one that predates a tightened rule gets the same
+	// actionable 400 the configure path gives, at the moment an operator touches it.
+	if targetState == StateActive {
 		if err := CanActivate(p); err != nil {
 			return err
 		}

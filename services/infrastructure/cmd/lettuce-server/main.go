@@ -703,6 +703,14 @@ func main() {
 				lazyManager.Run(ctx, 30*time.Second)
 			})
 			safego.Go(leaderCtx, logger, "leaf-health-recorder", healthRecorder.Start)
+			// One-shot advisory sweep (PB-36): WARN for every ACTIVE leaf whose
+			// validation config predates a since-added rule and would now be refused
+			// at configure — the configure-time gates cannot reach configs written
+			// before they existed. Leader-gated so a multi-replica fleet logs each
+			// footgun once per election, not once per head.
+			safego.Go(leaderCtx, logger, "leaf-config-footgun-scan", func(ctx context.Context) {
+				leaf.WarnActiveConfigFootguns(ctx, leafRepo, logger)
+			})
 			safego.Go(leaderCtx, logger, "artifact-gc", artifactGC.Start)
 			if didRecheckWorker != nil {
 				safego.Go(leaderCtx, logger, "did-recheck-worker", didRecheckWorker.Start)

@@ -697,10 +697,29 @@ func ValidateValidationConfig(c *ValidationConfig) *apierror.APIError {
 		// author's back — un-compared fields would validate no matter what they carry.
 		// Only refused when redundant comparison can occur: target_copies >= 2, or
 		// spot-check (which forces a 2-of-2 corroboration on a single-copy leaf).
-		if (effTarget >= 2 || c.SpotCheckEnabled) && len(c.CompareFields) == 0 && len(c.IgnoreFields) == 0 {
+		// A genuinely-deterministic output needs no field list: compare_all_fields is
+		// the explicit whole-output assertion that satisfies this gate (PB-36).
+		if (effTarget >= 2 || c.SpotCheckEnabled) && len(c.CompareFields) == 0 && len(c.IgnoreFields) == 0 && !c.CompareAllFields {
 			return apierror.ValidationError(
-				"NUMERIC_TOLERANCE on a redundant leaf requires compare_fields or ignore_fields: the comparator flattens the entire output JSON, so nondeterministic fields (e.g. timing metadata like compute_time_ms) make honest results disagree. Set compare_fields to the science output (recommended), or ignore_fields for the nondeterministic fields.",
+				"NUMERIC_TOLERANCE on a redundant leaf requires comparison scoping: the comparator flattens the entire output JSON, so nondeterministic fields (e.g. timing metadata like compute_time_ms) make honest results disagree. Set compare_fields to the science output (recommended), ignore_fields for the nondeterministic fields, or compare_all_fields: true if every output field is deterministic.",
 				validationDetail{Field: "compare_fields", Reason: "comparison_scope_required"})
+		}
+	}
+
+	// compare_all_fields is an assertion, not a scope: combining it with a field list is
+	// contradictory ("all fields" vs "these fields"), and outside NUMERIC_TOLERANCE it
+	// would be vestigial (EXACT with no ignore_fields already compares the whole output
+	// by checksum), so both are refused rather than silently reconciled (PB-36).
+	if c.CompareAllFields {
+		if c.ComparisonMode != ComparisonNumericTolerance {
+			return apierror.ValidationError(
+				"compare_all_fields is only valid when comparison_mode is NUMERIC_TOLERANCE (EXACT already compares the whole output by checksum)",
+				validationDetail{Field: "compare_all_fields", Reason: "not_applicable_for_mode"})
+		}
+		if len(c.CompareFields) > 0 || len(c.IgnoreFields) > 0 {
+			return apierror.ValidationError(
+				"compare_all_fields asserts the WHOLE output is deterministic and cannot be combined with compare_fields or ignore_fields; drop compare_all_fields to scope the comparison",
+				validationDetail{Field: "compare_all_fields", Reason: "contradicts_field_scoping"})
 		}
 	}
 
