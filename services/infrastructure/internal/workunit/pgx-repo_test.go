@@ -1350,6 +1350,14 @@ func TestWorkUnitUpdateStateRejectedToFailed(t *testing.T) {
 // createActiveTestLeaf creates a project with state=ACTIVE and the given resource requirements.
 func createActiveTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID, resReqs, execConfig, valConfig string) types.ID {
 	t.Helper()
+	return createActiveTestLeafVis(t, pool, creatorID, resReqs, execConfig, valConfig, "PUBLIC")
+}
+
+// createActiveTestLeafVis is createActiveTestLeaf with an explicit visibility
+// ('PUBLIC' / 'UNLISTED' / 'PRIVATE') — the dispatch visibility gate (PB-38) needs
+// non-PUBLIC fixtures.
+func createActiveTestLeafVis(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID, resReqs, execConfig, valConfig, visibility string) types.ID {
+	t.Helper()
 	ctx := context.Background()
 	id := types.NewID()
 	slug := "active-leaf-" + uuid.New().String()[:8]
@@ -1361,6 +1369,9 @@ func createActiveTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID,
 	}
 	if valConfig == "" {
 		valConfig = `{"redundancy_factor":2,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`
+	}
+	if visibility == "" {
+		visibility = "PUBLIC"
 	}
 	_, err := pool.Exec(ctx, `
 		INSERT INTO leafs (
@@ -1375,10 +1386,10 @@ func createActiveTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID,
 			'{"transfer_strategy":"INLINE","aggregation_format":"JSON","max_input_size_bytes":1048576}',
 			'{"credit_per_validated_work_unit":1.0}',
 			$8::jsonb,
-			false, 'PUBLIC', $5
+			false, $9::leaf_visibility, $5
 		)`,
 		id, "Active Leaf "+slug, slug, "An active leaf for assignment tests",
-		creatorID, execConfig, valConfig, resReqs,
+		creatorID, execConfig, valConfig, resReqs, visibility,
 	)
 	if err != nil {
 		t.Fatalf("failed to create active test leaf: %v", err)

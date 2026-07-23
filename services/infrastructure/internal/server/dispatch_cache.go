@@ -1119,6 +1119,7 @@ const (
 	rejectBlockedLeaf                            // unit's leaf is blocked for this volunteer
 	rejectHRClassMismatch                        // unit pinned to a different hardware class
 	rejectLeafNotCached                          // leaf metadata not yet warmed
+	rejectLeafNotPublic                          // non-PUBLIC leaf, requester did not pin it by id (PB-38)
 	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
 	rejectInfeasibleDeadline                     // host too slow to finish this unit before its deadline
 	rejectTrustReserved                          // untrusted requester; unit's last slots reserved for trusted subjects
@@ -1152,6 +1153,8 @@ func (r rejectReason) String() string {
 		return "hr_class_mismatch"
 	case rejectLeafNotCached:
 		return "leaf_not_cached"
+	case rejectLeafNotPublic:
+		return "leaf_not_public"
 	case rejectCapabilityMismatch:
 		return "capability_mismatch"
 	case rejectInfeasibleDeadline:
@@ -1340,6 +1343,18 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 		// while locked.)
 		return false, rejectLeafNotCached
 	}
+	// Visibility gate (PB-38), the in-memory mirror of the SQL selection predicate: a
+	// non-PUBLIC (UNLISTED/PRIVATE) leaf's units go ONLY to a requester that named the
+	// leaf explicitly in its leaf filter — the pin-by-id opt-in. The global refill no
+	// longer stages non-PUBLIC leafs, but a LEAF-SCOPED refill (for a pinned requester)
+	// stages them into the SHARED ready pool, so without this check an any-leaf
+	// requester could still be handed a hidden leaf's unit out of that pool. Matched on
+	// the two explicit hidden values (not != PUBLIC) so a sparsely-built snapshot with
+	// a zero-value Visibility stays eligible — the DB column is NOT NULL DEFAULT
+	// 'PUBLIC', so a warmed production leaf is never empty.
+	if (lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate) && !containsID(opts.LeafIDs, leafID) {
+		return false, rejectLeafNotPublic
+	}
 	if !leafMatchesCapabilities(lf, opts) {
 		return false, rejectCapabilityMismatch
 	}
@@ -1524,8 +1539,10 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 // already snapshotted into an in-flight flushBatch (copied under mu, written outside
 // the lock) cannot be recalled. The buffered-abandon path no longer has that
 // residual window at all: AbandonWorkUnit forces flushPendingFor first (PB-7), which
-// drains the queues AND waits out any in-flight batch (PB-15), so by the time it
-// releases the hold there is nothing in flight to re-stamp.
+// drains the queues AND waits out any in-flight batch (PB-15) — and when that drain
+// cannot complete within the shed budget (maintenance-semaphore saturation, PB-37)
+// the abandon fails RETRYABLE before releasing the hold, so there is never anything
+// in flight to re-stamp a released hold.
 func (c *dispatchCache) purgePendingForLocked(unitID, volunteerID types.ID) {
 	if len(c.pendingWrites) > 0 {
 		w := c.pendingWrites[:0]
@@ -1572,14 +1589,22 @@ func (c *dispatchCache) hasInMemReservation(unitID, volunteerID types.ID) bool {
 // before StartWork's run-start transaction reads/Assigns the unit — or before an
 // abandon closes it (PB-7). The CALLER already holds an admission slot, so this drains
 // without re-acquiring (avoiding a self-deadlock when admissionCap == 1). It closes
-// the flush race deterministically: after it returns (short of ctx expiry), a landed
-// reservation is durable; an in-memory hold the flush could not land was voided, so
-// the caller's subsequent checks fail closed. Unlike the pre-PB-15 version it also
-// waits out any ticker flush batch already in flight — the window that made the old
-// drain non-deterministic — and drains the spot-check queue, which the old version
-// never touched (the unconditional spot-check variant of the same denial).
-func (c *dispatchCache) flushPendingFor(ctx context.Context) {
-	c.flushAllPendingHeld(ctx)
+// the flush race deterministically: after a TRUE return, a landed reservation is
+// durable and an in-memory hold the flush could not land was voided, so the caller's
+// subsequent checks fail closed. Unlike the pre-PB-15 version it also waits out any
+// ticker flush batch already in flight — the window that made the old drain
+// non-deterministic — and drains the spot-check queue, which the old version never
+// touched (the unconditional spot-check variant of the same denial).
+//
+// Returns FALSE when ctx expired before everything pending had landed or voided
+// (PB-37: reachable under maintenance-semaphore saturation, when the in-flight ticker
+// batch the drain must wait out is itself blocked on the saturated maintenance slot).
+// A false return means a write for the caller's (unit, volunteer) may STILL land after
+// this returns — the caller must not take any branch that assumes the DB state is
+// settled (StartWork's drop-the-unit denial, abandon's hold release); it should fail
+// RETRYABLE instead so the outcome under saturation is deterministic.
+func (c *dispatchCache) flushPendingFor(ctx context.Context) bool {
+	return c.flushAllPendingHeld(ctx)
 }
 
 // onUnitDone evicts a unit from the in-memory ledger entirely (all holders) and
@@ -2494,7 +2519,15 @@ func (c *dispatchCache) flushOnce(ctx context.Context) {
 // PB-15 (spot-check half): the spot-check queue was previously drained ONLY by the
 // 100ms ticker, so a warm-cache volunteer's first StartWork on a spot-checked unit
 // was denied unconditionally. It is now drained here too.
-func (c *dispatchCache) flushAllPendingHeld(ctx context.Context) {
+//
+// PB-37: the drain reports whether it COMPLETED. True = every pending write landed or
+// was voided (the settled state the Major-3 guard needs). False = ctx expired first —
+// either mid-drain (a dead ctx makes flushBatch error-and-requeue, which would
+// otherwise busy-loop here forever) or while waiting out an in-flight ticker batch
+// (maintenance-semaphore saturation can hold that batch out for the whole DB timeout).
+// On false, a write can still land AFTER this returns; callers must fail retryable
+// rather than proceed on an assumed-settled DB state.
+func (c *dispatchCache) flushAllPendingHeld(ctx context.Context) bool {
 	for {
 		c.mu.Lock()
 		remaining := len(c.pendingWrites)
@@ -2503,7 +2536,14 @@ func (c *dispatchCache) flushAllPendingHeld(ctx context.Context) {
 		doneCh := c.flushDoneCh
 		c.mu.Unlock()
 		if remaining == 0 && remainingSC == 0 && inFlight == 0 {
-			return
+			return true
+		}
+		// A dead ctx can make no further progress: flushBatch/flushSpotChecks would
+		// error against the expired ctx and requeue their records (an unbounded
+		// busy-loop pre-PB-37), and the in-flight wait below would return on the same
+		// ctx anyway. Report the drain incomplete.
+		if ctx.Err() != nil {
+			return false
 		}
 		if remaining > 0 {
 			c.flushBatch(ctx, false)
@@ -2518,7 +2558,7 @@ func (c *dispatchCache) flushAllPendingHeld(ctx context.Context) {
 		select {
 		case <-doneCh:
 		case <-ctx.Done():
-			return
+			return false
 		}
 	}
 }

@@ -36,10 +36,11 @@
 // in-flight cap, homogeneous-redundancy hardware-class matching,
 // runtime/capability fit, feasibility-at-deadline, the trusted-corroborator
 // reservation (an untrusted requester withheld from a slot the quorum still needs a
-// trusted result to fill), and account standing (a BENCHED requester refused all
+// trusted result to fill), account standing (a BENCHED requester refused all
 // dispatch, and copies/results held or submitted by a neutralized account not
-// counting toward redundancy coverage — forced replication) — with boundary cases
-// at each cap/limit edge.
+// counting toward redundancy coverage — forced replication), and leaf visibility
+// (a non-PUBLIC leaf served only to a requester that pinned it by id, PB-38) — with
+// boundary cases at each cap/limit edge.
 package dispatchparity
 
 // Dimension names the single predicate axis a Scenario primarily exercises. It
@@ -61,6 +62,20 @@ const (
 	DimFeasibility       Dimension = "deadline_feasibility"
 	DimTrustReservation  Dimension = "trusted_corroborator_reservation"
 	DimStanding          Dimension = "account_standing"
+	DimVisibility        Dimension = "leaf_visibility"
+)
+
+// Leaf-visibility values for the DimVisibility dimension (PB-38). They mirror the
+// leafs.visibility domain as plain strings so this package stays primitive-only. The
+// ZERO value ("") reads as PUBLIC — the gate is then inert, so every pre-existing
+// scenario is unaffected. The rule: a non-PUBLIC (UNLISTED/PRIVATE) leaf's units are
+// served ONLY to a requester whose leaf filter names the leaf explicitly (the
+// pin-by-id opt-in); an any-leaf request gets PUBLIC only, matching the catalog
+// (GetHeadInfo lists PUBLIC ACTIVE leafs only).
+const (
+	VisibilityPublic   = "" // PUBLIC: the gate is inert (zero value)
+	VisibilityUnlisted = "UNLISTED"
+	VisibilityPrivate  = "PRIVATE"
 )
 
 // Requester account-standing values for the DimStanding dimension (account standing,
@@ -212,6 +227,16 @@ type Scenario struct {
 	// TargetCopies is the leaf's effective redundancy (validation_config
 	// redundancy_factor): how many distinct volunteers may each hold a copy.
 	TargetCopies int
+	// LeafVisibility is the target leaf's visibility: VisibilityPublic (the ""
+	// zero value, gate inert), VisibilityUnlisted, or VisibilityPrivate. A
+	// non-PUBLIC leaf's units are served only when the requester names the leaf in
+	// its leaf filter (AnyLeafRequest false) — the PB-38 visibility gate.
+	LeafVisibility string
+	// AnyLeafRequest, when true, makes the requester's leaf filter EMPTY (the
+	// any-leaf fallback a volunteer with no cached catalog sends). The zero value
+	// (false) scopes the request to the target leaf — the pin-by-id form, and the
+	// shape every pre-visibility scenario always ran with on the SQL side.
+	AnyLeafRequest bool
 	// OtherLiveCopies is the number of live copies of the target unit already held
 	// by OTHER, distinct volunteers (each a work_unit_assignment_history row with
 	// outcome NULL). They consume redundancy headroom.
@@ -434,7 +459,10 @@ func (s Scenario) EnforcedBy(g Gate) bool {
 		// trusted reservation (both embed countableCoverageSQL).
 		case DimRedundancy, DimTrustReservation, DimStanding, DimSelfLiveCopy, DimSelfPendingResult, DimSubjectDistinct, DimCooldown, DimFeasibility, DimBaseline:
 			return true
-		default: // capability, hr_class, inflight_cap — delegated to the hand-out
+		default: // capability, hr_class, inflight_cap, visibility — delegated to the hand-out
+			// (visibility is a SELECTION property: the landing write cannot see the
+			// request's leaf filter, and it must land a pinned-UNLISTED hand-out, so
+			// the read-side gates own the refusal — PB-38.)
 			return false
 		}
 	case GateReserveCopy:
@@ -1051,6 +1079,41 @@ func Scenarios() []Scenario {
 			// Gate-inertness control: every standing field at its zero value (OK requester, no
 			// probation coverage) must reach the SAME eligible verdict as the plain baseline,
 			// pinning that a non-standing deployment is byte-for-byte unchanged.
+			s.Eligible = true
+		}),
+
+		// --- leaf visibility (PB-38) -----------------------------------------
+		// A leaf hidden from the catalog (GetHeadInfo lists PUBLIC ACTIVE only) must
+		// not dispatch through catalog-driven requests: an any-leaf request (the
+		// volunteer fallback with no leaf filter) gets PUBLIC leafs only, while a
+		// request that names the leaf id explicitly (the pin-by-id opt-in — attach
+		// --leaf / a browser body naming the id) is still served. Enforced by the two
+		// read-side gates; the landing writes deliberately delegate (they cannot see
+		// the request's leaf filter, and must land a pinned-UNLISTED hand-out).
+		with("visibility_unlisted_any_leaf_refused", DimVisibility, func(s *Scenario) {
+			s.LeafVisibility = VisibilityUnlisted
+			s.AnyLeafRequest = true
+			s.Eligible = false
+		}),
+		with("visibility_unlisted_pinned_by_id_served", DimVisibility, func(s *Scenario) {
+			s.LeafVisibility = VisibilityUnlisted
+			s.AnyLeafRequest = false // leaf filter names the target leaf
+			s.Eligible = true
+		}),
+		with("visibility_private_any_leaf_refused", DimVisibility, func(s *Scenario) {
+			s.LeafVisibility = VisibilityPrivate
+			s.AnyLeafRequest = true
+			s.Eligible = false
+		}),
+		with("visibility_private_pinned_by_id_served", DimVisibility, func(s *Scenario) {
+			s.LeafVisibility = VisibilityPrivate
+			s.AnyLeafRequest = false
+			s.Eligible = true
+		}),
+		with("visibility_public_any_leaf_served_control", DimVisibility, func(s *Scenario) {
+			// Control: a PUBLIC leaf serves the any-leaf fallback exactly as before.
+			s.LeafVisibility = VisibilityPublic
+			s.AnyLeafRequest = true
 			s.Eligible = true
 		}),
 	}
