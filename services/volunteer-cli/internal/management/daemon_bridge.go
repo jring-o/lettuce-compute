@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
@@ -26,6 +27,10 @@ type DaemonBridge struct {
 	daemon  *daemon.Daemon
 	cfgPath string
 	eta     *etaTracker
+	// cfgMu serializes this bridge's config write-backs (UpdateConfig,
+	// AttachLeaf, DetachLeaf) so two concurrent API writes cannot interleave
+	// their load-modify-save cycles and drop each other's changes.
+	cfgMu sync.Mutex
 }
 
 // NewDaemonBridge creates a bridge between the management API and the daemon.
@@ -365,16 +370,54 @@ type AttachRequest struct {
 	Name          string `json:"name,omitempty"`
 }
 
+// loadWriteBase returns the config a bridge write-back must start from: the
+// CURRENT on-disk file, not the daemon's in-memory copy. The two diverge
+// whenever the CLI edits config.yaml while the daemon runs — most critically
+// `heads trust <head> none`, which revokes runtime trust on disk and tells the
+// user to restart. Persisting the daemon's boot-time snapshot here silently
+// overwrote that revocation with the stale, wider trust (PB-28), so disk state
+// is authoritative and every bridge write is rebased onto it. The in-memory
+// config is the base only when no config file exists at all — then there is no
+// disk-side decision to preserve.
+//
+// DataDir is always carried over from the live config: it is resolved at
+// startup (--data-dir applied, made absolute) and the running daemon's paths
+// must not move because a write-back re-read a relative or stale value from
+// the file.
+func (b *DaemonBridge) loadWriteBase() (*config.Config, error) {
+	live := b.daemon.GetConfig()
+	if _, err := os.Stat(b.cfgPath); os.IsNotExist(err) {
+		base := *live
+		base.Servers = make([]config.ServerConfig, len(live.Servers))
+		copy(base.Servers, live.Servers)
+		return &base, nil
+	}
+	base, err := config.Load(b.cfgPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading current config from disk: %w", err)
+	}
+	base.DataDir = live.DataDir
+	return base, nil
+}
+
 // AttachLeaf adds a server to the configuration and persists it.
 func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	if req.ServerAddress == "" {
 		return fmt.Errorf("server_address is required")
 	}
 
-	cfg := b.daemon.GetConfig()
+	b.cfgMu.Lock()
+	defer b.cfgMu.Unlock()
+
+	// Rebase onto the on-disk config (see loadWriteBase); the daemon's live
+	// config is unchanged unless Save succeeds.
+	newCfg, err := b.loadWriteBase()
+	if err != nil {
+		return err
+	}
 
 	// Check for duplicates.
-	for _, s := range cfg.Servers {
+	for _, s := range newCfg.Servers {
 		if s.GRPCAddress == req.ServerAddress {
 			return fmt.Errorf("already attached to %s", req.ServerAddress)
 		}
@@ -385,13 +428,13 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 		name = req.ServerAddress
 	}
 
-	// Copy config before mutating so the daemon's live config is unchanged if Save fails.
-	newCfg := *cfg
-	newCfg.Servers = make([]config.ServerConfig, len(cfg.Servers), len(cfg.Servers)+1)
-	copy(newCfg.Servers, cfg.Servers)
 	sc := config.ServerConfig{
 		GRPCAddress: req.ServerAddress,
 		Name:        name,
+		// Explicit empty, not nil: attaching through the bridge has no consent
+		// step, so the new head starts WASM-only and the trust migration must
+		// never re-seed it from available_runtimes (PB-28).
+		TrustedRuntimes: []string{},
 	}
 	if req.LeafID != "" {
 		sc.PinnedLeafIDs = []string{req.LeafID}
@@ -402,7 +445,7 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
-	b.daemon.ApplyConfig(&newCfg)
+	b.daemon.ApplyConfig(newCfg)
 	return nil
 }
 
@@ -418,11 +461,20 @@ func (b *DaemonBridge) DetachLeaf(req DetachRequest) error {
 		return fmt.Errorf("server_name or server_address is required")
 	}
 
-	cfg := b.daemon.GetConfig()
+	b.cfgMu.Lock()
+	defer b.cfgMu.Unlock()
+
+	// Rebase onto the on-disk config (see loadWriteBase); the daemon's live
+	// config is unchanged unless Save succeeds.
+	newCfg, err := b.loadWriteBase()
+	if err != nil {
+		return err
+	}
+
 	found := false
 	var remaining []config.ServerConfig
 
-	for _, s := range cfg.Servers {
+	for _, s := range newCfg.Servers {
 		name := s.DisplayName()
 		if (req.ServerName != "" && name == req.ServerName) ||
 			(req.ServerAddress != "" && s.GRPCAddress == req.ServerAddress) {
@@ -436,15 +488,13 @@ func (b *DaemonBridge) DetachLeaf(req DetachRequest) error {
 		return errNotFound
 	}
 
-	// Copy config before mutating so the daemon's live config is unchanged if Save fails.
-	newCfg := *cfg
 	newCfg.Servers = remaining
 
 	if err := newCfg.Save(b.cfgPath); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
-	b.daemon.ApplyConfig(&newCfg)
+	b.daemon.ApplyConfig(newCfg)
 	return nil
 }
 
@@ -681,13 +731,15 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 
 // UpdateConfig applies a partial config update, validates, persists, and applies.
 func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, error) {
-	cfg := b.daemon.GetConfig()
+	b.cfgMu.Lock()
+	defer b.cfgMu.Unlock()
 
-	// Copy config before mutating so the daemon's live config is unchanged if
-	// validation or Save fails.
-	newCfg := *cfg
-	newCfg.Servers = make([]config.ServerConfig, len(cfg.Servers))
-	copy(newCfg.Servers, cfg.Servers)
+	// Rebase the partial onto the on-disk config (see loadWriteBase); the
+	// daemon's live config is unchanged unless validation and Save succeed.
+	newCfg, err := b.loadWriteBase()
+	if err != nil {
+		return nil, err
+	}
 
 	// Apply partial updates to recognized fields.
 	if v, ok := partial["resource_limits"]; ok {
@@ -728,7 +780,7 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 	}
 	if v, ok := partial["servers"]; ok {
 		if serverList, ok := v.([]any); ok {
-			applyServers(&newCfg, serverList)
+			applyServers(newCfg, serverList)
 		}
 	}
 
@@ -740,7 +792,7 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 		return nil, fmt.Errorf("saving config: %w", err)
 	}
 
-	b.daemon.ApplyConfig(&newCfg)
+	b.daemon.ApplyConfig(newCfg)
 
 	resp := b.GetConfig()
 	return &resp, nil
