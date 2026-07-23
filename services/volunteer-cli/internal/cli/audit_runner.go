@@ -92,6 +92,13 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 		return fmt.Errorf("--poll-interval must be positive")
 	}
 
+	// Same PB-30 invariant as the daemon: the sandbox dirs created under the data
+	// dir are shielded from other local users only by its 0o700 mode.
+	dataDirTightened, err := daemon.EnsureDataDirPrivate(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("securing data directory: %w", err)
+	}
+
 	// Load the identity keypair — the same account key the daemon authenticates with.
 	pub, priv, err := identity.LoadKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	if err != nil {
@@ -113,6 +120,11 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 		pubFP = fmt.Sprintf("%x", pub[:4])
 	}
 	logger.Info("audit runner starting", "version", version, "pubkey_fp", pubFP, "once", once, "poll_interval", pollInterval)
+
+	if dataDirTightened {
+		logger.Warn("data directory had group/other access; tightened to 0700 — the sandbox dirs beneath it rely on this mode to keep other local users out (PB-30)",
+			"data_dir", cfg.DataDir)
+	}
 
 	// WASM is always available (wazero is embedded); make sure the registry can serve
 	// wasm-runtime audit jobs even if the config predates WASM.

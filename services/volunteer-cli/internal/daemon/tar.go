@@ -120,6 +120,19 @@ const (
 // extraction failure (cap breach, traversal, I/O error) the partial contents
 // written under dir are removed best-effort so the caller does not resume
 // from a half-extracted checkpoint.
+//
+// Restored entries are normalized SANDBOX-WRITABLE — dirs 0o777, files 0o666 —
+// the same contract makeSandboxWritable applies to the fresh bind dirs
+// (PB-23). Checkpoint restore is how a unit reassigned ACROSS volunteers gets
+// its state, and a hardened CPU container runs as nobody (65534:65534): files
+// restored volunteer-owned 0644/0755 could not be overwritten in place, so the
+// resumed leaf died with EACCES on its first checkpoint write (PB-29).
+// World-writable is deliberate and contained exactly as in PB-23: every
+// ancestor under the volunteer's 0o700 data dir keeps other host users out,
+// the dirs are per-unit, and chown-to-sandbox-uid is not portable (rootless
+// engines remap uids; Windows/macOS binds cross a VM share). Native-runtime
+// checkpoints get the same modes harmlessly (the volunteer's own process
+// writes them).
 func extractTar(data []byte, dir string) (err error) {
 	// F2: track files we created so a cap breach mid-extraction wipes them.
 	// We only remove what we wrote (best-effort), leaving any pre-existing
@@ -155,18 +168,31 @@ func extractTar(data []byte, dir string) (err error) {
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if mkErr := os.MkdirAll(target, 0755); mkErr != nil {
+			if mkErr := os.MkdirAll(target, 0o777); mkErr != nil {
 				return fmt.Errorf("creating dir %s: %w", target, mkErr)
 			}
+			// Explicit chmod after MkdirAll so the process umask cannot narrow the
+			// sandbox-writable mode (same pattern as makeSandboxWritable).
+			if chErr := os.Chmod(target, 0o777); chErr != nil {
+				return fmt.Errorf("making dir %s sandbox-writable: %w", target, chErr)
+			}
 		case tar.TypeReg:
-			if mkErr := os.MkdirAll(filepath.Dir(target), 0755); mkErr != nil {
+			parent := filepath.Dir(target)
+			if mkErr := os.MkdirAll(parent, 0o777); mkErr != nil {
 				return fmt.Errorf("creating parent dir for %s: %w", target, mkErr)
+			}
+			if chErr := os.Chmod(parent, 0o777); chErr != nil {
+				return fmt.Errorf("making parent dir of %s sandbox-writable: %w", target, chErr)
 			}
 			f, createErr := os.Create(target)
 			if createErr != nil {
 				return fmt.Errorf("creating file %s: %w", target, createErr)
 			}
 			written = append(written, target)
+			if chErr := f.Chmod(0o666); chErr != nil {
+				f.Close()
+				return fmt.Errorf("making file %s sandbox-writable: %w", target, chErr)
+			}
 			// F2: per-entry and remaining-total cap. Read at most limit+1
 			// bytes so we can detect overflow by observing n > limit rather
 			// than silently truncating (which io.LimitReader alone would do).

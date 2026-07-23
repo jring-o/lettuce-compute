@@ -66,6 +66,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("daemon is already running (PID: %d). Use 'lettuce-volunteer stop' to stop it", pid)
 	}
 
+	// Enforce the 0o700 data dir the sandbox containment model assumes (PB-30):
+	// the world-writable container bind dirs below are shielded from other local
+	// users ONLY by this mode, and MkdirAll never tightens a pre-existing looser
+	// dir (e.g. --data-dir pointed at an existing 0755 directory). Refusing to
+	// start is correct when it cannot be enforced. Done before anything touches
+	// the data dir; the WARN lands after the logger exists.
+	dataDirTightened, err := daemon.EnsureDataDirPrivate(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("securing data directory: %w", err)
+	}
+
 	// Load identity keypair.
 	pub, priv, err := identity.LoadKeyPair(cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	if err != nil {
@@ -113,6 +124,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	)
 
 	logger.Info("logging to file", "path", cfg.LogFilePath(), "enabled", cfg.LogToFile)
+
+	if dataDirTightened {
+		logger.Warn("data directory had group/other access; tightened to 0700 — the sandbox dirs beneath it rely on this mode to keep other local users out (PB-30)",
+			"data_dir", cfg.DataDir)
+	}
 
 	// Record which identity + config this daemon is running under: a SHORT public-key
 	// fingerprint (first 8 hex chars of the Ed25519 PUBLIC key — never the private
