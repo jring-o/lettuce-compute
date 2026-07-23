@@ -495,7 +495,7 @@ func TestDetachLeafViaCLI(t *testing.T) {
 	c.KeyFile = filepath.Join(dir, "identity.key")
 	c.PubKeyFile = filepath.Join(dir, "identity.pub")
 	c.Servers = []config.ServerConfig{
-		{GRPCAddress: "srv:9090", HTTPAddress: "http://srv:8080", LeafID: "proj-1", Name: "srv"},
+		{GRPCAddress: "srv:9090", HTTPAddress: "http://srv:8080", PinnedLeafIDs: []string{"proj-1"}, Name: "srv"},
 	}
 	if err := c.Save(cfgFile); err != nil {
 		t.Fatal(err)
@@ -515,8 +515,12 @@ func TestDetachLeafViaCLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Servers) != 0 {
-		t.Errorf("servers = %d, want 0", len(loaded.Servers))
+	// The pin is removed; the head entry stays attached (PB-16 model).
+	if len(loaded.Servers) != 1 {
+		t.Fatalf("servers = %d, want 1 (head entry stays)", len(loaded.Servers))
+	}
+	if len(loaded.Servers[0].PinnedLeafIDs) != 0 {
+		t.Errorf("pins = %v, want none after detach", loaded.Servers[0].PinnedLeafIDs)
 	}
 }
 

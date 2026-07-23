@@ -333,14 +333,24 @@ func (b *DaemonBridge) GetLeafs() []LeafInfo {
 		if serverStatus[name] {
 			status = "connected"
 		}
-		leafs = append(leafs, LeafInfo{
+		info := LeafInfo{
 			ServerName:         name,
 			ServerAddress:      srv.GRPCAddress,
-			LeafID:             srv.LeafID,
 			Status:             status,
 			CreditEarned:       serverCredit[name],
 			WorkUnitsCompleted: serverWUs[name],
-		})
+		}
+		if len(srv.PinnedLeafIDs) == 0 {
+			leafs = append(leafs, info)
+			continue
+		}
+		// One row per explicitly pinned leaf (PB-16: pins live ON the head entry
+		// now, several per head).
+		for _, pin := range srv.PinnedLeafIDs {
+			row := info
+			row.LeafID = pin
+			leafs = append(leafs, row)
+		}
 	}
 	if leafs == nil {
 		leafs = []LeafInfo{}
@@ -379,11 +389,14 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	newCfg := *cfg
 	newCfg.Servers = make([]config.ServerConfig, len(cfg.Servers), len(cfg.Servers)+1)
 	copy(newCfg.Servers, cfg.Servers)
-	newCfg.Servers = append(newCfg.Servers, config.ServerConfig{
+	sc := config.ServerConfig{
 		GRPCAddress: req.ServerAddress,
-		LeafID:      req.LeafID,
 		Name:        name,
-	})
+	}
+	if req.LeafID != "" {
+		sc.PinnedLeafIDs = []string{req.LeafID}
+	}
+	newCfg.Servers = append(newCfg.Servers, sc)
 
 	if err := newCfg.Save(b.cfgPath); err != nil {
 		return fmt.Errorf("saving config: %w", err)
@@ -457,23 +470,21 @@ func (b *DaemonBridge) GetAvailableLeafsLegacy(search, area string) []AvailableL
 	for _, srv := range cfg.Servers {
 		name := srv.DisplayName()
 
-		if srv.LeafID == "" {
-			continue
-		}
+		for _, pin := range srv.PinnedLeafIDs {
+			p := AvailableLeaf{
+				ServerName: name,
+				LeafID:     pin,
+				LeafName:   name,
+			}
 
-		p := AvailableLeaf{
-			ServerName: name,
-			LeafID:     srv.LeafID,
-			LeafName:   name,
+			if search != "" && !containsIgnoreCase(p.LeafName, search) && !containsIgnoreCase(p.LeafID, search) {
+				continue
+			}
+			if area != "" && !containsIgnoreCase(p.ResearchArea, area) {
+				continue
+			}
+			leafs = append(leafs, p)
 		}
-
-		if search != "" && !containsIgnoreCase(p.LeafName, search) && !containsIgnoreCase(p.LeafID, search) {
-			continue
-		}
-		if area != "" && !containsIgnoreCase(p.ResearchArea, area) {
-			continue
-		}
-		leafs = append(leafs, p)
 	}
 
 	if leafs == nil {

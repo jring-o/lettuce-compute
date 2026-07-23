@@ -41,8 +41,8 @@ func TestAttachLeaf(t *testing.T) {
 		t.Fatalf("servers = %d, want 1", len(mgr.cfg.Servers))
 	}
 	s := mgr.cfg.Servers[0]
-	if s.LeafID != "proj-1" || s.GRPCAddress != "localhost:9090" {
-		t.Errorf("server = %+v, want proj-1 on localhost:9090", s)
+	if s.GRPCAddress != "localhost:9090" || len(s.PinnedLeafIDs) != 1 || s.PinnedLeafIDs[0] != "proj-1" {
+		t.Errorf("server = %+v, want proj-1 pinned on localhost:9090", s)
 	}
 }
 
@@ -127,8 +127,12 @@ func TestDetachLeaf(t *testing.T) {
 		t.Fatalf("DetachLeaf: %v", err)
 	}
 
-	if len(mgr.cfg.Servers) != 0 {
-		t.Fatalf("servers = %d, want 0", len(mgr.cfg.Servers))
+	// The head entry stays attached; only the pin is removed (PB-16 model).
+	if len(mgr.cfg.Servers) != 1 {
+		t.Fatalf("servers = %d, want 1 (head entry stays)", len(mgr.cfg.Servers))
+	}
+	if len(mgr.cfg.Servers[0].PinnedLeafIDs) != 0 {
+		t.Fatalf("pins = %v, want none", mgr.cfg.Servers[0].PinnedLeafIDs)
 	}
 }
 
@@ -372,8 +376,9 @@ func TestDetachServer(t *testing.T) {
 		t.Fatalf("attach leaf: %v", err)
 	}
 
-	if len(mgr.cfg.Servers) != 2 {
-		t.Fatalf("servers = %d, want 2", len(mgr.cfg.Servers))
+	// The pin merges into the one head entry (PB-16 model).
+	if len(mgr.cfg.Servers) != 1 {
+		t.Fatalf("servers = %d, want 1", len(mgr.cfg.Servers))
 	}
 
 	if err := mgr.DetachServer("example.com"); err != nil {
@@ -417,7 +422,7 @@ func TestAttachLeafPersists(t *testing.T) {
 	if len(loaded.Servers) != 1 {
 		t.Fatalf("persisted servers = %d, want 1", len(loaded.Servers))
 	}
-	if loaded.Servers[0].LeafID != "proj-1" {
-		t.Errorf("persisted leaf ID = %q, want proj-1", loaded.Servers[0].LeafID)
+	if len(loaded.Servers[0].PinnedLeafIDs) != 1 || loaded.Servers[0].PinnedLeafIDs[0] != "proj-1" {
+		t.Errorf("persisted pins = %v, want [proj-1]", loaded.Servers[0].PinnedLeafIDs)
 	}
 }

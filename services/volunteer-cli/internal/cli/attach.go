@@ -103,29 +103,72 @@ func attachServer(cmd *cobra.Command, mgr *project.Manager, host string, grpcPor
 	}
 	logger.Info("server validated", "version", statusResp.Version, "status", statusResp.Status)
 
-	if leafID != "" {
-		if err := mgr.AttachLeaf(leafID, grpcAddr, httpAddr, host); err != nil {
-			return err
+	// Resolve --trust up front when given (both forms use it).
+	var trusted []string
+	trustGiven := cmd.Flags().Changed("trust")
+	if trustGiven {
+		t, perr := parseTrustRuntimes(trust)
+		if perr != nil {
+			return perr
 		}
-		fmt.Printf("Attached to leaf %s on %s. gRPC: %s, HTTP: %s.\n", leafID, host, grpcAddr, httpAddr)
-	} else {
-		// Per-head runtime trust: attaching a head is the trust decision, and this records
-		// how far it extends. Use the --trust flag when given (non-interactive), else prompt.
-		var trusted []string
-		if cmd.Flags().Changed("trust") {
-			t, perr := parseTrustRuntimes(trust)
-			if perr != nil {
-				return perr
+		trusted = t
+	}
+
+	if leafID != "" {
+		// Leaf-pin form. On an ALREADY-ATTACHED head the pin is merged into the
+		// existing entry — appending a duplicate entry used to drop the
+		// --insecure/--trust flags and the daemon then collapsed the duplicate,
+		// silently discarding the pin (PB-16). Explicitly-given flags update the
+		// existing entry; unspecified flags leave it as configured.
+		if mgr.HasServer(grpcAddr) {
+			var insecureP *bool
+			var caCertP *string
+			if cmd.Flags().Changed("insecure") {
+				insecureP = &insecure
 			}
-			trusted = t
-		} else {
+			if cmd.Flags().Changed("ca-cert") {
+				caCertP = &caCertPath
+			}
+			var trustedP []string
+			if trustGiven {
+				trustedP = trusted
+			}
+			if insecureP != nil || caCertP != nil || trustedP != nil {
+				if err := mgr.ApplyServerFlags(grpcAddr, insecureP, caCertP, trustedP); err != nil {
+					return err
+				}
+			}
+			if err := mgr.AttachLeaf(leafID, grpcAddr, httpAddr, host); err != nil {
+				return err
+			}
+			fmt.Printf("Pinned leaf %s on already-attached head %s — the daemon will request its work by id on next startup (works for unlisted leafs too).\n", leafID, host)
+			return nil
+		}
+
+		// New head: full attach (trust decision included), then pin.
+		if !trustGiven {
 			trusted = promptRuntimeTrust(bufio.NewScanner(os.Stdin), host, containerBackendAvailable())
 		}
 		if err := mgr.AttachServerWithTLS(host, grpcPort, httpPort, insecure, caCertPath, trusted); err != nil {
 			return err
 		}
-		fmt.Printf("Attached to %s (may run: %s). gRPC: %s, HTTP: %s. The daemon will include this in its work pool on next startup.\n", host, trustSummary(trusted), grpcAddr, httpAddr)
+		if err := mgr.AttachLeaf(leafID, grpcAddr, httpAddr, host); err != nil {
+			return err
+		}
+		fmt.Printf("Attached to %s (may run: %s) and pinned leaf %s. gRPC: %s, HTTP: %s.\n", host, trustSummary(trusted), leafID, grpcAddr, httpAddr)
+		return nil
 	}
+
+	// Head-only form. Per-head runtime trust: attaching a head is the trust
+	// decision, and this records how far it extends. Use the --trust flag when
+	// given (non-interactive), else prompt.
+	if !trustGiven {
+		trusted = promptRuntimeTrust(bufio.NewScanner(os.Stdin), host, containerBackendAvailable())
+	}
+	if err := mgr.AttachServerWithTLS(host, grpcPort, httpPort, insecure, caCertPath, trusted); err != nil {
+		return err
+	}
+	fmt.Printf("Attached to %s (may run: %s). gRPC: %s, HTTP: %s. The daemon will include this in its work pool on next startup.\n", host, trustSummary(trusted), grpcAddr, httpAddr)
 	return nil
 }
 
@@ -134,10 +177,14 @@ func attachLeafByID(mgr *project.Manager, leafID string) error {
 		return fmt.Errorf("no servers configured. Use `lettuce-volunteer attach --server <host>` first")
 	}
 
+	// The pin is merged into the first configured head's entry (PB-16): the
+	// daemon will request this leaf's work by id even when the head's public
+	// catalog does not list it (UNLISTED leafs are absent from GetHeadInfo by
+	// design and are reachable only via an explicit pin).
 	srv := cfg.Servers[0]
 	if err := mgr.AttachLeaf(leafID, srv.GRPCAddress, srv.HTTPAddress, srv.Name); err != nil {
 		return err
 	}
-	fmt.Printf("Attached leaf %s on server %s.\n", leafID, srv.GRPCAddress)
+	fmt.Printf("Pinned leaf %s on head %s — the daemon will request its work by id on next startup (works for unlisted leafs too).\n", leafID, srv.DisplayName())
 	return nil
 }

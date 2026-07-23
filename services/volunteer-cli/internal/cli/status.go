@@ -93,8 +93,8 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			if name == "" {
 				name = s.GRPCAddress
 			}
-			if s.LeafID != "" {
-				fmt.Printf("  - %s (leaf: %s)\n", name, s.LeafID)
+			if len(s.PinnedLeafIDs) > 0 {
+				fmt.Printf("  - %s (all listed leafs + pinned: %s)\n", name, strings.Join(s.PinnedLeafIDs, ", "))
 			} else {
 				fmt.Printf("  - %s (all leafs)\n", name)
 			}

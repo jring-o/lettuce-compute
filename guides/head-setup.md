@@ -403,6 +403,12 @@ lettuce-volunteer start
 (443 over HTTPS by default). `start` connects and begins computing. A volunteer can attach
 to additional heads later with `lettuce-volunteer attach --server another-head.example.com`.
 
+Attached volunteers automatically pick up every **PUBLIC** leaf on your head. A leaf
+created with `UNLISTED` or `PRIVATE` visibility is absent from the public catalog, so it
+gets no volunteers until each one explicitly pins it by ID:
+`lettuce-volunteer attach <leaf-id>` (then restart the daemon). See the visibility table
+in [first-leaf.md](first-leaf.md) Step 4.
+
 ---
 
 ## Operations
