@@ -1,0 +1,17 @@
+# Build-context hygiene (PB-4): the Dockerfile does `COPY . .`, so without this
+# file whatever the host happens to have leaks into the image — a local
+# node_modules overwrites the `npm ci` layer file-by-file (wrong-platform
+# binaries) and makes the context transfer pathologically slow, and stale build
+# output or local env files ship along with it. Keep host-generated and
+# secret-bearing paths out of the build context. CI plants a sentinel in
+# node_modules and asserts the built image does not contain it.
+node_modules
+.next
+.swc
+coverage
+tsconfig.tsbuildinfo
+npm-debug.log*
+.env*
+data
+Dockerfile
+.dockerignore
