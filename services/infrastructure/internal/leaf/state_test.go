@@ -372,17 +372,44 @@ func TestTransitionLeaf_ConfigIncomplete(t *testing.T) {
 	}
 }
 
-func TestTransitionLeaf_ResumeSkipsActivationCheck(t *testing.T) {
-	// PAUSED -> ACTIVE should NOT re-check configs.
-	// Use invalid config to prove it doesn't check.
+func TestTransitionLeaf_ResumeRerunsActivationCheck(t *testing.T) {
+	// PAUSED -> ACTIVE re-runs the activation prerequisites (PB-36): resume used to
+	// skip them, which let a leaf activated before a validation rule existed re-enter
+	// ACTIVE with a config the current rules refuse. Use an invalid config to prove
+	// the check now runs.
 	p := validProject()
 	p.State = StatePaused
-	p.ExecutionConfig.Runtime = "" // would fail CanActivate
+	p.ExecutionConfig.Runtime = "" // fails CanActivate
+
+	repo := &mockRepository{}
+	err := TransitionLeaf(context.Background(), repo, p, StateActive)
+	if err == nil {
+		t.Fatal("resume with a config the current rules refuse must be rejected, got nil")
+	}
+	var apiErr *apierror.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *apierror.APIError, got %T", err)
+	}
+	if apiErr.Code != "CONFIGURATION_INCOMPLETE" {
+		t.Errorf("expected code CONFIGURATION_INCOMPLETE, got %s", apiErr.Code)
+	}
+	if p.State != StatePaused {
+		t.Errorf("state should not have changed, got %s", p.State)
+	}
+	if repo.updateCalled {
+		t.Error("repo.Update should not have been called when the resume is refused")
+	}
+}
+
+func TestTransitionLeaf_ResumeWithValidConfigStillWorks(t *testing.T) {
+	// Control: a paused leaf whose config passes current validation resumes cleanly.
+	p := validProject()
+	p.State = StatePaused
 
 	repo := &mockRepository{}
 	err := TransitionLeaf(context.Background(), repo, p, StateActive)
 	if err != nil {
-		t.Fatalf("resume should skip activation check, got: %v", err)
+		t.Fatalf("resume with a valid config must succeed, got: %v", err)
 	}
 	if p.State != StateActive {
 		t.Errorf("expected state ACTIVE, got %s", p.State)

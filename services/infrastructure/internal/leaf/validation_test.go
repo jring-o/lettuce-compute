@@ -740,7 +740,62 @@ func TestValidateValidationConfig(t *testing.T) {
 				c.IgnoreFields = nil
 			},
 			wantErr: true,
-			errMsg:  "compare_fields or ignore_fields",
+			errMsg:  "requires comparison scoping",
+		},
+		{
+			// PB-36: a leaf whose ENTIRE output is deterministic has no field to name;
+			// compare_all_fields is the explicit whole-output assertion that satisfies
+			// the scoping gate. Built via JSON exactly as the configure path receives it.
+			name: "numeric_tolerance with compare_all_fields allowed on redundant leaf (explicit determinism opt-in)",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				if err := json.Unmarshal([]byte(`{"compare_all_fields": true}`), c); err != nil {
+					panic(err)
+				}
+			},
+			wantErr: false,
+		},
+		{
+			// PB-36: compare_all_fields is an assertion, not a scope — combining it with
+			// a field list is contradictory and refused.
+			name: "compare_all_fields combined with compare_fields rejected",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				c.CompareFields = []string{"result"}
+				if err := json.Unmarshal([]byte(`{"compare_all_fields": true}`), c); err != nil {
+					panic(err)
+				}
+			},
+			wantErr: true,
+			errMsg:  "cannot be combined",
+		},
+		{
+			name: "compare_all_fields combined with ignore_fields rejected",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "NUMERIC_TOLERANCE"
+				c.NumericTolerance = &tolerance
+				c.IgnoreFields = []string{"compute_time_ms"}
+				if err := json.Unmarshal([]byte(`{"compare_all_fields": true}`), c); err != nil {
+					panic(err)
+				}
+			},
+			wantErr: true,
+			errMsg:  "cannot be combined",
+		},
+		{
+			// PB-36: on EXACT the knob would be vestigial (an unscoped EXACT leaf already
+			// compares the whole output by checksum), so it is refused, not ignored.
+			name: "compare_all_fields rejected outside NUMERIC_TOLERANCE",
+			modify: func(c *ValidationConfig) {
+				c.ComparisonMode = "EXACT"
+				if err := json.Unmarshal([]byte(`{"compare_all_fields": true}`), c); err != nil {
+					panic(err)
+				}
+			},
+			wantErr: true,
+			errMsg:  "only valid when comparison_mode is NUMERIC_TOLERANCE",
 		},
 		{
 			// PB-10 control: a SINGLE-copy NUMERIC_TOLERANCE leaf (no spot-check) never
