@@ -749,6 +749,13 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  AND l.state = 'ACTIVE'
 		  AND (array_length($1::uuid[], 1) IS NULL OR wu.leaf_id = ANY($1))
 		  AND (array_length($2::uuid[], 1) IS NULL OR NOT wu.leaf_id = ANY($2))
+		  -- Visibility gate (PB-38): a non-PUBLIC (UNLISTED/PRIVATE) leaf's units are
+		  -- served ONLY to a requester that named the leaf explicitly in its leaf filter
+		  -- ($1) — the pin-by-id opt-in (attach --leaf / a browser request body naming
+		  -- the id). An any-leaf request (empty $1) gets PUBLIC only, matching the
+		  -- catalog (GetHeadInfo lists PUBLIC ACTIVE only): a leaf hidden from discovery
+		  -- must not dispatch through discovery-driven requests.
+		  AND (l.visibility = 'PUBLIC' OR wu.leaf_id = ANY($1))
 		  AND COALESCE((l.resource_requirements->>'min_cpu_cores')::int, 0) <= $3
 		  -- Memory matches on the container limit (execution_config.max_memory_mb),
 		  -- the single source of truth: the volunteer's budget ($4) must cover the
@@ -1034,9 +1041,17 @@ type DispatchCandidate struct {
 //     path still dispatches WASM independently (it reads via FindNextAssignable,
 //     which ignores dispatch claims); the two dispatchers are arbitrated by the SQL
 //     landing gates exactly like two head replicas' caches — per-volunteer
-//     distinctness / cooldown / the live-copy unique are authoritative at landing,
-//     and the residual browser-tx-vs-cache-flush headroom race is bounded to one
-//     extra redundant copy (a wasted-compute corner, never a wrong validation).
+//     distinctness / cooldown / the live-copy unique are authoritative at landing.
+//     The residual browser-tx-vs-cache-flush headroom race over-dispatches at most
+//     +(R-1) extra copies per unit, R being the leaf's effective redundancy — NOT
+//     the +1 originally documented (PB-37 doc correction, from the Batch-B closeout
+//     refuters): the cache freezes a staged candidate's DB active-count at refill
+//     and never refreshes it for browser landings, and FlushReservations enforces
+//     headroom against a per-statement snapshot blind to its own batch, so each of
+//     the unit's remaining R-1 cache slots can individually over-land against a
+//     browser copy it cannot see. Still a wasted-compute corner, never a wrong
+//     validation: validate-at-quorum supersedes the extras and terminal-state
+//     transitions are idempotent.
 //   - FOR UPDATE OF wu SKIP LOCKED is KEPT (short-lived for a bulk read), the proven
 //     no-double-hand primitive; the refill writes nothing, so the lock is released
 //     at the end of this SELECT's transaction.
@@ -1119,6 +1134,13 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		  -- leafs so a leaf-filtered requester can be served even when the ready pool is
 		  -- monopolized by a higher-priority/older leaf.
 		  AND (array_length($3::uuid[], 1) IS NULL OR wu.leaf_id = ANY($3::uuid[]))
+		  -- Visibility gate (PB-38): the GLOBAL refill ($3 empty) stages PUBLIC leafs
+		  -- only, so an UNLISTED/PRIVATE leaf's units never enter the shared ready pool
+		  -- through discovery-driven dispatch; a LEAF-SCOPED refill (triggered by a
+		  -- requester that named the leaf id — the pin-by-id opt-in) still stages it.
+		  -- The in-memory hand-out mirrors this per-requester (eligibleLocked), so a
+		  -- pinned-leaf unit staged here is still refused to any-leaf requesters.
+		  AND (l.visibility = 'PUBLIC' OR wu.leaf_id = ANY($3::uuid[]))
 		  -- Per-copy redundancy (volunteer-agnostic at refill): COUNTABLE live copies +
 		  -- COUNTABLE PENDING results must be below the leaf's effective redundancy
 		  -- (countableCoverageSQL — account standing, BG-24b: a copy held or a result
@@ -1247,6 +1269,10 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			  AND (array_length($2::uuid[], 1) IS NULL OR NOT (wu2.id = ANY($2::uuid[])))
 			  -- Optional leaf scope (the on-demand leaf-scoped refill).
 			  AND (array_length($3::uuid[], 1) IS NULL OR wu2.leaf_id = ANY($3::uuid[]))
+			  -- Visibility gate (PB-38), exactly as FindDispatchableBatch: the global
+			  -- refill claims PUBLIC only; a leaf-scoped (pin-by-id) refill still claims
+			  -- the named UNLISTED/PRIVATE leaf's units.
+			  AND (l2.visibility = 'PUBLIC' OR wu2.leaf_id = ANY($3::uuid[]))
 			  -- CLAIM EXCLUDE: another replica's LIVE claim hides the unit; a NULL claim,
 			  -- an expired claim, or THIS head's own claim is re-claimable.
 			  AND (wu2.dispatch_claimed_by IS NULL

@@ -193,7 +193,13 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 	ctx := context.Background()
 
 	userID := createTestUser(t, pool, "parity-"+uuid.New().String()[:8])
-	leafID := createActiveTestLeaf(t, pool, &userID, parityResReq(s), parityExecConfig(s), parityValConfig(s))
+	// The scenario's zero-value visibility ("") maps to the column default PUBLIC;
+	// non-PUBLIC scenarios exercise the PB-38 visibility gate.
+	vis := s.LeafVisibility
+	if vis == dispatchparity.VisibilityPublic {
+		vis = "PUBLIC"
+	}
+	leafID := createActiveTestLeafVis(t, pool, &userID, parityResReq(s), parityExecConfig(s), parityValConfig(s), vis)
 
 	requester := createTestVolunteer(t, pool)
 	// The landing gates (FlushReservations / ReserveCopy) read the requester's STORED
@@ -363,9 +369,12 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 // parityOpts builds the AssignmentOptions FindNextAssignable is called with. It is
 // scoped to the target leaf so ONLY the target unit is a selection candidate — any
 // in-flight filler units on other leafs are excluded, making the returned unit
-// unambiguously "the target, or nothing".
+// unambiguously "the target, or nothing". A scenario that sets AnyLeafRequest runs
+// the volunteer's any-leaf fallback instead (empty leaf filter — the input the
+// PB-38 visibility gate keys on); such scenarios are seeded into a table cleaned
+// per-scenario and add no filler units, so the target-or-nothing property holds.
 func parityOpts(s dispatchparity.Scenario, seed seededParity) AssignmentOptions {
-	return AssignmentOptions{
+	opts := AssignmentOptions{
 		VolunteerID:             seed.requester,
 		LeafIDs:                 []types.ID{seed.leafID},
 		MaxCPUCores:             s.RequesterMaxCPUCores,
@@ -378,6 +387,10 @@ func parityOpts(s dispatchparity.Scenario, seed seededParity) AssignmentOptions 
 		HostID:                  seed.hostID,
 		BenchmarkFPOPS:          s.RequesterBenchmarkFPOPS,
 	}
+	if s.AnyLeafRequest {
+		opts.LeafIDs = nil
+	}
+	return opts
 }
 
 func TestDispatchPredicateParity_SQL(t *testing.T) {

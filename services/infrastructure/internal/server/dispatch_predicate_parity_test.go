@@ -93,9 +93,16 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 	}
 	hostKey := meterID(requester, hostPtr)
 
-	// Leaf snapshot the capability + feasibility checks read.
+	// Leaf snapshot the capability + feasibility + visibility checks read. The
+	// scenario's zero-value visibility ("") maps to PUBLIC — what the DB's NOT NULL
+	// DEFAULT 'PUBLIC' column always yields for a warmed production leaf.
+	vis := leaf.VisibilityPublic
+	if s.LeafVisibility != dispatchparity.VisibilityPublic {
+		vis = leaf.LeafVisibility(s.LeafVisibility)
+	}
 	lf := &leaf.Leaf{
-		ID: leafID,
+		ID:         leafID,
+		Visibility: vis,
 		ExecutionConfig: leaf.ExecutionConfig{
 			Runtime:     s.LeafRuntime,
 			GPURequired: s.LeafGPURequired,
@@ -295,6 +302,12 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		// The requester's resolved trust subject drives the per-principal distinctness
 		// checks — the whole point of the subject dimension.
 		TrustSubject: reqSubject,
+	}
+	// The request's leaf scope: pinned to the target leaf unless the scenario runs
+	// the any-leaf fallback — the input the visibility gate (PB-38) keys on, and the
+	// same shape the SQL half's parityOpts builds.
+	if !s.AnyLeafRequest {
+		opts.LeafIDs = []types.ID{leafID}
 	}
 	return requester, hostKey, opts, cand
 }

@@ -2056,8 +2056,21 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 	// immediately, but its async copy-insert may not have landed yet. If the cache
 	// holds this volunteer's reservation, force the pending flush so the RESERVED copy
 	// row is durable (or voided on conflict) before the run-start.
+	//
+	// PB-37: the forced flush must COMPLETE before Assign may be trusted. Under
+	// maintenance-semaphore saturation an in-flight ticker batch can outlive the shed
+	// budget; the pre-fix code fell through regardless, and the volunteer got the
+	// drop-the-unit denial below while the stuck batch landed its RESERVED copy row
+	// moments later — a phantom reservation for a unit the volunteer had already
+	// dropped (reaped only by the buffer reconciler, the pre-PB-15 churn in
+	// miniature). Fail RETRYABLE instead: the volunteer keeps the unit and retries,
+	// so whenever the batch does land, the row is its own still-held reservation —
+	// wait-or-fail-atomically, never denial-plus-phantom.
 	if s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID) {
-		s.dispatchCache.flushPendingFor(ctx)
+		if !s.dispatchCache.flushPendingFor(ctx) {
+			dispatchShedTotal.WithLabelValues("start_work_flush_wait").Inc()
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; reservation flush incomplete — back off and retry StartWork")
+		}
 	}
 
 	// Run-start: flip THIS volunteer's reserved copy to RUNNING (started_at = NOW),
@@ -2339,9 +2352,18 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	// reservation, force the pending flush first — after it, the copy row is durable
 	// (closable below) or the hold was voided (nothing to close, and nothing left
 	// behind to churn).
+	// PB-37: like StartWork, the forced flush must COMPLETE before the branches below
+	// may trust the DB state. If it times out with a ticker batch still in flight
+	// (maintenance-semaphore saturation), proceeding would release the in-memory hold
+	// and then let the stuck batch land a RESERVED copy row for it afterwards — the
+	// exact stray-row re-stamp purgePendingForLocked cannot recall. Fail RETRYABLE
+	// with the hold intact instead.
 	hadInMemHold := s.dispatchCache != nil && s.dispatchCache.hasInMemReservation(workUnitID, volunteerID)
 	if hadInMemHold {
-		s.dispatchCache.flushPendingFor(ctx)
+		if !s.dispatchCache.flushPendingFor(ctx) {
+			dispatchShedTotal.WithLabelValues("abandon_flush_wait").Inc()
+			return nil, status.Errorf(codes.ResourceExhausted, "dispatch overloaded; reservation flush incomplete — back off and retry AbandonWorkUnit")
+		}
 	}
 
 	// Per-copy dispatch: abandoning a unit just closes THIS volunteer's live copy
