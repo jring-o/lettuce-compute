@@ -139,9 +139,10 @@ type Daemon struct {
 	// Cached hardware capabilities (detected once at startup)
 	cachedHW *lettucev1.HardwareCapabilities
 
-	// Podman machine lifecycle (Windows/macOS).
-	machineManager   *runtime.PodmanMachineManager
-	machineStartedBy bool // true if this daemon started the machine
+	// Podman machine lifecycle (Windows/macOS). Whether this process started the
+	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
+	// itself — see runtime.PodmanMachineManager.StartedByThisProcess.
+	machineManager *runtime.PodmanMachineManager
 
 	// Leaf discovery and weighted scheduling.
 	leafCache        *LeafCache
@@ -2121,21 +2122,6 @@ func (d *Daemon) GetWeightedSelector() *WeightedSelector {
 // GetMachineManager returns the Podman machine manager, or nil if not configured.
 func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
 	return d.machineManager
-}
-
-// SetMachineStartedByDaemon marks that the daemon started the Podman machine,
-// so it can be stopped on daemon shutdown.
-func (d *Daemon) SetMachineStartedByDaemon(started bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.machineStartedBy = started
-}
-
-// MachineStartedByDaemon returns whether the daemon started the Podman machine.
-func (d *Daemon) MachineStartedByDaemon() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.machineStartedBy
 }
 
 // SetSlotManagerForTest injects a SlotManager into the daemon for testing.
