@@ -206,6 +206,105 @@ jobs:
             echo "FAIL: Caddyfile triggers a deprecation warning (see output above)"
             exit 1
           fi
+      # Behavioral contract of the shipped proxy config, checked against a LIVE
+      # Caddy (same digest-pinned image) fronting stub upstreams. Static
+      # validation cannot catch these: the registry version-check ping must
+      # answer an anonymous GET /v2/ with a 401 Basic challenge (docker/podman/
+      # skopeo only attach credentials after seeing one — a 200-no-challenge
+      # ping makes every push fail "authentication required" with correct
+      # creds), pulls must stay anonymous, and routes where the head enforces
+      # a small body cap must get a 413 AT THE PROXY (an oversized body that
+      # reaches the head instead resets the connection: the client sees 502
+      # and passive health ejects the replica for 30s).
+      - name: Proxy contract smoke (registry auth challenge, per-route body caps)
+        run: |
+          set -eu
+          CADDY_IMG='caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648'
+          PY_IMG='python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de'
+          # The same site-address transform an operator applies (domain -> local
+          # hostname); routing, matchers, and caps are untouched.
+          sed -e 's|^your-domain.com {|http://localhost {|' \
+              -e 's|^viz.your-domain.com {|http://viz.localhost {|' \
+              -e '/# HTTP to HTTPS redirect/,$d' Caddyfile > /tmp/Caddyfile.ci
+          # The infrastructure stub must DRAIN request bodies like the real head
+          # does: Caddy enforces request_body caps while streaming, so against a
+          # stub that answers without reading, an early 200 can beat the cap trip
+          # and mask a missing cap.
+          cat > /tmp/stub.py <<'PYEOF'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class H(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+              def _serve(self):
+                  n = int(self.headers.get("Content-Length") or 0)
+                  while n > 0:
+                      chunk = self.rfile.read(min(n, 1 << 20))
+                      if not chunk:
+                          break
+                      n -= len(chunk)
+                  body = b"stub-infrastructure"
+                  self.send_response(200)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a):
+                  pass
+              do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _serve
+          HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+          PYEOF
+          docker network create proxysmoke
+          docker run -d --rm --network proxysmoke --name infrastructure -v /tmp/stub.py:/stub.py:ro "$PY_IMG" python /stub.py
+          docker run -d --rm --network proxysmoke --name registry "$CADDY_IMG" caddy respond --listen :5000 "stub-registry"
+          docker run -d --rm --network proxysmoke --name dashboard "$CADDY_IMG" caddy respond --listen :3000 "stub-dashboard"
+          HASH="$(docker run --rm "$CADDY_IMG" caddy hash-password --plaintext ci-registry-pw)"
+          docker run -d --rm --network proxysmoke --name proxy -p 127.0.0.1:8088:80 \
+            -v /tmp/Caddyfile.ci:/etc/caddy/Caddyfile:ro \
+            -e REGISTRY_USER=ci-user -e "REGISTRY_PASS_HASH=$HASH" "$CADDY_IMG"
+          for i in $(seq 1 40); do
+            curl -s -o /dev/null http://localhost:8088/ && break
+            [ "$i" = 40 ] && { echo "FAIL: proxy never became ready"; docker logs proxy; exit 1; }
+            sleep 0.5
+          done
+          assert_code() {
+            want="$1"; shift
+            got="$(curl -s -o /dev/null -w '%{http_code}' -m 120 "$@" || true)"
+            [ "$got" = "$want" ] || { echo "FAIL: expected $want, got $got for: $*"; docker logs proxy; exit 1; }
+            echo "OK $want <- $*"
+          }
+          # Registry auth handshake (PB-22)
+          assert_code 401 http://localhost:8088/v2/
+          curl -s -o /dev/null -D /tmp/ping-headers http://localhost:8088/v2/
+          grep -qi '^www-authenticate: *basic' /tmp/ping-headers \
+            || { echo "FAIL: anonymous GET /v2/ carries no Basic challenge"; cat /tmp/ping-headers; exit 1; }
+          echo "OK Basic challenge on anonymous /v2/ ping"
+          assert_code 200 -u ci-user:ci-registry-pw http://localhost:8088/v2/
+          assert_code 401 -u ci-user:wrong-password http://localhost:8088/v2/
+          assert_code 200 http://localhost:8088/v2/nbody/manifests/1.0
+          assert_code 401 -X POST http://localhost:8088/v2/nbody/blobs/uploads/
+          assert_code 200 -u ci-user:ci-registry-pw -X POST http://localhost:8088/v2/nbody/blobs/uploads/
+          # Per-route body caps (PB-20): every oversized declared body must get
+          # a 413 at the proxy, and each 413 must leave the upstream in
+          # rotation — the health probe after each one catches an ejection at
+          # the exact request that caused it.
+          head -c 2048     /dev/zero > /tmp/b2k
+          head -c 70000    /dev/zero > /tmp/b70k
+          head -c 11000000 /dev/zero > /tmp/b11m
+          head -c 68000000 /dev/zero > /tmp/b65m
+          assert_code 413 -X POST --data-binary @/tmp/b2k  http://localhost:8088/api/v1/attestations/verify
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b70k http://localhost:8088/api/v1/volunteers/register
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b70k http://localhost:8088/api/v1/volunteers/register-challenge
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b11m http://localhost:8088/api/v1/volunteers/submit-result
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b65m http://localhost:8088/api/v1/leafs/x/work-units/bulk
+          assert_code 200 http://localhost:8088/api/v1/health
+          # ...while in-cap bodies still reach the backend
+          head -c 512 /dev/zero > /tmp/b512
+          assert_code 200 -X POST --data-binary @/tmp/b512 http://localhost:8088/api/v1/attestations/verify
+          assert_code 200 -X POST --data-binary @/tmp/b2k  http://localhost:8088/api/v1/leafs/x/work-units/bulk
+          docker rm -f proxy infrastructure registry dashboard >/dev/null 2>&1 || true
+          docker network rm proxysmoke >/dev/null 2>&1 || true
       - name: Makefile guardrails (BG-35)
         run: |
           bad=$(grep -n 'docker compose' Makefile | grep -vE '^[0-9]+:\s*#' | grep -v -- '-f compose.yaml -p lettuce-dev' || true)
