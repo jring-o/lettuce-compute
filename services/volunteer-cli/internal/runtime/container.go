@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
@@ -858,6 +859,13 @@ func tailOfFile(path string, maxBytes int64) string {
 }
 
 // captureContainerLogs writes container stdout/stderr to execution.log capped at 10 MB.
+//
+// The engine's log stream is MULTIPLEXED (the container runs without a TTY, so
+// Docker/Podman frame stdout and stderr with 8-byte stream headers). It must be
+// demultiplexed before writing — a raw copy lands frame-header bytes in
+// execution.log and in the non-zero-exit WARN tail built from it, garbling what
+// a leaf author reads (PB-32). Both demuxed streams interleave into the one
+// file, preserving output order.
 func (c *ContainerRuntime) captureContainerLogs(ctx context.Context, containerID, workDir string) {
 	logReader, err := c.dockerClient.ContainerLogs(ctx, containerID)
 	if err != nil {
@@ -874,8 +882,13 @@ func (c *ContainerRuntime) captureContainerLogs(ctx context.Context, containerID
 	}
 	defer logFile.Close()
 
+	// The cap bounds the multiplexed input; truncating mid-frame makes StdCopy
+	// return an error after flushing every complete frame, which is exactly the
+	// best-effort behavior wanted here.
 	const maxLogSize = 10 * 1024 * 1024
-	_, _ = io.Copy(logFile, io.LimitReader(logReader, maxLogSize))
+	if _, err := stdcopy.StdCopy(logFile, logFile, io.LimitReader(logReader, maxLogSize)); err != nil {
+		c.logger.Debug("container log stream ended irregularly (truncated frame or non-multiplexed stream)", "error", err)
+	}
 }
 
 // readOutput reads output.dat from the output directory. If output.dat doesn't

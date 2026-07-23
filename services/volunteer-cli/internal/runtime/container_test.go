@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // MockDockerClient implements DockerClient for testing without a real Docker daemon.
@@ -167,6 +169,15 @@ func newTestContainerRuntime(t *testing.T, mock *MockDockerClient) (*ContainerRu
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cr := NewContainerRuntimeWithClient(dataDir, logger, mock)
 	return cr, dataDir
+}
+
+// newTestContainerRuntimeWithLogBuffer is newTestContainerRuntime with the
+// runtime's slog output captured in buf, so tests can assert on daemon-side
+// WARN content (e.g. the non-zero-exit log tail).
+func newTestContainerRuntimeWithLogBuffer(t *testing.T, mock *MockDockerClient, buf *bytes.Buffer) *ContainerRuntime {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return NewContainerRuntimeWithClient(t.TempDir(), logger, mock)
 }
 
 func TestContainerRuntime_Name(t *testing.T) {
@@ -849,11 +860,34 @@ func TestContainerRuntime_CleanupNil(t *testing.T) {
 	}
 }
 
+// muxedLogStream builds a Docker/Podman multiplexed log stream (the framed
+// format the engine emits for a TTY-less container) carrying the given stdout
+// and stderr payloads. This is what a real engine hands ContainerLogs, so the
+// mock feeds the same shape the product must demultiplex (PB-32 — the old
+// raw-bytes mock is exactly why the frame-header garbling was invisible to CI).
+func muxedLogStream(t *testing.T, stdout, stderr []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if len(stdout) > 0 {
+		if _, err := stdcopy.NewStdWriter(&buf, stdcopy.Stdout).Write(stdout); err != nil {
+			t.Fatalf("frame stdout: %v", err)
+		}
+	}
+	if len(stderr) > 0 {
+		if _, err := stdcopy.NewStdWriter(&buf, stdcopy.Stderr).Write(stderr); err != nil {
+			t.Fatalf("frame stderr: %v", err)
+		}
+	}
+	return buf.Bytes()
+}
+
 func TestContainerRuntime_ExecuteContainerLogsCaptured(t *testing.T) {
-	logContent := "container stdout line 1\ncontainer stderr line 2\n"
+	stdoutContent := "container stdout line 1\n"
+	stderrContent := "container stderr line 2\n"
+	muxed := muxedLogStream(t, []byte(stdoutContent), []byte(stderrContent))
 	mock := &MockDockerClient{
 		ContainerLogsFn: func(ctx context.Context, containerID string) (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader([]byte(logContent))), nil
+			return io.NopCloser(bytes.NewReader(muxed)), nil
 		},
 	}
 	cr, _ := newTestContainerRuntime(t, mock)
@@ -876,13 +910,73 @@ func TestContainerRuntime_ExecuteContainerLogsCaptured(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	// Verify execution.log was written.
+	// Verify execution.log was written DEMUXED: payloads only, in order.
 	logData, err := os.ReadFile(filepath.Join(prep.WorkDir, "execution.log"))
 	if err != nil {
 		t.Fatalf("read execution.log: %v", err)
 	}
-	if string(logData) != logContent {
-		t.Errorf("execution.log = %q, want %q", logData, logContent)
+	if want := stdoutContent + stderrContent; string(logData) != want {
+		t.Errorf("execution.log = %q, want %q", logData, want)
+	}
+}
+
+// TestContainerRuntime_LogsDemuxed is the PB-32 regression test: the engine's
+// multiplexed log stream must be demultiplexed before it reaches execution.log
+// and the non-zero-exit WARN tail. Before the fix the raw framed stream was
+// copied through, so 8-byte frame headers (0x01/0x02 stream bytes and length
+// words) garbled both places a leaf author looks.
+func TestContainerRuntime_LogsDemuxed(t *testing.T) {
+	muxed := muxedLogStream(t, []byte("out-marker\n"), []byte("err-marker\n"))
+	var logBuf bytes.Buffer
+	mock := &MockDockerClient{
+		ContainerLogsFn: func(ctx context.Context, containerID string) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(muxed)), nil
+		},
+		ContainerWaitFn: func(ctx context.Context, containerID string) (int64, error) {
+			return 3, nil // non-zero exit: the WARN-tail path
+		},
+	}
+	cr := newTestContainerRuntimeWithLogBuffer(t, mock, &logBuf)
+
+	wu := &WorkUnit{
+		ID:            "8a2b6c4d-1e3f-4a5b-9c7d-2f4e6a8b0c1d",
+		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
+	}
+
+	prep, err := cr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer cr.Cleanup(prep)
+
+	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
+
+	result, err := cr.Execute(context.Background(), wu, prep)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.ExitCode != 3 {
+		t.Fatalf("ExitCode = %d, want 3", result.ExitCode)
+	}
+
+	logData, err := os.ReadFile(filepath.Join(prep.WorkDir, "execution.log"))
+	if err != nil {
+		t.Fatalf("read execution.log: %v", err)
+	}
+	if want := "out-marker\nerr-marker\n"; string(logData) != want {
+		t.Errorf("execution.log = %q, want the demuxed payloads %q (PB-32)", logData, want)
+	}
+	if bytes.ContainsAny(logData, "\x00\x01\x02") {
+		t.Errorf("execution.log contains frame-header bytes: %q", logData)
+	}
+
+	// The surfaced WARN tail must carry the clean stderr content, no header bytes.
+	warnOut := logBuf.String()
+	if !strings.Contains(warnOut, "err-marker") {
+		t.Errorf("non-zero-exit WARN does not surface the stderr content; log:\n%s", warnOut)
+	}
+	if strings.Contains(warnOut, "\\x01") || strings.Contains(warnOut, "\\u0001") {
+		t.Errorf("non-zero-exit WARN tail carries frame-header bytes; log:\n%s", warnOut)
 	}
 }
 
@@ -915,11 +1009,19 @@ func TestContainerRuntime_ExecuteOutputFallback(t *testing.T) {
 }
 
 func TestContainerRuntime_ExecuteLogCap(t *testing.T) {
-	// Generate logs larger than 10 MB to verify the cap.
-	bigLog := make([]byte, 11*1024*1024) // 11 MB
-	for i := range bigLog {
-		bigLog[i] = 'A'
+	// Generate a multiplexed stream whose payload exceeds 10 MB to verify the
+	// cap. Framed in engine-realistic small chunks (one frame per write, ~16 KB)
+	// — StdCopy flushes whole frames only, so the frame at the cap boundary is
+	// dropped rather than split.
+	var muxBuf bytes.Buffer
+	stdoutW := stdcopy.NewStdWriter(&muxBuf, stdcopy.Stdout)
+	chunk := bytes.Repeat([]byte{'A'}, 16*1024)
+	for written := 0; written < 11*1024*1024; written += len(chunk) {
+		if _, err := stdoutW.Write(chunk); err != nil {
+			t.Fatalf("frame stdout chunk: %v", err)
+		}
 	}
+	bigLog := muxBuf.Bytes()
 	mock := &MockDockerClient{
 		ContainerLogsFn: func(ctx context.Context, containerID string) (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(bigLog)), nil
@@ -949,12 +1051,20 @@ func TestContainerRuntime_ExecuteLogCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read execution.log: %v", err)
 	}
+	// The 10 MB cap bounds the multiplexed INPUT; the demuxed payload written out
+	// is therefore at most the cap (slightly under it once frame headers are
+	// stripped), and must still be a substantial capture, not a truncated stub.
 	maxLogSize := 10 * 1024 * 1024
 	if len(logData) > maxLogSize {
 		t.Errorf("execution.log size = %d, want <= %d (10 MB cap)", len(logData), maxLogSize)
 	}
-	if len(logData) != maxLogSize {
-		t.Errorf("execution.log size = %d, want exactly %d (should fill up to cap)", len(logData), maxLogSize)
+	if len(logData) < maxLogSize/2 {
+		t.Errorf("execution.log size = %d, want a near-cap capture (cap %d)", len(logData), maxLogSize)
+	}
+	for i, b := range logData {
+		if b != 'A' {
+			t.Fatalf("execution.log byte %d = %#x, want pure demuxed payload", i, b)
+		}
 	}
 }
 
