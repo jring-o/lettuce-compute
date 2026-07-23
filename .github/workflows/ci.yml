@@ -190,14 +190,22 @@ jobs:
         # Runs `caddy validate` in the SAME digest-pinned image the production
         # compose deploys. The env placeholders ({$REGISTRY_USER} etc.) resolve
         # at load time, so supply stand-ins (the hash is Caddy's documented
-        # example bcrypt output, not a real credential).
+        # example bcrypt output, not a real credential). Beyond validity, the
+        # step fails on any deprecation warning: a deprecated directive still
+        # validates today but is removed in a future Caddy major, and the only
+        # signal is a WARN in the boot log that production operators never read.
         run: |
-          docker run --rm \
+          out="$(docker run --rm \
             -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
             -e REGISTRY_USER=ci-stub \
             -e 'REGISTRY_PASS_HASH=$2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG' \
             caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 \
-            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1)" || { echo "$out"; exit 1; }
+          echo "$out"
+          if echo "$out" | grep -qi 'deprecat'; then
+            echo "FAIL: Caddyfile triggers a deprecation warning (see output above)"
+            exit 1
+          fi
       - name: Makefile guardrails (BG-35)
         run: |
           bad=$(grep -n 'docker compose' Makefile | grep -vE '^[0-9]+:\s*#' | grep -v -- '-f compose.yaml -p lettuce-dev' || true)

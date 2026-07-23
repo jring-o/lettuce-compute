@@ -47,7 +47,7 @@ your-domain.com {
 	# Docker registry — anonymous pull, authenticated push/delete
 	handle /v2/* {
 		@registry_write method PUT PATCH POST DELETE
-		basicauth @registry_write {
+		basic_auth @registry_write {
 			{$REGISTRY_USER} {$REGISTRY_PASS_HASH}
 		}
 		reverse_proxy registry:5000
@@ -72,7 +72,7 @@ your-domain.com {
 		# legitimate caller can always chunk under (an oversized upload gets a
 		# 413 from the proxy). The registry (/v2/*) and dashboard handles are
 		# deliberately uncapped here: image pushes are multi-GB (and
-		# write-gated by basicauth), and the dashboard enforces its own
+		# write-gated by basic_auth), and the dashboard enforces its own
 		# framework body limits.
 		request_body {
 			max_size 64MB
