@@ -44,10 +44,22 @@ your-domain.com {
 		}
 	}
 
-	# Docker registry — anonymous pull, authenticated push/delete
+	# Docker registry — anonymous pull, authenticated push/delete.
+	# The version-check ping (GET /v2/) is ALSO credential-gated: docker, podman,
+	# and skopeo probe it before any operation and only attach credentials when
+	# the ping answers 401 with a WWW-Authenticate challenge. A 200-with-no-
+	# challenge ping makes every client push anonymously and fail mid-upload
+	# with "authentication required" even when the stored password is correct —
+	# and lets `podman login` "succeed" against any password. Gating the ping
+	# restores the standard registry auth handshake; pulls stay anonymous
+	# (GET/HEAD on /v2/<name>/... paths are matched by neither gate).
 	handle /v2/* {
 		@registry_write method PUT PATCH POST DELETE
+		@registry_ping path /v2/
 		basic_auth @registry_write {
+			{$REGISTRY_USER} {$REGISTRY_PASS_HASH}
+		}
+		basic_auth @registry_ping {
 			{$REGISTRY_USER} {$REGISTRY_PASS_HASH}
 		}
 		reverse_proxy registry:5000
@@ -64,16 +76,61 @@ your-domain.com {
 	# client IP in X-Forwarded-For; set LETTUCE_TRUSTED_PROXIES (already wired in
 	# compose.production.yaml) so the head buckets per real client, not per proxy.
 	handle /api/v1/* {
-		# Per-request body ceiling. Volunteer-facing (Ed25519-signed) REST
-		# bodies are hard-capped at 10MB by the head itself; the API-key owner
-		# routes have no head-side cap, and the largest of them — bulk
-		# work-unit upload — already tells callers to split oversized batches
-		# into multiple requests, so 64MB is an operational ceiling a
-		# legitimate caller can always chunk under (an oversized upload gets a
-		# 413 from the proxy). The registry (/v2/*) and dashboard handles are
-		# deliberately uncapped here: image pushes are multi-GB (and
-		# write-gated by basic_auth), and the dashboard enforces its own
+		# Per-request body ceilings. The general 64MB ceiling covers the
+		# API-key owner routes, which have no head-side cap — the largest of
+		# them, bulk work-unit upload, already tells callers to split oversized
+		# batches into multiple requests. The registry (/v2/*) and dashboard
+		# handles are deliberately uncapped here: image pushes are multi-GB
+		# (and write-gated by basic_auth), and the dashboard enforces its own
 		# framework body limits.
+		#
+		# Routes where the head enforces a SMALLER body cap of its own must be
+		# capped at the proxy, at or below the head's value: an oversized body
+		# that reaches the head instead makes the head reset the connection
+		# mid-upload, the client sees 502 (not 413), and the failed attempt
+		# counts against passive health (max_fails 1) — one benign oversized
+		# POST then ejects the replica from rotation for fail_duration, which
+		# on a one-replica deploy answers ALL /api/v1/* traffic 503 until the
+		# window lapses.
+		#
+		# The caps are enforced in two layers because Caddy (v2.11) checks
+		# request_body limits only WHILE STREAMING to the upstream, and a
+		# mid-stream trip is itself counted as an upstream failure — the client
+		# gets the 413, but the replica is still ejected. The expression guards
+		# below therefore reject an over-cap declared Content-Length up front
+		# (413, upstream never contacted, no health penalty), which covers
+		# every standard client; the request_body caps stay as the enforcement
+		# backstop for length-less (chunked) uploads, where a deliberately
+		# oversized stream is cut at the cap and answered 413 at the cost of
+		# one passive-health strike.
+		#
+		# CONTRACT: any head-side body cap below the 64MB default must be
+		# mirrored here — expression guard and request_body pair — at the same
+		# value or lower. Current head caps: attestation/handler.go
+		# verifyMaxBody = 1 KiB; browser-volunteer-handlers.go
+		# browserRegisterMaxBody = 64 KiB; ed25519_auth.go ed25519MaxBodySize
+		# = 10 MiB (every signed volunteer REST body).
+		@oversized_verify expression `{path} == "/api/v1/attestations/verify" && {header.Content-Length} != "" && int({header.Content-Length}) > 1024`
+		error @oversized_verify 413
+		@oversized_register expression `({path} == "/api/v1/volunteers/register" || {path} == "/api/v1/volunteers/register-challenge") && {header.Content-Length} != "" && int({header.Content-Length}) > 65536`
+		error @oversized_register 413
+		@oversized_signed expression `{path}.startsWith("/api/v1/volunteers/") && {header.Content-Length} != "" && int({header.Content-Length}) > 10485760`
+		error @oversized_signed 413
+		@oversized_any expression `{header.Content-Length} != "" && int({header.Content-Length}) > 64000000`
+		error @oversized_any 413
+
+		@attestation_verify path /api/v1/attestations/verify
+		request_body @attestation_verify {
+			max_size 1KiB
+		}
+		@volunteer_register path /api/v1/volunteers/register /api/v1/volunteers/register-challenge
+		request_body @volunteer_register {
+			max_size 64KiB
+		}
+		@volunteer_signed path /api/v1/volunteers/*
+		request_body @volunteer_signed {
+			max_size 10MiB
+		}
 		request_body {
 			max_size 64MB
 		}
