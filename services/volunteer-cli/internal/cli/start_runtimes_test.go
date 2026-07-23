@@ -44,7 +44,7 @@ func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 	off := config.Defaults()
 	off.DataDir = t.TempDir()
 	off.Servers = []config.ServerConfig{{GRPCAddress: "h1:443"}} // nil TrustedRuntimes => WASM only
-	regOff, _, _ := buildRuntimeRegistry(off, logger)
+	regOff, _ := buildRuntimeRegistry(off, logger)
 	if regOff.GetRuntime("native") != nil {
 		t.Error("native must NOT be registered when no attached head is trusted for NATIVE")
 	}
@@ -61,7 +61,7 @@ func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 	legacy.AvailableRuntimes = []string{"NATIVE", "WASM"}
 	legacy.AllowNativeRuntime = true
 	legacy.Servers = []config.ServerConfig{{GRPCAddress: "h1:443"}} // no head trusts NATIVE
-	regLegacy, _, _ := buildRuntimeRegistry(legacy, logger)
+	regLegacy, _ := buildRuntimeRegistry(legacy, logger)
 	if regLegacy.GetRuntime("native") != nil {
 		t.Error("native must NOT be built from the legacy global flags; only a head's TrustedRuntimes grants it")
 	}
@@ -70,7 +70,7 @@ func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 	on := config.Defaults()
 	on.DataDir = t.TempDir()
 	on.Servers = []config.ServerConfig{{GRPCAddress: "h1:443", TrustedRuntimes: []string{"NATIVE"}}}
-	regOn, _, _ := buildRuntimeRegistry(on, logger)
+	regOn, _ := buildRuntimeRegistry(on, logger)
 	if regOn.GetRuntime("native") == nil {
 		t.Error("native must be registered when a head is trusted for NATIVE")
 	}

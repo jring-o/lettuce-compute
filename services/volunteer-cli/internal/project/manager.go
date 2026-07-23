@@ -145,14 +145,12 @@ func (m *Manager) AttachLeaf(leafID, grpcAddr, httpAddr, name string) error {
 	return m.cfg.Save(m.cfgPath)
 }
 
-// AttachServer adds a self-hosted server connection with default TLS settings.
-func (m *Manager) AttachServer(host string, grpcPort, httpPort int) error {
-	return m.AttachServerWithTLS(host, grpcPort, httpPort, false, "", nil)
-}
-
 // AttachServerWithTLS adds a self-hosted server connection with TLS configuration and the
 // per-head runtime trust the volunteer chose for it (trustedRuntimes: the UPPERCASE opt-ins
-// beyond the always-allowed WASM — e.g. ["CONTAINER"]; nil means WASM-only).
+// beyond the always-allowed WASM — e.g. ["CONTAINER"]). Pass a NON-NIL empty list for an
+// explicit "WASM only": nil is reserved for entries that predate per-head trust, which the
+// config loader re-seeds from the legacy global knobs — handing it a deliberate "none"
+// would silently upgrade that choice (PB-28).
 func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insecure bool, caCertPath string, trustedRuntimes []string) error {
 	if grpcPort <= 0 {
 		grpcPort = 443

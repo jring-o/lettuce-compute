@@ -53,6 +53,15 @@ type PodmanMachineManager struct {
 	initializing bool
 	stopping     bool
 
+	// startedByThisProcess records whether THIS process actually issued the
+	// successful `podman machine start` that brought the machine up (set on
+	// startLocked success, cleared on stopLocked success). The machine is a
+	// host-wide singleton shared with every other container on the box, so the
+	// daemon's shutdown hook may stop it ONLY when the daemon itself started it
+	// (PB-27) — Setup() no-ops idempotently on an already-running machine, and
+	// "setup succeeded" must never be read as "we own the machine".
+	startedByThisProcess bool
+
 	// Status cache
 	cachedInfo *MachineInfo
 	cachedAt   time.Time
@@ -304,6 +313,10 @@ func (m *PodmanMachineManager) startLocked() error {
 		return fmt.Errorf("podman machine start failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
+	m.mu.Lock()
+	m.startedByThisProcess = true
+	m.mu.Unlock()
+
 	m.logger.Info("podman machine started")
 	return nil
 }
@@ -338,12 +351,28 @@ func (m *PodmanMachineManager) stopLocked() error {
 		return fmt.Errorf("podman machine stop failed: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 
+	// The machine is down; this process no longer owns a start it should undo.
+	m.mu.Lock()
+	m.startedByThisProcess = false
+	m.mu.Unlock()
+
 	m.logger.Info("podman machine stopped")
 	return nil
 }
 
+// StartedByThisProcess reports whether this process issued the successful
+// `podman machine start` that brought the machine up (and has not stopped it
+// since). The daemon's shutdown hook consults this so it never stops a machine
+// somebody else was already running (PB-27).
+func (m *PodmanMachineManager) StartedByThisProcess() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.startedByThisProcess
+}
+
 // Setup is the full initialization flow: Init (if not initialized) + Start.
-// Idempotent — no-op if already running.
+// Idempotent — no-op if already running (in which case this process does NOT
+// become the machine's owner; see StartedByThisProcess).
 func (m *PodmanMachineManager) Setup(cpus, memoryMB, diskGB int) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()

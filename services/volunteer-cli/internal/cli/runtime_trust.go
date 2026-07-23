@@ -19,10 +19,12 @@ func containerBackendAvailable() bool {
 // parseTrustRuntimes parses a comma-separated runtime list (e.g. "container,native") into the
 // UPPERCASE opt-in set stored in config.ServerConfig.TrustedRuntimes. WASM is always trusted, so
 // it is accepted but dropped (never stored); "none" (or empty) yields the WASM-only set. Unknown
-// names are an error rather than silently ignored.
+// names are an error rather than silently ignored. The result is always NON-NIL: an explicit
+// "none" must persist as an empty list, not as an absent key that the legacy-trust migration
+// would re-seed from available_runtimes (PB-28).
 func parseTrustRuntimes(csv string) ([]string, error) {
 	seen := map[string]bool{}
-	var out []string
+	out := []string{}
 	for _, part := range strings.Split(csv, ",") {
 		p := strings.ToUpper(strings.TrimSpace(part))
 		switch p {
@@ -45,9 +47,10 @@ func parseTrustRuntimes(csv string) ([]string, error) {
 // machine, returning the chosen opt-in runtimes (UPPERCASE; WASM is implicit and never returned).
 // CONTAINER is offered only when a backend is present. NATIVE always defaults to no, with an
 // explicit warning. On EOF (a non-interactive stream), the prompts take their defaults, so the
-// result is the safe posture: WASM plus container-if-available, never native.
+// result is the safe posture: WASM plus container-if-available, never native. Always NON-NIL —
+// declining everything is an explicit choice that must persist as such (PB-28).
 func promptRuntimeTrust(scanner *bufio.Scanner, headName string, containerAvailable bool) []string {
-	var trusted []string
+	trusted := []string{}
 	fmt.Printf("\nA head is a trust domain — attaching to %q means trusting its operator to run\n", headName)
 	fmt.Println("code on this machine. Choose what this head may run. WASM is always allowed: it is")
 	fmt.Println("fully sandboxed and cannot touch anything outside its own work folder.")

@@ -161,21 +161,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// never gets container work it can only abandon (which would churn units to
 	// FAILED on the head). native/wasm are always registered; container only when
 	// a backend is detected and initializes.
-	registry, machineManager, machineSetupOK := buildRuntimeRegistry(cfg, logger)
+	registry, machineManager := buildRuntimeRegistry(cfg, logger)
 	machineRuntimes := advertisedRuntimes(registry)
 	logger.Info("runtimes available on this machine", "runtimes", machineRuntimes)
 
-	// If we started a Podman machine, stop it on exit. Registered here (right
-	// after setup, before the connect loop) so it also fires on the early
-	// "could not connect to any server" return below — otherwise a failed
-	// startup would leak the running VM.
-	if machineManager != nil && machineSetupOK {
-		defer func() {
-			logger.Info("stopping podman machine on daemon shutdown")
-			if err := machineManager.Stop(); err != nil {
-				logger.Warn("failed to stop podman machine", "error", err)
-			}
-		}()
+	// Undo a daemon-started Podman machine on exit. Registered here (right after
+	// setup, before the connect loop) so it also fires on the early "could not
+	// connect to any server" return below — otherwise a failed startup would leak
+	// the VM it started. The ownership check lives inside the helper and is
+	// evaluated AT SHUTDOWN, so a machine that was already running when the
+	// daemon came up — a host-wide singleton every other container on the box
+	// depends on — is left exactly as it was found (PB-27).
+	if machineManager != nil {
+		defer stopMachineIfDaemonStarted(machineManager, logger)
 	}
 
 	// Connect to all configured servers — one gRPC connection per head address.
@@ -377,12 +375,34 @@ func runStart(cmd *cobra.Command, args []string) error {
 	return d.Run(ctx)
 }
 
+// stopMachineIfDaemonStarted stops the Podman machine at daemon shutdown ONLY
+// when this daemon process actually started it (PB-27). The machine is a
+// host-wide singleton: stopping one the operator (or another tool) was already
+// running tears down every co-tenant container on the box, so a machine found
+// running is always left running.
+func stopMachineIfDaemonStarted(mm *runtime.PodmanMachineManager, logger *slog.Logger) {
+	if mm == nil {
+		return
+	}
+	if !mm.StartedByThisProcess() {
+		if mm.NeedsMachine() {
+			logger.Info("leaving podman machine running on daemon shutdown (this daemon did not start it)")
+		}
+		return
+	}
+	logger.Info("stopping podman machine on daemon shutdown (this daemon started it)")
+	if err := mm.Stop(); err != nil {
+		logger.Warn("failed to stop podman machine", "error", err)
+	}
+}
+
 // buildRuntimeRegistry constructs the runtime registry. native and wasm are
 // always registered; the container runtime is added only when CONTAINER is
 // configured AND a working backend (Docker/Podman, setting up a Podman machine
-// if needed) is detected and initializes. Returning the machine manager and the
-// setup flag lets the caller stop a daemon-started Podman machine on shutdown.
-func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager, bool) {
+// if needed) is detected and initializes. The machine manager is returned so
+// the caller can undo a daemon-started Podman machine on shutdown (the manager
+// itself tracks whether this process started it — see StartedByThisProcess).
+func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager) {
 	registry := daemon.NewRuntimeRegistry()
 
 	// SECURITY (BG-12, per-head trust): build native ONLY when at least one attached head
@@ -407,7 +427,6 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 
 	// Register container runtime if configured.
 	var machineManager *runtime.PodmanMachineManager
-	machineSetupOK := false
 	if anyServerTrusts(cfg.Servers, "CONTAINER") {
 		// Honor the operator's configured backend preference (container_backend).
 		// When set to "docker", Docker is chosen if present so large images use
@@ -434,8 +453,6 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 					logger.Warn("podman machine setup failed, container runtime may be unavailable", "error", err)
 				} else if err := machineManager.WaitForReady(60 * time.Second); err != nil {
 					logger.Warn("podman machine not ready after setup", "error", err)
-				} else {
-					machineSetupOK = true
 				}
 				// Re-detect backend after machine setup to get updated socket path.
 				backend = runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), preferred)
@@ -466,7 +483,7 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 		}
 	}
 
-	return registry, machineManager, machineSetupOK
+	return registry, machineManager
 }
 
 // advertisedRuntimes returns the UPPERCASE runtime enum names the volunteer can

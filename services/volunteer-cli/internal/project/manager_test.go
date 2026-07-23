@@ -62,7 +62,7 @@ func TestAttachLeafDuplicate(t *testing.T) {
 func TestAttachServer(t *testing.T) {
 	mgr, _ := testManager(t)
 
-	err := mgr.AttachServer("example.com", 0, 0)
+	err := mgr.AttachServerWithTLS("example.com", 0, 0, false, "", []string{})
 	if err != nil {
 		t.Fatalf("AttachServer: %v", err)
 	}
@@ -85,11 +85,11 @@ func TestAttachServer(t *testing.T) {
 func TestAttachServerDuplicate(t *testing.T) {
 	mgr, _ := testManager(t)
 
-	if err := mgr.AttachServer("example.com", 9090, 8080); err != nil {
+	if err := mgr.AttachServerWithTLS("example.com", 9090, 8080, false, "", []string{}); err != nil {
 		t.Fatalf("first attach: %v", err)
 	}
 
-	err := mgr.AttachServer("example.com", 9090, 8080)
+	err := mgr.AttachServerWithTLS("example.com", 9090, 8080, false, "", []string{})
 	if err == nil {
 		t.Fatal("duplicate server attach should fail")
 	}
@@ -98,7 +98,7 @@ func TestAttachServerDuplicate(t *testing.T) {
 func TestAttachServerCustomPorts(t *testing.T) {
 	mgr, _ := testManager(t)
 
-	err := mgr.AttachServer("example.com", 9091, 8081)
+	err := mgr.AttachServerWithTLS("example.com", 9091, 8081, false, "", []string{})
 	if err != nil {
 		t.Fatalf("AttachServer: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestGetHistoryEmpty(t *testing.T) {
 func TestDetachServer(t *testing.T) {
 	mgr, _ := testManager(t)
 
-	if err := mgr.AttachServer("example.com", 9090, 8080); err != nil {
+	if err := mgr.AttachServerWithTLS("example.com", 9090, 8080, false, "", []string{}); err != nil {
 		t.Fatalf("attach: %v", err)
 	}
 	if err := mgr.AttachLeaf("p1", "example.com:9090", "http://example.com:8080", "example.com"); err != nil {
