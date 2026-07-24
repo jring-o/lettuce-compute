@@ -817,6 +817,39 @@ func (c *dispatchCache) requestLeafRefill(leafIDs []types.ID) {
 	}
 }
 
+// watermarkRefillCovers reports whether the GLOBAL watermark refill will, on its own,
+// stage work for EVERY named leaf. It is the condition under which HandOut may skip
+// asking for an on-demand leaf-scoped refill for a requester it handed nothing — the
+// refill economy the old `readyNonEmpty` gate was standing in for, stated directly.
+//
+// True only when every named leaf is WARMED and PUBLIC, because the dispatchable query
+// the watermark refill runs stages PUBLIC leafs only (PB-38): a non-PUBLIC leaf reaches
+// the ready pool exclusively through a leaf-scoped (pin-by-id) refill, so no watermark
+// state ever covers it.
+//
+// A leaf the cache has never warmed counts as NOT covered. That fail-safe direction is
+// deliberate and is the PB-16 case: on a head whose only ACTIVE leafs are non-PUBLIC
+// nothing ever stages them, so nothing ever warms them either, and assuming coverage
+// there is exactly the starvation. Being wrong the other way costs one redundant
+// leaf-scoped query, which warms the leaf and settles the question.
+//
+// Visibility is read the way eligibleLocked reads it — the two explicit hidden values
+// are what exclude, so a sparsely-built snapshot with a zero-value Visibility counts as
+// PUBLIC (the DB column is NOT NULL DEFAULT 'PUBLIC', so a warmed production leaf is
+// never empty). Takes leafMu via peekLeaf and must NOT be called while holding mu.
+func (c *dispatchCache) watermarkRefillCovers(leafIDs []types.ID) bool {
+	for _, id := range leafIDs {
+		lf := c.peekLeaf(id)
+		if lf == nil {
+			return false
+		}
+		if lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate {
+			return false
+		}
+	}
+	return true
+}
+
 // drainLeafRefills returns and clears the set of leafs awaiting an on-demand
 // leaf-scoped refill.
 func (c *dispatchCache) drainLeafRefills() []types.ID {
@@ -1029,14 +1062,33 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	}
 	c.mu.Unlock()
 
-	// Blocker 2 (leaf-filtered starvation): a requester filtered to specific leafs that
-	// got NOTHING while the ready pool still holds units is being starved by a different
-	// leaf monopolizing the pool (the global watermark refill never notices, since the
-	// pool is "full"). Request an on-demand, leaf-scoped refill for the requester's
-	// leafs so they get staged regardless of the watermark. (BlockedLeafIDs alone are an
-	// exclusion, not a positive scope, so we only do this for an explicit LeafIDs
-	// filter.)
-	if len(results) == 0 && len(opts.LeafIDs) > 0 && readyNonEmpty {
+	// Leaf-filtered starvation: a requester filtered to specific leafs that got NOTHING
+	// needs those leafs staged on demand, because the global watermark refill will not
+	// necessarily do it for them. Two distinct shapes reach this point:
+	//
+	//   1. Blocker 2 — the ready pool still holds units, so the requester is starved by a
+	//      different leaf monopolizing the pool (the watermark refill never notices, since
+	//      the pool is "full").
+	//   2. PB-16 — the requested leaf is non-PUBLIC. The global refill's visibility gate
+	//      (PB-38) stages PUBLIC leafs only, so an UNLISTED/PRIVATE leaf's units NEVER
+	//      enter the ready pool through it, at any watermark; a leaf-scoped refill is the
+	//      ONLY way they are staged.
+	//
+	// The gate here used to be `readyNonEmpty` alone — a stand-in for "the watermark refill
+	// is already about to stage everything dispatchable, so a second leaf-scoped query
+	// would be duplicate work". That was refill economy, and it was exact while the global
+	// refill spanned every ACTIVE leaf. PB-38's visibility gate broke the equivalence, and
+	// PB-16 is the consequence: on a head whose only ACTIVE leafs are UNLISTED/PRIVATE the
+	// ready pool is permanently empty, so this gate held the leaf-scoped refill closed
+	// forever and a pinned volunteer starved indefinitely (any co-resident PUBLIC leaf with
+	// queued work masks it completely, which is how it survived the fix wave). The economy
+	// is kept, but expressed as what it actually meant: skip only when the watermark refill
+	// demonstrably covers every named leaf (watermarkRefillCovers). An empty pool always
+	// signals that refill below (drained), so the skip stays safe.
+	//
+	// (BlockedLeafIDs alone are an exclusion, not a positive scope, so we only do this for
+	// an explicit LeafIDs filter.)
+	if len(results) == 0 && len(opts.LeafIDs) > 0 && (readyNonEmpty || !c.watermarkRefillCovers(opts.LeafIDs)) {
 		c.requestLeafRefill(opts.LeafIDs)
 	}
 
