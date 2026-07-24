@@ -248,8 +248,11 @@ jobs:
       # creds), pulls must stay anonymous, and routes where the head enforces
       # a small body cap must get a 413 AT THE PROXY (an oversized body that
       # reaches the head instead resets the connection: the client sees 502
-      # and passive health ejects the replica for 30s).
-      - name: Proxy contract smoke (registry auth challenge, per-route body caps)
+      # and passive health ejects the replica for 30s). The body-cap block also
+      # guards PB-20b (mis-cased paths must still 413 without ejecting), PB-20c
+      # (the bind-did signed cap), and the chunked residual (a length-less
+      # oversized POST must 413 up front, not eject).
+      - name: Proxy contract smoke (registry auth challenge, per-route body caps incl. case/chunked/bind-did)
         run: |
           set -eu
           CADDY_IMG='caddy:2-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648'
@@ -279,6 +282,12 @@ jobs:
                   self.send_header("Content-Length", str(len(body)))
                   self.end_headers()
                   self.wfile.write(body)
+              def do_OPTIONS(self):
+                  # Mirror the head's CORS preflight answer so an OPTIONS that
+                  # passes the proxy guards is visibly a 204, not a 413.
+                  self.send_response(204)
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
               def log_message(self, *a):
                   pass
               do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = _serve
@@ -336,6 +345,47 @@ jobs:
           head -c 512 /dev/zero > /tmp/b512
           assert_code 200 -X POST --data-binary @/tmp/b512 http://localhost:8088/api/v1/attestations/verify
           assert_code 200 -X POST --data-binary @/tmp/b2k  http://localhost:8088/api/v1/leafs/x/work-units/bulk
+          # PB-20b regression: the up-front guards MUST select their route with a
+          # case-INSENSITIVE matcher, exactly like the request_body backstop. If
+          # a guard reverts to a case-sensitive {path} ==/startsWith compare, a
+          # mis-cased path (/VERIFY, /REGISTER, /VOLUNTEERS/...) skips the clean
+          # 413, falls onto the streaming backstop, and the mid-stream trip
+          # ejects the sole /api/v1 replica — the health probe after each one
+          # goes 503 and fails this job.
+          assert_code 413 -X POST --data-binary @/tmp/b2k  --path-as-is http://localhost:8088/api/v1/attestations/VERIFY
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b70k --path-as-is http://localhost:8088/api/v1/volunteers/REGISTER
+          assert_code 200 http://localhost:8088/api/v1/health
+          assert_code 413 -X POST --data-binary @/tmp/b11m --path-as-is http://localhost:8088/api/v1/VOLUNTEERS/submit-result
+          assert_code 200 http://localhost:8088/api/v1/health
+          # PB-20c regression: /api/v1/identity/bind-did carries the 10 MiB
+          # Ed25519 cap but lives OUTSIDE /api/v1/volunteers/* — it must be
+          # mirrored here too, or a 10-64MB body streams through to the head.
+          assert_code 413 -X POST --data-binary @/tmp/b11m http://localhost:8088/api/v1/identity/bind-did
+          assert_code 200 http://localhost:8088/api/v1/health
+          # PB-20 chunked residual regression: a length-less (chunked) oversized
+          # POST to a small-cap route must be rejected UP FRONT (413) without
+          # ejecting the replica. Without the guards' length-less arm it trips
+          # the streaming backstop and the mid-stream 413 counts against
+          # max_fails (health 503 after).
+          assert_chunked_413_no_eject() {
+            path="$1"; bytes="$2"
+            code="$(head -c "$bytes" /dev/zero | curl -s -o /dev/null -w '%{http_code}' -m 120 \
+              -X POST -H 'Transfer-Encoding: chunked' --data-binary @- "http://localhost:8088$path" || true)"
+            [ "$code" = "413" ] || { echo "FAIL: chunked oversized POST to $path expected 413, got $code"; docker logs proxy; exit 1; }
+            h="$(curl -s -o /dev/null -w '%{http_code}' -m 30 http://localhost:8088/api/v1/health || true)"
+            [ "$h" = "200" ] || { echo "FAIL: chunked oversized POST to $path ejected the replica (health=$h)"; docker logs proxy; exit 1; }
+            echo "OK chunked 413 + health 200 <- $path"
+          }
+          assert_chunked_413_no_eject /api/v1/attestations/verify        5000
+          assert_chunked_413_no_eject /api/v1/volunteers/register        70000
+          assert_chunked_413_no_eject /api/v1/volunteers/submit-result   12000000
+          assert_chunked_413_no_eject /api/v1/identity/bind-did          12000000
+          # ...and the length-less arm must NOT touch bodiless requests: a
+          # documented bodiless owner POST (curl -X POST .../activate, no
+          # Content-Length) and a CORS preflight must still pass, not 413.
+          assert_code 200 -X POST http://localhost:8088/api/v1/leafs/x/activate
+          assert_code 204 -X OPTIONS http://localhost:8088/api/v1/volunteers/register
           docker rm -f proxy infrastructure registry dashboard >/dev/null 2>&1 || true
           docker network rm proxysmoke >/dev/null 2>&1 || true
       - name: Makefile guardrails (BG-35)

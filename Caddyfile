@@ -94,29 +94,60 @@ your-domain.com {
 		# window lapses.
 		#
 		# The caps are enforced in two layers because Caddy (v2.11) checks
-		# request_body limits only WHILE STREAMING to the upstream, and a
+		# request_body limits only WHILE STREAMING to the upstream, and that
 		# mid-stream trip is itself counted as an upstream failure — the client
-		# gets the 413, but the replica is still ejected. The expression guards
-		# below therefore reject an over-cap declared Content-Length up front
-		# (413, upstream never contacted, no health penalty), which covers
-		# every standard client; the request_body caps stay as the enforcement
-		# backstop for length-less (chunked) uploads, where a deliberately
-		# oversized stream is cut at the cap and answered 413 at the cost of
-		# one passive-health strike.
+		# gets a 413, but the replica is still ejected. Caddy offers no way to
+		# exclude a client-body error from max_fails accounting for a dynamic
+		# upstream (there is no per-status or per-cause passive-health filter),
+		# so the request_body directives below are a hard-cap BACKSTOP only, and
+		# the @oversized_* guards reject an over-limit request UP FRONT (413,
+		# upstream never contacted, no health penalty) so the backstop does not
+		# have to fire.
 		#
-		# CONTRACT: any head-side body cap below the 64MB default must be
-		# mirrored here — expression guard and request_body pair — at the same
-		# value or lower. Current head caps: attestation/handler.go
-		# verifyMaxBody = 1 KiB; browser-volunteer-handlers.go
-		# browserRegisterMaxBody = 64 KiB; ed25519_auth.go ed25519MaxBodySize
-		# = 10 MiB (every signed volunteer REST body).
-		@oversized_verify expression `{path} == "/api/v1/attestations/verify" && {header.Content-Length} != "" && int({header.Content-Length}) > 1024`
+		# For a guard to cover exactly what its backstop covers, it selects the
+		# route with the SAME case-insensitive `path` matcher the request_body
+		# pair uses. (An earlier revision compared {path} with a case-SENSITIVE
+		# CEL ==/startsWith, so POST /api/v1/attestations/VERIFY skipped the
+		# guard, fell onto the backstop, and ejected the replica — PB-20b.) The
+		# length expression rejects a request that EITHER declares an over-cap
+		# Content-Length (any method) OR declares no length at all on a body-
+		# bearing method — a length-less/chunked upload, whose real size Caddy
+		# cannot know up front (the PB-20 chunked residual: without this arm a
+		# single chunked POST tripped the backstop and ejected the replica).
+		# GET/HEAD/OPTIONS are exempt from the length-less arm so an empty
+		# request (including a CORS preflight) still passes. The general ceiling
+		# omits the length-less arm entirely: bodiless owner POSTs (.../activate,
+		# .../pause, …) are a documented curl flow that legitimately sends no
+		# Content-Length, so a chunked >64MB body to an owner route is the one
+		# residual the backstop still guards (bytes bounded, one strike).
+		#
+		# CONTRACT: any head-side body cap below the 64MB default MUST be
+		# mirrored here — an @oversized_* guard AND a request_body pair, keyed
+		# off the same path, at the same value or lower. Verified head caps:
+		#   attestation/handler.go verifyMaxBody         = 1 KiB
+		#       → POST /api/v1/attestations/verify
+		#   browser-volunteer-handlers.go browserRegisterMaxBody = 64 KiB
+		#       → POST /api/v1/volunteers/register, .../register-challenge
+		#   ed25519_auth.go ed25519MaxBodySize           = 10 MiB (every
+		#       Ed25519-signed REST body): /api/v1/volunteers/* (request-work,
+		#       submit-result) AND /api/v1/identity/bind-did — the latter lives
+		#       outside /api/v1/volunteers/* and was previously unmirrored (PB-20c).
+		@oversized_verify {
+			path /api/v1/attestations/verify
+			expression `({http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 1024) || (!({http.request.method} in ["GET","HEAD","OPTIONS"]) && {http.request.header.Content-Length} == "")`
+		}
 		error @oversized_verify 413
-		@oversized_register expression `({path} == "/api/v1/volunteers/register" || {path} == "/api/v1/volunteers/register-challenge") && {header.Content-Length} != "" && int({header.Content-Length}) > 65536`
+		@oversized_register {
+			path /api/v1/volunteers/register /api/v1/volunteers/register-challenge
+			expression `({http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 65536) || (!({http.request.method} in ["GET","HEAD","OPTIONS"]) && {http.request.header.Content-Length} == "")`
+		}
 		error @oversized_register 413
-		@oversized_signed expression `{path}.startsWith("/api/v1/volunteers/") && {header.Content-Length} != "" && int({header.Content-Length}) > 10485760`
+		@oversized_signed {
+			path /api/v1/volunteers/* /api/v1/identity/bind-did
+			expression `({http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 10485760) || (!({http.request.method} in ["GET","HEAD","OPTIONS"]) && {http.request.header.Content-Length} == "")`
+		}
 		error @oversized_signed 413
-		@oversized_any expression `{header.Content-Length} != "" && int({header.Content-Length}) > 64000000`
+		@oversized_any expression `{http.request.header.Content-Length} != "" && int({http.request.header.Content-Length}) > 64000000`
 		error @oversized_any 413
 
 		@attestation_verify path /api/v1/attestations/verify
@@ -127,8 +158,10 @@ your-domain.com {
 		request_body @volunteer_register {
 			max_size 64KiB
 		}
-		@volunteer_signed path /api/v1/volunteers/*
-		request_body @volunteer_signed {
+		# Every Ed25519-signed REST body (10 MiB head cap): the volunteer routes
+		# AND /api/v1/identity/bind-did, which lives outside /api/v1/volunteers/*.
+		@signed_routes path /api/v1/volunteers/* /api/v1/identity/bind-did
+		request_body @signed_routes {
 			max_size 10MiB
 		}
 		request_body {
