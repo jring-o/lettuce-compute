@@ -247,11 +247,16 @@ jobs:
       # ping makes every push fail "authentication required" with correct
       # creds), pulls must stay anonymous, and routes where the head enforces
       # a small body cap must get a 413 AT THE PROXY (an oversized body that
-      # reaches the head instead resets the connection: the client sees 502
-      # and passive health ejects the replica for 30s). The body-cap block also
-      # guards PB-20b (mis-cased paths must still 413 without ejecting), PB-20c
-      # (the bind-did signed cap), and the chunked residual (a length-less
-      # oversized POST must 413 up front, not eject).
+      # reaches the head instead resets the connection and the client sees a
+      # 502). The body-cap block also guards PB-20b (mis-cased paths must
+      # still 413), PB-20c (the bind-did signed cap), the chunked residual
+      # (a length-less oversized POST must 413 up front), and the PB-20
+      # structural fix: the proxy runs WITHOUT passive-health ejection, so no
+      # request — any method, route, or body encoding, including one that
+      # trips the streaming request_body backstop mid-proxy — may take the
+      # sole upstream out of rotation. The final chunked-to-owner-route
+      # assert drives exactly that backstop trip and fails this job if anyone
+      # re-adds fail_duration/max_fails to the /api/v1 reverse_proxy.
       - name: Proxy contract smoke (registry auth challenge, per-route body caps incl. case/chunked/bind-did)
         run: |
           set -eu
@@ -271,6 +276,19 @@ jobs:
           class H(BaseHTTPRequestHandler):
               protocol_version = "HTTP/1.1"
               def _serve(self):
+                  if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                      # Drain the raw chunked stream until the proxy stops
+                      # sending (EOF once its request_body cap trips and it
+                      # drops the upstream connection). Answering before the
+                      # drain would let an early 200 beat the cap trip and
+                      # mask a missing cap, same as the Content-Length path.
+                      try:
+                          while self.rfile.read(1 << 20):
+                              pass
+                      except OSError:
+                          pass
+                      self.close_connection = True
+                      return
                   n = int(self.headers.get("Content-Length") or 0)
                   while n > 0:
                       chunk = self.rfile.read(min(n, 1 << 20))
@@ -345,13 +363,14 @@ jobs:
           head -c 512 /dev/zero > /tmp/b512
           assert_code 200 -X POST --data-binary @/tmp/b512 http://localhost:8088/api/v1/attestations/verify
           assert_code 200 -X POST --data-binary @/tmp/b2k  http://localhost:8088/api/v1/leafs/x/work-units/bulk
-          # PB-20b regression: the up-front guards MUST select their route with a
-          # case-INSENSITIVE matcher, exactly like the request_body backstop. If
-          # a guard reverts to a case-sensitive {path} ==/startsWith compare, a
-          # mis-cased path (/VERIFY, /REGISTER, /VOLUNTEERS/...) skips the clean
-          # 413, falls onto the streaming backstop, and the mid-stream trip
-          # ejects the sole /api/v1 replica — the health probe after each one
-          # goes 503 and fails this job.
+          # PB-20b regression: a mis-cased path (/VERIFY, /REGISTER,
+          # /VOLUNTEERS/...) must still get a 413 — the guards select their
+          # route with the SAME case-insensitive `path` matcher the
+          # request_body backstop uses, so path case cannot dodge a cap. (With
+          # passive-health ejection now removed, a guard that regressed to a
+          # case-sensitive compare would fall onto the streaming backstop and
+          # still 413 without ejecting — these asserts pin the client-visible
+          # contract, not which layer answered.)
           assert_code 413 -X POST --data-binary @/tmp/b2k  --path-as-is http://localhost:8088/api/v1/attestations/VERIFY
           assert_code 200 http://localhost:8088/api/v1/health
           assert_code 413 -X POST --data-binary @/tmp/b70k --path-as-is http://localhost:8088/api/v1/volunteers/REGISTER
@@ -364,10 +383,10 @@ jobs:
           assert_code 413 -X POST --data-binary @/tmp/b11m http://localhost:8088/api/v1/identity/bind-did
           assert_code 200 http://localhost:8088/api/v1/health
           # PB-20 chunked residual regression: a length-less (chunked) oversized
-          # POST to a small-cap route must be rejected UP FRONT (413) without
-          # ejecting the replica. Without the guards' length-less arm it trips
-          # the streaming backstop and the mid-stream 413 counts against
-          # max_fails (health 503 after).
+          # POST to a small-cap route must be rejected UP FRONT (413 with no
+          # bytes streamed toward the head) — the guards' length-less arm
+          # answers it before the upstream is contacted. The health probe after
+          # each one confirms the API keeps serving.
           assert_chunked_413_no_eject() {
             path="$1"; bytes="$2"
             code="$(head -c "$bytes" /dev/zero | curl -s -o /dev/null -w '%{http_code}' -m 120 \
@@ -381,6 +400,20 @@ jobs:
           assert_chunked_413_no_eject /api/v1/volunteers/register        70000
           assert_chunked_413_no_eject /api/v1/volunteers/submit-result   12000000
           assert_chunked_413_no_eject /api/v1/identity/bind-did          12000000
+          # PB-20 structural fix: the one case the up-front guards deliberately
+          # do NOT cover — a length-less (chunked) >64MB body to an owner route
+          # (the general ceiling has no length-less arm because bodiless owner
+          # POSTs legitimately send no Content-Length) — trips the streaming
+          # request_body backstop MID-PROXY, while Caddy is copying the body to
+          # the upstream. Caddy counts that trip as an upstream failure, so
+          # with passive-health ejection configured (fail_duration/max_fails)
+          # this single anonymous request ejected the sole replica and turned
+          # ALL /api/v1/* traffic into 503s for the fail_duration window. The
+          # proxy now runs without passive ejection: the client must get the
+          # 413 AND the very next request must still reach the upstream. This
+          # assert fails if fail_duration/max_fails are ever re-added to the
+          # /api/v1 reverse_proxy.
+          assert_chunked_413_no_eject /api/v1/leafs/x/work-units/bulk    68000000
           # ...and the length-less arm must NOT touch bodiless requests: a
           # documented bodiless owner POST (curl -X POST .../activate, no
           # Content-Length) and a CORS preflight must still pass, not 413.

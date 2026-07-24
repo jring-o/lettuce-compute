@@ -30,15 +30,21 @@ your-domain.com {
 				versions h2c
 			}
 			lb_policy round_robin
-			# Health checking so a booting/wedged replica is pulled from
-			# rotation instead of eating its round-robin share. NOTE: these are
-			# PASSIVE checks (mark an upstream down after a failed attempt) plus
-			# a dial-retry budget (a connection-refused attempt fails over to
-			# another replica before the client sees an error). Caddy's ACTIVE
-			# health checks (health_uri) do not run for dynamic upstreams —
-			# configuring them here would validate and silently do nothing.
-			fail_duration 30s
-			max_fails 1
+			# Dial-retry budget only — passive health ejection (fail_duration/
+			# max_fails) is deliberately ABSENT. Caddy counts any mid-stream
+			# proxy error as an upstream failure, including a client-caused
+			# request_body cap trip (gRPC is always length-less, so an over-cap
+			# message trips the cap only while streaming to the upstream), and
+			# offers no way to exclude client-caused failures from that
+			# accounting. With ejection enabled, one such request pulls the
+			# replica from rotation and answers every gRPC call 503 for the
+			# fail_duration window — on a one-replica deploy, a full anonymous
+			# denial of service. Failover instead rides the dial-retry budget
+			# below: a connection-refused attempt retries (and with >1 replica
+			# lands on another IP via round_robin) before the client sees an
+			# error. Caddy's ACTIVE health checks (health_uri) do not run for
+			# dynamic upstreams — configuring them here would validate and
+			# silently do nothing.
 			lb_try_duration 5s
 			lb_try_interval 250ms
 		}
@@ -87,22 +93,27 @@ your-domain.com {
 		# Routes where the head enforces a SMALLER body cap of its own must be
 		# capped at the proxy, at or below the head's value: an oversized body
 		# that reaches the head instead makes the head reset the connection
-		# mid-upload, the client sees 502 (not 413), and the failed attempt
-		# counts against passive health (max_fails 1) — one benign oversized
-		# POST then ejects the replica from rotation for fail_duration, which
-		# on a one-replica deploy answers ALL /api/v1/* traffic 503 until the
-		# window lapses.
+		# mid-upload, so the client sees a 502 (not the correct 413) and the
+		# over-cap bytes cross the proxy->head hop for nothing.
 		#
-		# The caps are enforced in two layers because Caddy (v2.11) checks
-		# request_body limits only WHILE STREAMING to the upstream, and that
-		# mid-stream trip is itself counted as an upstream failure — the client
-		# gets a 413, but the replica is still ejected. Caddy offers no way to
-		# exclude a client-body error from max_fails accounting for a dynamic
-		# upstream (there is no per-status or per-cause passive-health filter),
-		# so the request_body directives below are a hard-cap BACKSTOP only, and
-		# the @oversized_* guards reject an over-limit request UP FRONT (413,
-		# upstream never contacted, no health penalty) so the backstop does not
-		# have to fire.
+		# The caps are enforced in two layers. The @oversized_* guards reject
+		# an over-limit request UP FRONT (413, upstream never contacted)
+		# whenever the declared Content-Length or a length-less body-bearing
+		# method gives it away; the request_body directives are a hard-cap
+		# BACKSTOP that Caddy (v2.11) enforces only WHILE STREAMING to the
+		# upstream, bounding the bytes any request can push no matter how it
+		# is encoded. Caddy counts that mid-stream trip as an upstream failure
+		# (the client still gets a 413, but there is no per-status or per-cause
+		# passive-health filter to exclude it), which is why this reverse_proxy
+		# runs with NO passive health ejection — no fail_duration/max_fails,
+		# matching the gRPC block above. With ejection enabled, any request
+		# that reached the backstop pulled the sole replica from rotation and
+		# answered ALL /api/v1/* traffic 503 for fail_duration (the PB-20
+		# family); rounds of widening the guards kept closing individual
+		# bypasses without ever making the guard set provably complete. With
+		# ejection off, a backstop trip costs exactly the offending request,
+		# so the guards below are an optimization (clean 413, no bytes
+		# streamed toward the head) rather than a completeness obligation.
 		#
 		# For a guard to cover exactly what its backstop covers, it selects the
 		# route with the SAME case-insensitive `path` matcher the request_body
@@ -119,7 +130,8 @@ your-domain.com {
 		# omits the length-less arm entirely: bodiless owner POSTs (.../activate,
 		# .../pause, …) are a documented curl flow that legitimately sends no
 		# Content-Length, so a chunked >64MB body to an owner route is the one
-		# residual the backstop still guards (bytes bounded, one strike).
+		# residual the backstop still catches (bytes bounded, and with
+		# ejection off the trip costs nothing beyond that request).
 		#
 		# CONTRACT: any head-side body cap below the 64MB default MUST be
 		# mirrored here — an @oversized_* guard AND a request_body pair, keyed
@@ -173,11 +185,10 @@ your-domain.com {
 				port 8080
 			}
 			lb_policy round_robin
-			# Passive health checks + dial-retry budget, matching the gRPC
-			# block above (active health_uri checks do not run for dynamic
-			# upstreams — see the note there).
-			fail_duration 30s
-			max_fails 1
+			# Dial-retry budget only — passive health ejection deliberately
+			# absent, matching the gRPC block above (see the note there; the
+			# body-cap comment above explains why ejection turned one client
+			# request into a fail_duration-long outage on this route).
 			lb_try_duration 5s
 			lb_try_interval 250ms
 		}
