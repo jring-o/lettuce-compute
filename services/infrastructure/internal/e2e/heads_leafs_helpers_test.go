@@ -277,19 +277,28 @@ type hlLeafOpts struct {
 	DataConfig   leaf.DataConfig
 	CreditConfig leaf.CreditConfig
 	ResourceReqs *leaf.ResourceRequirements
+	// Visibility controls discoverability and, through it, dispatch: non-PUBLIC leafs
+	// are excluded from any-leaf/catalog-driven dispatch and served only to a requester
+	// that pins the leaf by id (PB-38/PB-16). Empty means PUBLIC, the default every
+	// pre-visibility test was written against.
+	Visibility leaf.LeafVisibility
 }
 
 // createHLLeaf creates, configures, and activates a leaf.
 func createHLLeaf(t *testing.T, env *headsLeafsEnv, ctx context.Context, userID types.ID, opts hlLeafOpts) leaf.Leaf {
 	t.Helper()
 
+	visibility := opts.Visibility
+	if visibility == "" {
+		visibility = leaf.VisibilityPublic
+	}
 	createReq := leaf.CreateLeafRequest{
 		Name:         opts.Name,
 		Description:  "Heads & Leafs E2E test leaf: " + opts.Name,
 		ResearchArea: []string{"testing"},
 		TaskPattern:  opts.TaskPattern,
 		IsOngoing:    false,
-		Visibility:   leaf.VisibilityPublic,
+		Visibility:   visibility,
 		CreatorID:    &userID,
 	}
 	resp := httpReq(t, "POST", env.httpURL+"/api/v1/leafs", createReq)
