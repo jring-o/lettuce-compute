@@ -708,6 +708,20 @@ func (r *DispatchCacheRef) InvalidateWorkUnit(id types.ID) {
 	}
 }
 
+// InvalidateLeaf forwards to the bound cache (leaf.DispatchInvalidator): the leaf
+// update/visibility/lifecycle handlers call it after every successful leaf mutation
+// so this replica's cached leaf snapshot stops being trusted immediately (PB-16 /
+// PB-38b — a flip to UNLISTED/PRIVATE must not keep dispatching on a snapshot that
+// still says PUBLIC).
+func (r *DispatchCacheRef) InvalidateLeaf(id types.ID) {
+	r.mu.Lock()
+	c := r.cache
+	r.mu.Unlock()
+	if c != nil {
+		c.InvalidateLeaf(id)
+	}
+}
+
 // handOutResult is one reserved unit + its leaf, ready to build into a proto
 // assignment.
 type handOutResult struct {
@@ -1085,6 +1099,19 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 				"work_unit_id", r.unit.ID, "leaf_id", r.unit.LeafID, "volunteer_id", volunteerID, "error", err)
 			continue
 		}
+		// Visibility re-check at the last write point (PB-38b): getLeaf may have just
+		// refreshed the snapshot past its TTL, and an accepted batch must not ship a
+		// hidden leaf's unit to a requester that did not pin it — the eligibility gate
+		// decided on the snapshot as it was, this decides on the freshest one in hand.
+		// Costs one branch on data already loaded; voids like the un-buildable case
+		// (the release also purges the still-queued reservation write).
+		if (lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate) &&
+			!containsID(opts.LeafIDs, r.unit.LeafID) {
+			c.releaseInMem(r.unit.ID, volunteerID)
+			c.logger.Warn("dispatch cache: voided hand-out of a non-PUBLIC leaf's unit to an un-pinned requester (stale-visibility race)",
+				"work_unit_id", r.unit.ID, "leaf_id", r.unit.LeafID, "volunteer_id", volunteerID)
+			continue
+		}
 		r.leaf = lf
 		// Artifact pinning (TODO #38): on a versioned leaf, pin EVERY unit to the
 		// current version at its first dispatch (first-writer-wins). This gives every
@@ -1151,6 +1178,7 @@ const (
 	rejectHRClassMismatch                        // unit pinned to a different hardware class
 	rejectLeafNotCached                          // leaf metadata not yet warmed
 	rejectLeafNotPublic                          // non-PUBLIC leaf, requester did not pin it by id (PB-38)
+	rejectLeafSnapshotStale                      // leaf snapshot over-TTL/invalidated; not trusted as PUBLIC for an un-pinned requester (PB-38b)
 	rejectCapabilityMismatch                     // volunteer capabilities do not fit the leaf
 	rejectInfeasibleDeadline                     // host too slow to finish this unit before its deadline
 	rejectTrustReserved                          // untrusted requester; unit's last slots reserved for trusted subjects
@@ -1186,6 +1214,8 @@ func (r rejectReason) String() string {
 		return "leaf_not_cached"
 	case rejectLeafNotPublic:
 		return "leaf_not_public"
+	case rejectLeafSnapshotStale:
+		return "leaf_snapshot_stale"
 	case rejectCapabilityMismatch:
 		return "capability_mismatch"
 	case rejectInfeasibleDeadline:
@@ -1367,7 +1397,7 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 		return false, rejectHRClassMismatch
 	}
 	// Capability fit against the cached leaf metadata.
-	lf := c.peekLeaf(leafID)
+	lf, leafFresh := c.peekLeafFresh(leafID)
 	if lf == nil {
 		// Leaf not yet cached: be conservative and skip; the next refill / a warmed
 		// cache lets it through. (getLeaf is not called under mu to avoid a DB touch
@@ -1383,8 +1413,27 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// the two explicit hidden values (not != PUBLIC) so a sparsely-built snapshot with
 	// a zero-value Visibility stays eligible — the DB column is NOT NULL DEFAULT
 	// 'PUBLIC', so a warmed production leaf is never empty.
-	if (lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate) && !containsID(opts.LeafIDs, leafID) {
-		return false, rejectLeafNotPublic
+	//
+	// The gate is FAIL-SAFE against snapshot staleness (PB-38b, PB-16 closeout #2 R1):
+	// a snapshot older than leafSnapshotTTL (or invalidated by a leaf mutation — see
+	// InvalidateLeaf) is NOT trusted to say PUBLIC, because nothing guarantees it still
+	// reflects the leaf's visibility — the live leak handed UNLISTED units to any-leaf
+	// volunteers 95 s after a flip precisely because this read trusted an aged PUBLIC
+	// snapshot. An un-pinned requester is therefore refused on a stale snapshot; the
+	// error costs one refused candidate until the off-hot-path refresh (the TTL-aware
+	// warmLeaf at staging, or the refiller tick's refreshStaleLeafSnapshots, both a
+	// bounded DB read under the maintenance admission budget) restores fresh truth —
+	// never a hidden unit handed to a requester that did not pin it. A PINNED requester
+	// is exempt from both checks: naming the leaf id is the opt-in, valid whatever the
+	// visibility, so pinned dispatch never degrades on an aged snapshot (making hidden-
+	// ness sticky here would just re-create the PB-16 starvation).
+	if !containsID(opts.LeafIDs, leafID) {
+		if lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate {
+			return false, rejectLeafNotPublic
+		}
+		if !leafFresh {
+			return false, rejectLeafSnapshotStale
+		}
 	}
 	if !leafMatchesCapabilities(lf, opts) {
 		return false, rejectCapabilityMismatch
@@ -1773,8 +1822,11 @@ type cachedLeaf struct {
 }
 
 // peekLeaf returns a cached leaf without a DB fetch (nil if not warmed). Used by the
-// hot-path capability check; a slightly stale capability snapshot is harmless (the
-// build path re-resolves freshness via getLeaf).
+// hot-path reads that are freshness-agnostic (HR pin, spot-check decision — a
+// slightly stale ValidationConfig is harmless; the build path re-resolves freshness
+// via getLeaf). The VISIBILITY consumer must use peekLeafFresh instead: it needs to
+// know whether the snapshot is still within its TTL, because an aged snapshot must
+// not be trusted to say PUBLIC (PB-38b).
 func (c *dispatchCache) peekLeaf(id types.ID) *leaf.Leaf {
 	c.leafMu.Lock()
 	defer c.leafMu.Unlock()
@@ -1782,6 +1834,21 @@ func (c *dispatchCache) peekLeaf(id types.ID) *leaf.Leaf {
 		return cl.leaf
 	}
 	return nil
+}
+
+// peekLeafFresh returns a cached leaf without a DB fetch, plus whether the snapshot
+// is FRESH — younger than leafSnapshotTTL and not invalidated (InvalidateLeaf zeroes
+// fetchedAt, which reads as maximally stale). eligibleLocked's visibility gate keys
+// on the second value: only a fresh snapshot may vouch that a leaf is PUBLIC to a
+// requester that did not pin it. ((nil, false) when not warmed.)
+func (c *dispatchCache) peekLeafFresh(id types.ID) (*leaf.Leaf, bool) {
+	c.leafMu.Lock()
+	defer c.leafMu.Unlock()
+	cl := c.leafCache[id]
+	if cl == nil {
+		return nil, false
+	}
+	return cl.leaf, c.now().Sub(cl.fetchedAt) < c.cfg.leafSnapshotTTL
 }
 
 // getLeaf returns the leaf for building an accepted hand-out's assignment. Off the
@@ -1820,11 +1887,19 @@ func (c *dispatchCache) getLeaf(id types.ID) (*leaf.Leaf, error) {
 	return lf, nil
 }
 
-// warmLeaf caches a leaf if not present (best-effort, called by the refiller so the
-// capability check in eligibleLocked has metadata for newly-staged units). Freshness
-// for the build path is handled by getLeaf's TTL, not here.
+// warmLeaf caches a leaf if not present, and REFRESHES it when the existing snapshot
+// is over-TTL or invalidated (best-effort, called by the refiller under the
+// maintenance admission slot fetchAndStage already holds, so eligibleLocked has
+// current metadata for newly-staged units). The refresh half is load-bearing for the
+// visibility gate (PB-38b): the leaf-scoped refill that stages a pinned hidden leaf's
+// units lands here, so the very staging event that puts hidden units into the SHARED
+// ready pool also restores a truthful snapshot for the any-leaf requesters that must
+// not receive them. (The pre-fix early-return on ANY existing entry was one of the
+// three dead ends the PB-16 closeouts enumerated: it kept a flipped leaf cached as
+// PUBLIC forever.) On a read error the prior snapshot is kept: the eligibleLocked
+// gate fail-closes on its staleness, so serving stale here can not leak.
 func (c *dispatchCache) warmLeaf(ctx context.Context, id types.ID) {
-	if c.peekLeaf(id) != nil {
+	if _, fresh := c.peekLeafFresh(id); fresh {
 		return
 	}
 	lf, err := c.deps.leafRepo.GetByID(ctx, id)
@@ -1832,18 +1907,36 @@ func (c *dispatchCache) warmLeaf(ctx context.Context, id types.ID) {
 		c.logger.Warn("dispatch cache: failed to warm leaf metadata", "leaf_id", id, "error", err)
 		return
 	}
+	if lf == nil {
+		return
+	}
 	c.leafMu.Lock()
 	c.leafCache[id] = &cachedLeaf{leaf: lf, fetchedAt: c.now()}
 	c.leafMu.Unlock()
 }
 
-// InvalidateLeaf drops a cached leaf snapshot so the next getLeaf re-reads it
-// immediately. Called when a leaf's artifact version is published/rolled back (or its
-// config changes) so the change reaches assignments at once on THIS replica; other
-// replicas converge within leafSnapshotTTL. Safe from any goroutine.
+// InvalidateLeaf marks a cached leaf snapshot STALE so it is refreshed before it is
+// trusted again: the next getLeaf re-reads it immediately, eligibleLocked stops
+// treating it as PUBLIC for un-pinned requesters (peekLeafFresh reads it as aged
+// out), and the next refresh (getLeaf on the build path, warmLeaf at staging, or the
+// refiller tick's refreshStaleLeafSnapshots) swaps in fresh truth. Called after every
+// leaf mutation — visibility/config update, lifecycle transition, artifact version
+// publish/rollback, delete — so the change reaches dispatch at once on THIS replica;
+// other replicas converge within leafSnapshotTTL (their eligibleLocked gate fail-
+// closes past the TTL, so a missed event bounds exposure rather than extending it).
+//
+// The entry is marked stale rather than DELETED deliberately: deleting it would send
+// every requester — including the pinned volunteers PB-16 exists to serve — through
+// rejectLeafNotCached with no re-warm path while the leaf's units sit staged, i.e. a
+// fresh starvation. Marking it stale keeps the capability/validation metadata
+// available (the same tolerance the TTL already grants) while withdrawing only the
+// visibility trust. The entry is REPLACED, not mutated: cachedLeaf values are
+// immutable once published, since readers hold them outside leafMu.
 func (c *dispatchCache) InvalidateLeaf(id types.ID) {
 	c.leafMu.Lock()
-	delete(c.leafCache, id)
+	if cl := c.leafCache[id]; cl != nil {
+		c.leafCache[id] = &cachedLeaf{leaf: cl.leaf} // zero fetchedAt = maximally stale
+	}
 	c.leafMu.Unlock()
 }
 
@@ -2190,6 +2283,15 @@ func (c *dispatchCache) runRefiller(ctx context.Context, tick time.Duration) {
 			// Service any pending leaf-scoped requests on the tick too, so a starved
 			// leaf is unblocked even if its signal was coalesced away.
 			c.leafRefillOnce(ctx)
+			// Keep the leaf snapshots of STAGED candidates fresh (PB-38b): the
+			// visibility gate fail-closes on an over-TTL/invalidated snapshot for
+			// un-pinned requesters, so without this refresh a staged PUBLIC leaf
+			// whose snapshot aged out (or was invalidated by a config update, or a
+			// leaf flipped BACK to PUBLIC while cached hidden) would stay refused to
+			// any-leaf volunteers until a hand-out happened to refresh it — which the
+			// refusal itself prevents. One bounded DB read per stale leaf per TTL,
+			// off the hot path, under the maintenance admission budget.
+			c.refreshStaleLeafSnapshots(ctx)
 			if c.readyLen() < c.cfg.lowWatermark {
 				consecutiveLowTicks++
 				if consecutiveLowTicks%lowTickLogEvery == 1 {
@@ -2271,6 +2373,91 @@ func (c *dispatchCache) leafRefillOnce(ctx context.Context) {
 		return
 	}
 	c.fetchAndStage(ctx, want, excluded, leafIDs)
+}
+
+// refreshStaleLeafSnapshots re-reads, from Postgres, the leaf snapshot of every leaf
+// that currently has STAGED candidates and whose snapshot is over-TTL or invalidated
+// (PB-38b). It is the off-hot-path refresh arm of eligibleLocked's fail-safe
+// visibility gate: the gate refuses to treat a stale snapshot as PUBLIC for an
+// un-pinned requester, and this — running every refiller tick — is what restores
+// fresh truth so a genuinely-PUBLIC leaf's any-leaf dispatch resumes within ~one tick
+// instead of degrading. It equally serves the flip-BACK direction (a leaf cached
+// hidden and then made PUBLIC would otherwise stay refused forever, because the
+// refusal prevents the very hand-outs whose getLeaf would refresh it).
+//
+// Cost is self-limiting: a refresh stamps fetchedAt, so each staged leaf costs at
+// most one bounded read per leafSnapshotTTL, serialized on the single refiller
+// goroutine under the maintenance admission budget. Under admission pressure it skips
+// the whole pass — the gate stays fail-safe on the stale snapshots in the meantime.
+//
+// A leaf the DB no longer has (deleted) has its snapshot dropped and its staged
+// candidates evicted: its units are gone with it, and dropping them stops this pass
+// from re-probing the id every tick.
+func (c *dispatchCache) refreshStaleLeafSnapshots(ctx context.Context) {
+	c.mu.Lock()
+	staged := make(map[types.ID]struct{})
+	for i := range c.ready {
+		staged[c.ready[i].unit.LeafID] = struct{}{}
+	}
+	c.mu.Unlock()
+	if len(staged) == 0 {
+		return
+	}
+	var stale []types.ID
+	c.leafMu.Lock()
+	for id := range staged {
+		cl := c.leafCache[id]
+		if cl == nil || c.now().Sub(cl.fetchedAt) >= c.cfg.leafSnapshotTTL {
+			stale = append(stale, id)
+		}
+	}
+	c.leafMu.Unlock()
+	if len(stale) == 0 {
+		return
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
+	defer cancel()
+	release, ok := c.acquireMaintenance(dbCtx)
+	if !ok {
+		return // admission/ctx pressure: keep the stale snapshots, retry next tick
+	}
+	defer release()
+	for _, id := range stale {
+		lf, err := c.deps.leafRepo.GetByID(dbCtx, id)
+		if err != nil && !isNotFound(err) {
+			c.logger.Warn("dispatch cache: stale leaf snapshot refresh failed; keeping prior snapshot",
+				"leaf_id", id, "error", err)
+			if dbCtx.Err() != nil {
+				return // budget exhausted: one WARN, not one per remaining leaf (PB-25 discipline)
+			}
+			continue
+		}
+		if err != nil || lf == nil {
+			// Leaf gone: drop the snapshot and evict its staged candidates.
+			c.leafMu.Lock()
+			delete(c.leafCache, id)
+			c.leafMu.Unlock()
+			c.dropStagedCandidatesForLeaf(id)
+			continue
+		}
+		c.leafMu.Lock()
+		c.leafCache[id] = &cachedLeaf{leaf: lf, fetchedAt: c.now()}
+		c.leafMu.Unlock()
+	}
+}
+
+// dropStagedCandidatesForLeaf removes every ready-pool candidate belonging to leafID
+// (used when the snapshot refresh finds the leaf deleted — its units are gone too).
+func (c *dispatchCache) dropStagedCandidatesForLeaf(leafID types.ID) {
+	c.mu.Lock()
+	kept := c.ready[:0]
+	for i := range c.ready {
+		if c.ready[i].unit.LeafID != leafID {
+			kept = append(kept, c.ready[i])
+		}
+	}
+	c.ready = kept
+	c.mu.Unlock()
 }
 
 // fetchAndStage runs one bounded FindDispatchableBatch (optionally leaf-scoped) and

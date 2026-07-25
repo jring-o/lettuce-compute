@@ -131,6 +131,11 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	}
 	// HTTP handlers.
 	leafHandler := leaf.NewLeafHandler(leafRepo, pool, logger)
+	// Mirror the production router wiring (PB-16 / PB-38b): every leaf mutation
+	// invalidates the dispatch cache's leaf snapshot through the late-bound ref,
+	// which StartDispatchCache binds below once the cache exists.
+	dispatchRef := server.NewDispatchCacheRef()
+	leafHandler.SetDispatchInvalidator(dispatchRef)
 	headHandler := leaf.NewHeadHandler(headCfg, pool, logger)
 	patternRouter := generate.NewRouter(paramsweep.Generate, mapreduce.Generate, montecarlo.Generate, custom.Generate, logger)
 	wuHandler := workunit.NewWorkUnitHandler(wuRepo, batchRepo, leafRepo, patternRouter.Generate, generate.NewPgxBatchSink(pool, logger), logger)
@@ -203,6 +208,7 @@ func setupHeadsLeafsServerOpts(t *testing.T, withCache bool, dispatchCfg server.
 	defer grpcCleanup()
 	volunteerSvc := server.NewVolunteerService(pool, "0.9.0.1-heads-leafs", startTime, volunteerRepo, wuRepo, leafRepo, assignRepo, resultRepo, batchRepo, checkpointRepo, validationEngine, logger, transition.TrustPolicy{})
 	server.SetHeadConfig(volunteerSvc, headCfg.Name, headCfg.Description, headCfg.URL, map[string]int32{"leaf-a": 50, "leaf-b": 30, "leaf-c": 20}, 10, dispatchCfg)
+	server.BindDispatchCacheRef(volunteerSvc, dispatchRef)
 
 	// Optionally start the Layer-2 in-process dispatch cache so RequestWorkUnit serves
 	// reservations from memory (hot path off Postgres) and the async flusher/refiller/

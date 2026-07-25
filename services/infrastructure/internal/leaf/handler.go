@@ -19,6 +19,9 @@ type LeafHandler struct {
 	repo   Repository
 	pool   *pgxpool.Pool
 	logger *slog.Logger
+	// dispatchInvalidator lets every leaf mutation reach the in-process dispatch
+	// cache (PB-16 / PB-38b); optional, nil = no-op.
+	dispatchInvalidator DispatchInvalidator
 }
 
 // NewLeafHandler creates a new LeafHandler.
@@ -27,6 +30,34 @@ func NewLeafHandler(repo Repository, pool *pgxpool.Pool, logger *slog.Logger) *L
 		repo:   repo,
 		pool:   pool,
 		logger: logger,
+	}
+}
+
+// DispatchInvalidator lets leaf mutations reach the in-process dispatch cache: the
+// cache holds a per-leaf snapshot (visibility, state, execution/validation config)
+// that its dispatch decisions read, and nothing else tells it the leaf changed. A
+// visibility flip that does not invalidate is how UNLISTED units were handed to
+// volunteers that never pinned the leaf (PB-38b / the PB-16 closeout-#2 leak).
+// Implemented by the server package's dispatch cache ref; a no-op when unwired.
+type DispatchInvalidator interface {
+	// InvalidateLeaf marks the leaf's cached dispatch snapshot stale so it is
+	// re-read from the database before it is trusted again.
+	InvalidateLeaf(id types.ID)
+}
+
+// SetDispatchInvalidator wires the dispatch cache invalidation hook. Optional so
+// existing constructor call sites are unchanged (mirrors the work-unit handler's
+// requeue hook, PB-9).
+func (h *LeafHandler) SetDispatchInvalidator(inv DispatchInvalidator) {
+	h.dispatchInvalidator = inv
+}
+
+// invalidateDispatch forwards to the wired invalidator, if any. Called after every
+// SUCCESSFUL leaf mutation — update (visibility/config), lifecycle transition,
+// artifact version activation, delete — never on a refused one.
+func (h *LeafHandler) invalidateDispatch(id types.ID) {
+	if h.dispatchInvalidator != nil {
+		h.dispatchInvalidator.InvalidateLeaf(id)
 	}
 }
 
@@ -568,6 +599,10 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The dispatch cache's snapshot of this leaf (visibility included) is now behind
+	// the database; stop trusting it before answering (PB-16 / PB-38b).
+	h.invalidateDispatch(id)
+
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -601,6 +636,8 @@ func (h *LeafHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}
+
+	h.invalidateDispatch(id)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -652,6 +689,10 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}
+
+	// State is dispatch-relevant (a pause must stop hand-outs; a configure may edit
+	// config): drop the dispatch cache's trust in its snapshot (PB-16 / PB-38b).
+	h.invalidateDispatch(id)
 
 	// On going live, surface the work-unit deadline this leaf's units will carry
 	// (otherwise invisible to operators) and warn if it is too short for the work.

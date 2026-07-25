@@ -157,8 +157,10 @@ func TestPB16_LeafFlippedPublicToUnlistedAfterWarm_PinnedVolunteerReceivesWork(t
 		t.Fatalf("setup: flushed RESERVED copy volunteer = %q, want %s", reserved, warmVolID)
 	}
 
-	// Phase 2 — the ordinary operator flow: publish, then unlist. The head's leaf-update
-	// path does not touch the dispatch cache, so its snapshot still reads PUBLIC.
+	// Phase 2 — the ordinary operator flow: publish, then unlist. (Historically the
+	// leaf-update path did not touch the dispatch cache, which left the snapshot
+	// reading PUBLIC — the starvation under test here; the update path now
+	// invalidates the snapshot, and the pinned staging below must work either way.)
 	unlisted := leaf.VisibilityUnlisted
 	resp := httpReq(t, "PUT", env.httpURL+"/api/v1/leafs/"+lf.ID.String(),
 		leaf.UpdateLeafRequest{Visibility: &unlisted})
@@ -178,11 +180,13 @@ func TestPB16_LeafFlippedPublicToUnlistedAfterWarm_PinnedVolunteerReceivesWork(t
 	}
 
 	// The ready pool must be EMPTY before the pinned poll, or this test proves nothing:
-	// a non-empty pool opens the refill gate on its own and masks the defect. An any-leaf
-	// probe is the sharp instrument here — the cache's stale snapshot still says PUBLIC,
-	// so it WOULD be handed these units if any were staged (the accepted PB-38b window).
-	// Getting nothing therefore means nothing is staged: the global watermark refill,
-	// which reads the DB rather than the snapshot, correctly stages no hidden leaf.
+	// a non-empty pool opens the refill gate on its own and masks the defect. The
+	// any-leaf probe asserts that emptiness end to end. (On the pre-fix head the
+	// probe was sharper still — the stale snapshot said PUBLIC, so staged units WOULD
+	// have been handed to it, which is the leak the flip now invalidates against; see
+	// pb16_stale_snapshot_leak_e2e_test.go for that side. Pool emptiness itself is
+	// carried by the PB-38 watermark gate, which reads the DB and stages no hidden
+	// leaf.)
 	probeKey := genVolunteerKey(t)
 	probeVolID := registerHLVolunteer(t, env, ctx, probeKey, "pb16-flip-probe-vol")
 	for i := 0; i < 5; i++ {

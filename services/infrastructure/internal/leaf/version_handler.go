@@ -100,6 +100,10 @@ func (h *LeafHandler) HandlePublishVersion(w http.ResponseWriter, r *http.Reques
 			apierror.WriteError(w, apierror.FromError(err))
 			return
 		}
+		// Activation denormalized this snapshot's execution_config onto the leaf: the
+		// dispatch cache's leaf snapshot is now behind the database (this was
+		// InvalidateLeaf's documented purpose all along — TODO #38).
+		h.invalidateDispatch(leafID)
 	}
 	l.Info("artifact version published", "leaf_id", leafID, "version_id", v.ID, "label", v.VersionLabel, "activated", activate)
 	writeJSON(w, http.StatusCreated, v)
@@ -150,6 +154,9 @@ func (h *LeafHandler) HandleActivateVersion(w http.ResponseWriter, r *http.Reque
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}
+	// Promote/rollback denormalizes the activated version's execution_config onto the
+	// leaf: stop trusting the dispatch cache's snapshot (TODO #38 / PB-16).
+	h.invalidateDispatch(leafID)
 	v, err := av.GetVersionByID(r.Context(), versionID)
 	if err != nil {
 		apierror.WriteError(w, apierror.FromError(err))
