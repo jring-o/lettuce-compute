@@ -21,12 +21,31 @@ import (
 // between them: gRPC RequestWorkUnit serves only from the in-process ready pool, the
 // global watermark refill stages PUBLIC leafs only (the PB-38 visibility gate), and
 // HandOut's on-demand leaf-scoped refill — the one path that stages a pinned
-// non-PUBLIC leaf — was gated on the ready pool being NON-EMPTY. On a head whose only
-// ACTIVE leafs are UNLISTED/PRIVATE the pool is permanently empty, so that gate never
-// opened and the pinned volunteer polled forever against a pool nothing would ever
-// fill. A co-resident PUBLIC leaf with queued work makes the pool non-empty and hides
-// the defect entirely, which is why every test written for the fix wave passed: none
-// of them ran a head with NO public backlog. These tests all do.
+// non-PUBLIC leaf — was suppressed by a PREDICTIVE GATE that tried to decide when the
+// global refill made it redundant. A co-resident PUBLIC leaf with queued work fills the
+// pool and hides the whole defect, which is why every test written for the fix wave
+// passed: none of them ran a head with NO public backlog. These tests all do.
+//
+// Two such gates shipped and both starved a pinned volunteer indefinitely:
+//
+//   - `readyNonEmpty` — skip the leaf-scoped refill while the ready pool is empty. On a
+//     head whose only ACTIVE leafs are non-PUBLIC the pool is empty forever, so the
+//     refill never fired. This is the filed shape, covered below by the "born hidden"
+//     tests (a leaf that is non-PUBLIC from the start, never warmed in the cache).
+//   - a coverage check — skip when every named leaf is WARMED in the leaf cache and
+//     PUBLIC. It reads `peekLeaf`, and nothing in the head ever invalidates that
+//     snapshot: `InvalidateLeaf` has no production caller, `warmLeaf` will not refresh
+//     an entry that already exists, and the only refresher (`getLeaf`'s
+//     leafSnapshotTTL) runs solely while building an ACCEPTED hand-out — the one thing
+//     the starvation prevents. A leaf warmed while PUBLIC and later set UNLISTED read
+//     as "covered" permanently. This is the "flipped after warm" shape, covered below.
+//
+// So the predicate is now unconditional: an empty-handed pinned poll ALWAYS queues the
+// leaf-scoped refill. The economy is carried by machinery that predicts nothing —
+// per-leaf coalescing in requestLeafRefill, serialization by the single refiller, and
+// the maintenance admission budget — which live measurement showed is nowhere near
+// binding (~2 000 hammered polls pinning nonexistent leaf ids produced 10 leaf-scoped
+// refills, no admission saturation, no control-dispatch latency regression).
 
 // unlistedOnlyHeadRepo fakes the work-unit repo of a head whose ONLY ACTIVE leaf is
 // UNLISTED (or PRIVATE) and holds queued work — no PUBLIC leaf, no PUBLIC backlog. Its
@@ -88,14 +107,15 @@ func unlistedLeaf(id types.ID, vis leaf.LeafVisibility) *leaf.Leaf {
 }
 
 // TestDispatchCache_NonPublicOnlyHead_PinnedRequesterIsStagedAndServed is the filed
-// PB-16 shape end to end through the cache's staging path: the ONLY leaf on the head is
-// non-PUBLIC and has queued units, there is NO public backlog to make the ready pool
-// non-empty, and a volunteer pins the leaf by id. It must be staged and served.
+// PB-16 shape ("born hidden") end to end through the cache's staging path: the ONLY leaf
+// on the head is non-PUBLIC and has queued units, there is NO public backlog to make the
+// ready pool non-empty, the cache has never warmed the leaf (nothing ever staged it), and
+// a volunteer pins it by id. It must be staged and served.
 //
-// Pre-fix this fails at the "pinned requester must now be served" assert: the first
-// hand-out requested no leaf-scoped refill (the readyNonEmpty gate), so leafRefillOnce
-// had nothing to service, the pool stayed empty, and every subsequent poll returned
-// nothing — the ~9 minutes of QUEUED units the live repro recorded.
+// Against the original `readyNonEmpty` gate this fails at the "no work was staged"
+// assert: the first hand-out requested no leaf-scoped refill, so leafRefillOnce had
+// nothing to service, the pool stayed empty, and every subsequent poll returned nothing —
+// the ~9 minutes of QUEUED units the live repro recorded.
 func TestDispatchCache_NonPublicOnlyHead_PinnedRequesterIsStagedAndServed(t *testing.T) {
 	for _, vis := range []leaf.LeafVisibility{leaf.VisibilityUnlisted, leaf.VisibilityPrivate} {
 		t.Run(string(vis), func(t *testing.T) {
@@ -185,6 +205,89 @@ func TestDispatchCache_UnlistedOnlyHead_LiveRefillerServesPinnedVolunteer(t *tes
 	t.Fatal("a volunteer pinning the head's only (UNLISTED) leaf polled for 5s and was never served: nothing stages a pinned non-PUBLIC leaf while the ready pool is empty (PB-16)")
 }
 
+// TestDispatchCache_LeafFlippedPublicToHidden_PinnedRequesterIsStagedAndServed is the
+// "flipped after warm" shape — an ordinary operator flow (publish a leaf, then decide it
+// should be unlisted) and the one that broke the first re-fix.
+//
+// The leaf was PUBLIC when its earlier units were dispatched, so the dispatch cache holds
+// a snapshot saying PUBLIC. The operator then flips it to UNLISTED/PRIVATE and generates
+// fresh units. Nothing in the head drops or refreshes that snapshot — InvalidateLeaf has
+// no production caller, warmLeaf will not refresh an existing entry, and getLeaf's TTL is
+// consulted only while building an ACCEPTED hand-out, which cannot happen while the leaf
+// is starved. So the cache keeps answering PUBLIC indefinitely while the DB says hidden.
+//
+// Against the coverage gate this was permanent starvation: the leaf read as "covered by
+// the watermark refill", the leaf-scoped refill was never requested, and the global refill
+// stages PUBLIC leafs only (per the DB, which says hidden) — 50 polls over 147 s produced
+// 0 hand-outs and 0 refills on a live head, curable only by a restart. With the gate gone
+// the pinned poll stages the leaf on the spot.
+//
+// Note what is deliberately NOT asserted here: that an any-leaf requester is refused. The
+// in-memory visibility gate also reads the stale PUBLIC snapshot, so for up to
+// leafSnapshotTTL after a flip it can still hand out the leaf's units — the already-filed
+// and accepted PB-38b window. That direction self-corrects (a hand-out is happening, so
+// getLeaf refreshes); the starvation direction never did, which is the asymmetry this
+// test exists for.
+func TestDispatchCache_LeafFlippedPublicToHidden_PinnedRequesterIsStagedAndServed(t *testing.T) {
+	for _, vis := range []leaf.LeafVisibility{leaf.VisibilityUnlisted, leaf.VisibilityPrivate} {
+		t.Run(string(vis), func(t *testing.T) {
+			ctx := context.Background()
+			leafID := types.NewID()
+			units := []types.ID{types.NewID(), types.NewID(), types.NewID()}
+
+			// The DB truth AFTER the flip: the leaf is hidden, so the dispatchable query
+			// returns its units only for a LEAF-SCOPED refill that names it.
+			wuRepo := unlistedOnlyHeadRepo(leafID, units)
+			leafRepo := &fakeLeafRepo{}
+			c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
+
+			// The cache's snapshot is the one warmed BEFORE the flip, while the leaf was
+			// still PUBLIC and its earlier units were being dispatched.
+			pub := nativeLeaf(leafID, 1, false, 0)
+			pub.Visibility = leaf.VisibilityPublic
+			c.warm(pub, leafRepo)
+			// ...and the repo (DB truth) now diverges from it: hidden. Nothing reconciles
+			// the two, which is exactly the live head's state.
+			seedLeafRepoOnly(leafRepo, unlistedLeaf(leafID, vis))
+			if cached := c.peekLeaf(leafID); cached == nil || cached.Visibility != leaf.VisibilityPublic {
+				t.Fatalf("test setup: the cached snapshot must still read PUBLIC (the stale state under test), got %v", cached)
+			}
+
+			// The head's own watermark refill honours the DB, not the snapshot: it stages
+			// nothing for a hidden leaf, so the shared ready pool is empty.
+			c.refillOnce(ctx)
+			if got := c.readyLen(); got != 0 {
+				t.Fatalf("the global refill staged %d unit(s) for a leaf the DB says is %s; the pool must be empty (PB-38)", got, vis)
+			}
+
+			// First poll from the pinned volunteer: nothing is staged yet, so it gets
+			// nothing — but it must leave an on-demand leaf-scoped refill request behind,
+			// stale PUBLIC snapshot notwithstanding.
+			pinVol := types.NewID()
+			pinOpts := capableOpts(pinVol, 0)
+			pinOpts.LeafIDs = []types.ID{leafID}
+			if got, _ := c.HandOut(pinVol, pinOpts, 2); len(got) != 0 {
+				t.Fatalf("first poll cannot serve from an empty pool, got %d unit(s)", len(got))
+			}
+
+			c.leafRefillOnce(ctx)
+			if c.readyLen() == 0 {
+				t.Fatalf("no work was staged for a leaf flipped PUBLIC->%s after it was warmed: the hand-out never requested a leaf-scoped refill, so the pinned volunteer starves until the head is restarted (PB-16)", vis)
+			}
+
+			got, _ := c.HandOut(pinVol, pinOpts, 2)
+			if len(got) == 0 {
+				t.Fatalf("pinned requester must be served the flipped leaf's staged work, got nothing (PB-16)")
+			}
+			for _, r := range got {
+				if r.unit.LeafID != leafID {
+					t.Fatalf("served a unit of leaf %s, want the pinned leaf %s", r.unit.LeafID, leafID)
+				}
+			}
+		})
+	}
+}
+
 // TestHandOut_EmptyPool_PinnedNonPublicLeaf_RequestsLeafRefill pins the changed
 // predicate directly: an empty ready pool no longer suppresses the on-demand
 // leaf-scoped refill for a leaf the watermark refill cannot stage.
@@ -208,10 +311,9 @@ func TestHandOut_EmptyPool_PinnedNonPublicLeaf_RequestsLeafRefill(t *testing.T) 
 }
 
 // TestHandOut_EmptyPool_PinnedUnknownLeaf_RequestsLeafRefill covers the cold cache: a
-// leaf the cache has never warmed has unknown visibility, and the fix treats unknown as
-// NOT covered by the watermark refill. That is the state a non-PUBLIC-only head is in
-// at boot — nothing has staged the leaf, so nothing has warmed it — and assuming
-// coverage there is the starvation itself.
+// leaf the cache has never warmed. That is the state a non-PUBLIC-only head is in at
+// boot — nothing has staged the leaf, so nothing has warmed it — and it is also every
+// pinned poll for a leaf id that does not exist at all.
 func TestHandOut_EmptyPool_PinnedUnknownLeaf_RequestsLeafRefill(t *testing.T) {
 	c := newTestCache(&fakeWURepo{}, &fakeLeafRepo{}, &fakeAssignRepo{})
 
@@ -228,12 +330,18 @@ func TestHandOut_EmptyPool_PinnedUnknownLeaf_RequestsLeafRefill(t *testing.T) {
 	}
 }
 
-// TestHandOut_EmptyPool_PinnedPublicLeaf_SkipsRedundantLeafRefill pins the refill
-// economy the old gate was there for, in the one case where it is provably valid: the
-// pool is empty and the pinned leaf is a warmed PUBLIC one, so the watermark refill
-// this very hand-out signals (drained) will stage it. No second, leaf-scoped query is
-// issued for it.
-func TestHandOut_EmptyPool_PinnedPublicLeaf_SkipsRedundantLeafRefill(t *testing.T) {
+// TestHandOut_EmptyPool_PinnedWarmedPublicLeaf_StillRequestsLeafRefill is the direct,
+// predicate-level statement of the rule that replaced the coverage gate, and it is the
+// smallest expression of the "flipped after warm" break: a leaf the cache has warmed as
+// PUBLIC gets the leaf-scoped refill anyway.
+//
+// It REPLACES TestHandOut_EmptyPool_PinnedPublicLeaf_SkipsRedundantLeafRefill, which
+// asserted the opposite — that a warmed PUBLIC leaf on an empty pool is covered by the
+// watermark refill and needs no leaf-scoped query. That is true only if the snapshot is
+// accurate, and the cache has no invalidation path that would make it so: "warmed as
+// PUBLIC" carries no information about the leaf's CURRENT visibility, so the skip it
+// pinned is precisely the permanent starvation R2 reproduced on a live head.
+func TestHandOut_EmptyPool_PinnedWarmedPublicLeaf_StillRequestsLeafRefill(t *testing.T) {
 	leafRepo := &fakeLeafRepo{}
 	c := newTestCache(&fakeWURepo{}, leafRepo, &fakeAssignRepo{})
 
@@ -248,7 +356,40 @@ func TestHandOut_EmptyPool_PinnedPublicLeaf_SkipsRedundantLeafRefill(t *testing.
 	if got, _ := c.HandOut(vol, opts, 1); len(got) != 0 {
 		t.Fatalf("empty pool cannot serve, got %d unit(s)", len(got))
 	}
+	pending := c.drainLeafRefills()
+	if len(pending) != 1 || pending[0] != leafID {
+		t.Fatalf("an empty-handed pinned poll must always queue a leaf-scoped refill — a cached PUBLIC snapshot proves nothing about the leaf's current visibility (PB-16) — got %v", pending)
+	}
+}
+
+// TestHandOut_RepeatedEmptyPinnedPolls_CoalesceIntoOneLeafRefill pins the economy that
+// actually carries the unconditional refill: requestLeafRefill is a SET keyed by leaf id,
+// so a starved volunteer polling in a tight loop — or many volunteers pinning the same
+// leaf — costs the refiller ONE query per drain, not one per poll. That, plus the single
+// refiller goroutine and the maintenance admission budget, is the whole cost model; no
+// prediction about the watermark refill is needed or wanted.
+func TestHandOut_RepeatedEmptyPinnedPolls_CoalesceIntoOneLeafRefill(t *testing.T) {
+	leafRepo := &fakeLeafRepo{}
+	c := newTestCache(&fakeWURepo{}, leafRepo, &fakeAssignRepo{})
+
+	leafID := types.NewID()
+	c.warm(unlistedLeaf(leafID, leaf.VisibilityUnlisted), leafRepo)
+
+	// Twenty polls from twenty distinct volunteers, all pinning the same leaf, all
+	// handed nothing (the pool is empty and nothing stages a hidden leaf but this).
+	for i := 0; i < 20; i++ {
+		vol := types.NewID()
+		opts := capableOpts(vol, 0)
+		opts.LeafIDs = []types.ID{leafID}
+		if got, _ := c.HandOut(vol, opts, 1); len(got) != 0 {
+			t.Fatalf("empty pool cannot serve, got %d unit(s)", len(got))
+		}
+	}
+	pending := c.drainLeafRefills()
+	if len(pending) != 1 || pending[0] != leafID {
+		t.Fatalf("20 empty-handed pinned polls for one leaf must coalesce into a single pending refill, got %v", pending)
+	}
 	if pending := c.drainLeafRefills(); len(pending) != 0 {
-		t.Fatalf("a warmed PUBLIC leaf on an empty pool is covered by the watermark refill; no leaf-scoped refill should be queued, got %v", pending)
+		t.Fatalf("the drain must clear the pending set, got %v", pending)
 	}
 }
