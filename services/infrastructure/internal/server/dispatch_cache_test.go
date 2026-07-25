@@ -536,8 +536,12 @@ func TestHandOut_MinSendInterval(t *testing.T) {
 	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 0 {
 		t.Fatalf("hand-out at +29s = %d, want 0 (still throttled)", len(r))
 	}
-	// At the interval boundary: volA may receive work again.
+	// At the interval boundary: volA may receive work again. The 30s jump also ages
+	// the leaf snapshot past leafSnapshotTTL, which the visibility gate fail-closes
+	// on for un-pinned requesters (PB-38b); model the refiller tick's refresh that a
+	// live head runs so only the send interval is under test here.
 	now = base.Add(30 * time.Second)
+	c.refreshStaleLeafSnapshots(context.Background())
 	if r, _ := c.HandOut(volA, capableOpts(volA, 0), 1); len(r) != 1 {
 		t.Fatalf("hand-out at +30s = %d, want 1 (interval elapsed)", len(r))
 	}

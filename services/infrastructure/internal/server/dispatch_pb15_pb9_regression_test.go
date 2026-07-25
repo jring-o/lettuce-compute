@@ -175,8 +175,12 @@ func TestHandOut_VoidBench_ExpiresInsteadOfStranding(t *testing.T) {
 
 	// Two minutes later — far past the void-bench throttle, with the candidate
 	// STILL staged (never re-staged) — the volunteer must be offered the unit
-	// again; the SQL landing remains the authoritative gate.
+	// again; the SQL landing remains the authoritative gate. The jump also ages the
+	// leaf snapshot past leafSnapshotTTL, which the visibility gate fail-closes on
+	// for un-pinned requesters (PB-38b); model the refiller tick's refresh a live
+	// head runs so only the bench expiry is under test here.
 	now = base.Add(2 * time.Minute)
+	c.refreshStaleLeafSnapshots(context.Background())
 	if res, _ := c.HandOut(vol, capableOpts(vol, 0), 1); len(res) != 1 {
 		t.Fatal("volunteer still benched on the staged candidate long after the bench window: the stale in-memory bench out-lives the SQL cooldown and permanently strands a one-volunteer pool (PB-9)")
 	}

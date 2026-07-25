@@ -101,6 +101,13 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// same way.
 	leafRepo := leaf.NewPgxRepository(deps.Pool)
 	leafHandler := leaf.NewLeafHandler(leafRepo, deps.Pool, deps.Logger)
+	// Every leaf mutation (visibility/config update, lifecycle transition, artifact
+	// version activation, delete) invalidates the dispatch cache's leaf snapshot so
+	// dispatch stops trusting stale visibility/config at once (PB-16 / PB-38b);
+	// nil-safe no-op until/unless the dispatch cache is started.
+	if deps.DispatchCacheRef != nil {
+		leafHandler.SetDispatchInvalidator(deps.DispatchCacheRef)
+	}
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}", leafViewer(leafHandler.HandleGet))
 	mux.HandleFunc("GET /api/v1/leafs", leafViewer(leafHandler.HandleList))
 
