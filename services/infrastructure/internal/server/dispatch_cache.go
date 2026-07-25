@@ -817,39 +817,6 @@ func (c *dispatchCache) requestLeafRefill(leafIDs []types.ID) {
 	}
 }
 
-// watermarkRefillCovers reports whether the GLOBAL watermark refill will, on its own,
-// stage work for EVERY named leaf. It is the condition under which HandOut may skip
-// asking for an on-demand leaf-scoped refill for a requester it handed nothing — the
-// refill economy the old `readyNonEmpty` gate was standing in for, stated directly.
-//
-// True only when every named leaf is WARMED and PUBLIC, because the dispatchable query
-// the watermark refill runs stages PUBLIC leafs only (PB-38): a non-PUBLIC leaf reaches
-// the ready pool exclusively through a leaf-scoped (pin-by-id) refill, so no watermark
-// state ever covers it.
-//
-// A leaf the cache has never warmed counts as NOT covered. That fail-safe direction is
-// deliberate and is the PB-16 case: on a head whose only ACTIVE leafs are non-PUBLIC
-// nothing ever stages them, so nothing ever warms them either, and assuming coverage
-// there is exactly the starvation. Being wrong the other way costs one redundant
-// leaf-scoped query, which warms the leaf and settles the question.
-//
-// Visibility is read the way eligibleLocked reads it — the two explicit hidden values
-// are what exclude, so a sparsely-built snapshot with a zero-value Visibility counts as
-// PUBLIC (the DB column is NOT NULL DEFAULT 'PUBLIC', so a warmed production leaf is
-// never empty). Takes leafMu via peekLeaf and must NOT be called while holding mu.
-func (c *dispatchCache) watermarkRefillCovers(leafIDs []types.ID) bool {
-	for _, id := range leafIDs {
-		lf := c.peekLeaf(id)
-		if lf == nil {
-			return false
-		}
-		if lf.Visibility == leaf.VisibilityUnlisted || lf.Visibility == leaf.VisibilityPrivate {
-			return false
-		}
-	}
-	return true
-}
-
 // drainLeafRefills returns and clears the set of leafs awaiting an on-demand
 // leaf-scoped refill.
 func (c *dispatchCache) drainLeafRefills() []types.ID {
@@ -1052,7 +1019,6 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// so this forward-overlapping append never reallocates and Go's copy handles it.
 	c.ready = append(kept, c.ready[i:]...)
 	readyLen := len(c.ready)
-	readyNonEmpty := readyLen > 0
 	drained = readyLen < c.cfg.lowWatermark
 	// Stamp the per-MACHINE send clock ONLY when work was actually handed out, so a
 	// machine that got nothing (no eligible work) may retry immediately and the interval
@@ -1062,9 +1028,11 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	}
 	c.mu.Unlock()
 
-	// Leaf-filtered starvation: a requester filtered to specific leafs that got NOTHING
-	// needs those leafs staged on demand, because the global watermark refill will not
-	// necessarily do it for them. Two distinct shapes reach this point:
+	// Leaf-filtered starvation (PB-16): a requester that named specific leafs and was
+	// handed NOTHING always queues an on-demand, leaf-scoped refill for those leafs. This
+	// predicate is UNCONDITIONAL by design — no attempt is made to predict whether the
+	// global watermark refill would have staged them anyway. Two distinct shapes reach
+	// this point and both need the refill:
 	//
 	//   1. Blocker 2 — the ready pool still holds units, so the requester is starved by a
 	//      different leaf monopolizing the pool (the watermark refill never notices, since
@@ -1074,21 +1042,32 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	//      enter the ready pool through it, at any watermark; a leaf-scoped refill is the
 	//      ONLY way they are staged.
 	//
-	// The gate here used to be `readyNonEmpty` alone — a stand-in for "the watermark refill
-	// is already about to stage everything dispatchable, so a second leaf-scoped query
-	// would be duplicate work". That was refill economy, and it was exact while the global
-	// refill spanned every ACTIVE leaf. PB-38's visibility gate broke the equivalence, and
-	// PB-16 is the consequence: on a head whose only ACTIVE leafs are UNLISTED/PRIVATE the
-	// ready pool is permanently empty, so this gate held the leaf-scoped refill closed
-	// forever and a pinned volunteer starved indefinitely (any co-resident PUBLIC leaf with
-	// queued work masks it completely, which is how it survived the fix wave). The economy
-	// is kept, but expressed as what it actually meant: skip only when the watermark refill
-	// demonstrably covers every named leaf (watermarkRefillCovers). An empty pool always
-	// signals that refill below (drained), so the skip stays safe.
+	// Two successive predictive gates have lived here and BOTH starved a pinned volunteer
+	// indefinitely, which is why there is no third. The first was `readyNonEmpty` — a
+	// stand-in for "the watermark refill is already about to stage everything dispatchable,
+	// so a second leaf-scoped query would be duplicate work". That was exact while the
+	// global refill spanned every ACTIVE leaf; PB-38's visibility gate broke the
+	// equivalence, and on a head whose only ACTIVE leafs are UNLISTED/PRIVATE the pool is
+	// permanently empty, so the gate stayed shut forever. The second was a coverage check
+	// that skipped the refill when every named leaf was warmed in the leaf cache AND
+	// PUBLIC. It read `peekLeaf`, and nothing in the head ever invalidates that snapshot:
+	// `warmLeaf` will not refresh an entry that already exists, and the only refresher
+	// (`getLeaf`'s leafSnapshotTTL) runs solely while building an ACCEPTED hand-out — the
+	// one thing the starvation prevents. A leaf warmed while PUBLIC and later set UNLISTED
+	// therefore read as "covered" permanently: 50 polls over 147 s produced zero hand-outs
+	// and zero refills on a live head, and only a restart (which drops the cache) cured it.
+	//
+	// The economy this gate was protecting is carried by machinery that does not have to
+	// predict anything: requestLeafRefill COALESCES repeat requests per leaf id, the single
+	// refiller goroutine SERIALIZES the resulting queries, and each one runs under the
+	// maintenance admission budget. Measured on a live head, that is nowhere near binding —
+	// ~2 000 hammered polls pinning nonexistent leaf ids produced 10 leaf-scoped refills,
+	// no admission saturation, and no regression in control dispatch latency. A redundant
+	// query is cheap; a starved volunteer is not.
 	//
 	// (BlockedLeafIDs alone are an exclusion, not a positive scope, so we only do this for
 	// an explicit LeafIDs filter.)
-	if len(results) == 0 && len(opts.LeafIDs) > 0 && (readyNonEmpty || !c.watermarkRefillCovers(opts.LeafIDs)) {
+	if len(results) == 0 && len(opts.LeafIDs) > 0 {
 		c.requestLeafRefill(opts.LeafIDs)
 	}
 
