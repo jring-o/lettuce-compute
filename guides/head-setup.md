@@ -146,19 +146,21 @@ docker compose down -v    # stop and wipe all data
 You'll need two things before you start:
 
 1. **A domain you control** (e.g. `your-domain.com`) — you'll create DNS records for it.
-2. **A Linux server** running Ubuntu 22.04+ — provisioned in Step 1.
+2. **A Linux server** running Ubuntu 24.04 LTS (or any 22.04+) — provisioned in Step 1.
 
 The whole process is ten steps and takes about 20 minutes (plus DNS propagation).
 
 ### Step 1 — Get a server
 
-**Recommended size:** 2 GB RAM / 1 vCPU or larger. The dashboard image is memory-hungry
-to build; on a 1 GB server you must build images one at a time (covered in Step 9).
+**Recommended size:** 2 GB RAM / 1 vCPU or larger. The images are memory-hungry to build:
+on a 2 GB server you should add a swapfile before building, and on a 1 GB server you must
+build images one at a time — both covered in Step 9.
 
 <details>
 <summary><strong>Option: DigitalOcean</strong> (click to expand walkthrough)</summary>
 
-1. Create a Droplet: **Ubuntu 22.04 (LTS) x64**, **Basic** plan, **2 GB / 1 CPU** or larger.
+1. Create a Droplet: **Ubuntu 24.04 (LTS) x64** (DigitalOcean no longer offers 22.04),
+   **Basic** plan, **2 GB / 1 CPU** or larger.
 2. Under **Authentication**, add your SSH key (so you can log in without a password).
 3. Create the droplet and note its **public IPv4 address** (shown on the droplet page).
 
@@ -167,8 +169,8 @@ to build; on a 1 GB server you must build images one at a time (covered in Step 
 <details>
 <summary><strong>Option: any other provider</strong> (Hetzner, AWS Lightsail, Vultr, Linode, …)</summary>
 
-Create an **Ubuntu 22.04** server with **≥ 2 GB RAM** and SSH access, and note its
-**public IPv4 address**. Everything below is provider-neutral.
+Create an **Ubuntu 24.04 LTS (or any 22.04+)** server with **≥ 2 GB RAM** and SSH access,
+and note its **public IPv4 address**. Everything below is provider-neutral.
 
 </details>
 
@@ -252,6 +254,23 @@ echo "registry password (save this): $REGPASS"
 docker run --rm caddy:2-alpine caddy hash-password --plaintext "$REGPASS"
 ```
 
+> **Important — escape the `$` signs in the hash before pasting it into `.env`.**
+> The hash always contains `$` characters (it looks like `$2a$14$...`), and Docker
+> Compose treats `$word` inside `.env` values as a variable reference — so part of your
+> hash is silently replaced with nothing. The symptom: every `docker compose` command
+> prints a warning like `The "2a" variable is not set`, the stack still starts, but
+> pushing container images fails with an authentication error much later. Escape every
+> `$` as `$$` when you paste the hash. If you already wrote the line with unescaped `$`,
+> this fixes it in place (run it exactly once):
+>
+> ```bash
+> sed -i '/^REGISTRY_PASS_HASH=/ s/\$/$$/g' .env
+> ```
+>
+> (If you test locally with podman-compose instead of Docker Compose, you will not see
+> this — podman-compose does not interpolate `.env` values this way. The escaping is
+> still required for the Docker Compose deploy described here.)
+
 Now edit `.env` (`nano .env`) and set every value:
 
 ```bash
@@ -287,7 +306,7 @@ REGISTRY_PASS_HASH=<the hash printed by caddy hash-password>
 | `LETTUCE_GRPC_PER_IP_STREAM_LIMIT` | *(optional)* Per-source-IP gRPC **stream** budget, **streams per minute** (default 600). The pre-decode flood backstop: enforced when a stream is opened, *before* the server reads or decodes the request body, and covering **every** method — including the in-flight work RPCs (`SubmitResult`, `SaveCheckpoint`, …) that are deliberately exempt from the request-rate limiters above. The default sits far above an honest volunteer's cadence; raise it together with `LETTUCE_GRPC_PER_IP_RATE_LIMIT` for NAT'ed fleets that share one source IP. |
 | `VIZ_ORIGIN` | The `viz.` subdomain, for visualization isolation. **Required in production** — it binds the viz-bundle route to this origin so author bundle code only runs in the sandboxed viz origin, never on your main app origin. It must be a **distinct host** from `PLATFORM_URL` and must **not share a cookie parent-domain** with it. If it is unset, empty, or resolves to the same origin as `PLATFORM_URL`, the dashboard **fails closed**: the visualization view does not render (it will not run author bundle code on the app origin). |
 | `VIZ_BUNDLE_ALLOWED_ORIGINS` | *(optional)* Comma-separated `scheme://host[:port]` origins the viz-bundle route may fetch tarballs from. Defaults to the `PLATFORM_URL` origin (where `/binaries/` is served), so you normally don't set it. Set it only if you host viz tarballs on additional origins (e.g. a CDN). |
-| `REGISTRY_USER` / `REGISTRY_PASS_HASH` | Credentials for pushing container images. The proxy needs the hash to start. |
+| `REGISTRY_USER` / `REGISTRY_PASS_HASH` | Credentials for pushing container images. The proxy needs the hash to start. **Every `$` in the hash must be escaped as `$$`** (see the note above the `.env` listing) or Docker Compose mangles it silently. |
 
 ### Step 7 — Set your domain in the Caddyfile
 
@@ -342,13 +361,25 @@ signer identity and every previously published attestation stops verifying.
 
 ### Step 9 — Start the stack
 
-On a 2 GB+ server, build and start everything at once:
+**On a 2 GB server, add swap before building.** `docker compose build` builds the
+infrastructure and dashboard images *in parallel*, and together they can exhaust 2 GB —
+the symptom is a build that stalls for tens of minutes with no output (cloud images
+usually ship with no swap). Three commands fix it permanently:
+
+```bash
+fallocate -l 3G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+free -h   # confirm the Swap line shows 3.0Gi
+```
+
+Then, on a 2 GB+ server, build and start everything at once:
 
 ```bash
 docker compose -f compose.production.yaml up -d --build
 ```
 
-On a 1 GB server, build images one at a time to avoid running out of memory:
+On a 1 GB server (or if you prefer not to add swap), build images one at a time to avoid
+running out of memory:
 
 ```bash
 docker compose -f compose.production.yaml build infrastructure
