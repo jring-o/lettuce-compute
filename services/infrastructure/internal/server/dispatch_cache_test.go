@@ -39,9 +39,9 @@ type fakeWURepo struct {
 	reserveCopyFn   func(wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error)
 	// countFn backs the reconcile.
 	countFn func() (map[types.ID]int, error)
-	// releaseFn backs ReleaseStaleBufferedCopies (the buffer reconcile); releaseCalls
+	// releaseFn backs ReleaseStaleHeldCopies (the held-copy reconcile); releaseCalls
 	// counts invocations so a test can assert it was (or was not) run.
-	releaseFn    func(vol types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error)
+	releaseFn    func(vol types.ID, held []types.ID, olderThan time.Time) ([]workunit.ReleasedCopy, error)
 	releaseCalls int
 	// dispatchFn backs FindDispatchableBatch AND ClaimDispatchableBatch (the refill);
 	// it observes the leaf scope.
@@ -165,7 +165,7 @@ func (f *fakeWURepo) CountActiveByHost(_ context.Context) (map[types.ID]int, err
 	return map[types.ID]int{}, nil
 }
 
-func (f *fakeWURepo) ReleaseStaleBufferedCopies(_ context.Context, vol types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error) {
+func (f *fakeWURepo) ReleaseStaleHeldCopies(_ context.Context, vol types.ID, held []types.ID, olderThan time.Time) ([]workunit.ReleasedCopy, error) {
 	f.mu.Lock()
 	f.releaseCalls++
 	fn := f.releaseFn
@@ -1784,12 +1784,12 @@ func TestReleaseInMemPurgesPending(t *testing.T) {
 	}
 }
 
-// TestReconcileBuffers_ReleasesUnheldBufferedReservations verifies the buffer
+// TestReconcileHeldCopies_ReleasesUnheldBufferedReservations verifies the held-copy
 // reconcile: a volunteer reports holding only a subset of the units the cache has
 // reserved for it, and the reconcile releases the dropped one (with the grace cutoff)
 // while leaving the held one — clearing the released unit's in-memory hold so it can
 // redispatch.
-func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
+func TestReconcileHeldCopies_ReleasesUnheldBufferedReservations(t *testing.T) {
 	wuRepo := &fakeWURepo{}
 	leafRepo := &fakeLeafRepo{}
 	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
@@ -1817,12 +1817,12 @@ func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
 	var gotVol types.ID
 	var gotHeld []types.ID
 	var gotCutoff time.Time
-	wuRepo.releaseFn = func(v types.ID, held []types.ID, olderThan time.Time) ([]types.ID, error) {
+	wuRepo.releaseFn = func(v types.ID, held []types.ID, olderThan time.Time) ([]workunit.ReleasedCopy, error) {
 		gotVol, gotHeld, gotCutoff = v, held, olderThan
-		return []types.ID{dropped}, nil
+		return []workunit.ReleasedCopy{{WorkUnitID: dropped}}, nil
 	}
 
-	c.reconcileBuffers(context.Background())
+	c.reconcileHeldCopies(context.Background())
 
 	if gotVol != vol {
 		t.Fatalf("release called for %v, want %v", gotVol, vol)
@@ -1846,11 +1846,11 @@ func TestReconcileBuffers_ReleasesUnheldBufferedReservations(t *testing.T) {
 	}
 }
 
-// TestReconcileBuffers_CutoffBoundedByReportTime verifies the reap cutoff is bounded by
-// the volunteer's last report time, not just now-grace. A full client that stopped
+// TestReconcileHeldCopies_CutoffBoundedByReportTime verifies the reap cutoff is bounded
+// by the volunteer's last report time, not just now-grace. A full client that stopped
 // requesting goes quiet; the batch that filled its buffer was created AFTER its last
 // report, so it must never be reaped even once it ages past the grace window.
-func TestReconcileBuffers_CutoffBoundedByReportTime(t *testing.T) {
+func TestReconcileHeldCopies_CutoffBoundedByReportTime(t *testing.T) {
 	wuRepo := &fakeWURepo{}
 	c := newTestCache(wuRepo, &fakeLeafRepo{}, &fakeAssignRepo{})
 
@@ -1863,11 +1863,11 @@ func TestReconcileBuffers_CutoffBoundedByReportTime(t *testing.T) {
 	c.now = func() time.Time { return base }
 
 	var gotCutoff time.Time
-	wuRepo.releaseFn = func(_ types.ID, _ []types.ID, olderThan time.Time) ([]types.ID, error) {
+	wuRepo.releaseFn = func(_ types.ID, _ []types.ID, olderThan time.Time) ([]workunit.ReleasedCopy, error) {
 		gotCutoff = olderThan
 		return nil, nil
 	}
-	c.reconcileBuffers(context.Background())
+	c.reconcileHeldCopies(context.Background())
 
 	want := base.Add(-70 * time.Second) // bounded by the report time, not now-grace (base-60s)
 	if !gotCutoff.Equal(want) {
@@ -1875,10 +1875,10 @@ func TestReconcileBuffers_CutoffBoundedByReportTime(t *testing.T) {
 	}
 }
 
-// TestReconcileBuffers_SkipsStaleReports verifies a volunteer whose last held-set
-// report is older than the freshness window is NOT reconciled (its buffered copies
-// ride the deadline instead), and its stale report is pruned.
-func TestReconcileBuffers_SkipsStaleReports(t *testing.T) {
+// TestReconcileHeldCopies_SkipsStaleReports verifies a volunteer whose last held-set
+// report is older than the freshness window is NOT reconciled (its copies ride the
+// deadline instead), and its stale report is pruned.
+func TestReconcileHeldCopies_SkipsStaleReports(t *testing.T) {
 	wuRepo := &fakeWURepo{}
 	c := newTestCache(wuRepo, &fakeLeafRepo{}, &fakeAssignRepo{})
 
@@ -1890,7 +1890,7 @@ func TestReconcileBuffers_SkipsStaleReports(t *testing.T) {
 	c.NoteVolunteerHeld(vol, vol, []types.ID{types.NewID()})
 	c.now = func() time.Time { return now.Add(heldReportFreshness + time.Second) }
 
-	c.reconcileBuffers(context.Background())
+	c.reconcileHeldCopies(context.Background())
 
 	if wuRepo.releaseCalls != 0 {
 		t.Fatalf("stale report must not trigger a DB release, got %d calls", wuRepo.releaseCalls)
@@ -2020,10 +2020,10 @@ func TestHandOut_DistinctnessStaysPerAccount_AcrossHosts(t *testing.T) {
 	}
 }
 
-// The buffer reconcile keys on the MACHINE: host A's held-report drives a release scoped to
-// host A and carrying only host A's held set, so it can never reap host B's buffered copies
-// (the account-keyed bug this fixes).
-func TestReconcileBuffers_PerHost_DoesNotEvictOtherHost(t *testing.T) {
+// The held-copy reconcile keys on the MACHINE: host A's held-report drives a release scoped
+// to host A and carrying only host A's held set, so it can never reap host B's copies (the
+// account-keyed bug this fixes).
+func TestReconcileHeldCopies_PerHost_DoesNotEvictOtherHost(t *testing.T) {
 	wuRepo := &fakeWURepo{}
 	leafRepo := &fakeLeafRepo{}
 	c := newTestCache(wuRepo, leafRepo, &fakeAssignRepo{})
@@ -2036,7 +2036,7 @@ func TestReconcileBuffers_PerHost_DoesNotEvictOtherHost(t *testing.T) {
 
 	var mu sync.Mutex
 	seen := map[types.ID][]types.ID{}
-	wuRepo.releaseFn = func(host types.ID, held []types.ID, _ time.Time) ([]types.ID, error) {
+	wuRepo.releaseFn = func(host types.ID, held []types.ID, _ time.Time) ([]workunit.ReleasedCopy, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		cp := append([]types.ID(nil), held...)
@@ -2048,7 +2048,7 @@ func TestReconcileBuffers_PerHost_DoesNotEvictOtherHost(t *testing.T) {
 	c.NoteVolunteerHeld(account, hostA, []types.ID{unitA})
 	c.NoteVolunteerHeld(account, hostB, []types.ID{unitB})
 
-	c.reconcileBuffers(context.Background())
+	c.reconcileHeldCopies(context.Background())
 
 	mu.Lock()
 	defer mu.Unlock()

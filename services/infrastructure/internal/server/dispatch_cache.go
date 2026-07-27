@@ -68,16 +68,20 @@ const (
 	// ceiling for an artifact publish/rollback (TODO #38): a RUNNING volunteer picks
 	// up a new version on its next work request within this window, with no restart.
 	defaultLeafSnapshotTTL = 30 * time.Second
-	// reconcileGracePeriod is the minimum age a buffered (un-started) copy must reach
-	// before the buffer reconcile may release it as no-longer-held. It protects a copy
-	// handed out moments ago from being reaped before the volunteer's next request
-	// reports holding it.
+	// reconcileGracePeriod is the minimum age a copy must reach before the held-copy
+	// reconcile may release it as no-longer-held. It protects a copy handed out moments
+	// ago from being reaped before the volunteer's next request reports holding it.
 	reconcileGracePeriod = 60 * time.Second
 	// heldReportFreshness bounds how recent a volunteer's reported held set must be for
-	// the buffer reconcile to act on it. A volunteer that has stopped polling (stale
-	// report) is not reconciled against — its buffered copies are reclaimed by the
-	// deadline instead, so a transient disconnect never wrongly drops its buffer.
+	// the held-copy reconcile to act on it. A volunteer that has stopped polling (stale
+	// report) is not reconciled against — its copies are reclaimed by the deadline
+	// instead, so a transient disconnect never wrongly drops its work.
 	heldReportFreshness = 90 * time.Second
+	// starveLogInterval throttles the per-machine WARN that names an in-flight-cap
+	// starvation (TB-13). A starved client polls continuously, so the condition must be
+	// visible without one line per request; a few minutes is short enough to catch the
+	// episode and long enough not to flood.
+	starveLogInterval = 5 * time.Minute
 	// trustScoreTTL bounds how long the cache trusts its in-memory snapshot of subject
 	// trust scores before the refill path re-reads them. The snapshot feeds only the
 	// trusted-corroborator reservation in eligibleLocked, which is stale-tolerant by
@@ -573,16 +577,24 @@ type dispatchCache struct {
 	pendingLeafRefills map[types.ID]struct{}
 
 	// heldReports records, per MACHINE (effective host id), the set of work units that
-	// host last reported holding in its client buffer (NoteVolunteerHeld, set on every
-	// RequestWorkUnit). The buffer reconcile (reconcileBuffers) releases buffered
-	// reservations a host no longer holds, so a client that drops its buffer (e.g. across
-	// a restart) stops being charged for reservations it forgot. Keyed per HOST (TODO #19)
+	// host last reported holding — its client buffer plus its running slots
+	// (NoteVolunteerHeld, set on every RequestWorkUnit). The held-copy reconcile
+	// (reconcileHeldCopies) releases reservations a host no longer holds, so a client that
+	// drops buffered or running work (e.g. across a crash) stops being charged for
+	// reservations it forgot. Keyed per HOST (TODO #19)
 	// because the held set is per-machine: two machines under one key report DIFFERENT
 	// buffers, so account-keying would make one machine's report evict the other's copies.
 	// Guarded by heldMu, separate from mu so recording a report on the hot path never
 	// blocks hand-outs.
 	heldMu      sync.Mutex
 	heldReports map[types.ID]heldReport
+
+	// lastStarveLog records, per MACHINE, when the in-flight-cap starvation WARN was last
+	// emitted for it, so a continuously-polling starved client produces one line per
+	// starveLogInterval instead of one per request. Its own mutex: the check runs after
+	// the hand-out releases mu and must not contend with hand-outs.
+	starveMu      sync.Mutex
+	lastStarveLog map[types.ID]time.Time
 
 	// flusherDone is closed by runFlusher after its final best-effort flush on
 	// shutdown. Drained() exposes it so the shutdown tail can wait for the final
@@ -592,11 +604,11 @@ type dispatchCache struct {
 	flusherDone chan struct{}
 }
 
-// heldReport is a MACHINE's most recently reported client-buffer contents (the work units
-// it currently holds) plus when it reported them. `at` gates staleness so the reconcile
-// only trusts a recent report. account carries the owning account id so the reconcile can
-// drop the released unit from the in-memory ledger, whose holders key on the ACCOUNT
-// (distinctness is per-account) even though the buffer report keys on the host.
+// heldReport is a MACHINE's most recently reported holdings (the work units it currently
+// has buffered or running) plus when it reported them. `at` gates staleness so the
+// reconcile only trusts a recent report. account carries the owning account id so the
+// reconcile can drop the released unit from the in-memory ledger, whose holders key on
+// the ACCOUNT (distinctness is per-account) even though the report keys on the host.
 type heldReport struct {
 	units   map[types.ID]struct{}
 	account types.ID
@@ -654,6 +666,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		leafRefillSignal:     make(chan struct{}, 1),
 		pendingLeafRefills:   make(map[types.ID]struct{}),
 		heldReports:          make(map[types.ID]heldReport),
+		lastStarveLog:        make(map[types.ID]time.Time),
 		flusherDone:          make(chan struct{}),
 		flushDoneCh:          make(chan struct{}),
 	}
@@ -1156,7 +1169,53 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			c.logger.Debug("hand-out empty: reject tally", attrs...)
 		}
 	}
+	// TB-13: a machine handed nothing where at least one candidate was refused by its OWN
+	// in-flight cap is starved by work it is already charged for, not by an empty queue.
+	// At the client the two are indistinguishable (both are an empty response), and on a
+	// production head the tally above is Debug-only — so a volunteer locked out by stale
+	// claims left no trace at all, and explaining one took a database session. Report it at
+	// WARN, throttled per machine, with the full tally so the mix is visible.
+	if taken == 0 && rejects[rejectInflightCap] > 0 && c.noteStarved(hostKey) {
+		attrs := make([]any, 0, 8+2*numRejectReasons)
+		attrs = append(attrs,
+			"volunteer_id", volunteerID,
+			"host_id", hostKey,
+			"inflight", c.inflightFor(hostKey),
+			"inflight_cap", opts.MaxInflightPerVolunteer,
+			"ready_len", readyLen)
+		// Tally keys are prefixed here: "inflight_cap" as a reject reason would otherwise
+		// collide with the machine's cap value above, and a refusal COUNT reading as a cap
+		// is exactly the kind of ambiguity an operator does not need mid-incident.
+		for r := rejectReason(1); r < numRejectReasons; r++ {
+			if rejects[r] > 0 {
+				attrs = append(attrs, "refused_"+r.String(), rejects[r])
+			}
+		}
+		c.logger.Warn("no work handed out: machine is at its own in-flight cap "+
+			"(copies it already holds, or stale claims it never returned)", attrs...)
+	}
 	return final, drained
+}
+
+// noteStarved reports whether the in-flight-cap starvation WARN should be emitted for
+// this machine now, stamping the machine's clock when it returns true. One line per
+// starveLogInterval per machine.
+func (c *dispatchCache) noteStarved(hostKey types.ID) bool {
+	now := c.now()
+	c.starveMu.Lock()
+	defer c.starveMu.Unlock()
+	if last, ok := c.lastStarveLog[hostKey]; ok && now.Sub(last) < starveLogInterval {
+		return false
+	}
+	c.lastStarveLog[hostKey] = now
+	return true
+}
+
+// inflightFor returns a machine's current in-flight count (for the starvation WARN).
+func (c *dispatchCache) inflightFor(hostKey types.ID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inflight[hostKey]
 }
 
 // rejectReason explains why eligibleLocked refused a candidate for a volunteer. It
@@ -3005,8 +3064,8 @@ func (c *dispatchCache) runReconciler(ctx context.Context, interval time.Duratio
 	}
 }
 
-// NoteVolunteerHeld records the set of work units a MACHINE reports holding in its client
-// buffer on a RequestWorkUnit (every buffered and running unit it currently has), keyed by
+// NoteVolunteerHeld records the set of work units a MACHINE reports holding on a
+// RequestWorkUnit (every buffered and running unit it currently has), keyed by
 // the requesting host's effective id (TODO #19) so two machines under one key never evict
 // each other's buffers. volunteerID (the account) is kept so the reconcile can drop the
 // released unit from the account-keyed in-memory ledger. Cheap and purely in-memory — it
@@ -3022,18 +3081,31 @@ func (c *dispatchCache) NoteVolunteerHeld(volunteerID, hostID types.ID, held []t
 	c.heldMu.Unlock()
 }
 
-// reconcileBuffers releases each volunteer's buffered (RESERVED, not-yet-run-started)
-// reservations that it no longer holds, per the held set it last reported. This is the
-// durable correction for a client whose buffer and the head's reservations have
-// diverged — a client that dropped its buffer across a restart, or a head restart that
-// left buffered copies in the DB the volunteer no longer tracks: the stale copy is
-// closed, its work unit redispatches at once, and it stops counting against the
-// volunteer's inflight cap. Only reports fresh enough to trust are acted on (a
-// volunteer that stopped polling has its copies reclaimed by the deadline instead), and
-// a copy is released only if it was created before BOTH the volunteer's last report and
-// the grace window — so the batch that filled a now-quiet client's buffer (created after
-// its last report) and a just-handed copy are never wrongly reaped. Running copies are untouched.
-func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
+// reconcileHeldCopies releases each machine's live reservations that it no longer holds,
+// per the held set it last reported. This is the durable correction for a client whose
+// state and the head's reservations have diverged — a client that dropped its buffer
+// across a restart, a client killed mid-run, or a head restart that left copies in the DB
+// the volunteer no longer tracks: the stale copy is closed, its work unit redispatches at
+// once, and it stops counting against the machine's inflight cap. Only reports fresh
+// enough to trust are acted on (a machine that stopped polling has its copies reclaimed by
+// the deadline instead), and a copy is released only if it was created before BOTH the
+// machine's last report and the grace window — so the batch that filled a now-quiet
+// client's buffer (created after its last report) and a just-handed copy are never wrongly
+// reaped.
+//
+// RUN-STARTED copies are released too (TB-13). The client reports its running units on
+// every request for exactly this reason, and without acting on that report a holder that
+// died mid-run kept its claim for the leaf's entire deadline — long enough (5 h on current
+// leaves) to consume a new volunteer's whole in-flight quota and leave it refused with no
+// explanation. A released RUNNING copy is wasted compute, so unlike a returned buffer
+// entry it records a bad reliability outcome for the machine, matching what the deadline
+// sweep would have recorded hours later.
+//
+// This trusts the client's report for running work, so it REQUIRES a client that sends the
+// held set (volunteer-CLI v0.10.0+). An older client reports nothing and would have its
+// running copies reaped; per the alpha compatibility policy that is a coordinated cutover,
+// not a reason to keep the lockout.
+func (c *dispatchCache) reconcileHeldCopies(ctx context.Context) {
 	now := c.now()
 
 	// Snapshot fresh reports and prune stale ones (a returning machine re-reports). Keyed
@@ -3081,13 +3153,13 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 			cancel()
 			continue // admission/ctx pressure: retry on the next tick
 		}
-		// Release by HOST (TODO #19): only THIS machine's buffered copies it no longer
-		// holds, so host A's report never reaps host B's buffer.
-		released, err := c.deps.wuRepo.ReleaseStaleBufferedCopies(relCtx, p.host, p.held, cutoff)
+		// Release by HOST (TODO #19): only THIS machine's copies it no longer holds, so
+		// host A's report never reaps host B's.
+		released, err := c.deps.wuRepo.ReleaseStaleHeldCopies(relCtx, p.host, p.held, cutoff)
 		release()
 		cancel()
 		if err != nil {
-			c.logger.Warn("dispatch cache: buffer reconcile failed", "host_id", p.host, "error", err)
+			c.logger.Warn("dispatch cache: held-copy reconcile failed", "host_id", p.host, "error", err)
 			continue
 		}
 		if len(released) == 0 {
@@ -3098,14 +3170,36 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 		// counting as held and can be re-staged. The in-memory holders key on the ACCOUNT,
 		// so release by account (the host's owner); releaseInMemLocked then decrements the
 		// host's inflight via the holder's stored host id. A no-op for copies this replica
-		// never held in memory (e.g. recovered from the DB after a head restart).
+		// never held in memory (a run-started copy, whose hold onRunStart already dropped;
+		// or one recovered from the DB after a head restart) — the inflight recount that
+		// follows this reconcile is what corrects those.
+		startedCount := 0
 		c.mu.Lock()
-		for _, uid := range released {
-			c.releaseInMemLocked(uid, p.account)
+		for _, rc := range released {
+			c.releaseInMemLocked(rc.WorkUnitID, p.account)
+			if rc.Started {
+				startedCount++
+			}
 		}
 		c.mu.Unlock()
-		c.logger.Info("dispatch cache: released stale buffered reservations",
-			"host_id", p.host, "volunteer_id", p.account, "released", len(released))
+		// A lost RUNNING copy is wasted work and a bad reliability signal for the machine
+		// that held it — the same signal the fault monitor records when such a copy finally
+		// times out. Recording it here keeps that signal instead of dropping it in exchange
+		// for the faster release. Best-effort: pure dispatch shaping, never correctness-
+		// bearing, so a failure is logged and the reconcile continues. Un-started copies
+		// stay unpenalized (#59): returning buffered work promptly is cooperative.
+		if c.deps.reliabilityRepo != nil {
+			for i := 0; i < startedCount; i++ {
+				if rerr := c.deps.reliabilityRepo.RecordOutcome(ctx, p.host, false); rerr != nil {
+					c.logger.Warn("dispatch cache: failed to record host reliability for released running copy",
+						"host_id", p.host, "error", rerr)
+					break
+				}
+			}
+		}
+		c.logger.Info("dispatch cache: released stale held reservations",
+			"host_id", p.host, "volunteer_id", p.account,
+			"released", len(released), "released_running", startedCount)
 	}
 	if releasedAny {
 		c.signalRefill()
@@ -3119,9 +3213,10 @@ func (c *dispatchCache) reconcileBuffers(ctx context.Context) {
 // unflushed) reservation is not under-counted. Both are keyed on the effective host id,
 // which equals the account id for a copy with no host — so the keys agree everywhere.
 func (c *dispatchCache) reconcileOnce(ctx context.Context) {
-	// First release any buffered reservations machines no longer hold, so the freed
-	// copies are reflected in the authoritative inflight counts recomputed below.
-	c.reconcileBuffers(ctx)
+	// First release any reservations machines no longer hold, so the freed copies are
+	// reflected in the authoritative inflight counts recomputed below.
+	c.reconcileHeldCopies(ctx)
+	c.pruneStarveLog()
 
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 	defer cancel()
@@ -3191,6 +3286,20 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 			if at.Before(cutoff) {
 				delete(c.lastHandOut, vol)
 			}
+		}
+	}
+}
+
+// pruneStarveLog drops starvation-log clock entries older than the throttle window: such
+// an entry can never suppress a line again, so it is pure residue. Takes only starveMu —
+// called before the reconcile takes the main lock, so the two are never nested.
+func (c *dispatchCache) pruneStarveLog() {
+	cutoff := c.now().Add(-starveLogInterval)
+	c.starveMu.Lock()
+	defer c.starveMu.Unlock()
+	for host, at := range c.lastStarveLog {
+		if at.Before(cutoff) {
+			delete(c.lastStarveLog, host)
 		}
 	}
 }

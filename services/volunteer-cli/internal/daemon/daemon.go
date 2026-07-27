@@ -849,9 +849,13 @@ func (d *Daemon) persistActiveTasks() {
 // heldWorkUnitIDs returns the ids of every work unit this volunteer currently holds:
 // its prefetch buffer (buffered, not yet started) plus its active slots (in-transit
 // and running). Reported on each RequestWorkUnit so the head can release any
-// reservation the volunteer no longer holds. The set deliberately includes running
-// units too: the head never reaps a started copy, but reporting it closes the window
-// between popping a unit from the buffer and the head recording its run-start.
+// reservation the volunteer no longer holds.
+//
+// Running units MUST be included. The head reconciles RUNNING copies against this set
+// too, and releases any it does not find (TB-13) — without that, a claim held by a
+// crashed client stood until the leaf's whole deadline and locked the volunteer out of
+// all work. Under-reporting therefore costs real work: a running unit left out of the
+// set is reaped and handed to someone else while this machine is still computing it.
 func (d *Daemon) heldWorkUnitIDs() []string {
 	var ids []string
 	if d.prefetchQueue != nil {
