@@ -33,6 +33,7 @@ scheduling.schedule_ranges, each entry being:
   - days: [0,1,2,3,4]   # 0=Mon … 6=Sun
     start_hour: 19       # 0-23
     end_hour: 7          # 0-23; end <= start means the window wraps past midnight`,
+		Args: noStrayArgs,
 		RunE: runScheduleShow,
 	}
 	cmd.AddCommand(

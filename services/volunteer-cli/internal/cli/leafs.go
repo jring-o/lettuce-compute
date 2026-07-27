@@ -18,6 +18,10 @@ func newLeafsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "leafs",
 		Short: "Manage leaf preferences (list, enable, disable, weight, reset)",
+		Args:  noStrayArgs,
+		// See newHeadsCmd: a non-runnable parent never reaches its Args
+		// constraint, so the help is served from RunE instead (TB-6).
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 
 	cmd.AddCommand(
@@ -308,7 +312,14 @@ func runLeafsWeight(cmd *cobra.Command, args []string) error {
 		if lp.Weights == nil {
 			lp.Weights = make(map[string]int)
 		}
+		// An absent key reads as Go's zero value, but an unweighted leaf is not
+		// weighted 0 — the daemon selects it at the default 100. Printing the
+		// raw map value made a first-time `leafs weight` claim the leaf had
+		// previously been ignored (TB-9); normalize the way `heads list` does.
 		oldWeight := lp.Weights[slug]
+		if oldWeight <= 0 {
+			oldWeight = 100
+		}
 		lp.Weights[slug] = weight
 		modified = true
 		fmt.Printf("Set weight for leaf %q on server %q: %d → %d\n", slug, name, oldWeight, weight)

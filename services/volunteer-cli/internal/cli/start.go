@@ -90,7 +90,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		"os", stdruntime.GOOS,
 		"arch", stdruntime.GOARCH,
 		"data_dir", cfg.DataDir,
-		"log_level", cfg.LogLevel,
+		"log_level", cfg.EffectiveLogLevel(),
 	)
 
 	logger.Info("logging to file", "path", cfg.LogFilePath(), "enabled", cfg.LogToFile)
@@ -527,8 +527,12 @@ func containsRuntime(runtimes []string, name string) bool {
 	return false
 }
 
+// parseSlogLevel maps a configured log level to its slog equivalent, folding
+// case so a value that reached the config by hand ("DEBUG") means what it says.
+// An unrecognized value still falls back to info — this renders a stored value
+// and must not fail; flags are refused up front by normalizeLogLevel instead.
 func parseSlogLevel(level string) slog.Level {
-	switch level {
+	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "debug":
 		return slog.LevelDebug
 	case "warn":

@@ -12,8 +12,19 @@ import (
 
 func newHeadsCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "heads",
-		Short: "Manage head (server) preferences (list, weight)",
+		Use: "heads",
+		// Do not enumerate the subcommands here — the previous list went stale
+		// the moment `trust` was added and hid the security-critical command
+		// from top-level help (TB-8). Name the areas instead; `heads --help`
+		// lists the real subcommands and cannot drift.
+		Short: "Manage attached heads: fetch weight and runtime trust",
+		Args:  noStrayArgs,
+		// Cobra returns "print my help" for a non-runnable command BEFORE it
+		// validates arguments, so an Args constraint on a bare parent is never
+		// consulted and `heads trus` prints help as if it were a valid request
+		// (TB-6). Showing the same help from RunE keeps bare `heads` identical
+		// while putting the constraint back in reach.
+		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 
 	cmd.AddCommand(
