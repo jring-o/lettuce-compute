@@ -26,10 +26,20 @@ func newStatusCmd() *cobra.Command {
 // statusAPIResponse mirrors the fields of the management API's GET /api/v1/status
 // that this command renders.
 type statusAPIResponse struct {
-	UptimeSeconds int                `json:"uptime_seconds"`
-	ActiveTasks   []statusActiveTask `json:"active_tasks"`
-	QueuedTasks   []statusQueuedTask `json:"queued_tasks"`
-	PausedReason  *string            `json:"paused_reason"`
+	UptimeSeconds int                 `json:"uptime_seconds"`
+	ActiveTasks   []statusActiveTask  `json:"active_tasks"`
+	QueuedTasks   []statusQueuedTask  `json:"queued_tasks"`
+	PausedReason  *string             `json:"paused_reason"`
+	FailingLeafs  []statusFailingLeaf `json:"failing_leafs"`
+}
+
+// statusFailingLeaf is a leaf whose work has failed on this machine.
+type statusFailingLeaf struct {
+	LeafName            string `json:"leaf_name"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	TotalFailures       int    `json:"total_failures"`
+	LastReason          string `json:"last_reason"`
+	Paused              bool   `json:"paused"`
 }
 
 type statusActiveTask struct {
@@ -190,6 +200,51 @@ func printActiveTasks(dataDir string) {
 	if len(sr.QueuedTasks) > 0 {
 		fmt.Printf("Buffered (fetched, not started): %d\n", len(sr.QueuedTasks))
 	}
+
+	printFailingLeafs(sr.FailingLeafs)
+}
+
+// printFailingLeafs reports leafs whose work reached this machine and failed
+// here. Silence about this was the whole of TB-10: a volunteer whose native
+// units were fetched, failed and abandoned dozens of times an hour saw no
+// completions and reasonably concluded no native work was ever sent. Nothing is
+// printed when nothing has failed, so a healthy volunteer's `status` is unchanged.
+func printFailingLeafs(failing []statusFailingLeaf) {
+	if len(failing) == 0 {
+		return
+	}
+	fmt.Printf("Failing leafs (%d) — work IS arriving for these and failing on this machine:\n", len(failing))
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "  LEAF\tFAILED\tIN A ROW\tSTATE\tLAST ERROR")
+	for _, f := range failing {
+		state := "retrying"
+		if f.Paused {
+			state = "paused"
+		}
+		fmt.Fprintf(w, "  %s\t%d\t%d\t%s\t%s\n",
+			labelOrDash(f.LeafName),
+			f.TotalFailures,
+			f.ConsecutiveFailures,
+			state,
+			labelOrDash(truncateReason(f.LastReason)),
+		)
+	}
+	_ = w.Flush()
+	fmt.Println("  A paused leaf is retried automatically later. If this persists, the leaf's")
+	fmt.Println("  program is failing on this machine — tell the head's operator, and see the")
+	fmt.Println("  daemon log for the program's own output.")
+}
+
+// truncateReason keeps a failure reason to one readable table cell. The reason
+// can carry a tail of the failing program's output, which belongs in the log,
+// not in a table.
+func truncateReason(s string) string {
+	const max = 60
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max-1] + "…"
 }
 
 // printCredit renders the volunteer's earned credit. Credit is secondary, so any

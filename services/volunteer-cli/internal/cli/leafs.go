@@ -3,9 +3,11 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -47,24 +49,55 @@ func newLeafsListCmd() *cobra.Command {
 
 // leafsAPIResponse is the shape of GET /api/v1/heads from the management API.
 type leafsAPIResponse struct {
-	Heads []leafsAPIHead `json:"heads"`
+	Heads   []leafsAPIHead  `json:"heads"`
+	Machine leafsAPIMachine `json:"machine"`
+}
+
+// leafsAPIMachine is what the RUNNING daemon says this machine can do. Taking it
+// from the daemon rather than re-deriving it here means the table answers for the
+// configuration actually loaded, and costs no second hardware probe (TB-4).
+type leafsAPIMachine struct {
+	Runtimes    []string `json:"runtimes"`
+	HasGPU      bool     `json:"has_gpu"`
+	MaxMemoryMB int      `json:"max_memory_mb"`
 }
 
 type leafsAPIHead struct {
-	Name   string          `json:"name"`
-	Weight int             `json:"weight"`
-	Leafs  []leafsAPILeaf  `json:"leafs"`
+	Name string `json:"name"`
+	// GRPCAddress identifies which configured server this head is, independent of
+	// the display name (which the head itself supplies and can change).
+	GRPCAddress string         `json:"grpc_address"`
+	Weight      int            `json:"weight"`
+	Leafs       []leafsAPILeaf `json:"leafs"`
 }
 
 type leafsAPILeaf struct {
-	Slug             string `json:"slug"`
-	Name             string `json:"name"`
-	State            string `json:"state"`
-	QueuedWorkUnits  int    `json:"queued_work_units"`
-	ActiveVolunteers int    `json:"active_volunteers"`
-	ActiveHosts      int    `json:"active_hosts"`
-	EffectiveWeight  int    `json:"effective_weight"`
-	Enabled          bool   `json:"enabled"`
+	Slug             string                 `json:"slug"`
+	Name             string                 `json:"name"`
+	State            string                 `json:"state"`
+	QueuedWorkUnits  int                    `json:"queued_work_units"`
+	ActiveVolunteers int                    `json:"active_volunteers"`
+	ActiveHosts      int                    `json:"active_hosts"`
+	EffectiveWeight  int                    `json:"effective_weight"`
+	Enabled          bool                   `json:"enabled"`
+	ExecutionSpec    *leafsAPIExecutionSpec `json:"execution_spec"`
+	Failures         *leafsAPILeafFailures  `json:"failures"`
+}
+
+// leafsAPIExecutionSpec carries the fields that decide a leaf's runtime and
+// whether this machine meets its requirements.
+type leafsAPIExecutionSpec struct {
+	Binaries    map[string]string `json:"binaries"`
+	Image       string            `json:"image"`
+	GPURequired bool              `json:"gpu_required"`
+	MaxMemoryMB int32             `json:"max_memory_mb"`
+}
+
+// leafsAPILeafFailures is a leaf's local failure record (TB-10).
+type leafsAPILeafFailures struct {
+	ConsecutiveFailures int  `json:"consecutive_failures"`
+	TotalFailures       int  `json:"total_failures"`
+	Paused              bool `json:"paused"`
 }
 
 func runLeafsList(cmd *cobra.Command, args []string) error {
@@ -76,30 +109,135 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 	// Query the running daemon's local management API for live per-head state.
 	// On any failure, fall back to config-only info but name the REAL reason
 	// instead of always claiming "not running" (TODO #21).
-	heads, err := fetchHeadsFromAPI()
+	resp, err := fetchHeadsFromAPI()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Showing config-only info (%v).\n\n", err)
 		return printLeafsFromConfig()
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tSTATE\tQUEUED\tVOLUNTEERS\tHOSTS\tWEIGHT\tENABLED\n")
+	printLeafsTable(os.Stdout, resp, cfg.Servers)
+	return nil
+}
 
-	for _, h := range heads {
+// printLeafsTable renders the live leaf table.
+//
+// STATE is the HEAD's leaf lifecycle state and ENABLED is the volunteer's own
+// preference toggle; neither says whether this machine will ever fetch the leaf.
+// Before TB-4 that was the whole table, so a NATIVE leaf on a container-only
+// machine displayed exactly like one that was being computed — "active ✓" — and
+// a tester reasonably read it as "my machine runs this". RUNTIME and WILL FETCH
+// answer the question the other columns look like they are answering, using the
+// same gates the daemon applies, with the blocking reason spelled out beneath.
+func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.ServerConfig) {
+	caps := volunteerCaps{
+		maxMemoryMB:     resp.Machine.MaxMemoryMB,
+		containerUsable: containsFold(resp.Machine.Runtimes, "container"),
+		hasGPU:          resp.Machine.HasGPU,
+	}
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tRUNTIME\tSTATE\tQUEUED\tVOLUNTEERS\tHOSTS\tWEIGHT\tENABLED\tWILL FETCH\n")
+
+	// Blocking reasons are collected and printed under the table so the rows stay
+	// aligned and scannable.
+	var notes []string
+	for _, h := range resp.Heads {
+		srv, known := serverConfigFor(servers, h)
 		for _, l := range h.Leafs {
+			spec := l.ExecutionSpec
+			if spec == nil {
+				spec = &leafsAPIExecutionSpec{}
+			}
+			label := l.Slug
+			if label == "" {
+				label = l.Name
+			}
+			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired)
+
 			enabled := "✓"
 			if !l.Enabled {
 				enabled = "✗"
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
-				h.Name, l.Slug, l.Name, l.State,
+
+			willFetch, note := willFetchVerdict(req, caps, srv, known, l)
+			if note != "" {
+				notes = append(notes, fmt.Sprintf("  %s / %s: %s", h.Name, label, note))
+			}
+
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+				h.Name, l.Slug, l.Name, runtimeKindOf(req), l.State,
 				l.QueuedWorkUnits, l.ActiveVolunteers, l.ActiveHosts,
-				l.EffectiveWeight, enabled,
+				l.EffectiveWeight, enabled, willFetch,
 			)
 		}
 	}
 	w.Flush()
-	return nil
+
+	if len(notes) > 0 {
+		fmt.Fprintln(out)
+		for _, n := range notes {
+			fmt.Fprintln(out, n)
+		}
+	}
+}
+
+// willFetchVerdict answers, for one leaf, whether this machine will fetch it —
+// and when it will not, why. The order matters: a leaf the volunteer disabled is
+// reported as their own choice rather than as a capability problem, and a leaf
+// paused by the failure breaker is reported as failing rather than as ineligible,
+// because those call for different actions.
+func willFetchVerdict(req leafRequirements, caps volunteerCaps, srv config.ServerConfig, known bool, l leafsAPILeaf) (verdict, note string) {
+	if !known {
+		// The daemon reported a head this config does not list (renamed or
+		// detached mid-run). Say so rather than guessing at its trust settings.
+		return "?", "this head is not in your config.yaml, so per-head runtime trust could not be checked"
+	}
+	if !l.Enabled {
+		return "no", "you disabled this leaf (`lettuce-volunteer leafs enable " + l.Slug + "`)"
+	}
+	if !strings.EqualFold(l.State, "ACTIVE") {
+		return "no", fmt.Sprintf("the head has this leaf in state %s, so it dispatches no work", l.State)
+	}
+	le, _ := classifyLeaf(req, caps, srv)
+	if !le.eligible {
+		return "no", le.reason
+	}
+	if l.Failures != nil && l.Failures.Paused {
+		return "paused", fmt.Sprintf("this leaf's work reached this machine and failed %d times in a row, so requests for it are paused; it retries automatically (see `lettuce-volunteer status`)",
+			l.Failures.ConsecutiveFailures)
+	}
+	if l.Failures != nil && l.Failures.TotalFailures > 0 {
+		return "yes", fmt.Sprintf("note: %d of this leaf's units have failed on this machine (see `lettuce-volunteer status`)", l.Failures.TotalFailures)
+	}
+	return "yes", ""
+}
+
+// serverConfigFor matches a head from the management API to its configured
+// server. It keys on the gRPC address, not the display name: the name in the API
+// response is the one the HEAD supplies via GetHeadInfo, which need not equal the
+// local config's name for it.
+func serverConfigFor(servers []config.ServerConfig, h leafsAPIHead) (config.ServerConfig, bool) {
+	for _, srv := range servers {
+		if h.GRPCAddress != "" && srv.GRPCAddress == h.GRPCAddress {
+			return srv, true
+		}
+	}
+	for _, srv := range servers {
+		if srv.DisplayName() == h.Name {
+			return srv, true
+		}
+	}
+	return config.ServerConfig{}, false
+}
+
+// containsFold reports whether s contains val, case-insensitively.
+func containsFold(s []string, val string) bool {
+	for _, v := range s {
+		if strings.EqualFold(v, val) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchHeadsFromAPI queries the running daemon's local management API for live
@@ -109,7 +247,7 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 // even while the daemon was running — TODO #21). The request targets
 // 127.0.0.1:<port> so it also satisfies the management API's Host-header allowlist.
 // Errors are returned verbatim so the caller can show the real reason.
-func fetchHeadsFromAPI() ([]leafsAPIHead, error) {
+func fetchHeadsFromAPI() (*leafsAPIResponse, error) {
 	info, err := management.ReadDaemonInfo(cfg.DataDir)
 	if err != nil {
 		return nil, fmt.Errorf("daemon not running (no daemon.json)")
@@ -137,10 +275,19 @@ func fetchHeadsFromAPI() ([]leafsAPIHead, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-	return result.Heads, nil
+	return &result, nil
 }
 
 func printLeafsFromConfig() error {
+	// This table is the volunteer's stored PREFERENCES, not live head state. It
+	// cannot show a leaf's runtime or whether this machine would fetch it —
+	// both need the daemon — so it says so rather than letting the columns it
+	// does have be read as the whole answer (TB-4).
+	fmt.Println("Without a running daemon this shows your saved leaf preferences only —")
+	fmt.Println("not each leaf's runtime, nor whether this machine would actually fetch it.")
+	fmt.Println("Start the daemon (`lettuce-volunteer start`) for that, or run `lettuce-volunteer doctor`.")
+	fmt.Println()
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "SERVER\tMODE\tWEIGHT\tENABLED SLUGS\tDISABLED SLUGS\n")
 	for _, srv := range cfg.Servers {

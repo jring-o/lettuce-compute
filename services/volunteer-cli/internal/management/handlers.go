@@ -128,7 +128,13 @@ func handleDetachLeaf(bridge *DaemonBridge) http.HandlerFunc {
 
 func handleGetHeads(bridge *DaemonBridge) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{"heads": bridge.GetHeads()})
+		// machine travels with the head list because a caller deciding whether
+		// this machine will ever fetch a given leaf needs both halves — the
+		// leaf's requirements and this daemon's real capabilities (TB-4).
+		writeJSON(w, map[string]any{
+			"heads":   bridge.GetHeads(),
+			"machine": bridge.MachineCaps(),
+		})
 	}
 }
 

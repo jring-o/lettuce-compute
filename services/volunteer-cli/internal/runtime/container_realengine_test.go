@@ -142,7 +142,7 @@ func TestRealEngine_HardenedCPUContainerCanWriteOutput(t *testing.T) {
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("hardened container exited %d — the leaf contract's output write failed (PB-23); execution.log:\n%s",
-			result.ExitCode, tailOfFile(filepath.Join(prep.WorkDir, "execution.log"), containerLogTailBytes))
+			result.ExitCode, ExecutionLogTail(prep.WorkDir))
 	}
 	if !strings.Contains(string(result.OutputData), "42") {
 		t.Fatalf("output not captured; got %q", result.OutputData)

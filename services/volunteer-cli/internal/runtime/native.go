@@ -243,7 +243,7 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	}
 
 	// Capture stdout/stderr to execution log, capped at 10 MB.
-	logPath := filepath.Join(prep.WorkDir, "execution.log")
+	logPath := ExecutionLogPath(prep.WorkDir)
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %w", err)
@@ -343,6 +343,22 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	} else if limitedWriter.written > 0 {
 		// Fall back to stdout if output.dat doesn't exist (or was refused).
 		outputData, _ = readRegularNoFollow(logPath)
+	}
+
+	// Surface the failure reason on a non-zero exit, exactly as the container
+	// runtime does. Without this the native path was silent: a leaf whose binary
+	// dies on this machine produced a bare abandon, the work dir (and with it the
+	// only copy of the process's output) was removed moments later, and the
+	// volunteer was left concluding they simply never received native work
+	// (TB-10). The full stdout/stderr stays in execution.log; the WARN carries a
+	// bounded tail of it.
+	if exitCode != 0 {
+		n.logger.Warn("native process exited non-zero",
+			"work_unit_id", wu.ID,
+			"exit_code", exitCode,
+			"log_tail", ExecutionLogTail(prep.WorkDir),
+			"log_path", logPath,
+		)
 	}
 
 	n.logger.Info("execution finished", "work_unit_id", wu.ID, "exit_code", exitCode, "wall_clock_s", wallClock.Seconds())
