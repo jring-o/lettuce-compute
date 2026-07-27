@@ -16,14 +16,18 @@ import (
 //
 // Enforcing limits against the test process ITSELF is unsafe and was the real
 // (mis-diagnosed) cause of the flaky #36 CI OOM. On Linux the fallback path sets
-// RLIMIT_AS — a virtual-address-space cap — via prlimit64. Lowering your own
-// limit needs no privilege, so `Enforce(os.Getpid(), {MaxMemoryMB: 256})`
-// actually SUCCEEDS in capping the test binary at 256 MB, and enforceFallback's
-// cleanup is a no-op that never restores it. The Go runtime then can't mmap past
-// that cap and the package dies with "fatal error: runtime: cannot allocate
-// memory" — nondeterministically, depending on the process's virtual footprint
-// at that moment (hence the flakiness; it crashed even under `go test -p 1`,
-// with no parallel package binaries to blame).
+// a memory rlimit via prlimit64. Lowering your own limit needs no privilege, so
+// `Enforce(os.Getpid(), {MaxMemoryMB: 256})` actually SUCCEEDS in capping the
+// test binary, and enforceFallback's cleanup is a no-op that never restores it.
+// The Go runtime then can't map past that cap and the package dies with "fatal
+// error: runtime: cannot allocate memory" — nondeterministically, depending on
+// the process's footprint at that moment (hence the flakiness; it crashed even
+// under `go test -p 1`, with no parallel package binaries to blame).
+//
+// The rlimit is now RLIMIT_DATA rather than the far more lethal RLIMIT_AS, and
+// it carries headroom over the declared value (TB-11), which makes this footgun
+// much harder to fire — but it is still a footgun, so the tests keep targeting a
+// child.
 //
 // Enforce is only ever meant to constrain a CHILD compute process (see
 // daemon.SetProcessNotifier), so the tests do the same. The child is the test
@@ -114,7 +118,7 @@ func TestEnforce_ChildProcess(t *testing.T) {
 	}
 	// A live, non-self PID exercises the real enforce path (prlimit64 +
 	// sched_setaffinity on Linux) without capping the test binary's own
-	// address space — capping our own RLIMIT_AS is the #36 footgun.
+	// memory — capping our own rlimit is the #36 footgun.
 	cleanup, err := l.Enforce(startLimiterTestChild(t), limits)
 	if err != nil {
 		t.Skipf("Enforce on child PID returned error (may be expected): %v", err)
