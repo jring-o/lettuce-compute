@@ -36,3 +36,51 @@ type Limiter interface {
 func NewLimiter(logger *slog.Logger) Limiter {
 	return newPlatformLimiter(logger)
 }
+
+const (
+	// goHeapArenaGranuleMB is the granule the Go runtime maps heap arenas in.
+	// Every managed runtime commits memory in chunks rather than by the byte;
+	// this is the largest granule we have measured and the one our own leaves
+	// hit, so it sets the scale of the headroom below.
+	goHeapArenaGranuleMB = 64
+
+	// minFallbackMemoryLimitMB is the floor for the fallback ceiling. Measured:
+	// no Go program starts under 64 MiB of RLIMIT_DATA whatever its working set,
+	// because it cannot map even one arena granule. The floor keeps a small
+	// per-unit declaration from landing below the point where a managed runtime
+	// can reach main() at all.
+	minFallbackMemoryLimitMB = 128
+)
+
+// fallbackMemoryLimitMB converts a work unit's declared memory ceiling into the
+// value the non-cgroups Linux path actually enforces. A declared 0 (unspecified)
+// stays 0, meaning no ceiling.
+//
+// The declared value must not be enforced verbatim. An rlimit bounds MAPPED
+// memory, whereas cgroups and the container engines bound RESIDENT memory, and a
+// managed runtime maps considerably more than it touches. Measured against a Go
+// leaf on Linux 6.6:
+//
+//   - a 100 MiB working set dies under a 128 MiB RLIMIT_DATA, because Go maps
+//     arenas in 64 MiB granules and so has 128 MiB mapped before the arena index
+//     and runtime structures are counted;
+//   - no Go program at all starts below 64 MiB.
+//
+// Enforcing the declaration exactly would therefore kill leaves behaving exactly
+// as declared — a subtler rerun of the RLIMIT_AS failure this replaced (TB-11).
+// The ceiling is headroomed instead: twice the declaration plus one granule.
+//
+// This is deliberately a backstop against a runaway leaf on the least-sandboxed
+// runtime we have, not an accounting boundary; precise accounting is what the
+// cgroups path is for. Measured: a unit declaring 128 MiB runs at its full
+// declaration and is still stopped at 400 MiB.
+func fallbackMemoryLimitMB(declaredMB int) int {
+	if declaredMB <= 0 {
+		return 0
+	}
+	limit := declaredMB*2 + goHeapArenaGranuleMB
+	if limit < minFallbackMemoryLimitMB {
+		limit = minFallbackMemoryLimitMB
+	}
+	return limit
+}

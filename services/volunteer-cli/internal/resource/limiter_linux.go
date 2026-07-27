@@ -129,22 +129,41 @@ type rlimit64 struct {
 
 // enforceFallback uses prlimit64 for memory and sched_setaffinity for CPU.
 func (l *LinuxLimiter) enforceFallback(pid int, limits *config.ResourceLimits) (func(), error) {
-	// Set RLIMIT_AS (virtual memory limit) via prlimit64 syscall.
-	if limits.MaxMemoryMB > 0 {
-		memBytes := uint64(limits.MaxMemoryMB) * 1024 * 1024
+	// Memory ceiling via prlimit64.
+	//
+	// This used RLIMIT_AS and was lethal (TB-11). RLIMIT_AS caps a process's
+	// VIRTUAL ADDRESS SPACE, which every managed runtime reserves vastly more of
+	// than it ever commits — a Go program reserves hundreds of MB of arenas
+	// before main() — so capping address space at the leaf's declared memory
+	// killed the process inside runtime.mallocinit(), before any leaf code ran.
+	// Measured: a trivial Go binary needs between 512 MB and 768 MB of RLIMIT_AS
+	// merely to START, no matter how little it goes on to use, so no headroom
+	// multiple on RLIMIT_AS is defensible. This path is what ordinary
+	// unprivileged Linux machines get (detectCgroupsV2 needs delegation they do
+	// not have), so the entire NATIVE runtime was unusable for most volunteers.
+	//
+	// RLIMIT_DATA bounds the data segment and, since Linux 4.7, writable private
+	// mappings — the memory a process actually commits — while leaving the
+	// PROT_NONE reservations a runtime makes at startup alone. Measured: it both
+	// admits a well-behaved leaf and still stops a runaway one. On kernels older
+	// than 4.7 it does not cover mmap at all and so is a no-op for runtimes that
+	// never call brk; that is accepted, as 4.7 predates every supported distro.
+	if limitMB := fallbackMemoryLimitMB(limits.MaxMemoryMB); limitMB > 0 {
+		memBytes := uint64(limitMB) * 1024 * 1024
 		lim := rlimit64{Cur: memBytes, Max: memBytes}
-		const rlimitAS = 9 // RLIMIT_AS on Linux
 		_, _, errno := syscall.RawSyscall6(
 			syscall.SYS_PRLIMIT64,
 			uintptr(pid),
-			uintptr(rlimitAS),
+			uintptr(syscall.RLIMIT_DATA),
 			uintptr(unsafe.Pointer(&lim)),
 			0, 0, 0,
 		)
 		if errno != 0 {
-			l.logger.Warn("prlimit64 RLIMIT_AS failed", "error", errno, "pid", pid)
+			l.logger.Warn("prlimit64 RLIMIT_DATA failed", "error", errno, "pid", pid)
 		} else {
-			l.logger.Debug("set memory limit via prlimit64", "pid", pid, "mb", limits.MaxMemoryMB)
+			l.logger.Debug("set memory limit via prlimit64",
+				"pid", pid, "resource", "RLIMIT_DATA",
+				"declared_mb", limits.MaxMemoryMB, "enforced_mb", limitMB)
 		}
 	}
 
