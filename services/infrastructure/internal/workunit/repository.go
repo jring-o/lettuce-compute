@@ -135,20 +135,32 @@ type WorkUnitRepository interface {
 	// the fallback). Used to reconcile the per-host in-flight counters (TODO #19).
 	CountActiveByHost(ctx context.Context) (map[types.ID]int, error)
 
-	// ReleaseStaleBufferedCopies closes a MACHINE's buffered (RESERVED, not-yet-
-	// run-started) live copies that the machine no longer holds in its client buffer
-	// (TODO #19): hostID is the reporting host's effective id, matched on
+	// ReleaseStaleHeldCopies closes a MACHINE's live copies that the machine no longer
+	// reports holding (TODO #19): hostID is the reporting host's effective id, matched on
 	// COALESCE(host_id, volunteer_id) so only THAT machine's copies are reaped (host A's
-	// report never releases host B's buffer) — and = the account id for a no-host copy.
-	// heldWorkUnitIDs is the set the machine reports it still has; any of its buffered
-	// copies for a unit NOT in that set, and older than olderThan (a grace window so a copy
-	// handed out moments ago is not reaped before the machine's next report includes it),
-	// is closed ABANDONED. The work unit stays QUEUED, so it redispatches immediately, and
-	// the freed copy stops counting against the host's inflight cap. RUNNING copies
-	// (started_at set) are never touched here — they ride their deadline. An empty
-	// heldWorkUnitIDs means the machine holds nothing, so all its grace-aged buffered
-	// copies are released. Returns the work-unit ids whose copies were released.
-	ReleaseStaleBufferedCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error)
+	// report never releases host B's copies) — and = the account id for a no-host copy.
+	// heldWorkUnitIDs is the set the machine reports it still has (its client buffer PLUS
+	// its running slots); any of its live copies for a unit NOT in that set, and created
+	// before olderThan (a grace window so a copy handed out moments ago is not reaped
+	// before the machine's next report includes it), is closed ABANDONED. The work unit
+	// stays QUEUED, so it redispatches immediately, and the freed copy stops counting
+	// against the host's inflight cap. An empty heldWorkUnitIDs means the machine holds
+	// nothing, so all its grace-aged copies are released.
+	//
+	// RUN-STARTED copies are released too (TB-13). They used to be excluded — a copy whose
+	// holder crashed mid-run then held its reservation until the leaf's whole
+	// deadline_seconds elapsed (5 h on current leaves), which is long enough to consume a
+	// new volunteer's entire in-flight quota and lock it out of all work with no
+	// explanation. The client reports its running units on every request precisely so the
+	// head can tell "still running it" from "lost it", and that report is the only signal
+	// that arrives sooner than the deadline. Releasing a started copy benches its holder on
+	// that unit for about one deadline (the ABANDONED + started_at signature the post-
+	// failure cooldown reads), so a machine that keeps dropping a unit does not immediately
+	// take it back.
+	//
+	// Returns one ReleasedCopy per closed copy, carrying whether it had run-started so the
+	// caller can apply the reliability signal that only wasted RUNNING work deserves.
+	ReleaseStaleHeldCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]ReleasedCopy, error)
 
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same
 	// predicates as FindNextAssignable) and inserts a RESERVED copy held until the

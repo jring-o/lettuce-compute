@@ -583,15 +583,20 @@ func TestClearExpiredDispatchClaims(t *testing.T) {
 	}
 }
 
-// TestReleaseStaleBufferedCopies asserts the buffer reconcile closes a volunteer's
-// buffered (RESERVED, un-started) copies it no longer reports holding, while leaving
-// the ones it still holds, leaving RUNNING copies untouched, and respecting the grace
-// window (a copy newer than the cutoff is never released).
-func TestReleaseStaleBufferedCopies(t *testing.T) {
+// TestReleaseStaleHeldCopies asserts the held-copy reconcile closes the copies a machine
+// no longer reports holding — BOTH buffered and run-started — while leaving the ones it
+// still holds and respecting the grace window (a copy newer than the cutoff is never
+// released).
+//
+// The running-copy arm is the TB-13 regression: this test previously asserted the
+// opposite ("runningUnit must remain live — started copies ride their deadline"), which
+// is exactly the behavior that stranded a crashed volunteer's claims for the leaf's whole
+// deadline.
+func TestReleaseStaleHeldCopies(t *testing.T) {
 	pool, cleanup := setupTestDB(t)
 	defer cleanup()
 
-	userID := createTestUser(t, pool, "release-stale-buffered")
+	userID := createTestUser(t, pool, "release-stale-held")
 	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
 	repo := NewPgxWorkUnitRepository(pool)
 	ctx := context.Background()
@@ -601,47 +606,171 @@ func TestReleaseStaleBufferedCopies(t *testing.T) {
 	heldUnit := mustQueuedWU(t, ctx, repo, leafID)
 	droppedUnit := mustQueuedWU(t, ctx, repo, leafID)
 	runningUnit := mustQueuedWU(t, ctx, repo, leafID)
+	heldRunningUnit := mustQueuedWU(t, ctx, repo, leafID)
 
-	for _, wu := range []*WorkUnit{heldUnit, droppedUnit, runningUnit} {
+	for _, wu := range []*WorkUnit{heldUnit, droppedUnit, runningUnit, heldRunningUnit} {
 		if _, err := repo.ReserveCopy(ctx, wu.ID, vol, nil, until, 3600); err != nil {
 			t.Fatalf("ReserveCopy(%s): %v", wu.ID, err)
 		}
 	}
-	// Run-start the running unit so its copy is no longer buffered (started_at set).
-	if _, err := repo.Assign(ctx, runningUnit.ID, vol); err != nil {
-		t.Fatalf("Assign: %v", err)
+	// Run-start two units so their copies are no longer buffered (started_at set): one
+	// the machine still reports running, one it lost.
+	for _, wu := range []*WorkUnit{runningUnit, heldRunningUnit} {
+		if _, err := repo.Assign(ctx, wu.ID, vol); err != nil {
+			t.Fatalf("Assign(%s): %v", wu.ID, err)
+		}
 	}
 
-	// Volunteer reports holding only heldUnit. Future cutoff so the grace window does
-	// not protect the just-created copies.
-	released, err := repo.ReleaseStaleBufferedCopies(ctx, vol, []types.ID{heldUnit.ID}, time.Now().UTC().Add(time.Minute))
+	// Volunteer reports holding heldUnit (buffered) and heldRunningUnit (running). Future
+	// cutoff so the grace window does not protect the just-created copies.
+	released, err := repo.ReleaseStaleHeldCopies(ctx, vol,
+		[]types.ID{heldUnit.ID, heldRunningUnit.ID}, time.Now().UTC().Add(time.Minute))
 	if err != nil {
-		t.Fatalf("ReleaseStaleBufferedCopies: %v", err)
+		t.Fatalf("ReleaseStaleHeldCopies: %v", err)
 	}
-	if len(released) != 1 || released[0] != droppedUnit.ID {
-		t.Fatalf("expected only droppedUnit released, got %v", released)
+	started := map[types.ID]bool{}
+	for _, rc := range released {
+		started[rc.WorkUnitID] = rc.Started
+	}
+	if len(released) != 2 {
+		t.Fatalf("expected droppedUnit + runningUnit released, got %+v", released)
+	}
+	if _, ok := started[droppedUnit.ID]; !ok {
+		t.Errorf("droppedUnit (buffered, not held) must be released, got %+v", released)
+	} else if started[droppedUnit.ID] {
+		t.Errorf("droppedUnit was never run-started; Started must be false")
+	}
+	if _, ok := started[runningUnit.ID]; !ok {
+		t.Errorf("runningUnit (started, not held) must be released — a crashed holder must not "+
+			"keep its claim until the deadline, got %+v", released)
+	} else if !started[runningUnit.ID] {
+		t.Errorf("runningUnit was run-started; Started must be true so the caller can apply the reliability signal")
 	}
 	if n, _ := repo.CountLiveCopies(ctx, droppedUnit.ID); n != 0 {
 		t.Errorf("droppedUnit should have 0 live copies after release, got %d", n)
 	}
+	if n, _ := repo.CountLiveCopies(ctx, runningUnit.ID); n != 0 {
+		t.Errorf("runningUnit should have 0 live copies after release, got %d", n)
+	}
 	if n, _ := repo.CountLiveCopies(ctx, heldUnit.ID); n != 1 {
 		t.Errorf("heldUnit must remain live (still reported held), got %d", n)
 	}
-	if n, _ := repo.CountLiveCopies(ctx, runningUnit.ID); n != 1 {
-		t.Errorf("runningUnit must remain live (started copies ride their deadline), got %d", n)
+	if n, _ := repo.CountLiveCopies(ctx, heldRunningUnit.ID); n != 1 {
+		t.Errorf("heldRunningUnit must remain live — the machine reported it is still running it, got %d", n)
+	}
+	// Both released units stay QUEUED, so they redispatch at once.
+	for _, id := range []types.ID{droppedUnit.ID, runningUnit.ID} {
+		wu, err := repo.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetByID(%s): %v", id, err)
+		}
+		if wu.State != WorkUnitStateQueued {
+			t.Errorf("released unit %s state = %s, want QUEUED (it must redispatch immediately)", id, wu.State)
+		}
 	}
 
-	// Grace window: a buffered copy newer than the cutoff is NOT released even when not
-	// held (empty held set = volunteer holds nothing).
+	// Grace window: a copy newer than the cutoff is NOT released even when not held
+	// (empty held set = machine holds nothing).
 	graceUnit := mustQueuedWU(t, ctx, repo, leafID)
 	if _, err := repo.ReserveCopy(ctx, graceUnit.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(grace): %v", err)
 	}
-	releasedGrace, err := repo.ReleaseStaleBufferedCopies(ctx, vol, nil, time.Now().UTC().Add(-time.Hour))
+	releasedGrace, err := repo.ReleaseStaleHeldCopies(ctx, vol, nil, time.Now().UTC().Add(-time.Hour))
 	if err != nil {
-		t.Fatalf("ReleaseStaleBufferedCopies (grace): %v", err)
+		t.Fatalf("ReleaseStaleHeldCopies (grace): %v", err)
 	}
 	if len(releasedGrace) != 0 {
-		t.Fatalf("grace window must protect a freshly-created copy, got %v", releasedGrace)
+		t.Fatalf("grace window must protect a freshly-created copy, got %+v", releasedGrace)
+	}
+}
+
+// TestReleaseStaleHeldCopies_FreesStrandedStartedCopy reproduces TB-13 end to end at the
+// database, in the shape the head was found in: a volunteer started two units on a leaf
+// with a 5-hour deadline, its client died, and the copies sat live with reserved_until
+// five hours out. With a cold-start in-flight quota of 2 those two claims are the
+// volunteer's whole budget, so the head correctly refused it every request for five hours
+// — CountActiveByHost is the number that gate reads.
+//
+// Before the fix the release could not touch a started copy, so the count stayed at 2 and
+// the machine stayed locked out.
+func TestReleaseStaleHeldCopies_FreesStrandedStartedCopy(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "release-stranded-started")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy1)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+	vol := createTestVolunteer(t, pool)
+
+	const deadlineSeconds = 18000 // 5 h, the current leaves' deadline
+	reservedUntil := time.Now().UTC().Add(deadlineSeconds * time.Second)
+
+	var stranded []types.ID
+	for i := 0; i < 2; i++ {
+		wu := mustQueuedWU(t, ctx, repo, leafID)
+		if _, err := repo.ReserveCopy(ctx, wu.ID, vol, nil, reservedUntil, deadlineSeconds); err != nil {
+			t.Fatalf("ReserveCopy: %v", err)
+		}
+		if _, err := repo.Assign(ctx, wu.ID, vol); err != nil {
+			t.Fatalf("Assign: %v", err)
+		}
+		stranded = append(stranded, wu.ID)
+	}
+
+	counts, err := repo.CountActiveByHost(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveByHost: %v", err)
+	}
+	if counts[vol] != 2 {
+		t.Fatalf("in-flight count before release = %d, want 2 (the stranded claims)", counts[vol])
+	}
+
+	// The client restarted with nothing to resume and reports holding no work at all.
+	released, err := repo.ReleaseStaleHeldCopies(ctx, vol, nil, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ReleaseStaleHeldCopies: %v", err)
+	}
+	if len(released) != 2 {
+		t.Fatalf("released %d copies, want 2 — a volunteer that reports holding nothing must "+
+			"not stay charged for run-started claims until the leaf's deadline", len(released))
+	}
+	for _, rc := range released {
+		if !rc.Started {
+			t.Errorf("released copy %s reported Started=false, want true", rc.WorkUnitID)
+		}
+	}
+
+	counts, err = repo.CountActiveByHost(ctx)
+	if err != nil {
+		t.Fatalf("CountActiveByHost (after): %v", err)
+	}
+	if counts[vol] != 0 {
+		t.Fatalf("in-flight count after release = %d, want 0 — the quota must be free immediately, "+
+			"not in %d seconds", counts[vol], deadlineSeconds)
+	}
+
+	// The units themselves are undamaged and immediately re-dispatchable to someone else.
+	for _, id := range stranded {
+		wu, err := repo.GetByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetByID(%s): %v", id, err)
+		}
+		if wu.State != WorkUnitStateQueued {
+			t.Errorf("stranded unit %s state = %s, want QUEUED", id, wu.State)
+		}
+	}
+	cands, err := repo.FindDispatchableBatch(ctx, 10, nil, nil)
+	if err != nil {
+		t.Fatalf("FindDispatchableBatch: %v", err)
+	}
+	dispatchable := map[types.ID]bool{}
+	for _, c := range cands {
+		dispatchable[c.WorkUnit.ID] = true
+	}
+	for _, id := range stranded {
+		if !dispatchable[id] {
+			t.Errorf("released unit %s is not dispatchable again", id)
+		}
 	}
 }

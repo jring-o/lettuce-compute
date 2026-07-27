@@ -1713,45 +1713,57 @@ func (r *PgxWorkUnitRepository) CountActiveByHost(ctx context.Context) (map[type
 	return out, nil
 }
 
-// ReleaseStaleBufferedCopies closes a volunteer's buffered (RESERVED, not-yet-run-
-// started) live copies that it no longer holds in its client buffer, per the held
-// set the volunteer reports on each request. See the WorkUnitRepository interface
-// for the full contract. The work unit stays QUEUED so it redispatches at once;
-// RUNNING copies (started_at set) are never touched here — they ride their deadline.
-// The created_at < olderThan guard is the grace window that protects a copy handed
-// out moments ago from being reaped before the volunteer's next report includes it.
-func (r *PgxWorkUnitRepository) ReleaseStaleBufferedCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]types.ID, error) {
+// ReleasedCopy is one copy closed by ReleaseStaleHeldCopies: the unit it belonged to
+// and whether it had RUN-STARTED. Started separates wasted compute (a running copy the
+// machine lost) from a returned buffer entry (never run, no reliability signal — #59),
+// which is the only distinction the caller needs after the release.
+type ReleasedCopy struct {
+	WorkUnitID types.ID
+	Started    bool
+}
+
+// ReleaseStaleHeldCopies closes a machine's live copies that it no longer reports
+// holding, per the held set the client sends on each request (its buffer plus its
+// running slots). See the WorkUnitRepository interface for the full contract. The work
+// unit stays QUEUED so it redispatches at once. The created_at < olderThan guard is the
+// grace window that protects a copy handed out moments ago from being reaped before the
+// machine's next report includes it — it is keyed on creation, not run-start, because
+// the question is whether the copy already existed when the machine built that report.
+//
+// RUN-STARTED copies are in scope (TB-13): excluding them left a crashed holder's claim
+// standing until the leaf's whole deadline elapsed, which locks a volunteer out of all
+// work once its stale claims fill its in-flight quota.
+func (r *PgxWorkUnitRepository) ReleaseStaleHeldCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]ReleasedCopy, error) {
 	rows, err := r.db.Query(ctx, `
 		UPDATE work_unit_assignment_history
 		SET outcome = 'ABANDONED', outcome_at = NOW()
 		-- Match by MACHINE (TODO #19): COALESCE(host_id, volunteer_id) = the reporting
-		-- host's effective id, so only THIS machine's buffered copies are reaped and host
-		-- A's report never releases host B's buffer. Equals volunteer_id for a no-host copy.
+		-- host's effective id, so only THIS machine's copies are reaped and host A's
+		-- report never releases host B's. Equals volunteer_id for a no-host copy.
 		WHERE COALESCE(host_id, volunteer_id) = $1
 		  AND outcome IS NULL
-		  AND started_at IS NULL
 		  AND created_at < $2
 		  -- Held-set guard: an empty/absent set (the machine holds nothing) releases every
-		  -- grace-aged buffered copy; otherwise release only those NOT in the held set.
+		  -- grace-aged copy; otherwise release only those NOT in the held set.
 		  AND (array_length($3::uuid[], 1) IS NULL OR NOT (work_unit_id = ANY($3::uuid[])))
-		RETURNING work_unit_id`,
+		RETURNING work_unit_id, (started_at IS NOT NULL)`,
 		hostID, olderThan, heldWorkUnitIDs,
 	)
 	if err != nil {
-		return nil, apierror.Internal("failed to release stale buffered copies", err)
+		return nil, apierror.Internal("failed to release stale held copies", err)
 	}
 	defer rows.Close()
 
-	var released []types.ID
+	var released []ReleasedCopy
 	for rows.Next() {
-		var wuID types.ID
-		if err := rows.Scan(&wuID); err != nil {
-			return nil, apierror.Internal("failed to scan released buffered copy", err)
+		var rc ReleasedCopy
+		if err := rows.Scan(&rc.WorkUnitID, &rc.Started); err != nil {
+			return nil, apierror.Internal("failed to scan released held copy", err)
 		}
-		released = append(released, wuID)
+		released = append(released, rc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, apierror.Internal("failed to iterate released buffered copies", err)
+		return nil, apierror.Internal("failed to iterate released held copies", err)
 	}
 	return released, nil
 }

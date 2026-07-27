@@ -70,7 +70,7 @@ func (m *mockWURepo) ClaimDispatchableBatch(context.Context, types.ID, time.Dura
 func (m *mockWURepo) ClearExpiredDispatchClaims(context.Context) (int64, error) {
 	return 0, nil
 }
-func (m *mockWURepo) ReleaseStaleBufferedCopies(context.Context, types.ID, []types.ID, time.Time) ([]types.ID, error) {
+func (m *mockWURepo) ReleaseStaleHeldCopies(context.Context, types.ID, []types.ID, time.Time) ([]workunit.ReleasedCopy, error) {
 	return nil, nil
 }
 func (m *mockWURepo) FlushReservations(context.Context, []workunit.FlushReservation, types.ID, time.Duration) ([]workunit.FlushedCopy, error) {
