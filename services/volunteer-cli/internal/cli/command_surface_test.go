@@ -122,6 +122,38 @@ func TestParentCommandsStillRunBare(t *testing.T) {
 	}
 }
 
+// TestGenuineFlagErrorsStillSayUnknownFlag guards the TB-6 fix against itself.
+// The root FlagErrorFunc rewrites an unknown-flag failure into an
+// unknown-command error, and it must do so ONLY when a stray token is the real
+// mistake — it keys off pflag collecting positional arguments into Flags().Args()
+// before it reports the bad flag. A genuinely mistyped flag must still be
+// reported as a flag error, or the fix would trade one misleading message for
+// another. Like TestParentCommandsStillRunBare this is a guard, not a
+// regression test: it passes against the pre-fix code too.
+func TestGenuineFlagErrorsStillSayUnknownFlag(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeDefaultConfig(t, dir)
+
+	cases := [][]string{
+		{"config", "--bogus"},                             // parent owning subcommands, no stray token
+		{"schedule", "set", "--frm", "20:00"},             // leaf command, mistyped flag
+		{"leafs", "list", "--bogus"},                      // leaf under a non-runnable parent
+		{"heads", "weight", "somehead", "200", "--bogus"}, // leaf command that takes positionals
+	}
+	for _, args := range cases {
+		full := append(append([]string{}, args...), "--config", cfgFile, "--data-dir", dir)
+		err := runCLI(t, full...)
+		label := strings.Join(args, " ")
+		if err == nil {
+			t.Errorf("`%s` succeeded; expected a flag error", label)
+			continue
+		}
+		if !strings.Contains(err.Error(), "unknown flag") {
+			t.Errorf("`%s`: %v — a genuinely bad flag must still be reported as a flag error", label, err)
+		}
+	}
+}
+
 // --- TB-8 ---
 
 // TestHeadsShortHelpMentionsTrust: `trust` is where a volunteer grants a head
