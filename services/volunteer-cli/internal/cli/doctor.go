@@ -441,6 +441,82 @@ func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, cap
 	}
 }
 
+// headProbePolicy controls how hard doctor tries before calling a head down.
+type headProbePolicy struct {
+	attempts   int           // total tries, including the first
+	firstProbe time.Duration // deadline for the FIRST try — short, see below
+	perAttempt time.Duration // deadline for every later try — generous
+	backoff    time.Duration // pause between tries
+}
+
+// probeDeadline returns the deadline for a given 1-based attempt.
+//
+// The first try is deliberately impatient and the retry patient. The failure
+// this policy exists for is a connection whose FIRST RPC stalls and whose second
+// answers at once, so waiting out a long deadline on attempt 1 buys nothing —
+// the answer is in attempt 2. Escalating means the reported case resolves faster
+// than the single long attempt it replaced, while a genuinely slow-but-healthy
+// head still gets the full deadline before anyone calls it unreachable.
+func (p headProbePolicy) probeDeadline(attempt int) time.Duration {
+	if attempt <= 1 && p.firstProbe > 0 {
+		return p.firstProbe
+	}
+	return p.perAttempt
+}
+
+// defaultHeadProbePolicy gives a head the same second chance the daemon does.
+//
+// A single attempt was not enough to justify a blocking failure (TB-12): the
+// daemon's connect path retries (client.NewWithRetry, 1s initial backoff) and
+// routinely succeeds on attempt 2 against a head whose first RPC stalls, so
+// doctor reported "no configured head is reachable" on machines that were
+// fetching, computing and submitting work at that very moment. A diagnostic
+// that fails on a healthy setup trains testers to ignore it, and it did:
+// it masked a real bug (TB-11) for a week.
+//
+// Two attempts with the daemon's own initial backoff, rather than the daemon's
+// unbounded retry, because doctor has to terminate. Each attempt keeps the
+// generous per-RPC deadline below.
+var defaultHeadProbePolicy = headProbePolicy{
+	attempts:   2,
+	firstProbe: 8 * time.Second,
+	perAttempt: 15 * time.Second,
+	backoff:    1 * time.Second,
+}
+
+// probeServerStatus calls probe until it succeeds or the policy is exhausted,
+// returning the response, the attempt number that produced it (or the number
+// spent), and the last error. Each attempt gets its own deadline: a stalled
+// first RPC must not eat the budget of the retry that would have succeeded.
+func probeServerStatus(
+	ctx context.Context,
+	p headProbePolicy,
+	probe func(context.Context) (*lettucev1.GetServerStatusResponse, error),
+) (*lettucev1.GetServerStatusResponse, int, error) {
+	if p.attempts < 1 {
+		p.attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= p.attempts; attempt++ {
+		probeCtx, cancel := context.WithTimeout(ctx, p.probeDeadline(attempt))
+		st, err := probe(probeCtx)
+		cancel()
+		if err == nil {
+			return st, attempt, nil
+		}
+		lastErr = err
+		if attempt == p.attempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, attempt, ctx.Err()
+		case <-time.After(p.backoff):
+		}
+	}
+	return nil, p.attempts, lastErr
+}
+
 // checkOneHead connects to a single head using the public discovery RPCs (no
 // identity needed), reports reachability + eligibility, and returns whether it
 // was reachable.
@@ -466,28 +542,43 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 	// TLS handshake + HTTP/2 setup) before the RPC, so give each public RPC its
 	// own generous deadline rather than sharing one tight budget. A busy head or
 	// a cold connection can take several seconds even while the daemon's warm,
-	// long-lived connection is submitting work fine.
-	const probeTimeout = 15 * time.Second
+	// long-lived connection is submitting work fine — and it is retried, so one
+	// stalled first RPC is no longer enough to declare a head down (TB-12).
+	policy := defaultHeadProbePolicy
 
-	statusCtx, cancelStatus := context.WithTimeout(ctx, probeTimeout)
-	defer cancelStatus()
-
-	st, err := gc.GetServerStatus(statusCtx)
+	st, statusAttempts, err := probeServerStatus(ctx, policy, gc.GetServerStatus)
 	if err != nil {
+		tries := ""
+		if policy.attempts > 1 {
+			tries = fmt.Sprintf(" over %d attempts", policy.attempts)
+		}
 		// A deadline here usually means "slow/cold connection," not "down" — the
 		// daemon's warm connection may be working fine. Don't cry "unreachable".
 		if status.Code(err) == codes.DeadlineExceeded {
 			rep.add(docWarn, name,
-				fmt.Sprintf("slow to respond (no reply within %s)", probeTimeout),
+				fmt.Sprintf("slow to respond (no reply within %s%s)", policy.probeDeadline(policy.attempts), tries),
 				"the head is reachable but slow — a busy head or a cold connection can exceed this; if work is still flowing, this is usually benign")
 		} else {
-			rep.add(docWarn, name, fmt.Sprintf("unreachable (%v)", err),
+			rep.add(docWarn, name, fmt.Sprintf("unreachable (%v)%s", err, tries),
 				"verify the host/port and that the head is running")
 		}
 		return false
 	}
 
-	headCtx, cancelHead := context.WithTimeout(ctx, probeTimeout)
+	// Reached, but not on the first try. Say so rather than staying silent: this
+	// is a real anomaly — the daemon shows the same first-RPC stall on every
+	// start — and it is the signal TB-12's second half exists to chase. It is
+	// deliberately a warning and not a failure, because work does flow.
+	if statusAttempts > 1 {
+		rep.add(docWarn, name,
+			fmt.Sprintf("reachable, but only on attempt %d — the first connection did not answer within %s", statusAttempts, policy.probeDeadline(1)),
+			"the head is usable and work will flow; a consistently slow first connection is worth reporting, as it also delays every daemon start")
+	}
+
+	// The connection is warm by now (GetServerStatus just succeeded on it), so
+	// this second RPC gets the generous deadline outright rather than the
+	// impatient first-try one.
+	headCtx, cancelHead := context.WithTimeout(ctx, policy.perAttempt)
 	defer cancelHead()
 
 	resp, err := gc.GetHeadInfo(headCtx, &lettucev1.GetHeadInfoRequest{})
