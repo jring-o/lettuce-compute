@@ -83,6 +83,21 @@ func New(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 
 	conn, err := grpc.NewClient(cfg.ServerURL,
 		grpc.WithTransportCredentials(creds),
+		// Do NOT let the resolver fetch a service config from DNS. gRPC's DNS resolver
+		// otherwise looks up a TXT record at "_grpc_config.<head hostname>" on every
+		// resolution — a name essentially no head publishes. On a network whose DNS answers
+		// "no such name" promptly that costs nothing; on one that simply never answers a
+		// negative query (VPNs, some routers and ISPs are all documented cases) the lookup
+		// stalls until it times out, measured at ~11s. The connection cannot proceed until
+		// resolution finishes, so every daemon start burned that stall, the first RPC died
+		// on its own 10s deadline, and the retry a second later succeeded because the
+		// lookup had completed meanwhile — the "always connects on attempt 2" symptom, and
+		// doctor calling a healthy head unreachable.
+		//
+		// We consume no service config from any source, so nothing is lost by not asking.
+		// Fixing it here rather than by publishing the record per head is deliberate: heads
+		// are run by independent operators, and a volunteer's DNS is not ours to repair.
+		grpc.WithDisableServiceConfig(),
 		grpc.WithChainUnaryInterceptor(
 			loggingClientInterceptor(logger, cfg.ServerURL),
 			signingClientInterceptor(cfg.Identity),
