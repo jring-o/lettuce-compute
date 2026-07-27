@@ -54,6 +54,15 @@ type Fetcher struct {
 	// Returns true if fetching should proceed, false to wait.
 	shouldFetchFunc func() bool
 
+	// leafFailurePausedFn reports whether a leaf is currently held back by the
+	// per-leaf execution-failure breaker (TB-10): its units ran on this machine
+	// and failed, repeatedly, so re-requesting them only burns units. Distinct
+	// from the per-runtime breaker below, which counts capability failures
+	// (missing runtime, failed Prepare) and pauses a whole runtime kind. Injected
+	// from the daemon, which owns the counter because failures are observed on
+	// the coordinator goroutine. nil disables the skip.
+	leafFailurePausedFn func(leafID string) bool
+
 	// --- CLIENT WORK BUFFER (Layer 1) ---
 	// workBufferFullFn reports whether the hours-based client work buffer is full.
 	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
@@ -161,6 +170,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafPrefsFunc:            d.leafPreferences,
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
 		shouldFetchFunc:          d.shouldFetch,
+		leafFailurePausedFn:      d.leafFailurePaused,
 		workBufferFullFn:         d.workBufferFull,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
@@ -448,6 +458,17 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			// grab->abandon churn and the head-side reassignment burn.
 			if reqRt := requiredRuntimeForLeaf(leaf); f.runtimePaused(reqRt) {
 				f.logger.Debug("fetcher: skipping leaf for paused runtime", "server", head.Name, "leaf_slug", leaf.Slug, "runtime", reqRt)
+				continue
+			}
+
+			// TB-10: this leaf's units run on this machine and fail — every time.
+			// The runtime breaker above cannot catch that (the runtime is present
+			// and Prepare succeeds), so without this skip the client fetched,
+			// failed and abandoned the same leaf several times a second for as
+			// long as the artifact stayed broken. Skip BEFORE issuing
+			// RequestWorkUnit, so the head is spared the churn too.
+			if f.leafFailurePausedFn != nil && f.leafFailurePausedFn(leaf.ID) {
+				f.logger.Debug("fetcher: skipping leaf paused after repeated local failures", "server", head.Name, "leaf_slug", leaf.Slug, "leaf_id", leaf.ID)
 				continue
 			}
 

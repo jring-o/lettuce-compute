@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,25 @@ type StatusResponse struct {
 	ActiveTasks      []ActiveTaskInfo `json:"active_tasks"`
 	QueuedTasks      []QueuedTaskInfo `json:"queued_tasks"`
 	PausedReason     *string          `json:"paused_reason"`
+	// FailingLeafs lists every leaf whose units have failed locally since the
+	// daemon started, newest failure first. It exists so a volunteer can see that
+	// work IS arriving and failing, rather than concluding they are never sent
+	// work of that kind — the exact misreading TB-10 was filed for.
+	FailingLeafs []FailingLeafInfo `json:"failing_leafs"`
+}
+
+// FailingLeafInfo is one leaf's local failure record, as reported by `status`.
+type FailingLeafInfo struct {
+	LeafID              string `json:"leaf_id"`
+	LeafName            string `json:"leaf_name"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	TotalFailures       int    `json:"total_failures"`
+	LastReason          string `json:"last_reason,omitempty"`
+	LastFailedAt        string `json:"last_failed_at,omitempty"`
+	// Paused reports that the per-leaf breaker has stopped requesting this leaf;
+	// PausedUntil is when it will be retried.
+	Paused      bool   `json:"paused"`
+	PausedUntil string `json:"paused_until,omitempty"`
 }
 
 // QueuedTaskInfo describes a work unit waiting in the prefetch queue.
@@ -249,7 +269,33 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 		ActiveTasks:      activeTasks,
 		QueuedTasks:      queuedTasks,
 		PausedReason:     pausedReasonPtr,
+		FailingLeafs:     b.failingLeafs(),
 	}
+}
+
+// failingLeafs renders the daemon's per-leaf failure records for the API,
+// resolving each leaf id to its display name.
+func (b *DaemonBridge) failingLeafs() []FailingLeafInfo {
+	snap := b.daemon.LeafFailureSnapshot()
+	out := make([]FailingLeafInfo, 0, len(snap))
+	for _, s := range snap {
+		info := FailingLeafInfo{
+			LeafID:              s.LeafID,
+			LeafName:            b.resolveLeafName(s.LeafID),
+			ConsecutiveFailures: s.Consecutive,
+			TotalFailures:       s.Total,
+			LastReason:          s.LastReason,
+			Paused:              s.Paused,
+		}
+		if !s.LastFailedAt.IsZero() {
+			info.LastFailedAt = s.LastFailedAt.UTC().Format(time.RFC3339)
+		}
+		if !s.PausedUntil.IsZero() {
+			info.PausedUntil = s.PausedUntil.UTC().Format(time.RFC3339)
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // Pause pauses the daemon. Returns error if already paused.
@@ -836,6 +882,42 @@ type LeafDetail struct {
 	Enabled          bool               `json:"enabled"`
 	EffectiveWeight  int                `json:"effective_weight"`
 	ExecutionSpec    *LeafExecutionSpec `json:"execution_spec,omitempty"`
+	// Failures is this leaf's local failure record, or nil if it has never
+	// failed on this machine. Carried alongside the leaf so `leafs list` can say
+	// "arriving and failing" in the same row that says "active" (TB-10).
+	Failures *FailingLeafInfo `json:"failures,omitempty"`
+}
+
+// MachineCapabilities is what this machine can actually do, as the RUNNING
+// daemon sees it. A client deciding whether a given leaf will ever be fetched
+// here needs the leaf's requirements AND these; deriving them again from
+// config.yaml would answer for a configuration that may not be the one the
+// daemon loaded, and would re-run hardware detection the daemon already did
+// once at startup (TB-4).
+type MachineCapabilities struct {
+	// Runtimes are the runtime kinds registered in the daemon's runtime
+	// registry, lowercase (e.g. ["container","native","wasm"]).
+	Runtimes []string `json:"runtimes"`
+	HasGPU   bool     `json:"has_gpu"`
+	// MaxMemoryMB is the per-unit memory ceiling the daemon is enforcing.
+	MaxMemoryMB int `json:"max_memory_mb"`
+}
+
+// MachineRuntimes returns the runtime kinds this daemon has registered and can
+// execute, lowercase and sorted.
+func (b *DaemonBridge) MachineRuntimes() []string {
+	names := b.daemon.AvailableRuntimeNames()
+	sort.Strings(names)
+	return names
+}
+
+// MachineCaps reports this machine's capabilities as the running daemon sees them.
+func (b *DaemonBridge) MachineCaps() MachineCapabilities {
+	return MachineCapabilities{
+		Runtimes:    b.MachineRuntimes(),
+		HasGPU:      b.daemon.HasGPU(),
+		MaxMemoryMB: b.daemon.GetConfig().ResourceLimits.MaxMemoryMB,
+	}
 }
 
 // GetHeads returns head info for all configured servers, with leaf details.
@@ -843,6 +925,13 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 	cfg := b.daemon.GetConfig()
 	mc := b.daemon.GetMultiClient()
 	lc := b.daemon.GetLeafCache()
+
+	// Per-leaf failure records, keyed by leaf id, so each leaf row can carry its
+	// own (TB-10).
+	failures := make(map[string]FailingLeafInfo)
+	for _, f := range b.failingLeafs() {
+		failures[f.LeafID] = f
+	}
 
 	serverStatus := make(map[string]bool)
 	serverVolunteerID := make(map[string]string)
@@ -938,6 +1027,9 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 						MaxDiskMB:     leaf.ExecutionSpec.MaxDiskMB,
 						NetworkAccess: leaf.ExecutionSpec.NetworkAccess,
 					}
+				}
+				if f, ok := failures[leaf.ID]; ok {
+					ld.Failures = &f
 				}
 				hi.Leafs = append(hi.Leafs, ld)
 			}

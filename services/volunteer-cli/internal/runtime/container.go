@@ -768,8 +768,8 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		c.logger.Warn("container exited non-zero",
 			"work_unit_id", wu.ID,
 			"exit_code", int(exitCode),
-			"log_tail", tailOfFile(filepath.Join(prep.WorkDir, "execution.log"), containerLogTailBytes),
-			"log_path", filepath.Join(prep.WorkDir, "execution.log"),
+			"log_tail", ExecutionLogTail(prep.WorkDir),
+			"log_path", ExecutionLogPath(prep.WorkDir),
 		)
 	}
 
@@ -829,35 +829,6 @@ func (c *ContainerRuntime) Cleanup(prep *PrepareResult) error {
 	return os.RemoveAll(prep.WorkDir)
 }
 
-// containerLogTailBytes bounds the execution-log excerpt attached to the
-// non-zero-exit WARN: enough for a stack trace, small enough for a log line.
-const containerLogTailBytes = 4096
-
-// tailOfFile returns up to the last maxBytes of the file as a string, or a
-// short placeholder when the file is missing/unreadable. Best-effort — used
-// only for diagnostics.
-func tailOfFile(path string, maxBytes int64) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return "(no captured container log)"
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return "(no captured container log)"
-	}
-	if st.Size() > maxBytes {
-		if _, err := f.Seek(-maxBytes, io.SeekEnd); err != nil {
-			return "(no captured container log)"
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
-	if err != nil || len(data) == 0 {
-		return "(no captured container log)"
-	}
-	return string(data)
-}
-
 // captureContainerLogs writes container stdout/stderr to execution.log capped at 10 MB.
 //
 // The engine's log stream is MULTIPLEXED (the container runs without a TTY, so
@@ -874,7 +845,7 @@ func (c *ContainerRuntime) captureContainerLogs(ctx context.Context, containerID
 	}
 	defer logReader.Close()
 
-	logPath := filepath.Join(workDir, "execution.log")
+	logPath := ExecutionLogPath(workDir)
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		c.logger.Warn("failed to create execution log", "error", err)

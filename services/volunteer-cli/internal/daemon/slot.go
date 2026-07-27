@@ -100,6 +100,13 @@ type SlotResult struct {
 	Err            error
 	TotalPausedDur time.Duration // accumulated pause time for CPU time calculation
 	VizBundlePath  string        // from PrepareResult; non-empty if leaf has viz bundle
+	// FailureLogTail is a single-line excerpt of the unit's execution log,
+	// captured only when the unit failed. It has to be read HERE, inside the
+	// slot: the deferred cleanup below removes the work dir before this result
+	// reaches the coordinator, so by the time the daemon decides to abandon the
+	// unit the one artifact explaining the failure is already gone (TB-10).
+	// Empty when the unit succeeded or the log could not be read.
+	FailureLogTail string
 }
 
 // SlotManager owns a fixed pool of execution slots.
@@ -180,6 +187,15 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 	var execErr error
 
 	defer func() {
+		// Read the execution log BEFORE either branch below: the cleanup branch
+		// deletes the work dir, and the preserve branch keeps it but this result
+		// still travels without it. Only on a failure — a unit that exited 0 has
+		// nothing to explain (TB-10).
+		var failureLogTail string
+		if execErr != nil || (execResult != nil && execResult.ExitCode != 0) {
+			failureLogTail = runtime.ExecutionLogSummary(prep.WorkDir, abandonReasonLogTailBytes)
+		}
+
 		// If daemon is shutting down and execution was interrupted (not completed
 		// successfully), preserve the work directory for resumption on next startup.
 		// A unit dropped at run-start (errStartWorkDropped) is no longer ours, so it
@@ -258,6 +274,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			Err:            execErr,
 			TotalPausedDur: pausedDur,
 			VizBundlePath:  prep.VizBundlePath,
+			FailureLogTail: failureLogTail,
 		}
 
 		// Return slot to available pool.

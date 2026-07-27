@@ -148,6 +148,13 @@ type Daemon struct {
 	leafCache        *LeafCache
 	weightedSelector *WeightedSelector
 
+	// Per-leaf execution-failure breaker (TB-10): counts consecutive local
+	// failures per leaf so the fetcher stops re-requesting a leaf that keeps
+	// failing on THIS machine, and so `status`/`leafs list` can say it is
+	// happening instead of leaving the volunteer to infer they are receiving no
+	// work. See leaf_failures.go.
+	leafFailures *leafFailureTracker
+
 	// Concurrent execution (replaces serial currentWU/pipelining).
 	slotManager   *SlotManager
 	prefetchQueue *PreFetchQueue
@@ -373,6 +380,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cachedHW:         hw,
 		leafCache:        leafCache,
 		weightedSelector: ws,
+		leafFailures:     newLeafFailureTracker(time.Now),
 		userPauseCh:      make(chan bool, 1),
 		processGroup:     pg,
 		benchmarkFPOPS:   benchFPOPS,
@@ -732,8 +740,10 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
 			"error", result.Err,
+			"log_tail", logTailOrNone(result.FailureLogTail),
 		)
-		d.abandonUnit(wu, conn, "execution failed: "+result.Err.Error())
+		d.noteLeafFailure(wu, result.Err.Error())
+		d.abandonUnit(wu, conn, withLogTail("execution failed: "+result.Err.Error(), result.FailureLogTail))
 		return
 	}
 
@@ -743,14 +753,27 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	}
 
 	if result.Result.ExitCode != 0 {
+		reason := fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode)
 		d.logger.Error("slot execution non-zero exit",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
 			"exit_code", result.Result.ExitCode,
+			"log_tail", logTailOrNone(result.FailureLogTail),
 		)
-		d.abandonUnit(wu, conn, fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode))
+		d.noteLeafFailure(wu, reason)
+		// Send the log tail to the head too. Without it the abandon reason was
+		// just the exit code, so an operator whose artifact is broken for a whole
+		// class of volunteer machines had nothing to diagnose from and the
+		// volunteer's own log was the only copy (TB-10).
+		d.abandonUnit(wu, conn, withLogTail(reason, result.FailureLogTail))
 		return
 	}
+
+	// The unit ran to a clean exit: this leaf works on this machine, so clear any
+	// failure streak the breaker was accumulating for it. Success is judged on the
+	// exit code, not on the submission below — whether the head is reachable says
+	// nothing about whether the artifact runs here.
+	d.noteLeafSuccess(wu)
 
 	// Persist result JSON for replay if the leaf has a viz bundle.
 	if result.VizBundlePath != "" && len(result.Result.OutputData) > 0 {
@@ -1636,6 +1659,107 @@ func (d *Daemon) abandonItem(item *PreFetchItem, reason string) {
 	d.logger.Info("abandoned un-run work unit back to head", "work_unit_id", item.WU.ID, "reason", reason)
 }
 
+// abandonReasonLogTailBytes bounds the execution-log excerpt appended to an
+// abandon reason. The reason crosses the wire and is written to the head's log,
+// so it has to stay one readable line — long enough for the decisive last lines
+// of a failing process, short enough not to swamp the operator's log.
+const abandonReasonLogTailBytes = 500
+
+// withLogTail appends an execution-log excerpt to an abandon reason, or returns
+// the reason unchanged when there was nothing to read.
+func withLogTail(reason, tail string) string {
+	if tail == "" {
+		return reason
+	}
+	return reason + "; output: " + tail
+}
+
+// logTailOrNone renders an execution-log excerpt for a log field, naming the
+// absence explicitly so an empty tail is not mistaken for silent output.
+func logTailOrNone(tail string) string {
+	if tail == "" {
+		return "(none captured)"
+	}
+	return tail
+}
+
+// noteLeafFailure records one local failure of a work unit's leaf against the
+// per-leaf breaker, and emits the single loud WARN when this failure is the one
+// that trips it. The volunteer is told what is happening and what it means —
+// before this, a leaf that failed on every attempt produced nothing a volunteer
+// would recognize as a problem with that leaf (TB-10).
+func (d *Daemon) noteLeafFailure(wu *runtime.WorkUnit, reason string) {
+	if d.leafFailures == nil || wu == nil {
+		return
+	}
+	count, tripped := d.leafFailures.RecordFailure(wu.LeafID, reason)
+	if !tripped {
+		return
+	}
+	name, slug := d.resolveLeafInfo(wu.LeafID)
+	d.logger.Warn("leaf keeps failing on this machine — pausing requests for it",
+		"leaf_id", wu.LeafID,
+		"leaf_name", name,
+		"leaf_slug", slug,
+		"consecutive_failures", count,
+		"last_reason", reason,
+		"cooldown", leafFailureCooldown,
+		"remedy", "this leaf's work fails locally every time, so requesting more of it only churns units; the daemon will retry it after the cooldown. Check the log lines above for the process output, and report it to the head's operator if it persists")
+}
+
+// noteLeafSuccess clears a leaf's failure streak after a clean run, marking the
+// recovery in the log when it un-pauses a leaf the breaker had tripped.
+func (d *Daemon) noteLeafSuccess(wu *runtime.WorkUnit) {
+	if d.leafFailures == nil || wu == nil {
+		return
+	}
+	if d.leafFailures.RecordSuccess(wu.LeafID) {
+		name, slug := d.resolveLeafInfo(wu.LeafID)
+		d.logger.Info("leaf recovered, resuming requests for it",
+			"leaf_id", wu.LeafID, "leaf_name", name, "leaf_slug", slug)
+	}
+}
+
+// AvailableRuntimeNames returns the runtime kinds this daemon has registered and
+// can execute (lowercase). Exported for the management API so a client can tell
+// which leafs this machine will ever be able to run.
+func (d *Daemon) AvailableRuntimeNames() []string {
+	if d.runtimeRegistry == nil {
+		return nil
+	}
+	return d.runtimeRegistry.AvailableRuntimes()
+}
+
+// HasGPU reports whether this machine has a GPU the daemon can use: one must be
+// present in the hardware detected at startup, and GPU work must not be disabled
+// in config. Serves the management API rather than re-running detection, which
+// on Windows means another exec.
+func (d *Daemon) HasGPU() bool {
+	if d.cfg != nil && d.cfg.ResourceLimits.MaxGPUVRAMPct == 0 {
+		return false
+	}
+	return d.cachedHW != nil && len(d.cachedHW.GetGpus()) > 0
+}
+
+// leafFailurePaused reports whether the per-leaf breaker is holding a leaf back.
+// Called from the fetcher goroutine; the tracker takes its own lock.
+func (d *Daemon) leafFailurePaused(leafID string) bool {
+	if d.leafFailures == nil {
+		return false
+	}
+	return d.leafFailures.Paused(leafID)
+}
+
+// LeafFailureSnapshot reports every leaf that has failed locally since the daemon
+// started, newest first. Read by the management API so `status` and `leafs list`
+// can show repeated failures instead of leaving them to head-side forensics.
+func (d *Daemon) LeafFailureSnapshot() []LeafFailureSummary {
+	if d.leafFailures == nil {
+		return nil
+	}
+	return d.leafFailures.Snapshot()
+}
+
 // abandonUnit closes this volunteer's live copy (RESERVED or RUNNING) of a locally
 // failed unit — non-zero exit, deadline-exceeded, runtime failure — back to the head
 // as ABANDONED. AbandonWorkUnit is the protocol's only failure signal (SubmitResult
@@ -2136,6 +2260,13 @@ func (d *Daemon) SetSlotManagerForTest(sm *SlotManager) {
 // volunteer ID population without running the full daemon loop.
 func (d *Daemon) SetMultiClientForTest(mc *MultiServerClient) {
 	d.multiClient = mc
+}
+
+// RecordLeafFailureForTest drives the per-leaf failure breaker directly, so an
+// external test package (e.g. management) can assert that a recorded failure
+// reaches the API without running a work unit.
+func (d *Daemon) RecordLeafFailureForTest(leafID, reason string) {
+	d.noteLeafFailure(&runtime.WorkUnit{LeafID: leafID}, reason)
 }
 
 // initializeWeights computes effective leaf weights from cache + config preferences.
