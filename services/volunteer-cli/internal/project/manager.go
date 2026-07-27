@@ -219,7 +219,12 @@ func (m *Manager) AttachServerWithTLS(host string, grpcPort, httpPort int, insec
 
 	for _, s := range m.cfg.Servers {
 		if s.GRPCAddress == grpcAddr && s.LeafID == "" {
-			return fmt.Errorf("already attached to server %s", grpcAddr)
+			// Re-attaching is the natural move for a volunteer who wants the trust
+			// question they were never asked, so a bare refusal leaves them stuck with
+			// no idea where the decision lives (TB-7). Name the command that does it.
+			return fmt.Errorf("already attached to server %s — to change what it may run on this machine: "+
+				"lettuce-volunteer heads trust %s container,native (or `heads list` to see the current setting)",
+				grpcAddr, s.DisplayName())
 		}
 	}
 

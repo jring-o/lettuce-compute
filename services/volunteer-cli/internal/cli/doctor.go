@@ -14,6 +14,7 @@ import (
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/cron"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
@@ -177,6 +178,15 @@ func checkAccountInfo(rep *doctorReport) {
 		}
 	}
 
+	// A schedule that can never become active blocks ALL work, so it is a failure
+	// here, not a line of information. Doctor previously echoed an unparseable cron
+	// expression verbatim alongside the passing checks, which is what let a
+	// silently-idle volunteer read as healthy (TB-3).
+	if err := cfg.Scheduling.NeverRuns(); err != nil {
+		rep.add(docFail, "schedule", describeSchedule(cfg.Scheduling),
+			"the volunteer will never run — set a daily window with `lettuce-volunteer schedule set --from 20:00 --to 06:00`, or `schedule clear` to run always")
+		return
+	}
 	rep.add(docInfo, "schedule", describeSchedule(cfg.Scheduling), "")
 }
 
@@ -200,6 +210,9 @@ func describeSchedule(s config.Scheduling) string {
 			}
 			return "SCHEDULED: " + strings.Join(parts, "; ")
 		case s.CronExpression != "":
+			if err := cron.Validate(s.CronExpression); err != nil {
+				return "SCHEDULED (cron: " + s.CronExpression + ") — NOT a valid cron expression: " + err.Error()
+			}
 			return "SCHEDULED (cron: " + s.CronExpression + ")"
 		default:
 			return "SCHEDULED but no window configured — the volunteer will never run (set one with `schedule set`)"

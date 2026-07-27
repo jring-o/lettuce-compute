@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lettuce-compute/volunteer-cli/internal/cron"
 	"gopkg.in/yaml.v3"
 )
 
@@ -159,6 +160,73 @@ type Scheduling struct {
 	IdleThresholdMins int             `yaml:"idle_threshold_mins" json:"idle_threshold_mins"`
 	CronExpression    string          `yaml:"cron_expression,omitempty" json:"cron_expression,omitempty"`
 	ScheduleRanges    []ScheduleRange `yaml:"schedule_ranges,omitempty" json:"schedule_ranges,omitempty"`
+}
+
+// NeverRuns reports WHY this scheduling configuration can never become active,
+// or nil when it can. It mirrors the SCHEDULED branch of the resource
+// scheduler's ShouldRun exactly — ranges take precedence, else the cron
+// expression must parse — so it is a statement about runtime behavior rather
+// than a stricter opinion about the file.
+//
+// It exists separately from Validate because the read paths (`start`, `doctor`)
+// must flag only a genuinely dead schedule: a config that is merely untidy
+// still runs today, and turning that into a refusal would lock working
+// volunteers out over something cosmetic. The write paths use Validate.
+func (s *Scheduling) NeverRuns() error {
+	if s.Mode != "SCHEDULED" || len(s.ScheduleRanges) > 0 {
+		return nil
+	}
+	if s.CronExpression == "" {
+		return errors.New("scheduling.mode is SCHEDULED but neither a time window nor a cron expression is configured")
+	}
+	if err := cron.Validate(s.CronExpression); err != nil {
+		return fmt.Errorf("scheduling.cron_expression %q is not a valid cron expression: %w", s.CronExpression, err)
+	}
+	return nil
+}
+
+// Validate checks the scheduling block on its own, so callers that need the
+// scheduling rules without validating a whole config can reuse them.
+//
+// The cron expression is PARSED, not merely checked for non-emptiness. An
+// unparseable expression used to be accepted everywhere it could be written and
+// then failed silently on every 10-second scheduler poll, so the volunteer was
+// configured, appeared healthy, and never ran (TB-3).
+func (s *Scheduling) Validate() error {
+	validModes := map[string]bool{"ALWAYS": true, "WHEN_IDLE": true, "SCHEDULED": true}
+	if !validModes[s.Mode] {
+		return fmt.Errorf("scheduling.mode must be ALWAYS, WHEN_IDLE, or SCHEDULED, got %q", s.Mode)
+	}
+	if s.Mode == "WHEN_IDLE" && s.IdleThresholdMins < 1 {
+		return fmt.Errorf("scheduling.idle_threshold_mins must be >= 1 when mode is WHEN_IDLE")
+	}
+	if s.Mode == "SCHEDULED" && s.CronExpression == "" && len(s.ScheduleRanges) == 0 {
+		return fmt.Errorf("scheduling.cron_expression or schedule_ranges is required when mode is SCHEDULED")
+	}
+	// Checked whenever present, not only when it is the active representation:
+	// schedule ranges take precedence over cron, so a stored bad cron would
+	// otherwise lie in wait until the ranges were removed.
+	if s.CronExpression != "" {
+		if err := cron.Validate(s.CronExpression); err != nil {
+			return fmt.Errorf("scheduling.cron_expression %q is not a valid cron expression: %w — "+
+				"if you meant a daily window use `lettuce-volunteer schedule set --from 20:00 --to 06:00`",
+				s.CronExpression, err)
+		}
+	}
+	for i, r := range s.ScheduleRanges {
+		if r.StartHour < 0 || r.StartHour > 23 {
+			return fmt.Errorf("scheduling.schedule_ranges[%d].start_hour must be 0-23, got %d", i, r.StartHour)
+		}
+		if r.EndHour < 0 || r.EndHour > 23 {
+			return fmt.Errorf("scheduling.schedule_ranges[%d].end_hour must be 0-23, got %d", i, r.EndHour)
+		}
+		for _, d := range r.Days {
+			if d < 0 || d > 6 {
+				return fmt.Errorf("scheduling.schedule_ranges[%d] has invalid day %d (must be 0-6)", i, d)
+			}
+		}
+	}
+	return nil
 }
 
 // LeafFilter controls which leafs the volunteer accepts.
@@ -749,7 +817,7 @@ var thermalComments = map[string]string{
 var schedulingComments = map[string]string{
 	"mode":                "ALWAYS, WHEN_IDLE (only when the machine is idle), or SCHEDULED (time windows).",
 	"idle_threshold_mins": "WHEN_IDLE only: minutes of inactivity before work starts.",
-	"cron_expression":     "SCHEDULED only: cron expression for active windows.",
+	"cron_expression":     "SCHEDULED only: a valid 5-field cron expression (minute hour day-of-month month day-of-week). Prefer schedule_ranges - see `lettuce-volunteer schedule set`.",
 }
 
 // Validate checks that all config values are valid.
@@ -770,28 +838,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("resource_limits.max_gpu_vram_pct must be 0-100, got %d", c.ResourceLimits.MaxGPUVRAMPct)
 	}
 
-	validModes := map[string]bool{"ALWAYS": true, "WHEN_IDLE": true, "SCHEDULED": true}
-	if !validModes[c.Scheduling.Mode] {
-		return fmt.Errorf("scheduling.mode must be ALWAYS, WHEN_IDLE, or SCHEDULED, got %q", c.Scheduling.Mode)
-	}
-	if c.Scheduling.Mode == "WHEN_IDLE" && c.Scheduling.IdleThresholdMins < 1 {
-		return fmt.Errorf("scheduling.idle_threshold_mins must be >= 1 when mode is WHEN_IDLE")
-	}
-	if c.Scheduling.Mode == "SCHEDULED" && c.Scheduling.CronExpression == "" && len(c.Scheduling.ScheduleRanges) == 0 {
-		return fmt.Errorf("scheduling.cron_expression or schedule_ranges is required when mode is SCHEDULED")
-	}
-	for i, r := range c.Scheduling.ScheduleRanges {
-		if r.StartHour < 0 || r.StartHour > 23 {
-			return fmt.Errorf("scheduling.schedule_ranges[%d].start_hour must be 0-23, got %d", i, r.StartHour)
-		}
-		if r.EndHour < 0 || r.EndHour > 23 {
-			return fmt.Errorf("scheduling.schedule_ranges[%d].end_hour must be 0-23, got %d", i, r.EndHour)
-		}
-		for _, d := range r.Days {
-			if d < 0 || d > 6 {
-				return fmt.Errorf("scheduling.schedule_ranges[%d] has invalid day %d (must be 0-6)", i, d)
-			}
-		}
+	if err := c.Scheduling.Validate(); err != nil {
+		return err
 	}
 
 	validLeafModes := map[string]bool{"ALL": true, "SPECIFIC": true, "BLOCKLIST": true}

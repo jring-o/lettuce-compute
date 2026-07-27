@@ -29,11 +29,13 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().String("schedule-mode", "", "Scheduling mode (always, idle, scheduled)")
 	cmd.Flags().Int("idle-threshold", 0, "Idle threshold in minutes")
 	cmd.Flags().String("server", "", "Server host to connect to")
+	cmd.Flags().String("trust", "", "With --server: runtimes to trust that head to run — comma list of container,native (wasm is always allowed). Omitted means WASM only")
 	cmd.Flags().String("enabled-leafs", "", "Comma-separated leaf slugs to enable (sets SPECIFIC mode)")
 	return cmd
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
+	trustFlag, _ := cmd.Flags().GetString("trust")
 	// Determine if running non-interactively (flags provided by desktop app).
 	nonInteractive := cmd.Flags().Changed("cpu-cores") || cmd.Flags().Changed("memory-mb") ||
 		cmd.Flags().Changed("schedule-mode") || cmd.Flags().Changed("server")
@@ -180,6 +182,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 		// Server.
 		if host, _ := cmd.Flags().GetString("server"); host != "" {
+			// Per-head runtime trust, from --trust. There is no one to prompt here, so
+			// the flag IS the consent; omitting it is an informed WASM-only default
+			// because the flag is documented on this command (TB-7).
+			trusted, terr := parseTrustRuntimes(trustFlag)
+			if terr != nil {
+				return fmt.Errorf("--trust: %w", terr)
+			}
 			name := host
 			sc := config.ServerConfig{}
 			if strings.Contains(host, ":") {
@@ -191,6 +200,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 				sc.HTTPAddress = fmt.Sprintf("https://%s", host)
 			}
 			sc.Name = name
+			applyInitTrust(&sc, trusted)
 			c.Servers = []config.ServerConfig{sc}
 		}
 
@@ -245,7 +255,14 @@ func runInit(cmd *cobra.Command, args []string) error {
 			c.Scheduling.IdleThresholdMins = promptInt(scanner, "Idle threshold minutes [5]", 5)
 		case "scheduled":
 			c.Scheduling.Mode = "SCHEDULED"
-			c.Scheduling.CronExpression = promptString(scanner, "Cron expression", "")
+			// Daily windows, not raw cron. This step used to ask for a bare "Cron
+			// expression" and store whatever was typed, so an answer that was not a
+			// 5-field cron — flags, a time range, a typo — produced a volunteer that
+			// looked configured and never ran (TB-3), and left a cron expression for
+			// `schedule add` to silently delete later (TB-2). Windows are the same
+			// language `schedule set` speaks and are validated as they are entered.
+			c.Scheduling.CronExpression = ""
+			c.Scheduling.ScheduleRanges = []config.ScheduleRange{promptScheduleWindow(scanner)}
 		default:
 			c.Scheduling.Mode = "ALWAYS"
 		}
@@ -319,6 +336,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 				sc.HTTPAddress = fmt.Sprintf("https://%s", host)
 			}
 			sc.Name = name
+			// The same consent `attach` gives, on the same prompt (TB-7). Container
+			// availability is the machine's real capability, exactly as at attach —
+			// trust is a per-head ceiling, and what the daemon actually advertises is
+			// that ceiling intersected with available_runtimes.
+			applyInitTrust(&sc, promptRuntimeTrust(scanner, name, containerBackendAvailable()))
 			c.Servers = []config.ServerConfig{sc}
 		}
 	}
@@ -340,6 +362,50 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\nConfig saved to %s\n", cfgPath)
 
 	return nil
+}
+
+// promptScheduleWindow asks for a daily time window (the --from/--to/--days trio
+// the `schedule` commands use) and re-asks until it parses, so init cannot write a
+// schedule the daemon will refuse. On a closed stdin every prompt takes its
+// default, which parses, so a non-interactive stream terminates on the first pass.
+func promptScheduleWindow(scanner *bufio.Scanner) config.ScheduleRange {
+	fmt.Println("Run only inside a daily time window. Hours are whole hours and the window may")
+	fmt.Println("wrap past midnight, so \"dusk till dawn\" is simply 20:00 to 06:00.")
+	for {
+		from := promptString(scanner, "Start of window, e.g. 20:00 [20:00]", "20:00")
+		to := promptString(scanner, "End of window, e.g. 06:00 [06:00]", "06:00")
+		days := promptString(scanner, "Days it applies, e.g. mon-fri or sat,sun [mon-sun]", "mon-sun")
+		r, err := buildScheduleRange(from, to, days)
+		if err != nil {
+			fmt.Printf("  %v\n  Let's try that again.\n", err)
+			continue
+		}
+		fmt.Printf("Schedule: %s\n", describeRange(r))
+		fmt.Println("You can change it later with `lettuce-volunteer schedule set` / `schedule add`.")
+		return r
+	}
+}
+
+// applyInitTrust records the per-head runtime trust for a head attached during
+// init and prints what was decided.
+//
+// init used to attach a head without ever putting the "a head is a trust domain"
+// consent that `attach` gives, writing an entry with an empty trusted_runtimes —
+// a silent, un-asked "WASM only". Against a head whose leafs are all
+// CONTAINER/NATIVE that volunteer then fetched nothing at all, with no prompt, no
+// warning and nothing pointing at `heads trust` (TB-7). The list is always
+// non-nil: an empty decision must persist as the explicit choice it is, never as
+// an absent key the legacy-trust migration would re-seed (PB-28).
+func applyInitTrust(sc *config.ServerConfig, trusted []string) {
+	if trusted == nil {
+		trusted = []string{}
+	}
+	sc.TrustedRuntimes = trusted
+	fmt.Printf("%s may run: %s\n", sc.Name, trustSummary(trusted))
+	if len(trusted) == 0 {
+		fmt.Printf("Note: WASM only. If this head hosts container or native leafs you will receive no\n"+
+			"work from it until you say so: lettuce-volunteer heads trust %s container\n", sc.Name)
+	}
 }
 
 func isYes(s string) bool {
