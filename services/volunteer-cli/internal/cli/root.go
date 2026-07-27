@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,15 +59,32 @@ func newRootCmd() *cobra.Command {
 				return fmt.Errorf("loading config: %w", err)
 			}
 
-			// Override log level if set via flag.
+			// --log-level and --log-file are one-time overrides for THIS
+			// command, held apart from the serialized config so no later
+			// cfg.Save turns them into the permanent setting (TB-5). The level
+			// is validated and case-folded here rather than at the point of
+			// use: an unrecognized value used to fall through to info silently,
+			// so a typo — or plain `--log-level DEBUG` — cost the volunteer the
+			// debug logs they asked for with nothing said (TB-1).
+			levelOverride := ""
 			if cmd.Flags().Changed("log-level") {
-				cfg.LogLevel = logLevel
+				canonical, err := normalizeLogLevel(logLevel)
+				if err != nil {
+					return err
+				}
+				levelOverride = canonical
 			}
+			fileOverride := ""
+			if cmd.Flags().Changed("log-file") {
+				fileOverride = logFile
+			}
+			cfg.SetLogOverrides(levelOverride, fileOverride)
+
+			// --data-dir names the whole profile the config lives in, so
+			// persisting it inside that profile is self-consistent; it stays an
+			// ordinary field.
 			if cmd.Flags().Changed("data-dir") {
 				cfg.DataDir = dataDir
-			}
-			if cmd.Flags().Changed("log-file") {
-				cfg.LogFile = logFile
 			}
 			// A relative data_dir written INTO the config file breaks the same
 			// way a relative flag does; resolve once here for every command.
@@ -77,6 +95,22 @@ func newRootCmd() *cobra.Command {
 		},
 		SilenceUsage: true,
 	}
+
+	// Cobra parses flags BEFORE it validates positional arguments, so a mistyped
+	// subcommand is reported as a bad flag: `schedule ad --from 03:00` fails with
+	// "unknown flag: --from" and sends the volunteer off to fix flags that were
+	// never wrong (TB-6). An Args constraint alone cannot catch this — it runs
+	// too late. When the command that failed owns subcommands and picked up a
+	// stray token matching none of them, name the real mistake instead. The
+	// handler is inherited by every subcommand, so setting it on root is enough.
+	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		if cmd.HasSubCommands() {
+			if stray := cmd.Flags().Args(); len(stray) > 0 {
+				return unknownSubcommandError(cmd, stray[0])
+			}
+		}
+		return err
+	})
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -112,6 +146,38 @@ func newRootCmd() *cobra.Command {
 	)
 
 	return root
+}
+
+// noStrayArgs is the Args validator for a command that owns subcommands. Cobra's
+// default only rejects an unknown subcommand on the ROOT command, so a typo'd
+// child — `lettuce-volunteer schedule ad` — is handed to the parent as a
+// positional argument and quietly ignored (TB-6). Runnable parents need this
+// explicitly; non-runnable ones would otherwise print their help as if nothing
+// were wrong.
+func noStrayArgs(cmd *cobra.Command, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	return unknownSubcommandError(cmd, args[0])
+}
+
+// unknownSubcommandError renders cobra's own "unknown command" message for a
+// token that matched no subcommand of cmd, including its spelling suggestions
+// so `schedule ad` points at `add`.
+func unknownSubcommandError(cmd *cobra.Command, name string) error {
+	msg := fmt.Sprintf("unknown command %q for %q", name, cmd.CommandPath())
+	// Mirror cobra's own lazy default; SuggestionsFor honors the field but,
+	// unlike the root path, never initializes it.
+	if cmd.SuggestionsMinimumDistance <= 0 {
+		cmd.SuggestionsMinimumDistance = 2
+	}
+	if suggestions := cmd.SuggestionsFor(name); len(suggestions) > 0 {
+		msg += "\n\nDid you mean this?\n"
+		for _, s := range suggestions {
+			msg += fmt.Sprintf("\t%s\n", s)
+		}
+	}
+	return errors.New(msg)
 }
 
 // Execute runs the root command.

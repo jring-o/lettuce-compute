@@ -12,6 +12,7 @@ func newConfigCmd() *cobra.Command {
 		Use:   "config",
 		Short: "Show or edit configuration",
 		Long:  "Display current configuration, or get/set individual values.",
+		Args:  noStrayArgs,
 		RunE:  runConfigShow,
 	}
 

@@ -94,6 +94,17 @@ type Config struct {
 	// surfaced via DeprecatedKeyWarnings; it is never read from or written to the
 	// file (no yaml tag, unexported), so an unknown key is reported, not applied.
 	deprecatedKeyWarnings []string
+
+	// logLevelOverride and logFileOverride hold the values of the global
+	// --log-level / --log-file flags for the lifetime of one command. They are
+	// unexported and untagged so Save can never flush them to disk: a flag is a
+	// one-time override, and it used to become the permanent setting because
+	// the flag wiring mutated LogLevel/LogFile in place and any later Save —
+	// registration on every `start`, `heads trust`, `schedule set` — wrote the
+	// whole struct back out (TB-5). Read them through EffectiveLogLevel and
+	// LogFilePath, never directly.
+	logLevelOverride string
+	logFileOverride  string
 }
 
 // ThermalConfig controls thermal monitoring thresholds.
@@ -341,9 +352,31 @@ func (c *Config) PubKeyFilePath() string {
 	return filepath.Join(c.DataDir, "identity.pub")
 }
 
-// LogFilePath returns the resolved log file path: the explicit LogFile when
-// set, otherwise <DataDir>/logs/volunteer.log.
+// SetLogOverrides records the --log-level / --log-file values for this run.
+// Either may be empty to leave the configured value in force. The values are
+// held outside the serialized struct, so they change what this process logs
+// without ever being written back by Save.
+func (c *Config) SetLogOverrides(level, file string) {
+	c.logLevelOverride = level
+	c.logFileOverride = file
+}
+
+// EffectiveLogLevel returns the level this process should log at: the
+// --log-level override when one was given, otherwise the configured log_level.
+func (c *Config) EffectiveLogLevel() string {
+	if c.logLevelOverride != "" {
+		return c.logLevelOverride
+	}
+	return c.LogLevel
+}
+
+// LogFilePath returns the resolved log file path: the --log-file override when
+// one was given, else the explicit LogFile, otherwise
+// <DataDir>/logs/volunteer.log.
 func (c *Config) LogFilePath() string {
+	if c.logFileOverride != "" {
+		return c.logFileOverride
+	}
 	if c.LogFile != "" {
 		return c.LogFile
 	}
