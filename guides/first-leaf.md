@@ -194,9 +194,19 @@ Cross-compile for whatever platforms your volunteers run (Linux and Windows show
 
 ```bash
 cd guides/examples/monte-carlo-pi
-GOOS=linux   GOARCH=amd64 go build -o monte-carlo-pi-linux .
-GOOS=windows GOARCH=amd64 go build -o monte-carlo-pi.exe   .
+GOWORK=off GOOS=linux   GOARCH=amd64 go build -o monte-carlo-pi-linux .
+GOWORK=off GOOS=windows GOARCH=amd64 go build -o monte-carlo-pi.exe   .
 ```
+
+> **Why `GOWORK=off`?** You are building inside a clone of this repository, whose
+> root carries a Go *workspace* file (`go.work`) listing only the two server
+> modules. The example is its own module and is deliberately not in that list, so
+> without `GOWORK=off` the build stops with *"current directory is contained in a
+> module that is not one of the workspace modules listed in go.work"*. `GOWORK=off`
+> ignores the workspace for that one command and changes nothing else — and it is
+> harmless everywhere, so keep it if you copy these lines elsewhere. If you copied
+> the example **out** of the repository (or wrote your own compute binary from
+> scratch), there is no workspace file above it and you do not need the prefix.
 
 ### Step 2 — Test it locally (recommended)
 

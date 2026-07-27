@@ -12,9 +12,16 @@ Monte Carlo aggregator averages the trials, converging on π ≈ 3.14159.
 ## Build
 
 ```bash
-GOOS=linux   GOARCH=amd64 go build -o monte-carlo-pi-linux .
-GOOS=windows GOARCH=amd64 go build -o monte-carlo-pi.exe   .
+GOWORK=off GOOS=linux   GOARCH=amd64 go build -o monte-carlo-pi-linux .
+GOWORK=off GOOS=windows GOARCH=amd64 go build -o monte-carlo-pi.exe   .
 ```
+
+`GOWORK=off` is required when you build here inside a clone of this repository: the
+repository root has a Go workspace file (`go.work`) that lists only the two server
+modules, and this example is a separate module that is deliberately not in it — so
+the build would otherwise stop with *"current directory is contained in a module
+that is not one of the workspace modules listed in go.work"*. The prefix is harmless
+if you copy the example out of the repository, where no workspace file applies.
 
 ## Compute checksums (required for NATIVE leafs)
 
