@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +81,35 @@ func TestLogLevelFlagAcceptsUppercase(t *testing.T) {
 	}
 	if lvl := parseSlogLevel(cfg.EffectiveLogLevel()); lvl.String() != "DEBUG" {
 		t.Errorf("logger would run at %v, want DEBUG", lvl)
+	}
+}
+
+// TestLogLevelFlagReachesTheLogger closes the last step of TB-1. The symptom the
+// tester reported was not "the accessor returns the wrong string" but "I asked
+// for debug logs and got none", so the assertion that matters is about the
+// logger every command actually builds, not the config accessor feeding it.
+func TestLogLevelFlagReachesTheLogger(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := writeDefaultConfig(t, dir)
+
+	if err := runCLI(t, "config", "get", "log_level", "--config", cfgFile, "--data-dir", dir, "--log-level", "DEBUG"); err != nil {
+		t.Fatalf("config get: %v", err)
+	}
+	logger, closeLogger := newLogger(cfg)
+	defer closeLogger()
+	if !logger.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("the logger built after `--log-level DEBUG` is not enabled at debug")
+	}
+
+	// Without the flag it must NOT be enabled at debug — otherwise the check
+	// above would pass no matter what the flag did.
+	if err := runCLI(t, "config", "get", "log_level", "--config", cfgFile, "--data-dir", dir); err != nil {
+		t.Fatalf("config get: %v", err)
+	}
+	plain, closePlain := newLogger(cfg)
+	defer closePlain()
+	if plain.Enabled(context.Background(), slog.LevelDebug) {
+		t.Error("the logger is enabled at debug with no flag set; the assertion above cannot fail")
 	}
 }
 
