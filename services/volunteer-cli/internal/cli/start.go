@@ -36,6 +36,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("daemon is already running (PID: %d). Use 'lettuce-volunteer stop' to stop it", pid)
 	}
 
+	// Refuse a schedule the daemon could never act on, rather than starting and
+	// waiting forever. An unparseable cron expression used to reach the scheduler,
+	// fail to parse on every 10-second poll, log a warn nobody reads, and leave the
+	// volunteer contributing nothing while looking configured (TB-3). Only a
+	// provably dead schedule is refused (NeverRuns, not the stricter Validate), so
+	// nothing that runs today is newly blocked.
+	if err := cfg.Scheduling.NeverRuns(); err != nil {
+		return fmt.Errorf("this schedule can never become active, so the daemon would never do any work: %w\n"+
+			"Set a daily window:  lettuce-volunteer schedule set --from 20:00 --to 06:00\n"+
+			"Or run always:       lettuce-volunteer schedule clear", err)
+	}
+
 	// Enforce the 0o700 data dir the sandbox containment model assumes (PB-30):
 	// the world-writable container bind dirs below are shielded from other local
 	// users ONLY by this mode, and MkdirAll never tightens a pre-existing looser

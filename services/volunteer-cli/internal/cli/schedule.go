@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/cron"
 	"github.com/spf13/cobra"
 )
 
@@ -48,6 +49,15 @@ scheduling.schedule_ranges, each entry being:
 		},
 	)
 	return cmd
+}
+
+// orDefault returns s, or def when s is blank — used to echo a volunteer's own
+// flags back in a remedy line without leaving empty holes in the command.
+func orDefault(s, def string) string {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	return s
 }
 
 // buildScheduleRange parses the --from/--to/--days flag trio into a ScheduleRange.
@@ -93,6 +103,8 @@ past midnight. This replaces any existing schedule window.`,
 				return err
 			}
 
+			replacedCron := cfg.Scheduling.CronExpression
+
 			cfg.Scheduling.Mode = "SCHEDULED"
 			cfg.Scheduling.CronExpression = ""
 			cfg.Scheduling.ScheduleRanges = []config.ScheduleRange{r}
@@ -104,6 +116,12 @@ past midnight. This replaces any existing schedule window.`,
 				return fmt.Errorf("saving config: %w", err)
 			}
 
+			// `set` legitimately replaces the previous schedule, but discarding a
+			// cron expression without a word is how a volunteer's configuration
+			// vanished unnoticed (TB-2), so say what was removed.
+			if replacedCron != "" {
+				fmt.Printf("Removed the previous cron expression: %s\n", replacedCron)
+			}
 			fmt.Printf("Schedule set: %s\n", describeRange(r))
 			switch {
 			case r.StartHour == r.EndHour:
@@ -144,8 +162,18 @@ Hours are whole-hour and a window may wrap past midnight.`,
 				return err
 			}
 
+			// `add` means "keep what is there and layer one more window", so it must
+			// not quietly throw away a cron expression it cannot layer onto — that
+			// silently deleted a volunteer's whole configured schedule (TB-2). The
+			// two ways forward are both explicit, so name them.
+			if cfg.Scheduling.CronExpression != "" {
+				return fmt.Errorf("this schedule is a cron expression (%s), which `add` cannot layer a window onto.\n"+
+					"Replace it with windows:  lettuce-volunteer schedule set --from %s --to %s --days %s\n"+
+					"Or drop the schedule:     lettuce-volunteer schedule clear",
+					cfg.Scheduling.CronExpression, orDefault(from, "20:00"), orDefault(to, "06:00"), orDefault(days, "mon-sun"))
+			}
+
 			cfg.Scheduling.Mode = "SCHEDULED"
-			cfg.Scheduling.CronExpression = ""
 			cfg.Scheduling.ScheduleRanges = append(cfg.Scheduling.ScheduleRanges, r)
 
 			if err := cfg.Validate(); err != nil {
@@ -176,6 +204,8 @@ func newScheduleClearCmd() *cobra.Command {
 		Short: "Run always (remove any schedule window)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			removedCron := cfg.Scheduling.CronExpression
+
 			cfg.Scheduling.Mode = "ALWAYS"
 			cfg.Scheduling.ScheduleRanges = nil
 			cfg.Scheduling.CronExpression = ""
@@ -184,6 +214,9 @@ func newScheduleClearCmd() *cobra.Command {
 			}
 			if err := cfg.Save(cfgPath); err != nil {
 				return fmt.Errorf("saving config: %w", err)
+			}
+			if removedCron != "" {
+				fmt.Printf("Removed the cron expression: %s\n", removedCron)
 			}
 			fmt.Println("Schedule cleared: the volunteer will run always (mode ALWAYS).")
 			fmt.Println("Restart the daemon for the change to take effect: lettuce-volunteer stop && lettuce-volunteer start")
@@ -213,6 +246,13 @@ func runScheduleShow(cmd *cobra.Command, args []string) error {
 			}
 		case s.CronExpression != "":
 			fmt.Printf("Cron expression: %s\n", s.CronExpression)
+			// Printing an unparseable expression verbatim, as if it were a working
+			// schedule, is how a volunteer stayed silently idle believing they were
+			// configured (TB-3). Say when it cannot run.
+			if err := cron.Validate(s.CronExpression); err != nil {
+				fmt.Printf("  INVALID — this is not a cron expression (%v), so the volunteer NEVER runs.\n", err)
+				fmt.Println("  Fix it with a daily window instead, e.g.: lettuce-volunteer schedule set --from 20:00 --to 06:00")
+			}
 		default:
 			fmt.Println("No window configured — SCHEDULED with neither a window nor a cron expression means the volunteer never runs. Use `schedule set` or `schedule clear`.")
 		}

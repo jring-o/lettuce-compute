@@ -2,13 +2,11 @@ package resource
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/cron"
 )
 
 // Scheduler determines whether the daemon should be active based on the
@@ -107,44 +105,11 @@ func (s *Scheduler) WaitUntilActive(ctx context.Context) error {
 	}
 }
 
-// matchesCron checks if the given time matches a cron expression.
-// Format: minute hour day-of-month month day-of-week
-// Supports: * (any), N (value), N-M (range), N,M (list), */N (step), N-M/S (range+step).
+// matchesCron checks if the given time matches a cron expression. The parser
+// lives in internal/cron so config validation refuses exactly what this would
+// fail to evaluate (TB-3) — one implementation, no possible drift.
 func matchesCron(expr string, t time.Time) (bool, error) {
-	fields := strings.Fields(expr)
-	if len(fields) != 5 {
-		return false, fmt.Errorf("cron expression must have 5 fields, got %d", len(fields))
-	}
-
-	checks := []struct {
-		value    int
-		min, max int
-	}{
-		{t.Minute(), 0, 59},
-		{t.Hour(), 0, 23},
-		{t.Day(), 1, 31},
-		{int(t.Month()), 1, 12},
-		{int(t.Weekday()), 0, 6}, // Sunday = 0
-	}
-
-	for i, check := range checks {
-		allowed, err := parseCronField(fields[i], check.min, check.max)
-		if err != nil {
-			return false, fmt.Errorf("field %d (%q): %w", i, fields[i], err)
-		}
-		found := false
-		for _, v := range allowed {
-			if v == check.value {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false, nil
-		}
-	}
-
-	return true, nil
+	return cron.Matches(expr, t)
 }
 
 // matchesScheduleRanges checks if the current time falls within any of the
@@ -188,62 +153,5 @@ func matchesScheduleRanges(ranges []config.ScheduleRange, t time.Time) bool {
 
 // parseCronField parses a single cron field into a set of matching values.
 func parseCronField(field string, min, max int) ([]int, error) {
-	var values []int
-
-	for _, part := range strings.Split(field, ",") {
-		part = strings.TrimSpace(part)
-
-		if part == "*" {
-			for i := min; i <= max; i++ {
-				values = append(values, i)
-			}
-			continue
-		}
-
-		// */step
-		if strings.HasPrefix(part, "*/") {
-			step, err := strconv.Atoi(part[2:])
-			if err != nil || step <= 0 {
-				return nil, fmt.Errorf("invalid step: %s", part)
-			}
-			for i := min; i <= max; i += step {
-				values = append(values, i)
-			}
-			continue
-		}
-
-		// range with optional step: N-M or N-M/S
-		if strings.Contains(part, "-") {
-			rangeParts := strings.SplitN(part, "/", 2)
-			bounds := strings.SplitN(rangeParts[0], "-", 2)
-			lo, err := strconv.Atoi(bounds[0])
-			if err != nil {
-				return nil, fmt.Errorf("invalid range start: %s", part)
-			}
-			hi, err := strconv.Atoi(bounds[1])
-			if err != nil {
-				return nil, fmt.Errorf("invalid range end: %s", part)
-			}
-			step := 1
-			if len(rangeParts) > 1 {
-				step, err = strconv.Atoi(rangeParts[1])
-				if err != nil || step <= 0 {
-					return nil, fmt.Errorf("invalid range step: %s", part)
-				}
-			}
-			for i := lo; i <= hi; i += step {
-				values = append(values, i)
-			}
-			continue
-		}
-
-		// single value
-		v, err := strconv.Atoi(part)
-		if err != nil {
-			return nil, fmt.Errorf("invalid value: %s", part)
-		}
-		values = append(values, v)
-	}
-
-	return values, nil
+	return cron.ParseField(field, min, max)
 }
