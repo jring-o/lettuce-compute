@@ -119,8 +119,16 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		maxMemoryMB:     cfg.ResourceLimits.MaxMemoryMB,
 		containerUsable: containerUsable,
 		hasGPU:          volunteerHasGPU(),
+		maxDiskMB:       int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
+		maxCPUCores:     cfg.ResourceLimits.MaxCPUCores,
 	}
 	rep.add(docInfo, "memory limit", fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this", caps.maxMemoryMB), "")
+	// Disk and cores gate dispatch exactly as memory does, and used to be the only
+	// two budgets nothing on this machine reported (TB-15). Printed next to the
+	// memory line so all three are read together.
+	rep.add(docInfo, "disk allowance", fmt.Sprintf("%d MB / %d GB (resource_limits.max_disk_gb) — a head only sends leafs whose required disk fits under this; this is the allowance you set, not free space (see 'disk space' above)",
+		caps.maxDiskMB, cfg.ResourceLimits.MaxDiskGB), "")
+	rep.add(docInfo, "cpu limit", fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — a head only sends leafs whose required cores fit under this", caps.maxCPUCores), "")
 
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
@@ -616,6 +624,10 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 			remedy = fmt.Sprintf("every leaf here needs a runtime you have not trusted this head to run — opt in with 'lettuce-volunteer heads trust %s <runtime>' if you accept running its code", name)
 		case res.memoryBlocked > 0:
 			remedy = fmt.Sprintf("raise resource_limits.max_memory_mb (currently %d MB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxMemoryMB)
+		case res.diskBlocked > 0:
+			remedy = fmt.Sprintf("raise resource_limits.max_disk_gb (currently %d GB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxDiskMB/1024)
+		case res.coresBlocked > 0:
+			remedy = fmt.Sprintf("raise resource_limits.max_cpu_cores (currently %d) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxCPUCores)
 		case res.gpuBlocked == res.total:
 			remedy = "every leaf here needs a GPU; none is detected/enabled (set resource_limits.max_gpu_vram_pct > 0 if you have one)"
 		default:
@@ -641,6 +653,12 @@ type volunteerCaps struct {
 	maxMemoryMB     int
 	containerUsable bool
 	hasGPU          bool
+	// maxDiskMB and maxCPUCores are the other two budgets the head's dispatch
+	// gate matches leafs against. They are in the units the head receives them
+	// in — max_disk_gb is advertised as MB — so callers convert once when filling
+	// this, never at the comparison (TB-15).
+	maxDiskMB   int64
+	maxCPUCores int
 }
 
 // leafEligibility is the per-leaf verdict doctor prints under a head.
@@ -657,6 +675,8 @@ type eligibilityResult struct {
 	containerBlocked int
 	trustBlocked     int
 	memoryBlocked    int
+	diskBlocked      int
+	coresBlocked     int
 	gpuBlocked       int
 	leaves           []leafEligibility
 }
@@ -673,17 +693,36 @@ type leafRequirements struct {
 	wasmCapable    bool
 	memoryMB       int
 	needsGPU       bool
+	// diskMB and cpuCores are the leaf's MACHINE requirements
+	// (resource_requirements.min_disk_mb / min_cpu_cores), which the head gates
+	// dispatch on. Zero means the head did not report them — treated as "no
+	// requirement" so an older head degrades to the pre-TB-15 behavior rather
+	// than blocking every leaf.
+	diskMB   int64
+	cpuCores int
+}
+
+// leafMachineNeeds carries the two machine budgets separately from the execution
+// spec, because the field that belongs here (resource_requirements.min_disk_mb)
+// sits one struct away from one that must NOT be used (execution_config's
+// max_disk_mb, the per-unit sandbox ceiling). A named struct at each call site
+// makes picking the wrong one visible instead of positional (TB-15).
+type leafMachineNeeds struct {
+	diskMB   int64
+	cpuCores int
 }
 
 // leafRequirementsFromSpec reduces a leaf's execution spec to its requirements.
 // binaries maps platform key -> URL; a "wasm" key means the leaf ships a WASM
 // build, any other key means it ships native builds.
-func leafRequirementsFromSpec(name, image string, binaries map[string]string, memoryMB int, gpuRequired bool) leafRequirements {
+func leafRequirementsFromSpec(name, image string, binaries map[string]string, memoryMB int, gpuRequired bool, needs leafMachineNeeds) leafRequirements {
 	req := leafRequirements{
 		name:           name,
 		needsContainer: image != "",
 		memoryMB:       memoryMB,
 		needsGPU:       gpuRequired,
+		diskMB:         needs.diskMB,
+		cpuCores:       needs.cpuCores,
 	}
 	for k := range binaries {
 		if strings.EqualFold(k, "wasm") {
@@ -719,11 +758,16 @@ func runtimeKindOf(req leafRequirements) string {
 // TRUST (the fetcher refuses — and never advertises — CONTAINER/NATIVE work for a
 // head the volunteer has not trusted for that runtime; WASM is always trusted),
 // the execution_config.max_memory_mb ceiling (the gate that silently fires for a
-// default-configured volunteer, #30), and GPU presence
-// (execution_config.gpu_required). A leaf may be blocked by more than one gate;
-// the first that bites is reported (container, then trust, then memory, then GPU).
-// blocked names that dimension, so a caller tallying reasons across a head does
-// not have to parse the message.
+// default-configured volunteer, #30), the resource_requirements.min_disk_mb and
+// min_cpu_cores machine budgets (TB-15), and GPU presence
+// (execution_config.gpu_required). Between them these are every dimension
+// FindNextAssignable matches on, which is the point: a leaf this reports eligible
+// is one the head will actually dispatch.
+//
+// A leaf may be blocked by more than one gate; the first that bites is reported
+// (container, then trust, then the three resource budgets, then GPU). blocked
+// names that dimension, so a caller tallying reasons across a head does not have
+// to parse the message.
 func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerConfig) (le leafEligibility, blocked string) {
 	head := srv.DisplayName()
 	switch {
@@ -738,11 +782,34 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	case req.memoryMB > caps.maxMemoryMB:
 		return leafEligibility{req.name, false,
 			fmt.Sprintf("needs %d MB memory > your limit %d MB", req.memoryMB, caps.maxMemoryMB)}, "memory"
+	// The two budget gates are skipped when the budget itself is unknown (zero).
+	// `leafs list` reads these from the RUNNING daemon, so an upgraded binary
+	// talking to a daemon started before this change would see 0 and report every
+	// disk-requiring leaf blocked — a false alarm worse than the silence it
+	// replaces. Absent means unknown here, exactly as it does for the leaf's side
+	// of the comparison. Config validation floors max_disk_gb at 1, so a genuinely
+	// configured volunteer never lands here.
+	case caps.maxDiskMB > 0 && req.diskMB > caps.maxDiskMB:
+		return leafEligibility{req.name, false,
+			fmt.Sprintf("needs %d MB disk > your allowance %d MB (raise it: lettuce-volunteer config set resource_limits.max_disk_gb %d, then restart)",
+				req.diskMB, caps.maxDiskMB, diskGBToCover(req.diskMB))}, "disk"
+	case caps.maxCPUCores > 0 && req.cpuCores > caps.maxCPUCores:
+		return leafEligibility{req.name, false,
+			fmt.Sprintf("needs %d CPU cores > your limit %d (raise it: lettuce-volunteer config set resource_limits.max_cpu_cores %d, then restart)",
+				req.cpuCores, caps.maxCPUCores, req.cpuCores)}, "cores"
 	case req.needsGPU && !caps.hasGPU:
 		return leafEligibility{req.name, false, "needs a GPU; none detected/enabled"}, "gpu"
 	default:
 		return leafEligibility{req.name, true, ""}, ""
 	}
+}
+
+// diskGBToCover converts a leaf's MB disk requirement into the whole max_disk_gb
+// value that would cover it, rounding up. The remedy has to be a number the
+// volunteer can paste: max_disk_gb is in GB and truncating would suggest a
+// setting that still falls short by up to 1023 MB.
+func diskGBToCover(mb int64) int {
+	return int((mb + 1023) / 1024)
 }
 
 // evaluateLeafEligibility runs classifyLeaf over every leaf a head offers,
@@ -762,7 +829,11 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 			name = lf.GetId()
 		}
 
-		req := leafRequirementsFromSpec(name, es.GetImage(), es.GetBinaries(), int(es.GetMaxMemoryMb()), es.GetGpuRequired())
+		// The machine budgets come from resource_requirements, NOT from the
+		// execution spec's max_disk_mb — see leafMachineNeeds.
+		rr := lf.GetResourceRequirements()
+		req := leafRequirementsFromSpec(name, es.GetImage(), es.GetBinaries(), int(es.GetMaxMemoryMb()), es.GetGpuRequired(),
+			leafMachineNeeds{diskMB: rr.GetMinDiskMb(), cpuCores: int(rr.GetMinCpuCores())})
 		le, blocked := classifyLeaf(req, caps, srv)
 		switch blocked {
 		case "container":
@@ -771,6 +842,10 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 			res.trustBlocked++
 		case "memory":
 			res.memoryBlocked++
+		case "disk":
+			res.diskBlocked++
+		case "cores":
+			res.coresBlocked++
 		case "gpu":
 			res.gpuBlocked++
 		default:

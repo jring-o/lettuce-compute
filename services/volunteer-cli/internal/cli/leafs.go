@@ -60,6 +60,8 @@ type leafsAPIMachine struct {
 	Runtimes    []string `json:"runtimes"`
 	HasGPU      bool     `json:"has_gpu"`
 	MaxMemoryMB int      `json:"max_memory_mb"`
+	MaxDiskMB   int64    `json:"max_disk_mb"`
+	MaxCPUCores int      `json:"max_cpu_cores"`
 }
 
 type leafsAPIHead struct {
@@ -69,6 +71,9 @@ type leafsAPIHead struct {
 	GRPCAddress string         `json:"grpc_address"`
 	Weight      int            `json:"weight"`
 	Leafs       []leafsAPILeaf `json:"leafs"`
+	// LeafsRefreshedAt is when this head's QUEUED/VOLUNTEERS/HOSTS figures were
+	// last fetched. Zero when nothing has been cached yet (TB-14).
+	LeafsRefreshedAt time.Time `json:"leafs_refreshed_at"`
 }
 
 type leafsAPILeaf struct {
@@ -81,7 +86,10 @@ type leafsAPILeaf struct {
 	EffectiveWeight  int                    `json:"effective_weight"`
 	Enabled          bool                   `json:"enabled"`
 	ExecutionSpec    *leafsAPIExecutionSpec `json:"execution_spec"`
-	Failures         *leafsAPILeafFailures  `json:"failures"`
+	// ResourceRequirements is what the head requires of this MACHINE before it
+	// dispatches this leaf. nil from a head too old to report it (TB-15).
+	ResourceRequirements *leafsAPIResourceRequirements `json:"resource_requirements"`
+	Failures             *leafsAPILeafFailures         `json:"failures"`
 }
 
 // leafsAPIExecutionSpec carries the fields that decide a leaf's runtime and
@@ -91,6 +99,14 @@ type leafsAPIExecutionSpec struct {
 	Image       string            `json:"image"`
 	GPURequired bool              `json:"gpu_required"`
 	MaxMemoryMB int32             `json:"max_memory_mb"`
+}
+
+// leafsAPIResourceRequirements carries the machine budgets the head's dispatch
+// gate matches against. Deliberately separate from leafsAPIExecutionSpec, whose
+// max_disk_mb is a different number and the wrong one to gate on (TB-15).
+type leafsAPIResourceRequirements struct {
+	MinDiskMB   int64 `json:"min_disk_mb"`
+	MinCPUCores int32 `json:"min_cpu_cores"`
 }
 
 // leafsAPILeafFailures is a leaf's local failure record (TB-10).
@@ -133,6 +149,8 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 		maxMemoryMB:     resp.Machine.MaxMemoryMB,
 		containerUsable: containsFold(resp.Machine.Runtimes, "container"),
 		hasGPU:          resp.Machine.HasGPU,
+		maxDiskMB:       resp.Machine.MaxDiskMB,
+		maxCPUCores:     resp.Machine.MaxCPUCores,
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -141,8 +159,14 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 	// Blocking reasons are collected and printed under the table so the rows stay
 	// aligned and scannable.
 	var notes []string
+	// Per-head snapshot ages, same treatment: an eleventh column would repeat the
+	// same value on every row of a head (TB-14).
+	var ages []string
 	for _, h := range resp.Heads {
 		srv, known := serverConfigFor(servers, h)
+		if len(h.Leafs) > 0 {
+			ages = append(ages, "  "+describeSnapshotAge(h.Name, h.LeafsRefreshedAt, time.Now()))
+		}
 		for _, l := range h.Leafs {
 			spec := l.ExecutionSpec
 			if spec == nil {
@@ -152,7 +176,13 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 			if label == "" {
 				label = l.Name
 			}
-			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired)
+			// Machine budgets come from resource_requirements, never from the
+			// execution spec's max_disk_mb — see leafMachineNeeds.
+			var needs leafMachineNeeds
+			if rr := l.ResourceRequirements; rr != nil {
+				needs = leafMachineNeeds{diskMB: rr.MinDiskMB, cpuCores: int(rr.MinCPUCores)}
+			}
+			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired, needs)
 
 			enabled := "✓"
 			if !l.Enabled {
@@ -173,11 +203,66 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 	}
 	w.Flush()
 
+	if len(ages) > 0 {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "QUEUED / VOLUNTEERS / HOSTS come from the head, as of:")
+		for _, a := range ages {
+			fmt.Fprintln(out, a)
+		}
+	}
+
 	if len(notes) > 0 {
 		fmt.Fprintln(out)
 		for _, n := range notes {
 			fmt.Fprintln(out, n)
 		}
+	}
+}
+
+// staleSnapshotAfter is when a leaf snapshot is old enough to explain itself
+// rather than just date itself. There is no refresh timer to compare against —
+// the daemon refreshes only when it goes looking for work — so this is a
+// judgement about when a reader would be misled, set well above the 5-minute
+// minimum refresh interval so ordinary fetching never trips it.
+const staleSnapshotAfter = 15 * time.Minute
+
+// describeSnapshotAge renders one head's leaf-figure vintage. The age is
+// unbounded by design: the refresh lives inside the fetch path, so a machine that
+// is not asking for work carries the same numbers indefinitely. Saying so turns
+// two wrong readings a tester reached unaided — a one-minute refresh clock, and
+// the head mis-grouping hosts — into a fact the table states itself (TB-14).
+func describeSnapshotAge(head string, refreshedAt, now time.Time) string {
+	if refreshedAt.IsZero() {
+		return fmt.Sprintf("%s — never refreshed; the daemon has not fetched head info yet", head)
+	}
+	age := now.Sub(refreshedAt)
+	if age < 0 {
+		age = 0
+	}
+	line := fmt.Sprintf("%s — %s (%s ago)", head, refreshedAt.Format("15:04:05"), roundAge(age))
+	if age >= staleSnapshotAfter {
+		// The cause is itself the answer to the question this reader is usually
+		// about to ask, so it is worth the extra clause.
+		line += "; this machine has not asked that head for work since, so the figures are frozen, not wrong"
+	}
+	return line
+}
+
+// roundAge renders a duration the way someone reading a table wants it: whole
+// seconds under a minute, whole minutes under an hour, then hours and minutes.
+func roundAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		h := int(d.Hours())
+		m := int(d.Minutes()) - h*60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh%dm", h, m)
 	}
 }
 
