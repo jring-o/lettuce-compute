@@ -378,13 +378,16 @@ thermal:
 > against the danger point the component itself declares to the kernel. A sensor
 > that declares none can never pause your work.
 
-> **`max_throttle_minutes` stops a freeze lasting forever.** If the reading
-> holding the pause is not something Lettuce's own load produced — a warm drive,
-> or a machine kept busy by your other work — then suspending Lettuce cannot cool
-> it, and without a ceiling the daemon would wait indefinitely. After this long it
-> resumes, logs loudly why, and stops trusting that particular sensor for a while.
-> Your CPU throttles itself in hardware regardless; this layer is a courtesy, not
-> your machine's actual protection. Set it negative to wait indefinitely instead.
+> **`max_throttle_minutes` stops a freeze lasting forever — but never on your
+> CPU or GPU.** If your processor is genuinely hot, work stays suspended for as
+> long as it stays hot, however long that is; that is the whole point of the
+> feature and this setting does not shorten it. The ceiling applies only when
+> some *other* part is holding the pause — a warm drive, a chipset — because
+> suspending Lettuce cannot cool a component its own work isn't heating, so
+> without a ceiling the daemon would wait for a change that never comes. After
+> this long it resumes, logs loudly why, and ignores that particular sensor for a
+> couple of hours before trusting it again. Set it negative to wait indefinitely
+> instead.
 
 > **These don't throttle *how much* runs.** Thermal pause is all-or-nothing
 > hardware protection, not a per-leaf or concurrency dial. To cap how much work
