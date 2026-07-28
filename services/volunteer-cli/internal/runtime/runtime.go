@@ -55,8 +55,10 @@ type ExecutionSpec struct {
 	Image           string // OCI image (container)
 	GPURequired     bool
 	GPUType         string // "nvidia", "amd", "any", or "" (empty = any)
-	MinVRAMMB       int32  // minimum GPU VRAM required (from leaf config)
-	MaxMemoryMB     int32
+	// A leaf's VRAM requirement is not carried per work unit: dispatch gates on it
+	// head-side, and the client checks it at eligibility time (TB-21). There was a
+	// MinVRAMMB here that nothing on the wire ever set.
+	MaxMemoryMB int32
 	MaxDiskMB       int32
 	NetworkAccess   bool
 }

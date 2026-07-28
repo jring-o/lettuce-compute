@@ -270,20 +270,10 @@ func TestValidateExecutionConfig(t *testing.T) {
 			},
 			wantErr: false,
 		},
-		{
-			name: "GPU with negative min_vram_gb",
-			modify: func(c *ExecutionConfig) {
-				c.Runtime = "CONTAINER"
-				c.Binaries = nil
-				img := "myimage:latest"
-				c.Image = &img
-				c.GPURequired = true
-				c.GPUType = "NVIDIA"
-				c.MinVRAMGB = -1
-			},
-			wantErr: true,
-			errMsg:  "min_vram_gb",
-		},
+		// The VRAM requirement no longer lives in ExecutionConfig at all (TB-20):
+		// min_vram_gb was a parallel, unenforced copy of
+		// resource_requirements.min_gpu_vram_mb. Its validation moved with it —
+		// see TestValidateResourceRequirements_VRAMWholeGiB.
 		{
 			name: "GPU with AMD type valid",
 			modify: func(c *ExecutionConfig) {

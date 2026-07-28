@@ -61,8 +61,17 @@ type LeafSummary struct {
 }
 
 // resourceSubset is the abbreviated resource requirements for list responses.
-// Memory is reported as the container limit (execution_config.max_memory_mb) —
-// the single source of truth, also the scheduler's matching floor.
+//
+// The abbreviation is in WHICH fields appear — never in which copy of a field is
+// reported. Every field here is sourced from the one dispatch actually gates on,
+// so the catalog cannot advertise a requirement the scheduler does not apply:
+// memory from execution_config.max_memory_mb (FindNextAssignable's max_memory_mb
+// predicate), VRAM from resource_requirements.min_gpu_vram_mb, and gpu_required
+// from EITHER gpu_required flag, matching the presence gate. TB-20: VRAM was
+// derived from execution_config.min_vram_gb — a field no dispatch path reads —
+// so a leaf gating at 4000 MB published 4096, and gpu_required read only
+// resource_requirements, so a leaf that set just the execution_config flag was
+// published as a CPU leaf while reaching no GPU-less volunteer.
 type resourceSubset struct {
 	GPURequired  bool `json:"gpu_required"`
 	GPUType      string `json:"gpu_type,omitempty"`
@@ -90,9 +99,9 @@ func ToLeafSummary(p *Leaf) LeafSummary {
 		IsOngoing:    p.IsOngoing,
 		Visibility:   p.Visibility,
 		ResourceRequirements: resourceSubset{
-			GPURequired:  p.ResourceRequirements.GPURequired,
+			GPURequired:  p.ResourceRequirements.GPURequired || p.ExecutionConfig.GPURequired,
 			GPUType:      p.ExecutionConfig.GPUType,
-			GPUMinVRAMMB: p.ExecutionConfig.MinVRAMGB * 1024,
+			GPUMinVRAMMB: p.ResourceRequirements.MinGPUVRAMMB,
 			MinCPUCores:  p.ResourceRequirements.MinCPUCores,
 			MaxMemoryMB:  p.ExecutionConfig.MaxMemoryMB,
 		},

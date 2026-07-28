@@ -62,6 +62,12 @@ type leafsAPIMachine struct {
 	MaxMemoryMB int      `json:"max_memory_mb"`
 	MaxDiskMB   int64    `json:"max_disk_mb"`
 	MaxCPUCores int      `json:"max_cpu_cores"`
+	// The GPU budgets (TB-21). MaxGPUVRAMMB is the allowed share, not the card.
+	MaxGPUVRAMMB           int      `json:"max_gpu_vram_mb"`
+	GPUCardVRAMMB          int      `json:"gpu_card_vram_mb"`
+	GPUVRAMPct             int      `json:"gpu_vram_pct"`
+	GPUVendors             []string `json:"gpu_vendors"`
+	GPUComputeCapabilities []string `json:"gpu_compute_capabilities"`
 }
 
 type leafsAPIHead struct {
@@ -107,6 +113,12 @@ type leafsAPIExecutionSpec struct {
 type leafsAPIResourceRequirements struct {
 	MinDiskMB   int64 `json:"min_disk_mb"`
 	MinCPUCores int32 `json:"min_cpu_cores"`
+	// GPU dimensions (TB-21). MinGPUVRAMMB is matched against the machine's
+	// allowed VRAM, not its card capacity.
+	MinGPUVRAMMB         int32  `json:"min_gpu_vram_mb"`
+	GPUType              string `json:"gpu_type"`
+	GPUComputeCapability string `json:"gpu_compute_capability"`
+	GPURequired          bool   `json:"gpu_required"`
 }
 
 // leafsAPILeafFailures is a leaf's local failure record (TB-10).
@@ -146,11 +158,16 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 // same gates the daemon applies, with the blocking reason spelled out beneath.
 func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.ServerConfig) {
 	caps := volunteerCaps{
-		maxMemoryMB:     resp.Machine.MaxMemoryMB,
-		containerUsable: containsFold(resp.Machine.Runtimes, "container"),
-		hasGPU:          resp.Machine.HasGPU,
-		maxDiskMB:       resp.Machine.MaxDiskMB,
-		maxCPUCores:     resp.Machine.MaxCPUCores,
+		maxMemoryMB:            resp.Machine.MaxMemoryMB,
+		containerUsable:        containsFold(resp.Machine.Runtimes, "container"),
+		hasGPU:                 resp.Machine.HasGPU,
+		maxDiskMB:              resp.Machine.MaxDiskMB,
+		maxCPUCores:            resp.Machine.MaxCPUCores,
+		maxGPUVRAMMB:           resp.Machine.MaxGPUVRAMMB,
+		gpuCardVRAMMB:          resp.Machine.GPUCardVRAMMB,
+		gpuVRAMPct:             resp.Machine.GPUVRAMPct,
+		gpuVendors:             resp.Machine.GPUVendors,
+		gpuComputeCapabilities: resp.Machine.GPUComputeCapabilities,
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
@@ -180,7 +197,14 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 			// execution spec's max_disk_mb — see leafMachineNeeds.
 			var needs leafMachineNeeds
 			if rr := l.ResourceRequirements; rr != nil {
-				needs = leafMachineNeeds{diskMB: rr.MinDiskMB, cpuCores: int(rr.MinCPUCores)}
+				needs = leafMachineNeeds{
+					diskMB:               rr.MinDiskMB,
+					cpuCores:             int(rr.MinCPUCores),
+					gpuVRAMMB:            int(rr.MinGPUVRAMMB),
+					gpuType:              rr.GPUType,
+					gpuComputeCapability: rr.GPUComputeCapability,
+					gpuRequired:          rr.GPURequired,
+				}
 			}
 			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired, needs)
 

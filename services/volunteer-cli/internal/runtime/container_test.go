@@ -2130,11 +2130,19 @@ func TestContainerRuntime_ExecuteNoCPULimit(t *testing.T) {
 	}
 }
 
-// TestContainerRuntime_VRAMLimitWarning verifies that when a work unit's MinVRAMMB
-// exceeds the volunteer's allowed VRAM budget, execution still proceeds (the VRAM
-// check is a safety-net warning, not a hard block). The container should still run
-// and produce output. (S58)
-func TestContainerRuntime_VRAMLimitWarning(t *testing.T) {
+// TestContainerRuntime_VRAMLimitEnv verifies that a GPU work unit is told its VRAM
+// budget through LETTUCE_GPU_VRAM_LIMIT_MB, computed from the card and the
+// volunteer's max_gpu_vram_pct.
+//
+// This replaces TestContainerRuntime_VRAMLimitWarning, which asserted a "safety
+// net" warning fired when a unit's MinVRAMMB exceeded that budget. The warning
+// could never fire in production: no wire field populated MinVRAMMB, so it was
+// always 0, and the test only saw a warning because it set the field itself —
+// green regardless of whether the code worked (TB-21). The check is gone; the
+// budget the container is handed is the part that was ever real. VRAM eligibility
+// is now gated head-side at dispatch and reported by `doctor` / `leafs list`
+// before a unit is fetched. (was S58)
+func TestContainerRuntime_VRAMLimitEnv(t *testing.T) {
 	withMockExecutor(t, func(name string, args ...string) ([]byte, error) {
 		if name == "nvidia-smi" {
 			for _, a := range args {
@@ -2166,7 +2174,6 @@ func TestContainerRuntime_VRAMLimitWarning(t *testing.T) {
 		ExecutionSpec: ExecutionSpec{
 			Image:       "cuda:latest",
 			GPURequired: true,
-			MinVRAMMB:   8000, // Exceeds allowed 5120 MB
 		},
 	}
 
@@ -2178,10 +2185,9 @@ func TestContainerRuntime_VRAMLimitWarning(t *testing.T) {
 
 	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("vram-warn-result"), 0o644)
 
-	// Execute should succeed â€” the VRAM check is a warning, not a hard block.
 	result, err := cr.Execute(context.Background(), wu, prep)
 	if err != nil {
-		t.Fatalf("Execute should succeed despite VRAM warning: %v", err)
+		t.Fatalf("Execute: %v", err)
 	}
 
 	// Verify output was produced normally.
@@ -2189,13 +2195,13 @@ func TestContainerRuntime_VRAMLimitWarning(t *testing.T) {
 		t.Errorf("OutputData = %q, want %q", result.OutputData, "vram-warn-result")
 	}
 
-	// Verify the warning was logged.
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "work unit VRAM requirement exceeds volunteer limit") {
-		t.Errorf("expected VRAM warning in log output, got: %s", logOutput)
+	// Nothing should be warned about here: the removed check was the only WARN on
+	// this path, and its absence is part of what this test now pins.
+	if logOutput := logBuf.String(); strings.Contains(logOutput, "VRAM") {
+		t.Errorf("unexpected VRAM warning in log output: %s", logOutput)
 	}
 
-	// Verify the VRAM limit env var is still set (uses allowed, not required).
+	// The env var is the allowance (10240 * 50%), not any per-unit requirement.
 	envSet := make(map[string]bool)
 	for _, e := range mock.LastCreateConfig.Env {
 		envSet[e] = true

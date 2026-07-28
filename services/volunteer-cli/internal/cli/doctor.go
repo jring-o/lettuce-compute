@@ -123,6 +123,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		maxDiskMB:       int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
 		maxCPUCores:     cfg.ResourceLimits.MaxCPUCores,
 	}
+	caps.maxGPUVRAMMB, caps.gpuCardVRAMMB, caps.gpuVRAMPct, caps.gpuVendors, caps.gpuComputeCapabilities =
+		volunteerGPUBudget()
 	rep.add(docInfo, "memory limit", fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this", caps.maxMemoryMB), "")
 	// Disk and cores gate dispatch exactly as memory does, and used to be the only
 	// two budgets nothing on this machine reported (TB-15). Printed next to the
@@ -669,8 +671,11 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 			remedy = fmt.Sprintf("raise resource_limits.max_disk_gb (currently %d GB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxDiskMB/1024)
 		case res.coresBlocked > 0:
 			remedy = fmt.Sprintf("raise resource_limits.max_cpu_cores (currently %d) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxCPUCores)
+		case res.vramBlocked > 0:
+			remedy = fmt.Sprintf("raise resource_limits.max_gpu_vram_pct (currently %d%%, giving %d MB of your %d MB card) to cover the per-leaf requirements below, then restart the daemon to re-advertise",
+				caps.gpuVRAMPct, caps.maxGPUVRAMMB, caps.gpuCardVRAMMB)
 		case res.gpuBlocked == res.total:
-			remedy = "every leaf here needs a GPU; none is detected/enabled (set resource_limits.max_gpu_vram_pct > 0 if you have one)"
+			remedy = "every leaf here needs a GPU this machine does not have or has not enabled (set resource_limits.max_gpu_vram_pct > 0 if you have one; a leaf may also require a specific make of card)"
 		default:
 			remedy = "this head has no leafs this volunteer can run — see the per-leaf reasons below"
 		}
@@ -700,6 +705,19 @@ type volunteerCaps struct {
 	// this, never at the comparison (TB-15).
 	maxDiskMB   int64
 	maxCPUCores int
+	// The GPU budgets, the last three dimensions dispatch matches on (TB-21).
+	// maxGPUVRAMMB is the ALLOWED VRAM — card capacity * max_gpu_vram_pct / 100,
+	// exactly what the head compares a leaf against — never the raw card size;
+	// comparing against capacity would report machines eligible that the head
+	// refuses, which is the bug. Vendors are uppercase ("NVIDIA").
+	// gpuCardVRAMMB and gpuVRAMPct describe the same card maxGPUVRAMMB came from,
+	// so a blocked message can name the setting to change and the hardware it
+	// applies to.
+	maxGPUVRAMMB           int
+	gpuCardVRAMMB          int
+	gpuVRAMPct             int
+	gpuVendors             []string
+	gpuComputeCapabilities []string
 }
 
 // leafEligibility is the per-leaf verdict doctor prints under a head.
@@ -718,6 +736,7 @@ type eligibilityResult struct {
 	memoryBlocked    int
 	diskBlocked      int
 	coresBlocked     int
+	vramBlocked      int
 	gpuBlocked       int
 	leaves           []leafEligibility
 }
@@ -741,16 +760,42 @@ type leafRequirements struct {
 	// than blocking every leaf.
 	diskMB   int64
 	cpuCores int
+	// The GPU requirements, zero/empty when the head did not report them —
+	// "unknown", read as no requirement, exactly as diskMB and cpuCores are
+	// (TB-21). gpuVRAMMB is matched against the machine's ALLOWED VRAM.
+	gpuVRAMMB            int
+	gpuType              string
+	gpuComputeCapability string
+	// The two gpu_required flags kept SEPARATE, because the dispatch predicate keys
+	// each GPU sub-gate on a different one and mirroring that exactly is the whole
+	// point of this struct: presence and VRAM on either flag, the vendor gate on
+	// execution_config.gpu_required alone, compute capability on
+	// resource_requirements.gpu_required alone. Collapsing them to one boolean makes
+	// the client STRICTER than the head — reporting a machine ineligible for a leaf
+	// it would actually be sent, which is the same divergence as the original defect
+	// pointing the other way.
+	specGPURequired bool
+	rrGPURequired   bool
 }
 
-// leafMachineNeeds carries the two machine budgets separately from the execution
+// leafMachineNeeds carries the machine budgets separately from the execution
 // spec, because the field that belongs here (resource_requirements.min_disk_mb)
 // sits one struct away from one that must NOT be used (execution_config's
 // max_disk_mb, the per-unit sandbox ceiling). A named struct at each call site
-// makes picking the wrong one visible instead of positional (TB-15).
+// makes picking the wrong one visible instead of positional (TB-15). The GPU
+// dimensions joined it for the same reason (TB-21) — min_gpu_vram_mb likewise has
+// a near-namesake the client already holds.
 type leafMachineNeeds struct {
-	diskMB   int64
-	cpuCores int
+	diskMB               int64
+	cpuCores             int
+	gpuVRAMMB            int
+	gpuType              string
+	gpuComputeCapability string
+	// resource_requirements.gpu_required — the OTHER of the two presence flags,
+	// ORed with the execution spec's in leafRequirementsFromSpec because that is
+	// what the dispatch predicate does. Reading the execution spec's alone reported
+	// a GPU-less machine eligible for a leaf that set only this one.
+	gpuRequired bool
 }
 
 // leafRequirementsFromSpec reduces a leaf's execution spec to its requirements.
@@ -758,12 +803,17 @@ type leafMachineNeeds struct {
 // build, any other key means it ships native builds.
 func leafRequirementsFromSpec(name, image string, binaries map[string]string, memoryMB int, gpuRequired bool, needs leafMachineNeeds) leafRequirements {
 	req := leafRequirements{
-		name:           name,
-		needsContainer: image != "",
-		memoryMB:       memoryMB,
-		needsGPU:       gpuRequired,
-		diskMB:         needs.diskMB,
-		cpuCores:       needs.cpuCores,
+		name:                 name,
+		needsContainer:       image != "",
+		memoryMB:             memoryMB,
+		needsGPU:             gpuRequired || needs.gpuRequired,
+		specGPURequired:      gpuRequired,
+		rrGPURequired:        needs.gpuRequired,
+		diskMB:               needs.diskMB,
+		cpuCores:             needs.cpuCores,
+		gpuVRAMMB:            needs.gpuVRAMMB,
+		gpuType:              needs.gpuType,
+		gpuComputeCapability: needs.gpuComputeCapability,
 	}
 	for k := range binaries {
 		if strings.EqualFold(k, "wasm") {
@@ -800,15 +850,20 @@ func runtimeKindOf(req leafRequirements) string {
 // head the volunteer has not trusted for that runtime; WASM is always trusted),
 // the execution_config.max_memory_mb ceiling (the gate that silently fires for a
 // default-configured volunteer, #30), the resource_requirements.min_disk_mb and
-// min_cpu_cores machine budgets (TB-15), and GPU presence
-// (execution_config.gpu_required). Between them these are every dimension
-// FindNextAssignable matches on, which is the point: a leaf this reports eligible
-// is one the head will actually dispatch.
+// min_cpu_cores machine budgets (TB-15), and the four GPU dimensions — presence,
+// allowed VRAM, vendor and compute capability (TB-21). Presence is the OR of the
+// two gpu_required flags, matching the predicate; the leaf-side flags are combined
+// in leafRequirementsFromSpec.
+//
+// These are every dimension FindNextAssignable matches on, which is the point: a
+// leaf this reports eligible is one the head will actually dispatch. Anything
+// added to that predicate has to be added here too, or this reports healthy
+// machines the head silently refuses — the defect behind both TB-15 and TB-21.
 //
 // A leaf may be blocked by more than one gate; the first that bites is reported
-// (container, then trust, then the three resource budgets, then GPU). blocked
-// names that dimension, so a caller tallying reasons across a head does not have
-// to parse the message.
+// (container, then trust, then the three resource budgets, then the GPU gates).
+// blocked names that dimension, so a caller tallying reasons across a head does
+// not have to parse the message.
 func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerConfig) (le leafEligibility, blocked string) {
 	head := srv.DisplayName()
 	switch {
@@ -840,9 +895,75 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 				req.cpuCores, caps.maxCPUCores, req.cpuCores)}, "cores"
 	case req.needsGPU && !caps.hasGPU:
 		return leafEligibility{req.name, false, "needs a GPU; none detected/enabled"}, "gpu"
+	// The three remaining GPU gates, each skipped when the leaf did not state a
+	// requirement or the daemon did not report a budget — same unknown-is-not-zero
+	// rule as disk and cores above.
+	//
+	// VRAM names FOUR numbers deliberately: the requirement, what this machine
+	// offers, the card's actual size and the percentage setting. The setting is
+	// usually what has to change, and a message naming only the shortfall sends
+	// people shopping for hardware they already own.
+	case req.needsGPU && req.gpuVRAMMB > 0 && caps.maxGPUVRAMMB > 0 && req.gpuVRAMMB > caps.maxGPUVRAMMB:
+		return leafEligibility{req.name, false,
+			fmt.Sprintf("needs %d MB GPU memory > the %d MB you allow (%s)%s",
+				req.gpuVRAMMB, caps.maxGPUVRAMMB, caps.describeVRAMAllowance(),
+				vramRemedy(req.gpuVRAMMB, caps))}, "vram"
+	// Vendor is gated on execution_config.gpu_required ALONE, and compute capability
+	// on resource_requirements.gpu_required alone — not on the OR — because that is
+	// how the dispatch predicate keys them. A leaf setting only the other flag has
+	// that sub-gate skipped head-side, so applying it here would refuse a machine
+	// the head would happily send work to.
+	case req.specGPURequired && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
+		!containsFold(caps.gpuVendors, req.gpuType):
+		return leafEligibility{req.name, false,
+			fmt.Sprintf("needs a %s GPU; yours is %s", strings.ToUpper(req.gpuType), strings.Join(caps.gpuVendors, "/"))}, "gpu"
+	case req.rrGPURequired && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
+		!containsFold(caps.gpuComputeCapabilities, req.gpuComputeCapability):
+		return leafEligibility{req.name, false,
+			fmt.Sprintf("needs GPU compute capability %s; yours is %s",
+				req.gpuComputeCapability, strings.Join(caps.gpuComputeCapabilities, "/"))}, "gpu"
 	default:
 		return leafEligibility{req.name, true, ""}, ""
 	}
+}
+
+// requiresSpecificGPUType reports whether a leaf's gpu_type constrains the vendor.
+// Empty and "ANY" do not — matching the dispatch predicate, which admits both.
+func requiresSpecificGPUType(gpuType string) bool {
+	t := strings.ToUpper(strings.TrimSpace(gpuType))
+	return t != "" && t != "ANY"
+}
+
+// describeVRAMAllowance spells out where the allowed figure came from, because
+// "you allow 3072 MB" on a machine with a 6 GB card reads as a hardware fault
+// rather than as a setting the volunteer chose.
+func (c volunteerCaps) describeVRAMAllowance() string {
+	if c.gpuCardVRAMMB == 0 || c.gpuVRAMPct == 0 {
+		return "your GPU allowance"
+	}
+	return fmt.Sprintf("%d%% of your %d MB card", c.gpuVRAMPct, c.gpuCardVRAMMB)
+}
+
+// vramRemedy names the max_gpu_vram_pct that would clear the requirement on this
+// machine's card, rounded UP — a truncated percentage lands the volunteer just
+// short, which they would set, restart, and still receive nothing.
+//
+// When the card itself is too small no percentage helps, and saying so is the
+// honest answer: suggesting 100% to someone who would still be refused is the
+// mistake the disk story documented, one dimension over.
+func vramRemedy(needMB int, caps volunteerCaps) string {
+	card := caps.gpuCardVRAMMB
+	if card <= 0 {
+		return ""
+	}
+	if needMB > card {
+		return "; your card is too small for this leaf whatever percentage you allow"
+	}
+	pct := (needMB*100 + card - 1) / card
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("; raise it: lettuce-volunteer config set resource_limits.max_gpu_vram_pct %d, then restart", pct)
 }
 
 // diskGBToCover converts a leaf's MB disk requirement into the whole max_disk_gb
@@ -874,7 +995,14 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 		// execution spec's max_disk_mb — see leafMachineNeeds.
 		rr := lf.GetResourceRequirements()
 		req := leafRequirementsFromSpec(name, es.GetImage(), es.GetBinaries(), int(es.GetMaxMemoryMb()), es.GetGpuRequired(),
-			leafMachineNeeds{diskMB: rr.GetMinDiskMb(), cpuCores: int(rr.GetMinCpuCores())})
+			leafMachineNeeds{
+				diskMB:               rr.GetMinDiskMb(),
+				cpuCores:             int(rr.GetMinCpuCores()),
+				gpuVRAMMB:            int(rr.GetMinGpuVramMb()),
+				gpuType:              rr.GetGpuType(),
+				gpuComputeCapability: rr.GetGpuComputeCapability(),
+				gpuRequired:          rr.GetGpuRequired(),
+			})
 		le, blocked := classifyLeaf(req, caps, srv)
 		switch blocked {
 		case "container":
@@ -887,6 +1015,8 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 			res.diskBlocked++
 		case "cores":
 			res.coresBlocked++
+		case "vram":
+			res.vramBlocked++
 		case "gpu":
 			res.gpuBlocked++
 		default:
@@ -907,6 +1037,27 @@ func volunteerHasGPU() bool {
 		return false
 	}
 	return len(detectGPUsFunc()) > 0
+}
+
+// volunteerGPUBudget reports this machine's GPU capabilities in the terms dispatch
+// matches leafs against (TB-21): the largest ALLOWED VRAM across its cards, the
+// card and percentage that produced it, and the vendors and compute capabilities
+// on offer. Runs the detected GPUs through the same config-application the
+// registration path uses (client.ApplyGPUConfig), then reduces them exactly as the
+// head does — largest allowed figure wins.
+func volunteerGPUBudget() (vramMB, cardVRAMMB, vramPct int, vendors, computeCapabilities []string) {
+	for _, g := range client.ApplyGPUConfig(cfg, detectGPUsFunc()) {
+		if eff := int(g.GetVramMb()) * int(g.GetMaxVramPct()) / 100; eff > vramMB {
+			vramMB, cardVRAMMB, vramPct = eff, int(g.GetVramMb()), int(g.GetMaxVramPct())
+		}
+		if v := strings.ToUpper(strings.TrimSpace(g.GetVendor())); v != "" {
+			vendors = append(vendors, v)
+		}
+		if cc := g.GetComputeCapability(); cc != "" {
+			computeCapabilities = append(computeCapabilities, cc)
+		}
+	}
+	return vramMB, cardVRAMMB, vramPct, vendors, computeCapabilities
 }
 
 func statusOrUnknown(s string) string {

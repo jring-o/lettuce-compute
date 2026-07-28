@@ -1169,20 +1169,41 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			c.logger.Debug("hand-out empty: reject tally", attrs...)
 		}
 	}
-	// TB-13: a machine handed nothing where at least one candidate was refused by its OWN
-	// in-flight cap is starved by work it is already charged for, not by an empty queue.
-	// At the client the two are indistinguishable (both are an empty response), and on a
-	// production head the tally above is Debug-only — so a volunteer locked out by stale
-	// claims left no trace at all, and explaining one took a database session. Report it at
-	// WARN, throttled per machine, with the full tally so the mix is visible.
-	if taken == 0 && rejects[rejectInflightCap] > 0 && c.noteStarved(hostKey) {
-		attrs := make([]any, 0, 8+2*numRejectReasons)
+	// TB-13 / TB-21: a machine handed nothing for a reason INVISIBLE TO IT gets a WARN,
+	// throttled per machine, with the full tally so the mix is visible. At the client every
+	// such refusal looks identical — an empty response — and on a production head the tally
+	// above is Debug-only, so these left no trace at all and explaining one took a database
+	// session. Two reasons qualify:
+	//
+	//   in-flight cap (TB-13)       — starved by work it is already charged for, or by stale
+	//                                 claims it never returned; not an empty queue.
+	//   capability mismatch (TB-21) — refused on a dimension the client may not be able to
+	//                                 check. Disk and cores reach it only from a TB-15+ head,
+	//                                 the three GPU dimensions only from a TB-21+ head, and an
+	//                                 older client checks none of them however new the head is.
+	//
+	// The machine's advertised budgets are logged alongside, because the whole diagnostic is
+	// "which of these is below what some leaf asked for" and reading them out of the database
+	// was the expensive half.
+	if taken == 0 && c.noteStarved(hostKey) &&
+		(rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0) {
+		attrs := make([]any, 0, 14+2*numRejectReasons)
 		attrs = append(attrs,
 			"volunteer_id", volunteerID,
 			"host_id", hostKey,
 			"inflight", c.inflightFor(hostKey),
 			"inflight_cap", opts.MaxInflightPerVolunteer,
 			"ready_len", readyLen)
+		if rejects[rejectCapabilityMismatch] > 0 {
+			attrs = append(attrs,
+				"max_cpu_cores", opts.MaxCPUCores,
+				"max_memory_mb", opts.MaxMemoryMB,
+				"max_disk_mb", opts.MaxDiskMB,
+				"has_gpu", opts.HasGPU,
+				"max_gpu_vram_mb", opts.MaxGPUVRAMMB,
+				"gpu_vendors", opts.GPUVendors,
+				"available_runtimes", opts.AvailableRuntimes)
+		}
 		// Tally keys are prefixed here: "inflight_cap" as a reject reason would otherwise
 		// collide with the machine's cap value above, and a refusal COUNT reading as a cap
 		// is exactly the kind of ambiguity an operator does not need mid-incident.
@@ -1191,8 +1212,13 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 				attrs = append(attrs, "refused_"+r.String(), rejects[r])
 			}
 		}
-		c.logger.Warn("no work handed out: machine is at its own in-flight cap "+
-			"(copies it already holds, or stale claims it never returned)", attrs...)
+		msg := "no work handed out: machine is at its own in-flight cap " +
+			"(copies it already holds, or stale claims it never returned)"
+		if rejects[rejectInflightCap] == 0 {
+			msg = "no work handed out: no leaf fits this machine's advertised capabilities " +
+				"(compare the budgets logged here against the leafs' resource_requirements)"
+		}
+		c.logger.Warn(msg, attrs...)
 	}
 	return final, drained
 }

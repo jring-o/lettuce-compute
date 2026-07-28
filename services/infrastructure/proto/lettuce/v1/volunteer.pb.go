@@ -1722,9 +1722,30 @@ func (x *ExecutionSpec) GetBinaryChecksums() map[string]string {
 // ceiling for one unit, this is the machine budget dispatch gates on, and nothing
 // keeps the two in step. Gate on this one.
 type LeafResourceRequirements struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MinDiskMb     int64                  `protobuf:"varint,1,opt,name=min_disk_mb,json=minDiskMb,proto3" json:"min_disk_mb,omitempty"`
-	MinCpuCores   int32                  `protobuf:"varint,2,opt,name=min_cpu_cores,json=minCpuCores,proto3" json:"min_cpu_cores,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	MinDiskMb   int64                  `protobuf:"varint,1,opt,name=min_disk_mb,json=minDiskMb,proto3" json:"min_disk_mb,omitempty"`
+	MinCpuCores int32                  `protobuf:"varint,2,opt,name=min_cpu_cores,json=minCpuCores,proto3" json:"min_cpu_cores,omitempty"`
+	// The three GPU dimensions dispatch also matches on (TB-21). Sent for the same
+	// reason as the two above: without them the client reports a GPU leaf eligible
+	// for any machine that has a GPU at all, whatever its size or make, and the
+	// volunteer idles with every local check passing.
+	//
+	// min_gpu_vram_mb is NOT compared against the card's capacity — dispatch
+	// compares it against VRAM * the volunteer's max_gpu_vram_pct / 100, the share
+	// they have allowed. A client checking it against raw card size will report
+	// machines eligible that the head refuses, which is the bug this field exists
+	// to end. gpu_type is the required vendor ("NVIDIA"/"AMD"/"WEBGPU"), empty or
+	// "ANY" meaning no constraint; gpu_compute_capability is an exact-match string
+	// (e.g. "8.6"), empty meaning no constraint.
+	MinGpuVramMb         int32  `protobuf:"varint,3,opt,name=min_gpu_vram_mb,json=minGpuVramMb,proto3" json:"min_gpu_vram_mb,omitempty"`
+	GpuType              string `protobuf:"bytes,4,opt,name=gpu_type,json=gpuType,proto3" json:"gpu_type,omitempty"`
+	GpuComputeCapability string `protobuf:"bytes,5,opt,name=gpu_compute_capability,json=gpuComputeCapability,proto3" json:"gpu_compute_capability,omitempty"`
+	// resource_requirements.gpu_required, the OTHER of the two GPU-presence flags.
+	// Dispatch requires a GPU when EITHER this or ExecutionSpec.gpu_required is set
+	// (they were historically unsynced — issue #30), so a client that reads only the
+	// execution-spec flag reports a GPU-less machine eligible for a leaf that sets
+	// just this one. Read them together, never alone.
+	GpuRequired   bool `protobuf:"varint,6,opt,name=gpu_required,json=gpuRequired,proto3" json:"gpu_required,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1771,6 +1792,34 @@ func (x *LeafResourceRequirements) GetMinCpuCores() int32 {
 		return x.MinCpuCores
 	}
 	return 0
+}
+
+func (x *LeafResourceRequirements) GetMinGpuVramMb() int32 {
+	if x != nil {
+		return x.MinGpuVramMb
+	}
+	return 0
+}
+
+func (x *LeafResourceRequirements) GetGpuType() string {
+	if x != nil {
+		return x.GpuType
+	}
+	return ""
+}
+
+func (x *LeafResourceRequirements) GetGpuComputeCapability() string {
+	if x != nil {
+		return x.GpuComputeCapability
+	}
+	return ""
+}
+
+func (x *LeafResourceRequirements) GetGpuRequired() bool {
+	if x != nil {
+		return x.GpuRequired
+	}
+	return false
 }
 
 type GetHeadInfoRequest struct {
@@ -2958,10 +3007,14 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aB\n" +
 	"\x14BinaryChecksumsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"^\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf9\x01\n" +
 	"\x18LeafResourceRequirements\x12\x1e\n" +
 	"\vmin_disk_mb\x18\x01 \x01(\x03R\tminDiskMb\x12\"\n" +
-	"\rmin_cpu_cores\x18\x02 \x01(\x05R\vminCpuCores\"\x14\n" +
+	"\rmin_cpu_cores\x18\x02 \x01(\x05R\vminCpuCores\x12%\n" +
+	"\x0fmin_gpu_vram_mb\x18\x03 \x01(\x05R\fminGpuVramMb\x12\x19\n" +
+	"\bgpu_type\x18\x04 \x01(\tR\agpuType\x124\n" +
+	"\x16gpu_compute_capability\x18\x05 \x01(\tR\x14gpuComputeCapability\x12!\n" +
+	"\fgpu_required\x18\x06 \x01(\bR\vgpuRequired\"\x14\n" +
 	"\x12GetHeadInfoRequest\"\xcf\x02\n" +
 	"\x13GetHeadInfoResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +

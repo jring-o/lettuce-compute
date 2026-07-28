@@ -807,7 +807,7 @@ var resourceLimitsComments = map[string]string{
 	"max_memory_mb":      "Memory ceiling. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
 	"max_disk_gb":        "Disk under the data dir the volunteer may use. Work is not fetched unless at least this much is free.",
 	"max_bandwidth_mbps": "Bandwidth cap in Mbps. 0 = unlimited.",
-	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. 0 disables GPU work entirely.",
+	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. A head compares a leaf's VRAM requirement against this share of your card, not the card itself, so at the default 50% a 6 GB card offers 3072 MB. 0 disables GPU work entirely.",
 	"max_pids":           "Max simultaneous processes/threads inside a container (fork-bomb cap). 0 uses the built-in default.",
 }
 

@@ -15,7 +15,6 @@ const mockLeaf: Leaf = {
     runtime: "NATIVE",
     gpu_required: false,
     gpu_type: "ANY",
-    min_vram_gb: 0,
     network_access: false,
     max_memory_mb: 1024,
     max_disk_mb: 2048,
@@ -215,5 +214,41 @@ describe("ProjectDetail", () => {
   it("does not render aggregation card when aggregation is not provided", () => {
     render(<ProjectDetail {...defaultProps} />);
     expect(screen.queryByTestId("aggregation-card")).not.toBeInTheDocument();
+  });
+
+  // TB-20: the VRAM figure must come from resource_requirements, the field the
+  // head gates dispatch on. It used to be read from execution_config.min_vram_gb,
+  // a parallel value nothing enforced, so this page could advertise a requirement
+  // no volunteer was actually judged against.
+  it("renders the GPU VRAM requirement from resource_requirements", () => {
+    const gpuLeaf: Leaf = {
+      ...mockLeaf,
+      execution_config: {
+        ...mockLeaf.execution_config!,
+        runtime: "CONTAINER",
+        gpu_required: true,
+        gpu_type: "NVIDIA",
+      },
+      resource_requirements: {
+        min_cpu_cores: 1,
+        min_disk_mb: 20480,
+        gpu_required: true,
+        min_gpu_vram_mb: 4096,
+      },
+    };
+    render(<ProjectDetail {...defaultProps} leaf={gpuLeaf} />);
+    const req = screen.getByTestId("gpu-requirement");
+    expect(req).toHaveTextContent("NVIDIA");
+    expect(req).toHaveTextContent("4096 MB VRAM");
+  });
+
+  it("omits the VRAM figure when the leaf states no requirement", () => {
+    const gpuLeaf: Leaf = {
+      ...mockLeaf,
+      execution_config: { ...mockLeaf.execution_config!, gpu_required: true },
+      resource_requirements: { gpu_required: true },
+    };
+    render(<ProjectDetail {...defaultProps} leaf={gpuLeaf} />);
+    expect(screen.getByTestId("gpu-requirement")).not.toHaveTextContent("VRAM");
   });
 });

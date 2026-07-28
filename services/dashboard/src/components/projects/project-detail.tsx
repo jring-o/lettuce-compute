@@ -162,8 +162,11 @@ export function ProjectDetail({
                   {leaf.execution_config.gpu_type !== "ANY"
                     ? ` (${leaf.execution_config.gpu_type})`
                     : ""}
-                  {leaf.execution_config.min_vram_gb > 0
-                    ? ` · ${leaf.execution_config.min_vram_gb * 1024} MB VRAM`
+                  {/* VRAM comes from resource_requirements — the field dispatch
+                      gates on. It used to be read from execution_config.min_vram_gb,
+                      an independently-settable copy nothing enforced (TB-20). */}
+                  {leaf.resource_requirements?.min_gpu_vram_mb
+                    ? ` · ${leaf.resource_requirements.min_gpu_vram_mb} MB VRAM`
                     : ""}
                 </span>
               </div>

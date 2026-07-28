@@ -45,7 +45,6 @@ export interface ExecutionConfig {
   dependencies?: string | null;
   gpu_required: boolean;
   gpu_type: "ANY" | "NVIDIA" | "AMD";
-  min_vram_gb: number;
   network_access: boolean;
   max_memory_mb: number;
   max_disk_mb: number;
@@ -113,7 +112,13 @@ export interface ResourceRequirements {
   min_disk_mb?: number;
   gpu_required?: boolean;
   gpu_type?: string;
+  // Two names for one requirement, because this interface serves both response
+  // shapes: list summaries abbreviate it to gpu_min_vram_mb, the full leaf detail
+  // returns it as min_gpu_vram_mb. Both now carry the value dispatch gates on
+  // (TB-20) — read whichever the endpoint you called provides, and never
+  // execution_config, which no longer holds a VRAM figure at all.
   gpu_min_vram_mb?: number;
+  min_gpu_vram_mb?: number;
   os?: string[];
   arch?: string[];
 }

@@ -513,10 +513,6 @@ func ValidateExecutionConfig(c *ExecutionConfig) *apierror.APIError {
 				fmt.Sprintf("invalid gpu_type: %q; must be one of ANY, NVIDIA, AMD, WEBGPU", c.GPUType),
 				validationDetail{Field: "gpu_type", Reason: "invalid_value"})
 		}
-		if c.MinVRAMGB < 0 {
-			return apierror.ValidationError("min_vram_gb must be non-negative",
-				validationDetail{Field: "min_vram_gb", Reason: "must_be_non_negative"})
-		}
 	}
 
 	// Resource limits must be positive
@@ -1138,11 +1134,32 @@ func ValidateResourceRequirements(r *ResourceRequirements) *apierror.APIError {
 		return apierror.ValidationError("min_gpu_vram_mb must be non-negative",
 			validationDetail{Field: "min_gpu_vram_mb", Reason: "must_be_non_negative"})
 	}
+	// A GPU memory requirement must be a whole number of GiB (TB-20). Graphics
+	// memory is sold and reported in whole GiB, so an arbitrary figure like 4000
+	// is not a capacity any card has — the live leaves that prompted this declared
+	// exactly that, and it read to a volunteer as "a 4 GB card will do" when the
+	// gate is against their allowed FRACTION of it. Whole GiB rather than a fixed
+	// list of sizes: a list would refuse the 3 GB, 10 GB, 11 GB, 20 GB, 40 GB and
+	// 80 GB cards that exist, and would go stale with every GPU generation.
+	if r.MinGPUVRAMMB%1024 != 0 {
+		return apierror.ValidationError(
+			fmt.Sprintf("min_gpu_vram_mb must be a whole number of GiB (a multiple of 1024); got %d, did you mean %d?",
+				r.MinGPUVRAMMB, wholeGiBToCover(r.MinGPUVRAMMB)),
+			validationDetail{Field: "min_gpu_vram_mb", Reason: "must_be_whole_gib"})
+	}
 	if r.MinBandwidthMbps < 0 {
 		return apierror.ValidationError("min_bandwidth_mbps must be non-negative",
 			validationDetail{Field: "min_bandwidth_mbps", Reason: "must_be_non_negative"})
 	}
 	return nil
+}
+
+// wholeGiBToCover rounds a VRAM figure UP to the next whole GiB, for the
+// suggestion in the validation error above. Up, never down: the value is a
+// floor a machine must clear, so rounding 4000 down to 3072 would silently
+// admit cards that cannot hold the work.
+func wholeGiBToCover(mb int) int {
+	return ((mb + 1023) / 1024) * 1024
 }
 
 // validateMapReduceDataConfig validates data_config fields specific to map-reduce leafs.
