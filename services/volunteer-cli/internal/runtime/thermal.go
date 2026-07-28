@@ -91,16 +91,23 @@ func criticalOverheats(sensors []Sensor, resumeMarginC int) (pausing []Sensor, s
 // critical point, mirroring the 10-degree CPU pause/resume gap.
 const criticalResumeMarginC = 10
 
-// defaultMaxThrottleMinutes bounds how long work stays frozen on one continuous
-// throttle before the client forces a re-evaluation.
+// defaultMaxThrottleMinutes bounds how long work stays frozen on a throttle held
+// by a sensor OUTSIDE the CPU and GPU families.
 //
-// Without a ceiling a throttle is a livelock whenever the heat is not ours to
-// clear — a stuck sensor, a misclassified part, or a machine kept hot by the
-// volunteer's own other work. Observed: 2 h 28 min frozen with no log output and
-// no path back. Forcing a resume is safe in the sense that matters: every CPU
-// throttles itself in hardware long before damage, so this layer is a courtesy
-// to the volunteer's machine, not its protection.
+// It deliberately does NOT bound a CPU or GPU throttle. Backing off a machine
+// whose processor is genuinely hot is the whole point of this feature and is
+// correct for as long as it stays hot — our own load is the plausible cause, and
+// a volunteer's machine matters more than our throughput. The ceiling exists
+// only for the case we cannot influence: a drive under someone else's I/O, a
+// chipset, or a sensor stuck above its own trip point, where staying frozen
+// helps nothing and is indistinguishable from a hung daemon.
 const defaultMaxThrottleMinutes = 30
+
+// suppressionCooldown is how long a sensor that held work past the throttle
+// ceiling is ignored afterwards. Bounded rather than permanent: a part that
+// genuinely overheats again later must still be able to pause work, so this
+// buys quiet rather than switching the sensor off for the daemon's lifetime.
+const suppressionCooldown = 2 * time.Hour
 
 // throttleLogInterval is how often an ongoing throttle re-announces itself, so a
 // frozen daemon is never silent for hours.
@@ -173,9 +180,11 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 	throttled := false
 	var throttledSince time.Time
 	var lastThrottleLog time.Time
-	// suppressed holds sensors that have been force-released past the throttle
-	// ceiling, so a stuck reading cannot immediately re-trip the same freeze.
-	suppressed := make(map[string]bool)
+	// suppressed maps a zone to the time its force-release cooldown ends, so a
+	// sensor that held work past the ceiling cannot immediately re-trip the same
+	// freeze. Time-bounded rather than permanent: a part that genuinely overheats
+	// again later must still be able to pause work.
+	suppressed := make(map[string]time.Time)
 
 	maxThrottle := time.Duration(t.config.MaxThrottleMinutes) * time.Minute
 	if t.config.MaxThrottleMinutes == 0 {
@@ -196,8 +205,8 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 			gpuTemp := t.readGPUTemperature()
 			sensors := t.readSensors()
 			critPausing, critStillHot := criticalOverheats(sensors, criticalResumeMarginC)
-			critPausing = filterSuppressed(critPausing, suppressed)
-			critStillHot = filterSuppressed(critStillHot, suppressed)
+			critPausing = filterSuppressed(critPausing, suppressed, t.now())
+			critStillHot = filterSuppressed(critStillHot, suppressed, t.now())
 
 			if !throttled {
 				cpuHot := cpuTemp > 0 && cpuTemp >= t.config.CPUPauseThresholdC
@@ -237,25 +246,38 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 
 			held := t.now().Sub(throttledSince)
 
-			// Force a release once the ceiling is reached. Whatever is holding us
-			// is not clearing, and staying frozen indefinitely on a signal this
-			// client cannot influence contributes nothing while looking identical
-			// to a hung daemon. Suppress the specific sensor so we do not thrash.
-			if maxThrottle > 0 && held >= maxThrottle {
+			// The ceiling applies ONLY when a live CPU/GPU reading is not what is
+			// holding us — i.e. reaching here with cpuOK && gpuOK means some other
+			// sensor is past its own declared critical point and staying there.
+			//
+			// A genuinely hot CPU or GPU must keep work suspended for as long as it
+			// stays hot, however long that is. That is the entire purpose of the
+			// feature, our own load is the plausible cause, and backing off is the
+			// correct response to a machine in trouble whatever caused it. An
+			// earlier version of this code force-released on ANY cause, which both
+			// contradicted that and — because the CPU check never consulted the
+			// suppression map — produced a freeze/unfreeze cycle at the ceiling
+			// interval rather than the single clean release it logged.
+			//
+			// What remains is the case the ceiling was actually for: a part whose
+			// temperature this client cannot influence (a drive under someone
+			// else's I/O, a chipset) or a sensor stuck above its trip point.
+			// Freezing forever on that contributes nothing and is
+			// indistinguishable from a hung daemon.
+			if maxThrottle > 0 && held >= maxThrottle && cpuOK && gpuOK && len(critStillHot) > 0 {
+				until := t.now().Add(suppressionCooldown)
 				for _, s := range critStillHot {
-					suppressed[s.Zone] = true
-				}
-				if !cpuOK {
-					suppressed["cpu"] = true
+					suppressed[s.Zone] = until
 				}
 				throttled = false
-				t.logger.Warn("thermal throttle force-released: still hot after the maximum throttle time",
+				t.logger.Warn("thermal throttle force-released: a non-CPU sensor stayed past its own critical point",
 					"paused_for", held.Round(time.Second).String(),
 					"max_throttle", maxThrottle.String(),
 					"cpu_temp", cpuTemp,
 					"gpu_temp", gpuTemp,
 					"sensors", describeSensors(critStillHot),
-					"note", "resuming work; this reading is not clearing while suspended, so it is unlikely to be ours. Hardware thermal protection is unaffected. Raise thermal.cpu_pause_threshold or set thermal.enabled=false if this recurs",
+					"suppressed_for", suppressionCooldown.String(),
+					"note", "the CPU and GPU are within their thresholds; this reading is not clearing while work is suspended, so suspending is not helping it. Resuming, and ignoring these sensors for the cooldown. Hardware thermal protection is unaffected.",
 				)
 				t.signal(ctx, false)
 				continue
@@ -278,16 +300,17 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// filterSuppressed drops sensors that have already force-released a throttle.
-func filterSuppressed(sensors []Sensor, suppressed map[string]bool) []Sensor {
+// filterSuppressed drops sensors whose force-release cooldown has not expired.
+func filterSuppressed(sensors []Sensor, suppressed map[string]time.Time, now time.Time) []Sensor {
 	if len(suppressed) == 0 {
 		return sensors
 	}
 	out := sensors[:0:0]
 	for _, s := range sensors {
-		if !suppressed[s.Zone] {
-			out = append(out, s)
+		if until, ok := suppressed[s.Zone]; ok && now.Before(until) {
+			continue
 		}
+		out = append(out, s)
 	}
 	return out
 }

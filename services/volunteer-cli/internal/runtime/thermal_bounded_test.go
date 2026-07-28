@@ -72,16 +72,21 @@ func collectSignals(ch chan bool, into *[]bool, mu *sync.Mutex, done <-chan stru
 	}
 }
 
-// A CPU sensor stuck above the resume threshold must not freeze work forever.
-func TestThermalMonitor_ForceReleasesAfterMaxThrottle(t *testing.T) {
+// A genuinely hot CPU must keep work frozen for as long as it stays hot — the
+// ceiling must NOT release it. An earlier version of this code force-released on
+// any cause, which contradicted the whole point of the feature; and because the
+// CPU check never consulted the suppression map, it produced a freeze/unfreeze
+// cycle at the ceiling interval rather than the single release it logged.
+func TestThermalMonitor_HotCPUIsNeverForceReleased(t *testing.T) {
 	withMockCPUTemp(t, 90) // permanently above the 85C pause / 75C resume band
 	withMockExecutor(t, notFoundForAll)
+	withMockSensors(t, nil)
 
 	clock := newFakeClock()
 	cfg := defaultThermalConfig()
 	cfg.MaxThrottleMinutes = 30
 
-	ch := make(chan bool, 8)
+	ch := make(chan bool, 16)
 	var mu sync.Mutex
 	var signals []bool
 	done := make(chan struct{})
@@ -97,14 +102,67 @@ func TestThermalMonitor_ForceReleasesAfterMaxThrottle(t *testing.T) {
 	m.Start(ctx)
 	defer m.Stop()
 
-	// Wait for the pause.
 	waitFor(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(signals) >= 1 && signals[0]
 	}, "thermal throttle never activated at 90C")
 
-	// Hold past the ceiling. The temperature never drops.
+	// Well past the ceiling, and past several multiples of it — the old code
+	// would have cycled release/re-pause once per ceiling interval.
+	for i := 0; i < 4; i++ {
+		clock.advance(31 * time.Minute)
+		time.Sleep(40 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, s := range signals[1:] {
+		if !s {
+			t.Fatalf("throttle released at signal %d while the CPU was still at 90C: a genuinely hot processor must keep work suspended for as long as it stays hot", i+1)
+		}
+	}
+	if len(signals) != 1 {
+		t.Errorf("got %d signals %v, want exactly 1 (the initial pause) — extra signals mean the throttle is cycling", len(signals), signals)
+	}
+}
+
+// The ceiling DOES apply when only a non-CPU sensor is holding us: suspending
+// work cannot cool a drive someone else is using, so freezing forever helps
+// nothing.
+func TestThermalMonitor_NonCPUSensorIsForceReleasedAtCeiling(t *testing.T) {
+	withMockCPUTemp(t, 60) // CPU fine
+	withMockExecutor(t, notFoundForAll)
+	withMockSensors(t, []Sensor{
+		{Zone: "thermal_zone2", Kind: "nvme", Class: SensorOther, TempC: 99, CriticalC: 95},
+	})
+
+	clock := newFakeClock()
+	cfg := defaultThermalConfig()
+	cfg.MaxThrottleMinutes = 30
+
+	ch := make(chan bool, 16)
+	var mu sync.Mutex
+	var signals []bool
+	done := make(chan struct{})
+	go collectSignals(ch, &signals, &mu, done)
+	defer close(done)
+
+	m := NewThermalMonitor(cfg, ch, testLogger())
+	m.SetClockForTest(clock.now)
+	m.SetPollIntervalForTest(5 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Start(ctx)
+	defer m.Stop()
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(signals) >= 1 && signals[0]
+	}, "a drive past its own critical point never paused work")
+
 	clock.advance(31 * time.Minute)
 
 	waitFor(t, func() bool {
@@ -116,7 +174,69 @@ func TestThermalMonitor_ForceReleasesAfterMaxThrottle(t *testing.T) {
 			}
 		}
 		return false
-	}, "still frozen 31 minutes into a 30-minute ceiling: a reading that never clears while suspended freezes the volunteer indefinitely")
+	}, "still frozen 31 minutes into a 30-minute ceiling on a sensor suspending work cannot cool")
+}
+
+// After a force-release the sensor is ignored for a cooldown — it must not
+// re-trip on the very next tick, and it must NOT be silenced permanently.
+func TestThermalMonitor_ForceReleasedSensorIsSuppressedThenRecovers(t *testing.T) {
+	withMockCPUTemp(t, 60)
+	withMockExecutor(t, notFoundForAll)
+	withMockSensors(t, []Sensor{
+		{Zone: "thermal_zone2", Kind: "nvme", Class: SensorOther, TempC: 99, CriticalC: 95},
+	})
+
+	clock := newFakeClock()
+	cfg := defaultThermalConfig()
+	cfg.MaxThrottleMinutes = 30
+
+	ch := make(chan bool, 16)
+	var mu sync.Mutex
+	var signals []bool
+	done := make(chan struct{})
+	go collectSignals(ch, &signals, &mu, done)
+	defer close(done)
+
+	m := NewThermalMonitor(cfg, ch, testLogger())
+	m.SetClockForTest(clock.now)
+	m.SetPollIntervalForTest(5 * time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.Start(ctx)
+	defer m.Stop()
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(signals) >= 1
+	}, "never paused")
+
+	clock.advance(31 * time.Minute) // force-release
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(signals) >= 2 && !signals[1]
+	}, "never force-released")
+
+	// Inside the cooldown the same still-hot sensor must not re-pause.
+	clock.advance(10 * time.Minute)
+	time.Sleep(60 * time.Millisecond)
+	mu.Lock()
+	n := len(signals)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("got %d signals, want 2: the sensor re-tripped inside its cooldown", n)
+	}
+
+	// Past the cooldown it must be able to protect the machine again —
+	// suppression is quiet, not permanent.
+	clock.advance(suppressionCooldown + time.Minute)
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(signals) >= 3 && signals[2]
+	}, "sensor stayed suppressed after its cooldown expired: one force-release must not disable it for the daemon's lifetime")
 }
 
 // The ceiling must not cut a throttle short while it is still working.
