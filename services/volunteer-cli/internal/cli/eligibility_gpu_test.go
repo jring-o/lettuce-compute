@@ -153,6 +153,47 @@ func TestEvaluateLeafEligibility_GPUVendorGate(t *testing.T) {
 	}
 }
 
+// TestEvaluateLeafEligibility_GPUSubGatesKeyOnTheSameFlagAsDispatch is the
+// mirror-image guard. The dispatch predicate keys each GPU sub-gate on a
+// DIFFERENT flag — presence and VRAM on either, the vendor gate on
+// execution_config.gpu_required alone, compute capability on
+// resource_requirements.gpu_required alone. Applying a sub-gate the head skips
+// makes the client stricter than the head, refusing a machine that would in fact
+// be sent work: the original divergence pointing the other way.
+func TestEvaluateLeafEligibility_GPUSubGatesKeyOnTheSameFlagAsDispatch(t *testing.T) {
+	amd := gpuCaps(8192, 50)
+	amd.gpuVendors = []string{"AMD"}
+	amd.gpuComputeCapabilities = []string{"7.5"}
+
+	// gpu_type is NVIDIA but only resource_requirements.gpu_required is set, so
+	// dispatch never applies the vendor gate.
+	vendorSkipped := []*lettucev1.LeafInfo{{
+		Id: "v", Slug: "v",
+		ExecutionSpec: &lettucev1.ExecutionSpec{Image: "x:1", GpuRequired: false, GpuType: "NVIDIA", MaxMemoryMb: 1024},
+		ResourceRequirements: &lettucev1.LeafResourceRequirements{
+			MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: true, GpuType: "NVIDIA",
+		},
+	}}
+	if res := evaluateLeafEligibility(vendorSkipped, amd, trustingHead); res.eligible != 1 {
+		t.Errorf("vendor gate applied where dispatch skips it: eligible=%d, want 1 (reason: %q)",
+			res.eligible, res.leaves[0].reason)
+	}
+
+	// Compute capability set, but only execution_config.gpu_required is — dispatch
+	// keys that gate on resource_requirements.gpu_required, so it never fires.
+	ccSkipped := []*lettucev1.LeafInfo{{
+		Id: "c", Slug: "c",
+		ExecutionSpec: &lettucev1.ExecutionSpec{Image: "x:1", GpuRequired: true, MaxMemoryMb: 1024},
+		ResourceRequirements: &lettucev1.LeafResourceRequirements{
+			MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: false, GpuComputeCapability: "8.6",
+		},
+	}}
+	if res := evaluateLeafEligibility(ccSkipped, amd, trustingHead); res.eligible != 1 {
+		t.Errorf("compute-capability gate applied where dispatch skips it: eligible=%d, want 1 (reason: %q)",
+			res.eligible, res.leaves[0].reason)
+	}
+}
+
 // TestEvaluateLeafEligibility_GPUComputeCapabilityGate covers the third.
 func TestEvaluateLeafEligibility_GPUComputeCapabilityGate(t *testing.T) {
 	leafs := []*lettucev1.LeafInfo{gpuLeafInfo(0, "", "8.6")}

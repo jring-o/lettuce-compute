@@ -766,6 +766,16 @@ type leafRequirements struct {
 	gpuVRAMMB            int
 	gpuType              string
 	gpuComputeCapability string
+	// The two gpu_required flags kept SEPARATE, because the dispatch predicate keys
+	// each GPU sub-gate on a different one and mirroring that exactly is the whole
+	// point of this struct: presence and VRAM on either flag, the vendor gate on
+	// execution_config.gpu_required alone, compute capability on
+	// resource_requirements.gpu_required alone. Collapsing them to one boolean makes
+	// the client STRICTER than the head — reporting a machine ineligible for a leaf
+	// it would actually be sent, which is the same divergence as the original defect
+	// pointing the other way.
+	specGPURequired bool
+	rrGPURequired   bool
 }
 
 // leafMachineNeeds carries the machine budgets separately from the execution
@@ -797,6 +807,8 @@ func leafRequirementsFromSpec(name, image string, binaries map[string]string, me
 		needsContainer:       image != "",
 		memoryMB:             memoryMB,
 		needsGPU:             gpuRequired || needs.gpuRequired,
+		specGPURequired:      gpuRequired,
+		rrGPURequired:        needs.gpuRequired,
 		diskMB:               needs.diskMB,
 		cpuCores:             needs.cpuCores,
 		gpuVRAMMB:            needs.gpuVRAMMB,
@@ -896,11 +908,16 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 			fmt.Sprintf("needs %d MB GPU memory > the %d MB you allow (%s)%s",
 				req.gpuVRAMMB, caps.maxGPUVRAMMB, caps.describeVRAMAllowance(),
 				vramRemedy(req.gpuVRAMMB, caps))}, "vram"
-	case req.needsGPU && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
+	// Vendor is gated on execution_config.gpu_required ALONE, and compute capability
+	// on resource_requirements.gpu_required alone — not on the OR — because that is
+	// how the dispatch predicate keys them. A leaf setting only the other flag has
+	// that sub-gate skipped head-side, so applying it here would refuse a machine
+	// the head would happily send work to.
+	case req.specGPURequired && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
 		!containsFold(caps.gpuVendors, req.gpuType):
 		return leafEligibility{req.name, false,
 			fmt.Sprintf("needs a %s GPU; yours is %s", strings.ToUpper(req.gpuType), strings.Join(caps.gpuVendors, "/"))}, "gpu"
-	case req.needsGPU && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
+	case req.rrGPURequired && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
 		!containsFold(caps.gpuComputeCapabilities, req.gpuComputeCapability):
 		return leafEligibility{req.name, false,
 			fmt.Sprintf("needs GPU compute capability %s; yours is %s",
