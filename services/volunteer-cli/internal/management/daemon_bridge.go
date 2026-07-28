@@ -884,6 +884,9 @@ type LeafResourceRequirements struct {
 	MinGPUVRAMMB         int32  `json:"min_gpu_vram_mb,omitempty"`
 	GPUType              string `json:"gpu_type,omitempty"`
 	GPUComputeCapability string `json:"gpu_compute_capability,omitempty"`
+	// resource_requirements.gpu_required — read together with the execution spec's
+	// flag, never alone; dispatch requires a GPU when either is set.
+	GPURequired bool `json:"gpu_required,omitempty"`
 }
 
 // LeafDetail describes a single leaf on a head, including effective config.
@@ -1090,6 +1093,7 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 						MinGPUVRAMMB:         rr.MinGPUVRAMMB,
 						GPUType:              rr.GPUType,
 						GPUComputeCapability: rr.GPUComputeCapability,
+						GPURequired:          rr.GPURequired,
 					}
 				}
 				if f, ok := failures[leaf.ID]; ok {

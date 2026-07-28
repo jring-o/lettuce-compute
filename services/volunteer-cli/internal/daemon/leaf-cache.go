@@ -54,6 +54,11 @@ type CachedResourceRequirements struct {
 	MinGPUVRAMMB         int32
 	GPUType              string
 	GPUComputeCapability string
+	// The OTHER GPU-presence flag. Dispatch requires a GPU when EITHER this or the
+	// execution spec's gpu_required is set, so they must be read together — reading
+	// the execution spec's alone reports a GPU-less machine eligible for a leaf that
+	// set only this one.
+	GPURequired bool
 }
 
 // CachedLeafInfo holds cached info about a single leaf.
@@ -138,6 +143,7 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 				MinGPUVRAMMB:         rr.GetMinGpuVramMb(),
 				GPUType:              rr.GetGpuType(),
 				GPUComputeCapability: rr.GetGpuComputeCapability(),
+				GPURequired:          rr.GetGpuRequired(),
 			}
 		}
 		cached.Leafs = append(cached.Leafs, cli)

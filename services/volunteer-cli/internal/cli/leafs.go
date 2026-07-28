@@ -118,6 +118,7 @@ type leafsAPIResourceRequirements struct {
 	MinGPUVRAMMB         int32  `json:"min_gpu_vram_mb"`
 	GPUType              string `json:"gpu_type"`
 	GPUComputeCapability string `json:"gpu_compute_capability"`
+	GPURequired          bool   `json:"gpu_required"`
 }
 
 // leafsAPILeafFailures is a leaf's local failure record (TB-10).
@@ -202,6 +203,7 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 					gpuVRAMMB:            int(rr.MinGPUVRAMMB),
 					gpuType:              rr.GPUType,
 					gpuComputeCapability: rr.GPUComputeCapability,
+					gpuRequired:          rr.GPURequired,
 				}
 			}
 			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired, needs)

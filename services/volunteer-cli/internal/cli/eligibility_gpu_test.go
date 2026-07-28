@@ -19,7 +19,44 @@ func gpuLeafInfo(vramMB int32, gpuType, computeCap string) *lettucev1.LeafInfo {
 		ResourceRequirements: &lettucev1.LeafResourceRequirements{
 			MinDiskMb: 1024, MinCpuCores: 1,
 			MinGpuVramMb: vramMB, GpuType: gpuType, GpuComputeCapability: computeCap,
+			GpuRequired: true,
 		},
+	}
+}
+
+// TestEvaluateLeafEligibility_GPURequiredFromEitherFlag pins the presence gate to
+// the dispatch predicate, which requires a GPU when EITHER gpu_required flag is
+// set (they were historically unsynced — issue #30). The client read only the
+// execution spec's, so a leaf that set just resource_requirements.gpu_required
+// slipped past every GPU gate and a GPU-less machine reported itself eligible.
+func TestEvaluateLeafEligibility_GPURequiredFromEitherFlag(t *testing.T) {
+	noGPU := volunteerCaps{maxMemoryMB: 16384, containerUsable: true, hasGPU: false,
+		maxDiskMB: 100 * 1024, maxCPUCores: 8}
+
+	for _, tc := range []struct {
+		name         string
+		specFlag     bool
+		rrFlag       bool
+		wantEligible int
+	}{
+		{"neither flag", false, false, 1},
+		{"execution spec only", true, false, 0},
+		{"resource requirements only", false, true, 0},
+		{"both", true, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leafs := []*lettucev1.LeafInfo{{
+				Id: "l", Slug: "l",
+				ExecutionSpec: &lettucev1.ExecutionSpec{Image: "x:1", GpuRequired: tc.specFlag, MaxMemoryMb: 1024},
+				ResourceRequirements: &lettucev1.LeafResourceRequirements{
+					MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: tc.rrFlag,
+				},
+			}}
+			if res := evaluateLeafEligibility(leafs, noGPU, trustingHead); res.eligible != tc.wantEligible {
+				t.Errorf("eligible=%d, want %d — the head requires a GPU when either flag is set",
+					res.eligible, tc.wantEligible)
+			}
+		})
 	}
 }
 

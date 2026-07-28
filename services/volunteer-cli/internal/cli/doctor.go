@@ -781,6 +781,11 @@ type leafMachineNeeds struct {
 	gpuVRAMMB            int
 	gpuType              string
 	gpuComputeCapability string
+	// resource_requirements.gpu_required — the OTHER of the two presence flags,
+	// ORed with the execution spec's in leafRequirementsFromSpec because that is
+	// what the dispatch predicate does. Reading the execution spec's alone reported
+	// a GPU-less machine eligible for a leaf that set only this one.
+	gpuRequired bool
 }
 
 // leafRequirementsFromSpec reduces a leaf's execution spec to its requirements.
@@ -791,7 +796,7 @@ func leafRequirementsFromSpec(name, image string, binaries map[string]string, me
 		name:                 name,
 		needsContainer:       image != "",
 		memoryMB:             memoryMB,
-		needsGPU:             gpuRequired,
+		needsGPU:             gpuRequired || needs.gpuRequired,
 		diskMB:               needs.diskMB,
 		cpuCores:             needs.cpuCores,
 		gpuVRAMMB:            needs.gpuVRAMMB,
@@ -834,7 +839,9 @@ func runtimeKindOf(req leafRequirements) string {
 // the execution_config.max_memory_mb ceiling (the gate that silently fires for a
 // default-configured volunteer, #30), the resource_requirements.min_disk_mb and
 // min_cpu_cores machine budgets (TB-15), and the four GPU dimensions — presence,
-// allowed VRAM, vendor and compute capability (TB-21).
+// allowed VRAM, vendor and compute capability (TB-21). Presence is the OR of the
+// two gpu_required flags, matching the predicate; the leaf-side flags are combined
+// in leafRequirementsFromSpec.
 //
 // These are every dimension FindNextAssignable matches on, which is the point: a
 // leaf this reports eligible is one the head will actually dispatch. Anything
@@ -977,6 +984,7 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 				gpuVRAMMB:            int(rr.GetMinGpuVramMb()),
 				gpuType:              rr.GetGpuType(),
 				gpuComputeCapability: rr.GetGpuComputeCapability(),
+				gpuRequired:          rr.GetGpuRequired(),
 			})
 		le, blocked := classifyLeaf(req, caps, srv)
 		switch blocked {

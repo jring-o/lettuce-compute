@@ -666,6 +666,7 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			MinGpuVramMb:         int32(resourceReqs.MinGPUVRAMMB),
 			GpuType:              execConfig.GPUType,
 			GpuComputeCapability: derefString(resourceReqs.GPUComputeCapability),
+			GpuRequired:          resourceReqs.GPURequired,
 		}
 		// #29 duration-aware batching (head side): give the volunteer a per-leaf
 		// duration estimate (seconds) so it can size its FIRST batch request to fill
