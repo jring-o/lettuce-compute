@@ -129,6 +129,19 @@ work files.
   underneath. Raise it with
   `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
   daemon, which is when the new figure is re-advertised.
+- **`max_gpu_vram_pct` is the same kind of trap, and sharper, because it is a
+  percentage.** A head does not compare a GPU leaf's memory requirement against
+  your card's size — it compares it against the *share of the card you allow*,
+  which defaults to **50%**. So an 8 GB card offers 4096 MB and clears a leaf
+  needing 4 GB; a 6 GB card offers 3072 MB and is never sent that leaf, even
+  though the card is bigger than the requirement. `lettuce-volunteer doctor` and
+  `leafs list` name any leaf blocked this way, print the requirement next to what
+  your machine offers and the card it came from, and suggest the percentage that
+  would clear it; where no percentage can (the card really is too small) they say
+  that instead. Raise it with
+  `lettuce-volunteer config set resource_limits.max_gpu_vram_pct <n>` and restart.
+  A leaf may also require a particular make of card, which the same commands
+  report.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
 
