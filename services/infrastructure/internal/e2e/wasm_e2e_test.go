@@ -268,6 +268,72 @@ func TestHeadInfo_CarriesResourceRequirements(t *testing.T) {
 	}
 }
 
+// TestHeadInfo_CarriesGPURequirements is the TB-21 protocol half: the three GPU
+// dimensions dispatch matches on have to reach the volunteer, or its eligibility
+// check reports GPU leafs runnable on any machine with a GPU of any size or make.
+func TestHeadInfo_CarriesGPURequirements(t *testing.T) {
+	env, cleanup := setupHeadsLeafsServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	userID := createTestUser(t, env.pool, ctx, "headinfo-gpureqs")
+
+	execCfg := defaultExecConfig()
+	execCfg.Runtime = leaf.RuntimeContainer
+	img := "example.test/model:1.0"
+	execCfg.Image = &img
+	execCfg.Binaries = nil
+	execCfg.BinaryChecksums = nil
+	execCfg.GPURequired = true
+	execCfg.GPUType = leaf.GPUTypeNvidia
+
+	cc := "8.6"
+	createHLLeaf(t, env, ctx, userID, hlLeafOpts{
+		Name:         "GPU Hungry Leaf",
+		TaskPattern:  leaf.PatternParameterSweep,
+		ExecConfig:   execCfg,
+		ValConfig:    defaultHLValConfig(),
+		FTConfig:     defaultFTConfig(),
+		DataConfig:   defaultDataConfig(),
+		CreditConfig: leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
+		ResourceReqs: &leaf.ResourceRequirements{
+			MinCPUCores: 1, MinDiskMB: 1024,
+			GPURequired: true, MinGPUVRAMMB: 4096, GPUComputeCapability: &cc,
+		},
+	})
+
+	resp, err := env.grpc.GetHeadInfo(ctx, &lettucev1.GetHeadInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetHeadInfo: %v", err)
+	}
+
+	var found bool
+	for _, li := range resp.Leafs {
+		if li.Name != "GPU Hungry Leaf" {
+			continue
+		}
+		found = true
+		rr := li.GetResourceRequirements()
+		if rr == nil {
+			t.Fatal("leaf has nil resource_requirements: a volunteer cannot check what it is never sent")
+		}
+		if rr.GetMinGpuVramMb() != 4096 {
+			t.Errorf("min_gpu_vram_mb = %d, want 4096", rr.GetMinGpuVramMb())
+		}
+		if rr.GetGpuType() != leaf.GPUTypeNvidia {
+			t.Errorf("gpu_type = %q, want %q", rr.GetGpuType(), leaf.GPUTypeNvidia)
+		}
+		if rr.GetGpuComputeCapability() != cc {
+			t.Errorf("gpu_compute_capability = %q, want %q", rr.GetGpuComputeCapability(), cc)
+		}
+	}
+	if !found {
+		t.Fatal("GPU Hungry Leaf not found in GetHeadInfo response")
+	}
+}
+
 // registerHLVolunteerWithRuntimes registers a volunteer with specific available runtimes.
 func registerHLVolunteerWithRuntimes(t *testing.T, env *headsLeafsEnv, ctx context.Context, pubKey []byte, name string, runtimes []string) string {
 	t.Helper()

@@ -46,6 +46,14 @@ type CachedExecutionSpec struct {
 type CachedResourceRequirements struct {
 	MinDiskMB   int64
 	MinCPUCores int32
+	// The GPU dimensions (TB-21). MinGPUVRAMMB is matched against this machine's
+	// ALLOWED VRAM, not its card capacity — see MachineCapabilities.MaxGPUVRAMMB.
+	// GPUType empty or "ANY" means any vendor; GPUComputeCapability empty means no
+	// constraint. Zero/empty also means "head too old to say", which the eligibility
+	// gates read as unknown rather than as "no requirement".
+	MinGPUVRAMMB         int32
+	GPUType              string
+	GPUComputeCapability string
 }
 
 // CachedLeafInfo holds cached info about a single leaf.
@@ -125,8 +133,11 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 		}
 		if rr := l.GetResourceRequirements(); rr != nil {
 			cli.ResourceRequirements = &CachedResourceRequirements{
-				MinDiskMB:   rr.GetMinDiskMb(),
-				MinCPUCores: rr.GetMinCpuCores(),
+				MinDiskMB:            rr.GetMinDiskMb(),
+				MinCPUCores:          rr.GetMinCpuCores(),
+				MinGPUVRAMMB:         rr.GetMinGpuVramMb(),
+				GPUType:              rr.GetGpuType(),
+				GPUComputeCapability: rr.GetGpuComputeCapability(),
 			}
 		}
 		cached.Leafs = append(cached.Leafs, cli)

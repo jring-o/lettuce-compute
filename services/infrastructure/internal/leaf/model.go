@@ -97,10 +97,14 @@ type ExecutionConfig struct {
 	Language      *string           `json:"language"`
 	EntryPoint    *string           `json:"entry_point"`
 	Dependencies  *string           `json:"dependencies"`
-	GPURequired   bool              `json:"gpu_required"`
-	GPUType       string            `json:"gpu_type"`
-	MinVRAMGB     int               `json:"min_vram_gb"`
-	NetworkAccess bool              `json:"network_access"`
+	GPURequired bool   `json:"gpu_required"`
+	GPUType     string `json:"gpu_type"`
+	// A leaf's VRAM requirement lives in ResourceRequirements.MinGPUVRAMMB, the
+	// field dispatch gates on. There was a second, parallel min_vram_gb here that
+	// nothing enforced; it was deleted in TB-20 after a leaf set the two
+	// independently and the public catalog published the inert one. Any min_vram_gb
+	// still present in a stored execution_config is ignored on read.
+	NetworkAccess bool `json:"network_access"`
 	MaxMemoryMB   int               `json:"max_memory_mb"`
 	MaxDiskMB     int               `json:"max_disk_mb"`
 	MaxCPUSeconds int               `json:"max_cpu_seconds"`

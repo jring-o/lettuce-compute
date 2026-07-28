@@ -879,6 +879,11 @@ type LeafExecutionSpec struct {
 type LeafResourceRequirements struct {
 	MinDiskMB   int64 `json:"min_disk_mb,omitempty"`
 	MinCPUCores int32 `json:"min_cpu_cores,omitempty"`
+	// GPU dimensions (TB-21). MinGPUVRAMMB is compared against the machine's
+	// ALLOWED VRAM, not its card size.
+	MinGPUVRAMMB         int32  `json:"min_gpu_vram_mb,omitempty"`
+	GPUType              string `json:"gpu_type,omitempty"`
+	GPUComputeCapability string `json:"gpu_compute_capability,omitempty"`
 }
 
 // LeafDetail describes a single leaf on a head, including effective config.
@@ -927,6 +932,17 @@ type MachineCapabilities struct {
 	// since (TB-15).
 	MaxDiskMB   int64 `json:"max_disk_mb"`
 	MaxCPUCores int   `json:"max_cpu_cores"`
+	// The GPU side of the same idea (TB-21). MaxGPUVRAMMB is the ALLOWED VRAM —
+	// card capacity * max_gpu_vram_pct / 100, the figure dispatch compares a leaf
+	// against — not the size of the card. GPUVendors are uppercase ("NVIDIA").
+	// GPUCardVRAMMB and GPUVRAMPct describe the same card MaxGPUVRAMMB came from,
+	// so a blocked-leaf message can say "70% of your 6144 MB card" rather than
+	// quoting an allowance that reads as a hardware fault.
+	MaxGPUVRAMMB           int      `json:"max_gpu_vram_mb"`
+	GPUCardVRAMMB          int      `json:"gpu_card_vram_mb"`
+	GPUVRAMPct             int      `json:"gpu_vram_pct"`
+	GPUVendors             []string `json:"gpu_vendors"`
+	GPUComputeCapabilities []string `json:"gpu_compute_capabilities"`
 }
 
 // MachineRuntimes returns the runtime kinds this daemon has registered and can
@@ -940,6 +956,7 @@ func (b *DaemonBridge) MachineRuntimes() []string {
 // MachineCaps reports this machine's capabilities as the running daemon sees them.
 func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 	rl := b.daemon.GetConfig().ResourceLimits
+	vramMB, cardVRAMMB, vramPct, vendors, computeCaps := b.daemon.GPUBudget()
 	return MachineCapabilities{
 		Runtimes:    b.MachineRuntimes(),
 		HasGPU:      b.daemon.HasGPU(),
@@ -947,8 +964,13 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 		// max_disk_gb is advertised to the head in MB (client/hardware.go), so it
 		// is converted here rather than at the comparison, where a GB-vs-MB slip
 		// would silently pass every leaf.
-		MaxDiskMB:   int64(rl.MaxDiskGB) * 1024,
-		MaxCPUCores: rl.MaxCPUCores,
+		MaxDiskMB:              int64(rl.MaxDiskGB) * 1024,
+		MaxCPUCores:            rl.MaxCPUCores,
+		MaxGPUVRAMMB:           vramMB,
+		GPUCardVRAMMB:          cardVRAMMB,
+		GPUVRAMPct:             vramPct,
+		GPUVendors:             vendors,
+		GPUComputeCapabilities: computeCaps,
 	}
 }
 
@@ -1063,8 +1085,11 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 				}
 				if rr := leaf.ResourceRequirements; rr != nil {
 					ld.ResourceRequirements = &LeafResourceRequirements{
-						MinDiskMB:   rr.MinDiskMB,
-						MinCPUCores: rr.MinCPUCores,
+						MinDiskMB:            rr.MinDiskMB,
+						MinCPUCores:          rr.MinCPUCores,
+						MinGPUVRAMMB:         rr.MinGPUVRAMMB,
+						GPUType:              rr.GPUType,
+						GPUComputeCapability: rr.GPUComputeCapability,
 					}
 				}
 				if f, ok := failures[leaf.ID]; ok {

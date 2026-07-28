@@ -1791,6 +1791,37 @@ func (d *Daemon) HasGPU() bool {
 	return d.cachedHW != nil && len(d.cachedHW.GetGpus()) > 0
 }
 
+// GPUBudget reports the GPU capabilities this daemon ADVERTISED to heads, in the
+// same terms dispatch matches leafs against (TB-21): the largest allowed VRAM
+// across this machine's GPUs, and the vendors and compute capabilities it offers.
+//
+// vramMB is VRAM * max_vram_pct / 100 per card, taking the largest — deliberately
+// identical to the head's own computation, because a client comparing a leaf's
+// requirement against raw card capacity would report machines eligible that the
+// head refuses, which is the entire bug this exists to end. Read from the cached
+// advertised hardware rather than re-detecting, so the answer is what the head was
+// actually told, and so Windows does not pay for another exec.
+// cardVRAMMB and vramPct describe the SAME card that produced vramMB, so a caller
+// explaining the allowance quotes that card's own percentage rather than the global
+// default — a per-GPU override in config makes those differ.
+func (d *Daemon) GPUBudget() (vramMB, cardVRAMMB, vramPct int, vendors []string, computeCapabilities []string) {
+	if !d.HasGPU() {
+		return 0, 0, 0, nil, nil
+	}
+	for _, g := range d.cachedHW.GetGpus() {
+		if eff := int(g.GetVramMb()) * int(g.GetMaxVramPct()) / 100; eff > vramMB {
+			vramMB, cardVRAMMB, vramPct = eff, int(g.GetVramMb()), int(g.GetMaxVramPct())
+		}
+		if v := strings.ToUpper(strings.TrimSpace(g.GetVendor())); v != "" {
+			vendors = append(vendors, v)
+		}
+		if cc := g.GetComputeCapability(); cc != "" {
+			computeCapabilities = append(computeCapabilities, cc)
+		}
+	}
+	return vramMB, cardVRAMMB, vramPct, vendors, computeCapabilities
+}
+
 // leafFailurePaused reports whether the per-leaf breaker is holding a leaf back.
 // Called from the fetcher goroutine; the tracker takes its own lock.
 func (d *Daemon) leafFailurePaused(leafID string) bool {

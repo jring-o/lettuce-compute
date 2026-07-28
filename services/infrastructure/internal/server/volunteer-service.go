@@ -649,13 +649,23 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			MaxDiskMb:       int32(execConfig.MaxDiskMB),
 			NetworkAccess:   execConfig.NetworkAccess,
 		}
-		// The two machine budgets dispatch gates on (FindNextAssignable's
-		// min_cpu_cores/min_disk_mb predicates). Without them the volunteer cannot
+		// The machine requirements dispatch gates on (FindNextAssignable's
+		// min_cpu_cores/min_disk_mb/GPU predicates). Without them the volunteer cannot
 		// tell "this head has nothing for me" from "I am too small for this leaf",
-		// and every client-side diagnostic reported the latter as eligible (TB-15).
+		// and every client-side diagnostic reported the latter as eligible (TB-15,
+		// and TB-21 for the three GPU dimensions).
+		//
+		// gpu_type comes from execution_config, matching the gate: the SQL predicate
+		// tests execution_config->>'gpu_type' against the volunteer's vendors, while
+		// VRAM and compute capability come from resource_requirements. The client is
+		// sent them in one message because it does not care which struct they were
+		// authored in — only which machine they refuse.
 		li.ResourceRequirements = &lettucev1.LeafResourceRequirements{
-			MinDiskMb:   int64(resourceReqs.MinDiskMB),
-			MinCpuCores: int32(resourceReqs.MinCPUCores),
+			MinDiskMb:            int64(resourceReqs.MinDiskMB),
+			MinCpuCores:          int32(resourceReqs.MinCPUCores),
+			MinGpuVramMb:         int32(resourceReqs.MinGPUVRAMMB),
+			GpuType:              execConfig.GPUType,
+			GpuComputeCapability: derefString(resourceReqs.GPUComputeCapability),
 		}
 		// #29 duration-aware batching (head side): give the volunteer a per-leaf
 		// duration estimate (seconds) so it can size its FIRST batch request to fill

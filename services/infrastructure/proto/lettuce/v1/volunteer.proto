@@ -328,6 +328,21 @@ message ExecutionSpec {
 message LeafResourceRequirements {
   int64 min_disk_mb = 1;
   int32 min_cpu_cores = 2;
+  // The three GPU dimensions dispatch also matches on (TB-21). Sent for the same
+  // reason as the two above: without them the client reports a GPU leaf eligible
+  // for any machine that has a GPU at all, whatever its size or make, and the
+  // volunteer idles with every local check passing.
+  //
+  // min_gpu_vram_mb is NOT compared against the card's capacity — dispatch
+  // compares it against VRAM * the volunteer's max_gpu_vram_pct / 100, the share
+  // they have allowed. A client checking it against raw card size will report
+  // machines eligible that the head refuses, which is the bug this field exists
+  // to end. gpu_type is the required vendor ("NVIDIA"/"AMD"/"WEBGPU"), empty or
+  // "ANY" meaning no constraint; gpu_compute_capability is an exact-match string
+  // (e.g. "8.6"), empty meaning no constraint.
+  int32 min_gpu_vram_mb = 3;
+  string gpu_type = 4;
+  string gpu_compute_capability = 5;
 }
 
 // --- v0.9.0.1 Head & Leaf discovery ---

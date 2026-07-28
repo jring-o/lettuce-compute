@@ -371,8 +371,10 @@ func TestBetaE2E_ContainerGPU(t *testing.T) {
 	execCfg := leaf.ExecutionConfig{
 		Runtime: "CONTAINER", Image: &alpineImage,
 		GPURequired: true, GPUType: "NVIDIA",
-		MaxMemoryMB: 4096, MaxDiskMB: 10240, MaxCPUSeconds: 3600, MinVRAMGB: 4,
+		MaxMemoryMB: 4096, MaxDiskMB: 10240, MaxCPUSeconds: 3600,
 	}
+	// The VRAM requirement is resource_requirements.min_gpu_vram_mb below — the
+	// only place it lives, and the only one dispatch reads (TB-20).
 	resReqs := &leaf.ResourceRequirements{
 		MinCPUCores:          1,
 		MinDiskMB:            1024,

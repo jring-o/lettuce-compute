@@ -453,8 +453,11 @@ func TestScenario4_GPUContainerViaPodman(t *testing.T) {
 	dockerCR.SetGPUs([]*runtime.GpuDetectionResult{nvidiaGPU})
 	dockerCR.SetMaxGPUVRAMPct(80)
 
+	// No per-unit VRAM requirement to set: the leaf's requirement is gated head-side
+	// and reported by the client's own eligibility check, never carried per unit
+	// (TB-21). The env var below is the machine's allowance, which is what the
+	// workload needs to know.
 	wu := newTestWorkUnit("33333333-3333-4333-8333-333333333333", "cuda-workload:latest", true, "nvidia")
-	wu.ExecutionSpec.MinVRAMMB = 4096
 	ctx := context.Background()
 
 	// Execute through Podman backend.

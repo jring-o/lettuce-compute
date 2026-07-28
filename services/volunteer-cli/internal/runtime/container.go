@@ -558,20 +558,16 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 			return nil, fmt.Errorf("work unit requires GPU but no matching GPU found")
 		}
 
-		// Enforce VRAM limit as safety net (assignment engine already filters,
-		// but we enforce at runtime per spec section 13.1).
+		// Tell the workload its VRAM budget. There used to be a "safety net" check
+		// here comparing it against wu.ExecutionSpec.MinVRAMMB — but no wire field
+		// ever populated MinVRAMMB, so it was always 0 and the warning could not
+		// fire (TB-21). Removed rather than plumbed: the head gates VRAM at dispatch
+		// and `doctor` / `leafs list` now report it before a unit is ever fetched, so
+		// a per-unit re-check would add wire surface to warn about something that
+		// cannot reach this point. A comparison that is structurally always false is
+		// worse than none — it reads as a check that ran.
 		if c.maxGPUVRAMPct > 0 && selectedGPU.VRAMMB > 0 {
 			allowedVRAMMB := int64(c.maxGPUVRAMPct) * int64(selectedGPU.VRAMMB) / 100
-			requiredVRAMMB := int64(wu.ExecutionSpec.MinVRAMMB)
-			if requiredVRAMMB > allowedVRAMMB {
-				c.logger.Warn("work unit VRAM requirement exceeds volunteer limit",
-					"required_mb", requiredVRAMMB,
-					"allowed_mb", allowedVRAMMB,
-					"gpu", selectedGPU.Model,
-					"max_vram_pct", c.maxGPUVRAMPct,
-					"work_unit_id", wu.ID,
-				)
-			}
 			env = append(env,
 				fmt.Sprintf("LETTUCE_GPU_VRAM_LIMIT_MB=%d", allowedVRAMMB),
 			)

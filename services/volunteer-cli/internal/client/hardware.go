@@ -184,11 +184,22 @@ func runWithFallback[T any](label string, fn func() T, fallback T) (out T) {
 
 // detectAndApplyGPUConfig detects GPUs and applies config limits.
 func detectAndApplyGPUConfig(cfg *config.Config) []*lettucev1.GpuInfo {
+	return ApplyGPUConfig(cfg, gpudetect.DetectGPUs())
+}
+
+// ApplyGPUConfig turns detected GPUs into what this volunteer ADVERTISES: the
+// global max_gpu_vram_pct, per-GPU overrides, and disabled cards applied. Exported
+// and separated from detection so `doctor` can answer "which leafs will this
+// machine be sent?" from exactly the numbers the head receives, without a second
+// hardware probe. Keeping one copy of the override rules is deliberate: a
+// diagnostic that computed a budget differently from the one advertised would
+// report machines eligible that the head refuses, which is the defect class this
+// belongs to (TB-21).
+func ApplyGPUConfig(cfg *config.Config, detected []*gpudetect.GpuDetectionResult) []*lettucev1.GpuInfo {
 	if cfg.ResourceLimits.MaxGPUVRAMPct == 0 {
 		return []*lettucev1.GpuInfo{}
 	}
 
-	detected := gpudetect.DetectGPUs()
 	var gpus []*lettucev1.GpuInfo
 
 	for i, g := range detected {
