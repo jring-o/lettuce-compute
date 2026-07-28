@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/cron"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
+	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
@@ -129,6 +130,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	rep.add(docInfo, "disk allowance", fmt.Sprintf("%d MB / %d GB (resource_limits.max_disk_gb) — a head only sends leafs whose required disk fits under this; this is the allowance you set, not free space (see 'disk space' above)",
 		caps.maxDiskMB, cfg.ResourceLimits.MaxDiskGB), "")
 	rep.add(docInfo, "cpu limit", fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — a head only sends leafs whose required cores fit under this", caps.maxCPUCores), "")
+	checkCPUEnforcement(rep, caps.maxCPUCores)
 
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
@@ -304,6 +306,45 @@ func checkDisk(rep *doctorReport, dataDir string, availableMB int64, maxDiskGB i
 			fmt.Sprintf("%d MB free on %s — below the %d MB the fetch gate needs to run any work", availableMB, dataDir, floorMB),
 			"free space, lower resource_limits.max_disk_gb, or use --data-dir on a roomier volume")
 	}
+}
+
+// checkCPUEnforcement reports the CPU cap ACTUALLY in force, next to the
+// configured one.
+//
+// The two can differ silently. On the Linux affinity fallback the cap is applied
+// by confining work to a subset of the CPUs this process may use, so when the
+// machine already confines Lettuce to fewer CPUs than max_cpu_cores the
+// configured number is not the binding constraint — and before TB-16 that
+// mismatch produced either a bare "sched_setaffinity failed" or, on a partial
+// overlap, no output at all. A volunteer had nowhere to confirm their setting
+// was holding. This line is that place.
+func checkCPUEnforcement(rep *doctorReport, maxCPUCores int) {
+	e := resource.DescribeCPUEnforcement()
+
+	if !e.Confinable {
+		rep.add(docInfo, "cpu enforcement",
+			fmt.Sprintf("%s — work is not confined to a core count on this platform; max_cpu_cores still decides which leafs a head will send you", e.Mechanism), "")
+		return
+	}
+
+	if e.PermittedCPUs <= 0 {
+		rep.add(docInfo, "cpu enforcement", e.Mechanism, "")
+		return
+	}
+
+	if e.PermittedCPUs <= maxCPUCores {
+		// Not a fault: the machine confines Lettuce more tightly than the
+		// volunteer's own budget does. Worth stating plainly, because it is
+		// indistinguishable from "my limit is being ignored" from the outside.
+		rep.add(docInfo, "cpu enforcement",
+			fmt.Sprintf("%s — this machine permits Lettuce on %d CPU(s), at or below your %d-core limit, so work can use at most %d",
+				e.Mechanism, e.PermittedCPUs, maxCPUCores, e.PermittedCPUs), "")
+		return
+	}
+
+	rep.add(docInfo, "cpu enforcement",
+		fmt.Sprintf("%s — this machine permits Lettuce on %d CPU(s); work is confined to %d of them",
+			e.Mechanism, e.PermittedCPUs, maxCPUCores), "")
 }
 
 // checkContainer reports whether the container runtime is genuinely usable, and

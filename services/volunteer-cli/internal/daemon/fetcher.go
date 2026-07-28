@@ -146,6 +146,23 @@ const runtimeAbandonPauseThreshold = 3
 // reclaim. See PreFetchQueue.DropLapsedReservations.
 const reservationDropMargin = 60 * time.Second
 
+// sweepBuffer drops buffered units that have aged out, on two independent
+// grounds. Idempotent and cheap (one mutex, one pass over a short slice), so it
+// is safe to call from both the fetcher loop and the daemon's buffer-maintenance
+// ticker — whichever is still running.
+func (f *Fetcher) sweepBuffer() {
+	// Deadline safety: drop at 90% of the unit's deadline.
+	f.queue.DropExpiring(0.1)
+
+	// Drop buffered items whose head-side reservation window has (nearly) lapsed.
+	// With per-task heartbeats removed, the reservation window (reserved_until) is
+	// sized ONCE at hand-out and is NOT renewed, so a unit held in the buffer past
+	// its window is re-staged by the head's lapsed-reservation sweep. This guard
+	// drops such a unit `reservationDropMargin` ahead of lapse, before we waste a
+	// run-start (StartWork) on a unit the head no longer believes is ours.
+	f.queue.DropLapsedReservations(reservationDropMargin, f.now())
+}
+
 // runtimeAbandonCooldown is how long a tripped runtime stays paused before it
 // is re-probed once. Container backends recover (Docker/Podman restart) and
 // leaf ExecutionSpecs change on head edits, so the pause is time-bounded rather
@@ -215,6 +232,21 @@ func (f *Fetcher) Run(ctx context.Context) {
 		default:
 		}
 
+		// Buffer maintenance runs BEFORE the fetch gate, not after it (TB-19).
+		//
+		// Both guards below are deadline safety, and a buffered unit ages out
+		// whether or not we are currently allowed to ask for more work. They used
+		// to sit after the shouldFetch early-continue, so they went dormant during
+		// exactly the long idle stretches — a closed schedule window, a tripped
+		// disk gate — in which a unit sits long enough to expire. Observed: units
+		// dropped 5 min 47 s and 27 min 7 s AFTER their head-side reservation had
+		// already lapsed on two scheduled hosts, versus on the second it came due
+		// on a third host running scheduling_mode ALWAYS.
+		//
+		// This ordering does not cover a thermal/resource pause, which cancels the
+		// whole fetcher goroutine — Daemon.runBufferMaintenance covers that.
+		f.sweepBuffer()
+
 		// Check if fetching is allowed (disk space, scheduler, etc.).
 		if f.shouldFetchFunc != nil && !f.shouldFetchFunc() {
 			f.logger.Debug("fetcher: shouldFetch returned false, waiting 1s")
@@ -223,17 +255,6 @@ func (f *Fetcher) Run(ctx context.Context) {
 			}
 			continue
 		}
-
-		// Drop expiring items (deadline safety).
-		f.queue.DropExpiring(0.1)
-
-		// Drop buffered items whose head-side reservation window has (nearly) lapsed.
-		// With per-task heartbeats removed, the reservation window (reserved_until) is
-		// sized ONCE at hand-out and is NOT renewed, so a unit held in the buffer past
-		// its window is re-staged by the head's lapsed-reservation sweep. This guard
-		// drops such a unit `reservationDropMargin` ahead of lapse, before we waste a
-		// run-start (StartWork) on a unit the head no longer believes is ours.
-		f.queue.DropLapsedReservations(reservationDropMargin, f.now())
 
 		// CLIENT WORK BUFFER (DoD #2): when the hours-based buffer is full, issue
 		// ZERO RequestWorkUnit calls. Re-check on a short cadence (f.backoff, not

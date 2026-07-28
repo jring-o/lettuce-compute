@@ -62,3 +62,16 @@ func (d *DarwinLimiter) CheckDiskSpace(path string, requiredMB int) error {
 
 	return nil
 }
+
+// describeCPUEnforcement reports macOS's CPU posture.
+//
+// The Darwin limiter sets a nice value and nothing else: macOS offers no
+// per-process CPU quota or affinity API comparable to cgroups or a Job Object,
+// so a work unit is de-prioritised rather than capped. max_cpu_cores therefore
+// serves only as the capability figure a head gates dispatch on.
+func describeCPUEnforcement() CPUEnforcement {
+	return CPUEnforcement{
+		Mechanism:  "lowered process priority only (macOS has no per-process CPU cap)",
+		Confinable: false,
+	}
+}

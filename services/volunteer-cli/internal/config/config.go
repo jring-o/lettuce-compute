@@ -116,6 +116,11 @@ type ThermalConfig struct {
 	GPUPauseThresholdC  int  `yaml:"gpu_pause_threshold" json:"gpu_pause_threshold"`     // default 80
 	GPUResumeThresholdC int  `yaml:"gpu_resume_threshold" json:"gpu_resume_threshold"`   // default 70
 	PollIntervalSeconds int  `yaml:"poll_interval_seconds" json:"poll_interval_seconds"` // default 10
+
+	// MaxThrottleMinutes bounds one continuous throttle. 0 uses the default (30);
+	// a negative value waits indefinitely, which is the pre-TB-17 behavior and is
+	// a livelock whenever the heat is not this client's to clear.
+	MaxThrottleMinutes int `yaml:"max_throttle_minutes" json:"max_throttle_minutes"` // default 30
 }
 
 // NotificationConfig controls notification preferences.
@@ -389,6 +394,7 @@ func Defaults() *Config {
 			GPUPauseThresholdC:  80,
 			GPUResumeThresholdC: 70,
 			PollIntervalSeconds: 10,
+			MaxThrottleMinutes:  30,
 		},
 		MaxConcurrentTasks: 1,
 		WorkBufferHours:    2.0,
@@ -807,6 +813,7 @@ var resourceLimitsComments = map[string]string{
 
 var thermalComments = map[string]string{
 	"enabled":               "Master switch for thermal protection.",
+	"max_throttle_minutes":  "How long work may stay frozen on one continuous overheat before the client resumes and re-checks. Stops a sensor that never cools (often not the CPU) from freezing you indefinitely. Negative means wait forever.",
 	"cpu_pause_threshold":   "degrees C - freeze ALL work when the CPU reaches this.",
 	"cpu_resume_threshold":  "degrees C - resume once the CPU cools below this (must be < cpu_pause_threshold).",
 	"gpu_pause_threshold":   "degrees C - freeze ALL work when the GPU reaches this.",
@@ -919,6 +926,9 @@ func (c *Config) Validate() error {
 			if threshold.value < 30 || threshold.value > 105 {
 				return fmt.Errorf("thermal.%s must be 30-105, got %d", threshold.name, threshold.value)
 			}
+		}
+		if c.Thermal.MaxThrottleMinutes > 1440 {
+			return fmt.Errorf("thermal.max_throttle_minutes must be <= 1440 (24h), got %d", c.Thermal.MaxThrottleMinutes)
 		}
 		if c.Thermal.PollIntervalSeconds < 1 || c.Thermal.PollIntervalSeconds > 300 {
 			return fmt.Errorf("thermal.poll_interval_seconds must be 1-300, got %d", c.Thermal.PollIntervalSeconds)
@@ -1089,6 +1099,12 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
 		c.Thermal.PollIntervalSeconds = v
+	case "thermal.max_throttle_minutes":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Thermal.MaxThrottleMinutes = v
 	default:
 		return fmt.Errorf("unknown config path: %s", dotPath)
 	}
@@ -1158,6 +1174,8 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return strconv.Itoa(c.Thermal.GPUResumeThresholdC), nil
 	case "thermal.poll_interval_seconds":
 		return strconv.Itoa(c.Thermal.PollIntervalSeconds), nil
+	case "thermal.max_throttle_minutes":
+		return strconv.Itoa(c.Thermal.MaxThrottleMinutes), nil
 	default:
 		return "", fmt.Errorf("unknown config path: %s", dotPath)
 	}
