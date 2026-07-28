@@ -854,6 +854,12 @@ type HeadInfo struct {
 	Weight      int          `json:"weight"`
 	VolunteerID string       `json:"volunteer_id,omitempty"`
 	Leafs       []LeafDetail `json:"leafs"`
+	// LeafsRefreshedAt is when this head's leaf figures below were last fetched.
+	// The daemon refreshes the leaf cache only inside the fetch path, so their age
+	// is unbounded: a host with a full buffer, or one slot held by a long unit,
+	// carries the same numbers for hours. Zero when nothing has been cached yet
+	// (rendered as unknown, never as "now") — TB-14.
+	LeafsRefreshedAt time.Time `json:"leafs_refreshed_at,omitzero"`
 }
 
 // LeafExecutionSpec is the JSON representation of a leaf's execution spec for the management API.
@@ -865,6 +871,14 @@ type LeafExecutionSpec struct {
 	MaxMemoryMB   int32             `json:"max_memory_mb,omitempty"`
 	MaxDiskMB     int32             `json:"max_disk_mb,omitempty"`
 	NetworkAccess bool              `json:"network_access,omitempty"`
+}
+
+// LeafResourceRequirements is the JSON representation of the machine budgets the
+// head's dispatch gate matches this leaf against (TB-15). Absent from a head too
+// old to report them.
+type LeafResourceRequirements struct {
+	MinDiskMB   int64 `json:"min_disk_mb,omitempty"`
+	MinCPUCores int32 `json:"min_cpu_cores,omitempty"`
 }
 
 // LeafDetail describes a single leaf on a head, including effective config.
@@ -882,6 +896,11 @@ type LeafDetail struct {
 	Enabled          bool               `json:"enabled"`
 	EffectiveWeight  int                `json:"effective_weight"`
 	ExecutionSpec    *LeafExecutionSpec `json:"execution_spec,omitempty"`
+	// ResourceRequirements is what the head requires of this machine before it
+	// will dispatch this leaf's work. Carried so `leafs list` can say "your disk
+	// allowance is below what this leaf needs" instead of promising a fetch that
+	// the head will refuse (TB-15).
+	ResourceRequirements *LeafResourceRequirements `json:"resource_requirements,omitempty"`
 	// Failures is this leaf's local failure record, or nil if it has never
 	// failed on this machine. Carried alongside the leaf so `leafs list` can say
 	// "arriving and failing" in the same row that says "active" (TB-10).
@@ -901,6 +920,13 @@ type MachineCapabilities struct {
 	HasGPU   bool     `json:"has_gpu"`
 	// MaxMemoryMB is the per-unit memory ceiling the daemon is enforcing.
 	MaxMemoryMB int `json:"max_memory_mb"`
+	// MaxDiskMB and MaxCPUCores are the other two budgets the head matches leafs
+	// against, in the same units it receives them (max_disk_gb is advertised as
+	// MB). Reported here so the client checks a leaf against what this daemon
+	// actually advertised, not against a config file that may have moved on
+	// since (TB-15).
+	MaxDiskMB   int64 `json:"max_disk_mb"`
+	MaxCPUCores int   `json:"max_cpu_cores"`
 }
 
 // MachineRuntimes returns the runtime kinds this daemon has registered and can
@@ -913,10 +939,16 @@ func (b *DaemonBridge) MachineRuntimes() []string {
 
 // MachineCaps reports this machine's capabilities as the running daemon sees them.
 func (b *DaemonBridge) MachineCaps() MachineCapabilities {
+	rl := b.daemon.GetConfig().ResourceLimits
 	return MachineCapabilities{
 		Runtimes:    b.MachineRuntimes(),
 		HasGPU:      b.daemon.HasGPU(),
-		MaxMemoryMB: b.daemon.GetConfig().ResourceLimits.MaxMemoryMB,
+		MaxMemoryMB: rl.MaxMemoryMB,
+		// max_disk_gb is advertised to the head in MB (client/hardware.go), so it
+		// is converted here rather than at the comparison, where a GB-vs-MB slip
+		// would silently pass every leaf.
+		MaxDiskMB:   int64(rl.MaxDiskGB) * 1024,
+		MaxCPUCores: rl.MaxCPUCores,
 	}
 }
 
@@ -968,6 +1000,7 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 			hi.Name = cached.Name
 			hi.Description = cached.Description
 			hi.URL = cached.URL
+			hi.LeafsRefreshedAt = cached.LastRefreshed
 
 			lp := srv.LeafPreferences
 			mode := lp.Mode
@@ -1026,6 +1059,12 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 						MaxMemoryMB:   leaf.ExecutionSpec.MaxMemoryMB,
 						MaxDiskMB:     leaf.ExecutionSpec.MaxDiskMB,
 						NetworkAccess: leaf.ExecutionSpec.NetworkAccess,
+					}
+				}
+				if rr := leaf.ResourceRequirements; rr != nil {
+					ld.ResourceRequirements = &LeafResourceRequirements{
+						MinDiskMB:   rr.MinDiskMB,
+						MinCPUCores: rr.MinCPUCores,
 					}
 				}
 				if f, ok := failures[leaf.ID]; ok {

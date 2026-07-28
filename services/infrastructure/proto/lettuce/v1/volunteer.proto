@@ -314,6 +314,22 @@ message ExecutionSpec {
   map<string, string> binary_checksums = 8;
 }
 
+// LeafResourceRequirements is what a leaf demands of a MACHINE, as distinct from
+// ExecutionSpec's per-unit sandbox limits. Dispatch matches these against the
+// volunteer's advertised resource_limits (min_disk_mb against max_disk_gb*1024,
+// min_cpu_cores against max_cpu_cores), so a leaf whose requirements exceed them
+// is never sent to that volunteer. Sending them lets the client answer "will this
+// machine ever run this leaf?" honestly instead of reporting eligible and idling
+// (TB-15).
+//
+// Note min_disk_mb is NOT ExecutionSpec.max_disk_mb: that is the sandbox's disk
+// ceiling for one unit, this is the machine budget dispatch gates on, and nothing
+// keeps the two in step. Gate on this one.
+message LeafResourceRequirements {
+  int64 min_disk_mb = 1;
+  int32 min_cpu_cores = 2;
+}
+
 // --- v0.9.0.1 Head & Leaf discovery ---
 
 message GetHeadInfoRequest {}
@@ -344,6 +360,9 @@ message LeafInfo {
   // Distinct active MACHINES on the leaf. A volunteer running one identity key on
   // N machines is 1 active_volunteer but N active_hosts (account<->host split).
   int32 active_hosts = 12;
+  // Machine requirements dispatch gates on. Absent (nil) from a pre-TB-15 head,
+  // which the client must read as "unknown", not as "no requirement".
+  LeafResourceRequirements resource_requirements = 13;
 }
 
 // --- AbandonWorkUnit ---

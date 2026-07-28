@@ -40,6 +40,14 @@ type CachedExecutionSpec struct {
 	NetworkAccess bool
 }
 
+// CachedResourceRequirements holds the machine budgets the head's dispatch gate
+// matches a leaf against. Distinct from CachedExecutionSpec's per-unit sandbox
+// limits, and nil when the head is too old to send them (TB-15).
+type CachedResourceRequirements struct {
+	MinDiskMB   int64
+	MinCPUCores int32
+}
+
 // CachedLeafInfo holds cached info about a single leaf.
 type CachedLeafInfo struct {
 	ID               string
@@ -53,6 +61,9 @@ type CachedLeafInfo struct {
 	ActiveVolunteers int
 	ActiveHosts      int // distinct active machines (a volunteer on N machines = N hosts)
 	ExecutionSpec    *CachedExecutionSpec
+	// ResourceRequirements is what the head's dispatch gate requires of this
+	// machine. nil from a pre-TB-15 head — "unknown", not "no requirement".
+	ResourceRequirements *CachedResourceRequirements
 
 	// EstimatedDurationSeconds is a per-leaf, benchmark-INDEPENDENT estimate of
 	// wall-clock seconds for one unit of this leaf (#29). The head derives it in
@@ -110,6 +121,12 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 				MaxMemoryMB:   es.GetMaxMemoryMb(),
 				MaxDiskMB:     es.GetMaxDiskMb(),
 				NetworkAccess: es.GetNetworkAccess(),
+			}
+		}
+		if rr := l.GetResourceRequirements(); rr != nil {
+			cli.ResourceRequirements = &CachedResourceRequirements{
+				MinDiskMB:   rr.GetMinDiskMb(),
+				MinCPUCores: rr.GetMinCpuCores(),
 			}
 		}
 		cached.Leafs = append(cached.Leafs, cli)

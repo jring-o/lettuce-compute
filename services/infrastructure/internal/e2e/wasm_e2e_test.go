@@ -209,6 +209,65 @@ func TestWasmE2E_GetHeadInfoExecutionSpec(t *testing.T) {
 	}
 }
 
+// TestHeadInfo_CarriesResourceRequirements is the head half of the TB-15
+// regression. Dispatch refuses a leaf whose resource_requirements.min_disk_mb or
+// min_cpu_cores exceeds the volunteer's advertised budgets, but GetHeadInfo did
+// not report either number, so no client could tell an ineligible leaf from an
+// eligible one — every volunteer-side diagnostic reported "eligible" and the
+// machine idled. The two values must reach the wire, and must be the
+// resource_requirements ones, not execution_config's max_disk_mb.
+func TestHeadInfo_CarriesResourceRequirements(t *testing.T) {
+	env, cleanup := setupHeadsLeafsServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	userID := createTestUser(t, env.pool, ctx, "headinfo-resreqs")
+
+	// min_disk_mb (15 GB) is deliberately different from the execution config's
+	// max_disk_mb (5 GB): they are separate fields with no synchronisation, and
+	// reading the wrong one is the trap this test exists to catch.
+	execCfg := defaultExecConfig()
+	execCfg.MaxDiskMB = 5120
+	createHLLeaf(t, env, ctx, userID, hlLeafOpts{
+		Name:         "Disk Hungry Leaf",
+		TaskPattern:  leaf.PatternParameterSweep,
+		ExecConfig:   execCfg,
+		ValConfig:    defaultHLValConfig(),
+		FTConfig:     defaultFTConfig(),
+		DataConfig:   defaultDataConfig(),
+		CreditConfig: leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
+		ResourceReqs: &leaf.ResourceRequirements{MinCPUCores: 4, MinDiskMB: 15360},
+	})
+
+	resp, err := env.grpc.GetHeadInfo(ctx, &lettucev1.GetHeadInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetHeadInfo: %v", err)
+	}
+
+	var found bool
+	for _, li := range resp.Leafs {
+		if li.Name != "Disk Hungry Leaf" {
+			continue
+		}
+		found = true
+		rr := li.GetResourceRequirements()
+		if rr == nil {
+			t.Fatal("leaf has nil resource_requirements: a volunteer cannot check what it is never sent")
+		}
+		if rr.GetMinDiskMb() != 15360 {
+			t.Errorf("min_disk_mb = %d, want 15360 (5120 would mean execution_config.max_disk_mb was read instead)", rr.GetMinDiskMb())
+		}
+		if rr.GetMinCpuCores() != 4 {
+			t.Errorf("min_cpu_cores = %d, want 4", rr.GetMinCpuCores())
+		}
+	}
+	if !found {
+		t.Fatal("Disk Hungry Leaf not found in GetHeadInfo response")
+	}
+}
+
 // registerHLVolunteerWithRuntimes registers a volunteer with specific available runtimes.
 func registerHLVolunteerWithRuntimes(t *testing.T, env *headsLeafsEnv, ctx context.Context, pubKey []byte, name string, runtimes []string) string {
 	t.Helper()

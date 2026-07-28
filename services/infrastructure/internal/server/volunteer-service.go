@@ -604,7 +604,8 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			COALESCE(q.cnt, 0),
 			COALESCE(a.cnt, 0),
 			COALESCE(hh.cnt, 0),
-			l.execution_config
+			l.execution_config,
+			l.resource_requirements
 		FROM leafs l
 		LEFT JOIN (
 			SELECT leaf_id, COUNT(*) AS cnt
@@ -627,8 +628,10 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 		var li lettucev1.LeafInfo
 		var researchArea []string
 		var execConfig leaf.ExecutionConfig
+		var resourceReqs leaf.ResourceRequirements
 		if err := rows.Scan(&li.Id, &li.Slug, &li.Name, &li.Description, &researchArea,
-			&li.TaskPattern, &li.State, &li.QueuedWorkUnits, &li.ActiveVolunteers, &li.ActiveHosts, &execConfig); err != nil {
+			&li.TaskPattern, &li.State, &li.QueuedWorkUnits, &li.ActiveVolunteers, &li.ActiveHosts,
+			&execConfig, &resourceReqs); err != nil {
 			s.logger.Error("scan leaf", "method", "GetHeadInfo", "error", err)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
@@ -645,6 +648,14 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 			MaxMemoryMb:     int32(execConfig.MaxMemoryMB),
 			MaxDiskMb:       int32(execConfig.MaxDiskMB),
 			NetworkAccess:   execConfig.NetworkAccess,
+		}
+		// The two machine budgets dispatch gates on (FindNextAssignable's
+		// min_cpu_cores/min_disk_mb predicates). Without them the volunteer cannot
+		// tell "this head has nothing for me" from "I am too small for this leaf",
+		// and every client-side diagnostic reported the latter as eligible (TB-15).
+		li.ResourceRequirements = &lettucev1.LeafResourceRequirements{
+			MinDiskMb:   int64(resourceReqs.MinDiskMB),
+			MinCpuCores: int32(resourceReqs.MinCPUCores),
 		}
 		// #29 duration-aware batching (head side): give the volunteer a per-leaf
 		// duration estimate (seconds) so it can size its FIRST batch request to fill

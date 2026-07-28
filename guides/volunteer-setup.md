@@ -119,6 +119,16 @@ work files.
   volume; `lettuce-volunteer doctor` reports the free space on each. If your home
   volume is small, point `--data-dir` at a roomier disk; if the image store is
   small, see the remedies below.
+- **`max_disk_gb` does two jobs, and the second one surprises people.** As well as
+  the free-space gate above, it is the disk budget your client advertises to each
+  head, and a head only sends you a leaf whose declared disk requirement fits
+  inside it. So a leaf needing 15 GB is never dispatched to a volunteer allowing
+  10 GB, no matter how much space is actually free. `lettuce-volunteer doctor`
+  prints the allowance next to your memory and CPU limits and names any leaf
+  blocked this way, and `leafs list` marks it `WILL FETCH: no` with the remedy
+  underneath. Raise it with
+  `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
+  daemon, which is when the new figure is re-advertised.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
 

@@ -1710,6 +1710,69 @@ func (x *ExecutionSpec) GetBinaryChecksums() map[string]string {
 	return nil
 }
 
+// LeafResourceRequirements is what a leaf demands of a MACHINE, as distinct from
+// ExecutionSpec's per-unit sandbox limits. Dispatch matches these against the
+// volunteer's advertised resource_limits (min_disk_mb against max_disk_gb*1024,
+// min_cpu_cores against max_cpu_cores), so a leaf whose requirements exceed them
+// is never sent to that volunteer. Sending them lets the client answer "will this
+// machine ever run this leaf?" honestly instead of reporting eligible and idling
+// (TB-15).
+//
+// Note min_disk_mb is NOT ExecutionSpec.max_disk_mb: that is the sandbox's disk
+// ceiling for one unit, this is the machine budget dispatch gates on, and nothing
+// keeps the two in step. Gate on this one.
+type LeafResourceRequirements struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MinDiskMb     int64                  `protobuf:"varint,1,opt,name=min_disk_mb,json=minDiskMb,proto3" json:"min_disk_mb,omitempty"`
+	MinCpuCores   int32                  `protobuf:"varint,2,opt,name=min_cpu_cores,json=minCpuCores,proto3" json:"min_cpu_cores,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeafResourceRequirements) Reset() {
+	*x = LeafResourceRequirements{}
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeafResourceRequirements) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeafResourceRequirements) ProtoMessage() {}
+
+func (x *LeafResourceRequirements) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeafResourceRequirements.ProtoReflect.Descriptor instead.
+func (*LeafResourceRequirements) Descriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *LeafResourceRequirements) GetMinDiskMb() int64 {
+	if x != nil {
+		return x.MinDiskMb
+	}
+	return 0
+}
+
+func (x *LeafResourceRequirements) GetMinCpuCores() int32 {
+	if x != nil {
+		return x.MinCpuCores
+	}
+	return 0
+}
+
 type GetHeadInfoRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1718,7 +1781,7 @@ type GetHeadInfoRequest struct {
 
 func (x *GetHeadInfoRequest) Reset() {
 	*x = GetHeadInfoRequest{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[21]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1730,7 +1793,7 @@ func (x *GetHeadInfoRequest) String() string {
 func (*GetHeadInfoRequest) ProtoMessage() {}
 
 func (x *GetHeadInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[21]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1743,7 +1806,7 @@ func (x *GetHeadInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHeadInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetHeadInfoRequest) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{21}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{22}
 }
 
 type GetHeadInfoResponse struct {
@@ -1759,7 +1822,7 @@ type GetHeadInfoResponse struct {
 
 func (x *GetHeadInfoResponse) Reset() {
 	*x = GetHeadInfoResponse{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[22]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1771,7 +1834,7 @@ func (x *GetHeadInfoResponse) String() string {
 func (*GetHeadInfoResponse) ProtoMessage() {}
 
 func (x *GetHeadInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[22]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1784,7 +1847,7 @@ func (x *GetHeadInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHeadInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetHeadInfoResponse) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{22}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *GetHeadInfoResponse) GetName() string {
@@ -1840,14 +1903,17 @@ type LeafInfo struct {
 	EstimatedDurationSeconds float64 `protobuf:"fixed64,11,opt,name=estimated_duration_seconds,json=estimatedDurationSeconds,proto3" json:"estimated_duration_seconds,omitempty"`
 	// Distinct active MACHINES on the leaf. A volunteer running one identity key on
 	// N machines is 1 active_volunteer but N active_hosts (account<->host split).
-	ActiveHosts   int32 `protobuf:"varint,12,opt,name=active_hosts,json=activeHosts,proto3" json:"active_hosts,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ActiveHosts int32 `protobuf:"varint,12,opt,name=active_hosts,json=activeHosts,proto3" json:"active_hosts,omitempty"`
+	// Machine requirements dispatch gates on. Absent (nil) from a pre-TB-15 head,
+	// which the client must read as "unknown", not as "no requirement".
+	ResourceRequirements *LeafResourceRequirements `protobuf:"bytes,13,opt,name=resource_requirements,json=resourceRequirements,proto3" json:"resource_requirements,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *LeafInfo) Reset() {
 	*x = LeafInfo{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[23]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1859,7 +1925,7 @@ func (x *LeafInfo) String() string {
 func (*LeafInfo) ProtoMessage() {}
 
 func (x *LeafInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[23]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1872,7 +1938,7 @@ func (x *LeafInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeafInfo.ProtoReflect.Descriptor instead.
 func (*LeafInfo) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{23}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *LeafInfo) GetId() string {
@@ -1959,6 +2025,13 @@ func (x *LeafInfo) GetActiveHosts() int32 {
 	return 0
 }
 
+func (x *LeafInfo) GetResourceRequirements() *LeafResourceRequirements {
+	if x != nil {
+		return x.ResourceRequirements
+	}
+	return nil
+}
+
 type AbandonWorkUnitRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	WorkUnitId    string                 `protobuf:"bytes,1,opt,name=work_unit_id,json=workUnitId,proto3" json:"work_unit_id,omitempty"`
@@ -1971,7 +2044,7 @@ type AbandonWorkUnitRequest struct {
 
 func (x *AbandonWorkUnitRequest) Reset() {
 	*x = AbandonWorkUnitRequest{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[24]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1983,7 +2056,7 @@ func (x *AbandonWorkUnitRequest) String() string {
 func (*AbandonWorkUnitRequest) ProtoMessage() {}
 
 func (x *AbandonWorkUnitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[24]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1996,7 +2069,7 @@ func (x *AbandonWorkUnitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonWorkUnitRequest.ProtoReflect.Descriptor instead.
 func (*AbandonWorkUnitRequest) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{24}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *AbandonWorkUnitRequest) GetWorkUnitId() string {
@@ -2037,7 +2110,7 @@ type AbandonWorkUnitResponse struct {
 
 func (x *AbandonWorkUnitResponse) Reset() {
 	*x = AbandonWorkUnitResponse{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[25]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2049,7 +2122,7 @@ func (x *AbandonWorkUnitResponse) String() string {
 func (*AbandonWorkUnitResponse) ProtoMessage() {}
 
 func (x *AbandonWorkUnitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[25]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2062,7 +2135,7 @@ func (x *AbandonWorkUnitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonWorkUnitResponse.ProtoReflect.Descriptor instead.
 func (*AbandonWorkUnitResponse) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{25}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *AbandonWorkUnitResponse) GetRequeued() bool {
@@ -2089,7 +2162,7 @@ type GetMyContributionRequest struct {
 
 func (x *GetMyContributionRequest) Reset() {
 	*x = GetMyContributionRequest{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2101,7 +2174,7 @@ func (x *GetMyContributionRequest) String() string {
 func (*GetMyContributionRequest) ProtoMessage() {}
 
 func (x *GetMyContributionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[26]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2114,7 +2187,7 @@ func (x *GetMyContributionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMyContributionRequest.ProtoReflect.Descriptor instead.
 func (*GetMyContributionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{26}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{27}
 }
 
 type GetMyContributionResponse struct {
@@ -2131,7 +2204,7 @@ type GetMyContributionResponse struct {
 
 func (x *GetMyContributionResponse) Reset() {
 	*x = GetMyContributionResponse{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2143,7 +2216,7 @@ func (x *GetMyContributionResponse) String() string {
 func (*GetMyContributionResponse) ProtoMessage() {}
 
 func (x *GetMyContributionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[27]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2156,7 +2229,7 @@ func (x *GetMyContributionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMyContributionResponse.ProtoReflect.Descriptor instead.
 func (*GetMyContributionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{27}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *GetMyContributionResponse) GetVolunteerId() string {
@@ -2215,7 +2288,7 @@ type LeafContribution struct {
 
 func (x *LeafContribution) Reset() {
 	*x = LeafContribution{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2227,7 +2300,7 @@ func (x *LeafContribution) String() string {
 func (*LeafContribution) ProtoMessage() {}
 
 func (x *LeafContribution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[28]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2240,7 +2313,7 @@ func (x *LeafContribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LeafContribution.ProtoReflect.Descriptor instead.
 func (*LeafContribution) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{28}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *LeafContribution) GetLeafId() string {
@@ -2296,7 +2369,7 @@ type ResourceTypeContribution struct {
 
 func (x *ResourceTypeContribution) Reset() {
 	*x = ResourceTypeContribution{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2308,7 +2381,7 @@ func (x *ResourceTypeContribution) String() string {
 func (*ResourceTypeContribution) ProtoMessage() {}
 
 func (x *ResourceTypeContribution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[29]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2321,7 +2394,7 @@ func (x *ResourceTypeContribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResourceTypeContribution.ProtoReflect.Descriptor instead.
 func (*ResourceTypeContribution) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{29}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ResourceTypeContribution) GetResourceType() string {
@@ -2355,7 +2428,7 @@ type DailyContribution struct {
 
 func (x *DailyContribution) Reset() {
 	*x = DailyContribution{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2367,7 +2440,7 @@ func (x *DailyContribution) String() string {
 func (*DailyContribution) ProtoMessage() {}
 
 func (x *DailyContribution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[30]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2380,7 +2453,7 @@ func (x *DailyContribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DailyContribution.ProtoReflect.Descriptor instead.
 func (*DailyContribution) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{30}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *DailyContribution) GetDate() string {
@@ -2407,7 +2480,7 @@ type WeeklyContribution struct {
 
 func (x *WeeklyContribution) Reset() {
 	*x = WeeklyContribution{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2419,7 +2492,7 @@ func (x *WeeklyContribution) String() string {
 func (*WeeklyContribution) ProtoMessage() {}
 
 func (x *WeeklyContribution) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[31]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2432,7 +2505,7 @@ func (x *WeeklyContribution) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WeeklyContribution.ProtoReflect.Descriptor instead.
 func (*WeeklyContribution) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{31}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *WeeklyContribution) GetWeekStart() string {
@@ -2460,7 +2533,7 @@ type ClaimAuditJobRequest struct {
 
 func (x *ClaimAuditJobRequest) Reset() {
 	*x = ClaimAuditJobRequest{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[32]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2472,7 +2545,7 @@ func (x *ClaimAuditJobRequest) String() string {
 func (*ClaimAuditJobRequest) ProtoMessage() {}
 
 func (x *ClaimAuditJobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[32]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2485,7 +2558,7 @@ func (x *ClaimAuditJobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimAuditJobRequest.ProtoReflect.Descriptor instead.
 func (*ClaimAuditJobRequest) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{32}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ClaimAuditJobRequest) GetHardware() *HardwareCapabilities {
@@ -2505,7 +2578,7 @@ type ClaimAuditJobResponse struct {
 
 func (x *ClaimAuditJobResponse) Reset() {
 	*x = ClaimAuditJobResponse{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[33]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2517,7 +2590,7 @@ func (x *ClaimAuditJobResponse) String() string {
 func (*ClaimAuditJobResponse) ProtoMessage() {}
 
 func (x *ClaimAuditJobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[33]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2530,7 +2603,7 @@ func (x *ClaimAuditJobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimAuditJobResponse.ProtoReflect.Descriptor instead.
 func (*ClaimAuditJobResponse) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{33}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ClaimAuditJobResponse) GetJob() *AuditJob {
@@ -2554,7 +2627,7 @@ type AuditJob struct {
 
 func (x *AuditJob) Reset() {
 	*x = AuditJob{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2566,7 +2639,7 @@ func (x *AuditJob) String() string {
 func (*AuditJob) ProtoMessage() {}
 
 func (x *AuditJob) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[34]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2579,7 +2652,7 @@ func (x *AuditJob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AuditJob.ProtoReflect.Descriptor instead.
 func (*AuditJob) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{34}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *AuditJob) GetAuditId() string {
@@ -2620,7 +2693,7 @@ type SubmitAuditResultRequest struct {
 
 func (x *SubmitAuditResultRequest) Reset() {
 	*x = SubmitAuditResultRequest{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2632,7 +2705,7 @@ func (x *SubmitAuditResultRequest) String() string {
 func (*SubmitAuditResultRequest) ProtoMessage() {}
 
 func (x *SubmitAuditResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[35]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2645,7 +2718,7 @@ func (x *SubmitAuditResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitAuditResultRequest.ProtoReflect.Descriptor instead.
 func (*SubmitAuditResultRequest) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{35}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *SubmitAuditResultRequest) GetAuditId() string {
@@ -2685,7 +2758,7 @@ type SubmitAuditResultResponse struct {
 
 func (x *SubmitAuditResultResponse) Reset() {
 	*x = SubmitAuditResultResponse{}
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2697,7 +2770,7 @@ func (x *SubmitAuditResultResponse) String() string {
 func (*SubmitAuditResultResponse) ProtoMessage() {}
 
 func (x *SubmitAuditResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[36]
+	mi := &file_proto_lettuce_v1_volunteer_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2710,7 +2783,7 @@ func (x *SubmitAuditResultResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitAuditResultResponse.ProtoReflect.Descriptor instead.
 func (*SubmitAuditResultResponse) Descriptor() ([]byte, []int) {
-	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{36}
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *SubmitAuditResultResponse) GetAccepted() bool {
@@ -2885,7 +2958,10 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aB\n" +
 	"\x14BinaryChecksumsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"^\n" +
+	"\x18LeafResourceRequirements\x12\x1e\n" +
+	"\vmin_disk_mb\x18\x01 \x01(\x03R\tminDiskMb\x12\"\n" +
+	"\rmin_cpu_cores\x18\x02 \x01(\x05R\vminCpuCores\"\x14\n" +
 	"\x12GetHeadInfoRequest\"\xcf\x02\n" +
 	"\x13GetHeadInfoResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +
@@ -2895,7 +2971,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x14default_leaf_weights\x18\x05 \x03(\v2A.lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntryR\x12defaultLeafWeights\x1aE\n" +
 	"\x17DefaultLeafWeightsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xc8\x03\n" +
+	"\x05value\x18\x02 \x01(\x05R\x05value:\x028\x01\"\xad\x04\n" +
 	"\bLeafInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04slug\x18\x02 \x01(\tR\x04slug\x12\x12\n" +
@@ -2909,7 +2985,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0eexecution_spec\x18\n" +
 	" \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\x12<\n" +
 	"\x1aestimated_duration_seconds\x18\v \x01(\x01R\x18estimatedDurationSeconds\x12!\n" +
-	"\factive_hosts\x18\f \x01(\x05R\vactiveHosts\"\x94\x01\n" +
+	"\factive_hosts\x18\f \x01(\x05R\vactiveHosts\x12c\n" +
+	"\x15resource_requirements\x18\r \x01(\v2..lettuce.volunteer.v1.LeafResourceRequirementsR\x14resourceRequirements\"\x94\x01\n" +
 	"\x16AbandonWorkUnitRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +
@@ -2996,7 +3073,7 @@ func file_proto_lettuce_v1_volunteer_proto_rawDescGZIP() []byte {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescData
 }
 
-var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
+var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*GetServerStatusRequest)(nil),           // 0: lettuce.volunteer.v1.GetServerStatusRequest
 	(*GetServerStatusResponse)(nil),          // 1: lettuce.volunteer.v1.GetServerStatusResponse
@@ -3019,78 +3096,80 @@ var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
 	(*GpuInfo)(nil),                          // 18: lettuce.volunteer.v1.GpuInfo
 	(*ExecutionMetadata)(nil),                // 19: lettuce.volunteer.v1.ExecutionMetadata
 	(*ExecutionSpec)(nil),                    // 20: lettuce.volunteer.v1.ExecutionSpec
-	(*GetHeadInfoRequest)(nil),               // 21: lettuce.volunteer.v1.GetHeadInfoRequest
-	(*GetHeadInfoResponse)(nil),              // 22: lettuce.volunteer.v1.GetHeadInfoResponse
-	(*LeafInfo)(nil),                         // 23: lettuce.volunteer.v1.LeafInfo
-	(*AbandonWorkUnitRequest)(nil),           // 24: lettuce.volunteer.v1.AbandonWorkUnitRequest
-	(*AbandonWorkUnitResponse)(nil),          // 25: lettuce.volunteer.v1.AbandonWorkUnitResponse
-	(*GetMyContributionRequest)(nil),         // 26: lettuce.volunteer.v1.GetMyContributionRequest
-	(*GetMyContributionResponse)(nil),        // 27: lettuce.volunteer.v1.GetMyContributionResponse
-	(*LeafContribution)(nil),                 // 28: lettuce.volunteer.v1.LeafContribution
-	(*ResourceTypeContribution)(nil),         // 29: lettuce.volunteer.v1.ResourceTypeContribution
-	(*DailyContribution)(nil),                // 30: lettuce.volunteer.v1.DailyContribution
-	(*WeeklyContribution)(nil),               // 31: lettuce.volunteer.v1.WeeklyContribution
-	(*ClaimAuditJobRequest)(nil),             // 32: lettuce.volunteer.v1.ClaimAuditJobRequest
-	(*ClaimAuditJobResponse)(nil),            // 33: lettuce.volunteer.v1.ClaimAuditJobResponse
-	(*AuditJob)(nil),                         // 34: lettuce.volunteer.v1.AuditJob
-	(*SubmitAuditResultRequest)(nil),         // 35: lettuce.volunteer.v1.SubmitAuditResultRequest
-	(*SubmitAuditResultResponse)(nil),        // 36: lettuce.volunteer.v1.SubmitAuditResultResponse
-	nil,                                      // 37: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
-	nil,                                      // 38: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	nil,                                      // 39: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	nil,                                      // 40: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	(*LeafResourceRequirements)(nil),         // 21: lettuce.volunteer.v1.LeafResourceRequirements
+	(*GetHeadInfoRequest)(nil),               // 22: lettuce.volunteer.v1.GetHeadInfoRequest
+	(*GetHeadInfoResponse)(nil),              // 23: lettuce.volunteer.v1.GetHeadInfoResponse
+	(*LeafInfo)(nil),                         // 24: lettuce.volunteer.v1.LeafInfo
+	(*AbandonWorkUnitRequest)(nil),           // 25: lettuce.volunteer.v1.AbandonWorkUnitRequest
+	(*AbandonWorkUnitResponse)(nil),          // 26: lettuce.volunteer.v1.AbandonWorkUnitResponse
+	(*GetMyContributionRequest)(nil),         // 27: lettuce.volunteer.v1.GetMyContributionRequest
+	(*GetMyContributionResponse)(nil),        // 28: lettuce.volunteer.v1.GetMyContributionResponse
+	(*LeafContribution)(nil),                 // 29: lettuce.volunteer.v1.LeafContribution
+	(*ResourceTypeContribution)(nil),         // 30: lettuce.volunteer.v1.ResourceTypeContribution
+	(*DailyContribution)(nil),                // 31: lettuce.volunteer.v1.DailyContribution
+	(*WeeklyContribution)(nil),               // 32: lettuce.volunteer.v1.WeeklyContribution
+	(*ClaimAuditJobRequest)(nil),             // 33: lettuce.volunteer.v1.ClaimAuditJobRequest
+	(*ClaimAuditJobResponse)(nil),            // 34: lettuce.volunteer.v1.ClaimAuditJobResponse
+	(*AuditJob)(nil),                         // 35: lettuce.volunteer.v1.AuditJob
+	(*SubmitAuditResultRequest)(nil),         // 36: lettuce.volunteer.v1.SubmitAuditResultRequest
+	(*SubmitAuditResultResponse)(nil),        // 37: lettuce.volunteer.v1.SubmitAuditResultResponse
+	nil,                                      // 38: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	nil,                                      // 39: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	nil,                                      // 40: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	nil,                                      // 41: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 }
 var file_proto_lettuce_v1_volunteer_proto_depIdxs = []int32{
 	17, // 0: lettuce.volunteer.v1.RegisterVolunteerRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	17, // 1: lettuce.volunteer.v1.RequestWorkUnitRequest.current_available:type_name -> lettuce.volunteer.v1.HardwareCapabilities
 	8,  // 2: lettuce.volunteer.v1.RequestWorkUnitResponse.assignments:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	37, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	38, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
 	20, // 4: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
 	19, // 5: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
 	18, // 6: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
-	38, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	39, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	23, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
-	40, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	39, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	40, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	24, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
+	41, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 	20, // 11: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
-	28, // 12: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
-	29, // 13: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
-	30, // 14: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
-	31, // 15: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
-	17, // 16: lettuce.volunteer.v1.ClaimAuditJobRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
-	34, // 17: lettuce.volunteer.v1.ClaimAuditJobResponse.job:type_name -> lettuce.volunteer.v1.AuditJob
-	8,  // 18: lettuce.volunteer.v1.AuditJob.assignment:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	0,  // 19: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
-	2,  // 20: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
-	4,  // 21: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
-	6,  // 22: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
-	9,  // 23: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
-	11, // 24: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
-	21, // 25: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
-	13, // 26: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
-	15, // 27: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
-	24, // 28: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
-	26, // 29: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
-	32, // 30: lettuce.volunteer.v1.AuditService.ClaimJob:input_type -> lettuce.volunteer.v1.ClaimAuditJobRequest
-	35, // 31: lettuce.volunteer.v1.AuditService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitAuditResultRequest
-	1,  // 32: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
-	3,  // 33: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
-	5,  // 34: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
-	7,  // 35: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
-	10, // 36: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
-	12, // 37: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
-	22, // 38: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
-	14, // 39: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
-	16, // 40: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
-	25, // 41: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
-	27, // 42: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
-	33, // 43: lettuce.volunteer.v1.AuditService.ClaimJob:output_type -> lettuce.volunteer.v1.ClaimAuditJobResponse
-	36, // 44: lettuce.volunteer.v1.AuditService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitAuditResultResponse
-	32, // [32:45] is the sub-list for method output_type
-	19, // [19:32] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	21, // 12: lettuce.volunteer.v1.LeafInfo.resource_requirements:type_name -> lettuce.volunteer.v1.LeafResourceRequirements
+	29, // 13: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
+	30, // 14: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
+	31, // 15: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
+	32, // 16: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
+	17, // 17: lettuce.volunteer.v1.ClaimAuditJobRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
+	35, // 18: lettuce.volunteer.v1.ClaimAuditJobResponse.job:type_name -> lettuce.volunteer.v1.AuditJob
+	8,  // 19: lettuce.volunteer.v1.AuditJob.assignment:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
+	0,  // 20: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
+	2,  // 21: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
+	4,  // 22: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
+	6,  // 23: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
+	9,  // 24: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
+	11, // 25: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
+	22, // 26: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
+	13, // 27: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
+	15, // 28: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
+	25, // 29: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
+	27, // 30: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
+	33, // 31: lettuce.volunteer.v1.AuditService.ClaimJob:input_type -> lettuce.volunteer.v1.ClaimAuditJobRequest
+	36, // 32: lettuce.volunteer.v1.AuditService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitAuditResultRequest
+	1,  // 33: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
+	3,  // 34: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
+	5,  // 35: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
+	7,  // 36: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
+	10, // 37: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
+	12, // 38: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
+	23, // 39: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
+	14, // 40: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
+	16, // 41: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
+	26, // 42: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
+	28, // 43: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
+	34, // 44: lettuce.volunteer.v1.AuditService.ClaimJob:output_type -> lettuce.volunteer.v1.ClaimAuditJobResponse
+	37, // 45: lettuce.volunteer.v1.AuditService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitAuditResultResponse
+	33, // [33:46] is the sub-list for method output_type
+	20, // [20:33] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() { file_proto_lettuce_v1_volunteer_proto_init() }
@@ -3104,7 +3183,7 @@ func file_proto_lettuce_v1_volunteer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_lettuce_v1_volunteer_proto_rawDesc), len(file_proto_lettuce_v1_volunteer_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   41,
+			NumMessages:   42,
 			NumExtensions: 0,
 			NumServices:   2,
 		},
