@@ -37,6 +37,35 @@ func NewLimiter(logger *slog.Logger) Limiter {
 	return newPlatformLimiter(logger)
 }
 
+// CPUEnforcement describes how this machine actually caps a work unit's CPU use,
+// so `doctor` can report the limit in force rather than only the one configured.
+//
+// The distinction matters because the configured number can silently fail to
+// apply (TB-16): the Linux affinity fallback is refused outright when the
+// process is confined to CPUs that do not include the ones requested, and
+// applies at the WRONG SIZE, with no output at any level, when the overlap is
+// only partial. `max_cpu_cores` was therefore a setting a volunteer could not
+// verify from anywhere.
+type CPUEnforcement struct {
+	// Mechanism names the cap actually in use, in a volunteer's language.
+	Mechanism string
+
+	// PermittedCPUs is how many CPUs this process may run on, or 0 when the
+	// platform does not report it. Fewer permitted CPUs than max_cpu_cores means
+	// the configured limit is not the binding constraint.
+	PermittedCPUs int
+
+	// Confinable is false when the platform cannot confine a work unit's CPU use
+	// at all, so max_cpu_cores serves only as the capability figure the head
+	// gates dispatch on.
+	Confinable bool
+}
+
+// DescribeCPUEnforcement reports how CPU limits are enforced on this machine.
+func DescribeCPUEnforcement() CPUEnforcement {
+	return describeCPUEnforcement()
+}
+
 const (
 	// goHeapArenaGranuleMB is the granule the Go runtime maps heap arenas in.
 	// Every managed runtime commits memory in chunks rather than by the byte;

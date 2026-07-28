@@ -304,6 +304,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		GPUPauseThresholdC:  cfg.Config.Thermal.GPUPauseThresholdC,
 		GPUResumeThresholdC: cfg.Config.Thermal.GPUResumeThresholdC,
 		PollIntervalSeconds: cfg.Config.Thermal.PollIntervalSeconds,
+		MaxThrottleMinutes:  cfg.Config.Thermal.MaxThrottleMinutes,
 	}
 	thermalMonitor := runtime.NewThermalMonitor(thermalCfg, thermalPauseCh, cfg.Logger)
 
@@ -518,6 +519,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go d.fetcher.Run(fetcherCtx)
 	}
 	startFetcher()
+
+	// Buffer maintenance is tied to the RUN context, not the fetcher's (TB-19).
+	//
+	// A thermal or resource pause cancels the fetcher outright and the coordinator
+	// loop below blocks in waitForResume, so neither one sweeps the buffer while
+	// paused — and a pause is precisely when a buffered unit sits long enough to
+	// outlive its head-side reservation. Observed: 69 min and 2 h 28 min thermal
+	// freezes on two tester hosts, over which nothing would have aged the buffer
+	// out. This goroutine keeps running across pauses and outlives every fetcher
+	// restart.
+	go d.runBufferMaintenance(ctx)
 
 	// Coordinator cleanup on exit.
 	defer func() {
@@ -812,21 +824,55 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 		"slot", result.SlotID,
 	)
 
+	// wallClock is elapsed time INCLUDING any period the unit spent suspended —
+	// frozen by a thermal throttle, the resource monitor, or a schedule window
+	// closing. activeSeconds subtracts that: the time it was actually computing.
+	wallClock := result.Result.Metrics.WallClockSeconds
+	active := activeSeconds(wallClock, result.TotalPausedDur)
+
 	// Update duration correction factor from actual vs estimated time.
+	//
+	// This must use the ACTIVE duration, not the raw wall clock (TB-18). The
+	// factor scales every future estimate for this leaf, ramps up aggressively
+	// (80/20) while decaying at 10% per unit, and is persisted to dcf.json — so a
+	// single unit that happened to be suspended mid-run poisoned the estimate for
+	// days across restarts, and the client throttled its own work intake in
+	// response. Observed: a unit reporting 10212 s wall clock for ~1400 s of
+	// computation after a 2 h 28 min thermal freeze, against a normal range of
+	// 146–2821 s for that leaf on that host.
+	//
+	// Elapsed rather than CPU time is deliberate and stays: competing load from
+	// the volunteer's own other work genuinely does make a unit take longer here,
+	// and the estimate should reflect that. Suspension is the opposite case —
+	// time the unit was not running at all.
 	if d.dcfTracker != nil && wu.RscFpopsEst > 0 && d.benchmarkFPOPS > 0 {
 		estimatedSec := wu.RscFpopsEst / d.benchmarkFPOPS
-		actualSec := float64(result.Result.Metrics.WallClockSeconds)
-		if actualSec > 0 {
-			d.dcfTracker.Update(wu.LeafID, estimatedSec, actualSec)
+		if active > 0 {
+			d.dcfTracker.Update(wu.LeafID, estimatedSec, float64(active))
 		}
 	}
 
-	wallClock := result.Result.Metrics.WallClockSeconds
-	cpuSeconds := wallClock - int64(result.TotalPausedDur.Seconds())
-	if cpuSeconds < 0 {
-		cpuSeconds = 0
+	d.recordHistory(wu, wallClock, active, submitResp.Accepted, conn.Name)
+}
+
+// activeSeconds is the time a work unit spent actually computing: its elapsed
+// wall clock less any period it was suspended.
+//
+// The two differ whenever a unit is frozen mid-run — a thermal throttle, the
+// resource monitor, or a schedule window closing — and conflating them is TB-18.
+// Suspension is not slowness: the unit was not running at all. Competing load
+// from the volunteer's own other work IS slowness and stays in the figure, which
+// is why this subtracts pause time rather than switching to CPU time.
+//
+// Clamped at zero: pause accounting is sampled independently of the runtime's
+// wall clock, and a rounding disagreement must never reach the estimator as a
+// negative duration.
+func activeSeconds(wallClockSec int64, paused time.Duration) int64 {
+	active := wallClockSec - int64(paused.Seconds())
+	if active < 0 {
+		return 0
 	}
-	d.recordHistory(wu, wallClock, cpuSeconds, submitResp.Accepted, conn.Name)
+	return active
 }
 
 // persistActiveTasks writes the current active tasks to disk so they survive
@@ -2531,6 +2577,43 @@ func (d *Daemon) persistPendingResult(wu *runtime.WorkUnit, result SlotResult, c
 // runPendingResultRetry resubmits persisted results until the head accepts them.
 // It sweeps once on start (recovering results stranded by a previous run) and
 // then every pendingResultRetryInterval until ctx is cancelled.
+// bufferMaintenanceInterval is how often buffered units are re-checked for
+// expiry independently of the fetcher. It only has to be short relative to the
+// margins the sweep enforces — 10% of a unit's deadline, and
+// reservationDropMargin (60s) before the head-side reservation lapses — not to
+// the deadline itself.
+const bufferMaintenanceInterval = 30 * time.Second
+
+// runBufferMaintenance ages buffered work units out on a timer that is
+// independent of the fetcher and of the coordinator loop (TB-19).
+//
+// Both of those stop during a pause: a thermal or resource pause cancels the
+// fetcher's context, and the coordinator then blocks in waitForResume. The
+// buffer, however, keeps ageing — a unit's head-side reservation lapses on wall
+// clock whether or not this client is doing anything — so the sweep needs an
+// owner that survives a pause. It is tied to the run context, so it stops only
+// when the daemon does.
+func (d *Daemon) runBufferMaintenance(ctx context.Context) {
+	ticker := time.NewTicker(bufferMaintenanceInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// The fetcher is replaced on every pause/resume, so read it under the
+			// lock rather than capturing one at start-up. A nil fetcher (pre-start
+			// or post-shutdown) simply means there is nothing to sweep yet.
+			d.mu.Lock()
+			f := d.fetcher
+			d.mu.Unlock()
+			if f != nil {
+				f.sweepBuffer()
+			}
+		}
+	}
+}
+
 func (d *Daemon) runPendingResultRetry(ctx context.Context) {
 	d.retryPendingResults(ctx)
 	ticker := time.NewTicker(pendingResultRetryInterval)

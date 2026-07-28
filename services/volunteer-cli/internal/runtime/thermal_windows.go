@@ -13,3 +13,9 @@ package runtime
 func readCPUTemperature() int {
 	return 0
 }
+
+// readSensors on Windows returns nothing, for the same reason
+// readCPUTemperature does: the WMI thermal class needs admin rights and can
+// raise UAC prompts, so no temperature is read at all. GPU monitoring via
+// nvidia-smi/rocm-smi is unaffected.
+func readSensors() []Sensor { return nil }

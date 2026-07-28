@@ -199,3 +199,16 @@ func (w *WindowsLimiter) CheckDiskSpace(path string, requiredMB int) error {
 
 	return nil
 }
+
+// describeCPUEnforcement reports the Windows CPU posture.
+//
+// The Job Object applies CPU RATE control — a hard cap on the share of CPU time
+// the job may consume — rather than placing work on chosen processors. Like the
+// cgroup quota on Linux this is insensitive to which CPUs are permitted, so
+// there is no permitted-set count to report.
+func describeCPUEnforcement() CPUEnforcement {
+	return CPUEnforcement{
+		Mechanism:  "Job Object CPU rate control",
+		Confinable: true,
+	}
+}

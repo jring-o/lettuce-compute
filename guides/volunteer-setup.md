@@ -367,7 +367,24 @@ thermal:
   gpu_pause_threshold: 80      # °C — freeze ALL work when the GPU reaches this
   gpu_resume_threshold: 70     # °C — resume once the GPU drops below this
   poll_interval_seconds: 10    # how often temperatures are sampled
+  max_throttle_minutes: 30     # resume and re-check after this long frozen (negative = wait indefinitely)
 ```
+
+> **Which sensors these apply to.** The CPU thresholds are compared against CPU
+> sensors only, and the GPU thresholds against GPU sensors only. Machines expose
+> plenty of other temperatures — the SSD, the WiFi chip, the chipset — and those
+> run hot by design, so judging them against a CPU's danger point would freeze
+> your work while your CPU was perfectly cool. They are still honoured, but only
+> against the danger point the component itself declares to the kernel. A sensor
+> that declares none can never pause your work.
+
+> **`max_throttle_minutes` stops a freeze lasting forever.** If the reading
+> holding the pause is not something Lettuce's own load produced — a warm drive,
+> or a machine kept busy by your other work — then suspending Lettuce cannot cool
+> it, and without a ceiling the daemon would wait indefinitely. After this long it
+> resumes, logs loudly why, and stops trusting that particular sensor for a while.
+> Your CPU throttles itself in hardware regardless; this layer is a courtesy, not
+> your machine's actual protection. Set it negative to wait indefinitely instead.
 
 > **These don't throttle *how much* runs.** Thermal pause is all-or-nothing
 > hardware protection, not a per-leaf or concurrency dial. To cap how much work

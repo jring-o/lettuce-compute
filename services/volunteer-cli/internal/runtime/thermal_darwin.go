@@ -23,3 +23,13 @@ func readCPUTemperature() int {
 
 	return 0
 }
+
+// readSensors on macOS returns nothing.
+//
+// There is no sysfs equivalent; the only CPU reading available is the
+// osx-cpu-temp shell-out above, which readCPUTemperature already handles. With
+// no sensor list there is no non-CPU overheat check on this platform, which is
+// correct rather than a gap: the class of bug it guards against (a drive's
+// temperature judged by the CPU's threshold) cannot arise where no drive
+// temperature is read.
+func readSensors() []Sensor { return nil }
