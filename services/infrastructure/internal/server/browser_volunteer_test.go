@@ -184,7 +184,7 @@ func (m *bvMockWURepo) CountActiveByHost(context.Context) (map[types.ID]int, err
 	return nil, nil
 }
 func (m *bvMockWURepo) CloseCopy(context.Context, types.ID, string) error { return nil }
-func (m *bvMockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID) error {
+func (m *bvMockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) error {
 	return nil
 }
 func (m *bvMockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -2162,14 +2163,18 @@ func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, 
 }
 
 // CloseCopyByVolunteer closes a volunteer's live copy of a unit with the given
-// outcome (used by submit/abandon). resultID may be nil. Returns apierror.Conflict
+// outcome (used by submit/abandon). resultID may be nil. reason is the client's
+// failure text, persisted on the row (TB-27) so "what failed?" survives log rotation;
+// empty stores NULL. Bounded here — the single write point — because the wire imposes
+// no length and a self-compiled client could send anything. Returns apierror.Conflict
 // if the volunteer has no live copy of the unit.
-func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID) error {
+func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_unit_assignment_history
-		SET outcome = $3, outcome_at = NOW(), result_id = COALESCE($4, result_id)
+		SET outcome = $3, outcome_at = NOW(), result_id = COALESCE($4, result_id),
+		    outcome_reason = $5
 		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
-		workUnitID, volunteerID, outcome, resultID,
+		workUnitID, volunteerID, outcome, resultID, boundedOutcomeReason(reason),
 	)
 	if err != nil {
 		return apierror.Internal("failed to close copy by volunteer", err)
@@ -2181,6 +2186,27 @@ func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUn
 		)
 	}
 	return nil
+}
+
+// maxOutcomeReasonBytes bounds the persisted outcome reason. The shipped client sends
+// a short prefix plus a 500-byte execution-log tail, so 2 KB never truncates an honest
+// reason; the bound guards the table against an arbitrary self-compiled client.
+const maxOutcomeReasonBytes = 2048
+
+// boundedOutcomeReason maps a client reason to its stored form: nil (SQL NULL) when
+// empty, truncated to maxOutcomeReasonBytes on a rune boundary otherwise.
+func boundedOutcomeReason(reason string) *string {
+	if reason == "" {
+		return nil
+	}
+	if len(reason) > maxOutcomeReasonBytes {
+		cut := maxOutcomeReasonBytes
+		for cut > 0 && !utf8.RuneStart(reason[cut]) {
+			cut--
+		}
+		reason = reason[:cut]
+	}
+	return &reason
 }
 
 // ExpireLiveCopies closes ALL live copies of a unit with the given outcome (used by

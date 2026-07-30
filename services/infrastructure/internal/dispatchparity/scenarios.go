@@ -207,9 +207,12 @@ const (
 // its CURRENT verdict so the suite stays green while documenting the drift in code;
 // a behavior change on EITHER side flips a value here and trips the assertion,
 // forcing a deliberate update. See the scenario's construction site for the
-// analysis and the offending code lines. There are currently NO known divergences
-// (the empty-requester-hr_class one was reconciled by aligning the SQL to the
-// stricter Go semantics); the mechanism stays for the next one found.
+// analysis and the offending code lines. One divergence is currently pinned:
+// cooldown_pool_exhausted_but_unit_covered_still_benched (TB-26 — the in-memory
+// bench-fallback judges exhaustion on live holders only, because its refill-time DB
+// coverage snapshot goes stale while the candidate stays staged; the SQL landing
+// remains the authoritative refusal). The empty-requester-hr_class divergence was
+// reconciled by aligning the SQL to the stricter Go semantics.
 type LayerDivergence struct {
 	Go  bool   // eligibleLocked's current verdict for this scenario
 	SQL bool   // FindNextAssignable's current verdict for this scenario
@@ -663,11 +666,26 @@ func Scenarios() []Scenario {
 		}),
 		with("cooldown_pool_exhausted_but_unit_covered_still_benched", DimCooldown, func(s *Scenario) {
 			// Control for the fallback: same aged outcome, but ANOTHER volunteer holds a
-			// live copy — the pool is not exhausted, so the bench holds for the rest of
-			// its window (fresh volunteers keep first refusal).
+			// live copy — the pool is not exhausted, so the SQL holds the bench for the
+			// rest of its window (fresh volunteers keep first refusal).
+			//
+			// DELIBERATE DIVERGENCE (TB-26): the SQL evaluates the unit's live copies
+			// FRESH per query, so the covering copy holds the bench. The in-memory arm
+			// judges exhaustion on its own holders only — its refill-time DB coverage
+			// snapshot (dbActiveCount) is never refreshed while the candidate stays
+			// staged, and trusting it froze the fallback shut for the leaf's whole
+			// deadline (failed units stranded 10+ hours on the beta fleet). This
+			// scenario's covering copy is a DB row the Go projection folds into that
+			// snapshot, so eligibleLocked admits once the grace passes and the SQL
+			// landing (the authoritative cooldown gate, asserted by this scenario's
+			// SQL half) refuses the flush — one voided hand-out, never a strand.
 			s.Cooldown = CooldownExpiredExhausted
-			s.OtherLiveCopies = 1 // TargetCopies=2 → headroom remains; refusal is the bench
-			s.Eligible = false
+			s.OtherLiveCopies = 1 // TargetCopies=2 → headroom remains; the SQL refusal is the bench
+			s.Divergence = &LayerDivergence{
+				Go:  true,
+				SQL: false,
+				Why: "in-memory bench-fallback exhaustion trusts live holders only (stale dbActiveCount froze it, TB-26); the SQL landing re-refuses",
+			}
 		}),
 
 		// --- per-machine in-flight cap ---------------------------------------
