@@ -20,8 +20,8 @@ func containerBackendAvailable() bool {
 // UPPERCASE opt-in set stored in config.ServerConfig.TrustedRuntimes. WASM is always trusted, so
 // it is accepted but dropped (never stored); "none" (or empty) yields the WASM-only set. Unknown
 // names are an error rather than silently ignored. The result is always NON-NIL: an explicit
-// "none" must persist as an empty list, not as an absent key that the legacy-trust migration
-// would re-seed from available_runtimes (PB-28).
+// "none" must persist as an empty list, not as an absent key the legacy-trust migration
+// would re-pin as an unrecorded decision (PB-28).
 func parseTrustRuntimes(csv string) ([]string, error) {
 	seen := map[string]bool{}
 	out := []string{}

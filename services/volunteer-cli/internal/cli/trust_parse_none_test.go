@@ -4,9 +4,10 @@ import "testing"
 
 // PB-28: parseTrustRuntimes must return a NON-NIL (possibly empty) list — the
 // empty list is how an explicit "none" stays distinguishable from a legacy
-// config with no per-head trust at all, which the loader re-seeds from the
-// global available_runtimes. A nil here collapsed the two cases and let the
-// migration silently grant CONTAINER trust over a deliberate `--trust none`.
+// config that never recorded a trust decision at all. A nil here collapsed the
+// two cases; historically that let the loader's migration silently grant
+// CONTAINER trust (seeded from the since-retired available_runtimes key) over
+// a deliberate `--trust none`.
 func TestParseTrustRuntimes_NoneIsExplicitEmpty(t *testing.T) {
 	for _, in := range []string{"none", "", "wasm", "NONE", " none "} {
 		got, err := parseTrustRuntimes(in)

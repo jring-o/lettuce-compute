@@ -33,7 +33,6 @@ func newTrustRevocationFixture(t *testing.T, extraServers ...config.ServerConfig
 	seed := config.Defaults()
 	seed.DataDir = dir
 	// What init writes on a container-capable host.
-	seed.AvailableRuntimes = []string{"WASM", "CONTAINER"}
 	seed.ContainerBackend = "podman"
 	seed.Servers = append([]config.ServerConfig{{
 		GRPCAddress:     "h1.example.org:443",
@@ -92,7 +91,7 @@ func requireH1TrustStillRevoked(t *testing.T, cfgPath, via string) *config.Confi
 		}
 		if srv.TrustedRuntimes == nil {
 			t.Fatalf("head %q trust became nil after %s; the explicit empty list must stay explicit "+
-				"or the next load re-seeds it from available_runtimes", srv.DisplayName(), via)
+				"or the next load re-pins it as a legacy blank", srv.DisplayName(), via)
 		}
 		return after
 	}

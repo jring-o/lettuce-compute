@@ -10,6 +10,7 @@ import (
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
 )
 
@@ -195,86 +196,95 @@ func TestCheckIdentity_PermissionDenied_GivesOwnershipRemedy(t *testing.T) {
 	}
 }
 
-// TestCheckDisk_MatchesFetchGate pins doctor's disk verdict to the daemon's live
-// shouldFetch gate (TODO #24): a host the gate would still fetch on must not be
-// reported as a blocking failure, and a host the gate would actually block must
-// fail with the gate's own numbers.
+// TestCheckDisk_MatchesFetchGate pins doctor's disk verdict to the daemon's
+// live fetch gate (TODO #24): free space is judged against the absolute floor
+// only — never against the max_disk_gb allowance, which is a capacity offer,
+// not a free-space requirement (TB-24). Per-leaf download verdicts are the
+// Heads section's job (localDiskFetchNote), where each leaf's need is known.
 func TestCheckDisk_MatchesFetchGate(t *testing.T) {
 	const dataDir = "/data"
 	cases := []struct {
 		name        string
 		availableMB int64
-		maxDiskGB   int
 		wantFails   int
 		wantWarns   int
 	}{
-		{
-			// Ample: above the full allowance — gate always fetches.
-			name: "ample", availableMB: 25 * 1024, maxDiskGB: 20, wantFails: 0, wantWarns: 0,
-		},
-		{
-			// The reported false positive: max_disk_gb (20 GB) exceeds the 10 GB
-			// cached-image headroom, and free space (15 GB) sits between them. The
-			// gate still fetches work for any already-cached image, so doctor must
-			// NOT report a blocking failure — at most a warning.
-			name: "cached_only_region", availableMB: 15 * 1024, maxDiskGB: 20, wantFails: 0, wantWarns: 1,
-		},
-		{
-			// Below even the cached-image headroom — the gate blocks all work, so
-			// doctor correctly fails.
-			name: "blocked", availableMB: 5 * 1024, maxDiskGB: 20, wantFails: 1, wantWarns: 0,
-		},
-		{
-			// With max_disk_gb <= the headroom there is no cached-only band: the
-			// gate is a single threshold, so a reading below it is a hard failure.
-			name: "small_allowance_blocked", availableMB: 5 * 1024, maxDiskGB: 10, wantFails: 1, wantWarns: 0,
-		},
-		{
-			name: "small_allowance_ample", availableMB: 12 * 1024, maxDiskGB: 10, wantFails: 0, wantWarns: 0,
-		},
+		// Above the floor: OK, regardless of any allowance.
+		{name: "above_floor", availableMB: 25 * 1024, wantFails: 0, wantWarns: 0},
+		// The TB-24 shape: free space far below a big allowance is still OK —
+		// the allowance is not a floor. (15 GB free was a warning pre-fix.)
+		{name: "below_allowance_still_ok", availableMB: 15 * 1024, wantFails: 0, wantWarns: 0},
+		// Below the absolute floor — the gate blocks all work, so doctor fails.
+		{name: "below_floor", availableMB: daemon.DiskFloorMB - 1, wantFails: 1, wantWarns: 0},
+		// Probe failed (non-positive reading) → warn, not a confident pass.
+		{name: "unreadable", availableMB: 0, wantFails: 0, wantWarns: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			rep := &doctorReport{w: &buf}
-			checkDisk(rep, dataDir, tc.availableMB, tc.maxDiskGB)
+			checkDisk(rep, dataDir, tc.availableMB)
 			if rep.fails != tc.wantFails || rep.warns != tc.wantWarns {
-				t.Errorf("checkDisk(avail=%d, maxGB=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
-					tc.availableMB, tc.maxDiskGB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
+				t.Errorf("checkDisk(avail=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
+					tc.availableMB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
 			}
 		})
 	}
 }
 
-// TestCheckImageStore_FlagsShortVolume covers the TODO #31 doctor surface: the
-// image-store filesystem (engine DockerRootDir / Podman graphroot) is reported
-// separately from the data dir, and a volume too small to pull a big image is a
-// warning (native + cached-image leafs still run), not a hard failure.
-func TestCheckImageStore_FlagsShortVolume(t *testing.T) {
+// TestLocalDiskFetchNote covers the per-leaf half of doctor's disk story
+// (TB-24): an eligible leaf whose declared need exceeds current free space gets
+// a download-gated note derived from the daemon's own thresholds; covered needs
+// and unknown readings get none.
+func TestLocalDiskFetchNote(t *testing.T) {
+	req := leafRequirements{name: "grep-cpu", needsContainer: true, diskMB: 15000}
+
+	// The tester's numbers: 24,721 MB free covers 15,000 + the floor.
+	if note := localDiskFetchNote(req, volunteerCaps{freeDataDirMB: 24721}); note != "" {
+		t.Errorf("free 24721 covers need 15000+floor, want no note; got: %s", note)
+	}
+	// 12,000 MB free does not.
+	note := localDiskFetchNote(req, volunteerCaps{freeDataDirMB: 12000})
+	if note == "" {
+		t.Fatal("free 12000 < need 15000+floor, want a download-gated note")
+	}
+	if !strings.Contains(note, "15000") {
+		t.Errorf("note must name the leaf's need; got: %s", note)
+	}
+	// Unknown need or unknown reading: no verdict.
+	if note := localDiskFetchNote(leafRequirements{name: "x"}, volunteerCaps{freeDataDirMB: 100}); note != "" {
+		t.Errorf("unknown need must produce no note; got: %s", note)
+	}
+	if note := localDiskFetchNote(req, volunteerCaps{}); note != "" {
+		t.Errorf("unknown free-space reading must produce no note; got: %s", note)
+	}
+}
+
+// TestCheckImageStore covers the TODO #31 doctor surface: the image-store
+// filesystem (engine DockerRootDir / Podman graphroot) is reported separately
+// from the data dir. It reports the reading and the per-leaf rule (TB-24 — a
+// pull needs the LEAF's declared disk free here, never the whole allowance);
+// only an unreadable volume warns.
+func TestCheckImageStore(t *testing.T) {
 	const storePath = "/var/lib/containers/storage"
 	cases := []struct {
 		name        string
 		availableMB int64
-		maxDiskGB   int
 		wantFails   int
 		wantWarns   int
 	}{
-		// Ample: at/above the full pull allowance → OK.
-		{name: "ample", availableMB: 120 * 1024, maxDiskGB: 100, wantFails: 0, wantWarns: 0},
-		// Short: data dir may be roomy, but the image store can't hold the pull →
-		// warn (not fail).
-		{name: "short", availableMB: 20 * 1024, maxDiskGB: 100, wantFails: 0, wantWarns: 1},
+		{name: "readable", availableMB: 20 * 1024, wantFails: 0, wantWarns: 0},
 		// Probe failed (non-positive reading) → warn, not a confident pass.
-		{name: "unreadable", availableMB: 0, maxDiskGB: 100, wantFails: 0, wantWarns: 1},
+		{name: "unreadable", availableMB: 0, wantFails: 0, wantWarns: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			rep := &doctorReport{w: &buf}
-			checkImageStore(rep, storePath, tc.availableMB, tc.maxDiskGB)
+			checkImageStore(rep, storePath, tc.availableMB)
 			if rep.fails != tc.wantFails || rep.warns != tc.wantWarns {
-				t.Errorf("checkImageStore(avail=%d, maxGB=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
-					tc.availableMB, tc.maxDiskGB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
+				t.Errorf("checkImageStore(avail=%d): fails=%d warns=%d, want fails=%d warns=%d\nreport:\n%s",
+					tc.availableMB, rep.fails, rep.warns, tc.wantFails, tc.wantWarns, buf.String())
 			}
 			if !strings.Contains(buf.String(), storePath) {
 				t.Errorf("report should name the image-store path %q; got:\n%s", storePath, buf.String())

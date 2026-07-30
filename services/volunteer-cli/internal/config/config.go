@@ -40,18 +40,12 @@ type Config struct {
 
 	Leafs LeafFilter `yaml:"leafs"`
 
-	AvailableRuntimes []string `yaml:"available_runtimes"`
-
-	// AllowNativeRuntime gates whether the daemon registers the NATIVE runtime,
-	// which runs an untrusted leaf binary directly on the host with no sandbox
-	// (BG-12). It defaults to false and is deliberately ABSENT from Defaults(): a
-	// pre-existing on-disk config has no allow_native_runtime key, so Load's
-	// unmarshal-over-Defaults leaves it false and native stays OFF after an upgrade
-	// unless the volunteer explicitly opts in. It must NOT be gated on
-	// available_runtimes membership — that field is persisted and already lists
-	// NATIVE for every onboarded tester, so gating on it would re-enable native for
-	// the whole existing population after `lettuce-volunteer update`.
-	AllowNativeRuntime bool `yaml:"allow_native_runtime"`
+	// The retired global runtime keys available_runtimes and allow_native_runtime
+	// are deliberately ABSENT from this struct (TB-25 / TQ-22). Runtime enablement
+	// is per-head trust (servers[].trusted_runtimes) plus a live engine probe at
+	// daemon start; the daemon, registration, and the diagnostics never consult a
+	// global list. An old config still carrying either key loads fine — the lenient
+	// Unmarshal ignores it and DeprecatedKeyWarnings tells the volunteer it is dead.
 
 	ContainerBackend string `yaml:"container_backend,omitempty"` // "podman", "docker", or ""
 
@@ -277,13 +271,14 @@ type ServerConfig struct {
 	// CONTAINER and NATIVE are explicit opt-ins.
 	//
 	// nil vs empty is load-bearing (PB-28): nil (key absent from the file) marks a
-	// config that predates per-head trust, and Load migrates it from the legacy
-	// global available_runtimes / allow_native_runtime so an upgraded volunteer
-	// keeps exactly today's posture. A present-but-EMPTY list ("trusted_runtimes:
-	// []") is an explicit "none": the volunteer deliberately granted this head
-	// WASM only, and the migration must never re-seed over that choice. The yaml
-	// tag therefore has no omitempty — every entry written by this version
-	// records its trust decision explicitly, empty included.
+	// config that predates per-head trust, and Load pins it to the explicit
+	// WASM-only empty list — trust in a head's CONTAINER/NATIVE code is a consent
+	// decision, and a file that never recorded one gets the safe answer, not a
+	// guess from the retired global keys (TB-25). A present-but-EMPTY list
+	// ("trusted_runtimes: []") is an explicit "none": the volunteer deliberately
+	// granted this head WASM only, and the migration must never re-seed over that
+	// choice. The yaml tag therefore has no omitempty — every entry written by
+	// this version records its trust decision explicitly, empty included.
 	TrustedRuntimes []string `yaml:"trusted_runtimes" json:"trusted_runtimes"`
 }
 
@@ -374,11 +369,6 @@ func Defaults() *Config {
 		Leafs: LeafFilter{
 			Mode: "ALL",
 		},
-		// WASM is the confined default runtime. NATIVE is opt-in via
-		// allow_native_runtime (BG-12); CONTAINER is added here when a backend is
-		// available. AllowNativeRuntime is intentionally omitted so its zero value
-		// (false) governs, keeping native OFF for upgraded configs.
-		AvailableRuntimes:     []string{"WASM"},
 		ContainerGPURelaxUser: true,
 		Notifications: NotificationConfig{
 			CreditMilestones:         true,
@@ -601,32 +591,26 @@ func appendUniqueString(list []string, s string) []string {
 	return append(list, s)
 }
 
-// migrateServerRuntimeTrust backfills per-head TrustedRuntimes for any server written
-// before per-head runtime trust existed, so an upgraded volunteer keeps EXACTLY today's
-// posture. Runtime enablement used to be two GLOBAL knobs — available_runtimes (WASM
-// always; CONTAINER opt-in) and allow_native_runtime (BG-12: native OFF unless explicitly
-// true) — which this maps onto the per-head field. WASM is implicit and never stored.
+// migrateServerRuntimeTrust pins per-head TrustedRuntimes for any server entry
+// that never recorded a trust decision (a NIL list — the key absent from the
+// file) to the explicit WASM-only empty list. Trusting a head to run CONTAINER
+// or NATIVE code is a consent decision made at attach (or via `heads trust`);
+// an entry with no recorded decision gets the safe default rather than a value
+// inferred from the retired global keys available_runtimes /
+// allow_native_runtime, which used to silently grant CONTAINER trust to every
+// entry written without one (TB-25, and the DA-3 consent gap). WASM needs no
+// entry — it is implicitly trusted always (EffectiveTrustedRuntimes).
 //
-// Only a NIL list (key absent from the file) is legacy and migrated. A
-// present-but-empty list is an explicit "WASM only" the volunteer chose at
-// attach or via `heads trust none`; re-seeding it from available_runtimes —
-// which init populates with CONTAINER on any podman/docker host — silently
-// upgraded a deliberate no-trust choice to CONTAINER trust (PB-28). The seeded
-// result is always non-nil so one load pins the migration and a later save
+// A present-but-empty list is an explicit "WASM only" the volunteer chose at
+// attach or via `heads trust none` and is left untouched (PB-28). The pinned
+// result is always non-nil so one load settles the question and a later save
 // records it explicitly.
 func (c *Config) migrateServerRuntimeTrust() {
 	for i := range c.Servers {
 		if c.Servers[i].TrustedRuntimes != nil {
 			continue // an explicit per-head choice, including the empty "WASM only"
 		}
-		trusted := []string{}
-		if containsFold(c.AvailableRuntimes, "CONTAINER") {
-			trusted = append(trusted, "CONTAINER")
-		}
-		if c.AllowNativeRuntime {
-			trusted = append(trusted, "NATIVE")
-		}
-		c.Servers[i].TrustedRuntimes = trusted
+		c.Servers[i].TrustedRuntimes = []string{}
 	}
 }
 
@@ -660,6 +644,12 @@ var deprecatedKeyHints = map[string]string{
 	// unit COUNT; the current key sizes it in HOURS. The value cannot be carried
 	// over safely, so point the user at the new key rather than copying the number.
 	"work_buffer_size": `renamed to "work_buffer_hours", which now sizes the buffer in HOURS of work per task (not a unit count) — set work_buffer_hours to the number of hours you want buffered.`,
+	// The two retired global runtime keys (TB-25 / TQ-22). Which runtimes actually
+	// run was never governed by them on current builds — per-head trust plus a live
+	// engine probe decide — so the keys sat in config.yaml reading as authoritative
+	// while contradicting the daemon. Name the real mechanism in the advisory.
+	"available_runtimes":   `retired: which runtimes run is decided per head by servers[].trusted_runtimes (see "lettuce-volunteer heads trust") plus a live engine check at daemon start. Delete the key.`,
+	"allow_native_runtime": `retired: NATIVE is enabled per head via servers[].trusted_runtimes (see "lettuce-volunteer heads trust"). Delete the key.`,
 }
 
 // detectUnknownKeys re-decodes the raw config bytes with strict field checking
@@ -793,8 +783,6 @@ func applyKeyComments(m *yaml.Node, comments map[string]string) {
 var topLevelConfigComments = map[string]string{
 	"max_concurrent_tasks": "How many work units run at once - THIS is the workload throttle (the thermal thresholds are not). The buffer target scales with it.",
 	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
-	"available_runtimes":    "Runtimes this volunteer will run. WASM is always available; CONTAINER also needs Docker or Podman. NATIVE and CONTAINER are enabled per head via trusted_runtimes (set at attach, or with 'heads trust').",
-	"allow_native_runtime":  "LEGACY global native switch: only read once, to seed per-head trusted_runtimes for configs that predate per-head trust. The per-head servers[].trusted_runtimes list is what actually gates NATIVE now.",
 	"container_cap_add":     "Linux capabilities to re-add to hardened containers. Default none (containers drop all capabilities).",
 	"container_gpu_relax_user": "Let GPU leaves relax the non-root/minimal-capability container posture when device access needs it. CPU leaves stay fully hardened.",
 	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
@@ -805,7 +793,7 @@ var topLevelConfigComments = map[string]string{
 var resourceLimitsComments = map[string]string{
 	"max_cpu_cores":      "Max CPU cores a single work unit may use.",
 	"max_memory_mb":      "Memory ceiling. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
-	"max_disk_gb":        "Disk under the data dir the volunteer may use. Work is not fetched unless at least this much is free.",
+	"max_disk_gb":        "Disk capacity you offer: a head only sends leafs whose declared disk need fits under this, and Lettuce keeps its own footprint (work folders + container images) within it. A download needs only the LEAF's declared disk free (plus a 2 GB floor), never this whole number.",
 	"max_bandwidth_mbps": "Bandwidth cap in Mbps. 0 = unlimited.",
 	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. A head compares a leaf's VRAM requirement against this share of your card, not the card itself, so at the default 50% a 6 GB card offers 3072 MB. 0 disables GPU work entirely.",
 	"max_pids":           "Max simultaneous processes/threads inside a container (fork-bomb cap). 0 uses the built-in default.",

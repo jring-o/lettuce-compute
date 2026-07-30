@@ -63,6 +63,15 @@ type Fetcher struct {
 	// the coordinator goroutine. nil disables the skip.
 	leafFailurePausedFn func(leafID string) bool
 
+	// leafDiskGateFn is the per-leaf disk gate (TB-24): whether fetching work
+	// for this leaf is currently allowed given free space, the leaf's declared
+	// disk need, and the volunteer's usage budget. shouldFetch already blocks
+	// the loop when NO leaf passes; this skip is the precise half — with mixed
+	// leafs, the affordable ones keep fetching while an unaffordable one is
+	// skipped instead of being requested, pulled, and dying mid-pull with
+	// ENOSPC. Injected from the daemon; nil disables the skip.
+	leafDiskGateFn func(leaf CachedLeafInfo) (bool, string)
+
 	// --- CLIENT WORK BUFFER (Layer 1) ---
 	// workBufferFullFn reports whether the hours-based client work buffer is full.
 	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
@@ -188,6 +197,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
 		shouldFetchFunc:          d.shouldFetch,
 		leafFailurePausedFn:      d.leafFailurePaused,
+		leafDiskGateFn:           d.leafDiskGate,
 		workBufferFullFn:         d.workBufferFull,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
@@ -462,6 +472,15 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			if f.serverBlockedLeafIDsFunc != nil {
 				blockedIDs = mergeUnique(blockedIDs, f.serverBlockedLeafIDsFunc(head.Name))
 			}
+			// TB-24: the any-leaf request can't be gated on a specific leaf's
+			// need, so gate it on the synthetic descriptor (per-task default
+			// need, conservative container assumption).
+			if f.leafDiskGateFn != nil {
+				if ok, reason := f.leafDiskGateFn(anyLeafInfo); !ok {
+					f.logger.Debug("fetcher: skipping disk-gated any-leaf request", "server", head.Name, "reason", reason)
+					continue
+				}
+			}
 			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
 			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs)
 			if pushed > 0 {
@@ -491,6 +510,17 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			if f.leafFailurePausedFn != nil && f.leafFailurePausedFn(leaf.ID) {
 				f.logger.Debug("fetcher: skipping leaf paused after repeated local failures", "server", head.Name, "leaf_slug", leaf.Slug, "leaf_id", leaf.ID)
 				continue
+			}
+
+			// TB-24: skip a leaf whose disk gate refuses — free space does not
+			// cover ITS declared need right now — so its units are never
+			// requested only to die mid-pull, while affordable leafs keep
+			// fetching. shouldFetch owns the loud all-leafs-gated WARN.
+			if f.leafDiskGateFn != nil {
+				if ok, reason := f.leafDiskGateFn(leaf); !ok {
+					f.logger.Debug("fetcher: skipping disk-gated leaf", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
+					continue
+				}
 			}
 
 			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil)

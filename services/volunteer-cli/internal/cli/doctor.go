@@ -99,7 +99,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	checkAccountInfo(rep)
 	checkDataDir(rep, cfg.DataDir)
 	checkIdentity(rep, cfg.KeyFilePath(), cfg.PubKeyFilePath())
-	checkDisk(rep, cfg.DataDir, client.DiskAvailableMB(cfg.DataDir), cfg.ResourceLimits.MaxDiskGB)
+	freeDataDirMB := client.DiskAvailableMB(cfg.DataDir)
+	checkDisk(rep, cfg.DataDir, freeDataDirMB)
+	checkDiskUsage(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB)
 	containerUsable := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
 
@@ -122,6 +124,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		hasGPU:          volunteerHasGPU(),
 		maxDiskMB:       int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
 		maxCPUCores:     cfg.ResourceLimits.MaxCPUCores,
+		freeDataDirMB:   freeDataDirMB,
 	}
 	caps.maxGPUVRAMMB, caps.gpuCardVRAMMB, caps.gpuVRAMPct, caps.gpuVendors, caps.gpuComputeCapabilities =
 		volunteerGPUBudget()
@@ -269,13 +272,14 @@ func checkIdentity(rep *doctorReport, keyFile, pubKeyFile string) {
 
 // checkDisk reports the disk-space verdict the daemon's live fetch gate
 // (daemon.shouldFetch) would reach for this volume, derived from the SAME
-// thresholds via daemon.ClassifyDiskGate so the diagnostic and the gate can
-// never disagree (TODO #24). The earlier check demanded the full max_disk_gb
-// allowance free and flagged a hard failure below it, which was a false positive
-// on hosts where the gate still fetched work for already-cached images.
-func checkDisk(rep *doctorReport, dataDir string, availableMB int64, maxDiskGB int) {
-	fullRequiredMB, cachedHeadroomMB := daemon.DiskGateThresholds(maxDiskGB)
-
+// thresholds so the diagnostic and the gate can never disagree (TODO #24).
+// Free space is compared against the absolute floor only: what a fetch requires
+// free is each LEAF's declared need, never the whole max_disk_gb allowance —
+// the earlier allowance-as-floor check meant raising the allowance to qualify
+// for a big leaf gated the volunteer's own image downloads (TB-24). Per-leaf
+// download verdicts appear in the Heads section, where each leaf's need is
+// known.
+func checkDisk(rep *doctorReport, dataDir string, availableMB int64) {
 	// A non-positive reading means the free-space probe failed (e.g. statfs
 	// error). The live gate's CheckDiskSpace would error and block, but doctor
 	// has no useful number to show, so surface it as a warning rather than a
@@ -287,27 +291,38 @@ func checkDisk(rep *doctorReport, dataDir string, availableMB int64, maxDiskGB i
 		return
 	}
 
-	switch daemon.ClassifyDiskGate(availableMB, maxDiskGB) {
-	case daemon.DiskAmple:
-		rep.add(docOK, "disk space",
-			fmt.Sprintf("%d MB free on %s (allowance %d MB)", availableMB, dataDir, fullRequiredMB), "")
-	case daemon.DiskCachedOnly:
-		// Between the cached-image headroom and the full allowance: the gate
-		// still runs work for any leaf whose image is already pulled, but a
-		// fresh image pull is gated. A warning, not a blocking failure.
-		rep.add(docWarn, "disk space",
-			fmt.Sprintf("%d MB free on %s — below the %d MB max_disk_gb allowance; work still runs for leafs whose image is already cached (needs %d MB), but pulling a fresh image is gated",
-				availableMB, dataDir, fullRequiredMB, cachedHeadroomMB),
-			"free disk space or lower resource_limits.max_disk_gb if you need fresh image pulls")
-	default: // daemon.DiskBlocked
-		floorMB := fullRequiredMB
-		if cachedHeadroomMB < floorMB {
-			floorMB = cachedHeadroomMB
-		}
+	if availableMB < daemon.DiskFloorMB {
 		rep.add(docFail, "disk space",
-			fmt.Sprintf("%d MB free on %s — below the %d MB the fetch gate needs to run any work", availableMB, dataDir, floorMB),
-			"free space, lower resource_limits.max_disk_gb, or use --data-dir on a roomier volume")
+			fmt.Sprintf("%d MB free on %s — below the %d MB floor the fetch gate needs to run any work", availableMB, dataDir, daemon.DiskFloorMB),
+			"free space, or use --data-dir on a roomier volume")
+		return
 	}
+	rep.add(docOK, "disk space",
+		fmt.Sprintf("%d MB free on %s — a work fetch needs the leaf's declared disk requirement free (plus a %d MB floor), shown per leaf in the Heads section", availableMB, dataDir, daemon.DiskFloorMB), "")
+}
+
+// checkDiskUsage reports Lettuce's own measured footprint against the
+// max_disk_gb allowance it is budgeted under — the honest usage figure that
+// used to exist nowhere (TB-24). Doctor can measure the data-dir tree directly;
+// cached container images also count on container hosts, but reading them
+// needs the engine's image list, so the figure is labelled accordingly.
+func checkDiskUsage(rep *doctorReport, dataDir string, maxDiskGB int) {
+	allowanceMB := int64(maxDiskGB) * 1024
+	usedMB, err := daemon.DirSizeMB(dataDir)
+	if err != nil {
+		rep.add(docInfo, "disk usage",
+			fmt.Sprintf("could not measure the data dir (%v); the running daemon budgets its usage against the %d MB allowance", err, allowanceMB), "")
+		return
+	}
+	level := docInfo
+	remedy := ""
+	if usedMB >= allowanceMB {
+		level = docWarn
+		remedy = "free space under the data dir, or raise resource_limits.max_disk_gb — at or over the allowance the daemon stops fetching (superseded container images are reclaimed automatically)"
+	}
+	rep.add(level, "disk usage",
+		fmt.Sprintf("Lettuce is using %d MB of its %d MB allowance (work folders under the data dir; cached container images count too on container hosts)",
+			usedMB, allowanceMB), remedy)
 }
 
 // checkCPUEnforcement reports the CPU cap ACTUALLY in force, next to the
@@ -349,20 +364,25 @@ func checkCPUEnforcement(rep *doctorReport, maxCPUCores int) {
 			e.Mechanism, e.PermittedCPUs, maxCPUCores), "")
 }
 
-// checkContainer reports whether the container runtime is genuinely usable, and
-// returns true only when its socket actually responds. Detection alone isn't
-// enough — a rootless Podman socket can exist but be permission-denied — so we
-// construct the runtime and Ping it.
-func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
-	if !containsRuntime(cfg.AvailableRuntimes, "CONTAINER") {
-		rep.add(docInfo, "container", "not enabled (no CONTAINER in available_runtimes) — native/wasm leafs still run", "")
-		return false
-	}
+// detectContainerBackendDoctor is checkContainer's engine-detection seam,
+// overridable in tests so the probe-first verdict can be exercised without a
+// real engine on the test host.
+var detectContainerBackendDoctor = runtime.DetectContainerBackendPreferred
 
-	info := runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), runtime.ContainerBackend(cfg.ContainerBackend))
+// checkContainer reports whether the container runtime is genuinely usable, and
+// returns true only when its socket actually responds. It derives the answer the
+// same way the daemon does — a live engine probe — never from a config record:
+// the retired available_runtimes key used to short-circuit this check, which let
+// doctor call a machine container-incapable while it was executing a container
+// unit (TB-25). Detection alone isn't enough either — a rootless Podman socket
+// can exist but be permission-denied — so we construct the runtime and Ping it,
+// which also finally distinguishes "no engine" from "engine present, socket
+// broken" in every config state.
+func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
+	info := detectContainerBackendDoctor(runtime.BundledPodmanPath(), runtime.ContainerBackend(cfg.ContainerBackend))
 	if info.Backend == runtime.BackendNone {
-		rep.add(docWarn, "container", "CONTAINER is enabled but no Docker or Podman was found",
-			"install Docker or Podman, or remove CONTAINER from available_runtimes")
+		rep.add(docInfo, "container", "no container engine found (Docker or Podman) — container leafs need one; native/wasm leafs still run",
+			"install Docker or Podman if you want to run container leafs")
 		return false
 	}
 
@@ -393,7 +413,7 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 	// NOT under the lettuce data dir, so a roomy data dir can hide a too-small
 	// image-store volume. Surface where it lands and whether it has pull headroom.
 	if einfo, ierr := cr.Client().Info(ctx); ierr == nil && einfo != nil {
-		checkImageStorePaths(rep, einfo, cfg.ResourceLimits.MaxDiskGB)
+		checkImageStorePaths(rep, einfo)
 	} else {
 		rep.add(docInfo, "image store", "could not determine the container image-store path from the engine",
 			"if a big-image pull fails with ENOSPC, check free space where the engine stores images (Docker data-root / Podman graphroot)")
@@ -406,9 +426,9 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 // (Docker DockerRootDir / Podman graphroot), but under Docker's containerd
 // snapshotter the image content lives under the containerd root (e.g.
 // /var/lib/containerd) — a different directory DockerRootDir does not name — so
-// we surface that and gate on whichever candidate filesystem has the least room
+// we surface that and report whichever candidate filesystem has the least room
 // (the one a pull would run out of space on first), matching the live disk gate.
-func checkImageStorePaths(rep *doctorReport, einfo *runtime.EngineInfo, maxDiskGB int) {
+func checkImageStorePaths(rep *doctorReport, einfo *runtime.EngineInfo) {
 	paths := einfo.ImageStorePaths
 	if len(paths) == 0 {
 		if einfo.StoragePath == "" {
@@ -434,7 +454,7 @@ func checkImageStorePaths(rep *doctorReport, einfo *runtime.EngineInfo, maxDiskG
 			bindPath, bindFree = p, f
 		}
 	}
-	checkImageStore(rep, bindPath, bindFree, maxDiskGB)
+	checkImageStore(rep, bindPath, bindFree)
 }
 
 // checkImageStore reports free space on the filesystem where the container
@@ -442,11 +462,11 @@ func checkImageStorePaths(rep *doctorReport, einfo *runtime.EngineInfo, maxDiskG
 // graphroot — which is NOT the lettuce data dir. A big-image leaf's pull lands
 // here, so a roomy data dir paired with a small image-store volume is exactly
 // the host the data-dir-only gate used to miss before failing mid-pull with
-// ENOSPC (TODO #31). Low space here is a warning, not a blocking failure: native
-// leafs and already-cached-image leafs still run.
-func checkImageStore(rep *doctorReport, storePath string, availableMB int64, maxDiskGB int) {
-	fullRequiredMB, _ := daemon.DiskGateThresholds(maxDiskGB)
-
+// ENOSPC (TODO #31). What a pull requires free here is the LEAF's declared disk
+// need plus the floor — never the whole max_disk_gb allowance (TB-24) — so this
+// line reports the reading and the rule; the per-leaf verdicts live in the
+// Heads section where each leaf's need is known.
+func checkImageStore(rep *doctorReport, storePath string, availableMB int64) {
 	if availableMB <= 0 {
 		// Matches the daemon's verdict for the same condition: unknown is not
 		// "full", so fetching is NOT gated on this path (normal on Windows/macOS,
@@ -457,16 +477,9 @@ func checkImageStore(rep *doctorReport, storePath string, availableMB int64, max
 			"the engine enforces its own storage limits; if a big-image pull fails with ENOSPC, free space there or enlarge the Podman-machine disk")
 		return
 	}
-	if availableMB >= int64(fullRequiredMB) {
-		rep.add(docOK, "image store",
-			fmt.Sprintf("%d MB free at %s (the engine's image store; a fresh big-image pull needs up to %d MB here)",
-				availableMB, storePath, fullRequiredMB), "")
-		return
-	}
-	rep.add(docWarn, "image store",
-		fmt.Sprintf("%d MB free at %s — below the %d MB allowance a fresh big-image pull can need; the pull would run out of space on this volume even if the data dir has room",
-			availableMB, storePath, fullRequiredMB),
-		"free space on the image-store volume, repoint the engine's storage (Docker data-root / Podman graphroot) to a roomier disk, or enlarge the Podman-machine disk")
+	rep.add(docOK, "image store",
+		fmt.Sprintf("%d MB free at %s (the engine's image store; a fresh pull needs the leaf's declared disk requirement free here, +%d MB floor)",
+			availableMB, storePath, daemon.DiskFloorMB), "")
 }
 
 func containerRemedy(backend runtime.ContainerBackend) string {
@@ -684,10 +697,15 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 
 	// Per-leaf requirement breakdown (#30): show exactly which leafs this volunteer
 	// can't run and why (memory/GPU/runtime), so the operator can act even when some
-	// leafs are still eligible (which keeps the head line a pass).
+	// leafs are still eligible (which keeps the head line a pass). An eligible leaf
+	// whose LOCAL disk gate currently refuses it gets its note too (TB-24) — the
+	// head would send it, this machine would skip it, and neither said so before.
 	for _, le := range res.leaves {
-		if !le.eligible {
+		switch {
+		case !le.eligible:
 			fmt.Fprintf(rep.w, "                       - %s: %s\n", le.name, le.reason)
+		case le.fetchNote != "":
+			fmt.Fprintf(rep.w, "                       - %s: %s\n", le.name, le.fetchNote)
 		}
 	}
 	return true
@@ -718,6 +736,11 @@ type volunteerCaps struct {
 	gpuVRAMPct             int
 	gpuVendors             []string
 	gpuComputeCapabilities []string
+	// freeDataDirMB is the current free-space reading on the data-dir volume
+	// (<= 0 when unknown). Not a dispatch dimension: it feeds the per-leaf
+	// LOCAL download-gate note (TB-24), which uses the same thresholds as the
+	// daemon's live gate so the two can never disagree.
+	freeDataDirMB int64
 }
 
 // leafEligibility is the per-leaf verdict doctor prints under a head.
@@ -725,6 +748,33 @@ type leafEligibility struct {
 	name     string
 	eligible bool
 	reason   string // why it's ineligible; empty when eligible
+	// fetchNote is the LOCAL disk-gate observation (TB-24): the head would
+	// dispatch this leaf, but this machine's current free space does not cover
+	// the leaf's declared need, so the daemon's fetch gate is (or would be)
+	// skipping it right now. Empty when free space covers the need or is
+	// unknown. Derived from the daemon's own thresholds (TODO #24).
+	fetchNote string
+}
+
+// localDiskFetchNote reports whether this machine's CURRENT free space covers
+// the leaf's declared disk need — the daemon's per-leaf fetch gate, evaluated
+// with doctor's free-space reading and the same daemon.LeafDiskThresholds the
+// live gate uses. Conservative fresh-download reading (doctor does not probe
+// which images are already cached); the wording says so for container leafs.
+func localDiskFetchNote(req leafRequirements, caps volunteerCaps) string {
+	if req.diskMB <= 0 || caps.freeDataDirMB <= 0 {
+		return "" // need or reading unknown — unknown is not a verdict
+	}
+	dataDirMB, _ := daemon.LeafDiskThresholds(req.diskMB, req.needsContainer, false)
+	if caps.freeDataDirMB >= dataDirMB {
+		return ""
+	}
+	if req.needsContainer {
+		return fmt.Sprintf("a fresh image download for this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available — work on an already-downloaded image still runs",
+			req.diskMB, daemon.DiskFloorMB, caps.freeDataDirMB)
+	}
+	return fmt.Sprintf("fetching this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available",
+		req.diskMB, daemon.DiskFloorMB, caps.freeDataDirMB)
 }
 
 // eligibilityResult aggregates the per-leaf verdicts for one head.
@@ -868,15 +918,15 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	head := srv.DisplayName()
 	switch {
 	case req.needsContainer && !caps.containerUsable:
-		return leafEligibility{req.name, false, "needs a container runtime"}, "container"
+		return leafEligibility{name: req.name, eligible: false, reason: "needs a container runtime"}, "container"
 	case req.needsContainer && !srv.TrustsRuntime("CONTAINER"):
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs the CONTAINER runtime, which you have not trusted this head to run (opt in: lettuce-volunteer heads trust %s container)", head)}, "trust"
 	case !req.needsContainer && req.nativeCapable && !req.wasmCapable && !srv.TrustsRuntime("NATIVE"):
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs the NATIVE runtime, which you have not trusted this head to run (opt in: lettuce-volunteer heads trust %s native)", head)}, "trust"
 	case req.memoryMB > caps.maxMemoryMB:
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d MB memory > your limit %d MB", req.memoryMB, caps.maxMemoryMB)}, "memory"
 	// The two budget gates are skipped when the budget itself is unknown (zero).
 	// `leafs list` reads these from the RUNNING daemon, so an upgraded binary
@@ -886,15 +936,15 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	// of the comparison. Config validation floors max_disk_gb at 1, so a genuinely
 	// configured volunteer never lands here.
 	case caps.maxDiskMB > 0 && req.diskMB > caps.maxDiskMB:
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d MB disk > your allowance %d MB (raise it: lettuce-volunteer config set resource_limits.max_disk_gb %d, then restart)",
 				req.diskMB, caps.maxDiskMB, diskGBToCover(req.diskMB))}, "disk"
 	case caps.maxCPUCores > 0 && req.cpuCores > caps.maxCPUCores:
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d CPU cores > your limit %d (raise it: lettuce-volunteer config set resource_limits.max_cpu_cores %d, then restart)",
 				req.cpuCores, caps.maxCPUCores, req.cpuCores)}, "cores"
 	case req.needsGPU && !caps.hasGPU:
-		return leafEligibility{req.name, false, "needs a GPU; none detected/enabled"}, "gpu"
+		return leafEligibility{name: req.name, eligible: false, reason: "needs a GPU; none detected/enabled"}, "gpu"
 	// The three remaining GPU gates, each skipped when the leaf did not state a
 	// requirement or the daemon did not report a budget — same unknown-is-not-zero
 	// rule as disk and cores above.
@@ -904,7 +954,7 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	// usually what has to change, and a message naming only the shortfall sends
 	// people shopping for hardware they already own.
 	case req.needsGPU && req.gpuVRAMMB > 0 && caps.maxGPUVRAMMB > 0 && req.gpuVRAMMB > caps.maxGPUVRAMMB:
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d MB GPU memory > the %d MB you allow (%s)%s",
 				req.gpuVRAMMB, caps.maxGPUVRAMMB, caps.describeVRAMAllowance(),
 				vramRemedy(req.gpuVRAMMB, caps))}, "vram"
@@ -915,15 +965,15 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	// the head would happily send work to.
 	case req.specGPURequired && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
 		!containsFold(caps.gpuVendors, req.gpuType):
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs a %s GPU; yours is %s", strings.ToUpper(req.gpuType), strings.Join(caps.gpuVendors, "/"))}, "gpu"
 	case req.rrGPURequired && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
 		!containsFold(caps.gpuComputeCapabilities, req.gpuComputeCapability):
-		return leafEligibility{req.name, false,
+		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs GPU compute capability %s; yours is %s",
 				req.gpuComputeCapability, strings.Join(caps.gpuComputeCapabilities, "/"))}, "gpu"
 	default:
-		return leafEligibility{req.name, true, ""}, ""
+		return leafEligibility{name: req.name, eligible: true}, ""
 	}
 }
 
@@ -1004,6 +1054,7 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 				gpuRequired:          rr.GetGpuRequired(),
 			})
 		le, blocked := classifyLeaf(req, caps, srv)
+		le.fetchNote = localDiskFetchNote(req, caps)
 		switch blocked {
 		case "container":
 			res.containerBlocked++

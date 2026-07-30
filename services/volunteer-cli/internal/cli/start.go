@@ -126,12 +126,6 @@ func runStart(cmd *cobra.Command, args []string) error {
 		"data_dir", cfg.DataDir,
 	)
 
-	// Ensure WASM is in AvailableRuntimes (handles existing configs that predate
-	// WASM support); the WASM runtime is always available.
-	if !containsRuntime(cfg.AvailableRuntimes, "WASM") {
-		cfg.AvailableRuntimes = append(cfg.AvailableRuntimes, "WASM")
-	}
-
 	// Artifact netguard opt-in (loud, off by default): if the operator listed heads
 	// in LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS, say so at startup — once per
 	// head, plus a loud flag for entries that match no configured head (a typo
@@ -528,15 +522,6 @@ func advertisedForServer(registry *daemon.RuntimeRegistry, srv config.ServerConf
 	}
 	sort.Strings(out)
 	return out
-}
-
-func containsRuntime(runtimes []string, name string) bool {
-	for _, r := range runtimes {
-		if r == name {
-			return true
-		}
-	}
-	return false
 }
 
 // parseSlogLevel maps a configured log level to its slog equivalent, folding

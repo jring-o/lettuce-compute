@@ -126,12 +126,6 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 			"data_dir", cfg.DataDir)
 	}
 
-	// WASM is always available (wazero is embedded); make sure the registry can serve
-	// wasm-runtime audit jobs even if the config predates WASM.
-	if !containsRuntime(cfg.AvailableRuntimes, "WASM") {
-		cfg.AvailableRuntimes = append(cfg.AvailableRuntimes, "WASM")
-	}
-
 	// Build the runtime registry exactly as the daemon does, then replicate the
 	// daemon's resource-limiter + process-group hookup so a re-executed leaf binary
 	// runs under the same OS-level limits and child-process containment a normal work

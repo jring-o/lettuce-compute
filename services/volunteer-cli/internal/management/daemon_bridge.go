@@ -326,12 +326,19 @@ type MetricsResponse struct {
 	GPUTempC     int     `json:"gpu_temp_c"`
 }
 
-// GetMetrics returns current resource usage metrics.
-// Real system metrics require platform-specific code; this returns zeros for now.
-// The desktop app will use these endpoints — real values will be populated when
-// platform metric collection is integrated.
+// GetMetrics returns current resource usage metrics. Disk figures are real
+// (TB-24): DiskUsedGB is Lettuce's measured footprint — the data-dir tree plus
+// cached container images — and DiskTotalGB is the max_disk_gb allowance that
+// footprint is budgeted against. The CPU/GPU/memory/temperature fields still
+// require platform-specific collection and remain zero until that is
+// integrated.
 func (b *DaemonBridge) GetMetrics() MetricsResponse {
-	return MetricsResponse{}
+	resp := MetricsResponse{}
+	if usedMB, allowanceMB, ok := b.daemon.DiskUsage(); ok {
+		resp.DiskUsedGB = float64(usedMB) / 1024
+		resp.DiskTotalGB = float64(allowanceMB) / 1024
+	}
+	return resp
 }
 
 // LeafInfo describes an attached leaf/server.
@@ -478,8 +485,8 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 		GRPCAddress: req.ServerAddress,
 		Name:        name,
 		// Explicit empty, not nil: attaching through the bridge has no consent
-		// step, so the new head starts WASM-only and the trust migration must
-		// never re-seed it from available_runtimes (PB-28).
+		// step, so the new head starts WASM-only as a recorded decision, not a
+		// legacy blank (PB-28).
 		TrustedRuntimes: []string{},
 	}
 	if req.LeafID != "" {
@@ -748,7 +755,6 @@ type ConfigResponse struct {
 	Servers           []config.ServerConfig     `json:"servers"`
 	LogLevel          string                    `json:"log_level"`
 	MaxConcurrent     int                       `json:"max_concurrent_tasks"`
-	AvailableRuntimes []string                  `json:"available_runtimes"`
 }
 
 // GetConfig returns the current configuration (with sensitive paths redacted).
@@ -771,7 +777,6 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 		Servers:           cfg.Servers,
 		LogLevel:          cfg.LogLevel,
 		MaxConcurrent:     cfg.MaxConcurrentTasks,
-		AvailableRuntimes: cfg.AvailableRuntimes,
 	}
 }
 

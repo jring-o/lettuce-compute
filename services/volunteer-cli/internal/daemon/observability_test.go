@@ -17,10 +17,13 @@ import (
 // per-poll Debug line), and re-arm so a later recovery + re-stall warns again.
 func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
-	lim := &thresholdLimiter{availMB: 50 * 1024}
+	// Below the absolute floor — the one condition that still gates ALL fetching
+	// regardless of any leaf's need (TB-24 removed the allowance-as-floor gate
+	// this test used to trip).
+	lim := &thresholdLimiter{availMB: DiskFloorMB - 1}
 	d := newTestDaemonWithResources(&mockClient{}, &mockRuntime{canHandle: true}, lim, scheduler)
 	d.cfg.DataDir = t.TempDir()
-	d.cfg.ResourceLimits.MaxDiskGB = 100 // needs 100*1024 MB free; only 50*1024 available â†’ gated
+	d.cfg.ResourceLimits.MaxDiskGB = 100
 
 	var buf bytes.Buffer
 	d.logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -44,7 +47,7 @@ func TestShouldFetch_DiskGateWarnsOnceAndRearms(t *testing.T) {
 	}
 
 	// Re-stall â†’ it warns again, proving the one-time flag re-armed.
-	lim.availMB = 50 * 1024
+	lim.availMB = DiskFloorMB - 1
 	d.shouldFetch()
 	if got := strings.Count(buf.String(), "not fetching work"); got != 2 {
 		t.Errorf("disk-gate WARN count after re-stall = %d, want 2", got)

@@ -155,6 +155,38 @@ func (c *ContainerRuntime) reapRepos(ctx context.Context, keep, repos map[string
 	}
 }
 
+// WantedImageBytes sums the on-disk bytes of every cached image belonging to a
+// repository the volunteer currently wants cached (SetWantedImages). Superseded
+// copies in those repositories are counted too — they occupy the volunteer's
+// max_disk_gb allowance until the reaper reclaims them, so an honest usage
+// figure must include them (TB-24). Returns ok=false when the wanted set is not
+// installed or the engine cannot be listed: unknown, never zero.
+func (c *ContainerRuntime) WantedImageBytes(ctx context.Context) (int64, bool) {
+	if c.wantedImages == nil {
+		return 0, false
+	}
+	repos := make(map[string]bool)
+	for _, ref := range c.wantedImages() {
+		if repo := repoFromImageRef(ref); repo != "" {
+			repos[repo] = true
+		}
+	}
+	if len(repos) == 0 {
+		return 0, true // no container leaf enabled: known-zero image usage
+	}
+	images, err := c.dockerClient.ImageList(ctx)
+	if err != nil {
+		return 0, false
+	}
+	var total int64
+	for _, img := range images {
+		if _, ok := matchRepo(img, repos); ok {
+			total += img.Size
+		}
+	}
+	return total, true
+}
+
 // matchRepo returns the repository from repos that img belongs to, and whether
 // any matched.
 func matchRepo(img ImageSummary, repos map[string]bool) (string, bool) {

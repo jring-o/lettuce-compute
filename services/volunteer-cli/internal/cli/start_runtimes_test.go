@@ -33,10 +33,10 @@ func TestAdvertisedRuntimes_UppercasesSortsAndReflectsRegistry(t *testing.T) {
 // (ServerConfig.TrustedRuntimes contains NATIVE — chosen at attach). No trusted head
 // builds wasm but NOT native, so native is never advertised and a native (or empty) work
 // unit is refused downstream. The test would fail on a build that registered native
-// unconditionally, gated it on the legacy global allow_native_runtime, or gated it on
-// available_runtimes membership. (The R1 upgrade-safety property — an upgraded pre-release
-// config must not silently gain native — is now enforced by config.Load's migration and is
-// covered by TestMigrateServerRuntimeTrust in the config package.)
+// unconditionally or gated it on anything but per-head trust. (The retired global keys
+// available_runtimes / allow_native_runtime no longer exist to key on — TB-25/TQ-22 —
+// and config.Load pins a nil trusted_runtimes to WASM-only, covered by
+// TestMigrateServerRuntimeTrust in the config package.)
 func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
@@ -50,20 +50,6 @@ func TestBuildRuntimeRegistry_NativeGate(t *testing.T) {
 	}
 	if regOff.GetRuntime("wasm") == nil {
 		t.Error("wasm must always be registered")
-	}
-
-	// The gate must NOT key on the legacy global flags: even with the old available_runtimes
-	// listing NATIVE and allow_native_runtime true, native stays off unless a HEAD trusts it.
-	// (Migration turns the old globals into per-head trust in Load; buildRuntimeRegistry itself
-	// looks only at per-head trust.)
-	legacy := config.Defaults()
-	legacy.DataDir = t.TempDir()
-	legacy.AvailableRuntimes = []string{"NATIVE", "WASM"}
-	legacy.AllowNativeRuntime = true
-	legacy.Servers = []config.ServerConfig{{GRPCAddress: "h1:443"}} // no head trusts NATIVE
-	regLegacy, _ := buildRuntimeRegistry(legacy, logger)
-	if regLegacy.GetRuntime("native") != nil {
-		t.Error("native must NOT be built from the legacy global flags; only a head's TrustedRuntimes grants it")
 	}
 
 	// Native ON: a head is explicitly trusted for NATIVE (the attach-time opt-in).

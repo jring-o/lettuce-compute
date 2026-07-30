@@ -118,8 +118,9 @@ func TestDuplicateMerge_ExplicitTrustIntersects(t *testing.T) {
 	}
 }
 
-// Control: two legacy duplicates with no trusted_runtimes key anywhere must
-// still take the migration seed, exactly as a single legacy entry would.
+// Control: two legacy duplicates with no trusted_runtimes key anywhere take the
+// migration pin, exactly as a single legacy entry would — WASM-only, never a
+// grant conjured from the retired available_runtimes key (TB-25).
 func TestDuplicateMerge_BothLegacyStillMigrates(t *testing.T) {
 	cfg := loadTrustMergeConfig(t,
 		"available_runtimes: [WASM, CONTAINER]",
@@ -134,8 +135,11 @@ func TestDuplicateMerge_BothLegacyStillMigrates(t *testing.T) {
 		t.Fatalf("servers = %d, want 1", len(cfg.Servers))
 	}
 	srv := cfg.Servers[0]
-	if !srv.TrustsRuntime("CONTAINER") {
-		t.Errorf("legacy duplicates (no trusted_runtimes key) must still migrate from "+
-			"available_runtimes; trusted = %v", srv.EffectiveTrustedRuntimes())
+	if srv.TrustsRuntime("CONTAINER") {
+		t.Errorf("legacy duplicates (no trusted_runtimes key) must NOT gain trust from the "+
+			"retired available_runtimes key; trusted = %v", srv.EffectiveTrustedRuntimes())
+	}
+	if srv.TrustedRuntimes == nil {
+		t.Error("merged legacy trust left nil; the migration must pin an explicit decision")
 	}
 }

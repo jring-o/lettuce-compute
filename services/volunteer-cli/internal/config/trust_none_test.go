@@ -11,9 +11,11 @@ import (
 // volunteer chose `--trust none` / `heads trust <head> none`) must survive a
 // config save/load cycle. Before the fix the empty list was dropped from the
 // file (omitempty), so the next Load could not tell it from a legacy
-// pre-per-head-trust config and re-seeded it from available_runtimes — which
-// init populates with CONTAINER on any podman/docker host — silently upgrading
-// a deliberate no-trust choice to CONTAINER trust.
+// pre-per-head-trust config and re-seeded it from the then-live global
+// available_runtimes key — which init populated with CONTAINER on any
+// podman/docker host — silently upgrading a deliberate no-trust choice to
+// CONTAINER trust. (The global key is retired now, TB-25; the explicit-empty
+// round-trip property stands on its own.)
 
 func TestExplicitTrustNone_SurvivesReload(t *testing.T) {
 	dir := t.TempDir()
@@ -21,9 +23,6 @@ func TestExplicitTrustNone_SurvivesReload(t *testing.T) {
 
 	cfg := Defaults()
 	cfg.DataDir = dir
-	// What init writes on a container-capable host — the seed source that
-	// overrode the explicit choice pre-fix.
-	cfg.AvailableRuntimes = []string{"WASM", "CONTAINER"}
 	cfg.Servers = []ServerConfig{{
 		GRPCAddress: "head1.example.com:443",
 		Name:        "head1.example.com",
@@ -51,11 +50,12 @@ func TestExplicitTrustNone_SurvivesReload(t *testing.T) {
 	}
 }
 
-// TestLegacyTrustUnset_StillMigrates is the control: a config whose server
-// entry has NO trusted_runtimes key at all (written before per-head trust
-// existed) must still be seeded from the legacy global knobs, exactly as
-// before, so an upgraded volunteer keeps its posture.
-func TestLegacyTrustUnset_StillMigrates(t *testing.T) {
+// TestLegacyTrustUnset_PinnedOnSave: a config whose server entry has NO
+// trusted_runtimes key at all (written before per-head trust existed) is pinned
+// to WASM-only on load (TB-25 — the retired global keys never grant trust), and
+// the pinned decision must be persisted explicitly on the next save so a later
+// load takes the explicit-choice path, not the migration.
+func TestLegacyTrustUnset_PinnedOnSave(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	raw := strings.Join([]string{
@@ -74,13 +74,14 @@ func TestLegacyTrustUnset_StillMigrates(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	srv := loaded.Servers[0]
-	if !srv.TrustsRuntime("CONTAINER") {
-		t.Errorf("legacy entry (no trusted_runtimes key) must migrate from available_runtimes; trusted = %v",
+	if srv.TrustsRuntime("CONTAINER") {
+		t.Errorf("legacy entry (no trusted_runtimes key) must NOT gain trust from the retired available_runtimes key; trusted = %v",
 			srv.EffectiveTrustedRuntimes())
 	}
+	if !srv.TrustsRuntime("WASM") {
+		t.Errorf("WASM must stay implicitly trusted; trusted = %v", srv.EffectiveTrustedRuntimes())
+	}
 
-	// The migration result must be pinned explicitly on the next save so a later
-	// load takes the explicit-choice path, not the migration.
 	if err := loaded.Save(path); err != nil {
 		t.Fatalf("Save after migration: %v", err)
 	}
@@ -89,6 +90,6 @@ func TestLegacyTrustUnset_StillMigrates(t *testing.T) {
 		t.Fatalf("read saved config: %v", err)
 	}
 	if !strings.Contains(string(data), "trusted_runtimes") {
-		t.Error("migrated trust was not persisted explicitly on save")
+		t.Error("pinned trust was not persisted explicitly on save")
 	}
 }
