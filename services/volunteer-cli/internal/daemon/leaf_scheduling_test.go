@@ -17,7 +17,7 @@ func newWeightTestDaemon(servers []config.ServerConfig) *Daemon {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false
 	cfg.Servers = servers
 

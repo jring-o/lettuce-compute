@@ -16,20 +16,18 @@ import (
 // BuildRegistrationRequest assembles a RegisterVolunteerRequest from identity,
 // hardware capabilities, and config.
 //
-// availableRuntimes, when non-empty, overrides cfg.AvailableRuntimes for what we
-// advertise to the head. Callers pass the runtimes the volunteer can ACTUALLY
-// run (e.g. derived from the live runtime registry) so a box that lists
-// CONTAINER in config but has no working Docker/Podman doesn't get assigned
-// container work it can only abandon. When empty, falls back to config.
+// availableRuntimes is what we advertise to the head. Callers pass the runtimes
+// the volunteer can ACTUALLY run — derived from the live runtime registry and
+// per-head trust — so a box with no working Docker/Podman never gets assigned
+// container work it can only abandon. There is no config fallback: the retired
+// available_runtimes key was an install-time record the daemon itself never
+// consulted (TB-25), so advertising it would advertise a guess.
 //
 // hostID is the SERVER-ISSUED id this machine previously received from THIS head
 // (echoed so the head refreshes the same hosts row), or empty to ask the head to mint
 // one. Host identity is head-minted only (BG-25); clients never generate it.
 func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
 	runtimes := availableRuntimes
-	if len(runtimes) == 0 {
-		runtimes = cfg.AvailableRuntimes
-	}
 	hostname, _ := os.Hostname()
 	return &lettucev1.RegisterVolunteerRequest{
 		PublicKey:         pub,
@@ -56,8 +54,8 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev
 // host-less until a later register mints one. store may be nil (the flow then runs
 // host-less and persists nothing).
 //
-// availableRuntimes (optional) advertises the runtimes actually available rather
-// than cfg.AvailableRuntimes — see BuildRegistrationRequest.
+// availableRuntimes advertises the runtimes actually available on this machine
+// for this head — see BuildRegistrationRequest.
 //
 // Returns the account's volunteer id, whether this was a new registration, and the
 // head-issued host id (possibly empty).

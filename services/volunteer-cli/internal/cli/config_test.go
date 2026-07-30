@@ -376,8 +376,9 @@ func TestInitWithServerHost(t *testing.T) {
 
 	go func() {
 		// cpu, memory, disk, scheduling mode, leaf mode,
-		// enable container tasks, enable thermal protection = 7 defaults
-		for i := 0; i < 7; i++ {
+		// enable thermal protection = 6 defaults (the container step detects,
+		// it no longer prompts — TB-25)
+		for i := 0; i < 6; i++ {
 			w.Write([]byte("\n"))
 		}
 		// server host with port
@@ -592,8 +593,9 @@ func TestInitWithServerHostNoPort(t *testing.T) {
 
 	go func() {
 		// cpu, memory, disk, scheduling mode, leaf mode,
-		// enable container tasks, enable thermal protection = 7 defaults
-		for i := 0; i < 7; i++ {
+		// enable thermal protection = 6 defaults (the container step detects,
+		// it no longer prompts — TB-25)
+		for i := 0; i < 6; i++ {
 			w.Write([]byte("\n"))
 		}
 		// server host without port — should default to :9090

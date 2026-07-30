@@ -237,11 +237,32 @@ func (m *mockRuntime) getCleanupCalls() int {
 }
 
 // newTestDaemon creates a Daemon with mock client and runtime, using fast backoffs for tests.
+// testDataDir returns the test daemons' shared data dir: one fresh directory
+// per test process — never the OS temp root itself. Fresh, because the disk
+// gate measures Lettuce's usage by walking the data dir (TB-24) and walking
+// the machine's whole temp tree is slow and nondeterministic under test.
+// SHARED (not per-test), because NewDaemon caches the CPU benchmark to a file
+// in the data dir — a fresh dir per daemon re-runs the multi-second benchmark
+// for every constructed test daemon, exactly as sharing os.TempDir() avoided.
+var testDataDirOnce sync.Once
+var testDataDirPath string
+
+func testDataDir() string {
+	testDataDirOnce.Do(func() {
+		if dir, err := os.MkdirTemp("", "lettuce-daemon-test"); err == nil {
+			testDataDirPath = dir
+		} else {
+			testDataDirPath = os.TempDir()
+		}
+	})
+	return testDataDirPath
+}
+
 func newTestDaemon(mc *mockClient, mr *mockRuntime) *Daemon {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false
 
 	d := NewDaemon(DaemonConfig{
@@ -954,7 +975,7 @@ func newTestDaemonWithResources(mc *mockClient, mr *mockRuntime, limiter resourc
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false
 
 	d := NewDaemon(DaemonConfig{
@@ -1072,7 +1093,7 @@ func TestDaemonLeafPreferences_Specific(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Leafs.Mode = "SPECIFIC"
 	cfg.Leafs.LeafIDs = []string{"proj-a", "proj-b"}
 
@@ -1115,7 +1136,7 @@ func TestDaemonLeafPreferences_Blocklist(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Leafs.Mode = "BLOCKLIST"
 	cfg.Leafs.BlockedIDs = []string{"proj-blocked"}
 

@@ -24,7 +24,7 @@ func newFetcherTestDaemon(servers []*ServerConnection) *Daemon {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false
 
 	mr := &mockRuntime{canHandle: true}

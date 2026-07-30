@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -30,15 +31,6 @@ func TestDefaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("default LogLevel = %q, want info", cfg.LogLevel)
 	}
-	// BG-12: WASM is the confined default; NATIVE is no longer a default runtime.
-	if len(cfg.AvailableRuntimes) != 1 || cfg.AvailableRuntimes[0] != "WASM" {
-		t.Errorf("default runtimes = %v, want [WASM]", cfg.AvailableRuntimes)
-	}
-	// BG-12: native must be OFF by default. The zero value governs so that an
-	// upgraded config with no allow_native_runtime key also lands native-off.
-	if cfg.AllowNativeRuntime {
-		t.Error("default AllowNativeRuntime = true, want false (native must be opt-in)")
-	}
 	if cfg.ResourceLimits.MaxGPUVRAMPct != 50 {
 		t.Errorf("default MaxGPUVRAMPct = %d, want 50", cfg.ResourceLimits.MaxGPUVRAMPct)
 	}
@@ -47,68 +39,15 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-// TestUpgradedConfigLeavesNativeOff is the BG-12 / design re-review R1 regression:
-// a volunteer whose on-disk config predates this release still lists NATIVE in
-// available_runtimes and has NO allow_native_runtime key. Loading it must leave
-// AllowNativeRuntime false (native OFF after `lettuce-volunteer update`), because
-// Load starts from Defaults() — where the bool is absent, hence false — and an
-// absent scalar key does not override it. A build that instead gated native on
-// available_runtimes membership would treat this same config as native-ON; that is
-// the exact regression this test guards against.
-func TestUpgradedConfigLeavesNativeOff(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	// Pre-release config body: NATIVE present in available_runtimes, no
-	// allow_native_runtime key anywhere.
-	preRelease := "available_runtimes:\n  - NATIVE\n  - WASM\n"
-	if err := os.WriteFile(path, []byte(preRelease), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.AllowNativeRuntime {
-		t.Fatal("upgraded pre-release config yielded AllowNativeRuntime=true; native must be OFF unless allow_native_runtime is explicitly set")
-	}
-	// The persisted available_runtimes still round-trips (it is not stripped),
-	// proving the native gate does NOT — and must not — key on this field.
-	foundNative := false
-	for _, r := range cfg.AvailableRuntimes {
-		if r == "NATIVE" {
-			foundNative = true
-		}
-	}
-	if !foundNative {
-		t.Error("expected persisted available_runtimes to still contain NATIVE (the gate must not depend on it)")
-	}
-}
-
-// TestExplicitOptInEnablesNative is the positive half of R1: allow_native_runtime:
-// true in the on-disk config loads as AllowNativeRuntime true.
-func TestExplicitOptInEnablesNative(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(path, []byte("allow_native_runtime: true\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if !cfg.AllowNativeRuntime {
-		t.Fatal("allow_native_runtime: true did not load as AllowNativeRuntime=true")
-	}
-}
-
-// TestMigrateServerRuntimeTrust covers the per-head-trust migration that runs in Load: a
-// config written before per-head trust existed backfills each server's TrustedRuntimes from
-// the legacy global available_runtimes / allow_native_runtime, so an upgraded volunteer
-// keeps EXACTLY today's posture — and NATIVE never appears from available_runtimes
-// membership alone (design re-review R1). A server that already carries an explicit
-// trusted_runtimes list is left untouched.
+// TestMigrateServerRuntimeTrust is the TB-25 / TQ-22 regression for the trust
+// migration that runs in Load. The retired global keys available_runtimes and
+// allow_native_runtime must have NO influence on per-head trust: a server entry
+// with no recorded trust decision (nil trusted_runtimes) is pinned to the
+// explicit WASM-only empty list — never seeded from the retired keys, which
+// used to silently grant CONTAINER (or NATIVE) trust the volunteer never chose
+// for that head (the DA-3 consent gap). An entry that carries an explicit
+// trusted_runtimes list — including the deliberate empty "WASM only" — is left
+// untouched (PB-28).
 func TestMigrateServerRuntimeTrust(t *testing.T) {
 	cases := []struct {
 		name                           string
@@ -116,24 +55,29 @@ func TestMigrateServerRuntimeTrust(t *testing.T) {
 		wantNative, wantCont, wantWasm bool
 	}{
 		{
-			name:       "R1 upgrade: NATIVE in available_runtimes, no allow_native_runtime -> native OFF",
-			yaml:       "servers:\n  - grpc_address: h1:443\navailable_runtimes:\n  - NATIVE\n  - WASM\n",
+			name:       "TB-25: retired available_runtimes CONTAINER must not seed trust",
+			yaml:       "servers:\n  - grpc_address: h1:443\navailable_runtimes:\n  - WASM\n  - CONTAINER\n",
 			wantNative: false, wantCont: false, wantWasm: true,
 		},
 		{
-			name:       "preserve global native-on: allow_native_runtime true -> native trusted per head",
+			name:       "TQ-22: retired allow_native_runtime true must not seed trust",
 			yaml:       "servers:\n  - grpc_address: h1:443\nallow_native_runtime: true\n",
-			wantNative: true, wantCont: false, wantWasm: true,
+			wantNative: false, wantCont: false, wantWasm: true,
 		},
 		{
-			name:       "container carried over from legacy available_runtimes",
-			yaml:       "servers:\n  - grpc_address: h1:443\navailable_runtimes:\n  - WASM\n  - CONTAINER\n",
-			wantNative: false, wantCont: true, wantWasm: true,
+			name:       "no recorded decision, no legacy keys -> WASM only",
+			yaml:       "servers:\n  - grpc_address: h1:443\n",
+			wantNative: false, wantCont: false, wantWasm: true,
 		},
 		{
-			name:       "explicit per-head trusted_runtimes wins over legacy globals",
+			name:       "explicit per-head trusted_runtimes preserved",
 			yaml:       "servers:\n  - grpc_address: h1:443\n    trusted_runtimes:\n      - CONTAINER\nallow_native_runtime: true\n",
 			wantNative: false, wantCont: true, wantWasm: true,
+		},
+		{
+			name:       "explicit empty trusted_runtimes preserved (PB-28)",
+			yaml:       "servers:\n  - grpc_address: h1:443\n    trusted_runtimes: []\navailable_runtimes:\n  - CONTAINER\n",
+			wantNative: false, wantCont: false, wantWasm: true,
 		},
 	}
 	for _, tc := range cases {
@@ -159,7 +103,38 @@ func TestMigrateServerRuntimeTrust(t *testing.T) {
 			if got := s.TrustsRuntime("WASM"); got != tc.wantWasm {
 				t.Errorf("TrustsRuntime(WASM) = %v, want %v (WASM is always trusted)", got, tc.wantWasm)
 			}
+			// The migration must pin the decision explicitly (non-nil), so a later
+			// Save records it and never re-asks.
+			if s.TrustedRuntimes == nil {
+				t.Error("TrustedRuntimes left nil; the migration must pin an explicit decision")
+			}
 		})
+	}
+}
+
+// TestRetiredRuntimeKeysWarned: an old config still carrying the retired
+// available_runtimes / allow_native_runtime keys must load cleanly AND tell the
+// volunteer the keys are dead (TB-25's testers hand-edited these keys precisely
+// because nothing said they had stopped mattering).
+func TestRetiredRuntimeKeysWarned(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "available_runtimes:\n  - WASM\n  - CONTAINER\nallow_native_runtime: true\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	warnings := strings.Join(cfg.DeprecatedKeyWarnings(), "\n")
+	if !strings.Contains(warnings, "available_runtimes") {
+		t.Errorf("expected a deprecation warning naming available_runtimes; got:\n%s", warnings)
+	}
+	if !strings.Contains(warnings, "allow_native_runtime") {
+		t.Errorf("expected a deprecation warning naming allow_native_runtime; got:\n%s", warnings)
+	}
+	if !strings.Contains(warnings, "heads trust") {
+		t.Errorf("expected the warnings to name the real mechanism (heads trust); got:\n%s", warnings)
 	}
 }
 

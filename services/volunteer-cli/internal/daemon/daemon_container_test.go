@@ -22,7 +22,7 @@ func newContainerTestDaemon(mc *mockClient, registry *RuntimeRegistry) *Daemon {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false // disable thermal for most tests
 
 	d := NewDaemon(DaemonConfig{
@@ -267,7 +267,7 @@ func TestF16_ThermalPauseResume(t *testing.T) {
 
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	cfg := config.Defaults()
-	cfg.DataDir = os.TempDir()
+	cfg.DataDir = testDataDir()
 	cfg.Thermal.Enabled = false // thermal monitor goroutine stays off; we test via thermalPauseCh directly
 
 	d := NewDaemon(DaemonConfig{

@@ -84,7 +84,7 @@ func TestInitScheduledWritesAWindowNotACronExpression(t *testing.T) {
 		"", "", "", // cpu, memory, disk
 		"scheduled",                 // scheduling mode
 		"19:00", "07:00", "mon-fri", // the window
-		"", "", "", "", // leaf mode, container, thermal, server host (skip)
+		"", "", "", // leaf mode, thermal, server host (skip)
 	})
 
 	if loaded.Scheduling.Mode != "SCHEDULED" {
@@ -121,7 +121,7 @@ func TestInitScheduledRejectsAnUnparseableWindowAndReasks(t *testing.T) {
 		"scheduled",
 		"--from 06:00", "04:00", "mon-fri", // the tester's shape of answer: refused
 		"20:00", "06:00", "sat,sun", // second attempt: accepted
-		"", "", "", "",
+		"", "", "",
 	})
 
 	if !strings.Contains(out, "try that again") {
@@ -152,7 +152,6 @@ func TestInitAttachedHeadGetsTheTrustConsent(t *testing.T) {
 		"", "", "", // cpu, memory, disk
 		"",                 // scheduling mode -> always
 		"",                 // leaf mode
-		"y",                // enable container tasks
 		"",                 // thermal
 		"head.example.com", // server host
 		"y",                // trust: CONTAINER
@@ -181,7 +180,7 @@ func TestInitAttachedHeadDecliningTrustIsToldWhereToChangeIt(t *testing.T) {
 
 	loaded, out := runInteractiveInit(t, dir, []string{
 		"", "", "",
-		"", "", "y", "",
+		"", "", "",
 		"head.example.com",
 		"n", // trust: no CONTAINER
 		"n", // trust: no NATIVE
@@ -190,8 +189,8 @@ func TestInitAttachedHeadDecliningTrustIsToldWhereToChangeIt(t *testing.T) {
 	if got := loaded.Servers[0].TrustedRuntimes; len(got) != 0 {
 		t.Errorf("trusted_runtimes = %v, want the empty (WASM-only) choice", got)
 	}
-	// Non-nil, so a later load does not treat the choice as a legacy blank and
-	// re-seed it from available_runtimes (PB-28).
+	// Non-nil, so a later load treats the choice as explicit rather than as a
+	// legacy blank to be re-pinned (PB-28).
 	if loaded.Servers[0].TrustedRuntimes == nil {
 		t.Error("trusted_runtimes is nil; an explicit decline must persist explicitly")
 	}

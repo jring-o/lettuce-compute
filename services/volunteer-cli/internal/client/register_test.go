@@ -21,7 +21,6 @@ func TestBuildRegistrationRequest(t *testing.T) {
 	}
 
 	cfg := config.Defaults()
-	cfg.AvailableRuntimes = []string{"NATIVE", "CONTAINER"}
 	cfg.Scheduling.Mode = "WHEN_IDLE"
 
 	hw := &lettucev1.HardwareCapabilities{
@@ -32,7 +31,7 @@ func TestBuildRegistrationRequest(t *testing.T) {
 		MaxMemoryMb:   8192,
 	}
 
-	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg)
+	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg, "NATIVE", "CONTAINER")
 
 	if len(req.PublicKey) != ed25519.PublicKeySize {
 		t.Errorf("PublicKey length = %d, want %d", len(req.PublicKey), ed25519.PublicKeySize)
@@ -57,38 +56,26 @@ func TestBuildRegistrationRequest(t *testing.T) {
 	}
 }
 
-// Explicit runtimes (what the volunteer can actually run) override the config
-// list — a box that lists CONTAINER but has no Docker/Podman advertises only
-// what's real, so the head never assigns it container work it must abandon.
-func TestBuildRegistrationRequest_ExplicitRuntimesOverrideConfig(t *testing.T) {
+// The advertised runtimes are exactly what the caller passes (derived from the
+// live runtime registry and per-head trust) — there is no config fallback, so a
+// stale config record can never be advertised as capability (TB-25).
+func TestBuildRegistrationRequest_AdvertisesExactlyWhatCallerPasses(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	cfg := config.Defaults()
-	cfg.AvailableRuntimes = []string{"NATIVE", "CONTAINER"} // config claims CONTAINER...
 
-	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg, "NATIVE", "WASM") // ...but advertise reality
-
-	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
-		t.Errorf("AvailableRuntimes = %v, want [NATIVE WASM] (explicit override wins over config)", req.AvailableRuntimes)
-	}
-}
-
-// With no explicit runtimes the request falls back to the config list, so
-// existing callers and tests keep their behavior.
-func TestBuildRegistrationRequest_EmptyRuntimesFallsBackToConfig(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	cfg := config.Defaults()
-	cfg.AvailableRuntimes = []string{"NATIVE", "WASM"}
-
-	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg) // no explicit runtimes
+	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg, "NATIVE", "WASM")
 
 	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
-		t.Errorf("AvailableRuntimes = %v, want config fallback [NATIVE WASM]", req.AvailableRuntimes)
+		t.Errorf("AvailableRuntimes = %v, want [NATIVE WASM] (exactly the caller's list)", req.AvailableRuntimes)
+	}
+
+	// No runtimes passed advertises none — never a value resurrected from config.
+	req = BuildRegistrationRequest(pub, "host-abc", nil, cfg)
+	if len(req.AvailableRuntimes) != 0 {
+		t.Errorf("AvailableRuntimes = %v, want none when the caller passes none", req.AvailableRuntimes)
 	}
 }
 
@@ -306,26 +293,6 @@ func TestRegisterConfigSaveError(t *testing.T) {
 	// The volunteer ID should still be returned even though save failed.
 	if volID != "vol-save-fail" {
 		t.Errorf("volunteerID = %q, want %q", volID, "vol-save-fail")
-	}
-}
-
-func TestBuildRegistrationRequestEmptyRuntimes(t *testing.T) {
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-
-	cfg := config.Defaults()
-	cfg.AvailableRuntimes = []string{}
-
-	hw := &lettucev1.HardwareCapabilities{
-		CpuCores: 4,
-	}
-
-	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg)
-
-	if len(req.AvailableRuntimes) != 0 {
-		t.Errorf("AvailableRuntimes length = %d, want 0", len(req.AvailableRuntimes))
 	}
 }
 

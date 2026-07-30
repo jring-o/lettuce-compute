@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +87,7 @@ func (l *pathLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	return nil
 }
 
-// --- Item 5: disk gate accounts for the cached image ---
+// --- The per-leaf disk gate (TB-24; formerly item 5's allowance-as-floor) ---
 
 func TestShouldFetch_FastPathWhenDiskAmple(t *testing.T) {
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
@@ -101,42 +102,33 @@ func TestShouldFetch_FastPathWhenDiskAmple(t *testing.T) {
 func TestShouldFetch_CachedImageRequiresOnlyWorkspace(t *testing.T) {
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
 	mc := &mockClient{}
-	// Enough for the 10 GB workspace headroom, but not the 100 GB full allowance.
+	// Enough for the bounded workspace requirement, but not the 100 GB allowance
+	// (which the gate must not demand — TB-24).
 	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, &thresholdLimiter{availMB: 50 * 1024}, scheduler)
 	d.cfg.ResourceLimits.MaxDiskGB = 100
 
-	// Register a container runtime whose image is already cached.
-	d.runtimeRegistry.Register(runtime.NewContainerRuntimeWithClient(t.TempDir(), quietLogger(), &fakeDocker{exists: true}))
-
-	// Seed the leaf cache with a leaf that uses that image.
-	mc.getHeadInfoFn = func(_ context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
-		return &lettucev1.GetHeadInfoResponse{
-			Leafs: []*lettucev1.LeafInfo{{
-				Id:            "leaf-1",
-				Slug:          "example-leaf",
-				State:         "ACTIVE",
-				ExecutionSpec: &lettucev1.ExecutionSpec{Image: "ghcr.io/example/img:1"},
-			}},
-		}, nil
-	}
-	if err := d.leafCache.Refresh(context.Background(), "default", mc); err != nil {
-		t.Fatalf("seed leaf cache: %v", err)
-	}
+	// Register a container runtime whose image is already cached, and seed a
+	// leaf using that image.
+	seedContainerLeaf(t, d, mc, &fakeDocker{exists: true}, "ghcr.io/example/img:1")
 
 	if !d.shouldFetch() {
 		t.Fatal("shouldFetch = false, want true (cached image needs only workspace headroom)")
 	}
 }
 
-func TestShouldFetch_NoCachedImageRequiresFullAllowance(t *testing.T) {
+// TestShouldFetch_AllowanceIsNotAFreeSpaceFloor pins TB-24's core repair: with
+// free space far below the max_disk_gb allowance but comfortably above what any
+// leaf actually needs, fetching proceeds. Under the old gate this exact setup
+// (50 GB free, 100 GB allowance, no cached image) blocked all fetching — the
+// allowance doubled as a free-space floor, so OFFERING more capacity to the
+// head made the volunteer's own fetches harder.
+func TestShouldFetch_AllowanceIsNotAFreeSpaceFloor(t *testing.T) {
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
-	// Below the full allowance and no container runtime registered, so no cached
-	// image can rescue the fetch.
 	d := newTestDaemonWithResources(&mockClient{}, &mockRuntime{canHandle: true}, &thresholdLimiter{availMB: 50 * 1024}, scheduler)
 	d.cfg.ResourceLimits.MaxDiskGB = 100
 
-	if d.shouldFetch() {
-		t.Fatal("shouldFetch = true, want false (no cached image, below full allowance)")
+	if !d.shouldFetch() {
+		t.Fatal("shouldFetch = false, want true — the allowance is a capacity offer, not a free-space floor (TB-24)")
 	}
 }
 
@@ -147,16 +139,27 @@ func TestShouldFetch_NoCachedImageRequiresFullAllowance(t *testing.T) {
 // image. Returns nothing; mutates d.
 func seedContainerLeaf(t *testing.T, d *Daemon, mc *mockClient, dc runtime.DockerClient, image string) {
 	t.Helper()
+	seedContainerLeafNeed(t, d, mc, dc, image, 0)
+}
+
+// seedContainerLeafNeed is seedContainerLeaf with the leaf's declared
+// min_disk_mb — the number the per-leaf disk gate compares free space against
+// (TB-24). 0 omits resource_requirements (the gate then uses the per-task
+// default need).
+func seedContainerLeafNeed(t *testing.T, d *Daemon, mc *mockClient, dc runtime.DockerClient, image string, minDiskMB int64) {
+	t.Helper()
 	d.runtimeRegistry.Register(runtime.NewContainerRuntimeWithClient(t.TempDir(), quietLogger(), dc))
+	leaf := &lettucev1.LeafInfo{
+		Id:            "leaf-1",
+		Slug:          "big-image-leaf",
+		State:         "ACTIVE",
+		ExecutionSpec: &lettucev1.ExecutionSpec{Image: image},
+	}
+	if minDiskMB > 0 {
+		leaf.ResourceRequirements = &lettucev1.LeafResourceRequirements{MinDiskMb: minDiskMB}
+	}
 	mc.getHeadInfoFn = func(_ context.Context, _ *lettucev1.GetHeadInfoRequest) (*lettucev1.GetHeadInfoResponse, error) {
-		return &lettucev1.GetHeadInfoResponse{
-			Leafs: []*lettucev1.LeafInfo{{
-				Id:            "leaf-1",
-				Slug:          "big-image-leaf",
-				State:         "ACTIVE",
-				ExecutionSpec: &lettucev1.ExecutionSpec{Image: image},
-			}},
-		}, nil
+		return &lettucev1.GetHeadInfoResponse{Leafs: []*lettucev1.LeafInfo{leaf}}, nil
 	}
 	if err := d.leafCache.Refresh(context.Background(), "default", mc); err != nil {
 		t.Fatalf("seed leaf cache: %v", err)
@@ -168,21 +171,22 @@ func seedContainerLeaf(t *testing.T, d *Daemon, mc *mockClient, dc runtime.Docke
 // Podman graphroot), NOT under the lettuce data dir. On a host with a roomy
 // data-dir volume but a small image-store volume, the old gate checked only the
 // data dir, passed, and the pull then died with ENOSPC on a filesystem it never
-// looked at. The gate must also reject when the image-store volume can't hold the
-// pull. (No cached image here, so a fresh pull is required.)
+// looked at. The gate must also reject when the image-store volume can't hold
+// the pull — sized by the LEAF's declared need, not the allowance (TB-24). (No
+// cached image here, so a fresh pull is required.)
 func TestShouldFetch_GatesImageStoreFilesystem(t *testing.T) {
 	const dataDir = "/data"
 	const storePath = "/var/lib/containers/storage"
 	scheduler := resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger())
 	mc := &mockClient{}
-	// Data dir is roomy (200 GB) but the image store is on a small volume (20 GB),
-	// below the 100 GB allowance a fresh big-image pull needs.
+	// Data dir is roomy (200 GB) but the image store is on a small volume
+	// (20 GB), below the leaf's declared 30 GB need.
 	lim := &pathLimiter{availMB: map[string]int{dataDir: 200 * 1024, storePath: 20 * 1024}}
 	d := newTestDaemonWithResources(mc, &mockRuntime{canHandle: true}, lim, scheduler)
 	d.cfg.DataDir = dataDir
 	d.cfg.ResourceLimits.MaxDiskGB = 100
 
-	seedContainerLeaf(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1")
+	seedContainerLeafNeed(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1", 30*1024)
 
 	if d.shouldFetch() {
 		t.Fatal("shouldFetch = true, want false — the image-store volume is too small to pull the image (TODO #31)")
@@ -236,7 +240,7 @@ func TestShouldFetch_GatesContainerdSnapshotterRoot(t *testing.T) {
 		storePaths:  []string{dockerRoot, containerdRoot},
 		snapshotter: true,
 	}
-	seedContainerLeaf(t, d, mc, dc, "ghcr.io/example/big:1")
+	seedContainerLeafNeed(t, d, mc, dc, "ghcr.io/example/big:1", 30*1024)
 
 	if d.shouldFetch() {
 		t.Fatal("shouldFetch = true, want false — the containerd image-store root is too small (Docker containerd snapshotter)")
@@ -265,61 +269,55 @@ func TestShouldFetch_CachedImageSkipsImageStoreGate(t *testing.T) {
 	}
 }
 
-// TestDiskGateThresholds checks the shared threshold helper the live gate and
-// the doctor preflight both consume (TODO #24).
-func TestDiskGateThresholds(t *testing.T) {
+// TestLeafDiskThresholds checks the shared per-leaf threshold helper the live
+// gate and the doctor preflight both consume (TODO #24 / TB-24). The
+// requirements derive from the LEAF's declared need — never from max_disk_gb.
+func TestLeafDiskThresholds(t *testing.T) {
 	cases := []struct {
-		maxDiskGB int
-		wantFull  int
-		wantCache int
+		name                  string
+		needMB                int64
+		isContainer, cached   bool
+		wantDataDir, wantStore int64
 	}{
-		{maxDiskGB: 20, wantFull: 20 * 1024, wantCache: cachedImageWorkspaceHeadroomMB},
-		{maxDiskGB: 10, wantFull: 10 * 1024, wantCache: cachedImageWorkspaceHeadroomMB},
-		{maxDiskGB: 0, wantFull: 1024, wantCache: cachedImageWorkspaceHeadroomMB},  // unset → 1 GB floor
-		{maxDiskGB: -5, wantFull: 1024, wantCache: cachedImageWorkspaceHeadroomMB}, // negative → 1 GB floor
-	}
-	for _, tc := range cases {
-		full, cache := DiskGateThresholds(tc.maxDiskGB)
-		if full != tc.wantFull || cache != tc.wantCache {
-			t.Errorf("DiskGateThresholds(%d) = (%d, %d), want (%d, %d)",
-				tc.maxDiskGB, full, cache, tc.wantFull, tc.wantCache)
-		}
-	}
-}
-
-// TestClassifyDiskGate verifies the shared classifier reproduces shouldFetch's
-// three-region decision: ample (always fetch), cached-only (fetch iff an image
-// is cached), and blocked. The cached-only band exists only when max_disk_gb
-// exceeds the 10 GB cached-image headroom.
-func TestClassifyDiskGate(t *testing.T) {
-	cases := []struct {
-		name        string
-		availableMB int64
-		maxDiskGB   int
-		want        DiskGateVerdict
-	}{
-		// max_disk_gb=20 (full 20 GB, headroom 10 GB) → all three bands exist.
-		{"ample_above_full", 25 * 1024, 20, DiskAmple},
-		{"ample_at_full", 20 * 1024, 20, DiskAmple},
-		{"cached_only_mid", 15 * 1024, 20, DiskCachedOnly},
-		{"cached_only_at_headroom", 10 * 1024, 20, DiskCachedOnly},
-		{"blocked_below_headroom", 10*1024 - 1, 20, DiskBlocked},
-		// max_disk_gb=10 (full == headroom) → no cached-only band.
-		{"small_ample", 10 * 1024, 10, DiskAmple},
-		{"small_blocked", 10*1024 - 1, 10, DiskBlocked},
-		// max_disk_gb=5 (full 5 GB < headroom) → cached path can't help; floor is full.
-		{"tiny_ample", 5 * 1024, 5, DiskAmple},
-		{"tiny_blocked", 5*1024 - 1, 5, DiskBlocked},
-		// Unset allowance falls back to the 1 GB floor.
-		{"unset_ample", 2048, 0, DiskAmple},
-		{"unset_blocked", 512, 0, DiskBlocked},
+		// Fresh container pull: full declared need on both volumes.
+		{"container_fresh", 15000, true, false, 15000 + DiskFloorMB, 15000 + DiskFloorMB},
+		// Cached image: workspace only (bounded by the headroom cap), no store gate.
+		{"container_cached_small", 1024, true, true, 1024 + DiskFloorMB, 0},
+		{"container_cached_big", 15000, true, true, cachedImageWorkspaceHeadroomMB + DiskFloorMB, 0},
+		// Native/wasm: declared need on the data dir only.
+		{"native", 5000, false, false, 5000 + DiskFloorMB, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ClassifyDiskGate(tc.availableMB, tc.maxDiskGB); got != tc.want {
-				t.Errorf("ClassifyDiskGate(%d, %d) = %d, want %d", tc.availableMB, tc.maxDiskGB, got, tc.want)
+			dataDir, store := LeafDiskThresholds(tc.needMB, tc.isContainer, tc.cached)
+			if dataDir != tc.wantDataDir || store != tc.wantStore {
+				t.Errorf("LeafDiskThresholds(%d, %v, %v) = (%d, %d), want (%d, %d)",
+					tc.needMB, tc.isContainer, tc.cached, dataDir, store, tc.wantDataDir, tc.wantStore)
 			}
 		})
+	}
+}
+
+// TestDiskBudgetVerdict checks the allowance budget: measured usage + the
+// leaf's incremental need must fit under max_disk_gb, and a refusal names the
+// setting (TB-24).
+func TestDiskBudgetVerdict(t *testing.T) {
+	// Within budget.
+	if ok, _ := DiskBudgetVerdict(15000, true, false, 5000, 30*1024); !ok {
+		t.Error("DiskBudgetVerdict = blocked, want ok (5000 used + 15000 need <= 30720 allowance)")
+	}
+	// Over budget: fresh need counts in full.
+	ok, reason := DiskBudgetVerdict(15000, true, false, 20000, 30*1024)
+	if ok {
+		t.Error("DiskBudgetVerdict = ok, want blocked (20000 used + 15000 need > 30720 allowance)")
+	}
+	if !strings.Contains(reason, "max_disk_gb") {
+		t.Errorf("budget refusal must name the setting; got: %s", reason)
+	}
+	// Cached image: only the (bounded) workspace is incremental — the image is
+	// already inside the measured usage.
+	if ok, _ := DiskBudgetVerdict(15000, true, true, 20000, 31*1024); !ok {
+		t.Error("DiskBudgetVerdict = blocked, want ok (cached: 20000 used + min(15000, headroom)=10240 <= 31744)")
 	}
 }
 

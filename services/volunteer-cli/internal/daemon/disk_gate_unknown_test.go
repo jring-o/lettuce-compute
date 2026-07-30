@@ -70,7 +70,8 @@ func TestShouldFetch_GenuinelyLowImageStoreStillGates(t *testing.T) {
 	d.cfg.DataDir = dataDir
 	d.cfg.ResourceLimits.MaxDiskGB = 100
 
-	seedContainerLeaf(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1")
+	// Declared need 30 GB > the store's 20 GB — determined-and-insufficient.
+	seedContainerLeafNeed(t, d, mc, &fakeDocker{exists: false, storePath: storePath}, "ghcr.io/example/big:1", 30*1024)
 
 	if d.shouldFetch() {
 		t.Fatal("shouldFetch = true, want false — a determined-and-insufficient image store must still gate")

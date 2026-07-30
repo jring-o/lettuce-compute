@@ -170,13 +170,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 		// runs more than one task when the machine genuinely has room, and the
 		// operator can raise max_concurrent_tasks explicitly if desired.
 
-		// Runtimes: WASM is the always-available sandboxed default; add CONTAINER when a
-		// Docker/Podman backend is present. NATIVE is never enabled here — it is a per-head
-		// trust opt-in chosen at `attach` (or later via `heads trust`).
-		c.AvailableRuntimes = []string{"WASM"}
+		// Container backend preference. Which runtimes actually run is decided per
+		// head (trusted_runtimes, chosen at attach or via `heads trust`) plus a live
+		// engine probe at daemon start (TB-25) — init only records which detected
+		// engine to prefer when both exist.
 		backend := detectContainerBackendFunc(rtdetect.BundledPodmanPath())
 		if backend.Backend != rtdetect.BackendNone {
-			c.AvailableRuntimes = append(c.AvailableRuntimes, "CONTAINER")
 			c.ContainerBackend = string(backend.Backend)
 		}
 
@@ -290,9 +289,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 		// Step 5: Runtimes
 		fmt.Println("\n=== Step 5: Runtimes ===")
-		// WASM is the always-available sandboxed default; CONTAINER is offered below when a
-		// backend is present. NATIVE is a per-head trust opt-in chosen at `attach`, never here.
-		c.AvailableRuntimes = []string{"WASM"}
+		// Detection only. Which runtimes actually run is decided per head — the
+		// trust consent at `attach` (or `heads trust`) plus a live engine probe at
+		// daemon start (TB-25) — so there is no enable/disable choice to record
+		// here; init just notes which detected engine to prefer when both exist.
 		fmt.Print("Checking for container runtime... ")
 		backend := detectContainerBackendFunc(rtdetect.BundledPodmanPath())
 		if backend.Backend != rtdetect.BackendNone {
@@ -301,15 +301,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 				fmt.Printf(" %s", backend.Version)
 			}
 			fmt.Println()
-			enableContainer := promptString(scanner, "Enable container tasks? [Y/n]", "y")
-			if strings.ToLower(enableContainer) != "n" && strings.ToLower(enableContainer) != "no" {
-				c.AvailableRuntimes = append(c.AvailableRuntimes, "CONTAINER")
-				c.ContainerBackend = string(backend.Backend)
-			}
+			c.ContainerBackend = string(backend.Backend)
+			fmt.Println("Container leafs can run here once you trust a head for CONTAINER (chosen at attach, or later with 'heads trust').")
 		} else {
-			fmt.Println("not found (container tasks will not be available)")
+			fmt.Println("not found (container leafs will not run on this machine; WASM always runs)")
 		}
-		fmt.Printf("Available runtimes: %s\n", strings.Join(c.AvailableRuntimes, ", "))
 
 		// Step 6: Thermal Protection
 		fmt.Println("\n=== Step 6: Thermal Protection ===")
@@ -339,7 +335,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			// The same consent `attach` gives, on the same prompt (TB-7). Container
 			// availability is the machine's real capability, exactly as at attach —
 			// trust is a per-head ceiling, and what the daemon actually advertises is
-			// that ceiling intersected with available_runtimes.
+			// that ceiling intersected with the runtimes it detects at start.
 			applyInitTrust(&sc, promptRuntimeTrust(scanner, name, containerBackendAvailable()))
 			c.Servers = []config.ServerConfig{sc}
 		}

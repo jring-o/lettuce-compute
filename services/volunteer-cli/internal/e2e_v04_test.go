@@ -183,9 +183,8 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 
 	// Host identity is head-issued (BG-25): register with an empty per-head store so the
 	// head mints an id, then present exactly that id on subsequent work requests.
-	// Advertise NATIVE explicitly: the leafs below are NATIVE, and the default
-	// advertisement (cfg.AvailableRuntimes) is WASM-only, which the head's
-	// capability matching rejects for them.
+	// Advertise NATIVE explicitly: the leafs below are NATIVE, and the advertised
+	// runtimes are exactly what the caller passes (TB-25 — no config fallback).
 	hostStore := identity.NewHostIDStore(filepath.Join(volDir, "host-ids.json"))
 	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath, "NATIVE", "WASM")
 	if err != nil {

@@ -45,8 +45,9 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 
 | Log message / symptom | Cause | Fix |
 |---|---|---|
-| `not fetching work: not enough free disk space …` (`volume=data dir`) | Free space on the data-dir volume is below your `max_disk_gb` allowance. | Free space, lower `resource_limits.max_disk_gb`, or `--data-dir` on a roomier volume. |
-| `not fetching work: not enough free disk space …` (`volume=image store`) | The container image-store volume (the `path=…` in the log) can't hold a fresh image pull, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
+| `not fetching work: disk-gated …` (`reason=…data dir…`) | Free space on the data-dir volume doesn't cover what an enabled leaf declares it needs (its disk requirement + a 2 GB floor), or is below the floor entirely. The reason names the numbers. | Free space, or `--data-dir` on a roomier volume. With several leafs enabled, only the ones that fit are fetched; this WARN fires when none fit. |
+| `not fetching work: disk-gated …` (`reason=…image store…`) | The container image-store volume (named in the reason) can't hold the fresh image pull an enabled leaf needs, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
+| `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb`. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
 | `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
@@ -111,22 +112,31 @@ ids** each head issues you (see [Running one identity on several
 machines](#running-one-identity-on-several-machines)), config, logs, and per-unit
 work files.
 
-- Before fetching any work, the daemon requires `max_disk_gb` free on **both**
-  the data-dir volume **and** the container image-store volume (where the
-  multi-GB image layers land — see ["Where container images actually
+- **What a fetch requires free is the leaf's own declared disk need, not your
+  whole allowance.** Before fetching work for a leaf whose container image is
+  not yet downloaded, the daemon checks that the leaf's declared disk
+  requirement (plus a 2 GB safety floor) is free on **both** the data-dir
+  volume **and** the container image-store volume (where the multi-GB image
+  layers land — see ["Where container images actually
   live"](#where-container-images-actually-live-vmlxc-users-read-this) below).
-  Whichever is short, the daemon stays idle and logs a one-time WARN naming that
-  volume; `lettuce-volunteer doctor` reports the free space on each. If your home
-  volume is small, point `--data-dir` at a roomier disk; if the image store is
-  small, see the remedies below.
-- **`max_disk_gb` does two jobs, and the second one surprises people.** As well as
-  the free-space gate above, it is the disk budget your client advertises to each
-  head, and a head only sends you a leaf whose declared disk requirement fits
-  inside it. So a leaf needing 15 GB is never dispatched to a volunteer allowing
-  10 GB, no matter how much space is actually free. `lettuce-volunteer doctor`
-  prints the allowance next to your memory and CPU limits and names any leaf
-  blocked this way, and `leafs list` marks it `WILL FETCH: no` with the remedy
-  underneath. Raise it with
+  A leaf whose image is already downloaded needs only workspace headroom. When
+  every enabled leaf is blocked this way the daemon stays idle and logs a
+  one-time WARN naming the numbers; with a mix, the affordable leafs keep
+  working while the too-big one is skipped. `lettuce-volunteer doctor` reports
+  free space, Lettuce's own measured usage, and — per leaf — whether a download
+  is currently gated. If your home volume is small, point `--data-dir` at a
+  roomier disk; if the image store is small, see the remedies below.
+- **`max_disk_gb` is the capacity you offer, in both directions.** It is the
+  disk budget your client advertises to each head — a head only sends you a
+  leaf whose declared disk requirement fits inside it, so a leaf needing 15 GB
+  is never dispatched to a volunteer allowing 10 GB, no matter how much space
+  is actually free. And the daemon keeps Lettuce's own footprint (work folders
+  plus downloaded container images) within the same number. Raising it to
+  qualify for a bigger leaf is safe: it does **not** raise what must be free
+  (that is always the leaf's own requirement, above). `lettuce-volunteer
+  doctor` prints the allowance next to your memory and CPU limits and names any
+  leaf blocked by it, and `leafs list` marks it `WILL FETCH: no` with the
+  remedy underneath. Raise it with
   `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
   daemon, which is when the new figure is re-advertised.
 - **`max_gpu_vram_pct` is the same kind of trap, and sharper, because it is a
@@ -198,13 +208,11 @@ the container runtime's store:
   image, which misleads people hunting for it. To put images on a big/separate
   volume, mount the **actual** store path (`docker info` → "Docker Root Dir" /
   the containerd root), or switch Docker to the `overlay2` driver.
-- Set `max_disk_gb` **below the volume's *reported* free space** — a "64 GB"
-  loopback/btrfs volume reports only ~60.6 GB free when empty, so a 60 GB setting
-  can fail on an empty disk.
 - The daemon checks free space on **this store volume** before fetching a
-  container leaf — not just the data dir — so a roomy `~/.lettuce` no longer lets
-  a too-small image store sail through the gate and then fail mid-pull with "no
-  space left on device". It is **containerd-snapshotter aware**: when `docker
+  container leaf whose image needs downloading — not just the data dir — sized
+  by that **leaf's declared disk requirement** (never your whole `max_disk_gb`),
+  so a roomy `~/.lettuce` no longer lets a too-small image store sail through
+  the gate and then fail mid-pull with "no space left on device". It is **containerd-snapshotter aware**: when `docker
   info` reports `driver-type: io.containerd.snapshotter.v1`, the daemon also
   checks the containerd root (default `/var/lib/containerd`) — where the blobs and
   snapshots actually land — rather than trusting "Docker Root Dir", which on such
