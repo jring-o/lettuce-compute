@@ -315,6 +315,13 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   instead of a trickle of tiny requests — your buffer fills to its
   `work_buffer_hours` target and your CPUs stay busy between polls. You don't
   configure this; longer-unit leafs are simply requested fewer at a time.
+- **Buffered units start first-fit, not strictly first-fetched.** A free slot
+  takes the oldest buffered unit that fits in the memory you've allowed
+  (`resource_limits.max_memory_mb`). If the oldest unit needs more memory than
+  is currently free, smaller units behind it start instead of the slot sitting
+  idle — the waiting unit logs a single `waiting for capacity` line, keeps its
+  place in line, and only a bounded number of units may jump it before the
+  volunteer holds the queue so it can run.
 - **Buffered work is reserved, not heartbeated.** There are no per-task
   keep-alive messages. When you fetch a unit the head reserves it for you for a
   bounded window; while it sits in your buffer the head won't hand that same unit

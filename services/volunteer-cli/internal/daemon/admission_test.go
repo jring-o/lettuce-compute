@@ -23,18 +23,18 @@ func TestCanAccommodateWU_FreeRAM(t *testing.T) {
 	freeSystemMemoryMB = func() (int, bool) { return 10000, true }
 
 	// 8000 MB WU + 512 headroom = 8512 <= 10000 free → fits.
-	if !d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 8000}}) {
+	if ok, _ := d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 8000}}); !ok {
 		t.Error("should accommodate 8000MB WU with 10000MB free")
 	}
 
 	// 10000 MB WU + 512 headroom = 10512 > 10000 free → reject.
-	if d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 10000}}) {
+	if ok, _ := d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 10000}}); ok {
 		t.Error("should NOT accommodate 10000MB WU when only 10000MB is free (headroom)")
 	}
 
 	// When free RAM is unknown, the real-RAM check is skipped.
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
-	if !d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 999999}}) {
+	if ok, _ := d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 999999}}); !ok {
 		t.Error("should accommodate when free RAM is unknown and no budget is configured")
 	}
 }
@@ -53,7 +53,7 @@ func TestCanAccommodateWU_GPUExclusivity(t *testing.T) {
 	if d.slotManager.ActiveGPUCount() != 0 {
 		t.Fatalf("ActiveGPUCount = %d, want 0", d.slotManager.ActiveGPUCount())
 	}
-	if !d.canAccommodateWU(gpuWU) {
+	if ok, _ := d.canAccommodateWU(gpuWU); !ok {
 		t.Fatal("should accommodate first GPU WU with 1 GPU and 0 active")
 	}
 
@@ -84,13 +84,13 @@ func TestCanAccommodateWU_GPUExclusivity(t *testing.T) {
 	}
 
 	// The single GPU is busy → a second GPU WU is refused.
-	if d.canAccommodateWU(gpuWU) {
+	if ok, _ := d.canAccommodateWU(gpuWU); ok {
 		t.Error("should NOT accommodate a second GPU WU when the only GPU is busy")
 	}
 
 	// A non-GPU WU is unaffected by GPU exclusivity.
 	cpuWU := &runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{GPURequired: false}}
-	if !d.canAccommodateWU(cpuWU) {
+	if ok, _ := d.canAccommodateWU(cpuWU); !ok {
 		t.Error("should accommodate a non-GPU WU regardless of GPU occupancy")
 	}
 
