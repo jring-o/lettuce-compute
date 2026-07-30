@@ -2391,7 +2391,9 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	// Per-copy dispatch: abandoning a unit just closes THIS volunteer's live copy
 	// (RESERVED or RUNNING) as ABANDONED. The work unit stays QUEUED and redispatches
 	// a fresh copy to a distinct volunteer — no per-unit expire/reassign, no cap.
-	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(assignment.OutcomeAbandoned), nil); cerr != nil {
+	// The client's reason text is persisted on the row (TB-27): it carries the failing
+	// process's output tail, and the log line below is the only other copy.
+	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(assignment.OutcomeAbandoned), nil, req.Reason); cerr != nil {
 		if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
 			if hadInMemHold {
 				// The volunteer DID hold this unit, but its reservation never became

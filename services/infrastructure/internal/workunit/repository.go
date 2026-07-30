@@ -198,8 +198,10 @@ type WorkUnitRepository interface {
 	CloseCopy(ctx context.Context, copyID types.ID, outcome string) error
 
 	// CloseCopyByVolunteer closes a volunteer's live copy of a unit with the given
-	// outcome (submit/abandon). Returns apierror.Conflict if no live copy exists.
-	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID) error
+	// outcome (submit/abandon). reason is the client's failure text, persisted on the
+	// row for head-side forensics (TB-27); empty stores NULL. Returns
+	// apierror.Conflict if no live copy exists.
+	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error
 
 	// ExpireLiveCopies closes ALL live copies of a unit with the given outcome
 	// (operator manual-requeue). Returns how many were closed.

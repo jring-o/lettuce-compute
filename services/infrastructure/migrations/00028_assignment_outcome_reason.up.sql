@@ -1,0 +1,15 @@
+-- 00028_assignment_outcome_reason.up.sql
+-- Persist the abandon reason on the copy row (TB-27).
+--
+-- A volunteer abandoning a copy sends a reason string that since v0.10.3 carries the
+-- failing process's own output tail — collected precisely so the head alone could
+-- diagnose a broken leaf. The head logged that string once and discarded it: after log
+-- rotation (or a container recreate, which is every upgrade) the answer to "what
+-- failed?" existed only in volunteer-submitted logs. A nullable text column on the
+-- assignment history row keeps it where the outcome already lives, turning head-side
+-- failure forensics into a SELECT.
+--
+-- Additive and instant (nullable, no default, no table rewrite); no code rolls back
+-- unsafely against it. Only the abandon path writes it today — EXPIRED closes are
+-- head-decided timeouts with no client text, so their rows stay NULL.
+ALTER TABLE work_unit_assignment_history ADD COLUMN outcome_reason TEXT;

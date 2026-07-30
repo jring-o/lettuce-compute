@@ -1169,11 +1169,11 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			c.logger.Debug("hand-out empty: reject tally", attrs...)
 		}
 	}
-	// TB-13 / TB-21: a machine handed nothing for a reason INVISIBLE TO IT gets a WARN,
-	// throttled per machine, with the full tally so the mix is visible. At the client every
-	// such refusal looks identical — an empty response — and on a production head the tally
-	// above is Debug-only, so these left no trace at all and explaining one took a database
-	// session. Two reasons qualify:
+	// TB-13 / TB-21 / TB-27: a machine handed nothing for a reason INVISIBLE TO IT gets a
+	// WARN, throttled per machine, with the full tally so the mix is visible. At the client
+	// every such refusal looks identical — an empty response — and on a production head the
+	// tally above is Debug-only, so these left no trace at all and explaining one took a
+	// database session. Four reasons qualify:
 	//
 	//   in-flight cap (TB-13)       — starved by work it is already charged for, or by stale
 	//                                 claims it never returned; not an empty queue.
@@ -1181,12 +1181,18 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	//                                 check. Disk and cores reach it only from a TB-15+ head,
 	//                                 the three GPU dimensions only from a TB-21+ head, and an
 	//                                 older client checks none of them however new the head is.
+	//   benched / already-contributed (TB-27) — every ready unit refuses this ACCOUNT
+	//                                 specifically: a recent failed copy benches it, or it
+	//                                 already contributed a result. On a small fleet this is
+	//                                 how a stranded unit presents, and it ran 10+ hours with
+	//                                 zero head-side signal before this arm existed.
 	//
 	// The machine's advertised budgets are logged alongside, because the whole diagnostic is
 	// "which of these is below what some leaf asked for" and reading them out of the database
 	// was the expensive half.
 	if taken == 0 && c.noteStarved(hostKey) &&
-		(rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0) {
+		(rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0 ||
+			rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0) {
 		attrs := make([]any, 0, 14+2*numRejectReasons)
 		attrs = append(attrs,
 			"volunteer_id", volunteerID,
@@ -1212,11 +1218,17 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 				attrs = append(attrs, "refused_"+r.String(), rejects[r])
 			}
 		}
-		msg := "no work handed out: machine is at its own in-flight cap " +
-			"(copies it already holds, or stale claims it never returned)"
-		if rejects[rejectInflightCap] == 0 {
+		var msg string
+		switch {
+		case rejects[rejectInflightCap] > 0:
+			msg = "no work handed out: machine is at its own in-flight cap " +
+				"(copies it already holds, or stale claims it never returned)"
+		case rejects[rejectCapabilityMismatch] > 0:
 			msg = "no work handed out: no leaf fits this machine's advertised capabilities " +
 				"(compare the budgets logged here against the leafs' resource_requirements)"
+		default:
+			msg = "no work handed out: every ready unit refuses this account specifically " +
+				"(a recent failed copy benches it, or it already contributed a result — see the refused_* tally)"
 		}
 		c.logger.Warn(msg, attrs...)
 	}
@@ -1440,12 +1452,19 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// while its window is live, and even then it yields once the fallback grace has passed
 	// with the unit still uncovered (zero live coverage — nobody fresh took it), mirroring
 	// the SQL cooldown gate so the in-memory snapshot can never out-live it and strand a
-	// small pool. The exhaustion mirror is conservative on purpose: dbActiveCount folds in
-	// PENDING results the SQL fallback ignores, so this arm may keep refusing where the SQL
-	// would already admit — bounded by `until`, never past the SQL cooldown's own window.
+	// small pool. Exhaustion is judged on the in-memory holders ONLY — never on
+	// dbActiveCount, a refill-time snapshot that is not refreshed while the candidate
+	// stays staged (rejected candidates stay in ready and refill excludes staged ids), so
+	// folding it in froze `exhausted` at its staging-time value and turned the fallback
+	// grace into the full leaf deadline for every benched account (TB-26). The holders-only
+	// arm can err ADMITTING (the unit may still hold live coverage this replica did not
+	// hand out, or a PENDING result), but the SQL landing re-checks the cooldown
+	// authoritatively — a wrong admit costs one voided hand-out and a voidBenchTTL
+	// re-bench, the same self-correction the trust-score staleness above relies on. Erring
+	// the other way has no correction: the refused request never reaches the SQL.
 	if e, benched := cand.benched[volunteerID]; benched {
 		now := c.now()
-		exhausted := cand.dbActiveCount+len(holders) == 0 && now.After(e.fallbackAt)
+		exhausted := len(holders) == 0 && now.After(e.fallbackAt)
 		if now.Before(e.until) && !exhausted {
 			return false, rejectBenched
 		}

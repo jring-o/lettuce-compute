@@ -42,7 +42,7 @@ func TestFindNextAssignable_GracefulBufferReturnNotBenched(t *testing.T) {
 	}
 	// volA gracefully abandons the un-started buffered copy (restart / shutdown path):
 	// closed ABANDONED, started_at still NULL.
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil); err != nil {
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
@@ -72,7 +72,7 @@ func TestReserveCopy_GracefulBufferReturnNotBenched(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil); err != nil {
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
@@ -98,7 +98,7 @@ func TestFlushReservations_GracefulBufferReturnLands(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil); err != nil {
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
@@ -132,7 +132,7 @@ func TestFindDispatchableBatch_GracefulBufferReturnNotBenched(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil); err != nil {
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
@@ -180,7 +180,7 @@ func TestReserveCopy_StartedThenAbandonStillBenched(t *testing.T) {
 	if _, err := repo.Assign(ctx, wu.ID, volA); err != nil {
 		t.Fatalf("run-start volA copy: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil); err != nil {
+	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
