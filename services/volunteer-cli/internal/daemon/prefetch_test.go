@@ -167,6 +167,71 @@ func TestPreFetchQueue_Clear(t *testing.T) {
 	}
 }
 
+func TestPreFetchQueue_PopFit_FirstFitPreservesOrder(t *testing.T) {
+	q := NewPreFetchQueue(5, newTestLogger())
+
+	itemA := newMockPreFetchItem("wu-a", 100, time.Now())
+	itemB := newMockPreFetchItem("wu-b", 100, time.Now())
+	itemC := newMockPreFetchItem("wu-c", 100, time.Now())
+	q.Push(itemA)
+	q.Push(itemB)
+	q.Push(itemC)
+
+	// A does not fit — the first fitting item (B) is selected past it.
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID != "wu-a" })
+	if got == nil || got.WU.ID != "wu-b" {
+		t.Fatalf("PopFit = %v, want wu-b", got)
+	}
+
+	// The rest stay in place, in order, and only the jumped item is counted.
+	items := q.Items()
+	if len(items) != 2 || items[0].WU.ID != "wu-a" || items[1].WU.ID != "wu-c" {
+		t.Errorf("remaining queue = %v, want [wu-a, wu-c]", items)
+	}
+	if itemA.TimesSkipped != 1 {
+		t.Errorf("itemA.TimesSkipped = %d, want 1", itemA.TimesSkipped)
+	}
+	if itemC.TimesSkipped != 0 {
+		t.Errorf("itemC.TimesSkipped = %d, want 0 (items behind the pick are not skipped)", itemC.TimesSkipped)
+	}
+}
+
+func TestPreFetchQueue_PopFit_StarvationGuard(t *testing.T) {
+	q := NewPreFetchQueue(5, newTestLogger())
+
+	head := newMockPreFetchItem("wu-head", 100, time.Now())
+	head.TimesSkipped = maxBackfillStarts
+	small := newMockPreFetchItem("wu-small", 100, time.Now())
+	q.Push(head)
+	q.Push(small)
+
+	// The head has been jumped maxBackfillStarts times: nothing behind it may
+	// start, even though it fits, so running work drains and the head recovers.
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-small" })
+	if got != nil {
+		t.Fatalf("PopFit = %v, want nil once the head hit the backfill cap", got.WU.ID)
+	}
+	if q.Len() != 2 {
+		t.Errorf("len = %d, want 2 (queue must be untouched)", q.Len())
+	}
+}
+
+func TestPreFetchQueue_PopFit_EmptyAndNoneFit(t *testing.T) {
+	q := NewPreFetchQueue(5, newTestLogger())
+
+	if got := q.PopFit(func(*PreFetchItem) bool { return true }); got != nil {
+		t.Errorf("PopFit on empty queue = %v, want nil", got)
+	}
+
+	q.Push(newMockPreFetchItem("wu-a", 100, time.Now()))
+	if got := q.PopFit(func(*PreFetchItem) bool { return false }); got != nil {
+		t.Errorf("PopFit with nothing fitting = %v, want nil", got)
+	}
+	if q.Len() != 1 {
+		t.Errorf("len = %d, want 1 (non-fitting item stays queued)", q.Len())
+	}
+}
+
 func TestPreFetchQueue_IsFull(t *testing.T) {
 	q := NewPreFetchQueue(2, newTestLogger())
 

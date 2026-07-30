@@ -1348,7 +1348,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 	// No memory limit configured Ã¢â‚¬â€ always allow.
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	wu := &runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 4096}}
-	if !d.canAccommodateWU(wu) {
+	if ok, _ := d.canAccommodateWU(wu); !ok {
 		t.Error("should accommodate when no memory limit configured")
 	}
 
@@ -1356,7 +1356,7 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 	d.cfg.ResourceLimits.MaxMemoryMB = 8192
 
 	// WU with 4GB Ã¢â‚¬â€ should fit (0 active + 4096 <= 8192).
-	if !d.canAccommodateWU(wu) {
+	if ok, _ := d.canAccommodateWU(wu); !ok {
 		t.Error("should accommodate 4GB WU with 8GB limit and 0 active")
 	}
 
@@ -1383,19 +1383,19 @@ func TestDaemon_CanAccommodateWU(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 6GB active + 4GB WU = 10GB > 8GB limit Ã¢â‚¬â€ should NOT accommodate.
-	if d.canAccommodateWU(wu) {
+	if ok, _ := d.canAccommodateWU(wu); ok {
 		t.Error("should NOT accommodate 4GB WU when 6GB active and 8GB limit")
 	}
 
 	// Smaller WU (1GB) should fit: 6GB + 1GB = 7GB <= 8GB.
 	smallWU := &runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}
-	if !d.canAccommodateWU(smallWU) {
+	if ok, _ := d.canAccommodateWU(smallWU); !ok {
 		t.Error("should accommodate 1GB WU when 6GB active and 8GB limit")
 	}
 
 	// WU with 0 MaxMemoryMB should use 512 default: 6GB + 512MB = 6.5GB <= 8GB.
 	defaultWU := &runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 0}}
-	if !d.canAccommodateWU(defaultWU) {
+	if ok, _ := d.canAccommodateWU(defaultWU); !ok {
 		t.Error("should accommodate WU with default 512MB when 6GB active and 8GB limit")
 	}
 

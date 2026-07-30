@@ -18,6 +18,14 @@ type PreFetchItem struct {
 	Runtime runtime.Runtime
 	Conn    *ServerConnection
 	FetchedAt time.Time
+
+	// BlockedSince is when this buffered unit first failed slot admission
+	// (zero = never refused); it keys the once-per-unit capacity-wait log and
+	// the wait duration reported when the unit finally starts (TB-23).
+	BlockedSince time.Time
+	// TimesSkipped counts units started past this one while it waited for
+	// capacity — PopFit's starvation guard (TB-22).
+	TimesSkipped int
 }
 
 // PreFetchQueue is a thread-safe queue of pre-fetched work units.
@@ -62,12 +70,38 @@ func (q *PreFetchQueue) Push(item *PreFetchItem) error {
 	return nil
 }
 
-// PushBack re-inserts an item at the front of the queue without signaling notify.
-// Used when an item was popped but can't be processed yet (e.g., insufficient resources).
-func (q *PreFetchQueue) PushBack(item *PreFetchItem) {
+// maxBackfillStarts bounds how many units may start past a buffered unit that
+// does not currently fit (see PopFit). Once a unit has been jumped this many
+// times PopFit stops offering anything behind it, so running work drains and
+// the skipped unit gets the next free slot instead of being starved by a
+// steady stream of smaller units. If capacity never frees, the reservation and
+// deadline drops (DropLapsedReservations, DropExpiring) remain the backstop.
+const maxBackfillStarts = 16
+
+// PopFit removes and returns the first item (in FIFO order) accepted by fits,
+// leaving every other item in place and in order. Selecting an item past the
+// front is a backfill: a unit the machine cannot currently fit no longer idles
+// a free slot while fitting units wait behind it (TB-22). Each item skipped
+// over gets its TimesSkipped incremented; an unfitting item already skipped
+// maxBackfillStarts times stops the scan. Returns nil if no acceptable item is
+// reachable. fits is called while holding the queue lock, so it must not call
+// back into the queue.
+func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool) *PreFetchItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.items = append([]*PreFetchItem{item}, q.items...)
+	for i, item := range q.items {
+		if fits(item) {
+			for _, skipped := range q.items[:i] {
+				skipped.TimesSkipped++
+			}
+			q.items = append(q.items[:i], q.items[i+1:]...)
+			return item
+		}
+		if item.TimesSkipped >= maxBackfillStarts {
+			return nil
+		}
+	}
+	return nil
 }
 
 // Pop removes and returns the front item (FIFO). Returns nil if empty.

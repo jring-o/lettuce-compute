@@ -969,7 +969,10 @@ func (d *Daemon) persistPrefetchBuffer() {
 	}
 }
 
-// fillSlots fills available execution slots from the pre-fetch queue.
+// fillSlots fills available execution slots from the pre-fetch queue. The
+// picker is first-fit, not pop-head-or-give-up: a buffered unit the machine
+// cannot currently fit stays in place, in order, while fitting units behind it
+// may start — see PopFit for the backfill and starvation rules (TB-22).
 func (d *Daemon) fillSlots(ctx context.Context) {
 	for {
 		slotID := d.slotManager.AvailableSlotID()
@@ -978,29 +981,41 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 			return // no available slots
 		}
 
-		item := d.prefetchQueue.Pop()
+		item := d.prefetchQueue.PopFit(func(it *PreFetchItem) bool {
+			ok, reason := d.canAccommodateWU(it.WU)
+			if !ok {
+				// Once per unit at Info, then Debug: this check runs on a
+				// 1-second tick, and per-check Info was ~30k identical
+				// lines/day on a machine waiting for capacity (TB-23).
+				if it.BlockedSince.IsZero() {
+					it.BlockedSince = time.Now()
+					d.logger.Info("buffered work unit waiting for capacity",
+						"work_unit_id", it.WU.ID, "leaf_id", it.WU.LeafID, "reason", reason)
+				} else {
+					d.logger.Debug("buffered work unit still waiting for capacity",
+						"work_unit_id", it.WU.ID, "reason", reason)
+				}
+			}
+			return ok
+		})
 		if item == nil {
-			// No items in queue — return slot.
-			d.logger.Debug("fillSlots: queue empty, returning slot", "slot", slotID, "queue_len", d.prefetchQueue.Len())
+			// Queue empty, nothing currently fits, or backfill is held for a
+			// starved unit — return the slot and wait for capacity to change.
+			d.logger.Debug("fillSlots: no runnable buffered unit", "queue_len", d.prefetchQueue.Len())
 			d.slotManager.ReturnSlotID(slotID)
 			return
 		}
 
-		// Check resource availability.
-		if !d.canAccommodateWU(item.WU) {
-			// Can't accommodate — push item back and return slot.
-			d.logger.Debug("fillSlots: can't accommodate WU, pushing back", "work_unit_id", item.WU.ID)
-			d.prefetchQueue.PushBack(item)
-			d.slotManager.ReturnSlotID(slotID)
-			return
-		}
-
-		d.logger.Info("starting work unit in slot",
+		startAttrs := []any{
 			"work_unit_id", item.WU.ID,
 			"leaf_id", item.WU.LeafID,
 			"slot", slotID,
 			"server", item.Conn.Name,
-		)
+		}
+		if !item.BlockedSince.IsZero() {
+			startAttrs = append(startAttrs, "waited_for_capacity", time.Since(item.BlockedSince).Round(time.Second).String())
+		}
+		d.logger.Info("starting work unit in slot", startAttrs...)
 
 		if err := d.slotManager.StartSlot(ctx, slotID, item, d); err != nil {
 			d.logger.Error("failed to start slot", "slot", slotID, "error", err)
@@ -1029,9 +1044,12 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 //  3. GPU exclusivity — at most one GPU work unit per physical GPU, so concurrent
 //     units never oversubscribe VRAM (the per-WU VRAM requirement isn't
 //     transmitted, so admission gates on device count).
-func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
+//
+// On refusal it returns the human-readable reason; it logs nothing itself —
+// callers run it on a 1-second tick and own the throttling (TB-23).
+func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	if d.slotManager == nil {
-		return true
+		return true, ""
 	}
 
 	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
@@ -1044,18 +1062,16 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 	if maxMemoryMB > 0 {
 		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(maxMemoryMB)
 		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
-			d.logger.Info("canAccommodateWU: exceeds configured memory budget; buffered work waiting for capacity",
-				"work_unit_id", wu.ID, "active_mb", activeMemoryMB, "wu_mb", wuMemoryMB, "max_mb", maxMemoryMB)
-			return false
+			return false, fmt.Sprintf("configured memory budget: %d MB active + %d MB unit exceeds max_memory_mb %d",
+				activeMemoryMB, wuMemoryMB, maxMemoryMB)
 		}
 	}
 
 	// 2. Real free system RAM (already reflects memory used by active containers).
 	if freeMB, ok := freeSystemMemoryMB(); ok {
 		if freeMB < wuMemoryMB+freeMemoryHeadroomMB {
-			d.logger.Info("canAccommodateWU: insufficient free system RAM; buffered work waiting for capacity",
-				"work_unit_id", wu.ID, "free_mb", freeMB, "wu_mb", wuMemoryMB, "headroom_mb", freeMemoryHeadroomMB)
-			return false
+			return false, fmt.Sprintf("free system RAM: %d MB free, unit needs %d MB + %d MB headroom",
+				freeMB, wuMemoryMB, freeMemoryHeadroomMB)
 		}
 	}
 
@@ -1066,13 +1082,12 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) bool {
 			gpuCount = len(d.cachedHW.GetGpus())
 		}
 		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
-			d.logger.Info("canAccommodateWU: all GPUs busy; buffered work waiting for capacity",
-				"work_unit_id", wu.ID, "gpu_count", gpuCount, "active_gpu_units", d.slotManager.ActiveGPUCount())
-			return false
+			return false, fmt.Sprintf("all GPUs busy: %d of %d running GPU work units",
+				d.slotManager.ActiveGPUCount(), gpuCount)
 		}
 	}
 
-	return true
+	return true, ""
 }
 
 // cachedImageWorkspaceHeadroomMB is the disk headroom required on the data-dir
