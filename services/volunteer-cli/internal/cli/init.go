@@ -223,8 +223,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 		c.ResourceLimits.MaxDiskGB = promptInt(scanner, fmt.Sprintf("Max disk GB [%d]", c.ResourceLimits.MaxDiskGB), c.ResourceLimits.MaxDiskGB)
 
 		// Step 2b: GPU
+		//
+		// Like every other prompt on a re-init, the defaults are the CURRENT values.
+		// This prompt used to default to enabled/50 regardless of the config, so a
+		// volunteer who had tuned the percentage — or disabled GPU outright — and
+		// pressed Enter through a re-init silently lost that choice (TB-28).
 		fmt.Println("\n=== GPU Detection ===")
-		gpus := rtdetect.DetectGPUs()
+		gpus := detectGPUsFunc()
 		if len(gpus) > 0 {
 			fmt.Printf("Detected %d GPU(s):\n", len(gpus))
 			for i, g := range gpus {
@@ -234,24 +239,49 @@ func runInit(cmd *cobra.Command, args []string) error {
 					fmt.Printf("  [%d] %s (%s)\n", i, g.Model, g.Vendor)
 				}
 			}
-			allowGPU := promptString(scanner, "Allow GPU tasks? [Y/n]", "y")
+			allowPrompt, allowDefault := "Allow GPU tasks? [Y/n]", "y"
+			if c.ResourceLimits.MaxGPUVRAMPct == 0 {
+				allowPrompt, allowDefault = "Allow GPU tasks? [y/N]", "n"
+			}
+			allowGPU := promptString(scanner, allowPrompt, allowDefault)
 			if strings.ToLower(allowGPU) == "n" || strings.ToLower(allowGPU) == "no" {
 				c.ResourceLimits.MaxGPUVRAMPct = 0
 			} else {
-				c.ResourceLimits.MaxGPUVRAMPct = promptInt(scanner, "Max VRAM percentage [50]", 50)
+				pctDefault := c.ResourceLimits.MaxGPUVRAMPct
+				if pctDefault <= 0 {
+					pctDefault = 50 // re-enabling after a disable: propose the factory default
+				}
+				c.ResourceLimits.MaxGPUVRAMPct = promptInt(scanner, fmt.Sprintf("Max VRAM percentage [%d]", pctDefault), pctDefault)
 			}
 		} else {
 			fmt.Println("No GPUs detected.")
 		}
 
 		// Step 3: Scheduling
+		//
+		// The defaults are the CURRENT mode and windows, exactly as the resource
+		// prompts above propose current values. This step used to default to the
+		// literal `always`, so a volunteer who had scheduled overnight-only crunching
+		// and pressed Enter through a re-init silently went 24/7 — while their
+		// windows stayed in the file, inert, saying otherwise (TB-28).
 		fmt.Println("\n=== Step 3: Scheduling ===")
 		fmt.Println("Modes: always, idle, scheduled")
-		mode := promptString(scanner, "Scheduling mode [always]", "always")
+		curMode := "always"
+		switch c.Scheduling.Mode {
+		case "WHEN_IDLE":
+			curMode = "idle"
+		case "SCHEDULED":
+			curMode = "scheduled"
+		}
+		mode := promptString(scanner, fmt.Sprintf("Scheduling mode [%s]", curMode), curMode)
 		switch strings.ToLower(mode) {
 		case "idle":
 			c.Scheduling.Mode = "WHEN_IDLE"
-			c.Scheduling.IdleThresholdMins = promptInt(scanner, "Idle threshold minutes [5]", 5)
+			idleDefault := c.Scheduling.IdleThresholdMins
+			if idleDefault <= 0 {
+				idleDefault = 5
+			}
+			c.Scheduling.IdleThresholdMins = promptInt(scanner, fmt.Sprintf("Idle threshold minutes [%d]", idleDefault), idleDefault)
 		case "scheduled":
 			c.Scheduling.Mode = "SCHEDULED"
 			// Daily windows, not raw cron. This step used to ask for a bare "Cron
@@ -261,9 +291,27 @@ func runInit(cmd *cobra.Command, args []string) error {
 			// `schedule add` to silently delete later (TB-2). Windows are the same
 			// language `schedule set` speaks and are validated as they are entered.
 			c.Scheduling.CronExpression = ""
-			c.Scheduling.ScheduleRanges = []config.ScheduleRange{promptScheduleWindow(scanner)}
+			if len(c.Scheduling.ScheduleRanges) > 0 {
+				fmt.Println("Current windows:")
+				for _, r := range c.Scheduling.ScheduleRanges {
+					fmt.Printf("  %s\n", describeRange(r))
+				}
+				keep := promptString(scanner, "Keep these windows? [Y/n]", "y")
+				if strings.ToLower(keep) == "n" || strings.ToLower(keep) == "no" {
+					c.Scheduling.ScheduleRanges = []config.ScheduleRange{promptScheduleWindow(scanner)}
+				}
+			} else {
+				c.Scheduling.ScheduleRanges = []config.ScheduleRange{promptScheduleWindow(scanner)}
+			}
 		default:
 			c.Scheduling.Mode = "ALWAYS"
+		}
+		// Windows survive a mode change in the file but have no effect outside
+		// SCHEDULED mode — say so, or the config quietly contradicts the behavior
+		// (the TB-28 trap, and the `config set scheduling.mode` family, TQ-14).
+		if c.Scheduling.Mode != "SCHEDULED" && len(c.Scheduling.ScheduleRanges) > 0 {
+			fmt.Printf("Note: your %d saved schedule window(s) will be ignored in %s mode.\n",
+				len(c.Scheduling.ScheduleRanges), c.Scheduling.Mode)
 		}
 
 		// Step 4: Leaf Preferences

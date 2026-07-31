@@ -246,3 +246,141 @@ func TestInitNonInteractiveTrustFlag(t *testing.T) {
 		}
 	})
 }
+
+// withDetectedGPU makes GPU detection report one GPU for the duration of the
+// test, so init's GPU step is offered deterministically (the cli TestMain
+// otherwise blanket-disables hardware detection).
+func withDetectedGPU(t *testing.T) {
+	t.Helper()
+	orig := detectGPUsFunc
+	detectGPUsFunc = func() []*rtdetect.GpuDetectionResult {
+		return []*rtdetect.GpuDetectionResult{{Model: "Test GPU", Vendor: "nvidia", VRAMMB: 8192}}
+	}
+	t.Cleanup(func() { detectGPUsFunc = orig })
+}
+
+// seedExistingConfig writes a config for init to re-run over.
+func seedExistingConfig(t *testing.T, dir string, mutate func(*config.Config)) {
+	t.Helper()
+	c := config.Defaults()
+	c.DataDir = dir
+	mutate(c)
+	if err := c.Save(filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatalf("seeding config: %v", err)
+	}
+}
+
+// TestReinitEnterThroughPreservesSchedulingMode is the TB-28 regression: init
+// explicitly supports re-running ("Config already exists. Reinitialize? [y/N]")
+// and every resource prompt proposes the CURRENT value, teaching that Enter
+// preserves. The scheduling prompt alone defaulted to the literal `always`, so
+// a volunteer who had scheduled overnight-only crunching and pressed Enter
+// through a re-init went 24/7 — while the windows stayed in config.yaml, inert,
+// saying otherwise.
+func TestReinitEnterThroughPreservesSchedulingMode(t *testing.T) {
+	withContainerBackend(t)
+	dir := t.TempDir()
+	seedExistingConfig(t, dir, func(c *config.Config) {
+		c.Scheduling.Mode = "SCHEDULED"
+		c.Scheduling.ScheduleRanges = []config.ScheduleRange{{Days: []int{5, 6}, StartHour: 22, EndHour: 6}}
+	})
+
+	// "y" answers the reinitialize prompt; every following prompt reads EOF and
+	// takes its default — the tester's exact Enter-through-everything path.
+	loaded, out := runInteractiveInit(t, dir, []string{"y"})
+
+	if loaded.Scheduling.Mode != "SCHEDULED" {
+		t.Errorf("Scheduling.Mode after Enter-through re-init = %q, want SCHEDULED preserved", loaded.Scheduling.Mode)
+	}
+	want := []config.ScheduleRange{{Days: []int{5, 6}, StartHour: 22, EndHour: 6}}
+	if !reflect.DeepEqual(loaded.Scheduling.ScheduleRanges, want) {
+		t.Errorf("ScheduleRanges = %+v, want %+v preserved", loaded.Scheduling.ScheduleRanges, want)
+	}
+	if strings.Contains(out, "will be ignored") {
+		t.Errorf("windows-ignored note shown although the mode stayed SCHEDULED:\n%s", out)
+	}
+}
+
+// TestReinitEnterThroughPreservesGPUVRAMPct is the GPU half of the TB-28
+// report. The prompt only appears when a GPU is detected — which is why the
+// triage repro (a GPU-less machine) could not reproduce this half — and it
+// defaulted to enabled/50 regardless of the config, so Enter lost a tuned
+// percentage and, worse, silently re-enabled a deliberately disabled GPU.
+func TestReinitEnterThroughPreservesGPUVRAMPct(t *testing.T) {
+	withContainerBackend(t)
+	withDetectedGPU(t)
+
+	t.Run("tuned percentage survives", func(t *testing.T) {
+		dir := t.TempDir()
+		seedExistingConfig(t, dir, func(c *config.Config) { c.ResourceLimits.MaxGPUVRAMPct = 80 })
+		loaded, _ := runInteractiveInit(t, dir, []string{"y"})
+		if loaded.ResourceLimits.MaxGPUVRAMPct != 80 {
+			t.Errorf("MaxGPUVRAMPct after Enter-through re-init = %d, want 80 preserved", loaded.ResourceLimits.MaxGPUVRAMPct)
+		}
+	})
+
+	t.Run("disabled GPU stays disabled", func(t *testing.T) {
+		dir := t.TempDir()
+		seedExistingConfig(t, dir, func(c *config.Config) { c.ResourceLimits.MaxGPUVRAMPct = 0 })
+		loaded, _ := runInteractiveInit(t, dir, []string{"y"})
+		if loaded.ResourceLimits.MaxGPUVRAMPct != 0 {
+			t.Errorf("MaxGPUVRAMPct after Enter-through re-init = %d, want 0 (GPU stays disabled)", loaded.ResourceLimits.MaxGPUVRAMPct)
+		}
+	})
+}
+
+// TestReinitSwitchingModeAwayWarnsSavedWindowsIgnored: deliberately leaving
+// SCHEDULED is a valid answer, but the saved windows stay in the file with no
+// effect — the TB-28 trap is a config that quietly contradicts the behavior,
+// so the switch must say the windows will be ignored.
+func TestReinitSwitchingModeAwayWarnsSavedWindowsIgnored(t *testing.T) {
+	withContainerBackend(t)
+	dir := t.TempDir()
+	seedExistingConfig(t, dir, func(c *config.Config) {
+		c.Scheduling.Mode = "SCHEDULED"
+		c.Scheduling.ScheduleRanges = []config.ScheduleRange{{Days: []int{5, 6}, StartHour: 22, EndHour: 6}}
+	})
+
+	loaded, out := runInteractiveInit(t, dir, []string{
+		"y",        // reinitialize
+		"", "", "", // cpu, memory, disk
+		"always", // scheduling mode: a deliberate switch away from SCHEDULED
+	})
+
+	if loaded.Scheduling.Mode != "ALWAYS" {
+		t.Fatalf("Scheduling.Mode = %q, want ALWAYS (the typed answer)", loaded.Scheduling.Mode)
+	}
+	if len(loaded.Scheduling.ScheduleRanges) != 1 {
+		t.Errorf("saved windows should stay in the file, got %+v", loaded.Scheduling.ScheduleRanges)
+	}
+	if !strings.Contains(out, "will be ignored in ALWAYS mode") {
+		t.Errorf("switching away from SCHEDULED with saved windows must say they will be ignored:\n%s", out)
+	}
+}
+
+// TestReinitScheduledCanReplaceWindows: keeping the current windows is the
+// Enter default, but declining must still offer the full window prompt.
+func TestReinitScheduledCanReplaceWindows(t *testing.T) {
+	withContainerBackend(t)
+	dir := t.TempDir()
+	seedExistingConfig(t, dir, func(c *config.Config) {
+		c.Scheduling.Mode = "SCHEDULED"
+		c.Scheduling.ScheduleRanges = []config.ScheduleRange{{Days: []int{5, 6}, StartHour: 22, EndHour: 6}}
+	})
+
+	loaded, _ := runInteractiveInit(t, dir, []string{
+		"y",        // reinitialize
+		"", "", "", // cpu, memory, disk
+		"",                          // scheduling mode: Enter keeps SCHEDULED
+		"n",                         // do not keep the current windows
+		"21:00", "05:00", "mon-fri", // the replacement
+	})
+
+	if loaded.Scheduling.Mode != "SCHEDULED" {
+		t.Fatalf("Scheduling.Mode = %q, want SCHEDULED", loaded.Scheduling.Mode)
+	}
+	want := []config.ScheduleRange{{Days: []int{0, 1, 2, 3, 4}, StartHour: 21, EndHour: 5}}
+	if !reflect.DeepEqual(loaded.Scheduling.ScheduleRanges, want) {
+		t.Errorf("ScheduleRanges = %+v, want the replacement %+v", loaded.Scheduling.ScheduleRanges, want)
+	}
+}
