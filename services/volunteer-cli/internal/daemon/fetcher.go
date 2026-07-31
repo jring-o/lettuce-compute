@@ -82,7 +82,27 @@ type Fetcher struct {
 	// --- CLIENT WORK BUFFER (Layer 1) ---
 	// workBufferFullFn reports whether the hours-based client work buffer is full.
 	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
+	// Since TB-32 a full-by-hours buffer that cannot occupy an idle slot reports
+	// NOT full, so fetching continues in starved-backfill mode (below).
 	workBufferFullFn func() bool
+	// starvedBackfillFn reports the TB-32 starved-backfill state: the buffer is
+	// full by hours but a slot is idle with nothing admissible buffered, so the
+	// ONLY point of fetching is to fill that slot. The fetcher then also applies
+	// leafFitGateFn, skipping leafs whose declared spec could not be admitted
+	// right now — without the skip it would just re-request the big-memory leaf
+	// that saturated the buffer in the first place. Injected from the daemon;
+	// nil disables the mode (plain deficit fetching).
+	starvedBackfillFn func() bool
+	// leafFitGateFn reports whether a unit shaped like this leaf's declared
+	// execution spec could currently be admitted to a slot. Only consulted in
+	// starved-backfill mode — normal deficit fetching deliberately buffers ahead
+	// units that cannot run beside the current mix but will run later.
+	leafFitGateFn func(leaf CachedLeafInfo) (bool, string)
+	// bufferAcceptsFn is the arrival-time guard on each unit of a batch reply
+	// (TB-32): a unit over the hours target that cannot start now is abandoned
+	// back to the head for immediate re-dispatch instead of being held past its
+	// usefulness and dropped at 90 % of deadline. nil accepts everything.
+	bufferAcceptsFn func(wu *runtime.WorkUnit) (bool, string)
 	// batchSizeFn returns how many assignments to request for a leaf given an
 	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest].
 	batchSizeFn func(estSecondsPerUnit float64) int32
@@ -207,6 +227,9 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafDiskGateFn:           d.leafDiskGate,
 		leafNeedsAbsentGPUFn:     d.leafNeedsAbsentGPU,
 		workBufferFullFn:         d.workBufferFull,
+		starvedBackfillFn:        d.starvedBackfill,
+		leafFitGateFn:            d.leafFitGate,
+		bufferAcceptsFn:          d.bufferAccepts,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
@@ -447,6 +470,13 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 	}
 	f.logger.Debug("fetcher: available servers", "count", len(available), "servers", serverNames(available))
 
+	// TB-32: are we fetching only because a full-by-hours buffer is starving an
+	// idle slot? Then restrict the round to leafs that could actually fill it.
+	backfill := f.starvedBackfillFn != nil && f.starvedBackfillFn()
+	if backfill {
+		f.logger.Debug("fetcher: starved-backfill round — only leafs admissible to the idle slot will be requested")
+	}
+
 	// Try heads in deficit order, skipping any still waiting out their
 	// server-directed retry delay.
 	tried := make(map[string]bool)
@@ -536,6 +566,17 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			if f.leafDiskGateFn != nil {
 				if ok, reason := f.leafDiskGateFn(leaf); !ok {
 					f.logger.Debug("fetcher: skipping disk-gated leaf", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
+					continue
+				}
+			}
+
+			// TB-32: in a starved-backfill round, skip a leaf whose declared
+			// spec could not be admitted to the idle slot right now — its units
+			// are exactly what saturated the buffer, and requesting more cannot
+			// end the starvation. The request goes to a leaf that can.
+			if backfill && f.leafFitGateFn != nil {
+				if ok, reason := f.leafFitGateFn(leaf); !ok {
+					f.logger.Debug("fetcher: skipping leaf that cannot fill the idle slot", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
 					continue
 				}
 			}
@@ -757,6 +798,20 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			continue
 		}
 		held[wu.ID] = struct{}{}
+
+		// TB-32: don't buffer past the hours target unless this unit can start
+		// in a starving idle slot right now. A batch sized from a bad estimate
+		// used to overshoot the target several times over; the excess sat until
+		// the deadline drop while the head believed it was being computed.
+		// Returning it here (before any Prepare cost) re-dispatches it in
+		// seconds instead of hours.
+		if f.bufferAcceptsFn != nil {
+			if ok, reason := f.bufferAcceptsFn(wu); !ok {
+				f.logger.Info("fetcher: returning batch unit the buffer cannot use", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "reason", reason)
+				f.abandonWorkUnit(ctx, head, wu, reason)
+				continue
+			}
+		}
 
 		rt, selErr := f.registry.SelectRuntime(wu)
 		if selErr != nil {
