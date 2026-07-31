@@ -322,6 +322,14 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   full it makes **zero** work requests — it just runs what it has. Buffered work
   is reserved for you by the head (not yet started), so it is cheap to hand back
   if you stop, and it is only downloaded/prepared right before it runs.
+- **"Full" also means usable.** If a slot is idle but nothing in the buffer can
+  start beside what's already running (say every buffered unit needs more memory
+  than you have left), the buffer does not count as full: the volunteer keeps
+  requesting — restricted to leafs whose units could actually fill that idle
+  slot — and any arriving work it can't use is handed straight back to the head
+  for immediate re-dispatch instead of sitting in the buffer until its deadline.
+  If a slot stays idle this way for more than about ten minutes, the volunteer
+  logs a warning naming what is blocking the buffered work.
 - **The buffer fills correctly even for fast leafs.** The head tells your
   volunteer roughly how long one unit of each leaf takes, so a leaf with very
   short units is requested in a single large batch (up to a safety ceiling)

@@ -220,6 +220,14 @@ type Daemon struct {
 	// determined from this host (see noteUnstattableImageStore), so the
 	// informational log fires once per path per daemon run. Guarded by diskGateMu.
 	unstattableStores map[string]bool
+
+	// Slot-starvation visibility (TB-32): an idle slot beside a buffer of
+	// inadmissible units lived entirely at INFO/DEBUG — testers measured
+	// slot-hours of idleness from log archaeology. trackSlotStarvation stamps
+	// when the state began and throttles the WARN.
+	slotStarveMu       sync.Mutex
+	slotStarvedSince   time.Time
+	slotStarveWarnedAt time.Time
 }
 
 // DaemonConfig holds all dependencies for creating a Daemon.
@@ -690,6 +698,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Fill available slots from the pre-fetch queue.
 		d.logger.Debug("daemon: filling slots", "active_slots", d.slotManager.ActiveCount(), "queue_len", d.prefetchQueue.Len())
 		d.fillSlots(ctx)
+
+		// Surface a slot that stays idle with only inadmissible work buffered
+		// (TB-32) — throttled WARN, otherwise the condition lives at DEBUG.
+		d.trackSlotStarvation()
 
 		// Keep the persisted prefetch buffer current so a non-graceful exit can resume
 		// it. Runs every iteration — the loop wakes on a queue push (Notify) and on slot
@@ -1346,10 +1358,28 @@ func (d *Daemon) bufferedSeconds() float64 {
 // workBufferFull reports whether the client work buffer holds enough work that
 // the fetcher must issue ZERO RequestWorkUnit calls (Layer-1 DoD #2).
 //
+// Fullness is the hours/count verdict (workBufferHoursFull) with one escape:
+// hours are not runnability (TB-32). A buffer saturated with units admission
+// refuses beside the running work — one big-memory leaf on a 2-slot host — used
+// to pin the idle slot for hours while other attached leafs had admissible
+// units the fetcher never asked for. So a full-by-hours buffer that cannot
+// occupy an idle slot does not gate fetching; the fetcher then requests in
+// starved-backfill mode (see starvedBackfill), which restricts it to leafs that
+// could actually fill that slot.
+func (d *Daemon) workBufferFull() bool {
+	if !d.workBufferHoursFull() {
+		return false
+	}
+	return !d.idleSlotStarved()
+}
+
+// workBufferHoursFull is the raw hours/count fullness verdict, with no regard
+// for whether the buffered work can currently run (TB-32 splits the two).
+//
 // When a per-unit time estimate is available it uses the hours-based target;
 // otherwise it falls back to a small per-slot unit count so the buffer can't
 // grow without bound when estimates are missing.
-func (d *Daemon) workBufferFull() bool {
+func (d *Daemon) workBufferHoursFull() bool {
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
 		// Hours target unusable (buffering disabled) — fall back to a unit count.
@@ -1361,6 +1391,79 @@ func (d *Daemon) workBufferFull() bool {
 		return true
 	}
 	return d.bufferedSeconds() >= target
+}
+
+// idleSlotStarved reports whether an execution slot is idle while nothing in
+// the work buffer can currently be admitted to it (canAccommodateWU) — the
+// TB-32 starvation state. An empty buffer beside an idle slot counts: a single
+// running unit whose estimate exceeds the whole hours target starves the other
+// slot the same way. Cheap in the healthy case — when every slot is busy it
+// returns false before touching the queue.
+func (d *Daemon) idleSlotStarved() bool {
+	if d.slotManager == nil || d.prefetchQueue == nil {
+		return false
+	}
+	if d.slotManager.ActiveCount() >= d.maxSlots() {
+		return false
+	}
+	for _, item := range d.prefetchQueue.Items() {
+		if item.WU == nil {
+			continue
+		}
+		if ok, _ := d.canAccommodateWU(item.WU); ok {
+			// Something buffered can fill the idle slot; fillSlots will.
+			return false
+		}
+	}
+	return true
+}
+
+// starvedBackfill reports whether the ONLY reason fetching is open is an idle
+// slot starved by a full-by-hours buffer. The fetcher uses it to fetch
+// precisely (skip leafs that could not fill the slot, see leafFitGate) instead
+// of piling more inadmissible hours onto an already-full buffer.
+func (d *Daemon) starvedBackfill() bool {
+	return d.workBufferHoursFull() && d.idleSlotStarved()
+}
+
+// leafFitGate reports whether a unit shaped like this leaf's declared
+// execution spec could currently be admitted to a slot (canAccommodateWU). In
+// starved-backfill mode the fetcher skips leafs that fail it: requesting the
+// big-memory leaf that saturated the buffer again cannot fill the idle slot,
+// while another attached leaf's small units can (TB-32). Deliberately NOT
+// applied to normal deficit fetching — buffering ahead a unit that cannot run
+// beside the current mix but will run alone later is the buffer's job. A leaf
+// with no published spec passes; the head's per-unit numbers stay authoritative.
+func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
+	if leaf.ExecutionSpec == nil {
+		return true, ""
+	}
+	return d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{
+		MaxMemoryMB: leaf.ExecutionSpec.MaxMemoryMB,
+		MaxDiskMB:   leaf.ExecutionSpec.MaxDiskMB,
+		GPURequired: leaf.ExecutionSpec.GPURequired,
+	}})
+}
+
+// bufferAccepts decides whether one more ARRIVING unit may be buffered, so a
+// batch reply cannot overshoot the hours target into deadline-drop territory
+// (TB-32's churn half: ten units of one leaf fetched, never run, dropped at
+// 90 % of deadline, re-issued elsewhere — zero compute). Under the target
+// everything is accepted. Over it, a unit is accepted only to feed a starving
+// idle slot — and only if it can start now; anything else is returned to the
+// head immediately (abandon → instant re-dispatch) instead of being held for
+// hours and dropped. Refusal reasons travel to the head as the abandon reason.
+func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
+	if !d.workBufferHoursFull() {
+		return true, ""
+	}
+	if !d.idleSlotStarved() {
+		return false, "work buffer full (over the hours target)"
+	}
+	if ok, reason := d.canAccommodateWU(wu); !ok {
+		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", reason)
+	}
+	return true, ""
 }
 
 // fallbackBufferUnits is the unit-count cap used when an hours estimate is
@@ -1432,6 +1535,64 @@ func (d *Daemon) avgBufferedSecondsPerUnit() float64 {
 		return 0
 	}
 	return total / float64(n)
+}
+
+// Slot-starvation WARN thresholds (TB-32). With the runnability-aware buffer
+// gate in place a starved slot normally refills within one fetch round, so a
+// starvation that PERSISTS means no attached head is serving anything this
+// machine can run right now — worth a WARN, throttled on the TB-27 pattern
+// rather than once-per-episode, because the state can hold for hours and a
+// single line at hour zero is easy to lose.
+const (
+	// slotStarveWarnAfter is how long a slot must sit idle with only
+	// inadmissible work buffered before the first WARN.
+	slotStarveWarnAfter = 10 * time.Minute
+	// slotStarveWarnInterval is the minimum spacing between repeat WARNs while
+	// the starvation persists.
+	slotStarveWarnInterval = 5 * time.Minute
+)
+
+// trackSlotStarvation runs on the coordinator tick: it watches for a slot
+// idling while the buffer holds only units admission refuses, and WARNs —
+// throttled — naming the head-of-buffer unit's blocking reason. Before TB-32
+// nothing above INFO recorded the whole condition. The empty-buffer variant of
+// starvation is deliberately excluded: with nothing buffered the fetcher's own
+// "connected but getting no work" WARN owns the diagnosis.
+func (d *Daemon) trackSlotStarvation() {
+	if d.slotManager == nil || d.prefetchQueue == nil {
+		return
+	}
+	starved := d.prefetchQueue.Len() > 0 && d.idleSlotStarved()
+
+	d.slotStarveMu.Lock()
+	defer d.slotStarveMu.Unlock()
+	if !starved {
+		d.slotStarvedSince = time.Time{}
+		d.slotStarveWarnedAt = time.Time{}
+		return
+	}
+	now := time.Now()
+	if d.slotStarvedSince.IsZero() {
+		d.slotStarvedSince = now
+		return
+	}
+	if now.Sub(d.slotStarvedSince) < slotStarveWarnAfter {
+		return
+	}
+	if !d.slotStarveWarnedAt.IsZero() && now.Sub(d.slotStarveWarnedAt) < slotStarveWarnInterval {
+		return
+	}
+	d.slotStarveWarnedAt = now
+
+	items := d.prefetchQueue.Items()
+	reason := ""
+	if len(items) > 0 && items[0].WU != nil {
+		_, reason = d.canAccommodateWU(items[0].WU)
+	}
+	d.logger.Warn("an execution slot is idle but none of the buffered work units can start on this machine — requesting admissible work from the attached heads, but none has served any",
+		"idle_for", now.Sub(d.slotStarvedSince).Round(time.Second).String(),
+		"buffered_units", len(items),
+		"head_of_buffer_reason", reason)
 }
 
 // warnDiskGateOnce surfaces the disk-space stall. The first time the gate
