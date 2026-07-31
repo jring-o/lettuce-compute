@@ -251,10 +251,15 @@ func TestLocalDiskFetchNote(t *testing.T) {
 	if !strings.Contains(note, "15000") {
 		t.Errorf("note must name the leaf's need; got: %s", note)
 	}
-	// Unknown need or unknown reading: no verdict.
-	if note := localDiskFetchNote(leafRequirements{name: "x"}, volunteerCaps{freeDataDirMB: 100}); note != "" {
-		t.Errorf("unknown need must produce no note; got: %s", note)
+	// An undeclared need takes the live gate's fallback (TB-31): with 100 MB
+	// free even the fallback is uncovered, and the note says it is assumed.
+	note = localDiskFetchNote(leafRequirements{name: "x"}, volunteerCaps{freeDataDirMB: 100})
+	if note == "" {
+		t.Error("undeclared need with 100 MB free must gate on the fallback, as the live gate does (TB-31)")
+	} else if !strings.Contains(note, "assumed") {
+		t.Errorf("fallback-based note must say the need is assumed; got: %s", note)
 	}
+	// Unknown free-space reading and no usage figure: no verdict.
 	if note := localDiskFetchNote(req, volunteerCaps{}); note != "" {
 		t.Errorf("unknown free-space reading must produce no note; got: %s", note)
 	}

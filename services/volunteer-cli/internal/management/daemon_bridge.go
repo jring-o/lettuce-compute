@@ -316,27 +316,34 @@ func (b *DaemonBridge) SuspendAndQuit() {
 
 // MetricsResponse is the response for GET /api/v1/metrics.
 type MetricsResponse struct {
-	CPUUsagePct  float64 `json:"cpu_usage_pct"`
-	GPUUsagePct  float64 `json:"gpu_usage_pct"`
-	MemoryUsedMB int     `json:"memory_used_mb"`
-	MemoryTotalMB int    `json:"memory_total_mb"`
-	DiskUsedGB   float64 `json:"disk_used_gb"`
-	DiskTotalGB  float64 `json:"disk_total_gb"`
-	CPUTempC     int     `json:"cpu_temp_c"`
-	GPUTempC     int     `json:"gpu_temp_c"`
+	CPUUsagePct   float64 `json:"cpu_usage_pct"`
+	GPUUsagePct   float64 `json:"gpu_usage_pct"`
+	MemoryUsedMB  int     `json:"memory_used_mb"`
+	MemoryTotalMB int     `json:"memory_total_mb"`
+	// The disk figures are the fetch gate's own (TB-24): DiskUsedMB is
+	// Lettuce's measured footprint — the data-dir tree plus cached container
+	// images — and DiskAllowanceMB is the max_disk_gb allowance it is budgeted
+	// against. DiskUsageKnown false means the daemon cannot measure usage right
+	// now; consumers must treat DiskUsedMB as absent then, never as zero —
+	// doctor quotes these instead of measuring for itself (TB-30). MB integers,
+	// not GB floats, so the reader and the gate quote identical numbers.
+	DiskUsedMB      int64 `json:"disk_used_mb"`
+	DiskAllowanceMB int64 `json:"disk_allowance_mb"`
+	DiskUsageKnown  bool  `json:"disk_usage_known"`
+	CPUTempC        int   `json:"cpu_temp_c"`
+	GPUTempC        int   `json:"gpu_temp_c"`
 }
 
-// GetMetrics returns current resource usage metrics. Disk figures are real
-// (TB-24): DiskUsedGB is Lettuce's measured footprint — the data-dir tree plus
-// cached container images — and DiskTotalGB is the max_disk_gb allowance that
-// footprint is budgeted against. The CPU/GPU/memory/temperature fields still
-// require platform-specific collection and remain zero until that is
-// integrated.
+// GetMetrics returns current resource usage metrics. The CPU/GPU/memory/
+// temperature fields still require platform-specific collection and remain
+// zero until that is integrated.
 func (b *DaemonBridge) GetMetrics() MetricsResponse {
 	resp := MetricsResponse{}
-	if usedMB, allowanceMB, ok := b.daemon.DiskUsage(); ok {
-		resp.DiskUsedGB = float64(usedMB) / 1024
-		resp.DiskTotalGB = float64(allowanceMB) / 1024
+	usedMB, allowanceMB, ok := b.daemon.DiskUsage()
+	resp.DiskAllowanceMB = allowanceMB
+	resp.DiskUsageKnown = ok
+	if ok {
+		resp.DiskUsedMB = usedMB
 	}
 	return resp
 }

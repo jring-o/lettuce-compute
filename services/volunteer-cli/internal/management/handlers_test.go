@@ -175,7 +175,7 @@ func TestHandleGetMetrics(t *testing.T) {
 
 	body := decodeJSON(t, resp)
 	// Verify expected fields exist.
-	for _, field := range []string{"cpu_usage_pct", "gpu_usage_pct", "memory_used_mb", "memory_total_mb", "disk_used_gb", "disk_total_gb", "cpu_temp_c", "gpu_temp_c"} {
+	for _, field := range []string{"cpu_usage_pct", "gpu_usage_pct", "memory_used_mb", "memory_total_mb", "disk_used_mb", "disk_allowance_mb", "disk_usage_known", "cpu_temp_c", "gpu_temp_c"} {
 		if _, ok := body[field]; !ok {
 			t.Errorf("missing field %s", field)
 		}

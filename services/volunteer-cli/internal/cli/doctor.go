@@ -32,8 +32,10 @@ func newDoctorCmd() *cobra.Command {
 container runtime (actually pinging the socket), and for each attached head
 whether it's reachable and how many of its leafs this volunteer can run.
 
-Safe to run any time — it never changes anything and doesn't need the daemon.
-Exits non-zero if a check that would block all work fails.`,
+Safe to run any time — it never changes anything and works without the daemon,
+though the disk-usage figure is most accurate while the daemon runs (doctor
+reads the daemon's own enforced measurement, which includes cached container
+images). Exits non-zero if a check that would block all work fails.`,
 		RunE: runDoctor,
 	}
 }
@@ -101,9 +103,12 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	checkIdentity(rep, cfg.KeyFilePath(), cfg.PubKeyFilePath())
 	freeDataDirMB := client.DiskAvailableMB(cfg.DataDir)
 	checkDisk(rep, cfg.DataDir, freeDataDirMB)
-	checkDiskUsage(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB)
+	// Container and daemon are checked before disk usage because the usage
+	// verdict depends on both: the running daemon's figure is the enforced one,
+	// and a container host without it can only report a partial number (TB-30).
 	containerUsable := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
+	lettuceUsedMB, usedMBKnown := checkDiskUsage(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB, containerUsable)
 
 	// Machine capability, honestly derived (BG-12-doctor): WASM always; CONTAINER when a
 	// backend is usable; NATIVE only when at least one head is trusted for it. Which heads
@@ -125,6 +130,8 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		maxDiskMB:       int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
 		maxCPUCores:     cfg.ResourceLimits.MaxCPUCores,
 		freeDataDirMB:   freeDataDirMB,
+		lettuceUsedMB:   lettuceUsedMB,
+		usedMBKnown:     usedMBKnown,
 	}
 	caps.maxGPUVRAMMB, caps.gpuCardVRAMMB, caps.gpuVRAMPct, caps.gpuVendors, caps.gpuComputeCapabilities =
 		volunteerGPUBudget()
@@ -301,28 +308,69 @@ func checkDisk(rep *doctorReport, dataDir string, availableMB int64) {
 		fmt.Sprintf("%d MB free on %s — a work fetch needs the leaf's declared disk requirement free (plus a %d MB floor), shown per leaf in the Heads section", availableMB, dataDir, daemon.DiskFloorMB), "")
 }
 
+// metricsAPIResponse mirrors the disk fields of the management API's GET
+// /api/v1/metrics — the running daemon's own TTL-cached usage measurement,
+// which is the figure the fetch gate actually enforces.
+type metricsAPIResponse struct {
+	DiskUsedMB      int64 `json:"disk_used_mb"`
+	DiskAllowanceMB int64 `json:"disk_allowance_mb"`
+	DiskUsageKnown  bool  `json:"disk_usage_known"`
+}
+
 // checkDiskUsage reports Lettuce's own measured footprint against the
-// max_disk_gb allowance it is budgeted under — the honest usage figure that
-// used to exist nowhere (TB-24). Doctor can measure the data-dir tree directly;
-// cached container images also count on container hosts, but reading them
-// needs the engine's image list, so the figure is labelled accordingly.
-func checkDiskUsage(rep *doctorReport, dataDir string, maxDiskGB int) {
+// max_disk_gb allowance it is budgeted under (TB-24), and returns the figure
+// (with whether it is complete) for the per-leaf budget verdicts in the Heads
+// section. The running daemon's measurement is quoted whenever it can be had —
+// it is the number the fetch gate enforces, data-dir tree PLUS cached
+// container images. Measuring the data-dir tree alone and merely labelling the
+// missing half read "41 MB of 30720 · all checks passed" on a host the daemon
+// had fully disk-gated at 27,723 MB of cached images (TB-30) — so without the
+// daemon, a container host's workspace-only figure is reported as partial with
+// the budget verdict unknown, never as a pass.
+func checkDiskUsage(rep *doctorReport, dataDir string, maxDiskGB int, containerUsable bool) (usedMB int64, known bool) {
 	allowanceMB := int64(maxDiskGB) * 1024
-	usedMB, err := daemon.DirSizeMB(dataDir)
+
+	var mr metricsAPIResponse
+	if err := managementGet(dataDir, "/api/v1/metrics", &mr); err == nil && mr.DiskUsageKnown {
+		// Trust the daemon's allowance over the config file's: the daemon
+		// enforces what it was started with.
+		reportDiskUsage(rep, mr.DiskUsedMB, mr.DiskAllowanceMB,
+			"measured by the running daemon: work folders + cached container images")
+		return mr.DiskUsedMB, true
+	}
+
+	dirMB, err := daemon.DirSizeMB(dataDir)
 	if err != nil {
 		rep.add(docInfo, "disk usage",
 			fmt.Sprintf("could not measure the data dir (%v); the running daemon budgets its usage against the %d MB allowance", err, allowanceMB), "")
-		return
+		return 0, false
 	}
+	if containerUsable {
+		// On a container host the dominant term is usually the cached images,
+		// which only the daemon sizes against its wanted-image set. A partial
+		// figure must not feed a pass verdict.
+		rep.add(docWarn, "disk usage",
+			fmt.Sprintf("work folders use %d MB of the %d MB allowance, but cached container images count too and are not measured here, so the budget verdict is unknown", dirMB, allowanceMB),
+			"start the daemon and re-run doctor — the running daemon reports the enforced figure, images included")
+		return dirMB, false
+	}
+	// No usable container engine: the gate itself cannot count images either
+	// (unknown fails open), so the workspace figure is the enforced one.
+	reportDiskUsage(rep, dirMB, allowanceMB, "work folders under the data dir")
+	return dirMB, true
+}
+
+// reportDiskUsage renders the usage-vs-allowance line, warning at or over the
+// allowance, where the daemon stops fetching entirely.
+func reportDiskUsage(rep *doctorReport, usedMB, allowanceMB int64, source string) {
 	level := docInfo
 	remedy := ""
 	if usedMB >= allowanceMB {
 		level = docWarn
-		remedy = "free space under the data dir, or raise resource_limits.max_disk_gb — at or over the allowance the daemon stops fetching (superseded container images are reclaimed automatically)"
+		remedy = "free space under the data dir, disable an unused leaf (its cached image leaves the budget), or raise resource_limits.max_disk_gb — at or over the allowance the daemon stops fetching (superseded container images are reclaimed automatically)"
 	}
 	rep.add(level, "disk usage",
-		fmt.Sprintf("Lettuce is using %d MB of its %d MB allowance (work folders under the data dir; cached container images count too on container hosts)",
-			usedMB, allowanceMB), remedy)
+		fmt.Sprintf("Lettuce is using %d MB of its %d MB allowance (%s)", usedMB, allowanceMB, source), remedy)
 }
 
 // checkCPUEnforcement reports the CPU cap ACTUALLY in force, next to the
@@ -693,6 +741,15 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 			remedy = "this head has no leafs this volunteer can run — see the per-leaf reasons below"
 		}
 	}
+	// When EVERY eligible leaf is locally fetch-gated, this volunteer fetches
+	// nothing from this head right now — the state the daemon reports as
+	// "disk-gated ... stays idle". A pass verdict here is the TB-30 failure
+	// shape (the diagnostic content while the daemon refuses all work), so the
+	// head line escalates to a warning with the notes as the detail.
+	if level == docOK && allEligibleFetchGated(res) {
+		level = docWarn
+		remedy = "the head would send every eligible leaf, but this machine's current disk state blocks fetching all of them — see the per-leaf notes below"
+	}
 	rep.add(level, name, detail, remedy)
 
 	// Per-leaf requirement breakdown (#30): show exactly which leafs this volunteer
@@ -709,6 +766,23 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		}
 	}
 	return true
+}
+
+// allEligibleFetchGated reports whether every leaf the head would dispatch to
+// this volunteer is currently blocked by the machine's LOCAL disk state (its
+// fetchNote). That is the TB-30 failure shape — a content diagnostic while the
+// daemon refuses all work — so the caller escalates it to a warning.
+func allEligibleFetchGated(res eligibilityResult) bool {
+	if res.eligible == 0 {
+		return false
+	}
+	gated := 0
+	for _, le := range res.leaves {
+		if le.eligible && le.fetchNote != "" {
+			gated++
+		}
+	}
+	return gated == res.eligible
 }
 
 // volunteerCaps is the subset of this volunteer's advertised capabilities that gate
@@ -741,6 +815,14 @@ type volunteerCaps struct {
 	// LOCAL download-gate note (TB-24), which uses the same thresholds as the
 	// daemon's live gate so the two can never disagree.
 	freeDataDirMB int64
+	// lettuceUsedMB is Lettuce's measured disk usage from checkDiskUsage, valid
+	// only when usedMBKnown — a partial (workspace-only, images unmeasured)
+	// figure must not feed a budget verdict (TB-30). Feeds the per-leaf
+	// usage + need vs allowance arithmetic, the half of the disk gate that
+	// fired on a tester's host while every free-space number looked fine
+	// (TB-31).
+	lettuceUsedMB int64
+	usedMBKnown   bool
 }
 
 // leafEligibility is the per-leaf verdict doctor prints under a head.
@@ -756,25 +838,44 @@ type leafEligibility struct {
 	fetchNote string
 }
 
-// localDiskFetchNote reports whether this machine's CURRENT free space covers
-// the leaf's declared disk need — the daemon's per-leaf fetch gate, evaluated
-// with doctor's free-space reading and the same daemon.LeafDiskThresholds the
-// live gate uses. Conservative fresh-download reading (doctor does not probe
-// which images are already cached); the wording says so for container leafs.
+// localDiskFetchNote reports whether this machine's CURRENT disk state lets
+// the daemon fetch this leaf — the daemon's per-leaf fetch gate, evaluated
+// with doctor's readings and the same daemon functions the live gate uses
+// (LeafDiskThresholds for free space, DiskBudgetVerdict for the allowance
+// budget, EffectiveLeafDiskNeedMB for an undeclared need — the live gate
+// applies that fallback, so doctor must too or the two disagree exactly on
+// undeclared leafs, TB-31). Conservative fresh-download reading (doctor does
+// not probe which images are already cached); the wording says so for
+// container leafs.
 func localDiskFetchNote(req leafRequirements, caps volunteerCaps) string {
-	if req.diskMB <= 0 || caps.freeDataDirMB <= 0 {
-		return "" // need or reading unknown — unknown is not a verdict
+	need := daemon.EffectiveLeafDiskNeedMB(req.diskMB)
+	assumed := ""
+	if req.diskMB <= 0 {
+		assumed = fmt.Sprintf(" (the leaf declares no disk need; %d MB is the assumed fallback)", need)
 	}
-	dataDirMB, _ := daemon.LeafDiskThresholds(req.diskMB, req.needsContainer, false)
-	if caps.freeDataDirMB >= dataDirMB {
-		return ""
+
+	if caps.freeDataDirMB > 0 {
+		dataDirMB, _ := daemon.LeafDiskThresholds(need, req.needsContainer, false)
+		if caps.freeDataDirMB < dataDirMB {
+			if req.needsContainer {
+				return fmt.Sprintf("a fresh image download for this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available%s — work on an already-downloaded image still runs",
+					need, daemon.DiskFloorMB, caps.freeDataDirMB, assumed)
+			}
+			return fmt.Sprintf("fetching this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available%s",
+				need, daemon.DiskFloorMB, caps.freeDataDirMB, assumed)
+		}
 	}
-	if req.needsContainer {
-		return fmt.Sprintf("a fresh image download for this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available — work on an already-downloaded image still runs",
-			req.diskMB, daemon.DiskFloorMB, caps.freeDataDirMB)
+
+	// The allowance-budget half (TB-30/TB-31): usage + the leaf's need must fit
+	// under max_disk_gb. This is the half that gated a tester's host while
+	// every free-space figure looked fine, and it needs a COMPLETE usage figure
+	// — a workspace-only reading would pass a budget the daemon fails.
+	if caps.usedMBKnown && caps.maxDiskMB > 0 {
+		if ok, reason := daemon.DiskBudgetVerdict(need, req.needsContainer, false, caps.lettuceUsedMB, caps.maxDiskMB); !ok {
+			return reason + assumed
+		}
 	}
-	return fmt.Sprintf("fetching this leaf is currently disk-gated: it needs %d MB free (+%d MB floor), %d MB available",
-		req.diskMB, daemon.DiskFloorMB, caps.freeDataDirMB)
+	return ""
 }
 
 // eligibilityResult aggregates the per-leaf verdicts for one head.
