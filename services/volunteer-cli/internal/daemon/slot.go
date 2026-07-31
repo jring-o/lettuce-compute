@@ -700,7 +700,16 @@ func (sm *SlotManager) ResumeAll() {
 				slot.pausedAt = time.Time{}
 			}
 			if err := slot.processHandle.Resume(); err != nil {
-				sm.logger.Warn("failed to resume process", "slot", slot.ID, "error", err)
+				if sm.shuttingDown.Load() {
+					// The shutdown resume is best-effort: each executor's cancel path
+					// unpauses and stops its own container concurrently, so "not
+					// paused" / "no such container" here means that cleanup already
+					// won the race — a success, not the engine-corruption-looking
+					// failure the WARN read as (TB-29).
+					sm.logger.Info("resume at shutdown skipped (already cleaned up by its executor)", "slot", slot.ID, "error", err)
+				} else {
+					sm.logger.Warn("failed to resume process", "slot", slot.ID, "error", err)
+				}
 			} else {
 				slot.suspended = false
 			}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +36,8 @@ type MockDockerClient struct {
 	ImageRemoveFn          func(ctx context.Context, imageID string) error
 	ImageDeclaredVolumesFn func(ctx context.Context, ref string) ([]string, error)
 	ContainerListFn        func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
+	ContainerPauseFn       func(ctx context.Context, containerID string) error
+	ContainerUnpauseFn     func(ctx context.Context, containerID string) error
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
@@ -154,10 +157,16 @@ func (m *MockDockerClient) ContainerRemove(ctx context.Context, containerID stri
 }
 
 func (m *MockDockerClient) ContainerPause(ctx context.Context, containerID string) error {
+	if m.ContainerPauseFn != nil {
+		return m.ContainerPauseFn(ctx, containerID)
+	}
 	return nil
 }
 
 func (m *MockDockerClient) ContainerUnpause(ctx context.Context, containerID string) error {
+	if m.ContainerUnpauseFn != nil {
+		return m.ContainerUnpauseFn(ctx, containerID)
+	}
 	return nil
 }
 
@@ -818,6 +827,92 @@ func TestContainerRuntime_GracefulStopOnCancel(t *testing.T) {
 		}
 	default:
 		t.Error("ContainerStop was not called on cancellation")
+	}
+}
+
+// TestContainerRuntime_CancelDuringPause_UnpausesBeforeStop is the TB-29
+// regression. While the daemon is paused, container units are frozen with
+// `docker pause`. A Ctrl-C during that pause reached this cancel path, which
+// stopped the still-paused container: podman refuses ("container state
+// improper", WARN), the TERM + grace window is silently defeated, and the
+// deferred force-remove kills the unit frozen. The cancel path must unpause
+// before stopping.
+func TestContainerRuntime_CancelDuringPause_UnpausesBeforeStop(t *testing.T) {
+	var mu sync.Mutex
+	paused, unpaused, stopped := false, false, false
+	stopRefusals := 0
+	mock := &MockDockerClient{
+		ContainerWaitFn: func(ctx context.Context, containerID string) (int64, error) {
+			<-ctx.Done()
+			return 0, ctx.Err()
+		},
+		ContainerPauseFn: func(ctx context.Context, containerID string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			paused = true
+			return nil
+		},
+		ContainerUnpauseFn: func(ctx context.Context, containerID string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if !paused {
+				return fmt.Errorf("container %s is not paused", containerID)
+			}
+			paused, unpaused = false, true
+			return nil
+		},
+		// Podman's documented behavior: stop on a paused container is refused.
+		ContainerStopFn: func(ctx context.Context, containerID string, timeout time.Duration) error {
+			mu.Lock()
+			defer mu.Unlock()
+			if paused {
+				stopRefusals++
+				return fmt.Errorf("container %s is running or paused, refusing to clean up: container state improper", containerID)
+			}
+			stopped = true
+			return nil
+		},
+	}
+	cr, _ := newTestContainerRuntime(t, mock)
+
+	wu := &WorkUnit{
+		ID:            "b7e0aa11-2222-3333-4444-555566667777",
+		ExecutionSpec: ExecutionSpec{Image: "alpine:latest"},
+	}
+	prep, err := cr.Prepare(context.Background(), wu)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	defer cr.Cleanup(prep)
+
+	// The daemon's pause handle freezes the container once the runtime reports
+	// its ID — the state a thermal/resource/user pause leaves a unit in.
+	prep.ContainerIDCallback = func(containerID string) {
+		if pauseErr := mock.ContainerPause(context.Background(), containerID); pauseErr != nil {
+			t.Errorf("pausing: %v", pauseErr)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel() // Ctrl-C lands mid-pause
+	}()
+
+	if _, execErr := cr.Execute(ctx, wu, prep); execErr == nil {
+		t.Fatal("expected cancellation error, got nil")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if stopRefusals != 0 {
+		t.Errorf("ContainerStop reached a still-paused container %d time(s); the engine refuses this (state improper)", stopRefusals)
+	}
+	if !unpaused {
+		t.Error("cancel path never unpaused the paused container")
+	}
+	if !stopped {
+		t.Error("graceful stop never succeeded; the paused unit dies frozen under force-remove, its TERM + grace window defeated")
 	}
 }
 
