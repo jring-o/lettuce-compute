@@ -931,22 +931,49 @@ func (d *Daemon) persistActiveTasks() {
 // all work. Under-reporting therefore costs real work: a running unit left out of the
 // set is reaped and handed to someone else while this machine is still computing it.
 func (d *Daemon) heldWorkUnitIDs() []string {
-	var ids []string
+	held := d.heldWorkUnits()
+	ids := make([]string, 0, len(held))
+	for _, wu := range held {
+		ids = append(ids, wu.ID)
+	}
+	return ids
+}
+
+// heldWorkUnits returns every work unit this volunteer currently holds,
+// exactly once each: queued in the prefetch buffer, mid queue→slot handoff
+// (popped by fillSlots, slot not yet active — TB-33), or running in a slot.
+// The handoff overlaps the active set for an instant at its end, so the union
+// deduplicates by work-unit ID. All buffer arithmetic (fullness, held-IDs
+// reported to heads) is built on this so a unit in transition never reads as
+// dropped or doubled.
+func (d *Daemon) heldWorkUnits() []*runtime.WorkUnit {
+	seen := make(map[string]struct{})
+	var held []*runtime.WorkUnit
+	add := func(wu *runtime.WorkUnit) {
+		if wu == nil {
+			return
+		}
+		if _, dup := seen[wu.ID]; dup {
+			return
+		}
+		seen[wu.ID] = struct{}{}
+		held = append(held, wu)
+	}
 	if d.prefetchQueue != nil {
-		for _, item := range d.prefetchQueue.Items() {
-			if item.WU != nil {
-				ids = append(ids, item.WU.ID)
-			}
+		queued, starting := d.prefetchQueue.HeldSnapshot()
+		for _, item := range queued {
+			add(item.WU)
+		}
+		for _, item := range starting {
+			add(item.WU)
 		}
 	}
 	if d.slotManager != nil {
 		for _, wu := range d.slotManager.ActiveWorkUnits() {
-			if wu != nil {
-				ids = append(ids, wu.ID)
-			}
+			add(wu)
 		}
 	}
-	return ids
+	return held
 }
 
 // persistPrefetchBuffer writes the current prefetch-buffer contents (buffered,
@@ -1056,6 +1083,10 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 		} else {
 			d.persistActiveTasks()
 		}
+		// End the handoff only now: on success the active slot carries the unit
+		// (set before StartSlot returned), on failure it was abandoned to the
+		// head — either way the accounting never saw it uncounted (TB-33).
+		d.prefetchQueue.FinishStart(item.WU.ID)
 	}
 }
 
@@ -1331,26 +1362,13 @@ func (d *Daemon) bufferTargetSeconds() float64 {
 	return hours * 3600 * float64(d.maxSlots())
 }
 
-// bufferedSeconds sums the estimated seconds of work currently buffered (queued,
-// un-run descriptors) and running (active slots). This is the "fill" measured
-// against bufferTargetSeconds.
+// bufferedSeconds sums the estimated seconds of work currently held: queued,
+// mid queue→slot handoff (TB-33), and running (active slots). This is the
+// "fill" measured against bufferTargetSeconds.
 func (d *Daemon) bufferedSeconds() float64 {
 	var total float64
-	if d.prefetchQueue != nil {
-		for _, item := range d.prefetchQueue.Items() {
-			if item.WU == nil {
-				continue
-			}
-			total += d.estSecondsForUnit(item.WU.LeafID, item.WU.RscFpopsEst)
-		}
-	}
-	if d.slotManager != nil {
-		for _, wu := range d.slotManager.ActiveWorkUnits() {
-			if wu == nil {
-				continue
-			}
-			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
-		}
+	for _, wu := range d.heldWorkUnits() {
+		total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
 	}
 	return total
 }
@@ -1397,16 +1415,37 @@ func (d *Daemon) workBufferHoursFull() bool {
 // the work buffer can currently be admitted to it (canAccommodateWU) — the
 // TB-32 starvation state. An empty buffer beside an idle slot counts: a single
 // running unit whose estimate exceeds the whole hours target starves the other
-// slot the same way. Cheap in the healthy case — when every slot is busy it
+// slot the same way. A slot whose unit is mid queue→slot handoff is occupied,
+// not idle (TB-33). Cheap in the healthy case — when every slot is busy it
 // returns false before touching the queue.
 func (d *Daemon) idleSlotStarved() bool {
 	if d.slotManager == nil || d.prefetchQueue == nil {
 		return false
 	}
-	if d.slotManager.ActiveCount() >= d.maxSlots() {
+	queued, starting := d.prefetchQueue.HeldSnapshot()
+	occupied := d.slotManager.ActiveCount()
+	if len(starting) > 0 {
+		// A unit in the handoff is about to occupy a slot; count it as if it
+		// already had, minus any overlap with slots that just turned active.
+		active := make(map[string]struct{})
+		for _, wu := range d.slotManager.ActiveWorkUnits() {
+			if wu != nil {
+				active[wu.ID] = struct{}{}
+			}
+		}
+		for _, item := range starting {
+			if item.WU == nil {
+				continue
+			}
+			if _, dup := active[item.WU.ID]; !dup {
+				occupied++
+			}
+		}
+	}
+	if occupied >= d.maxSlots() {
 		return false
 	}
-	for _, item := range d.prefetchQueue.Items() {
+	for _, item := range queued {
 		if item.WU == nil {
 			continue
 		}
@@ -1472,16 +1511,10 @@ func (d *Daemon) fallbackBufferUnits() int {
 	return fallbackBufferUnitsPerSlot * d.maxSlots()
 }
 
-// bufferedUnitCount counts queued + running units (the unit-count fallback view).
+// bufferedUnitCount counts held units — queued, mid queue→slot handoff
+// (TB-33), and running — each exactly once (the unit-count fallback view).
 func (d *Daemon) bufferedUnitCount() int {
-	n := 0
-	if d.prefetchQueue != nil {
-		n += d.prefetchQueue.Len()
-	}
-	if d.slotManager != nil {
-		n += d.slotManager.ActiveCount()
-	}
-	return n
+	return len(d.heldWorkUnits())
 }
 
 // requestBatchSize returns how many assignments the fetcher should ask a head

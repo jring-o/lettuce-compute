@@ -32,6 +32,14 @@ type PreFetchItem struct {
 type PreFetchQueue struct {
 	mu       sync.Mutex
 	items    []*PreFetchItem
+	// starting holds items popped for a slot whose activation has not finished
+	// (between fillSlots' PopFit and its FinishStart call). Such a unit is in
+	// neither items nor an active slot, so without this set every slot start
+	// opens a window where buffer accounting undercounts by one unit — long
+	// enough for the fetcher to judge the buffer "not full", request one more
+	// unit, and have the TB-32 arrival guard bounce that unit back to the head
+	// when the count recovers before it lands (TB-33).
+	starting map[string]*PreFetchItem
 	maxDepth int
 	logger   *slog.Logger
 	notify   chan struct{} // signaled when an item is pushed
@@ -43,6 +51,7 @@ func NewPreFetchQueue(maxDepth int, logger *slog.Logger) *PreFetchQueue {
 		maxDepth = 3
 	}
 	return &PreFetchQueue{
+		starting: make(map[string]*PreFetchItem),
 		maxDepth: maxDepth,
 		logger:   logger,
 		notify:   make(chan struct{}, 1),
@@ -95,6 +104,12 @@ func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool) *PreFetchItem {
 				skipped.TimesSkipped++
 			}
 			q.items = append(q.items[:i], q.items[i+1:]...)
+			// The unit stays accounted as held until FinishStart: it leaves
+			// the queue and enters the slot handoff in one critical section,
+			// so no reader ever sees it in neither place (TB-33).
+			if item.WU != nil {
+				q.starting[item.WU.ID] = item
+			}
 			return item
 		}
 		if item.TimesSkipped >= maxBackfillStarts {
@@ -102,6 +117,35 @@ func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool) *PreFetchItem {
 		}
 	}
 	return nil
+}
+
+// FinishStart ends a unit's queue→slot handoff: fillSlots calls it once the
+// slot activation attempt is over — the slot is active, or the unit was
+// abandoned after a failed start. Until this call the popped unit still counts
+// as held (see the starting field); afterwards the active slot (or nobody)
+// carries it. Unknown ids are a no-op.
+func (q *PreFetchQueue) FinishStart(id string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	delete(q.starting, id)
+}
+
+// HeldSnapshot returns, under one lock, the queued items and the items in the
+// queue→slot handoff (popped but not yet FinishStart-ed). Buffer accounting
+// and the held-IDs list read this instead of Items so a unit mid-handoff never
+// disappears from the arithmetic (TB-33). Callers deduplicate against active
+// slots by work-unit ID: near the end of a handoff a unit is briefly both
+// starting and active, and must count once, not twice.
+func (q *PreFetchQueue) HeldSnapshot() (queued, starting []*PreFetchItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	queued = make([]*PreFetchItem, len(q.items))
+	copy(queued, q.items)
+	starting = make([]*PreFetchItem, 0, len(q.starting))
+	for _, item := range q.starting {
+		starting = append(starting, item)
+	}
+	return queued, starting
 }
 
 // Pop removes and returns the front item (FIFO). Returns nil if empty.
