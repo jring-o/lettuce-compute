@@ -72,6 +72,13 @@ type Fetcher struct {
 	// ENOSPC. Injected from the daemon; nil disables the skip.
 	leafDiskGateFn func(leaf CachedLeafInfo) (bool, string)
 
+	// leafNeedsAbsentGPUFn reports a leaf that requires a GPU this machine does
+	// not offer — the head refuses those at dispatch, so requesting them only
+	// burns an RPC, and letting them reach the disk gate logs disk remedies for
+	// a leaf no allowance raise could unblock (TB-30). Injected from the
+	// daemon; nil disables the skip.
+	leafNeedsAbsentGPUFn func(leaf CachedLeafInfo) bool
+
 	// --- CLIENT WORK BUFFER (Layer 1) ---
 	// workBufferFullFn reports whether the hours-based client work buffer is full.
 	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
@@ -198,6 +205,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		shouldFetchFunc:          d.shouldFetch,
 		leafFailurePausedFn:      d.leafFailurePaused,
 		leafDiskGateFn:           d.leafDiskGate,
+		leafNeedsAbsentGPUFn:     d.leafNeedsAbsentGPU,
 		workBufferFullFn:         d.workBufferFull,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
@@ -473,8 +481,8 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 				blockedIDs = mergeUnique(blockedIDs, f.serverBlockedLeafIDsFunc(head.Name))
 			}
 			// TB-24: the any-leaf request can't be gated on a specific leaf's
-			// need, so gate it on the synthetic descriptor (per-task default
-			// need, conservative container assumption).
+			// need, so gate it on the synthetic descriptor (unknown-need
+			// fallback, conservative container assumption).
 			if f.leafDiskGateFn != nil {
 				if ok, reason := f.leafDiskGateFn(anyLeafInfo); !ok {
 					f.logger.Debug("fetcher: skipping disk-gated any-leaf request", "server", head.Name, "reason", reason)
@@ -509,6 +517,15 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 			// RequestWorkUnit, so the head is spared the churn too.
 			if f.leafFailurePausedFn != nil && f.leafFailurePausedFn(leaf.ID) {
 				f.logger.Debug("fetcher: skipping leaf paused after repeated local failures", "server", head.Name, "leaf_slug", leaf.Slug, "leaf_id", leaf.ID)
+				continue
+			}
+
+			// TB-30: a leaf that requires a GPU this machine does not offer is
+			// skipped BEFORE the disk gate — the head would refuse it whatever
+			// the disk verdict, so the RPC is pointless and a disk-remedy log
+			// line for it would invite an allowance raise that changes nothing.
+			if f.leafNeedsAbsentGPUFn != nil && f.leafNeedsAbsentGPUFn(leaf) {
+				f.logger.Debug("fetcher: skipping leaf that requires a GPU this machine does not offer", "server", head.Name, "leaf_slug", leaf.Slug)
 				continue
 			}
 

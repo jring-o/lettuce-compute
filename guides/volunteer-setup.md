@@ -121,10 +121,15 @@ work files.
   live"](#where-container-images-actually-live-vmlxc-users-read-this) below).
   A leaf whose image is already downloaded needs only workspace headroom. When
   every enabled leaf is blocked this way the daemon stays idle and logs a
-  one-time WARN naming the numbers; with a mix, the affordable leafs keep
-  working while the too-big one is skipped. `lettuce-volunteer doctor` reports
-  free space, Lettuce's own measured usage, and — per leaf — whether a download
-  is currently gated. If your home volume is small, point `--data-dir` at a
+  one-time WARN naming the numbers and an example leaf; with a mix, the
+  affordable leafs keep working while the too-big one is skipped.
+  `lettuce-volunteer doctor` reports free space, Lettuce's own measured usage,
+  and — per leaf — whether fetching is currently gated, including the
+  usage-plus-need arithmetic against your allowance. The usage figure is read
+  from the **running daemon** (whose measurement — work folders plus downloaded
+  container images — is the one the gate enforces); with the daemon stopped on
+  a container host, doctor says the figure is partial rather than calling the
+  budget healthy. If your home volume is small, point `--data-dir` at a
   roomier disk; if the image store is small, see the remedies below.
 - **`max_disk_gb` is the capacity you offer, in both directions.** It is the
   disk budget your client advertises to each head — a head only sends you a

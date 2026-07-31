@@ -61,16 +61,39 @@ const imageCacheCheckTTL = 30 * time.Second
 // measurement walks the data-dir tree, which is not free on big work dirs.
 const diskUsageCheckTTL = 60 * time.Second
 
+// UnknownLeafDiskNeedMB is the disk need assumed for a leaf that does not
+// declare resource_requirements.min_disk_mb. It used to be the per-task /work
+// ceiling default (runtime.DefaultPerTaskDiskMB, 10 GB), which exactly equals
+// the default max_disk_gb allowance — usage + need could then only fit at zero
+// measured usage, so a default-configured volunteer was silently disk-gated on
+// every undeclared leaf the moment the daemon had written a log file (TB-31).
+// 2 GB keeps "unknown is not needs-nothing" while leaving the default
+// allowance ~8 GB of usage headroom; heads stamp min_disk_mb = 1024 at leaf
+// creation (and migration 00029 backfills legacy leafs), so this fallback only
+// governs heads that publish no requirements at all.
+const UnknownLeafDiskNeedMB = 2048
+
+// EffectiveLeafDiskNeedMB returns the disk need the gate uses for a leaf
+// declaring declaredMB (resource_requirements.min_disk_mb; 0 = the head did
+// not say). Exported because doctor's per-leaf verdicts must apply the same
+// fallback, or the diagnostic and the live gate disagree on undeclared leafs.
+func EffectiveLeafDiskNeedMB(declaredMB int64) int64 {
+	if declaredMB > 0 {
+		return declaredMB
+	}
+	return UnknownLeafDiskNeedMB
+}
+
 // leafDiskNeedMB returns the disk the leaf declares it needs on this machine
 // (resource_requirements.min_disk_mb, the same number the head's dispatch gate
-// compares against the advertised allowance). Zero/absent means the head did
-// not say — fall back to the per-task default rather than zero, because
-// unknown is not "needs nothing".
+// compares against the advertised allowance), or the unknown-need fallback
+// when the head did not say.
 func leafDiskNeedMB(leaf CachedLeafInfo) int64 {
-	if leaf.ResourceRequirements != nil && leaf.ResourceRequirements.MinDiskMB > 0 {
-		return leaf.ResourceRequirements.MinDiskMB
+	var declared int64
+	if leaf.ResourceRequirements != nil {
+		declared = leaf.ResourceRequirements.MinDiskMB
 	}
-	return int64(runtime.DefaultPerTaskDiskMB)
+	return EffectiveLeafDiskNeedMB(declared)
 }
 
 // LeafDiskThresholds returns the free-space thresholds (MB) the fetch gate

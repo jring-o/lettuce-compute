@@ -1144,7 +1144,7 @@ func (d *Daemon) shouldFetch() bool {
 	leafs := d.allEnabledLeafs()
 	if len(leafs) == 0 {
 		// No cached leaf catalog (e.g. a head that doesn't surface GetHeadInfo):
-		// gate the any-leaf request on the per-task default need, since the
+		// gate the any-leaf request on the unknown-need fallback, since the
 		// leaf's real requirement is unknowable here.
 		if ok, reason := d.leafDiskGate(anyLeafInfo); !ok {
 			d.warnDiskGateOnce(reason)
@@ -1154,16 +1154,57 @@ func (d *Daemon) shouldFetch() bool {
 		return true
 	}
 
+	var gatedLabel, gatedReason string
+	sawFetchable := false
 	for _, leaf := range leafs {
-		if ok, _ := d.leafDiskGate(leaf); ok {
+		// A leaf that requires a GPU this machine does not offer is refused by
+		// the head whatever its disk verdict, so it neither justifies fetching
+		// nor supplies the representative disk reason — a disk remedy quoted
+		// for it (raise max_disk_gb) could not change the outcome (TB-30).
+		if d.leafNeedsAbsentGPU(leaf) {
+			continue
+		}
+		sawFetchable = true
+		ok, reason := d.leafDiskGate(leaf)
+		if ok {
 			d.clearDiskGateWarning()
 			return true
 		}
+		if gatedLabel == "" {
+			gatedLabel = leaf.Slug
+			if gatedLabel == "" {
+				gatedLabel = leaf.ID
+			}
+			gatedReason = reason
+		}
 	}
-	// Every enabled leaf is disk-gated; surface one representative reason.
-	_, reason := d.leafDiskGate(leafs[0])
-	d.warnDiskGateOnce("every enabled leaf is disk-gated — first: " + reason)
+	if !sawFetchable {
+		// Every enabled leaf needs a GPU this machine does not offer — a
+		// permanent capability mismatch, not a disk stall. `leafs list` and
+		// `doctor` name it per leaf (TB-21).
+		d.logger.Debug("shouldFetch: every enabled leaf requires a GPU this machine does not offer")
+		return false
+	}
+	// Every fetchable leaf is disk-gated; surface one representative reason,
+	// naming its leaf — an unnamed "this leaf" sent a tester hunting through
+	// the catalog for which leaf the numbers belonged to (TB-30).
+	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason))
 	return false
+}
+
+// leafNeedsAbsentGPU reports whether this leaf requires a GPU (either of the
+// two gpu_required flags — dispatch ORs them, TB-21) on a machine that
+// advertises none. Presence-only deliberately: VRAM, vendor and compute
+// capability shortfalls stay the head's call, so this can never skip a leaf
+// the head would actually dispatch.
+func (d *Daemon) leafNeedsAbsentGPU(leaf CachedLeafInfo) bool {
+	if d.HasGPU() {
+		return false
+	}
+	if leaf.ExecutionSpec != nil && leaf.ExecutionSpec.GPURequired {
+		return true
+	}
+	return leaf.ResourceRequirements != nil && leaf.ResourceRequirements.GPURequired
 }
 
 // allEnabledLeafs returns the enabled leafs across every attached head.
