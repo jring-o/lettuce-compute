@@ -648,7 +648,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 			// Wait for resume.
 			if !d.waitForResume(ctx, pauseCh) {
-				// Shutting down — resume processes so they can be cleaned up.
+				// Shutting down — resume processes so they can be cleaned up. Mark the
+				// shutdown BEFORE resuming: the executors' own cancel paths are already
+				// racing to unpause-and-stop their containers, so a resume that finds
+				// its container gone (or no longer paused) is cleanup succeeding, not
+				// failing, and ResumeAll must not WARN about it (TB-29).
+				d.slotManager.SetShuttingDown()
 				d.slotManager.ResumeAll()
 				return nil // context cancelled
 			}
@@ -1956,6 +1961,12 @@ func (d *Daemon) waitForScheduleActive(ctx context.Context) bool {
 	if hadActive {
 		// Resume even on cancellation so the suspended processes are unfrozen for the
 		// shutdown path to clean up; the SuspendAll above is otherwise unbalanced.
+		// On cancellation, mark the shutdown first so ResumeAll treats a container
+		// already cleaned up by its executor's racing cancel path as the success it
+		// is rather than WARNing (TB-29).
+		if err != nil {
+			d.slotManager.SetShuttingDown()
+		}
 		d.slotManager.ResumeAll()
 		if err == nil {
 			d.logger.Info("schedule active again: resumed previously suspended tasks")

@@ -741,6 +741,15 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 			// period so its entrypoint receives a termination signal and can flush a
 			// final checkpoint before being killed. Detached context — waitCtx is done.
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), gracefulShutdownGrace+5*time.Second)
+			// The cancellation can land mid-pause (the daemon suspends container
+			// units with `docker pause`). A paused container cannot take the TERM:
+			// podman refuses the stop outright ("container state improper") and the
+			// unit dies frozen under the deferred force-remove, its grace window
+			// silently defeated (TB-29). Unpause first, best-effort — "not paused"
+			// is the normal case and not worth a log line.
+			if unpauseErr := c.dockerClient.ContainerUnpause(stopCtx, containerID); unpauseErr == nil {
+				c.logger.Info("unpaused container for graceful stop", "work_unit_id", wu.ID, "container", containerID)
+			}
 			if stopErr := c.dockerClient.ContainerStop(stopCtx, containerID, gracefulShutdownGrace); stopErr != nil {
 				c.logger.Warn("graceful container stop failed", "work_unit_id", wu.ID, "container", containerID, "error", stopErr)
 			}
