@@ -264,19 +264,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 			logger.Info("re-registered with server", "server", name, "volunteer_id", volID, "head_version", headVersion)
 		}
 
-		// Protocol-version coupling: warn loudly when the head and this volunteer are
-		// on different non-dev builds, since that is exactly the condition that gets a
-		// volunteer rejected ("too old for this head"). "dev" builds are local and
-		// never coupled, so they are excluded to avoid crying wolf during development.
-		// Compare NORMALIZED versions: the volunteer release stamps a bare "0.5.2"
-		// (release.yml strips the leading v) while the head, built from
-		// `git describe --tags`, stamps "v0.5.2" — without normalizing, a correctly
-		// matched pair would false-positive purely over the "v" prefix.
-		if headVersion != "" && version != "" && headVersion != "dev" && version != "dev" &&
-			normalizeVersion(headVersion) != normalizeVersion(version) {
-			logger.Warn("volunteer/head version mismatch; head and volunteers must run matching builds (protocol-version coupling)",
-				"server", name, "head_version", headVersion, "volunteer_version", version)
-		}
+		// Version-skew note (TB-36): a newer volunteer against an older head is the
+		// project's NORMAL state after every client-only release, so a mere
+		// version-string difference is worth an Info line, never a WARN — the old WARN
+		// asserted "must run matching builds", a requirement that does not exist and
+		// that fired on every volunteer at every boot for as long as a client-only
+		// release was current. The REAL compatibility gate is the head actively
+		// rejecting a too-old client, which has its own loud, actionable WARN on the
+		// work path ("run 'lettuce-volunteer update'"). "dev" builds are local and
+		// never coupled, so they are excluded. Compare NORMALIZED versions: the
+		// volunteer release stamps a bare "0.5.2" (release.yml strips the leading v)
+		// while the head, built from `git describe --tags`, stamps "v0.5.2".
+		logVersionSkew(logger, name, headVersion, version)
 	}
 
 	if len(connections) == 0 {
@@ -544,7 +543,24 @@ func parseSlogLevel(level string) slog.Level {
 // normalizeVersion strips surrounding whitespace and a single leading "v" so the
 // volunteer's release stamp ("0.5.2", v-less per release.yml) compares equal to the
 // head's stamp ("v0.5.2" when built from `git describe --tags`). Used only for the
-// version-mismatch check, not for display.
+// version-skew note, not for display.
 func normalizeVersion(v string) string {
 	return strings.TrimPrefix(strings.TrimSpace(v), "v")
+}
+
+// logVersionSkew emits the boot-time note for a head/volunteer release-version
+// difference — at INFO, because a version skew is informational, not actionable
+// (TB-36): volunteers cannot upgrade heads, most releases are client-only, and the
+// head enforces real compatibility itself by rejecting a too-old client with its
+// own WARN and an update hint. Nothing is logged for matching, empty, or "dev"
+// versions.
+func logVersionSkew(logger *slog.Logger, server, headVersion, volunteerVersion string) {
+	if headVersion == "" || volunteerVersion == "" || headVersion == "dev" || volunteerVersion == "dev" {
+		return
+	}
+	if normalizeVersion(headVersion) == normalizeVersion(volunteerVersion) {
+		return
+	}
+	logger.Info("volunteer and head run different releases; this is normal after a client-only release — the head will say so itself if this build is ever too old for it",
+		"server", server, "head_version", headVersion, "volunteer_version", volunteerVersion)
 }
