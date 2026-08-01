@@ -88,8 +88,11 @@ type UnitSnapshot struct {
 	// yet — RESERVED or RUNNING. A live copy may still produce a result, so the unit is never
 	// dead-lettered while one exists.
 	LiveCopies int
-	// TotalCopies is the number of copies ever created for the unit (the dead-letter ceiling
-	// probe).
+	// TotalCopies is the number of BUDGET-COUNTING copies ever created for the unit (the
+	// dead-letter ceiling probe). Since TB-35 the count the snapshot builder reads
+	// (CountTotalCopies) excludes RETURNED give-backs — a copy a volunteer returned un-run
+	// because its buffer could not use it carries no information about the unit and must
+	// not spend its budget; every other copy, probation included, still counts.
 	TotalCopies int
 	// ErrorCopies is the number of copies that ended badly (EXPIRED/ABANDONED) plus DISAGREED
 	// results — the max_error_copies probe.
@@ -175,10 +178,15 @@ func RedundancyMet(s UnitSnapshot) bool {
 // unit with a live copy — that copy is allowed to finish (matches DeadLetterIfExhausted's
 // "no live copy" guard).
 //
-// Both probes are DELIBERATELY RAW (TotalCopies / ErrorCopies, probation included): the copy
-// budget is the resource valve that bounds a unit's total churn, so a unit that keeps drawing
-// probation copies (which never cover redundancy) still eventually exhausts its budget and
-// stops burning the pool — the forced-replication above cannot loop unboundedly.
+// Both probes are DELIBERATELY RAW with respect to standing (TotalCopies / ErrorCopies,
+// probation included): the copy budget is the resource valve that bounds a unit's total churn,
+// so a unit that keeps drawing probation copies (which never cover redundancy) still eventually
+// exhausts its budget and stops burning the pool — the forced-replication above cannot loop
+// unboundedly. The ONE exclusion is RETURNED give-backs (TB-35), filtered out upstream in the
+// counts themselves (budgetCopiesSQL / errorCopiesSQL): an un-run buffer give-back says nothing
+// about the unit, and billing it dead-lettered healthy units at zero compute. Its churn is
+// bounded on the dispatch side instead (the re-offer cooldown + the client's fetch hysteresis),
+// not by unit death.
 func capsExhausted(s UnitSnapshot) bool {
 	p := s.Policy
 	if p.MaxTotalCopies > 0 && s.TotalCopies >= p.MaxTotalCopies {

@@ -318,10 +318,13 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   volunteer follows it.
 - **It keeps a client work buffer measured in hours, not units.** Rather than
   fetching one unit at a time, the volunteer requests work in batches and holds
-  roughly `work_buffer_hours` of work per concurrent task. While that buffer is
-  full it makes **zero** work requests — it just runs what it has. Buffered work
-  is reserved for you by the head (not yet started), so it is cheap to hand back
-  if you stop, and it is only downloaded/prepared right before it runs.
+  roughly `work_buffer_hours` of work per concurrent task. Once that buffer has
+  filled it makes **zero** work requests until the remaining work has drained
+  below about half the target, then refills back to the target in one round — so
+  fetches come in well-spaced batches instead of a constant trickle of one-unit
+  top-ups at the target line. Buffered work is reserved for you by the head (not
+  yet started), so it is cheap to hand back if you stop, and it is only
+  downloaded/prepared right before it runs.
 - **"Full" also means usable.** If a slot is idle but nothing in the buffer can
   start beside what's already running (say every buffered unit needs more memory
   than you have left), the buffer does not count as full: the volunteer keeps
@@ -335,7 +338,13 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   short units is requested in a single large batch (up to a safety ceiling)
   instead of a trickle of tiny requests — your buffer fills to its
   `work_buffer_hours` target and your CPUs stay busy between polls. You don't
-  configure this; longer-unit leafs are simply requested fewer at a time.
+  configure this; longer-unit leafs are simply requested fewer at a time. If the
+  head's per-unit figure turns out wrong, the volunteer corrects it from the
+  units that actually arrive and caps the next request at what the last round
+  could really hold, so one mis-sized batch never turns into an endless
+  request-and-return loop. Returned units cost the work unit nothing: the head
+  records them as unused give-backs (not failures) and simply avoids re-offering
+  the same unit to the same machine for a few minutes.
 - **Buffered units start first-fit, not strictly first-fetched.** A free slot
   takes the oldest buffered unit that fits in the memory you've allowed
   (`resource_limits.max_memory_mb`). If the oldest unit needs more memory than

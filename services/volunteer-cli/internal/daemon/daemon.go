@@ -183,6 +183,24 @@ type Daemon struct {
 	benchmarkFPOPS float64
 	dcfTracker     *DCFTracker
 
+	// Per-leaf per-unit seconds observed on the most recent ARRIVED batch (TB-34):
+	// the mean estSecondsForUnit over the units a batch actually delivered. The
+	// batch-size estimate (leafEstSeconds) takes the max of this and the leaf-level
+	// figure, so one 60× over-ask corrects itself on the very next round instead of
+	// waiting on the DCF — which learns only from COMPLETIONS and so never hears
+	// about units that keep being returned un-run (the self-sustaining loop).
+	arrivalEstMu  sync.Mutex
+	arrivalEstSec map[string]float64
+
+	// Fetch-gate hysteresis (TB-34): once the buffer fills to the hours target,
+	// fetching stays closed until the REMAINING buffered work drains below the
+	// low-water mark (workBufferLowWaterFrac), instead of reopening one unit under
+	// the target line. Without the latch, fetch-gate and arrival-acceptance shared
+	// one threshold, so a buffer hovering at the line requested-and-refused
+	// indefinitely (the observed 170–283 give-backs per host per day).
+	bufferFilledMu sync.Mutex
+	bufferFilled   bool
+
 	// Image-presence gate: caches, per enabled leaf image, whether that image is
 	// already pulled, so the disk gate requires only workspace headroom for a
 	// cached-image rerun — for THAT leaf, not for every leaf (TB-24; the old
@@ -405,6 +423,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		processGroup:     pg,
 		benchmarkFPOPS:   benchFPOPS,
 		dcfTracker:       dcfTracker,
+		arrivalEstSec:    make(map[string]float64),
 	}
 }
 
@@ -1336,15 +1355,48 @@ func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
 // when the head supplied no estimate.
 func (d *Daemon) leafEstSeconds(leaf CachedLeafInfo) float64 {
 	sec := leaf.EstimatedDurationSeconds
-	if sec <= 0 {
-		return 0
-	}
-	if d.dcfTracker != nil {
+	if sec > 0 && d.dcfTracker != nil {
 		if dcf := d.dcfTracker.Get(leaf.ID); dcf > 0 {
 			sec *= dcf
 		}
 	}
+	// TB-34: fold in what the last ARRIVED batch of this leaf actually measured
+	// (per-unit FP-ops against this host's benchmark). Taking the max corrects the
+	// over-ask case — a leaf-level estimate far below the units' real size asked for
+	// 60× what the buffer could hold, and the DCF never corrects it because it learns
+	// only from completions, which the returned tail never produces. When the head's
+	// figure is the larger one it still wins (smaller asks are the safe direction).
+	d.arrivalEstMu.Lock()
+	if arr := d.arrivalEstSec[leaf.ID]; arr > sec {
+		sec = arr
+	}
+	d.arrivalEstMu.Unlock()
+	if sec <= 0 {
+		return 0
+	}
 	return sec
+}
+
+// noteArrivalEstimate records the per-unit seconds a just-arrived unit of the leaf
+// implies (its rsc_fpops_est against this host's benchmark, DCF applied — see
+// arrivalEstSec). Called by the fetcher per arrival; a unit with no usable estimate
+// records nothing (the previous figure stands). Units of one leaf are near-uniform,
+// so the latest observation is the batch signal with no windowing machinery.
+func (d *Daemon) noteArrivalEstimate(leafID string, rscFpopsEst float64) {
+	if leafID == "" {
+		return
+	}
+	sec := d.estSecondsForUnit(leafID, rscFpopsEst)
+	if sec <= 0 {
+		return
+	}
+	d.arrivalEstMu.Lock()
+	if d.arrivalEstSec == nil {
+		// Lazy init: test daemons are built as struct literals without the constructor.
+		d.arrivalEstSec = make(map[string]float64)
+	}
+	d.arrivalEstSec[leafID] = sec
+	d.arrivalEstMu.Unlock()
 }
 
 // bufferTargetSeconds is the total seconds of work the client work buffer aims
@@ -1364,7 +1416,11 @@ func (d *Daemon) bufferTargetSeconds() float64 {
 
 // bufferedSeconds sums the estimated seconds of work currently held: queued,
 // mid queue→slot handoff (TB-33), and running (active slots). This is the
-// "fill" measured against bufferTargetSeconds.
+// "fill" measured against bufferTargetSeconds. Every unit is booked at its FULL
+// estimate — including running ones — which is the right (conservative) measure
+// for ACCEPTANCE: an arriving unit must fit under the target however far the
+// running work has progressed. The refill trigger uses the remaining-time view
+// (bufferedRemainingSeconds) instead.
 func (d *Daemon) bufferedSeconds() float64 {
 	var total float64
 	for _, wu := range d.heldWorkUnits() {
@@ -1373,22 +1429,89 @@ func (d *Daemon) bufferedSeconds() float64 {
 	return total
 }
 
+// bufferedRemainingSeconds is the buffer fill measured as REMAINING work: a
+// running unit counts max(estimate − run time so far, 0) instead of its full
+// booking (TB-34, from the tester's design input: "2 h buffered" can mean ~1 h of
+// actual runway, so a refill trigger that reads full bookings starts later than
+// the target implies). Queued and mid-handoff units still count in full — nothing
+// has been spent on them. Only the hysteresis low-water comparison reads this;
+// acceptance keeps the conservative full-booking view.
+func (d *Daemon) bufferedRemainingSeconds() float64 {
+	var elapsed map[string]time.Duration
+	if d.slotManager != nil {
+		elapsed = d.slotManager.ActiveElapsedByUnit()
+	}
+	var total float64
+	for _, wu := range d.heldWorkUnits() {
+		est := d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		if ran, ok := elapsed[wu.ID]; ok {
+			est -= ran.Seconds()
+			if est < 0 {
+				est = 0
+			}
+		}
+		total += est
+	}
+	return total
+}
+
+// workBufferLowWaterFrac is the hysteresis low-water mark as a fraction of the
+// hours target (TB-34): once the buffer has filled, fetching reopens only when
+// the REMAINING buffered work drains below this fraction, so the interval
+// between fetch rounds is about half the buffer of compute — the incumbent
+// volunteer-computing platform's proven two-level ("min/max buffer") design.
+// One shared threshold for fetch-gate and arrival-acceptance made the buffer
+// hover at the line and request-and-refuse indefinitely.
+const workBufferLowWaterFrac = 0.5
+
 // workBufferFull reports whether the client work buffer holds enough work that
 // the fetcher must issue ZERO RequestWorkUnit calls (Layer-1 DoD #2).
 //
-// Fullness is the hours/count verdict (workBufferHoursFull) with one escape:
-// hours are not runnability (TB-32). A buffer saturated with units admission
-// refuses beside the running work — one big-memory leaf on a 2-slot host — used
-// to pin the idle slot for hours while other attached leafs had admissible
-// units the fetcher never asked for. So a full-by-hours buffer that cannot
-// occupy an idle slot does not gate fetching; the fetcher then requests in
-// starved-backfill mode (see starvedBackfill), which restricts it to leafs that
-// could actually fill that slot.
+// Fullness is the hours/count verdict (workBufferHoursFull) with HYSTERESIS
+// (TB-34): reaching the target latches the gate closed, and it stays closed —
+// even as completions drop the fill back under the target — until the remaining
+// buffered work sinks below the low-water mark (workBufferLowWaterFrac, measured
+// in REMAINING time so booked-but-mostly-done running work does not overstate
+// the runway). Then one refill round fills back to the target. Acceptance
+// (bufferAccepts) deliberately keeps the raw single threshold: hysteresis shapes
+// when we ASK, never how much we may hold.
+//
+// One escape, unchanged (TB-32): hours are not runnability. A buffer saturated
+// with units admission refuses beside the running work — one big-memory leaf on
+// a 2-slot host — used to pin the idle slot for hours while other attached
+// leafs had admissible units the fetcher never asked for. So a full buffer that
+// cannot occupy an idle slot does not gate fetching, latch or no latch; the
+// fetcher then requests in starved-backfill mode (see starvedBackfill), which
+// restricts it to leafs that could actually fill that slot.
 func (d *Daemon) workBufferFull() bool {
-	if !d.workBufferHoursFull() {
+	d.bufferFilledMu.Lock()
+	if d.workBufferHoursFull() {
+		d.bufferFilled = true
+	} else if d.bufferFilled && d.bufferBelowLowWater() {
+		d.bufferFilled = false
+	}
+	full := d.bufferFilled
+	d.bufferFilledMu.Unlock()
+	if !full {
 		return false
 	}
 	return !d.idleSlotStarved()
+}
+
+// bufferBelowLowWater reports whether the buffer has drained enough for the
+// hysteresis latch to reopen fetching: remaining buffered work under
+// workBufferLowWaterFrac of the hours target. When the hours math is unusable
+// (buffering disabled, or held units with no estimates) it reopens at the
+// unit-count cap itself — count mode keeps its pre-hysteresis cadence, because a
+// halved count threshold would idle the slot between the last spare unit
+// starting and the next fetch round, and count-mode asks are already bounded by
+// the batch-feedback cap rather than by an estimate.
+func (d *Daemon) bufferBelowLowWater() bool {
+	target := d.bufferTargetSeconds()
+	if target <= 0 || d.bufferedSeconds() <= 0 {
+		return d.bufferedUnitCount() < d.fallbackBufferUnits()
+	}
+	return d.bufferedRemainingSeconds() < target*workBufferLowWaterFrac
 }
 
 // workBufferHoursFull is the raw hours/count fullness verdict, with no regard
@@ -1828,6 +1951,11 @@ func (d *Daemon) allEnabledImageRefs() []string {
 // abandonItem returns an un-run prefetched unit to the head so it isn't orphaned
 // as ASSIGNED. Uses a detached context with a short timeout so it still reaches
 // the head during shutdown, when the run context is already cancelled. See item 4.
+// Flagged unrun_giveback: every caller returns a BUFFERED unit this volunteer
+// never computed (shutdown clear, failed slot start), so the head closes the copy
+// RETURNED — budget-neutral (TB-35). The head verifies the copy really never
+// run-started before honoring the flag, so a start that failed AFTER StartWork
+// landed still closes ABANDONED.
 func (d *Daemon) abandonItem(item *PreFetchItem, reason string) {
 	if item == nil || item.Conn == nil || item.Conn.Client == nil || item.WU == nil {
 		return
@@ -1835,10 +1963,11 @@ func (d *Daemon) abandonItem(item *PreFetchItem, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := item.Conn.Client.AbandonWorkUnit(ctx, &lettucev1.AbandonWorkUnitRequest{
-		WorkUnitId:  item.WU.ID,
-		VolunteerId: item.Conn.VolunteerID,
-		PublicKey:   d.pubKey,
-		Reason:      reason,
+		WorkUnitId:    item.WU.ID,
+		VolunteerId:   item.Conn.VolunteerID,
+		PublicKey:     d.pubKey,
+		Reason:        reason,
+		UnrunGiveback: true,
 	}); err != nil {
 		d.logger.Warn("failed to abandon un-run work unit", "work_unit_id", item.WU.ID, "error", err)
 		return

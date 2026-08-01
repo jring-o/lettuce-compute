@@ -1,0 +1,22 @@
+-- 00030_returned_copy_outcome.up.sql
+-- Budget-neutral give-backs (TB-35): a new copy outcome RETURNED.
+--
+-- A v0.10.7+ volunteer returns a batch unit it never started when its work buffer cannot
+-- use it (the TB-32 arrival-time give-back). Those returns were closed ABANDONED, and the
+-- dead-letter ceiling counts every history row, so a healthy unit whose batch tail kept
+-- bouncing between full buffers burned through max_total_copies and was parked FAILED with
+-- zero compute ever attempted — 33 units in one day on the live heads, 8 of them carrying an
+-- honest PENDING result that was orphaned by the kill.
+--
+-- RETURNED closes such a copy NON-PUNITIVELY and BUDGET-NEUTRALLY: it counts toward neither
+-- the dead-letter total ceiling nor the error-copy cap (it carries no information about the
+-- unit — only about the returning volunteer's buffer at that moment), and it does not bench
+-- the volunteer the way a started-then-failed copy does. Its only effect is a short
+-- re-offer cooldown so the same machine is not handed the same unit straight back.
+-- The head stamps it ONLY when the wire flag unrun_giveback is set AND the copy really
+-- never started (started_at IS NULL) — the flag alone never whitewashes a started copy.
+--
+-- ADDITIVE / non-breaking: a new enum value only. Older clients never set the flag, so
+-- their give-backs keep closing ABANDONED exactly as before. ADD VALUE is transactional on
+-- PostgreSQL 12+ (the head runs 16).
+ALTER TYPE assignment_outcome ADD VALUE IF NOT EXISTS 'RETURNED';

@@ -393,6 +393,13 @@ message AbandonWorkUnitRequest {
   string volunteer_id = 2;
   bytes public_key = 3;
   string reason = 4;              // e.g., "prepare failed: no binary for platform"
+  // True when the volunteer is returning a unit it never started because its work
+  // buffer could not use it (an arrival-time give-back), as opposed to abandoning
+  // work that failed. The head verifies the copy really never started before
+  // treating the return as budget-neutral (outcome RETURNED instead of ABANDONED);
+  // the flag alone never whitewashes a started copy. Absent (false) from older
+  // clients, whose give-backs are then billed as plain abandons, as before.
+  bool unrun_giveback = 5;
 }
 
 message AbandonWorkUnitResponse {

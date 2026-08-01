@@ -529,6 +529,28 @@ func (sm *SlotManager) ActiveWorkUnits() []*runtime.WorkUnit {
 	return wus
 }
 
+// ActiveElapsedByUnit returns, per active slot's work unit, the COMPUTE time it
+// has accrued across sessions: sessionElapsed minus sessionPaused, so suspended
+// stretches do not read as progress (the TB-18 lesson) and daemon-down gaps never
+// count. The work buffer's refill trigger subtracts it from each running unit's
+// estimate so booked-but-mostly-done work does not overstate the remaining
+// runway (TB-34).
+func (sm *SlotManager) ActiveElapsedByUnit() map[string]time.Duration {
+	out := make(map[string]time.Duration)
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil {
+			ran := slot.sessionElapsed() - slot.sessionPaused()
+			if ran < 0 {
+				ran = 0
+			}
+			out[slot.wu.ID] = ran
+		}
+		slot.mu.Unlock()
+	}
+	return out
+}
+
 // ActiveWorkDirs returns the per-unit work directories of all currently active slots.
 // Used by the startup orphaned-work-dir GC (#58) to know which dirs are owned by a
 // running slot (and so must NOT be reaped). A slot with no prep (not yet started) or an

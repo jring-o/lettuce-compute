@@ -3413,10 +3413,13 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 // benchSet builds a candidate's timed bench map from the refill snapshot's
 // per-volunteer benching outcomes (nil for an empty/absent slice, so an unstaged
 // candidate carries a nil — not empty — map, read as "no members" at no allocation
-// cost). Each entry mirrors the SQL cooldown gate exactly (PB-9): the bench lapses
-// one cooldown window (~one deadline, floor 1s — GREATEST(deadline_seconds, 1)) after
-// the benching outcome, and the pool-exhausted fallback may re-admit the volunteer
-// benchPoolExhaustedGraceSeconds after that outcome if the unit is still uncovered.
+// cost). Each entry mirrors the SQL cooldown gate exactly (PB-9): a bench outcome
+// lapses one cooldown window (~one deadline, floor 1s — GREATEST(deadline_seconds, 1))
+// after it; a RETURNED give-back (TB-35) lapses after the short re-offer throttle
+// (ReturnedReofferCooldownSeconds) instead. Either way the pool-exhausted fallback may
+// re-admit the volunteer benchPoolExhaustedGraceSeconds after the outcome if the unit
+// is still uncovered. A volunteer with entries of both kinds keeps whichever bench
+// holds longest (the SQL gate refuses while ANY arm refuses).
 func benchSet(benched []workunit.BenchedVolunteer, deadlineSeconds int) map[types.ID]benchEntry {
 	if len(benched) == 0 {
 		return nil
@@ -3427,10 +3430,23 @@ func benchSet(benched []workunit.BenchedVolunteer, deadlineSeconds int) map[type
 	}
 	s := make(map[types.ID]benchEntry, len(benched))
 	for _, b := range benched {
-		s[b.VolunteerID] = benchEntry{
-			until:      b.OutcomeAt.Add(cooldown),
+		window := cooldown
+		if b.Returned {
+			window = workunit.ReturnedReofferCooldownSeconds * time.Second
+		}
+		e := benchEntry{
+			until:      b.OutcomeAt.Add(window),
 			fallbackAt: b.OutcomeAt.Add(benchPoolExhaustedGraceSeconds * time.Second),
 		}
+		if prev, ok := s[b.VolunteerID]; ok {
+			if prev.until.After(e.until) {
+				e.until = prev.until
+			}
+			if prev.fallbackAt.After(e.fallbackAt) {
+				e.fallbackAt = prev.fallbackAt
+			}
+		}
+		s[b.VolunteerID] = e
 	}
 	return s
 }

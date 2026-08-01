@@ -734,9 +734,14 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > with **no per-attempt retry cap**. The only terminal stop is a dead-letter ceiling
 > (`max_total_copies`, currently auto-derived to `redundancy_factor + 6`): a unit that
 > can never be completed is parked `FAILED` + flagged for review rather than retried
-> forever. A volunteer whose copy just timed out is briefly benched so a fresh
-> volunteer gets first refusal, then becomes eligible again if the pool is otherwise
-> exhausted (so work never strands).
+> forever. Copies a volunteer hands back **unused** (its work buffer could not hold
+> them — recorded as `RETURNED`) do **not** count toward that ceiling or the error cap:
+> a full buffer says nothing about the unit, so give-backs can never dead-letter a
+> healthy unit. A returned unit is simply not re-offered to the same machine for about
+> ten minutes. Once a unit's budget **is** spent, dispatch stops serving it entirely
+> while it awaits the dead-letter sweep. A volunteer whose copy timed out is briefly
+> benched so a fresh volunteer gets first refusal, then becomes eligible again if the
+> pool is otherwise exhausted (so work never strands).
 
 ### Account standing backpressure
 

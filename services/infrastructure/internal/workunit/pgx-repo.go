@@ -547,6 +547,17 @@ func subjectExprSQL(volAlias string) string {
 // rule in memory (server.benchEntry).
 const BenchPoolExhaustedGraceSeconds = 120
 
+// ReturnedReofferCooldownSeconds is how long a RETURNED give-back (TB-35) keeps the
+// SAME volunteer from being re-offered the SAME unit. A give-back is budget-neutral
+// and non-punitive, so this short window is its only teeth: without it the head
+// re-handed a just-returned copy to the machine that returned it seconds ago, and the
+// pair ping-ponged one unit for hours (one traced unit made 29 laps in a day, TB-34).
+// Ten minutes is far above the observed 2.5-minute lap time yet short beside the
+// bench cooldown (~one deadline); the pool-exhausted fallback still applies, so a
+// small pool where that volunteer is the only taker re-admits it after the grace
+// rather than stranding the unit.
+const ReturnedReofferCooldownSeconds = 600
+
 // cooldownGuardSQL builds the post-failure cooldown guard shared by the three
 // authoritative landing/read gates (FindNextAssignable, FlushReservations,
 // ReserveCopy): refuse the requester a copy of the unit while a recent benching
@@ -558,17 +569,27 @@ const BenchPoolExhaustedGraceSeconds = 120
 //
 // A copy benches only if the volunteer actually STARTED it: a graceful return of
 // un-started buffered work (ABANDONED, started_at NULL) is not a reliability signal
-// and does not bench (#59). The clause is keyed on volunteer_id, NOT the trust
+// and does not bench (#59). A RETURNED give-back (TB-35) refuses on its own, much
+// shorter window (ReturnedReofferCooldownSeconds — a re-offer throttle, not a
+// reliability bench). The clause is keyed on volunteer_id, NOT the trust
 // subject, BY DESIGN: the cooldown is a per-account reliability signal — one device
 // timing out does not bench its siblings bound to the same DID.
 func cooldownGuardSQL(unitExpr, volExpr, wuAlias string) string {
 	return `NOT EXISTS (
 		SELECT 1 FROM work_unit_assignment_history cg_h
 		WHERE cg_h.work_unit_id = ` + unitExpr + ` AND cg_h.volunteer_id = ` + volExpr + `
-		  AND (cg_h.outcome = 'EXPIRED'
+		  AND (
+		    (
+		      (cg_h.outcome = 'EXPIRED'
 		       OR (cg_h.outcome = 'ABANDONED' AND cg_h.started_at IS NOT NULL))
+		      AND cg_h.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
+		    )
+		    OR (
+		      cg_h.outcome = 'RETURNED'
+		      AND cg_h.outcome_at > NOW() - INTERVAL '` + strconv.Itoa(ReturnedReofferCooldownSeconds) + ` seconds'
+		    )
+		  )
 		  AND cg_h.outcome_at IS NOT NULL
-		  AND cg_h.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
 		  -- Pool-exhausted fallback (PB-9): the bench holds only while fresh volunteers
 		  -- are (or may still be) covering the unit. Once this benching outcome is older
 		  -- than the fallback grace AND the unit currently has ZERO live copies — nobody
@@ -584,12 +605,17 @@ func cooldownGuardSQL(unitExpr, volExpr, wuAlias string) string {
 }
 
 // benchedSnapshotSQL builds the refill-time benched-volunteer snapshot for the
-// dispatchable queries: one 'volunteer_id|epoch_of_latest_benching_outcome' text per
-// benched volunteer of the unit aliased by wuAlias. Carrying the outcome time (not
+// dispatchable queries: one 'volunteer_id|epoch_of_latest_benching_outcome[|R]' text
+// per refused volunteer of the unit aliased by wuAlias. Carrying the outcome time (not
 // just membership) lets the dispatch cache seed TIMED bench entries that mirror the
 // SQL cooldown window instead of out-living it while the candidate sits staged
-// (PB-9's stale-set defect). Parsed by parseBenchTexts. The cb_* internal alias
-// collides with none of the dispatch queries' aliases.
+// (PB-9's stale-set defect). Two entry kinds, matching cooldownGuardSQL's two arms:
+// plain bench entries (EXPIRED / started-then-ABANDONED, ~one deadline window) and
+// '|R'-suffixed RETURNED give-back entries (TB-35, the short
+// ReturnedReofferCooldownSeconds re-offer throttle). A volunteer with both kinds
+// yields two entries; the cache keeps whichever bench holds longest (benchSet).
+// Parsed by parseBenchTexts. The cb_* internal aliases collide with none of the
+// dispatch queries' aliases.
 func benchedSnapshotSQL(wuAlias string) string {
 	return `ARRAY(
 		SELECT cb.volunteer_id::text || '|' || floor(extract(epoch FROM MAX(cb.outcome_at)))::bigint::text
@@ -600,19 +626,32 @@ func benchedSnapshotSQL(wuAlias string) string {
 		   AND cb.outcome_at IS NOT NULL
 		   AND cb.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
 		 GROUP BY cb.volunteer_id
+	) || ARRAY(
+		SELECT cbr.volunteer_id::text || '|' || floor(extract(epoch FROM MAX(cbr.outcome_at)))::bigint::text || '|R'
+		 FROM work_unit_assignment_history cbr
+		 WHERE cbr.work_unit_id = ` + wuAlias + `.id AND cbr.volunteer_id IS NOT NULL
+		   AND cbr.outcome = 'RETURNED'
+		   AND cbr.outcome_at IS NOT NULL
+		   AND cbr.outcome_at > NOW() - INTERVAL '` + strconv.Itoa(ReturnedReofferCooldownSeconds) + ` seconds'
+		 GROUP BY cbr.volunteer_id
 	)`
 }
 
 // BenchedVolunteer is one entry of a DispatchCandidate's benched snapshot: the
 // volunteer and the time of its most recent benching outcome on the unit, from which
-// the cache derives the bench window (outcome + ~one deadline) and the
-// pool-exhausted fallback moment (outcome + BenchPoolExhaustedGraceSeconds).
+// the cache derives the bench window (outcome + ~one deadline, or the short
+// ReturnedReofferCooldownSeconds when Returned — TB-35) and the pool-exhausted
+// fallback moment (outcome + BenchPoolExhaustedGraceSeconds).
 type BenchedVolunteer struct {
 	VolunteerID types.ID
 	OutcomeAt   time.Time
+	// Returned marks a give-back entry (the '|R' snapshot suffix): the volunteer
+	// returned its copy un-run, so the window is the short re-offer throttle, not the
+	// deadline-scaled reliability bench.
+	Returned bool
 }
 
-// parseBenchTexts parses benchedSnapshotSQL's 'uuid|epoch' texts. Defensive: a
+// parseBenchTexts parses benchedSnapshotSQL's 'uuid|epoch[|R]' texts. Defensive: a
 // malformed entry is dropped rather than failing the whole refill (the parseIDTexts
 // precedent).
 func parseBenchTexts(texts []string) []BenchedVolunteer {
@@ -621,10 +660,11 @@ func parseBenchTexts(texts []string) []BenchedVolunteer {
 	}
 	out := make([]BenchedVolunteer, 0, len(texts))
 	for _, t := range texts {
-		idPart, epochPart, found := strings.Cut(t, "|")
+		idPart, rest, found := strings.Cut(t, "|")
 		if !found {
 			continue
 		}
+		epochPart, kind, _ := strings.Cut(rest, "|")
 		id, err := types.ParseID(idPart)
 		if err != nil {
 			continue
@@ -633,7 +673,11 @@ func parseBenchTexts(texts []string) []BenchedVolunteer {
 		if err != nil {
 			continue
 		}
-		out = append(out, BenchedVolunteer{VolunteerID: id, OutcomeAt: time.Unix(epoch, 0).UTC()})
+		out = append(out, BenchedVolunteer{
+			VolunteerID: id,
+			OutcomeAt:   time.Unix(epoch, 0).UTC(),
+			Returned:    kind == "R",
+		})
 	}
 	return out
 }
@@ -799,6 +843,10 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- replication is FORCED around neutralized results; with an all-OK population this
 		  -- reduces byte-for-byte to the raw live+pending count.
 		  AND `+countableCoverageSQL("wu.id")+` < `+effTargetWuL+`
+		  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): the browser
+		  -- immediate-assign twin of the refill/landing gates — a unit whose budget is
+		  -- spent can never mint another copy row, so it is not assignable.
+		  AND `+capsNotExhaustedWuL+`
 		  -- Trusted-corroborator reservation (trust gate): when this unit's leaf resolves a
 		  -- trusted-corroborator requirement K > 0 (effTrustKSQL, the SQL twin of
 		  -- transition.TrustPolicy.ResolveTrust), the unit keeps its last slots RESERVED for
@@ -1151,6 +1199,10 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		  -- distinctness is re-checked in memory at hand-out. Reduces to the raw live+pending
 		  -- count for an all-OK population.
 		  AND `+countableCoverageSQL("wu.id")+` < `+effTargetWuL+`
+		  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): a unit whose budget is
+		  -- spent can never mint another copy row, so staging it would only produce claimless
+		  -- zombie hand-outs; it stays out of the pool until the dead-letter sweep parks it.
+		  AND `+capsNotExhaustedWuL+`
 		ORDER BY wu.priority DESC, wu.created_at ASC
 		LIMIT $1
 		FOR UPDATE OF wu SKIP LOCKED`,
@@ -1284,6 +1336,9 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			  -- BG-24b: a copy/result held or submitted by a non-OK account does not count, so
 			  -- full replication is forced around it; reduces to raw live+pending when all OK).
 			  AND `+countableCoverageSQL("wu2.id")+` < `+effTargetSQL("wu2", "l2")+`
+			  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): never claim a unit
+			  -- for which no copy row can be minted (see FindDispatchableBatch).
+			  AND `+capsNotExhaustedSQL("wu2", "l2")+`
 			ORDER BY wu2.priority DESC, wu2.created_at ASC
 			LIMIT $1
 			FOR UPDATE OF wu2 SKIP LOCKED
@@ -1518,6 +1573,10 @@ func (r *PgxWorkUnitRepository) FlushReservations(ctx context.Context, recs []Fl
 		JOIN leafs l ON l.id = wu.leaf_id
 		JOIN volunteers vv ON vv.id = v.vol
 		WHERE `+countableCoverageSQL("v.id")+` < `+effTargetWuL+`
+		  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): the landing twin of the
+		  -- refill gates. A stale staged candidate whose budget was exhausted after refill
+		  -- must not land one more row past the ceiling; the refused hold is voided.
+		  AND `+capsNotExhaustedWuL+`
 		  -- Redundancy headroom counts only COUNTABLE coverage (countableCoverageSQL —
 		  -- account standing, BG-24b): a copy held or a result submitted by a non-OK account
 		  -- does not cover redundancy, so a landing that fills the last COUNTABLE slot is
@@ -1734,10 +1793,17 @@ type ReleasedCopy struct {
 // RUN-STARTED copies are in scope (TB-13): excluding them left a crashed holder's claim
 // standing until the leaf's whole deadline elapsed, which locks a volunteer out of all
 // work once its stale claims fill its in-flight quota.
+//
+// An UN-STARTED copy released here closes RETURNED, not ABANDONED (TB-35): it is the
+// reaper-side twin of the client's explicit give-back — a buffered copy the machine
+// dropped (or whose abandon RPC lost the flush race) never ran and says nothing about
+// the unit, so it must not spend the unit's copy budget. A RUN-STARTED copy still
+// closes ABANDONED (lost compute — a real signal, and it keeps the volunteer benched).
 func (r *PgxWorkUnitRepository) ReleaseStaleHeldCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]ReleasedCopy, error) {
 	rows, err := r.db.Query(ctx, `
 		UPDATE work_unit_assignment_history
-		SET outcome = 'ABANDONED', outcome_at = NOW()
+		SET outcome = (CASE WHEN started_at IS NULL THEN 'RETURNED' ELSE 'ABANDONED' END)::assignment_outcome,
+		    outcome_at = NOW()
 		-- Match by MACHINE (TODO #19): COALESCE(host_id, volunteer_id) = the reporting
 		-- host's effective id, so only THIS machine's copies are reaped and host A's
 		-- report never releases host B's. Equals volunteer_id for a no-host copy.
@@ -1840,6 +1906,9 @@ func (r *PgxWorkUnitRepository) ReserveCopy(ctx context.Context, workUnitID, vol
 		JOIN leafs l ON l.id = wu.leaf_id
 		JOIN volunteers vv ON vv.id = $2
 		WHERE wu.id = $1 AND wu.state = 'QUEUED'
+		  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): the spot-check landing
+		  -- twin of the FlushReservations gate — never mint a copy row past the ceiling.
+		  AND `+capsNotExhaustedWuL+`
 		  -- No trusted-corroborator reservation re-check here, BY DESIGN — the same contract
 		  -- ReserveCopy already has for the redundancy headroom. This is the spot-check landing
 		  -- path; it trusts FindNextAssignable to have applied the reservation at read time and
@@ -2168,10 +2237,17 @@ func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, 
 // empty stores NULL. Bounded here — the single write point — because the wire imposes
 // no length and a self-compiled client could send anything. Returns apierror.Conflict
 // if the volunteer has no live copy of the unit.
+//
+// RETURNED (the budget-neutral un-run give-back, TB-35) is verified here, at the same
+// single write point: a caller asking for RETURNED gets it only when the copy really
+// never started (started_at IS NULL); a STARTED copy closes ABANDONED instead, so a
+// client's give-back flag can never whitewash work it actually began and dropped.
 func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_unit_assignment_history
-		SET outcome = $3, outcome_at = NOW(), result_id = COALESCE($4, result_id),
+		SET outcome = (CASE WHEN $3 = 'RETURNED' AND started_at IS NOT NULL
+		                    THEN 'ABANDONED' ELSE $3 END)::assignment_outcome,
+		    outcome_at = NOW(), result_id = COALESCE($4, result_id),
 		    outcome_reason = $5
 		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
 		workUnitID, volunteerID, outcome, resultID, boundedOutcomeReason(reason),
@@ -2237,12 +2313,17 @@ func (r *PgxWorkUnitRepository) CountLiveCopies(ctx context.Context, workUnitID 
 	return n, nil
 }
 
-// CountTotalCopies returns the total number of copies (history rows) ever created for
-// a unit — the dead-letter ceiling probe (property 6).
+// CountTotalCopies returns the number of BUDGET-COUNTING copies ever created for a unit
+// — the dead-letter ceiling probe (property 6). Since TB-35 this embeds budgetCopiesSQL,
+// which excludes RETURNED give-backs (a copy returned un-run by a full buffer says nothing
+// about the unit and must not spend its budget); every other row, live or closed, counts.
+// The transitioner's UnitSnapshot.TotalCopies and RefundCopyBudget's rebase both read this
+// same definition, so the decider, the executor, and the refund can never disagree about
+// how much budget a unit has spent.
 func (r *PgxWorkUnitRepository) CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error) {
 	var n int
 	if err := r.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1`,
+		`SELECT `+budgetCopiesSQL("$1"),
 		workUnitID,
 	).Scan(&n); err != nil {
 		return 0, apierror.Internal("failed to count total copies", err)
@@ -2283,8 +2364,9 @@ func (r *PgxWorkUnitRepository) CountErrorCopies(ctx context.Context, workUnitID
 
 // DeadLetterIfExhausted parks a unit FAILED + flagged-for-review iff it is QUEUED, COMPLETED,
 // or REJECTED, has NO live copy outstanding, its redundancy is still unmet (version-homogeneous
-// PENDING results < quorum), AND its copy budget is spent: EITHER the total copies ever created
-// has reached its dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR —
+// PENDING results < quorum), AND its copy budget is spent: EITHER the budget-counting copies
+// (every history row except RETURNED give-backs — budgetCopiesSQL, TB-35) have reached its
+// dead-letter ceiling (max_total_copies, defaulting to target + a margin) OR —
 // when the owner configured an error cap — the error copies (EXPIRED/ABANDONED + DISAGREED)
 // have reached max_error_copies. In the SAME transaction, every surviving PENDING result of the
 // failed unit is disposed to SUPERSEDED (★BG-21i): a below-quorum PENDING row that outlived the
@@ -2369,10 +2451,7 @@ func (r *PgxWorkUnitRepository) DeadLetterIfExhausted(ctx context.Context, workU
 			  )
 			  AND `+versionHomogeneousPendingSQL("wu.id")+` < `+effQuorumWuL+`
 			  AND (
-			    (
-			      SELECT COUNT(*) FROM work_unit_assignment_history h2
-			      WHERE h2.work_unit_id = wu.id
-			    ) >= `+effMaxTotalWuL+`
+			    `+budgetCopiesSQL("wu.id")+` >= `+effMaxTotalWuL+`
 			    OR (
 			      `+effMaxErrorWuL+` > 0 AND `+errorCopiesSQL("wu.id")+` >= `+effMaxErrorWuL+`
 			    )
@@ -2428,9 +2507,10 @@ func (r *PgxWorkUnitRepository) Reassign(ctx context.Context, id types.ID) (*Wor
 //	max_total_copies = <copies ever created> + maxTotal
 //	max_error_copies = <error copies so far> + maxError   (only when maxError > 0)
 //
-// The copy count is inlined from CountTotalCopies and the error count embeds the shared
-// errorCopiesSQL fragment (the same one CountErrorCopies and the dead-letter probe use), so
-// the refund reads exactly the tallies the dead-letter probe reads. maxError == 0 means the
+// The copy count embeds the shared budgetCopiesSQL fragment (the same one CountTotalCopies
+// and the dead-letter probe use — RETURNED give-backs excluded, TB-35) and the error count
+// embeds the shared errorCopiesSQL fragment (the same one CountErrorCopies and the
+// dead-letter probe use), so the refund reads exactly the tallies the dead-letter probe reads. maxError == 0 means the
 // resolved error ceiling is unlimited (0 = unlimited): the CASE leaves max_error_copies
 // untouched, because materializing count+0 would CREATE a finite error ceiling that never
 // existed.
@@ -2445,9 +2525,7 @@ func (r *PgxWorkUnitRepository) Reassign(ctx context.Context, id types.ID) (*Wor
 func (r *PgxWorkUnitRepository) RefundCopyBudget(ctx context.Context, id types.ID, maxTotal, maxError int) (bool, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE work_units SET
-			max_total_copies = (
-				SELECT COUNT(*) FROM work_unit_assignment_history WHERE work_unit_id = $1
-			) + $2,
+			max_total_copies = `+budgetCopiesSQL("$1")+` + $2,
 			max_error_copies = CASE WHEN $3 > 0 THEN `+errorCopiesSQL("$1")+` + $3 ELSE max_error_copies END,
 			updated_at = now()
 		WHERE id = $1 AND state = 'REJECTED'`,

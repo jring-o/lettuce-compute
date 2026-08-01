@@ -199,7 +199,9 @@ type WorkUnitRepository interface {
 
 	// CloseCopyByVolunteer closes a volunteer's live copy of a unit with the given
 	// outcome (submit/abandon). reason is the client's failure text, persisted on the
-	// row for head-side forensics (TB-27); empty stores NULL. Returns
+	// row for head-side forensics (TB-27); empty stores NULL. RETURNED (the
+	// budget-neutral un-run give-back, TB-35) is verified at the write: it lands only
+	// on a copy that never started; a STARTED copy closes ABANDONED instead. Returns
 	// apierror.Conflict if no live copy exists.
 	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error
 
@@ -215,7 +217,8 @@ type WorkUnitRepository interface {
 	// replication around a probation account instead of counting its copy.
 	CountProbationLiveCopies(ctx context.Context, workUnitID types.ID) (int, error)
 
-	// CountTotalCopies returns the total copies ever created for a unit (dead-letter probe).
+	// CountTotalCopies returns the BUDGET-COUNTING copies ever created for a unit (the
+	// dead-letter probe) — every history row except RETURNED give-backs (TB-35).
 	CountTotalCopies(ctx context.Context, workUnitID types.ID) (int, error)
 
 	// CountErrorCopies returns the unit's wasted-work tally (EXPIRED/ABANDONED copies +

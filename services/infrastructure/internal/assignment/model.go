@@ -19,6 +19,15 @@ const (
 	// EXPIRED/ABANDONED it carries no bad reliability signal — the work was superseded, not
 	// failed. Never written for a target == quorum leaf (no extras exist at validation).
 	OutcomeSuperseded AssignmentOutcome = "SUPERSEDED"
+	// OutcomeReturned closes a copy the volunteer gave back UN-RUN because its work
+	// buffer could not use it (the TB-32 arrival-time give-back, flagged on the wire as
+	// unrun_giveback and verified un-started head-side — TB-35). Like SUPERSEDED it is
+	// non-punitive, and it carries no information about the UNIT either, so it counts
+	// toward NEITHER the dead-letter copy budget nor the error-copy cap (a batch tail
+	// bounced by full buffers must never dead-letter a healthy unit). Its only teeth are
+	// a short per-(unit, volunteer) re-offer cooldown so the same machine is not handed
+	// the same unit right back.
+	OutcomeReturned AssignmentOutcome = "RETURNED"
 )
 
 // AssignmentHistoryEntry records a single assignment of a work unit to a volunteer.
