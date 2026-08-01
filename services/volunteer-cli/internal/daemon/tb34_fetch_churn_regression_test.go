@@ -193,22 +193,24 @@ func TestTB34_RemainingTimeRefillTrigger(t *testing.T) {
 		t.Fatalf("StartSlot: %v", err)
 	}
 
-	// Rewind the slot's start to 1 h ago: full booking 7200 s, remaining ≈ 3600 s.
+	// Rewind the slot's start to 45 min ago: full booking 7200 s, remaining
+	// ≈ 4500 s — clearly ABOVE the 3600 s low-water line, so the comparison
+	// cannot flake on scheduler latency (an exact-boundary probe did, on CI).
 	slot := d.slotManager.slots[slotID]
 	slot.mu.Lock()
-	slot.startedAt = time.Now().Add(-time.Hour)
+	slot.startedAt = time.Now().Add(-45 * time.Minute)
 	slot.mu.Unlock()
 
 	if got := d.bufferedSeconds(); got < 7000 {
 		t.Fatalf("bufferedSeconds = %g, want the full 7200 booking (acceptance stays conservative)", got)
 	}
 	rem := d.bufferedRemainingSeconds()
-	if rem < 3400 || rem > 3800 {
-		t.Fatalf("bufferedRemainingSeconds = %g, want ≈3600 (est − 1h run)", rem)
+	if rem < 4300 || rem > 4700 {
+		t.Fatalf("bufferedRemainingSeconds = %g, want ≈4500 (est − 45min run)", rem)
 	}
-	// 3600 s remaining is NOT yet under the 3600 s low-water line…
+	// 4500 s remaining is NOT yet under the 3600 s low-water line…
 	if d.bufferBelowLowWater() {
-		t.Error("bufferBelowLowWater true at exactly the mark, want false")
+		t.Error("bufferBelowLowWater true well above the mark, want false")
 	}
 	// …but at 90 minutes in (1800 s remaining < 3600 s) the refill trigger opens
 	// while the unit is STILL RUNNING — the next unit is fetched before the slot
