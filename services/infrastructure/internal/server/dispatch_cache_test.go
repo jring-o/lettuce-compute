@@ -1363,6 +1363,159 @@ func (c *dispatchCache) readyContainsLockedTest(id types.ID) bool {
 	return c.readyContainsLocked(id)
 }
 
+// TestLeafScopedRefillEvictsIntoFullPool is TB-37's regression: a ready pool AT
+// capacity, monopolized by leaf A, must answer a starved leaf-B requester by EVICTING
+// unheld leaf-A candidates to make room for the leaf-scoped refill's units — not by
+// re-queueing the refill until a hand-out happens to free a slot (the old behavior,
+// under which a leaf-filtered volunteer went hungry beside ten thousand QUEUED units
+// of its leaf, fed only as staged candidates happened to exhaust).
+func TestLeafScopedRefillEvictsIntoFullPool(t *testing.T) {
+	leafA := types.NewID()
+	leafB := types.NewID()
+	bUnits := []types.ID{types.NewID(), types.NewID(), types.NewID()}
+
+	scopedCalls := 0
+	var gotLeafScope []types.ID
+	wuRepo := &fakeWURepo{
+		dispatchFn: func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
+			scopedCalls++
+			gotLeafScope = leafIDs
+			out := make([]workunit.DispatchCandidate, 0, len(bUnits))
+			for _, id := range bUnits {
+				out = append(out, workunit.DispatchCandidate{
+					WorkUnit:         &workunit.WorkUnit{ID: id, LeafID: leafB, State: workunit.WorkUnitStateQueued},
+					LeafID:           leafB,
+					RedundancyFactor: 1,
+				})
+			}
+			return out, nil
+		},
+	}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+	c.warm(nativeLeaf(leafA, 1, false, 0), leafRepo)
+	c.warm(nativeLeaf(leafB, 1, false, 0), leafRepo)
+	// Fill the pool to its ceiling with leaf A's units.
+	for i := 0; i < c.cfg.readyPoolSize; i++ {
+		c.stageUnit(types.NewID(), leafA, 1, 0)
+	}
+
+	// The starved request: leaf-B-filtered, handed nothing, queues the on-demand refill.
+	vol := types.NewID()
+	opts := capableOpts(vol, 0)
+	opts.LeafIDs = []types.ID{leafB}
+	if results, _ := c.HandOut(vol, opts, 2); len(results) != 0 {
+		t.Fatalf("leaf-B requester should get nothing from a full leaf-A pool, got %d", len(results))
+	}
+
+	c.leafRefillOnce(context.Background())
+
+	if scopedCalls == 0 {
+		t.Fatalf("full pool: the leaf-scoped refill never ran the dispatchable query (re-queued instead of evicting)")
+	}
+	if len(gotLeafScope) != 1 || gotLeafScope[0] != leafB {
+		t.Fatalf("leaf scope not passed to the repo, got %v", gotLeafScope)
+	}
+	for _, id := range bUnits {
+		if !c.readyContainsLockedTest(id) {
+			t.Fatalf("leaf B's unit was not staged into the full pool")
+		}
+	}
+	if got := c.readyLen(); got > c.cfg.readyPoolSize {
+		t.Fatalf("eviction must respect the pool ceiling, ready_len %d > %d", got, c.cfg.readyPoolSize)
+	}
+
+	// The heal: the same starved requester is now fed leaf B's work.
+	results, _ := c.HandOut(vol, opts, 2)
+	if len(results) != 2 {
+		t.Fatalf("leaf-B requester still starved after the leaf-scoped refill, handed %d", len(results))
+	}
+	for _, r := range results {
+		if r.unit.LeafID != leafB {
+			t.Fatalf("handed a unit of the wrong leaf")
+		}
+	}
+}
+
+// TestLeafScopedEvictionSparesHeldAndDemandedCandidates asserts the TB-37 eviction
+// never drops a candidate with live in-memory holders (its staged entry hands the
+// unit's remaining redundant copies out in parallel) nor one of the demanded leaf's
+// own candidates: a full pool with nothing evictable stages nothing rather than
+// disturbing held or wanted work.
+func TestLeafScopedEvictionSparesHeldAndDemandedCandidates(t *testing.T) {
+	leafA := types.NewID()
+	leafB := types.NewID()
+	wuRepo := &fakeWURepo{
+		dispatchFn: func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error) {
+			id := types.NewID()
+			return []workunit.DispatchCandidate{{
+				WorkUnit:         &workunit.WorkUnit{ID: id, LeafID: leafB, State: workunit.WorkUnitStateQueued},
+				LeafID:           leafB,
+				RedundancyFactor: 1,
+			}}, nil
+		},
+	}
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+	c.warm(nativeLeaf(leafA, 2, false, 0), leafRepo)
+	c.warm(nativeLeaf(leafB, 1, false, 0), leafRepo)
+	// Fill the pool to its ceiling: leaf-A candidates each HELD by a volunteer
+	// (redundancy 2, so a held candidate legitimately stays staged), interleaved with
+	// leaf B's own unheld candidates.
+	holder := types.NewID()
+	before := make(map[types.ID]struct{}, c.cfg.readyPoolSize)
+	for i := 0; i < c.cfg.readyPoolSize; i++ {
+		id := types.NewID()
+		before[id] = struct{}{}
+		if i%2 == 0 {
+			c.stageUnit(id, leafA, 2, 0)
+			c.mu.Lock()
+			c.reservedInMem[id] = map[types.ID]heldCopy{holder: {reservedUntil: c.now().Add(time.Hour), hostID: holder}}
+			c.mu.Unlock()
+		} else {
+			c.stageUnit(id, leafB, 1, 0)
+		}
+	}
+
+	c.requestLeafRefill([]types.ID{leafB})
+	c.leafRefillOnce(context.Background())
+
+	if got := c.readyLen(); got != c.cfg.readyPoolSize {
+		t.Fatalf("nothing was evictable, ready_len should stay %d, got %d", c.cfg.readyPoolSize, got)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.ready {
+		if _, ok := before[c.ready[i].unit.ID]; !ok {
+			t.Fatalf("a held or demanded-leaf candidate was evicted to admit a new unit")
+		}
+	}
+}
+
+// TestLeafScopedRefillEmptyAnswerEvictsNothing asserts a leaf demand the DB cannot
+// serve (a bogus or drained leaf id) costs the full pool nothing: the eviction budget
+// is what the query actually returned, and an empty answer leaves the pool untouched.
+func TestLeafScopedRefillEmptyAnswerEvictsNothing(t *testing.T) {
+	leafA := types.NewID()
+	wuRepo := &fakeWURepo{} // dispatchable query returns nothing
+	leafRepo := &fakeLeafRepo{}
+	assignRepo := &fakeAssignRepo{}
+	c := newTestCache(wuRepo, leafRepo, assignRepo)
+	c.warm(nativeLeaf(leafA, 1, false, 0), leafRepo)
+	for i := 0; i < c.cfg.readyPoolSize; i++ {
+		c.stageUnit(types.NewID(), leafA, 1, 0)
+	}
+
+	c.requestLeafRefill([]types.ID{types.NewID()})
+	c.leafRefillOnce(context.Background())
+
+	if got := c.readyLen(); got != c.cfg.readyPoolSize {
+		t.Fatalf("an unservable leaf demand must evict nothing, ready_len %d != %d", got, c.cfg.readyPoolSize)
+	}
+}
+
 // --- Major 3: StartWork flush-race (in-memory reservation) --------------------
 
 // TestHasInMemReservationFlushRace asserts the cache reports an in-memory reservation

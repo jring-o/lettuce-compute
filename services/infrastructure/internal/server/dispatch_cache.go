@@ -2452,31 +2452,23 @@ func (c *dispatchCache) refillOnce(ctx context.Context) {
 // leafRefillOnce services pending on-demand, leaf-scoped refill requests (Blocker 2).
 // Unlike refillOnce it does NOT gate on the global low-watermark — its whole purpose
 // is to stage units for a starved leaf even when the pool is "full" of a different
-// leaf. It is bounded by the same admission semaphore + ready-pool ceiling.
+// leaf. For the same reason it does not gate on the ready-pool ceiling either (TB-37):
+// a pool AT capacity, monopolized by other leaves, is exactly the starvation this path
+// exists to break, so fetchAndStage makes room by evicting unheld other-leaf
+// candidates for what the leaf-scoped query returns. The old answer — re-queue the
+// request until a hand-out frees a slot — starved a leaf-filtered volunteer beside ten
+// thousand QUEUED units of its leaf (the pool only shrinks when a staged candidate's
+// copies are exhausted, so the refill got a slot or two per episode at best) and spun
+// the refiller's select on the re-queued signal in the meantime.
 func (c *dispatchCache) leafRefillOnce(ctx context.Context) {
 	leafIDs := c.drainLeafRefills()
 	if len(leafIDs) == 0 {
 		return
 	}
 	c.mu.Lock()
-	have := len(c.ready)
-	if have >= c.cfg.readyPoolSize {
-		// Pool is genuinely at capacity: cannot stage more without evicting. Re-queue
-		// the request so it is retried once a hand-out frees space.
-		c.mu.Unlock()
-		c.requestLeafRefill(leafIDs)
-		return
-	}
-	want := c.cfg.refillBatchSize
-	if have+want > c.cfg.readyPoolSize {
-		want = c.cfg.readyPoolSize - have
-	}
 	excluded := c.excludedIDsLocked()
 	c.mu.Unlock()
-	if want <= 0 {
-		return
-	}
-	c.fetchAndStage(ctx, want, excluded, leafIDs)
+	c.fetchAndStage(ctx, c.cfg.refillBatchSize, excluded, leafIDs)
 }
 
 // refreshStaleLeafSnapshots re-reads, from Postgres, the leaf snapshot of every leaf
@@ -2562,6 +2554,41 @@ func (c *dispatchCache) dropStagedCandidatesForLeaf(leafID types.ID) {
 	}
 	c.ready = kept
 	c.mu.Unlock()
+}
+
+// evictForLeafDemandLocked drops up to need ready-pool candidates whose leaf is NOT
+// among the demanded leafIDs, walking from the back (lowest priority) so the pool's
+// best candidates survive (TB-37: room for a leaf-scoped refill in a full pool). Two
+// kinds of candidate are never evicted: one with live in-memory holders (its staged
+// entry is what hands the unit's REMAINING redundant copies out in parallel —
+// property 7), and the demanded leaves' own candidates (they are what the requester
+// is starved for; that some may refuse the requester per-account is the per-account
+// freshness problem, deliberately out of scope here). Caller holds mu. Returns how
+// many were evicted; one filtered compaction pass, no per-eviction memmove.
+func (c *dispatchCache) evictForLeafDemandLocked(need int, leafIDs []types.ID) int {
+	drop := make(map[int]struct{}, need)
+	for i := len(c.ready) - 1; i >= 0 && len(drop) < need; i-- {
+		cd := c.ready[i]
+		if containsID(leafIDs, cd.unit.LeafID) {
+			continue
+		}
+		if _, held := c.reservedInMem[cd.unit.ID]; held {
+			continue
+		}
+		drop[i] = struct{}{}
+	}
+	if len(drop) == 0 {
+		return 0
+	}
+	kept := c.ready[:0]
+	for i := range c.ready {
+		if _, gone := drop[i]; gone {
+			continue
+		}
+		kept = append(kept, c.ready[i])
+	}
+	c.ready = kept
+	return len(drop)
 }
 
 // fetchAndStage runs one bounded FindDispatchableBatch (optionally leaf-scoped) and
@@ -2652,6 +2679,33 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	}
 
 	c.mu.Lock()
+	// TB-37: a leaf-scoped refill answers EXPRESSED, currently-unmet demand — a
+	// leaf-filtered requester was just handed nothing — so a pool full of OTHER leaves
+	// must not refuse it room; that monopoly is the exact starvation this path exists
+	// to break. Make room by evicting unheld candidates of undemanded leaves, lowest
+	// priority first (the pool back). The eviction budget is what the query returned
+	// AND can stage, so a demand the DB cannot serve (a bogus or drained leaf id)
+	// evicts nothing. The watermark refill (no leaf scope) keeps the plain ceiling
+	// break below. An evicted candidate is merely un-staged: its unit stays QUEUED in
+	// Postgres, and under scale-out its dispatch claim lapses passively (the header's
+	// crash-safety rule), so eviction never loses work.
+	evicted := 0
+	if len(leafIDs) > 0 {
+		stageable := 0
+		for i := range staged {
+			uid := staged[i].unit.ID
+			if _, held := c.reservedInMem[uid]; held {
+				continue
+			}
+			if c.readyContainsLocked(uid) {
+				continue
+			}
+			stageable++
+		}
+		if need := stageable - (c.cfg.readyPoolSize - len(c.ready)); need > 0 {
+			evicted = c.evictForLeafDemandLocked(need, leafIDs)
+		}
+	}
 	stagedCount := 0
 	// Skip any id that became in-memory-held between the snapshot and now (a hand-out
 	// raced the refill); SKIP LOCKED + excluded make this rare, but guard anyway.
@@ -2673,7 +2727,7 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 	// D-3: confirm a successful restock and how much of the returned batch actually
 	// landed (the remainder was already held/staged or hit the pool ceiling).
 	c.logger.Debug("refill: staged",
-		"returned", len(cands), "staged", stagedCount, "leaf_scoped", len(leafIDs) > 0)
+		"returned", len(cands), "staged", stagedCount, "evicted", evicted, "leaf_scoped", len(leafIDs) > 0)
 }
 
 // refreshTrustScores re-reads the subject trust-score snapshot from the trust store when
