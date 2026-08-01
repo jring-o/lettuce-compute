@@ -111,8 +111,22 @@ type Fetcher struct {
 	// leaf's units have been buffered (#29). It prefers the leaf-level,
 	// benchmark-independent estimate carried in CachedLeafInfo
 	// (EstimatedDurationSeconds), so it stays non-zero even on a host with no CPU
-	// benchmark — the exact case the old FP-ops-only path tripped to 0.
+	// benchmark — the exact case the old FP-ops-only path tripped to 0. Since TB-34
+	// the daemon folds in the per-unit estimate observed on the leaf's last ARRIVED
+	// batch (max wins), so a leaf-level figure far below the units' real size stops
+	// producing 60× over-asks after the first round.
 	leafEstSecondsFn func(leaf CachedLeafInfo) float64
+	// noteArrivalEstFn feeds the daemon one arrived unit's rsc_fpops_est so the
+	// arrival-side estimate above learns (TB-34). nil disables the learning.
+	noteArrivalEstFn func(leafID string, rscFpopsEst float64)
+
+	// batchCap caps the next ask per head+leaf after a round whose tail the buffer
+	// returned (TB-34's batch feedback): the cap is what that round actually KEPT
+	// plus one, so a mis-sized ask shrinks immediately instead of re-asking the
+	// same figure from the same wrong estimate; a round kept in full clears the
+	// cap. Keyed "head|leafID". Owned by the single Run goroutine — no lock (the
+	// runtimeAbandons pattern).
+	batchCap map[string]int32
 
 	// heldWorkUnitIDsFn returns the ids of every work unit the volunteer currently
 	// holds — its prefetch buffer (buffered, not yet started) plus its active slots
@@ -232,10 +246,12 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		bufferAcceptsFn:          d.bufferAccepts,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
+		noteArrivalEstFn:         d.noteArrivalEstimate,
 		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
 		rateLimitBackoff:         defaultRateLimitBackoff,
 		runtimeAbandons:          make(map[string]int),
 		pausedRuntimes:           make(map[string]time.Time),
+		batchCap:                 make(map[string]int32),
 		now:                      time.Now,
 	}
 }
@@ -633,6 +649,12 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	if f.batchSizeFn != nil {
 		maxAssignments = f.batchSizeFn(estSec)
 	}
+	// TB-34 batch feedback: after a round whose tail this buffer returned, cap the
+	// ask at what that round actually kept + 1 until a round is kept in full — the
+	// direct bound that holds even while the estimates are still wrong.
+	if limit, ok := f.batchCap[batchCapKey(head.Name, leaf.ID)]; ok && maxAssignments > limit {
+		maxAssignments = limit
+	}
 
 	// Report the work units this volunteer currently holds so the head can release
 	// any reservations it no longer holds (e.g. dropped across a restart). The set
@@ -753,15 +775,41 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	}
 
 	// Prepare and buffer every assignment in the batch.
-	return f.bufferBatch(ctx, head, leaf, resp.Assignments), false
+	kept, returned := f.bufferBatch(ctx, head, leaf, resp.Assignments)
+	f.noteBatchOutcome(head.Name, leaf.ID, kept, returned)
+	return kept, false
+}
+
+// batchCapKey keys the per-head-per-leaf batch cap (see batchCap).
+func batchCapKey(headName, leafID string) string {
+	return headName + "|" + leafID
+}
+
+// noteBatchOutcome updates the TB-34 batch-feedback cap after a non-empty batch:
+// a returned tail caps the next ask at kept+1; a fully-kept batch clears the cap
+// (the deficit/estimate math takes over again, now fed by the arrival estimates).
+func (f *Fetcher) noteBatchOutcome(headName, leafID string, kept, returned int) {
+	key := batchCapKey(headName, leafID)
+	if returned > 0 {
+		limit := int32(kept + 1)
+		if limit < 1 {
+			limit = 1
+		}
+		f.batchCap[key] = limit
+		f.logger.Debug("fetcher: batch tail returned; capping next ask",
+			"server", headName, "leaf_id", leafID, "kept", kept, "returned", returned, "next_cap", limit)
+		return
+	}
+	delete(f.batchCap, key)
 }
 
 // bufferBatch prepares each assignment in a batch and pushes it into the client
 // work buffer, recording the assignment with the selector once per buffered
 // unit. Unusable units (bad ID, no runtime, prepare failure) are abandoned back
-// to the head. Returns the count actually buffered.
-func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, assignments []*lettucev1.WorkUnitAssignment) int {
-	pushed := 0
+// to the head. Returns the count actually buffered AND the count returned as
+// un-run buffer give-backs (the bufferAccepts refusals + a full-queue push), so
+// requestAndBuffer can shrink the next ask after a returned tail (TB-34).
+func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, assignments []*lettucev1.WorkUnitAssignment) (pushed, returned int) {
 	// Dedup against what this volunteer already holds (prefetch buffer + active slots)
 	// and against earlier units in this same batch. A head should never hand a unit a
 	// volunteer already holds, but if one slips through (e.g. a re-stage that raced the
@@ -792,6 +840,13 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			continue
 		}
 
+		// TB-34: let the batch-size estimate learn from what actually arrived —
+		// including a unit the buffer is about to return, which is exactly the
+		// evidence the leaf-level figure was wrong.
+		if f.noteArrivalEstFn != nil {
+			f.noteArrivalEstFn(wu.LeafID, wu.RscFpopsEst)
+		}
+
 		// Skip a unit already held (buffered, running, or seen earlier in this batch).
 		if _, dup := held[wu.ID]; dup {
 			f.logger.Debug("fetcher: skipping duplicate work unit already held", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug)
@@ -804,11 +859,14 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		// used to overshoot the target several times over; the excess sat until
 		// the deadline drop while the head believed it was being computed.
 		// Returning it here (before any Prepare cost) re-dispatches it in
-		// seconds instead of hours.
+		// seconds instead of hours. Flagged as an un-run give-back so the head
+		// closes the copy RETURNED (budget-neutral, TB-35), and counted so the
+		// next ask for this leaf shrinks (TB-34's batch feedback).
 		if f.bufferAcceptsFn != nil {
 			if ok, reason := f.bufferAcceptsFn(wu); !ok {
 				f.logger.Info("fetcher: returning batch unit the buffer cannot use", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "reason", reason)
-				f.abandonWorkUnit(ctx, head, wu, reason)
+				f.giveBackWorkUnit(ctx, head, wu, reason)
+				returned++
 				continue
 			}
 		}
@@ -867,9 +925,11 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		}
 		if err := f.queue.Push(item); err != nil {
 			// Buffer filled between the fullness check and now — return the un-run
-			// unit to the head and clean up rather than orphaning it as reserved.
+			// unit to the head (a give-back: budget-neutral, TB-35) and clean up
+			// rather than orphaning it as reserved.
 			f.logger.Warn("fetcher: queue push failed (full between check and push)", "error", err)
-			f.abandonWorkUnit(ctx, head, wu, "buffer full")
+			f.giveBackWorkUnit(ctx, head, wu, "buffer full")
+			returned++
 			if rt != nil && prep != nil {
 				rt.Cleanup(prep)
 			}
@@ -882,20 +942,33 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		f.selector.RecordAssignment(head.Name, leaf.Slug)
 		pushed++
 	}
-	return pushed
+	return pushed, returned
 }
 
 // abandonWorkUnit tells the server to release a work unit the volunteer can't execute.
 // It detaches from the caller's context so abandonment still reaches the head even
 // when the caller's context was cancelled (e.g. mid-shutdown). See item 4.
 func (f *Fetcher) abandonWorkUnit(ctx context.Context, conn *ServerConnection, wu *runtime.WorkUnit, reason string) {
+	f.abandon(ctx, conn, wu, reason, false)
+}
+
+// giveBackWorkUnit returns an un-run unit the buffer cannot use (the TB-32
+// arrival-time give-back), flagged unrun_giveback so the head closes the copy
+// RETURNED — budget-neutral (TB-35) — instead of ABANDONED. Only for units this
+// volunteer never started; the head verifies that before honoring the flag.
+func (f *Fetcher) giveBackWorkUnit(ctx context.Context, conn *ServerConnection, wu *runtime.WorkUnit, reason string) {
+	f.abandon(ctx, conn, wu, reason, true)
+}
+
+func (f *Fetcher) abandon(ctx context.Context, conn *ServerConnection, wu *runtime.WorkUnit, reason string, unrunGiveback bool) {
 	abCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	resp, err := conn.Client.AbandonWorkUnit(abCtx, &lettucev1.AbandonWorkUnitRequest{
-		WorkUnitId:  wu.ID,
-		VolunteerId: conn.VolunteerID,
-		PublicKey:   f.pubKey,
-		Reason:      reason,
+		WorkUnitId:    wu.ID,
+		VolunteerId:   conn.VolunteerID,
+		PublicKey:     f.pubKey,
+		Reason:        reason,
+		UnrunGiveback: unrunGiveback,
 	})
 	if err != nil {
 		f.logger.Warn("fetcher: abandon work unit failed", "work_unit_id", wu.ID, "error", err)

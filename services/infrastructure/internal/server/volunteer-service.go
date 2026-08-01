@@ -2389,11 +2389,19 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	}
 
 	// Per-copy dispatch: abandoning a unit just closes THIS volunteer's live copy
-	// (RESERVED or RUNNING) as ABANDONED. The work unit stays QUEUED and redispatches
-	// a fresh copy to a distinct volunteer — no per-unit expire/reassign, no cap.
+	// (RESERVED or RUNNING) as ABANDONED — or, when the client flags an un-run buffer
+	// give-back (unrun_giveback, TB-35), as RETURNED: budget-neutral, non-benching,
+	// with only a short re-offer cooldown. The repo verifies the copy really never
+	// started before honoring RETURNED (a started copy closes ABANDONED regardless of
+	// the flag). The work unit stays QUEUED and redispatches a fresh copy to a distinct
+	// volunteer — no per-unit expire/reassign, no cap.
 	// The client's reason text is persisted on the row (TB-27): it carries the failing
 	// process's output tail, and the log line below is the only other copy.
-	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(assignment.OutcomeAbandoned), nil, req.Reason); cerr != nil {
+	closeOutcome := assignment.OutcomeAbandoned
+	if req.UnrunGiveback {
+		closeOutcome = assignment.OutcomeReturned
+	}
+	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(closeOutcome), nil, req.Reason); cerr != nil {
 		if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
 			if hadInMemHold {
 				// The volunteer DID hold this unit, but its reservation never became
@@ -2435,10 +2443,19 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		requeued = false
 	}
 
+	// Evict a dead-lettered unit from the dispatch ledger entirely (TB-35): the refill
+	// gates keep an exhausted unit from being RE-staged, but a candidate already in the
+	// ready pool would otherwise keep serving claimless hand-outs until the reconciler
+	// caught up — exactly the zombie window this abandon may have just closed.
+	if !requeued && s.dispatchCache != nil {
+		s.dispatchCache.onUnitDone(workUnitID)
+	}
+
 	s.logger.Info("work unit copy abandoned by volunteer",
 		"work_unit_id", req.WorkUnitId,
 		"volunteer_id", req.VolunteerId,
 		"reason", req.Reason,
+		"unrun_giveback", req.UnrunGiveback,
 		"requeued", requeued,
 	)
 

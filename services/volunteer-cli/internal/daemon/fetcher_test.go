@@ -174,7 +174,7 @@ func TestBufferBatch_SkipsAlreadyHeldUnits(t *testing.T) {
 		}
 	}
 	// heldID is already held; freshID appears twice (an intra-batch duplicate).
-	pushed := fetcher.bufferBatch(context.Background(), servers[0], leaf,
+	pushed, _ := fetcher.bufferBatch(context.Background(), servers[0], leaf,
 		[]*lettucev1.WorkUnitAssignment{mkAsg(heldID), mkAsg(freshID), mkAsg(freshID)})
 
 	if pushed != 1 {
@@ -215,7 +215,7 @@ func TestBufferBatch_PerHeadRuntimeTrustGate(t *testing.T) {
 	}
 
 	// Trusted head: the native unit is buffered.
-	pushedTrusted := fetcher.bufferBatch(context.Background(), servers[0], leaf,
+	pushedTrusted, _ := fetcher.bufferBatch(context.Background(), servers[0], leaf,
 		[]*lettucev1.WorkUnitAssignment{mkAsg("00000000-0000-4000-8000-000000000001")})
 	if pushedTrusted != 1 {
 		t.Fatalf("trusted head: bufferBatch pushed %d, want 1", pushedTrusted)
@@ -225,7 +225,7 @@ func TestBufferBatch_PerHeadRuntimeTrustGate(t *testing.T) {
 	}
 
 	// Untrusted (WASM-only) head: the native unit is refused and abandoned back to the head.
-	pushedUntrusted := fetcher.bufferBatch(context.Background(), servers[1], leaf,
+	pushedUntrusted, _ := fetcher.bufferBatch(context.Background(), servers[1], leaf,
 		[]*lettucev1.WorkUnitAssignment{mkAsg("00000000-0000-4000-8000-000000000002")})
 	if pushedUntrusted != 0 {
 		t.Fatalf("untrusted head: bufferBatch pushed %d, want 0 (native not trusted -> abandoned)", pushedUntrusted)

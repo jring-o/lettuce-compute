@@ -2082,11 +2082,18 @@ func (x *LeafInfo) GetResourceRequirements() *LeafResourceRequirements {
 }
 
 type AbandonWorkUnitRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	WorkUnitId    string                 `protobuf:"bytes,1,opt,name=work_unit_id,json=workUnitId,proto3" json:"work_unit_id,omitempty"`
-	VolunteerId   string                 `protobuf:"bytes,2,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"`
-	PublicKey     []byte                 `protobuf:"bytes,3,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
-	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"` // e.g., "prepare failed: no binary for platform"
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	WorkUnitId  string                 `protobuf:"bytes,1,opt,name=work_unit_id,json=workUnitId,proto3" json:"work_unit_id,omitempty"`
+	VolunteerId string                 `protobuf:"bytes,2,opt,name=volunteer_id,json=volunteerId,proto3" json:"volunteer_id,omitempty"`
+	PublicKey   []byte                 `protobuf:"bytes,3,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	Reason      string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"` // e.g., "prepare failed: no binary for platform"
+	// True when the volunteer is returning a unit it never started because its work
+	// buffer could not use it (an arrival-time give-back), as opposed to abandoning
+	// work that failed. The head verifies the copy really never started before
+	// treating the return as budget-neutral (outcome RETURNED instead of ABANDONED);
+	// the flag alone never whitewashes a started copy. Absent (false) from older
+	// clients, whose give-backs are then billed as plain abandons, as before.
+	UnrunGiveback bool `protobuf:"varint,5,opt,name=unrun_giveback,json=unrunGiveback,proto3" json:"unrun_giveback,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2147,6 +2154,13 @@ func (x *AbandonWorkUnitRequest) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *AbandonWorkUnitRequest) GetUnrunGiveback() bool {
+	if x != nil {
+		return x.UnrunGiveback
+	}
+	return false
 }
 
 type AbandonWorkUnitResponse struct {
@@ -3039,14 +3053,15 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	" \x01(\v2#.lettuce.volunteer.v1.ExecutionSpecR\rexecutionSpec\x12<\n" +
 	"\x1aestimated_duration_seconds\x18\v \x01(\x01R\x18estimatedDurationSeconds\x12!\n" +
 	"\factive_hosts\x18\f \x01(\x05R\vactiveHosts\x12c\n" +
-	"\x15resource_requirements\x18\r \x01(\v2..lettuce.volunteer.v1.LeafResourceRequirementsR\x14resourceRequirements\"\x94\x01\n" +
+	"\x15resource_requirements\x18\r \x01(\v2..lettuce.volunteer.v1.LeafResourceRequirementsR\x14resourceRequirements\"\xbb\x01\n" +
 	"\x16AbandonWorkUnitRequest\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12!\n" +
 	"\fvolunteer_id\x18\x02 \x01(\tR\vvolunteerId\x12\x1d\n" +
 	"\n" +
 	"public_key\x18\x03 \x01(\fR\tpublicKey\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"O\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\x12%\n" +
+	"\x0eunrun_giveback\x18\x05 \x01(\bR\runrunGiveback\"O\n" +
 	"\x17AbandonWorkUnitResponse\x12\x1a\n" +
 	"\brequeued\x18\x01 \x01(\bR\brequeued\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x1a\n" +

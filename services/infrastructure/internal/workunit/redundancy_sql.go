@@ -77,6 +77,10 @@ func effMaxErrorSQL(wu, l string) string {
 // disjunct so the count has a single definition (the same discipline countableCoverageSQL has:
 // the drift BG-27 exposed came from an executor that never embedded a shared fragment at all).
 //
+// RETURNED rows (un-run buffer give-backs, TB-35) are deliberately NOT in the outcome list:
+// a give-back carries no information about the unit, so it is not an error signal — the same
+// reasoning that keeps SUPERSEDED out.
+//
 // unitID is the work-unit id column/placeholder expression in scope ("wu.id", "$1", ...). The
 // internal aliases are ec_-prefixed so an embedding never collides with a host query's aliases,
 // following countableLiveCopiesSQL's prefix idiom.
@@ -89,13 +93,50 @@ func errorCopiesSQL(unitID string) string {
 	)`
 }
 
+// budgetCopiesSQL: the copies that COUNT toward the dead-letter total ceiling
+// (max_total_copies) — every history row EXCEPT the RETURNED give-backs (TB-35). A copy a
+// volunteer returned un-run because its work buffer could not use it says nothing about the
+// unit, so it must not spend the unit's budget: before this exclusion, a batch tail bouncing
+// between full buffers drove healthy units to FAILED with zero compute ever attempted (the
+// dead units' claims split 153 un-run give-backs / 9 real attempts on the live heads).
+// LIVE rows (outcome IS NULL) still count, exactly as the old raw COUNT(*) counted them —
+// IS DISTINCT FROM keeps them (NULL is distinct from 'RETURNED').
+//
+// Written ONCE here and embedded by CountTotalCopies, DeadLetterIfExhausted's total-ceiling
+// disjunct, RefundCopyBudget's rebase, and capsNotExhaustedSQL, so the budget count has a
+// single definition (the errorCopiesSQL discipline). bc_-prefixed internal alias.
+func budgetCopiesSQL(unitID string) string {
+	return `(SELECT COUNT(*) FROM work_unit_assignment_history bc_h
+		 WHERE bc_h.work_unit_id = ` + unitID + ` AND bc_h.outcome IS DISTINCT FROM 'RETURNED')`
+}
+
+// capsNotExhaustedSQL: the dispatch-side twin of transition.capsExhausted (decide.go),
+// negated — TRUE while the unit's copy budget still has room: budget-counting copies below
+// the total ceiling AND (when an error cap is configured) error copies below it. Every
+// dispatch read/landing (FindNextAssignable, FindDispatchableBatch, ClaimDispatchableBatch,
+// FlushReservations, ReserveCopy) embeds it so a unit whose budget is spent is never staged,
+// handed out, or landed again (TB-35's zombie half): before this gate, dispatch kept serving
+// an exhausted unit — for which no copy row could ever be minted — for hours between budget
+// exhaustion and the dead-letter sweep, every return failing "no live copy". The
+// `> 0` guard on the error arm mirrors DeadLetterIfExhausted's: 0 = unlimited.
+func capsNotExhaustedSQL(wu, l string) string {
+	return `(
+		` + budgetCopiesSQL(wu+".id") + ` < ` + effMaxTotalSQL(wu, l) + `
+		AND (
+		  ` + effMaxErrorSQL(wu, l) + ` = 0
+		  OR ` + errorCopiesSQL(wu+".id") + ` < ` + effMaxErrorSQL(wu, l) + `
+		)
+	)`
+}
+
 // Precomputed fragments for the common wu/l alias pair (used by every query except
 // ClaimDispatchableBatch's inner select, which builds its own with effTargetSQL("wu2","l2")).
 var (
-	effTargetWuL   = effTargetSQL("wu", "l")
-	effQuorumWuL   = effQuorumSQL("wu", "l")
-	effMaxTotalWuL = effMaxTotalSQL("wu", "l")
-	effMaxErrorWuL = effMaxErrorSQL("wu", "l")
+	effTargetWuL        = effTargetSQL("wu", "l")
+	effQuorumWuL        = effQuorumSQL("wu", "l")
+	effMaxTotalWuL      = effMaxTotalSQL("wu", "l")
+	effMaxErrorWuL      = effMaxErrorSQL("wu", "l")
+	capsNotExhaustedWuL = capsNotExhaustedSQL("wu", "l")
 )
 
 // --- Trust-gate dispatch (trusted-corroborator reservation) ---

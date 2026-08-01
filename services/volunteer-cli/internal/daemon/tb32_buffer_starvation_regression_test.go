@@ -250,7 +250,7 @@ func TestTB32_BatchOverflowReturnsToHeadInsteadOfWaitingForDeadline(t *testing.T
 	}
 
 	// Two more big units on an already-full buffer: both returned, none buffered.
-	pushed := fetcher.bufferBatch(context.Background(), servers[0],
+	pushed, _ := fetcher.bufferBatch(context.Background(), servers[0],
 		CachedLeafInfo{ID: "leaf-grep", Slug: "grep"},
 		[]*lettucev1.WorkUnitAssignment{
 			asg("00000000-0000-4000-8000-0000000000e1", 6000, 7200),
@@ -267,7 +267,7 @@ func TestTB32_BatchOverflowReturnsToHeadInsteadOfWaitingForDeadline(t *testing.T
 	}
 
 	// An over-target unit that CAN start feeds the starving slot — kept.
-	pushed = fetcher.bufferBatch(context.Background(), servers[0],
+	pushed, _ = fetcher.bufferBatch(context.Background(), servers[0],
 		CachedLeafInfo{ID: "leaf-small", Slug: "small"},
 		[]*lettucev1.WorkUnitAssignment{asg("00000000-0000-4000-8000-0000000000e3", 512, 600)})
 	if pushed != 1 {
@@ -276,7 +276,7 @@ func TestTB32_BatchOverflowReturnsToHeadInsteadOfWaitingForDeadline(t *testing.T
 
 	// The slot's need is now met from the buffer: a further over-target unit is
 	// returned, so the buffer cannot grow without bound.
-	pushed = fetcher.bufferBatch(context.Background(), servers[0],
+	pushed, _ = fetcher.bufferBatch(context.Background(), servers[0],
 		CachedLeafInfo{ID: "leaf-small", Slug: "small"},
 		[]*lettucev1.WorkUnitAssignment{asg("00000000-0000-4000-8000-0000000000e4", 512, 600)})
 	if pushed != 0 {
