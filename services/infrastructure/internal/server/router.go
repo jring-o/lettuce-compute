@@ -291,17 +291,19 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	// Leaf mutations. Create is authOnly + leafViewer: requireAuth guarantees a
 	// caller, and leafViewer injects that caller's identity so handleCreate can
 	// bind creator_id to it (★BG-11d-write / R1.5) without importing the server
-	// package.
+	// package. The update/delete/transition routes take the same inner leafViewer
+	// (after the authOwner gate) so the handlers' audit lines can name the actor
+	// (TB-38); it grants nothing — ownership was already enforced outside it.
 	mux.HandleFunc("POST /api/v1/leafs", authOnly(leafViewer(leafHandler.HandleCreate)))
-	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", authOwner(leafHandler.HandleUpdate))
-	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", authOwner(leafHandler.HandleDelete))
+	mux.HandleFunc("PUT /api/v1/leafs/{leaf_id}", authOwner(leafViewer(leafHandler.HandleUpdate)))
+	mux.HandleFunc("DELETE /api/v1/leafs/{leaf_id}", authOwner(leafViewer(leafHandler.HandleDelete)))
 
 	// Leaf state transitions.
-	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", authOwner(leafHandler.HandleActivate))
-	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/pause", authOwner(leafHandler.HandlePause))
-	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/resume", authOwner(leafHandler.HandleResume))
-	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/archive", authOwner(leafHandler.HandleArchive))
-	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", authOwner(leafHandler.HandleConfigure))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/activate", authOwner(leafViewer(leafHandler.HandleActivate)))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/pause", authOwner(leafViewer(leafHandler.HandlePause)))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/resume", authOwner(leafViewer(leafHandler.HandleResume)))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/archive", authOwner(leafViewer(leafHandler.HandleArchive)))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/configure", authOwner(leafViewer(leafHandler.HandleConfigure)))
 
 	// Artifact version registry (TODO #38): publish an immutable version (snapshots the
 	// leaf's current execution_config), list history, activate/roll back, purge.

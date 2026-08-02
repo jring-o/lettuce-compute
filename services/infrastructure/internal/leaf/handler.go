@@ -1,10 +1,12 @@
 package leaf
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -421,6 +423,9 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}
+	// TB-38 (4): snapshot the pre-update state (a deep copy via the JSON encoding)
+	// for the audit diff logged after a successful update.
+	beforeJSON, _ := json.Marshal(p)
 
 	// Apply partial updates.
 	if req.Name != nil {
@@ -603,6 +608,14 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// the database; stop trusting it before answering (PB-16 / PB-38b).
 	h.invalidateDispatch(id)
 
+	// TB-38 (4): one audit line per successful mutation, carrying a field-level
+	// before→after diff, the actor, and the request id (already on l). Without it a
+	// PUT appeared only as the generic access line, and reconstructing WHAT changed
+	// on a live leaf took DB timestamps, public reads, and the operator's memory.
+	afterJSON, _ := json.Marshal(p)
+	attrs := append([]any{"leaf_id", id}, leafAuditDiffAttrs(beforeJSON, afterJSON)...)
+	l.Info("leaf updated", append(attrs, actorAttrs(r)...)...)
+
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -638,6 +651,10 @@ func (h *LeafHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.invalidateDispatch(id)
+
+	// TB-38 (4): audit the successful mutation with the actor.
+	l.Info("leaf deleted",
+		append([]any{"leaf_id", id, "name", p.Name, "state", p.State}, actorAttrs(r)...)...)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -683,6 +700,7 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 		apierror.WriteError(w, apierror.FromError(err))
 		return
 	}
+	from := p.State
 
 	if err := TransitionLeaf(r.Context(), h.repo, p, target); err != nil {
 		l.Info(op+" transition failed", "error", err, "leaf_id", id, "state", p.State)
@@ -693,6 +711,12 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 	// State is dispatch-relevant (a pause must stop hand-outs; a configure may edit
 	// config): drop the dispatch cache's trust in its snapshot (PB-16 / PB-38b).
 	h.invalidateDispatch(id)
+
+	// TB-38 (4): audit every successful transition with the actor. Activation keeps
+	// its dedicated detail lines below; pause/resume/archive/configure previously
+	// logged nothing at all on success.
+	l.Info("leaf state changed",
+		append([]any{"leaf_id", id, "op", op, "from", from, "to", p.State}, actorAttrs(r)...)...)
 
 	// On going live, surface the work-unit deadline this leaf's units will carry
 	// (otherwise invisible to operators) and warn if it is too short for the work.
@@ -712,6 +736,49 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 	}
 
 	writeJSON(w, http.StatusOK, p)
+}
+
+// actorAttrs identifies the caller of a leaf mutation for the audit line (TB-38):
+// the authenticated user when the route injected a Viewer, plus the connection's
+// remote address. The request id is already carried by the context logger.
+func actorAttrs(r *http.Request) []any {
+	attrs := []any{"remote_addr", r.RemoteAddr}
+	if v, ok := ViewerFromContext(r.Context()); ok {
+		attrs = append(attrs, "actor_user_id", v.UserID, "actor_is_admin", v.IsAdmin)
+	}
+	return attrs
+}
+
+// leafAuditDiffAttrs renders the field-level diff between two JSON encodings of one
+// leaf as log attributes: "changed" lists the top-level fields that differ, and each
+// changed field contributes a <field>_before / <field>_after pair with its exact
+// values, so the prior state survives in the log. updated_at is skipped — it changes
+// on every write and carries no intent.
+func leafAuditDiffAttrs(before, after []byte) []any {
+	var b, a map[string]json.RawMessage
+	if json.Unmarshal(before, &b) != nil || json.Unmarshal(after, &a) != nil {
+		return []any{"diff_error", "could not decode leaf snapshots"}
+	}
+	keys := make([]string, 0, len(a))
+	for k := range a {
+		keys = append(keys, k)
+	}
+	for k := range b {
+		if _, ok := a[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	changed := make([]string, 0, 4)
+	attrs := make([]any, 0, 8)
+	for _, k := range keys {
+		if k == "updated_at" || bytes.Equal(b[k], a[k]) {
+			continue
+		}
+		changed = append(changed, k)
+		attrs = append(attrs, k+"_before", string(b[k]), k+"_after", string(a[k]))
+	}
+	return append([]any{"changed", changed}, attrs...)
 }
 
 // writeJSON encodes v as JSON and writes it with the given status code.

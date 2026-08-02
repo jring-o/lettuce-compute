@@ -1148,16 +1148,24 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	if drained {
 		c.signalRefill()
 	}
-	// D-2 / D-1: per-call hand-out summary, and (when nothing was handed out) the reject
-	// tally that explains it. Guarded behind a single Enabled check so the steady-state
-	// hot path allocates nothing when Debug is disabled (the production default).
-	if c.logger.Enabled(context.Background(), slog.LevelDebug) {
-		c.logger.Debug("hand-out",
+	// TB-38 (1): every accepted hand-out is one Info line per unit carrying the
+	// identifying triple (unit, leaf, volunteer) plus the requesting machine and the
+	// reservation window — the head-side record that this unit left for that machine.
+	// Volume is bounded by real dispatch rate (≈ results accepted, already Info). This
+	// used to be a Debug-only per-call summary, which is why TB-35's claimless serving
+	// was provable only from the client's receipts plus absent DB rows.
+	for _, r := range final {
+		c.logger.Info("hand-out",
+			"work_unit_id", r.unit.ID,
+			"leaf_id", r.unit.LeafID,
 			"volunteer_id", volunteerID,
-			"requested", n,
-			"handed", len(final),
-			"ready_len", readyLen,
-			"drained", drained)
+			"host_id", hostKey,
+			"reserved_until", *r.unit.ReservedUntil)
+	}
+	// D-1: when nothing was handed out, the per-reason reject tally that explains it.
+	// Guarded behind an Enabled check so the steady-state hot path allocates nothing
+	// when Debug is disabled (the production default).
+	if c.logger.Enabled(context.Background(), slog.LevelDebug) {
 		if taken == 0 {
 			attrs := make([]any, 0, 4+2*numRejectReasons)
 			attrs = append(attrs, "volunteer_id", volunteerID, "ready_len", readyLen)
@@ -1193,13 +1201,20 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	if taken == 0 && c.noteStarved(hostKey) &&
 		(rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0 ||
 			rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0) {
-		attrs := make([]any, 0, 14+2*numRejectReasons)
+		attrs := make([]any, 0, 20+2*numRejectReasons)
 		attrs = append(attrs,
 			"volunteer_id", volunteerID,
 			"host_id", hostKey,
 			"inflight", c.inflightFor(hostKey),
 			"inflight_cap", opts.MaxInflightPerVolunteer,
-			"ready_len", readyLen)
+			"ready_len", readyLen,
+			// TB-38 (2): the request's own inputs — what the machine ASKED for — next
+			// to the tallies that answer it. Without the leaf filter here, "did this
+			// client ask narrowly (a client bug) or broadly" was unanswerable from the
+			// head log at all (the 2026-08-01 starved-backfill case).
+			"requested", n,
+			"leaf_ids", opts.LeafIDs,
+			"blocked_leaf_ids", opts.BlockedLeafIDs)
 		if rejects[rejectCapabilityMismatch] > 0 {
 			attrs = append(attrs,
 				"max_cpu_cores", opts.MaxCPUCores,
@@ -3013,11 +3028,14 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 			continue
 		}
 		c.voidNonLandedCopy(rec.WorkUnitID, rec.VolunteerID)
-		// D-5: a non-landed copy silently revokes a hand-out (the unit is no longer
-		// QUEUED, redundancy was met, this volunteer already holds a live copy, or it is
-		// in post-failure cooldown). voidNonLandedCopy also benches the volunteer on the
-		// staged candidate so the same un-reservable unit is not re-offered to it next tick.
-		c.logger.Debug("voided non-landed copy (flush conflict); benched volunteer on candidate",
+		// D-5 / TB-38 (5): a non-landed copy silently revokes a hand-out the volunteer
+		// already received (the unit is no longer QUEUED, redundancy was met, this
+		// volunteer already holds a live copy, or it is in post-failure cooldown).
+		// voidNonLandedCopy also benches the volunteer on the staged candidate so the
+		// same un-reservable unit is not re-offered to it next tick. Warn, not Debug:
+		// a hand-out whose claim never became durable is the TB-35 zombie-window shape,
+		// and its recurrence must be visible on a production head.
+		c.logger.Warn("dispatch cache: hand-out copy did not land (flush conflict); voided and benched volunteer on candidate",
 			"work_unit_id", rec.WorkUnitID, "volunteer_id", rec.VolunteerID)
 	}
 }
