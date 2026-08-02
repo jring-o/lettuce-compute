@@ -1432,6 +1432,14 @@ func (s *volunteerService) requestWorkUnitFromDB(ctx context.Context, volunteerI
 	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(reserved))
 	for _, ru := range reserved {
 		assignments = append(assignments, buildWorkUnitAssignment(ru.wu, ru.leaf, nil))
+		// TB-38 (1): the same per-unit hand-out Info the cache path (HandOut) emits,
+		// so this fallback dispatch path leaves the same head-side record.
+		s.logger.Info("hand-out",
+			"work_unit_id", ru.wu.ID,
+			"leaf_id", ru.wu.LeafID,
+			"volunteer_id", volunteerID,
+			"host_id", meterID(volunteerID, opts.HostID),
+			"reserved_until", ru.wu.ReservedUntil)
 	}
 
 	return &lettucev1.RequestWorkUnitResponse{
@@ -1764,12 +1772,18 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 		// Reuse the unit loaded once under the row lock above. The grace path keeps its
 		// existing terminal-state refusal (there is no live copy to close here).
 		if submitUnit.State == workunit.WorkUnitStateValidated || submitUnit.State == workunit.WorkUnitStateFailed {
+			// TB-38 (3): a refused RPC logs its refusal with the identifying triple. The
+			// volunteer sees only the error; without these lines the head kept no record.
+			s.logger.Info("SubmitResult refused: work unit already finalized",
+				"work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", submitUnit.LeafID, "state", submitUnit.State)
 			return nil, status.Errorf(codes.FailedPrecondition, "work unit already finalized; result is too late to accept")
 		}
 
 		latest, latestErr := txAssignRepo.FindLatestByWorkUnitAndVolunteer(ctx, workUnitID, volunteerID)
 		if latestErr != nil || latest.Outcome == nil ||
 			(*latest.Outcome != assignment.OutcomeExpired && *latest.Outcome != assignment.OutcomeAbandoned) {
+			s.logger.Info("SubmitResult refused: no active assignment for this volunteer",
+				"work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", submitUnit.LeafID)
 			return nil, status.Errorf(codes.FailedPrecondition, "no active assignment for this volunteer and work unit")
 		}
 
@@ -1800,6 +1814,11 @@ func (s *volunteerService) SubmitResult(ctx context.Context, req *lettucev1.Subm
 			s.logger.Error("failed to commit supersede on finalized unit", "work_unit_id", workUnitID, "error", err)
 			return nil, status.Errorf(codes.Internal, "internal error")
 		}
+		// TB-38 (3): same refusal as the grace path above, but this one also closed the
+		// caller's still-live copy — say so, and name the copy it superseded.
+		s.logger.Info("SubmitResult refused: work unit already finalized; live copy superseded",
+			"work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", submitUnit.LeafID,
+			"state", submitUnit.State, "copy_id", activeAssignment.ID)
 		return nil, status.Errorf(codes.FailedPrecondition, "work unit already finalized; result is too late to accept")
 	}
 
@@ -2071,6 +2090,10 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 	// Per-copy dispatch: a work unit stays QUEUED while its copies run, so a terminal
 	// (COMPLETED/VALIDATED/REJECTED/FAILED) unit has nothing to run-start.
 	if wu.State != workunit.WorkUnitStateQueued {
+		// TB-38 (3): a refused RPC logs its refusal with the identifying triple. The
+		// volunteer sees only the message; without this line the head kept no record.
+		s.logger.Info("StartWork refused: work unit no longer dispatchable",
+			"work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", wu.LeafID, "state", wu.State)
 		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer dispatchable"}, nil
 	}
 
@@ -2101,6 +2124,9 @@ func (s *volunteerService) StartWork(ctx context.Context, req *lettucev1.StartWo
 	// redundancy copies keep dispatching in parallel. 0 rows -> this volunteer holds no
 	// live copy (its reservation lapsed / was voided): tell it to drop the unit.
 	if _, aerr := s.wuRepo.Assign(ctx, workUnitID, volunteerID); aerr != nil {
+		// TB-38 (3): the drop-the-unit denial, previously answered with no log line.
+		s.logger.Info("StartWork refused: work unit no longer reserved for this volunteer",
+			"work_unit_id", workUnitID, "volunteer_id", volunteerID, "leaf_id", wu.LeafID, "error", aerr)
 		return &lettucev1.StartWorkResponse{Ok: false, Message: "work unit no longer reserved for this volunteer"}, nil
 	}
 
@@ -2419,6 +2445,14 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 				}, nil
 			}
 			// No live copy and no in-memory hold (already lapsed/closed): stale abandon.
+			// TB-38 (3): this refusal was answered ~50–97 times/host/day with zero
+			// head-side record. Log it with its triple; the leaf is loaded best-effort
+			// (one PK read, and this path is rare and off the hot loop).
+			attrs := []any{"work_unit_id", req.WorkUnitId, "volunteer_id", req.VolunteerId, "reason", req.Reason}
+			if wu, werr := s.wuRepo.GetByID(ctx, workUnitID); werr == nil {
+				attrs = append(attrs, "leaf_id", wu.LeafID)
+			}
+			s.logger.Info("AbandonWorkUnit refused: no live copy for this volunteer", attrs...)
 			return nil, status.Errorf(codes.FailedPrecondition, "no live copy found for this volunteer and work unit")
 		}
 		s.logger.Error("abandon: failed to close copy", "work_unit_id", req.WorkUnitId, "error", cerr)
