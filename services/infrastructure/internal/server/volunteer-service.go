@@ -2427,7 +2427,8 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	if req.UnrunGiveback {
 		closeOutcome = assignment.OutcomeReturned
 	}
-	if cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(closeOutcome), nil, req.Reason); cerr != nil {
+	closed, cerr := s.wuRepo.CloseCopyByVolunteer(ctx, workUnitID, volunteerID, string(closeOutcome), nil, req.Reason)
+	if cerr != nil {
 		if cApiErr, ok := cerr.(*apierror.APIError); ok && cApiErr.HTTPStatus == 409 {
 			if hadInMemHold {
 				// The volunteer DID hold this unit, but its reservation never became
@@ -2459,10 +2460,19 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
 
-	// Dispatch cache: drop this volunteer's in-memory hold so the cache stops counting
-	// it; the unit stays QUEUED and is re-stageable for a fresh distinct volunteer.
+	// Dispatch cache: drop this volunteer's in-memory hold AND record the close on the
+	// still-staged candidate's bench (TB-40). The candidate's bench map is a refill-time
+	// snapshot that predates the cooldown row this close just wrote, so a bare release
+	// left the cache re-offering the unit to this same volunteer on its next poll — a
+	// hand-out whose reservation flush the SQL landing was guaranteed to refuse, buffered
+	// client-side as a phantom that died at run-start. The bench mirrors what the write
+	// actually recorded (`closed`, not the requested outcome), so a graceful un-started
+	// ABANDONED return still benches nothing (#59) and a downgraded give-back benches
+	// the full deadline window. The unit stays QUEUED and staged for fresh distinct
+	// volunteers.
 	if s.dispatchCache != nil {
-		s.dispatchCache.releaseInMem(workUnitID, volunteerID)
+		s.dispatchCache.onCopyClosed(workUnitID, volunteerID,
+			closed.Outcome == string(assignment.OutcomeReturned), closed.Started)
 	}
 
 	// Delegate the post-close decision to the single transitioner (TODO #50): requeue (stay
@@ -2490,6 +2500,7 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 		"volunteer_id", req.VolunteerId,
 		"reason", req.Reason,
 		"unrun_giveback", req.UnrunGiveback,
+		"outcome", closed.Outcome,
 		"requeued", requeued,
 	)
 

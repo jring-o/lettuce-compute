@@ -281,7 +281,7 @@ func TestCountActiveByVolunteer(t *testing.T) {
 	if _, err := repo.ReserveCopy(ctx, rc.ID, vol, nil, until, 3600); err != nil {
 		t.Fatalf("ReserveCopy(rc): %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, rc.ID, vol, "ABANDONED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, rc.ID, vol, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("CloseCopyByVolunteer(rc): %v", err)
 	}
 

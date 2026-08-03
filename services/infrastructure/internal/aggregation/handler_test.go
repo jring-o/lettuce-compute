@@ -164,8 +164,8 @@ func (m *mockWURepo) FindStuckSpotCheckUnits(context.Context, int) ([]*workunit.
 func (m *mockWURepo) CloseCopy(context.Context, types.ID, string) error {
 	return nil
 }
-func (m *mockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) error {
-	return nil
+func (m *mockWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) (workunit.ClosedCopy, error) {
+	return workunit.ClosedCopy{}, nil
 }
 func (m *mockWURepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
 	return 0, nil

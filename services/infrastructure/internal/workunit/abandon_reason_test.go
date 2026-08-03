@@ -31,7 +31,7 @@ func TestCloseCopyByVolunteer_PersistsAbandonReason(t *testing.T) {
 	}
 
 	reason := "non-zero exit code 137; output: worker: signal: killed"
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, reason); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, reason); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 
@@ -66,7 +66,7 @@ func TestCloseCopyByVolunteer_EmptyReasonStoresNull(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("close volA copy ABANDONED: %v", err)
 	}
 

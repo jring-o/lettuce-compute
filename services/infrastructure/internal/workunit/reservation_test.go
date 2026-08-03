@@ -320,7 +320,7 @@ func TestCloseCopyByVolunteer_AbandonBufferedCopyReReservable(t *testing.T) {
 		t.Fatalf("reserve vol1: %v", err)
 	}
 
-	if err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol1, "ABANDONED", nil, ""); err != nil {
+	if _, err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol1, "ABANDONED", nil, ""); err != nil {
 		t.Fatalf("CloseCopyByVolunteer: %v", err)
 	}
 	// No live copy remains.
@@ -359,7 +359,7 @@ func TestCloseCopyByVolunteer_NoLiveCopyConflicts(t *testing.T) {
 
 	// vol2 never reserved this unit; closing its (nonexistent) copy must conflict,
 	// not silently drop vol1's copy.
-	if err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol2, "ABANDONED", nil, ""); err == nil {
+	if _, err := wuRepo.CloseCopyByVolunteer(ctx, wu.ID, vol2, "ABANDONED", nil, ""); err == nil {
 		t.Fatalf("expected Conflict closing a copy not held by vol2")
 	}
 }
@@ -654,7 +654,7 @@ func TestReserveCopy_RefusesBenchedVolunteer(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil, ""); err != nil {
 		t.Fatalf("close volA copy EXPIRED: %v", err)
 	}
 
@@ -718,7 +718,7 @@ func TestFlushReservations_SkipsBenchedVolunteer(t *testing.T) {
 	if _, err := repo.ReserveNextAssignable(ctx, reserveOpts(volA, 0), 60*time.Second); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "EXPIRED", nil, ""); err != nil {
 		t.Fatalf("close volA copy EXPIRED: %v", err)
 	}
 

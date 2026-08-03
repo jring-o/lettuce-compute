@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/workunit"
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 )
 
@@ -21,9 +22,9 @@ type givebackRecordingWURepo struct {
 	lastCloseOutcome string
 }
 
-func (m *givebackRecordingWURepo) CloseCopyByVolunteer(_ context.Context, _ types.ID, _ types.ID, outcome string, _ *types.ID, _ string) error {
+func (m *givebackRecordingWURepo) CloseCopyByVolunteer(_ context.Context, _ types.ID, _ types.ID, outcome string, _ *types.ID, _ string) (workunit.ClosedCopy, error) {
 	m.lastCloseOutcome = outcome
-	return nil
+	return workunit.ClosedCopy{Outcome: outcome}, nil
 }
 
 func TestAbandonWorkUnit_GivebackFlagSelectsReturnedOutcome(t *testing.T) {
