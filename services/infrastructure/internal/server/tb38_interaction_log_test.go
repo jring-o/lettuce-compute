@@ -192,8 +192,8 @@ type staleAbandonWURepo struct {
 	bvMockWURepo
 }
 
-func (m *staleAbandonWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) error {
-	return apierror.Conflict("no live copy", nil)
+func (m *staleAbandonWURepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) (workunit.ClosedCopy, error) {
+	return workunit.ClosedCopy{}, apierror.Conflict("no live copy", nil)
 }
 
 // TestAbandonWorkUnit_StaleRefusalIsLogged: the FailedPrecondition "no live copy"

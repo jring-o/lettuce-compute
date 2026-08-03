@@ -102,8 +102,8 @@ func (r *mockWorkUnitRepo) CloseCopy(context.Context, types.ID, string) error {
 }
 func (r *mockWorkUnitRepo) CountErrorCopies(context.Context, types.ID) (int, error) { return 0, nil }
 func (r *mockWorkUnitRepo) MarkCompleted(context.Context, types.ID) error           { return nil }
-func (r *mockWorkUnitRepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) error {
-	return nil
+func (r *mockWorkUnitRepo) CloseCopyByVolunteer(context.Context, types.ID, types.ID, string, *types.ID, string) (workunit.ClosedCopy, error) {
+	return workunit.ClosedCopy{}, nil
 }
 func (r *mockWorkUnitRepo) ExpireLiveCopies(context.Context, types.ID, string) (int, error) {
 	return 0, nil

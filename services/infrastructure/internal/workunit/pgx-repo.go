@@ -2242,26 +2242,30 @@ func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, 
 // single write point: a caller asking for RETURNED gets it only when the copy really
 // never started (started_at IS NULL); a STARTED copy closes ABANDONED instead, so a
 // client's give-back flag can never whitewash work it actually began and dropped.
-func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error {
-	tag, err := r.db.Exec(ctx, `
+// The RETURNING clause reports the honored outcome and the copy's started-ness back
+// to the caller (TB-40) — the facts the cooldown gate benches on, from the same write.
+func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) (ClosedCopy, error) {
+	var closed ClosedCopy
+	err := r.db.QueryRow(ctx, `
 		UPDATE work_unit_assignment_history
 		SET outcome = (CASE WHEN $3 = 'RETURNED' AND started_at IS NOT NULL
 		                    THEN 'ABANDONED' ELSE $3 END)::assignment_outcome,
 		    outcome_at = NOW(), result_id = COALESCE($4, result_id),
 		    outcome_reason = $5
-		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL`,
+		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL
+		RETURNING outcome, started_at IS NOT NULL`,
 		workUnitID, volunteerID, outcome, resultID, boundedOutcomeReason(reason),
-	)
+	).Scan(&closed.Outcome, &closed.Started)
 	if err != nil {
-		return apierror.Internal("failed to close copy by volunteer", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ClosedCopy{}, apierror.Conflict(
+				"no live copy for this volunteer to close",
+				map[string]string{"code": "COPY_CONFLICT"},
+			)
+		}
+		return ClosedCopy{}, apierror.Internal("failed to close copy by volunteer", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return apierror.Conflict(
-			"no live copy for this volunteer to close",
-			map[string]string{"code": "COPY_CONFLICT"},
-		)
-	}
-	return nil
+	return closed, nil
 }
 
 // maxOutcomeReasonBytes bounds the persisted outcome reason. The shipped client sends

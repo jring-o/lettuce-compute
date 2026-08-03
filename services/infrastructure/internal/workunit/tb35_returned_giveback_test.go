@@ -64,7 +64,7 @@ func TestCloseCopyByVolunteer_ReturnedVerifiedUnstarted(t *testing.T) {
 	if _, err := repo.ReserveCopy(ctx, unrun.ID, volA, nil, time.Now().UTC().Add(time.Hour), unrun.DeadlineSeconds); err != nil {
 		t.Fatalf("reserve un-run copy: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, unrun.ID, volA, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, unrun.ID, volA, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
 		t.Fatalf("close un-run copy RETURNED: %v", err)
 	}
 	if got := copyOutcome(t, pool, unrun.ID, volA); got != "RETURNED" {
@@ -80,7 +80,7 @@ func TestCloseCopyByVolunteer_ReturnedVerifiedUnstarted(t *testing.T) {
 	if _, err := repo.Assign(ctx, started.ID, volA); err != nil {
 		t.Fatalf("run-start copy: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, started.ID, volA, "RETURNED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, started.ID, volA, "RETURNED", nil, ""); err != nil {
 		t.Fatalf("close started copy: %v", err)
 	}
 	if got := copyOutcome(t, pool, started.ID, volA); got != "ABANDONED" {
@@ -111,7 +111,7 @@ func TestTB35_ReturnedGivebacksDoNotBurnCopyBudget(t *testing.T) {
 		if _, err := repo.ReserveCopy(ctx, churned.ID, vol, nil, time.Now().UTC().Add(time.Hour), churned.DeadlineSeconds); err != nil {
 			t.Fatalf("reserve: %v", err)
 		}
-		if err := repo.CloseCopyByVolunteer(ctx, churned.ID, vol, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
+		if _, err := repo.CloseCopyByVolunteer(ctx, churned.ID, vol, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
 			t.Fatalf("close RETURNED: %v", err)
 		}
 	}
@@ -240,7 +240,7 @@ func TestTB35_ReturnedReofferCooldown(t *testing.T) {
 	if _, err := repo.ReserveCopy(ctx, wu.ID, volA, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("reserve volA: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volA, "RETURNED", nil, "work buffer full (over the hours target)"); err != nil {
 		t.Fatalf("close volA RETURNED: %v", err)
 	}
 
@@ -286,7 +286,7 @@ func TestTB35_ReturnedReofferCooldown(t *testing.T) {
 	if _, err := repo.ReserveCopy(ctx, wu.ID, volB, nil, time.Now().UTC().Add(time.Hour), wu.DeadlineSeconds); err != nil {
 		t.Fatalf("fresh volunteer must be admitted during the returner's cooldown: %v", err)
 	}
-	if err := repo.CloseCopyByVolunteer(ctx, wu.ID, volB, "RETURNED", nil, ""); err != nil {
+	if _, err := repo.CloseCopyByVolunteer(ctx, wu.ID, volB, "RETURNED", nil, ""); err != nil {
 		t.Fatalf("close volB RETURNED: %v", err)
 	}
 

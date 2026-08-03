@@ -1728,6 +1728,61 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 	}
 }
 
+// onCopyClosed drops one volunteer's in-memory hold after AbandonWorkUnit closed its
+// copy row and, when that close feeds the SQL cooldown, benches the volunteer on the
+// still-staged candidate with the window the fresh row now enforces (TB-40). The
+// candidate's bench map is a refill-time snapshot, taken BEFORE this close existed,
+// and it refreshes only on re-stage — which never happens while the candidate sits
+// staged. So a bare release left eligibleLocked blind to the SQL cooldown the close
+// just started: the closer's next poll (30–60 s later, squarely inside the window)
+// was re-handed the same unit, the async reservation flush was refused, and the
+// client — never told — buffered a phantom that died at run-start (~14 % of fleet
+// slot starts on 2026-08-02). voidNonLandedCopy stays the backstop for refusals this
+// replica did NOT perform (it learns of those only from the flush conflict, so it can
+// only throttle blind); this path knows the honored outcome and its time, so it
+// mirrors the SQL gate exactly — bench-or-not per cooldownGuardSQL's arms, the
+// per-outcome window, and the pool-exhausted fallback intact so a small pool still
+// cannot strand.
+//
+// `returned` and `started` are what the close actually WROTE (workunit.ClosedCopy —
+// the repo downgrades a mis-flagged give-back of a started copy to ABANDONED), so
+// this stays in lockstep with the row the SQL gate will read.
+func (c *dispatchCache) onCopyClosed(unitID, volunteerID types.ID, returned, started bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseInMemLocked(unitID, volunteerID)
+	// A graceful return of un-started buffered work (ABANDONED, started_at NULL) is
+	// not a reliability signal and does not feed the SQL cooldown (#59) — so it must
+	// not bench here either, or a one-volunteer pool is refused in memory forever
+	// what the SQL landing would grant at once (the graceful-buffer-return e2e
+	// property). RETURNED benches its short re-offer throttle even though un-started:
+	// that IS the give-back's only teeth (TB-35).
+	if !returned && !started {
+		return
+	}
+	for i := range c.ready {
+		if c.ready[i].unit.ID != unitID {
+			continue
+		}
+		if c.ready[i].benched == nil {
+			c.ready[i].benched = make(map[types.ID]benchEntry)
+		}
+		e := benchEntryFor(c.now(), returned, c.ready[i].unit.DeadlineSeconds)
+		// Keep whichever bench holds longest (benchSet's merge rule: the SQL gate
+		// refuses while ANY arm refuses).
+		if prev, ok := c.ready[i].benched[volunteerID]; ok {
+			if prev.until.After(e.until) {
+				e.until = prev.until
+			}
+			if prev.fallbackAt.After(e.fallbackAt) {
+				e.fallbackAt = prev.fallbackAt
+			}
+		}
+		c.ready[i].benched[volunteerID] = e
+		return
+	}
+}
+
 // purgePendingForLocked drops any queued reservation / spot-check write for
 // (unitID, volunteerID) so a late flush cannot re-stamp a reservation onto a unit
 // whose in-memory hold was just voided. Caller holds mu. (Forward-overlapping
@@ -3496,20 +3551,9 @@ func benchSet(benched []workunit.BenchedVolunteer, deadlineSeconds int) map[type
 	if len(benched) == 0 {
 		return nil
 	}
-	cooldown := time.Duration(deadlineSeconds) * time.Second
-	if cooldown < time.Second {
-		cooldown = time.Second
-	}
 	s := make(map[types.ID]benchEntry, len(benched))
 	for _, b := range benched {
-		window := cooldown
-		if b.Returned {
-			window = workunit.ReturnedReofferCooldownSeconds * time.Second
-		}
-		e := benchEntry{
-			until:      b.OutcomeAt.Add(window),
-			fallbackAt: b.OutcomeAt.Add(benchPoolExhaustedGraceSeconds * time.Second),
-		}
+		e := benchEntryFor(b.OutcomeAt, b.Returned, deadlineSeconds)
 		if prev, ok := s[b.VolunteerID]; ok {
 			if prev.until.After(e.until) {
 				e.until = prev.until
@@ -3521,6 +3565,26 @@ func benchSet(benched []workunit.BenchedVolunteer, deadlineSeconds int) map[type
 		s[b.VolunteerID] = e
 	}
 	return s
+}
+
+// benchEntryFor computes one benching outcome's timed window, the single formula the
+// refill snapshot (benchSet) and the live close path (onCopyClosed, TB-40) share so
+// the two can never drift: ~one deadline for a benching outcome (floor 1 s —
+// GREATEST(deadline_seconds, 1) parity with the SQL gate), the short re-offer
+// throttle for a RETURNED give-back (TB-35), and either way the pool-exhausted
+// fallback moment (outcome + benchPoolExhaustedGraceSeconds).
+func benchEntryFor(outcomeAt time.Time, returned bool, deadlineSeconds int) benchEntry {
+	window := time.Duration(deadlineSeconds) * time.Second
+	if window < time.Second {
+		window = time.Second
+	}
+	if returned {
+		window = workunit.ReturnedReofferCooldownSeconds * time.Second
+	}
+	return benchEntry{
+		until:      outcomeAt.Add(window),
+		fallbackAt: outcomeAt.Add(benchPoolExhaustedGraceSeconds * time.Second),
+	}
 }
 
 // strSet builds a set from a slice of strings (nil for an empty/absent slice, so an

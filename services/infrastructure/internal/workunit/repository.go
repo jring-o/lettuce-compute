@@ -201,9 +201,12 @@ type WorkUnitRepository interface {
 	// outcome (submit/abandon). reason is the client's failure text, persisted on the
 	// row for head-side forensics (TB-27); empty stores NULL. RETURNED (the
 	// budget-neutral un-run give-back, TB-35) is verified at the write: it lands only
-	// on a copy that never started; a STARTED copy closes ABANDONED instead. Returns
+	// on a copy that never started; a STARTED copy closes ABANDONED instead. The
+	// returned ClosedCopy reports what was actually written — the honored outcome and
+	// the copy's started-ness, the exact facts the SQL cooldown benches on — so the
+	// caller can mirror the gate in memory at close time (TB-40). Returns
 	// apierror.Conflict if no live copy exists.
-	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) error
+	CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) (ClosedCopy, error)
 
 	// ExpireLiveCopies closes ALL live copies of a unit with the given outcome
 	// (operator manual-requeue). Returns how many were closed.
