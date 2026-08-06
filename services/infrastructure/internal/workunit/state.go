@@ -40,8 +40,16 @@ var validTransitions = map[WorkUnitState][]WorkUnitState{
 	// this deliberately diverges from IsTerminalState, which still reports VALIDATED as
 	// terminal: "terminal" means "the TRANSITIONER never re-decides it" (the
 	// decideAndApply guard), not "no edge exists". Only the enforcement pass takes this
-	// edge. WorkUnitStateFailed remains fully terminal.
+	// edge.
 	WorkUnitStateValidated: {WorkUnitStateRejected},
+	// FAILED likewise has exactly ONE outbound edge: the operator revive (TB-39) —
+	// dead-letter parks a unit FAILED + flagged-for-review "for a human to review", and
+	// this is the reviewer's verb (ReviveDeadLettered: re-judge verified give-backs
+	// RETURNED, resurrect the disposed results, requeue). Same IsTerminalState divergence
+	// as VALIDATED: the transitioner never re-decides a FAILED unit; only the operator
+	// endpoint takes this edge, and only after the budget probe says the revived unit
+	// would actually dispatch.
+	WorkUnitStateFailed: {WorkUnitStateQueued},
 }
 
 // ValidateTransition checks whether a state transition is allowed.
@@ -65,9 +73,11 @@ func ValidateTransition(from, to WorkUnitState) error {
 // IsTerminalState returns true for VALIDATED and FAILED. "Terminal" here means the
 // TRANSITIONER never re-decides the unit (transition.decideAndApply no-ops on it) — NOT
 // "no edge exists": validTransitions carries the single VALIDATED→REJECTED
-// audit-enforcement demotion edge (design doc §9.7), taken only by the enforcement pass,
-// never by the transitioner. Keep the two in deliberate divergence; gating new behavior
-// on IsTerminalState alone must account for the enforcement edge.
+// audit-enforcement demotion edge (design doc §9.7) and the single FAILED→QUEUED
+// operator-revive edge (TB-39), each taken only by its own pass — enforcement and the
+// admin revive endpoint respectively — never by the transitioner. Keep the two in
+// deliberate divergence; gating new behavior on IsTerminalState alone must account for
+// both edges.
 func IsTerminalState(state WorkUnitState) bool {
 	return state == WorkUnitStateValidated || state == WorkUnitStateFailed
 }

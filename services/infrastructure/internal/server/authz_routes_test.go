@@ -95,6 +95,7 @@ var authzRouteTable = []authzRoute{
 	{method: "GET", pattern: "/api/v1/leafs/{leaf_id}/work-units/{work_unit_id}", tier: tierOwner, probeAllowed: true},
 	{method: "POST", pattern: "/api/v1/leafs/{leaf_id}/work-units/generate", tier: tierOwner},
 	{method: "POST", pattern: "/api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/requeue", tier: tierOwner},
+	{method: "POST", pattern: "/api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/revive", tier: tierOwner},
 	{method: "POST", pattern: "/api/v1/leafs/{leaf_id}/work-units/bulk", tier: tierOwner},
 	{method: "GET", pattern: "/api/v1/leafs/{leaf_id}/results", tier: tierOwner, probeAllowed: true},
 	{method: "POST", pattern: "/api/v1/leafs/{leaf_id}/aggregate", tier: tierOwner},
