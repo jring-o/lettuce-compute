@@ -3,6 +3,8 @@ package workunit
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -75,6 +77,10 @@ type WorkUnitHandler struct {
 	generate            GenerateFunc
 	sink                BatchSink // eager-generation persistence seam (design §4.8); per-batch atomic
 	logger              *slog.Logger
+	// reviver + resolveBudgets power the operator revive endpoint (TB-39); wired via
+	// SetReviver.
+	reviver        Reviver
+	resolveBudgets func(ctx context.Context, wu *WorkUnit) (freshTotal int, errorCeiling int, err error)
 }
 
 // SetAssignmentRepo wires the assignment-history repository so operator requeue
@@ -101,6 +107,25 @@ type DispatchInvalidator interface {
 // Optional so existing constructor call sites are unchanged.
 func (h *WorkUnitHandler) SetDispatchInvalidator(inv DispatchInvalidator) {
 	h.dispatchInvalidator = inv
+}
+
+// Reviver is the narrow data-layer slice HandleRevive needs (TB-39). Like DemoterRepo it
+// is deliberately kept OFF the shared WorkUnitRepository interface, which many packages'
+// test fakes implement in full — *PgxWorkUnitRepository satisfies it.
+type Reviver interface {
+	// ReviveDeadLettered restores a FAILED unit to QUEUED atomically: give-backs
+	// re-judged RETURNED, budget probed (optionally refunded), SUPERSEDED results
+	// resurrected, requeue field semantics applied.
+	ReviveDeadLettered(ctx context.Context, id types.ID, refundRealFailures bool, freshTotal, freshError int) (*ReviveOutcome, error)
+}
+
+// SetReviver wires the operator revive endpoint's data layer and its budget resolver —
+// the same (freshTotal, errorCeiling) resolution the enforcement demoter injects (the
+// walk unit override → leaf config → derived default lives above this package). Optional
+// so existing constructor call sites are unchanged; the endpoint 500s if unwired.
+func (h *WorkUnitHandler) SetReviver(rev Reviver, resolveBudgets func(ctx context.Context, wu *WorkUnit) (freshTotal int, errorCeiling int, err error)) {
+	h.reviver = rev
+	h.resolveBudgets = resolveBudgets
 }
 
 // invalidateDispatch forwards to the wired invalidator, if any.
@@ -357,6 +382,116 @@ func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) 
 		))
 		return
 	}
+}
+
+// HandleRevive handles POST /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/revive
+// (exported for auth wrapping).
+func (h *WorkUnitHandler) HandleRevive(w http.ResponseWriter, r *http.Request) {
+	h.handleRevive(w, r)
+}
+
+// ReviveRequest is the revive endpoint's optional JSON body. RefundRealFailures is the
+// explicit poison-unit override: without it, a unit whose budget still reads exhausted
+// after the give-back reclassification is refused (real failures keep it dead); with it,
+// a fresh budget is rebased on top of everything still billed.
+type ReviveRequest struct {
+	RefundRealFailures bool `json:"refund_real_failures"`
+}
+
+// handleRevive restores a dead-lettered (FAILED + flagged-for-review) work unit to the
+// dispatchable queue — the review verb the dead-letter parking always implied (TB-39).
+// Operator-authed like requeue (the router wraps it with requireAuth +
+// requireLeafOwnership). The heavy lifting — reclassify give-backs, probe the budget,
+// resurrect results, requeue — is one transaction in ReviveDeadLettered; this handler
+// scopes, parses, resolves the refund ceilings, and audits.
+func (h *WorkUnitHandler) handleRevive(w http.ResponseWriter, r *http.Request) {
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	leafID, err := types.ParseID(r.PathValue("leaf_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid leaf_id: must be a valid UUID", nil))
+		return
+	}
+
+	workUnitID, err := types.ParseID(r.PathValue("work_unit_id"))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid work_unit_id: must be a valid UUID", nil))
+		return
+	}
+
+	if h.reviver == nil {
+		apierror.WriteError(w, apierror.Internal("revive is not wired on this server", nil))
+		return
+	}
+
+	// The body is optional: a bare POST means no override.
+	var req ReviveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+		return
+	}
+
+	wu, err := h.wuRepo.GetByID(r.Context(), workUnitID)
+	if err != nil {
+		l.Error("revive: failed to get work unit", "error", err, "work_unit_id", workUnitID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	// Scope to the leaf in the path (mirrors handleGet/handleRequeue).
+	if wu.LeafID != leafID {
+		apierror.WriteError(w, apierror.NotFound("work_unit", workUnitID.String()))
+		return
+	}
+
+	// Resolve the refund ceilings BEFORE the transaction (the resolution reads the leaf,
+	// which the revive tx doesn't lock). The tx re-verifies FAILED under the row lock,
+	// so a stale read here costs nothing.
+	var freshTotal, freshError int
+	if req.RefundRealFailures {
+		if h.resolveBudgets == nil {
+			apierror.WriteError(w, apierror.Internal("revive refund is not wired on this server", nil))
+			return
+		}
+		freshTotal, freshError, err = h.resolveBudgets(r.Context(), wu)
+		if err != nil {
+			l.Error("revive: failed to resolve refund budget", "error", err, "work_unit_id", workUnitID)
+			apierror.WriteError(w, apierror.FromError(err))
+			return
+		}
+	}
+
+	out, err := h.reviver.ReviveDeadLettered(r.Context(), workUnitID, req.RefundRealFailures, freshTotal, freshError)
+	if err != nil {
+		// Refusals are the endpoint's answers, not faults: INVALID_REVIVE_STATE and
+		// REVIVE_BUDGET_EXHAUSTED come back as 409s with the operands in the message.
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	// PB-9: as in requeue — drop the unit's stale in-memory dispatch state so the
+	// revived unit re-stages from a fresh DB snapshot immediately.
+	h.invalidateDispatch(workUnitID)
+
+	// The audit line (TB-38 shape): an operator action logs its inputs and its outcome
+	// at production level, one grep. Request id rides in via LoggerFromContext.
+	l.Info("work unit revived by operator",
+		"work_unit_id", workUnitID, "leaf_id", leafID,
+		"reclassified_givebacks", out.ReclassifiedGivebacks,
+		"resurrected_results", out.ResurrectedResults,
+		"refund_real_failures", out.Refunded,
+		"budget_spent", out.BudgetSpent, "budget_ceiling", out.BudgetCeiling,
+		"error_spent", out.ErrorSpent, "error_ceiling", out.ErrorCeiling,
+		"remote_addr", r.RemoteAddr)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"work_unit_id":           workUnitID.String(),
+		"revived":                true,
+		"state":                  string(WorkUnitStateQueued),
+		"reclassified_givebacks": out.ReclassifiedGivebacks,
+		"resurrected_results":    out.ResurrectedResults,
+		"refunded":               out.Refunded,
+	})
 }
 
 // closeActiveAssignment sets the outcome on the prior volunteer's open

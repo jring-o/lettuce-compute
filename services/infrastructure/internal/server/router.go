@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ed25519"
 	"fmt"
 	"log/slog"
@@ -38,6 +39,7 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/result"
 	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/stats"
+	"github.com/lettuce-compute/infrastructure/internal/transition"
 	"github.com/lettuce-compute/infrastructure/internal/trust"
 	"github.com/lettuce-compute/infrastructure/internal/validation"
 	"github.com/lettuce-compute/infrastructure/internal/volunteer"
@@ -136,6 +138,25 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	if deps.DispatchCacheRef != nil {
 		wuHandler.SetDispatchInvalidator(deps.DispatchCacheRef)
 	}
+	// Enables the operator revive of dead-lettered units (TB-39). The budget resolver
+	// mirrors the enforcement demoter's (main.go newEnforcementBudgetResolver): the
+	// fresh ceilings a brand-new unit of this leaf would get — trust policy never
+	// touches the budget fields, so plain ResolvePolicy suffices here.
+	wuHandler.SetReviver(wuRepo, func(ctx context.Context, wu *workunit.WorkUnit) (int, int, error) {
+		lf, err := leafRepo.GetByID(ctx, wu.LeafID)
+		if err != nil {
+			return 0, 0, err
+		}
+		policy := transition.ResolvePolicy(lf, wu)
+		freshTotal := lf.ValidationConfig.MaxTotalCopies
+		if freshTotal <= 0 {
+			// The derived default a brand-new unit would get: target + retry margin
+			// (EffectiveMaxTotalCopies on a zeroed unit ignores any materialized
+			// per-unit override).
+			freshTotal = (&workunit.WorkUnit{}).EffectiveMaxTotalCopies(policy.TargetCopies)
+		}
+		return freshTotal, policy.MaxErrorCopies, nil
+	})
 
 	// Result handler (RegisterRoutes is no-op; all routes are protected).
 	resultRepo := result.NewPgxRepository(deps.Pool)
@@ -317,6 +338,7 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("GET /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}", authOwner(wuHandler.HandleGet))
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/work-units/generate", authOwner(wuHandler.HandleGenerate))
 	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/requeue", authOwner(wuHandler.HandleRequeue))
+	mux.HandleFunc("POST /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/revive", authOwner(wuHandler.HandleRevive))
 
 	// Custom pattern bulk upload.
 	bulkHandler := custom.NewBulkUploadHandler(wuRepo, batchRepo, leafRepo, deps.Logger)

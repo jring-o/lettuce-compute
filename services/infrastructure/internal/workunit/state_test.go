@@ -44,6 +44,9 @@ func TestValidateTransition(t *testing.T) {
 		// unit whose accepted output was refuted with nothing repairable is demoted so it
 		// can requeue and revalidate honestly. Taken only by the enforcement pass.
 		{"VALIDATED → REJECTED", WorkUnitStateValidated, WorkUnitStateRejected},
+		// The single operator-revive edge (TB-39): a dead-lettered unit restored to the
+		// queue by the admin revive endpoint, after the budget probe. Taken only there.
+		{"FAILED → QUEUED", WorkUnitStateFailed, WorkUnitStateQueued},
 	}
 
 	for _, tc := range validCases {
@@ -63,7 +66,6 @@ func TestValidateTransition(t *testing.T) {
 		// stays refused (design doc §9.10 viii).
 		{"VALIDATED → QUEUED", WorkUnitStateValidated, WorkUnitStateQueued},
 		{"VALIDATED → COMPLETED", WorkUnitStateValidated, WorkUnitStateCompleted},
-		{"FAILED → QUEUED", WorkUnitStateFailed, WorkUnitStateQueued},
 		{"CREATED → RUNNING", WorkUnitStateCreated, WorkUnitStateRunning},
 		{"VALIDATED → FAILED", WorkUnitStateValidated, WorkUnitStateFailed},
 		{"FAILED → VALIDATED", WorkUnitStateFailed, WorkUnitStateValidated},

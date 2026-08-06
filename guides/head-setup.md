@@ -742,6 +742,14 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > while it awaits the dead-letter sweep. A volunteer whose copy timed out is briefly
 > benched so a fresh volunteer gets first refusal, then becomes eligible again if the
 > pool is otherwise exhausted (so work never strands).
+>
+> A parked unit is **recoverable**: `POST
+> /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/revive` (owner API key) re-judges
+> any unused give-backs an older client billed as failures, restores results that were
+> set aside when the unit died, and returns the unit to the queue. If the budget was
+> spent by *real* failures (timeouts, crashes), the revive refuses — that unit likely
+> has a genuine problem — unless you explicitly pass
+> `{"refund_real_failures": true}` to grant it a fresh copy budget anyway.
 
 ### Account standing backpressure
 
