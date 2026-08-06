@@ -79,44 +79,87 @@ func (q *PreFetchQueue) Push(item *PreFetchItem) error {
 	return nil
 }
 
-// maxBackfillStarts bounds how many units may start past a buffered unit that
-// does not currently fit (see PopFit). Once a unit has been jumped this many
-// times PopFit stops offering anything behind it, so running work drains and
-// the skipped unit gets the next free slot instead of being starved by a
-// steady stream of smaller units. If capacity never frees, the reservation and
-// deadline drops (DropLapsedReservations, DropExpiring) remain the backstop.
+// maxBackfillStarts bounds how many DELAYING units may start past a buffered
+// unit that does not currently fit (see PopFit). Once a unit has been jumped
+// this many times by backfills that could postpone its own admission, no
+// further such backfill may pass it, so running work drains and the skipped
+// unit gets the next free slot instead of being starved by a steady stream of
+// competing units. If capacity never frees, the reservation and deadline drops
+// (DropLapsedReservations, DropExpiring) remain the backstop.
 const maxBackfillStarts = 16
 
-// PopFit removes and returns the first item (in FIFO order) accepted by fits,
-// leaving every other item in place and in order. Selecting an item past the
-// front is a backfill: a unit the machine cannot currently fit no longer idles
-// a free slot while fitting units wait behind it (TB-22). Each item skipped
-// over gets its TimesSkipped incremented; an unfitting item already skipped
-// maxBackfillStarts times stops the scan. Returns nil if no acceptable item is
-// reachable. fits is called while holding the queue lock, so it must not call
-// back into the queue.
-func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool) *PreFetchItem {
+// PopFit removes and returns the first item (in FIFO order) accepted by fits
+// and vetoed by no starvation-capped item ahead of it, leaving every other
+// item in place and in order. Selecting an item past the front is a backfill:
+// a unit the machine cannot currently fit no longer idles a free slot while
+// fitting units wait behind it (TB-22).
+//
+// mayDelay(blocked, candidate) reports whether starting candidate now could
+// postpone blocked's own admission. Only such jumps count against a waiting
+// unit's TimesSkipped, and only such candidates are refused once the unit's
+// count reaches maxBackfillStarts — a harmless backfill (one whose booking
+// coexists with the waiting unit's) passes freely however often the unit has
+// been jumped. TB-45 is the cap doing neither: it stopped the whole scan AT a
+// capped item, freezing every unit behind it and idling a slot for as long as
+// the running work lasted, while blocking exactly the backfills that could
+// not have delayed the capped unit by one second.
+//
+// Returns nil if no acceptable item is reachable. Both predicates are called
+// while holding the queue lock, so they must not call back into the queue.
+func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) *PreFetchItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for i, item := range q.items {
-		if fits(item) {
-			for _, skipped := range q.items[:i] {
-				skipped.TimesSkipped++
-			}
-			q.items = append(q.items[:i], q.items[i+1:]...)
-			// The unit stays accounted as held until FinishStart: it leaves
-			// the queue and enters the slot handoff in one critical section,
-			// so no reader ever sees it in neither place (TB-33).
-			if item.WU != nil {
-				q.starting[item.WU.ID] = item
-			}
-			return item
-		}
-		if item.TimesSkipped >= maxBackfillStarts {
-			return nil
+	i := q.scanFit(fits, mayDelay)
+	if i < 0 {
+		return nil
+	}
+	item := q.items[i]
+	for _, skipped := range q.items[:i] {
+		if mayDelay(skipped, item) {
+			skipped.TimesSkipped++
 		}
 	}
-	return nil
+	q.items = append(q.items[:i], q.items[i+1:]...)
+	// The unit stays accounted as held until FinishStart: it leaves
+	// the queue and enters the slot handoff in one critical section,
+	// so no reader ever sees it in neither place (TB-33).
+	if item.WU != nil {
+		q.starting[item.WU.ID] = item
+	}
+	return item
+}
+
+// scanFit returns the index of the first item accepted by fits that no capped
+// item ahead of it vetoes, or -1. Callers hold q.mu. Every item ahead of a
+// candidate failed fits this scan (first-fit), so the veto question is exactly
+// "has this unfitting unit exhausted its tolerance for delaying jumps, and is
+// the candidate such a jump".
+func (q *PreFetchQueue) scanFit(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) int {
+scan:
+	for i, item := range q.items {
+		if !fits(item) {
+			continue
+		}
+		for _, ahead := range q.items[:i] {
+			if ahead.TimesSkipped >= maxBackfillStarts && mayDelay(ahead, item) {
+				continue scan
+			}
+		}
+		return i
+	}
+	return -1
+}
+
+// HasRunnable reports whether PopFit with the same predicates would return an
+// item, without popping or counting anything. The starvation watchdog
+// (idleSlotStarved) asks THIS — the picker's own reachability — instead of
+// running a parallel whole-queue scan: TB-45's freeze stayed silent precisely
+// because the watchdog's predicate disagreed with the picker's about whether
+// the fitting unit behind a capped head was startable.
+func (q *PreFetchQueue) HasRunnable(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.scanFit(fits, mayDelay) >= 0
 }
 
 // FinishStart ends a unit's queue→slot handoff: fillSlots calls it once the

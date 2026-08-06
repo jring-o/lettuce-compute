@@ -17,7 +17,7 @@ import (
 
 func TestComputeTaskStatus_Running(t *testing.T) {
 	task := daemon.CurrentTask{Suspended: false}
-	status, reason := computeTaskStatus(task, "")
+	status, reason := computeTaskStatus(task, "", false)
 	if status != "running" {
 		t.Errorf("status = %q, want %q", status, "running")
 	}
@@ -28,7 +28,7 @@ func TestComputeTaskStatus_Running(t *testing.T) {
 
 func TestComputeTaskStatus_SuspendedUser(t *testing.T) {
 	task := daemon.CurrentTask{Suspended: true}
-	status, reason := computeTaskStatus(task, "user")
+	status, reason := computeTaskStatus(task, "user", true)
 	if status != "suspended_user" {
 		t.Errorf("status = %q, want %q", status, "suspended_user")
 	}
@@ -39,7 +39,7 @@ func TestComputeTaskStatus_SuspendedUser(t *testing.T) {
 
 func TestComputeTaskStatus_SuspendedThermal(t *testing.T) {
 	task := daemon.CurrentTask{Suspended: true}
-	status, reason := computeTaskStatus(task, "thermal")
+	status, reason := computeTaskStatus(task, "thermal", true)
 	if status != "suspended_thermal" {
 		t.Errorf("status = %q, want %q", status, "suspended_thermal")
 	}
@@ -50,7 +50,7 @@ func TestComputeTaskStatus_SuspendedThermal(t *testing.T) {
 
 func TestComputeTaskStatus_SuspendedScheduled(t *testing.T) {
 	task := daemon.CurrentTask{Suspended: true}
-	status, reason := computeTaskStatus(task, "scheduled")
+	status, reason := computeTaskStatus(task, "scheduled", true)
 	if status != "suspended_scheduled" {
 		t.Errorf("status = %q, want %q", status, "suspended_scheduled")
 	}
@@ -62,12 +62,29 @@ func TestComputeTaskStatus_SuspendedScheduled(t *testing.T) {
 func TestComputeTaskStatus_PerSlotSuspendedNoDaemonPause(t *testing.T) {
 	// Slot suspended but daemon not paused -> suspended_user (per-slot user action).
 	task := daemon.CurrentTask{Suspended: true}
-	status, reason := computeTaskStatus(task, "")
+	status, reason := computeTaskStatus(task, "", false)
 	if status != "suspended_user" {
 		t.Errorf("status = %q, want %q", status, "suspended_user")
 	}
 	if reason == nil {
 		t.Error("reason should not be nil")
+	}
+}
+
+func TestComputeTaskStatus_UnexplainedDaemonPause(t *testing.T) {
+	// Daemon paused but no reason named: never claim a user action that didn't
+	// happen — schedule-gate-suspended tasks displayed "User paused" for months
+	// through this arm (TB-44).
+	task := daemon.CurrentTask{Suspended: true}
+	status, reason := computeTaskStatus(task, "", true)
+	if status == "suspended_user" {
+		t.Errorf("status = %q — an unexplained suspension under a daemon pause must not be labeled a user action (TB-44)", status)
+	}
+	if status != "suspended" {
+		t.Errorf("status = %q, want %q", status, "suspended")
+	}
+	if reason == nil || *reason != "Paused (reason not reported)" {
+		t.Errorf("reason = %v, want %q", reason, "Paused (reason not reported)")
 	}
 }
 
@@ -127,7 +144,7 @@ func TestHistoryEntry_BackwardCompat_MissingCPUSeconds(t *testing.T) {
 func TestComputeTaskStatus_NotSuspendedIgnoresPauseReason(t *testing.T) {
 	// Even if pauseReason is set (e.g., "thermal"), a non-suspended task should be "running".
 	task := daemon.CurrentTask{Suspended: false}
-	status, reason := computeTaskStatus(task, "thermal")
+	status, reason := computeTaskStatus(task, "thermal", true)
 	if status != "running" {
 		t.Errorf("status = %q, want %q", status, "running")
 	}
@@ -232,7 +249,7 @@ func TestBuildActiveTaskInfo_Running(t *testing.T) {
 		DeadlineSeconds: 3600,
 	}
 
-	info := bridge.buildActiveTaskInfo(task, "")
+	info := bridge.buildActiveTaskInfo(task, "", false)
 	if info.WorkUnitID != "wu-test" {
 		t.Errorf("WorkUnitID = %q, want %q", info.WorkUnitID, "wu-test")
 	}
@@ -285,7 +302,7 @@ func TestBuildActiveTaskInfo_CPUSecondsClamped(t *testing.T) {
 		TotalPausedSeconds: 999,
 	}
 
-	info := bridge.buildActiveTaskInfo(task, "")
+	info := bridge.buildActiveTaskInfo(task, "", false)
 	if info.CPUSeconds != 0 {
 		t.Errorf("CPUSeconds = %d, want 0 (clamped)", info.CPUSeconds)
 	}
@@ -310,7 +327,7 @@ func TestBuildActiveTaskInfo_SuspendedThermal(t *testing.T) {
 		StartedAt:  time.Now().Add(-30 * time.Second),
 	}
 
-	info := bridge.buildActiveTaskInfo(task, "thermal")
+	info := bridge.buildActiveTaskInfo(task, "thermal", true)
 	if info.TaskStatus != "suspended_thermal" {
 		t.Errorf("TaskStatus = %q, want %q", info.TaskStatus, "suspended_thermal")
 	}
@@ -340,7 +357,7 @@ func TestBuildActiveTaskInfo_BenchmarkEstimate(t *testing.T) {
 		EstimatedSeconds: 100,
 	}
 
-	info := bridge.buildActiveTaskInfo(task, "")
+	info := bridge.buildActiveTaskInfo(task, "", false)
 	if info.EstimatedRemainingSec == nil {
 		t.Fatal("EstimatedRemainingSec should not be nil for benchmark estimate")
 	}
@@ -373,7 +390,7 @@ func TestBuildActiveTaskInfo_VizBundleAndCheckpoint(t *testing.T) {
 		StartedAt:             time.Now().Add(-10 * time.Minute),
 	}
 
-	info := bridge.buildActiveTaskInfo(task, "")
+	info := bridge.buildActiveTaskInfo(task, "", false)
 	if info.VizBundlePath == nil || *info.VizBundlePath != "/tmp/viz-bundle.tar.gz" {
 		t.Errorf("VizBundlePath = %v, want /tmp/viz-bundle.tar.gz", info.VizBundlePath)
 	}

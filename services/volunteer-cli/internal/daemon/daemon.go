@@ -1071,7 +1071,7 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 				}
 			}
 			return ok
-		})
+		}, d.itemMayDelay)
 		if item == nil {
 			// Queue empty, nothing currently fits, or backfill is held for a
 			// starved unit — return the slot and wait for capacity to change.
@@ -1181,6 +1181,70 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	}
 
 	return true, ""
+}
+
+// mayDelayAdmission reports whether starting candidate now could postpone
+// blocked's own future admission — the delay test the backfill starvation cap
+// gates on (TB-45; EASY backfilling's rule, specialized to this admission
+// model). The declared bookings decide: when both units fit the configured
+// budgets TOGETHER, capacity that frees enough to admit blocked can never be
+// re-consumed by candidate, so candidate is harmless whatever the current
+// running set looks like. Real free system RAM is deliberately not consulted:
+// it cannot be projected to blocked's future admission moment, and candidate
+// already passed the live free-RAM guard (canAccommodateWU) to be startable
+// at all.
+//
+// Unknown shapes (nil units) count as delaying, keeping the cap's protection.
+func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
+	if blocked == nil || candidate == nil {
+		return true
+	}
+
+	// Configured memory budget: harmless iff both bookings fit it together.
+	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
+		blockedMemMB := runtime.BookedMemMB(int(blocked.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
+		candMemMB := runtime.BookedMemMB(int(candidate.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
+		if blockedMemMB+candMemMB > maxMemoryMB {
+			return true
+		}
+	}
+
+	// GPU exclusivity: two GPU units co-run only when two physical GPUs exist.
+	if blocked.ExecutionSpec.GPURequired && candidate.ExecutionSpec.GPURequired {
+		gpuCount := 0
+		if d.cachedHW != nil {
+			gpuCount = len(d.cachedHW.GetGpus())
+		}
+		if gpuCount < 2 {
+			return true
+		}
+	}
+
+	// Disk workspace: harmless iff the volume's free space covers both units'
+	// enforced /work ceilings plus the floor, so candidate running at its
+	// ceiling still leaves blocked's own admission headroom.
+	if d.limiter != nil {
+		maxDiskMB := d.cfg.ResourceLimits.MaxDiskGB * 1024
+		blockedDiskMB := runtime.BookedDiskMB(int(blocked.ExecutionSpec.MaxDiskMB), maxDiskMB)
+		candDiskMB := runtime.BookedDiskMB(int(candidate.ExecutionSpec.MaxDiskMB), maxDiskMB)
+		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, blockedDiskMB+candDiskMB+DiskFloorMB); err != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+// itemMayDelay adapts mayDelayAdmission to the prefetch queue's item type.
+func (d *Daemon) itemMayDelay(blocked, candidate *PreFetchItem) bool {
+	var b, c *runtime.WorkUnit
+	if blocked != nil {
+		b = blocked.WU
+	}
+	if candidate != nil {
+		c = candidate.WU
+	}
+	return d.mayDelayAdmission(b, c)
 }
 
 // shouldFetch checks whether the fetcher should request ANY work right now.
@@ -1534,18 +1598,23 @@ func (d *Daemon) workBufferHoursFull() bool {
 	return d.bufferedSeconds() >= target
 }
 
-// idleSlotStarved reports whether an execution slot is idle while nothing in
-// the work buffer can currently be admitted to it (canAccommodateWU) — the
-// TB-32 starvation state. An empty buffer beside an idle slot counts: a single
-// running unit whose estimate exceeds the whole hours target starves the other
-// slot the same way. A slot whose unit is mid queue→slot handoff is occupied,
-// not idle (TB-33). Cheap in the healthy case — when every slot is busy it
-// returns false before touching the queue.
+// idleSlotStarved reports whether an execution slot is idle while the picker
+// would start nothing from the work buffer — the TB-32 starvation state. The
+// verdict is the PICKER's own reachability (PreFetchQueue.HasRunnable with the
+// same predicates fillSlots hands PopFit), not a parallel scan: TB-45 froze a
+// slot for 43 minutes beside a unit a whole-queue admission check found
+// startable but the picker's capped scan never reached, so this returned
+// false and the WARN specified for exactly that idle slot stayed silent. An
+// empty buffer beside an idle slot counts: a single running unit whose
+// estimate exceeds the whole hours target starves the other slot the same
+// way. A slot whose unit is mid queue→slot handoff is occupied, not idle
+// (TB-33). Cheap in the healthy case — when every slot is busy it returns
+// false before touching the queue.
 func (d *Daemon) idleSlotStarved() bool {
 	if d.slotManager == nil || d.prefetchQueue == nil {
 		return false
 	}
-	queued, starting := d.prefetchQueue.HeldSnapshot()
+	_, starting := d.prefetchQueue.HeldSnapshot()
 	occupied := d.slotManager.ActiveCount()
 	if len(starting) > 0 {
 		// A unit in the handoff is about to occupy a slot; count it as if it
@@ -1568,16 +1637,13 @@ func (d *Daemon) idleSlotStarved() bool {
 	if occupied >= d.maxSlots() {
 		return false
 	}
-	for _, item := range queued {
+	return !d.prefetchQueue.HasRunnable(func(item *PreFetchItem) bool {
 		if item.WU == nil {
-			continue
-		}
-		if ok, _ := d.canAccommodateWU(item.WU); ok {
-			// Something buffered can fill the idle slot; fillSlots will.
 			return false
 		}
-	}
-	return true
+		ok, _ := d.canAccommodateWU(item.WU)
+		return ok
+	}, d.itemMayDelay)
 }
 
 // starvedBackfill reports whether the ONLY reason fetching is open is an idle
@@ -2409,24 +2475,46 @@ func (d *Daemon) Resume() error {
 	return nil
 }
 
-// IsPaused returns true if the daemon is paused by any source.
+// IsPaused returns true if the daemon is paused by any source. The schedule
+// verdict comes from LIVE policy, not only the signal-driven fields: the main
+// loop's gate (waitForScheduleActive) parks and suspends slots without setting
+// them, and it usually beats the resource monitor's pause signal to a closing
+// window — always on a daemon booted inside one — so a gate-park was
+// unrepresentable here and `status` showed an active, unexplained daemon for
+// the whole window (TB-44).
 func (d *Daemon) IsPaused() bool {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.paused || d.userPaused
+	paused := d.paused || d.userPaused
+	d.mu.Unlock()
+	return paused || d.scheduleClosed()
 }
 
-// PauseReason returns the reason the daemon is paused, or empty string if not paused.
+// PauseReason returns the reason the daemon is paused, or empty string if not
+// paused. A user pause outranks everything (it is the state `resume` undoes);
+// then the signal-driven reason; then the live schedule verdict (TB-44).
 func (d *Daemon) PauseReason() string {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.userPaused {
+		d.mu.Unlock()
 		return "user"
 	}
 	if d.paused {
-		return d.pauseReason
+		reason := d.pauseReason
+		d.mu.Unlock()
+		return reason
+	}
+	d.mu.Unlock()
+	if d.scheduleClosed() {
+		return "scheduled"
 	}
 	return ""
+}
+
+// scheduleClosed reports whether the scheduler currently forbids running —
+// the live-policy half of IsPaused/PauseReason. The scheduler is set once at
+// construction, so it is read without d.mu; ShouldRun takes no daemon locks.
+func (d *Daemon) scheduleClosed() bool {
+	return d.scheduler != nil && !d.scheduler.ShouldRun()
 }
 
 // CurrentTask holds info about an in-progress work unit.

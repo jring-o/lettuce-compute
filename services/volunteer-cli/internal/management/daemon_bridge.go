@@ -128,8 +128,14 @@ type ActiveTaskInfo struct {
 	ProcessID             *int    `json:"process_id"`
 }
 
-// computeTaskStatus determines the status string and reason for an active task.
-func computeTaskStatus(task daemon.CurrentTask, pauseReason string) (status string, reason *string) {
+// computeTaskStatus determines the status string and reason for an active
+// task. "User paused" is claimed only when it is the one remaining
+// explanation: with the daemon itself paused for a reason nobody named, an
+// unexplained suspension must say the reason is unknown rather than invent a
+// user action — the default arm is exactly how schedule-gate-suspended tasks
+// spent months displaying "User paused" (TB-44). With the daemon NOT paused,
+// a suspended slot is the per-task suspend verb, which IS a user action.
+func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused bool) (status string, reason *string) {
 	if task.Suspended {
 		switch pauseReason {
 		case "thermal":
@@ -140,7 +146,16 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string) (status stri
 			status = "suspended_scheduled"
 			r := "Outside scheduled computing hours"
 			return status, &r
+		case "user":
+			status = "suspended_user"
+			r := "User paused"
+			return status, &r
 		default:
+			if daemonPaused {
+				status = "suspended"
+				r := "Paused (reason not reported)"
+				return status, &r
+			}
 			status = "suspended_user"
 			r := "User paused"
 			return status, &r
@@ -151,8 +166,8 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string) (status stri
 
 // buildActiveTaskInfo converts a daemon.CurrentTask into the API's ActiveTaskInfo,
 // computing derived fields (progress, elapsed, CPU seconds, ETA).
-func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason string) ActiveTaskInfo {
-	taskStatus, statusReason := computeTaskStatus(t, pauseReason)
+func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason string, daemonPaused bool) ActiveTaskInfo {
+	taskStatus, statusReason := computeTaskStatus(t, pauseReason, daemonPaused)
 
 	info := ActiveTaskInfo{
 		WorkUnitID:            t.WorkUnitID,
@@ -203,9 +218,10 @@ func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason str
 
 // GetStatus returns the current daemon state.
 func (b *DaemonBridge) GetStatus() StatusResponse {
+	daemonPaused := b.daemon.IsPaused()
 	state := "stopped"
 	if b.daemon.IsRunning() {
-		if b.daemon.IsPaused() {
+		if daemonPaused {
 			state = "paused"
 		} else {
 			state = "active"
@@ -231,7 +247,7 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 
 	var activeTasks []ActiveTaskInfo
 	for _, t := range b.daemon.GetCurrentTasks() {
-		activeTasks = append(activeTasks, b.buildActiveTaskInfo(t, pauseReason))
+		activeTasks = append(activeTasks, b.buildActiveTaskInfo(t, pauseReason, daemonPaused))
 	}
 	if activeTasks == nil {
 		activeTasks = []ActiveTaskInfo{}
@@ -1377,6 +1393,7 @@ func (b *DaemonBridge) AbortTask(workUnitID string) error {
 // GetTaskDetails returns full details for a single active task including per-process metrics.
 func (b *DaemonBridge) GetTaskDetails(workUnitID string) (*TaskDetail, error) {
 	pauseReason := b.daemon.PauseReason()
+	daemonPaused := b.daemon.IsPaused()
 
 	// Find the matching task in the active tasks list.
 	var found *daemon.CurrentTask
@@ -1392,7 +1409,7 @@ func (b *DaemonBridge) GetTaskDetails(workUnitID string) (*TaskDetail, error) {
 	}
 
 	t := found
-	info := b.buildActiveTaskInfo(*t, pauseReason)
+	info := b.buildActiveTaskInfo(*t, pauseReason, daemonPaused)
 
 	detail := &TaskDetail{
 		ActiveTaskInfo: info,
