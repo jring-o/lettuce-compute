@@ -27,13 +27,13 @@ func TestEvaluateLeafEligibility_RuntimeGate(t *testing.T) {
 	}
 
 	// Without a usable container runtime, the image leaf is blocked (ample memory).
-	res := evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: false}, trustingHead)
+	res := evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: false}, trustingHead, nil)
 	if res.total != 3 || res.eligible != 2 || res.containerBlocked != 1 {
 		t.Errorf("no container: total=%d eligible=%d containerBlocked=%d, want 3/2/1", res.total, res.eligible, res.containerBlocked)
 	}
 
 	// With a usable container runtime, everything is runnable.
-	res = evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: true}, trustingHead)
+	res = evaluateLeafEligibility(leafs, volunteerCaps{maxMemoryMB: 16384, containerUsable: true}, trustingHead, nil)
 	if res.total != 3 || res.eligible != 3 || res.containerBlocked != 0 {
 		t.Errorf("with container: total=%d eligible=%d containerBlocked=%d, want 3/3/0", res.total, res.eligible, res.containerBlocked)
 	}
@@ -57,18 +57,18 @@ func TestEvaluateLeafEligibility_TrustGate(t *testing.T) {
 	caps := volunteerCaps{maxMemoryMB: 16384, containerUsable: true}
 	untrusting := config.ServerConfig{Name: "wasm-only-head"} // no TrustedRuntimes → WASM only
 
-	if res := evaluateLeafEligibility(nativeOnly, caps, untrusting); res.eligible != 0 || res.trustBlocked != 1 {
+	if res := evaluateLeafEligibility(nativeOnly, caps, untrusting, nil); res.eligible != 0 || res.trustBlocked != 1 {
 		t.Errorf("native leaf, untrusted head: eligible=%d trustBlocked=%d, want 0/1", res.eligible, res.trustBlocked)
 	}
-	if res := evaluateLeafEligibility(containerLeaf, caps, untrusting); res.eligible != 0 || res.trustBlocked != 1 {
+	if res := evaluateLeafEligibility(containerLeaf, caps, untrusting, nil); res.eligible != 0 || res.trustBlocked != 1 {
 		t.Errorf("container leaf, untrusted head: eligible=%d trustBlocked=%d, want 0/1", res.eligible, res.trustBlocked)
 	}
 	// WASM is always trusted — stays eligible on an untrusting head.
-	if res := evaluateLeafEligibility(wasmLeaf, caps, untrusting); res.eligible != 1 || res.trustBlocked != 0 {
+	if res := evaluateLeafEligibility(wasmLeaf, caps, untrusting, nil); res.eligible != 1 || res.trustBlocked != 0 {
 		t.Errorf("wasm leaf, untrusted head: eligible=%d trustBlocked=%d, want 1/0", res.eligible, res.trustBlocked)
 	}
 	// And trusting the head restores eligibility.
-	if res := evaluateLeafEligibility(nativeOnly, caps, trustingHead); res.eligible != 1 || res.trustBlocked != 0 {
+	if res := evaluateLeafEligibility(nativeOnly, caps, trustingHead, nil); res.eligible != 1 || res.trustBlocked != 0 {
 		t.Errorf("native leaf, trusted head: eligible=%d trustBlocked=%d, want 1/0", res.eligible, res.trustBlocked)
 	}
 }
@@ -87,7 +87,7 @@ func TestCountEligibleLeafs_MemoryGate(t *testing.T) {
 
 	// Volunteer limit 2048 MB, has a usable container runtime, no GPU.
 	caps := volunteerCaps{maxMemoryMB: 2048, containerUsable: true, hasGPU: false}
-	res := evaluateLeafEligibility(leafs, caps, trustingHead)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead, nil)
 
 	if res.total != 2 || res.eligible != 1 {
 		t.Fatalf("total=%d eligible=%d, want 2/1 (the 4096 MB leaf gated by memory)", res.total, res.eligible)

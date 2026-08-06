@@ -96,6 +96,20 @@ type leafsAPILeaf struct {
 	// dispatches this leaf. nil from a head too old to report it (TB-15).
 	ResourceRequirements *leafsAPIResourceRequirements `json:"resource_requirements"`
 	Failures             *leafsAPILeafFailures         `json:"failures"`
+	// DiskGate is the RUNNING daemon's live disk-gate verdict for this leaf —
+	// the arithmetic that actually decides a fetch, with inputs (measured usage,
+	// image cachedness) only the daemon has. nil from a daemon predating the
+	// field (TB-41).
+	DiskGate *leafsAPIDiskGate `json:"disk_gate"`
+}
+
+// leafsAPIDiskGate mirrors management.LeafDiskGate: whether the daemon's
+// fetcher is skipping this leaf right now and why, plus the max_disk_gb that
+// would clear both the head's dispatch gate and this machine's current budget.
+type leafsAPIDiskGate struct {
+	Blocked   bool   `json:"blocked"`
+	Reason    string `json:"reason"`
+	RaiseToGB int    `json:"raise_to_gb"`
 }
 
 // leafsAPIExecutionSpec carries the fields that decide a leaf's runtime and
@@ -207,6 +221,9 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 				}
 			}
 			req := leafRequirementsFromSpec(label, spec.Image, spec.Binaries, int(spec.MaxMemoryMB), spec.GPURequired, needs)
+			if l.DiskGate != nil {
+				req.raiseDiskGBHint = l.DiskGate.RaiseToGB
+			}
 
 			enabled := "✓"
 			if !l.Enabled {
@@ -310,6 +327,13 @@ func willFetchVerdict(req leafRequirements, caps volunteerCaps, srv config.Serve
 	le, _ := classifyLeaf(req, caps, srv)
 	if !le.eligible {
 		return "no", le.reason
+	}
+	// The head would dispatch this leaf — but the daemon's own fetch gate may
+	// still be skipping it. Quote that verdict rather than contradicting it:
+	// before TB-41 this column said "yes" while the same binary's fetcher
+	// looped `skipping disk-gated leaf` on the exact leaf.
+	if l.DiskGate != nil && l.DiskGate.Blocked {
+		return "no", "disk-gated right now by this machine's own daemon: " + l.DiskGate.Reason
 	}
 	if l.Failures != nil && l.Failures.Paused {
 		return "paused", fmt.Sprintf("this leaf's work reached this machine and failed %d times in a row, so requests for it are paused; it retries automatically (see `lettuce-volunteer status`)",

@@ -128,16 +128,33 @@ func leafIncrementalNeedMB(needMB int64, isContainer, imageCached bool) int64 {
 
 // DiskBudgetVerdict applies the allowance budget: Lettuce's measured usage plus
 // the leaf's incremental need must fit under max_disk_gb. Returns ok and, when
-// blocked, a reason naming the numbers and the setting (the refusal must name
-// the setting or the confusion outlives the fix — TB-24's prior-art lesson).
+// blocked, a reason naming the numbers, the setting, AND the value that clears
+// it (the refusal must name every operand of its own arithmetic or the
+// confusion outlives the fix — TB-24's prior-art lesson; a refusal without the
+// covering value sent a tester on a raise-and-chase, TB-41).
 func DiskBudgetVerdict(needMB int64, isContainer, imageCached bool, usedMB, allowanceMB int64) (bool, string) {
 	incr := leafIncrementalNeedMB(needMB, isContainer, imageCached)
 	if usedMB+incr <= allowanceMB {
 		return true, ""
 	}
 	return false, fmt.Sprintf(
-		"disk budget: Lettuce already uses %d MB (work folders + cached images) and this leaf needs %d MB more, exceeding the %d MB max_disk_gb allowance — free space (superseded images are reclaimed automatically), disable an unused leaf, or raise resource_limits.max_disk_gb",
-		usedMB, incr, allowanceMB)
+		"disk budget: Lettuce already uses %d MB (work folders + cached images) and this leaf needs %d MB more, exceeding the %d MB max_disk_gb allowance — free space (superseded images are reclaimed automatically), disable an unused leaf, or raise resource_limits.max_disk_gb to %d",
+		usedMB, incr, allowanceMB, DiskAllowanceGBToCover(needMB, isContainer, imageCached, usedMB))
+}
+
+// DiskAllowanceGBToCover returns the whole max_disk_gb value that clears BOTH
+// gates standing between this machine and this leaf: the head's dispatch gate
+// (the declared need must fit under the advertised allowance) and this
+// machine's own budget (usage + incremental need must fit under it too).
+// Computed from today's usage, because a number covering the leaf requirement
+// alone leaves the volunteer still gated after pasting it — the observed
+// 20 → 27 → 43 → 53 GB chase (TB-41).
+func DiskAllowanceGBToCover(needMB int64, isContainer, imageCached bool, usedMB int64) int {
+	cover := needMB
+	if withUsage := usedMB + leafIncrementalNeedMB(needMB, isContainer, imageCached); withUsage > cover {
+		cover = withUsage
+	}
+	return int((cover + 1023) / 1024)
 }
 
 // leafIsContainer reports whether the leaf executes as a container, and whether
@@ -152,6 +169,49 @@ func leafIsContainer(leaf CachedLeafInfo) (isContainer, known bool) {
 	return leaf.ExecutionSpec.Image != "", true
 }
 
+// leafDiskGateInputs derives the three inputs every disk-gate computation
+// takes for one leaf: its effective need, whether it runs as a container
+// (unknown read as container iff a container runtime is registered — the
+// conservative reading), and whether its image is already cached.
+func (d *Daemon) leafDiskGateInputs(leaf CachedLeafInfo) (need int64, isContainer, cached bool) {
+	need = leafDiskNeedMB(leaf)
+	isContainer, known := leafIsContainer(leaf)
+	if !known {
+		isContainer = d.runtimeRegistry != nil && d.runtimeRegistry.GetRuntime("container") != nil
+	}
+	if isContainer && known {
+		cached = d.leafImageCached(leaf)
+	}
+	return need, isContainer, cached
+}
+
+// LeafDiskGateStatus is the live gate's answer for one leaf, exposed over the
+// management API so `leafs list` and doctor can quote the daemon's own verdict
+// instead of recomputing it with inputs they cannot know — image cachedness
+// above all (TB-41, TB-42). RaiseToGB is the max_disk_gb that would clear both
+// the head's dispatch gate and this machine's current budget for this leaf.
+type LeafDiskGateStatus struct {
+	Blocked   bool
+	Reason    string
+	RaiseToGB int
+}
+
+// LeafDiskGateStatus reports the live per-leaf disk gate's verdict plus the
+// covering-allowance arithmetic, for the management API.
+func (d *Daemon) LeafDiskGateStatus(leaf CachedLeafInfo) LeafDiskGateStatus {
+	ok, reason := d.leafDiskGate(leaf)
+	need, isContainer, cached := d.leafDiskGateInputs(leaf)
+	var usedMB int64
+	if mb, measured := d.lettuceDiskUsageMB(); measured {
+		usedMB = mb
+	}
+	return LeafDiskGateStatus{
+		Blocked:   !ok,
+		Reason:    reason,
+		RaiseToGB: DiskAllowanceGBToCover(need, isContainer, cached, usedMB),
+	}
+}
+
 // leafDiskGate is the live per-leaf disk gate: whether fetching work for this
 // leaf is currently allowed, and if not, why. Called by shouldFetch (fetch iff
 // at least one enabled leaf passes) and by the fetcher (skip exactly the leafs
@@ -161,15 +221,7 @@ func (d *Daemon) leafDiskGate(leaf CachedLeafInfo) (bool, string) {
 		return true, ""
 	}
 
-	need := leafDiskNeedMB(leaf)
-	isContainer, known := leafIsContainer(leaf)
-	if !known {
-		isContainer = d.runtimeRegistry != nil && d.runtimeRegistry.GetRuntime("container") != nil
-	}
-	cached := false
-	if isContainer && known {
-		cached = d.leafImageCached(leaf)
-	}
+	need, isContainer, cached := d.leafDiskGateInputs(leaf)
 
 	dataDirMB, storeMB := LeafDiskThresholds(need, isContainer, cached)
 

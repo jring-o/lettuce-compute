@@ -29,7 +29,7 @@ func TestEvaluateLeafEligibility_DiskGate(t *testing.T) {
 	// The reported shape: memory raised to 6000, disk left at the 10 GB default.
 	caps := volunteerCaps{maxMemoryMB: 6000, containerUsable: true, maxDiskMB: 10 * 1024, maxCPUCores: 8}
 
-	res := evaluateLeafEligibility(leafs, caps, trustingHead)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead, nil)
 	if res.total != 2 || res.eligible != 1 {
 		t.Fatalf("total=%d eligible=%d, want 2/1 (the 15 GB leaf gated by disk)", res.total, res.eligible)
 	}
@@ -62,7 +62,7 @@ func TestEvaluateLeafEligibility_CoresGate(t *testing.T) {
 	}
 	caps := volunteerCaps{maxMemoryMB: 16384, containerUsable: true, maxDiskMB: 100 * 1024, maxCPUCores: 2}
 
-	res := evaluateLeafEligibility(leafs, caps, trustingHead)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead, nil)
 	if res.eligible != 0 || res.coresBlocked != 1 {
 		t.Fatalf("eligible=%d coresBlocked=%d, want 0/1", res.eligible, res.coresBlocked)
 	}
@@ -83,7 +83,7 @@ func TestEvaluateLeafEligibility_UnknownBudgetsDoNotBlock(t *testing.T) {
 		{Id: "l", Slug: "l", ExecutionSpec: &lettucev1.ExecutionSpec{MaxMemoryMb: 1024}},
 	}
 	caps := volunteerCaps{maxMemoryMB: 4096, containerUsable: true, maxDiskMB: 10 * 1024, maxCPUCores: 2}
-	if res := evaluateLeafEligibility(oldHeadLeafs, caps, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(oldHeadLeafs, caps, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("old head: eligible=%d, want 1 (absent requirements are unknown, not blocking)", res.eligible)
 	}
 
@@ -94,7 +94,7 @@ func TestEvaluateLeafEligibility_UnknownBudgetsDoNotBlock(t *testing.T) {
 			ResourceRequirements: &lettucev1.LeafResourceRequirements{MinDiskMb: 15360, MinCpuCores: 8}},
 	}
 	unknownCaps := volunteerCaps{maxMemoryMB: 4096, containerUsable: true}
-	if res := evaluateLeafEligibility(hungry, unknownCaps, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(hungry, unknownCaps, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("old daemon: eligible=%d, want 1 (an unreported budget must not fabricate a block)", res.eligible)
 	}
 }

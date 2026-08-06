@@ -52,7 +52,7 @@ func TestEvaluateLeafEligibility_GPURequiredFromEitherFlag(t *testing.T) {
 					MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: tc.rrFlag,
 				},
 			}}
-			if res := evaluateLeafEligibility(leafs, noGPU, trustingHead); res.eligible != tc.wantEligible {
+			if res := evaluateLeafEligibility(leafs, noGPU, trustingHead, nil); res.eligible != tc.wantEligible {
 				t.Errorf("eligible=%d, want %d — the head requires a GPU when either flag is set",
 					res.eligible, tc.wantEligible)
 			}
@@ -82,7 +82,7 @@ func TestEvaluateLeafEligibility_VRAMGate(t *testing.T) {
 
 	// A 6 GB card at the default 50% offers 3072 MB — below the 4096 gate. The
 	// machine has a GPU, so presence alone would call this eligible.
-	res := evaluateLeafEligibility(leafs, gpuCaps(6144, 50), trustingHead)
+	res := evaluateLeafEligibility(leafs, gpuCaps(6144, 50), trustingHead, nil)
 	if res.total != 1 || res.eligible != 0 || res.vramBlocked != 1 {
 		t.Fatalf("total=%d eligible=%d vramBlocked=%d, want 1/0/1", res.total, res.eligible, res.vramBlocked)
 	}
@@ -100,12 +100,12 @@ func TestEvaluateLeafEligibility_VRAMGate(t *testing.T) {
 
 	// 67% of 6144 is 4116 — clears 4096. Rounding the suggestion down to 66 would
 	// give 4055 and leave the volunteer still refused after restarting.
-	if res := evaluateLeafEligibility(leafs, gpuCaps(6144, 67), trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(leafs, gpuCaps(6144, 67), trustingHead, nil); res.eligible != 1 {
 		t.Errorf("at the suggested 67%%, eligible=%d want 1 — the remedy does not clear the gate", res.eligible)
 	}
 
 	// An 8 GB card at the default clears it exactly (4096 >= 4096).
-	if res := evaluateLeafEligibility(leafs, gpuCaps(8192, 50), trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(leafs, gpuCaps(8192, 50), trustingHead, nil); res.eligible != 1 {
 		t.Errorf("8 GB card at 50%%: eligible=%d, want 1", res.eligible)
 	}
 }
@@ -115,7 +115,7 @@ func TestEvaluateLeafEligibility_VRAMGate(t *testing.T) {
 // class of message wastes people's time.
 func TestEvaluateLeafEligibility_VRAMCardTooSmall(t *testing.T) {
 	leafs := []*lettucev1.LeafInfo{gpuLeafInfo(12288, "", "")}
-	res := evaluateLeafEligibility(leafs, gpuCaps(6144, 50), trustingHead)
+	res := evaluateLeafEligibility(leafs, gpuCaps(6144, 50), trustingHead, nil)
 	if res.vramBlocked != 1 {
 		t.Fatalf("vramBlocked=%d, want 1", res.vramBlocked)
 	}
@@ -137,7 +137,7 @@ func TestEvaluateLeafEligibility_GPUVendorGate(t *testing.T) {
 
 	amd := gpuCaps(8192, 50)
 	amd.gpuVendors = []string{"AMD"}
-	res := evaluateLeafEligibility(leafs, amd, trustingHead)
+	res := evaluateLeafEligibility(leafs, amd, trustingHead, nil)
 	if res.eligible != 0 || res.gpuBlocked != 1 {
 		t.Fatalf("eligible=%d gpuBlocked=%d, want 0/1", res.eligible, res.gpuBlocked)
 	}
@@ -147,7 +147,7 @@ func TestEvaluateLeafEligibility_GPUVendorGate(t *testing.T) {
 
 	// "ANY" and empty are not constraints — the dispatch predicate admits both.
 	for _, gpuType := range []string{"", "ANY"} {
-		if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{gpuLeafInfo(0, gpuType, "")}, amd, trustingHead); res.eligible != 1 {
+		if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{gpuLeafInfo(0, gpuType, "")}, amd, trustingHead, nil); res.eligible != 1 {
 			t.Errorf("gpu_type=%q: eligible=%d, want 1 (not a constraint)", gpuType, res.eligible)
 		}
 	}
@@ -174,7 +174,7 @@ func TestEvaluateLeafEligibility_GPUSubGatesKeyOnTheSameFlagAsDispatch(t *testin
 			MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: true, GpuType: "NVIDIA",
 		},
 	}}
-	if res := evaluateLeafEligibility(vendorSkipped, amd, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(vendorSkipped, amd, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("vendor gate applied where dispatch skips it: eligible=%d, want 1 (reason: %q)",
 			res.eligible, res.leaves[0].reason)
 	}
@@ -188,7 +188,7 @@ func TestEvaluateLeafEligibility_GPUSubGatesKeyOnTheSameFlagAsDispatch(t *testin
 			MinDiskMb: 1024, MinCpuCores: 1, GpuRequired: false, GpuComputeCapability: "8.6",
 		},
 	}}
-	if res := evaluateLeafEligibility(ccSkipped, amd, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(ccSkipped, amd, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("compute-capability gate applied where dispatch skips it: eligible=%d, want 1 (reason: %q)",
 			res.eligible, res.leaves[0].reason)
 	}
@@ -200,13 +200,13 @@ func TestEvaluateLeafEligibility_GPUComputeCapabilityGate(t *testing.T) {
 
 	caps := gpuCaps(8192, 50)
 	caps.gpuComputeCapabilities = []string{"7.5"}
-	res := evaluateLeafEligibility(leafs, caps, trustingHead)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead, nil)
 	if res.eligible != 0 || res.gpuBlocked != 1 {
 		t.Fatalf("eligible=%d gpuBlocked=%d, want 0/1", res.eligible, res.gpuBlocked)
 	}
 
 	caps.gpuComputeCapabilities = []string{"8.6"}
-	if res := evaluateLeafEligibility(leafs, caps, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility(leafs, caps, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("matching compute capability: eligible=%d, want 1", res.eligible)
 	}
 }
@@ -223,14 +223,14 @@ func TestEvaluateLeafEligibility_GPUUnknownBudgetsDoNotBlock(t *testing.T) {
 		ExecutionSpec:        &lettucev1.ExecutionSpec{Image: "x:1", GpuRequired: true, MaxMemoryMb: 1024},
 		ResourceRequirements: &lettucev1.LeafResourceRequirements{MinDiskMb: 1024, MinCpuCores: 1},
 	}
-	if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{old}, gpuCaps(4096, 25), trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{old}, gpuCaps(4096, 25), trustingHead, nil); res.eligible != 1 {
 		t.Errorf("leaf with no stated GPU requirements: eligible=%d, want 1", res.eligible)
 	}
 
 	// Daemon reports no GPU budget (pre-TB-21 daemon), leaf does state one.
 	unknown := volunteerCaps{maxMemoryMB: 16384, containerUsable: true, hasGPU: true,
 		maxDiskMB: 100 * 1024, maxCPUCores: 8}
-	if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{gpuLeafInfo(4096, "NVIDIA", "8.6")}, unknown, trustingHead); res.eligible != 1 {
+	if res := evaluateLeafEligibility([]*lettucev1.LeafInfo{gpuLeafInfo(4096, "NVIDIA", "8.6")}, unknown, trustingHead, nil); res.eligible != 1 {
 		t.Errorf("machine with unknown GPU budgets: eligible=%d, want 1", res.eligible)
 	}
 }

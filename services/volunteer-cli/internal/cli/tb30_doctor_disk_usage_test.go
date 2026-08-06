@@ -184,7 +184,7 @@ func TestTB30_AllEligibleLeafsFetchGatedEscalates(t *testing.T) {
 		usedMBKnown:   true,
 	}
 
-	res := evaluateLeafEligibility(leafs, caps, trustingHead)
+	res := evaluateLeafEligibility(leafs, caps, trustingHead, nil)
 	if res.eligible != 1 {
 		t.Fatalf("eligible = %d, want 1 (the head WOULD dispatch this leaf)", res.eligible)
 	}
@@ -194,7 +194,7 @@ func TestTB30_AllEligibleLeafsFetchGatedEscalates(t *testing.T) {
 
 	// With the budget healthy nothing is gated and no escalation happens.
 	caps.lettuceUsedMB = 100
-	if allEligibleFetchGated(evaluateLeafEligibility(leafs, caps, trustingHead)) {
+	if allEligibleFetchGated(evaluateLeafEligibility(leafs, caps, trustingHead, nil)) {
 		t.Error("nothing is gated, must not escalate")
 	}
 	// No eligible leafs at all is the ineligibility story, not this one.
