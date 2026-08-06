@@ -7,11 +7,17 @@ const { auth } = NextAuth(authConfig);
 /**
  * Anonymous allowlist for the /api/* surface. EXACT-SEGMENT prefixes only:
  * a request path must be the prefix itself or continue with a "/" — never a
- * bare string prefix. A loose "/api/viz/" prefix would re-admit
- * "/api/viz/results" and reopen BG-07; this list names "/api/viz/bundle"
- * (public, origin-isolated author code) but NOT "/api/viz".
+ * bare string prefix (a loose "/api/viz/" prefix would admit lookalike
+ * segments). Entries:
+ *   - "/api/auth"        NextAuth sign-in handshake.
+ *   - "/api/viz/bundle"  public, origin-isolated author code.
+ *   - "/api/viz/results" NOT public data (BG-07): the route itself enforces
+ *     owner-or-admin per leaf, EXCEPT leafs whose results_visibility field
+ *     is PUBLIC — the per-leaf opt-in from design §4.7. Anonymous callers
+ *     must reach the route for that per-leaf policy to run; the middleware
+ *     cannot know which leaf a request names.
  */
-const API_ANON_ALLOWLIST = ["/api/auth", "/api/viz/bundle"];
+const API_ANON_ALLOWLIST = ["/api/auth", "/api/viz/bundle", "/api/viz/results"];
 
 function isAllowlistedApi(pathname: string): boolean {
   return API_ANON_ALLOWLIST.some(

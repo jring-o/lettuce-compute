@@ -38,6 +38,19 @@ const (
 	VisibilityPrivate  LeafVisibility = "PRIVATE"
 )
 
+// ResultsVisibility is the per-leaf results-visibility policy (design §4.7).
+// It governs who may view the leaf's RESULTS (output_data replay — the
+// dashboard's visualization surfaces), which are leaf CONTENTS and therefore
+// owner-only by default regardless of the leaf's catalog Visibility (design
+// §1.3, BG-07). PUBLIC is the additive per-leaf opt-in those surfaces honor;
+// it never overrides Visibility — a PRIVATE leaf stays hidden regardless.
+type ResultsVisibility string
+
+const (
+	ResultsVisibilityOwnerOnly ResultsVisibility = "OWNER_ONLY"
+	ResultsVisibilityPublic    ResultsVisibility = "PUBLIC"
+)
+
 // Runtime type constants.
 const (
 	RuntimeNative    = "NATIVE"
@@ -374,9 +387,15 @@ type Leaf struct {
 	HealthConfig         HealthConfig         `json:"health_config"`
 	IsOngoing            bool                 `json:"is_ongoing"`
 	Visibility           LeafVisibility       `json:"visibility"`
-	StatsCacheSeconds    int                  `json:"stats_cache_seconds"`
-	CreatedAt            time.Time            `json:"created_at"`
-	UpdatedAt            time.Time            `json:"updated_at"`
+	// ResultsVisibility is the per-leaf public-visualization opt-in (design
+	// §4.7): OWNER_ONLY (the database default) keeps results owner/admin-only;
+	// PUBLIC opts this leaf's visualize page and replay results into anonymous
+	// viewing. Set through the leaf-update API only — creation always starts
+	// OWNER_ONLY, so publishing results is a separate, audited decision (TB-38).
+	ResultsVisibility ResultsVisibility `json:"results_visibility"`
+	StatsCacheSeconds int               `json:"stats_cache_seconds"`
+	CreatedAt         time.Time         `json:"created_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
 	// CurrentArtifactVersionID points at the leaf_artifact_versions row this leaf
 	// currently dispatches (TODO #38). Nil = no published version yet: the legacy
 	// path, where assignments build from ExecutionConfig directly. Owned by

@@ -7,6 +7,7 @@ export const revalidate = 30; // ISR: revalidate leaf detail every 30 seconds
 import { infrastructureClient, InfrastructureApiError } from "@/lib/infrastructure-client";
 import { db } from "@/lib/db";
 import { users } from "@/lib/db/schema";
+import { isPublicResultsLeaf } from "@/lib/results-visibility";
 import { ProjectDetail } from "@/components/projects/project-detail";
 
 export async function generateMetadata({
@@ -71,6 +72,12 @@ export default async function LeafDetailPage({
         stats={stats}
         creator={creator}
         serverHost={serverHost}
+        // The Visualize button shows on this anonymous-reachable page ONLY for
+        // leafs whose results_visibility opted them PUBLIC (design §4.7) — for
+        // every other leaf the visualize page would 404 non-owners anyway.
+        hasVisualization={
+          Boolean(leaf.execution_config?.binaries?.viz) && isPublicResultsLeaf(leaf)
+        }
       />
     </div>
   );

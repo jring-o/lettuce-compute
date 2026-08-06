@@ -45,6 +45,7 @@ func scanLeaf(row pgx.Row) (*Leaf, error) {
 		&p.ResourceRequirements,
 		&p.IsOngoing,
 		&p.Visibility,
+		&p.ResultsVisibility,
 		&p.StatsCacheSeconds,
 		&p.CreatedAt,
 		&p.UpdatedAt,
@@ -62,11 +63,15 @@ const leafColumns = `id, name, slug, description, research_area,
 	creator_id, creator_public_key, state, task_pattern,
 	execution_config, validation_config, fault_tolerance_config,
 	data_config, credit_config, resource_requirements,
-	is_ongoing, visibility, stats_cache_seconds, created_at, updated_at,
+	is_ongoing, visibility, results_visibility, stats_cache_seconds, created_at, updated_at,
 	current_artifact_version_id, generation_cursor`
 
 // Create inserts a new leaf. The slug is generated automatically from the name.
 // On return, p is populated with the DB-generated id, slug, and timestamps.
+// results_visibility is deliberately absent from the INSERT: every new leaf
+// starts at the database default (OWNER_ONLY) — publishing results is a
+// separate, audited leaf-update (design §4.7). RETURNING scans the default back
+// into p.
 func (r *PgxRepository) Create(ctx context.Context, p *Leaf) error {
 	slug, err := GenerateUniqueSlug(ctx, r.pool, p.Name, p.CreatorID)
 	if err != nil {
@@ -341,7 +346,8 @@ func (r *PgxRepository) Update(ctx context.Context, p *Leaf) error {
 			resource_requirements = $12,
 			is_ongoing = $13,
 			visibility = $14,
-			stats_cache_seconds = $15
+			results_visibility = $15,
+			stats_cache_seconds = $16
 		WHERE id = $1`,
 		p.ID,
 		p.Name,
@@ -357,6 +363,7 @@ func (r *PgxRepository) Update(ctx context.Context, p *Leaf) error {
 		p.ResourceRequirements,
 		p.IsOngoing,
 		p.Visibility,
+		p.ResultsVisibility,
 		p.StatsCacheSeconds,
 	)
 	if err != nil {

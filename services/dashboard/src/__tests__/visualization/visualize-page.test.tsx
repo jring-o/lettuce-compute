@@ -109,6 +109,7 @@ function makeLeaf(overrides: Partial<Leaf> = {}): Leaf {
     resource_requirements: null,
     is_ongoing: false,
     visibility: "PUBLIC",
+    results_visibility: "OWNER_ONLY",
     stats_cache_seconds: 60,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-03-01T00:00:00Z",
@@ -172,7 +173,9 @@ function makeParams(slug: string, searchParams: Record<string, string> = {}) {
 describe("VisualizePage (server component)", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    // Default: an authenticated owner of the leaf (creator_id "user-1").
+    // Default: an authenticated owner of the leaf (creator_id "user-1"), and
+    // makeLeaf's results_visibility default of OWNER_ONLY — the owner-only
+    // policy every existing test assumes.
     mockAuth.mockResolvedValue({ user: { id: "user-1", role: "USER" } });
     mockLeafOwnershipVerdict.mockResolvedValue({ allowed: true });
   });
@@ -280,6 +283,52 @@ describe("VisualizePage (server component)", () => {
     );
     expect(mockNotFound).toHaveBeenCalled();
     expect(mockListWorkUnits).not.toHaveBeenCalled();
+    expect(mockListResults).not.toHaveBeenCalled();
+  });
+
+  // --- Public visualization opt-in (leaf.results_visibility, design §4.7) ---
+
+  it("renders for an anonymous caller when the leaf's results_visibility is PUBLIC", async () => {
+    mockAuth.mockResolvedValue(null);
+
+    mockGetLeaf.mockResolvedValue(makeLeaf({ results_visibility: "PUBLIC" }));
+    mockListWorkUnits.mockResolvedValue({
+      data: [makeWorkUnit({ id: "wu-001" })],
+      pagination: { next_cursor: null, has_more: false },
+    });
+    mockListResults.mockResolvedValue({
+      data: [makeResult({ work_unit_id: "wu-001" })],
+      pagination: { next_cursor: null, has_more: false },
+    });
+
+    const page = await VisualizePage(makeParams("nbody-sim"));
+    render(page);
+
+    expect(screen.getByTestId("visualization-page")).toBeInTheDocument();
+    // The public path never consults the per-user ownership predicate.
+    expect(mockLeafOwnershipVerdict).not.toHaveBeenCalled();
+    expect(mockNotFound).not.toHaveBeenCalled();
+  });
+
+  it("still calls notFound() for an anonymous caller when results_visibility is OWNER_ONLY", async () => {
+    mockAuth.mockResolvedValue(null);
+    mockGetLeaf.mockResolvedValue(makeLeaf({ results_visibility: "OWNER_ONLY" }));
+
+    await expect(VisualizePage(makeParams("nbody-sim"))).rejects.toThrow(
+      "NEXT_NOT_FOUND",
+    );
+    expect(mockListResults).not.toHaveBeenCalled();
+  });
+
+  it("still calls notFound() for a PRIVATE leaf even when results_visibility is PUBLIC", async () => {
+    mockAuth.mockResolvedValue(null);
+    mockGetLeaf.mockResolvedValue(
+      makeLeaf({ visibility: "PRIVATE", results_visibility: "PUBLIC" }),
+    );
+
+    await expect(VisualizePage(makeParams("nbody-sim"))).rejects.toThrow(
+      "NEXT_NOT_FOUND",
+    );
     expect(mockListResults).not.toHaveBeenCalled();
   });
 

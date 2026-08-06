@@ -52,7 +52,10 @@ const ALLOWLIST: Record<string, string[]> = {
   // aggregate/work-unit contents reads that used to live here).
   "leafs/[slug]/page.tsx": ["getLeaf", "getLeafStats"],
   // Public visualize page — gated to owner/admin (notFound() otherwise) before
-  // it replays results, because output_data is owner-only contents (§1.3).
+  // it replays results, because output_data is owner-only contents (§1.3),
+  // EXCEPT leafs whose results_visibility field is PUBLIC — the per-leaf
+  // opt-in from design §4.7 (lib/results-visibility.ts), read from the leaf
+  // the page already fetched.
   "leafs/[slug]/visualize/page.tsx": ["getLeaf", "listWorkUnits", "listResults"],
   // Owner dashboard page — ownership-checked at the top (creator_id ===
   // session.user.id else redirect); keeps the contents reads (R1.2).

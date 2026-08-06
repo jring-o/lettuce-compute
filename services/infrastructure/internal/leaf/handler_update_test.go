@@ -188,3 +188,36 @@ func TestHandleUpdate_IsOngoingFlipWithNumTrialsInSameRequest(t *testing.T) {
 		t.Error("is_ongoing flip not persisted")
 	}
 }
+
+// TestHandleUpdate_SetsResultsVisibility: the per-leaf public-visualization
+// opt-in (design §4.7) is set through the ordinary leaf-update endpoint.
+func TestHandleUpdate_SetsResultsVisibility(t *testing.T) {
+	lf := newUpdateTestLeaf()
+	lf.ResultsVisibility = ResultsVisibilityOwnerOnly
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: slog.Default()}
+
+	rec := doUpdate(t, h, lf.ID, `{"results_visibility":"PUBLIC"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if lf.ResultsVisibility != ResultsVisibilityPublic {
+		t.Errorf("ResultsVisibility = %q, want PUBLIC persisted", lf.ResultsVisibility)
+	}
+}
+
+// TestHandleUpdate_RejectsInvalidResultsVisibility: anything outside
+// OWNER_ONLY/PUBLIC is refused up front — never stored, never sent to the
+// database enum.
+func TestHandleUpdate_RejectsInvalidResultsVisibility(t *testing.T) {
+	lf := newUpdateTestLeaf()
+	lf.ResultsVisibility = ResultsVisibilityOwnerOnly
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: slog.Default()}
+
+	rec := doUpdate(t, h, lf.ID, `{"results_visibility":"EVERYONE"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if lf.ResultsVisibility != ResultsVisibilityOwnerOnly {
+		t.Errorf("ResultsVisibility = %q, must be unchanged after a rejected update", lf.ResultsVisibility)
+	}
+}

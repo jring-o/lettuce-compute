@@ -120,7 +120,7 @@ describe("middleware", () => {
 
   describe("/api/* default-deny", () => {
     it("returns a 401 (not a redirect) for an anonymous data API call", () => {
-      const req = mockRequest("/api/viz/results", false);
+      const req = mockRequest("/api/files/some-file-id", false);
       const result = capturedCallback!(req);
 
       expect(result).toBeDefined();
@@ -130,7 +130,7 @@ describe("middleware", () => {
     });
 
     it("allows an authenticated /api/* call through", () => {
-      const req = mockRequest("/api/viz/results", true);
+      const req = mockRequest("/api/upload", true);
       expect(capturedCallback!(req)).toBeUndefined();
     });
 
@@ -144,8 +144,19 @@ describe("middleware", () => {
       expect(capturedCallback!(req)).toBeUndefined();
     });
 
-    it("does NOT allowlist /api/viz/results via a loose /api/viz prefix (BG-07)", () => {
+    it("allowlists /api/viz/results anonymously — the ROUTE enforces owner-or-public-results per leaf (BG-07 / design §4.7)", () => {
       const req = mockRequest("/api/viz/results", false);
+      expect(capturedCallback!(req)).toBeUndefined();
+    });
+
+    it("does NOT allowlist the rest of /api/viz/* via a loose prefix", () => {
+      const req = mockRequest("/api/viz/other", false);
+      const result = capturedCallback!(req);
+      expect(result!.status).toBe(401);
+    });
+
+    it("does NOT treat a /api/viz/results-lookalike segment as allowlisted", () => {
+      const req = mockRequest("/api/viz/resultsxyz", false);
       const result = capturedCallback!(req);
       expect(result!.status).toBe(401);
     });

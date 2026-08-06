@@ -19,6 +19,15 @@ export type TaskPattern =
 
 export type LeafVisibility = "PUBLIC" | "UNLISTED" | "PRIVATE";
 
+/**
+ * Per-leaf results-visibility policy (design §4.7): OWNER_ONLY keeps results
+ * (output_data replay — the visualization surfaces) owner/admin-only regardless
+ * of the leaf's catalog visibility (§1.3, BG-07); PUBLIC is the additive
+ * per-leaf opt-in that makes the visualize page and replay results viewable
+ * without a session. It never overrides visibility — PRIVATE leafs stay hidden.
+ */
+export type ResultsVisibility = "OWNER_ONLY" | "PUBLIC";
+
 export type WorkUnitState =
   | "PENDING"
   | "ASSIGNED"
@@ -142,6 +151,7 @@ export interface Leaf {
   resource_requirements: ResourceRequirements | null;
   is_ongoing: boolean;
   visibility: LeafVisibility;
+  results_visibility: ResultsVisibility;
   stats_cache_seconds: number;
   created_at: string;
   updated_at: string;
@@ -287,6 +297,7 @@ export interface UpdateLeafRequest {
   resource_requirements?: ResourceRequirements;
   is_ongoing?: boolean;
   visibility?: LeafVisibility;
+  results_visibility?: ResultsVisibility;
   stats_cache_seconds?: number;
 }
 

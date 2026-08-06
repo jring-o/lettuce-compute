@@ -595,6 +595,39 @@ curl -s "$HEAD/api/v1/leafs/$LEAF_ID/results" \
 curl -s -X POST $HEAD/api/v1/leafs/$LEAF_ID/archive -H "Authorization: Bearer $ADMIN_KEY"
 ```
 
+### Making a leaf's visualization public (`results_visibility`)
+
+By default a leaf's **results are private**: the dashboard's visualization page
+(`/leafs/<slug>/visualize`) and its replay data are visible only to the leaf's owner and
+admins, even when the leaf itself is `PUBLIC` in the catalog. That is deliberate — a
+result's `output_data` is the leaf's content, and catalog visibility only controls who
+can *find* the leaf, not who can read what it computed.
+
+If you want anyone — including visitors who are not signed in — to watch a leaf's
+visualization, opt that one leaf in by setting its `results_visibility` field:
+
+```bash
+# Make this leaf's visualization and replay results publicly viewable
+curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"results_visibility": "PUBLIC"}'
+
+# Back to the default (owner/admin only)
+curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"results_visibility": "OWNER_ONLY"}'
+```
+
+**Know what you are publishing.** `PUBLIC` here exposes the leaf's submitted results —
+the full `output_data` each work unit produced, validated or not, replayed through the
+leaf's visualization — to any anonymous visitor. Opt in only leaves whose results you
+consider publishable. The opt-in is per-leaf and additive: every other leaf keeps the
+default, and a `PRIVATE` leaf stays completely hidden even if its `results_visibility`
+is `PUBLIC`. Once opted in, the leaf's public catalog page also shows the **Visualize**
+button to everyone (for leaves that ship a viz bundle). Each change is recorded in the
+head's audit log with the actor and the before/after values. Changes reach anonymous
+viewers within about a minute (the dashboard caches pages and verdicts briefly).
+
 ### Why is my leaf getting no volunteers?
 
 Work only flows when a volunteer can *find* the leaf, *run* its runtime, and *fit* its
