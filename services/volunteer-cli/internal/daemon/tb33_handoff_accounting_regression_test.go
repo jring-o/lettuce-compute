@@ -53,7 +53,7 @@ func TestTB33_UnitInSlotHandoffStaysCounted(t *testing.T) {
 	}
 
 	// Begin the handoff exactly as fillSlots does.
-	item := d.prefetchQueue.PopFit(func(*PreFetchItem) bool { return true })
+	item := d.prefetchQueue.PopFit(func(*PreFetchItem) bool { return true }, alwaysDelays)
 	if item == nil {
 		t.Fatal("PopFit returned nil")
 	}
@@ -93,7 +93,7 @@ func TestTB33_UnitInSlotHandoffStaysCounted(t *testing.T) {
 func TestTB33_HandoffOverlapNotDoubleCounted(t *testing.T) {
 	d := tb33HandoffDaemon(t)
 
-	item := d.prefetchQueue.PopFit(func(*PreFetchItem) bool { return true })
+	item := d.prefetchQueue.PopFit(func(*PreFetchItem) bool { return true }, alwaysDelays)
 	if item == nil {
 		t.Fatal("PopFit returned nil")
 	}
