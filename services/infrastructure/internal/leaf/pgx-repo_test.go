@@ -75,12 +75,12 @@ func createTestUser(t *testing.T, pool *pgxpool.Pool, username string) types.ID 
 
 func newTestLeaf(creatorID *types.ID) *Leaf {
 	return &Leaf{
-		Name:        "Test Leaf " + uuid.New().String()[:8],
-		Description: "A test leaf for integration testing purposes",
+		Name:         "Test Leaf " + uuid.New().String()[:8],
+		Description:  "A test leaf for integration testing purposes",
 		ResearchArea: []string{"physics", "ml-ai"},
-		CreatorID:   creatorID,
-		State:       StateDraft,
-		TaskPattern: PatternParameterSweep,
+		CreatorID:    creatorID,
+		State:        StateDraft,
+		TaskPattern:  PatternParameterSweep,
 		ExecutionConfig: ExecutionConfig{
 			Runtime:       "NATIVE",
 			GPUType:       "ANY",
@@ -113,8 +113,43 @@ func newTestLeaf(creatorID *types.ID) *Leaf {
 			MinCPUCores: 1,
 			MinDiskMB:   1024,
 		},
-		IsOngoing:  false,
-		Visibility: VisibilityPublic,
+		IsOngoing:         false,
+		Visibility:        VisibilityPublic,
+		ResultsVisibility: ResultsVisibilityOwnerOnly,
+	}
+}
+
+// TestResultsVisibilityDefaultAndUpdate: a new leaf starts at the database
+// default OWNER_ONLY regardless of what the caller passed (the INSERT omits the
+// column — publishing results is a separate, audited update, design §4.7), and
+// an update to PUBLIC round-trips.
+func TestResultsVisibilityDefaultAndUpdate(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	userID := createTestUser(t, pool, "rv-creator")
+	repo := NewPgxRepository(pool)
+	ctx := context.Background()
+
+	p := newTestLeaf(&userID)
+	p.ResultsVisibility = ResultsVisibilityPublic // must NOT survive creation
+	if err := repo.Create(ctx, p); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if p.ResultsVisibility != ResultsVisibilityOwnerOnly {
+		t.Errorf("after Create, ResultsVisibility = %q, want the OWNER_ONLY default", p.ResultsVisibility)
+	}
+
+	p.ResultsVisibility = ResultsVisibilityPublic
+	if err := repo.Update(ctx, p); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, err := repo.GetByID(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.ResultsVisibility != ResultsVisibilityPublic {
+		t.Errorf("after Update, ResultsVisibility = %q, want PUBLIC", got.ResultsVisibility)
 	}
 }
 

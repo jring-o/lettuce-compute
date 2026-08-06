@@ -76,6 +76,7 @@ const mockLeaf: Leaf = {
   resource_requirements: null,
   is_ongoing: false,
   visibility: "PUBLIC",
+  results_visibility: "OWNER_ONLY",
   stats_cache_seconds: 60,
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",

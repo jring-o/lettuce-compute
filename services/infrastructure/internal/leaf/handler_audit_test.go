@@ -154,3 +154,50 @@ func TestHandleTransition_EmitsAuditLine(t *testing.T) {
 		t.Errorf("actor_user_id = %q, want %q", got, actor.String())
 	}
 }
+
+// TB-38 × design §4.7: flipping results_visibility must land in the audit diff
+// with its before/after values and the actor — the reason the public-viz
+// opt-in lives on the leaf row rather than in deployment config is precisely
+// that an edit leaves this reconstructable line.
+func TestHandleUpdate_AuditsResultsVisibilityFlip(t *testing.T) {
+	lf := newUpdateTestLeaf()
+	lf.ResultsVisibility = ResultsVisibilityOwnerOnly
+	actor := types.NewID()
+	logger, buf := auditTestLogger()
+	h := &LeafHandler{repo: &mockUpdateRepo{leaf: lf}, logger: logger}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/leafs/"+lf.ID.String(),
+		bytes.NewBufferString(`{"results_visibility":"PUBLIC"}`))
+	req.SetPathValue("leaf_id", lf.ID.String())
+	req = req.WithContext(WithViewer(req.Context(), Viewer{UserID: actor, Authed: true}))
+	rec := httptest.NewRecorder()
+	h.handleUpdate(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	lines := auditLines(buf, "leaf updated")
+	if len(lines) != 1 {
+		t.Fatalf("audit lines = %d, want 1; got log:\n%s", len(lines), buf.String())
+	}
+	line := lines[0]
+	changed, _ := line["changed"].([]any)
+	found := false
+	for _, c := range changed {
+		if s, _ := c.(string); s == "results_visibility" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("changed = %v, must include results_visibility", changed)
+	}
+	if got, _ := line["results_visibility_before"].(string); got != `"OWNER_ONLY"` {
+		t.Errorf("results_visibility_before = %q, want the prior value", got)
+	}
+	if got, _ := line["results_visibility_after"].(string); got != `"PUBLIC"` {
+		t.Errorf("results_visibility_after = %q, want the new value", got)
+	}
+	if got, _ := line["actor_user_id"].(string); got != actor.String() {
+		t.Errorf("actor_user_id = %q, want %q", got, actor.String())
+	}
+}

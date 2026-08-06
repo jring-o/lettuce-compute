@@ -3,6 +3,7 @@ package leaf
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -442,6 +443,18 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Visibility != nil {
 		p.Visibility = *req.Visibility
+	}
+	if req.ResultsVisibility != nil {
+		switch *req.ResultsVisibility {
+		case ResultsVisibilityOwnerOnly, ResultsVisibilityPublic:
+			// valid
+		default:
+			apierror.WriteError(w, apierror.ValidationError(
+				fmt.Sprintf("invalid results_visibility: %q; must be one of OWNER_ONLY, PUBLIC", *req.ResultsVisibility),
+				nil))
+			return
+		}
+		p.ResultsVisibility = *req.ResultsVisibility
 	}
 	if req.StatsCacheSeconds != nil {
 		v := *req.StatsCacheSeconds

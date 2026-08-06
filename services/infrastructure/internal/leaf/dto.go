@@ -35,7 +35,12 @@ type UpdateLeafRequest struct {
 	ResourceRequirements *ResourceRequirements `json:"resource_requirements,omitempty"`
 	IsOngoing            *bool                 `json:"is_ongoing,omitempty"`
 	Visibility           *LeafVisibility    `json:"visibility,omitempty"`
-	StatsCacheSeconds    *int                  `json:"stats_cache_seconds,omitempty"`
+	// ResultsVisibility is the per-leaf public-visualization opt-in (design
+	// §4.7). Not accepted at creation — flipping a leaf's results PUBLIC is a
+	// deliberate post-creation act that flows through this endpoint's TB-38
+	// audit diff.
+	ResultsVisibility *ResultsVisibility `json:"results_visibility,omitempty"`
+	StatsCacheSeconds *int               `json:"stats_cache_seconds,omitempty"`
 }
 
 // LeafSummary is the abbreviated response for list endpoints.
