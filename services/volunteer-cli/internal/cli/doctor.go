@@ -33,9 +33,11 @@ container runtime (actually pinging the socket), and for each attached head
 whether it's reachable and how many of its leafs this volunteer can run.
 
 Safe to run any time — it never changes anything and works without the daemon,
-though the disk-usage figure is most accurate while the daemon runs (doctor
-reads the daemon's own enforced measurement, which includes cached container
-images). Exits non-zero if a check that would block all work fails.`,
+though the disk verdicts are most accurate while the daemon runs: doctor then
+quotes the daemon's own enforced usage measurement (cached container images
+included) and its live per-leaf fetch-gate verdicts, instead of recomputing
+them under a fresh-download assumption. Exits non-zero if a check that would
+block all work fails.`,
 		RunE: runDoctor,
 	}
 }
@@ -146,7 +148,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
-	checkHeads(cmd.Context(), rep, logger, caps)
+	checkHeads(cmd.Context(), rep, logger, caps, fetchDaemonLeafDiskGates())
 
 	fmt.Fprintln(out)
 	switch {
@@ -546,7 +548,35 @@ func checkDaemon(rep *doctorReport, dataDir string) {
 	rep.add(docInfo, "daemon", "not running", "")
 }
 
-func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, caps volunteerCaps) {
+// fetchDaemonLeafDiskGates asks the running daemon for its per-leaf disk-gate
+// verdicts, keyed by gRPC address then by leaf slug (name when the slug is
+// empty) so checkOneHead can match them to the leafs the HEAD reports. nil
+// when the daemon is down or unreachable — the per-leaf notes then fall back
+// to the conservative local reading, labelled as an assumption (TB-42).
+func fetchDaemonLeafDiskGates() map[string]map[string]*leafsAPIDiskGate {
+	resp, err := fetchHeadsFromAPI()
+	if err != nil {
+		return nil
+	}
+	gates := make(map[string]map[string]*leafsAPIDiskGate)
+	for _, h := range resp.Heads {
+		byLeaf := make(map[string]*leafsAPIDiskGate)
+		for _, l := range h.Leafs {
+			if l.DiskGate == nil {
+				continue // a daemon predating the field
+			}
+			key := l.Slug
+			if key == "" {
+				key = l.Name
+			}
+			byLeaf[key] = l.DiskGate
+		}
+		gates[h.GRPCAddress] = byLeaf
+	}
+	return gates
+}
+
+func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, caps volunteerCaps, daemonGates map[string]map[string]*leafsAPIDiskGate) {
 	if len(cfg.Servers) == 0 {
 		rep.add(docFail, "(none)", "no heads configured",
 			"run: lettuce-volunteer attach --server <host>")
@@ -555,7 +585,7 @@ func checkHeads(ctx context.Context, rep *doctorReport, logger *slog.Logger, cap
 
 	reachable := 0
 	for _, srv := range cfg.Servers {
-		if checkOneHead(ctx, rep, logger, srv, caps) {
+		if checkOneHead(ctx, rep, logger, srv, caps, daemonGates[srv.GRPCAddress]) {
 			reachable++
 		}
 	}
@@ -644,8 +674,9 @@ func probeServerStatus(
 
 // checkOneHead connects to a single head using the public discovery RPCs (no
 // identity needed), reports reachability + eligibility, and returns whether it
-// was reachable.
-func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, srv config.ServerConfig, caps volunteerCaps) bool {
+// was reachable. daemonGates is the running daemon's per-leaf disk-gate
+// verdicts for THIS head (nil when the daemon is down).
+func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, srv config.ServerConfig, caps volunteerCaps, daemonGates map[string]*leafsAPIDiskGate) bool {
 	name := srv.DisplayName()
 	gc, err := client.New(client.ClientConfig{
 		ServerURL:     srv.GRPCAddress,
@@ -713,7 +744,7 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 		return true
 	}
 
-	res := evaluateLeafEligibility(resp.GetLeafs(), caps, srv)
+	res := evaluateLeafEligibility(resp.GetLeafs(), caps, srv, daemonGates)
 	detail := fmt.Sprintf("reachable — server %s, db %s; eligible for %d of %d leafs",
 		st.GetVersion(), statusOrUnknown(st.GetDatabaseStatus()), res.eligible, res.total)
 
@@ -844,9 +875,15 @@ type leafEligibility struct {
 // (LeafDiskThresholds for free space, DiskBudgetVerdict for the allowance
 // budget, EffectiveLeafDiskNeedMB for an undeclared need — the live gate
 // applies that fallback, so doctor must too or the two disagree exactly on
-// undeclared leafs, TB-31). Conservative fresh-download reading (doctor does
-// not probe which images are already cached); the wording says so for
-// container leafs.
+// undeclared leafs, TB-31).
+//
+// This is the FALLBACK reading, used only when the running daemon's own
+// verdict could not be fetched (see evaluateLeafEligibility): doctor cannot
+// probe which images are already cached, so it assumes a fresh download —
+// which charges a cached container leaf up to ~10 GB more than the live gate
+// does. Both branches say so for container leafs; omitting the caveat from the
+// budget branch is what let doctor contradict a happily-fetching daemon
+// indefinitely (TB-42).
 func localDiskFetchNote(req leafRequirements, caps volunteerCaps) string {
 	need := daemon.EffectiveLeafDiskNeedMB(req.diskMB)
 	assumed := ""
@@ -872,7 +909,11 @@ func localDiskFetchNote(req leafRequirements, caps volunteerCaps) string {
 	// — a workspace-only reading would pass a budget the daemon fails.
 	if caps.usedMBKnown && caps.maxDiskMB > 0 {
 		if ok, reason := daemon.DiskBudgetVerdict(need, req.needsContainer, false, caps.lettuceUsedMB, caps.maxDiskMB); !ok {
-			return reason + assumed
+			note := reason + assumed
+			if req.needsContainer {
+				note += " (assuming a fresh image download — the running daemon knows whether the image is already cached and may charge less; start it and re-run doctor for the enforced verdict)"
+			}
+			return note
 		}
 	}
 	return ""
@@ -927,6 +968,13 @@ type leafRequirements struct {
 	// pointing the other way.
 	specGPURequired bool
 	rrGPURequired   bool
+	// raiseDiskGBHint is the RUNNING daemon's answer to "what max_disk_gb lets
+	// this machine run this leaf" — computed from live usage and real image
+	// cachedness (daemon.DiskAllowanceGBToCover), inputs no recomputation here
+	// can supply. 0 when no running daemon provided one; the disk remedy then
+	// falls back to covering the leaf requirement alone, which is the number
+	// that sent a tester on the 20 → 27 → 43 → 53 GB chase (TB-41).
+	raiseDiskGBHint int
 }
 
 // leafMachineNeeds carries the machine budgets separately from the execution
@@ -1011,10 +1059,15 @@ func runtimeKindOf(req leafRequirements) string {
 // added to that predicate has to be added here too, or this reports healthy
 // machines the head silently refuses — the defect behind both TB-15 and TB-21.
 //
-// A leaf may be blocked by more than one gate; the first that bites is reported
-// (container, then trust, then the three resource budgets, then the GPU gates).
-// blocked names that dimension, so a caller tallying reasons across a head does
-// not have to parse the message.
+// A leaf may be blocked by more than one gate; the first that bites is reported.
+// The UNFIXABLE-HARDWARE gates (GPU presence, vendor, compute capability, a
+// card too small at any percentage) come before the settings gates (memory,
+// disk, cores, VRAM percentage): a settings remedy costs a config change and a
+// restart to try, and paying that only to reveal a permanent hardware blocker
+// is the trap a real tester walked into — his allowance raise was prompted by
+// the disk rows of three GPU leaves his machine can never run (TB-43).
+// blocked names the reported dimension, so a caller tallying reasons across a
+// head does not have to parse the message.
 func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerConfig) (le leafEligibility, blocked string) {
 	head := srv.DisplayName()
 	switch {
@@ -1026,6 +1079,29 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	case !req.needsContainer && req.nativeCapable && !req.wasmCapable && !srv.TrustsRuntime("NATIVE"):
 		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs the NATIVE runtime, which you have not trusted this head to run (opt in: lettuce-volunteer heads trust %s native)", head)}, "trust"
+	case req.needsGPU && !caps.hasGPU:
+		return leafEligibility{name: req.name, eligible: false, reason: "needs a GPU; none detected/enabled"}, "gpu"
+	// Vendor is gated on execution_config.gpu_required ALONE, and compute capability
+	// on resource_requirements.gpu_required alone — not on the OR — because that is
+	// how the dispatch predicate keys them. A leaf setting only the other flag has
+	// that sub-gate skipped head-side, so applying it here would refuse a machine
+	// the head would happily send work to. Each is also skipped when the leaf did
+	// not state a requirement or the daemon did not report a budget — the
+	// unknown-is-not-zero rule, as for disk and cores below.
+	case req.specGPURequired && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
+		!containsFold(caps.gpuVendors, req.gpuType):
+		return leafEligibility{name: req.name, eligible: false, reason:
+			fmt.Sprintf("needs a %s GPU; yours is %s", strings.ToUpper(req.gpuType), strings.Join(caps.gpuVendors, "/"))}, "gpu"
+	case req.rrGPURequired && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
+		!containsFold(caps.gpuComputeCapabilities, req.gpuComputeCapability):
+		return leafEligibility{name: req.name, eligible: false, reason:
+			fmt.Sprintf("needs GPU compute capability %s; yours is %s",
+				req.gpuComputeCapability, strings.Join(caps.gpuComputeCapabilities, "/"))}, "gpu"
+	// A card too small at 100% is hardware, not a setting, so it is judged here
+	// with the other unfixable gates rather than with the VRAM-percentage gate
+	// below (same wording either way — vramRemedy detects the too-small card).
+	case req.needsGPU && req.gpuVRAMMB > 0 && caps.gpuCardVRAMMB > 0 && req.gpuVRAMMB > caps.gpuCardVRAMMB:
+		return leafEligibility{name: req.name, eligible: false, reason: vramBlockedReason(req, caps)}, "vram"
 	case req.memoryMB > caps.maxMemoryMB:
 		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d MB memory > your limit %d MB", req.memoryMB, caps.maxMemoryMB)}, "memory"
@@ -1037,45 +1113,35 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	// of the comparison. Config validation floors max_disk_gb at 1, so a genuinely
 	// configured volunteer never lands here.
 	case caps.maxDiskMB > 0 && req.diskMB > caps.maxDiskMB:
+		raiseGB, sized := diskGBToCover(req.diskMB), ""
+		if req.raiseDiskGBHint > 0 {
+			// The daemon's number covers today's usage too; the requirement-only
+			// number below leaves the volunteer still gated after pasting it (TB-41).
+			raiseGB, sized = req.raiseDiskGBHint, " — sized to clear this machine's current usage too"
+		}
 		return leafEligibility{name: req.name, eligible: false, reason:
-			fmt.Sprintf("needs %d MB disk > your allowance %d MB (raise it: lettuce-volunteer config set resource_limits.max_disk_gb %d, then restart)",
-				req.diskMB, caps.maxDiskMB, diskGBToCover(req.diskMB))}, "disk"
+			fmt.Sprintf("needs %d MB disk > your allowance %d MB (raise it: lettuce-volunteer config set resource_limits.max_disk_gb %d, then restart%s)",
+				req.diskMB, caps.maxDiskMB, raiseGB, sized)}, "disk"
 	case caps.maxCPUCores > 0 && req.cpuCores > caps.maxCPUCores:
 		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d CPU cores > your limit %d (raise it: lettuce-volunteer config set resource_limits.max_cpu_cores %d, then restart)",
 				req.cpuCores, caps.maxCPUCores, req.cpuCores)}, "cores"
-	case req.needsGPU && !caps.hasGPU:
-		return leafEligibility{name: req.name, eligible: false, reason: "needs a GPU; none detected/enabled"}, "gpu"
-	// The three remaining GPU gates, each skipped when the leaf did not state a
-	// requirement or the daemon did not report a budget — same unknown-is-not-zero
-	// rule as disk and cores above.
-	//
-	// VRAM names FOUR numbers deliberately: the requirement, what this machine
-	// offers, the card's actual size and the percentage setting. The setting is
-	// usually what has to change, and a message naming only the shortfall sends
-	// people shopping for hardware they already own.
 	case req.needsGPU && req.gpuVRAMMB > 0 && caps.maxGPUVRAMMB > 0 && req.gpuVRAMMB > caps.maxGPUVRAMMB:
-		return leafEligibility{name: req.name, eligible: false, reason:
-			fmt.Sprintf("needs %d MB GPU memory > the %d MB you allow (%s)%s",
-				req.gpuVRAMMB, caps.maxGPUVRAMMB, caps.describeVRAMAllowance(),
-				vramRemedy(req.gpuVRAMMB, caps))}, "vram"
-	// Vendor is gated on execution_config.gpu_required ALONE, and compute capability
-	// on resource_requirements.gpu_required alone — not on the OR — because that is
-	// how the dispatch predicate keys them. A leaf setting only the other flag has
-	// that sub-gate skipped head-side, so applying it here would refuse a machine
-	// the head would happily send work to.
-	case req.specGPURequired && requiresSpecificGPUType(req.gpuType) && len(caps.gpuVendors) > 0 &&
-		!containsFold(caps.gpuVendors, req.gpuType):
-		return leafEligibility{name: req.name, eligible: false, reason:
-			fmt.Sprintf("needs a %s GPU; yours is %s", strings.ToUpper(req.gpuType), strings.Join(caps.gpuVendors, "/"))}, "gpu"
-	case req.rrGPURequired && req.gpuComputeCapability != "" && len(caps.gpuComputeCapabilities) > 0 &&
-		!containsFold(caps.gpuComputeCapabilities, req.gpuComputeCapability):
-		return leafEligibility{name: req.name, eligible: false, reason:
-			fmt.Sprintf("needs GPU compute capability %s; yours is %s",
-				req.gpuComputeCapability, strings.Join(caps.gpuComputeCapabilities, "/"))}, "gpu"
+		return leafEligibility{name: req.name, eligible: false, reason: vramBlockedReason(req, caps)}, "vram"
 	default:
 		return leafEligibility{name: req.name, eligible: true}, ""
 	}
+}
+
+// vramBlockedReason renders the VRAM refusal, shared by the too-small-card and
+// percentage cases. It names FOUR numbers deliberately: the requirement, what
+// this machine offers, the card's actual size and the percentage setting. The
+// setting is usually what has to change, and a message naming only the
+// shortfall sends people shopping for hardware they already own.
+func vramBlockedReason(req leafRequirements, caps volunteerCaps) string {
+	return fmt.Sprintf("needs %d MB GPU memory > the %d MB you allow (%s)%s",
+		req.gpuVRAMMB, caps.maxGPUVRAMMB, caps.describeVRAMAllowance(),
+		vramRemedy(req.gpuVRAMMB, caps))
 }
 
 // requiresSpecificGPUType reports whether a leaf's gpu_type constrains the vendor.
@@ -1129,7 +1195,15 @@ func diskGBToCover(mb int64) int {
 // tallying each blocking dimension so the caller can print the right remedy.
 // Ignoring trust counted leafs the volunteer could never receive as "eligible"
 // (PB-5).
-func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, srv config.ServerConfig) eligibilityResult {
+//
+// daemonGates carries the RUNNING daemon's per-leaf disk-gate verdicts for
+// this head, keyed like the leaf names here (slug, falling back to name). When
+// a leaf has one, its fetch note QUOTES that verdict and its disk remedy uses
+// the daemon's covering allowance — the daemon knows the measured usage and
+// image cachedness this code cannot, and recomputing with a guessed input is
+// how doctor contradicted a happily-fetching daemon for good (TB-42). nil (or
+// a miss) falls back to the conservative local reading, labelled as such.
+func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, srv config.ServerConfig, daemonGates map[string]*leafsAPIDiskGate) eligibilityResult {
 	var res eligibilityResult
 	for _, lf := range leafs {
 		res.total++
@@ -1154,8 +1228,19 @@ func evaluateLeafEligibility(leafs []*lettucev1.LeafInfo, caps volunteerCaps, sr
 				gpuComputeCapability: rr.GetGpuComputeCapability(),
 				gpuRequired:          rr.GetGpuRequired(),
 			})
+		gate := daemonGates[name]
+		if gate != nil {
+			req.raiseDiskGBHint = gate.RaiseToGB
+		}
 		le, blocked := classifyLeaf(req, caps, srv)
-		le.fetchNote = localDiskFetchNote(req, caps)
+		if gate != nil {
+			le.fetchNote = ""
+			if gate.Blocked {
+				le.fetchNote = "the running daemon is disk-gating this leaf right now: " + gate.Reason
+			}
+		} else {
+			le.fetchNote = localDiskFetchNote(req, caps)
+		}
 		switch blocked {
 		case "container":
 			res.containerBlocked++

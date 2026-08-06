@@ -901,6 +901,19 @@ type LeafResourceRequirements struct {
 	GPURequired bool `json:"gpu_required,omitempty"`
 }
 
+// LeafDiskGate is the RUNNING daemon's live disk-gate verdict for one leaf
+// (TB-41): whether its fetcher is skipping this leaf right now and why, plus
+// the max_disk_gb that would clear both the head's dispatch gate and this
+// machine's current budget. Computed daemon-side because the inputs — measured
+// usage and image cachedness — exist only there; a client recomputing the
+// verdict from the leaf requirement alone is how three surfaces came to give
+// three different answers (TB-41/TB-42).
+type LeafDiskGate struct {
+	Blocked   bool   `json:"blocked"`
+	Reason    string `json:"reason,omitempty"`
+	RaiseToGB int    `json:"raise_to_gb,omitempty"`
+}
+
 // LeafDetail describes a single leaf on a head, including effective config.
 type LeafDetail struct {
 	ID               string             `json:"id"`
@@ -925,6 +938,9 @@ type LeafDetail struct {
 	// failed on this machine. Carried alongside the leaf so `leafs list` can say
 	// "arriving and failing" in the same row that says "active" (TB-10).
 	Failures *FailingLeafInfo `json:"failures,omitempty"`
+	// DiskGate is the daemon's own live fetch-gate verdict for this leaf, so
+	// WILL FETCH answers with the arithmetic that actually decides (TB-41).
+	DiskGate *LeafDiskGate `json:"disk_gate,omitempty"`
 }
 
 // MachineCapabilities is what this machine can actually do, as the RUNNING
@@ -1111,6 +1127,8 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 				if f, ok := failures[leaf.ID]; ok {
 					ld.Failures = &f
 				}
+				gs := b.daemon.LeafDiskGateStatus(leaf)
+				ld.DiskGate = &LeafDiskGate{Blocked: gs.Blocked, Reason: gs.Reason, RaiseToGB: gs.RaiseToGB}
 				hi.Leafs = append(hi.Leafs, ld)
 			}
 		} else {

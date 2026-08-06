@@ -47,7 +47,7 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 |---|---|---|
 | `not fetching work: disk-gated …` (`reason=…data dir…`) | Free space on the data-dir volume doesn't cover what an enabled leaf declares it needs (its disk requirement + a 2 GB floor), or is below the floor entirely. The reason names the numbers. | Free space, or `--data-dir` on a roomier volume. With several leafs enabled, only the ones that fit are fetched; this WARN fires when none fit. |
 | `not fetching work: disk-gated …` (`reason=…image store…`) | The container image-store volume (named in the reason) can't hold the fresh image pull an enabled leaf needs, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
-| `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb`. |
+| `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
 | `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
@@ -125,12 +125,16 @@ work files.
   affordable leafs keep working while the too-big one is skipped.
   `lettuce-volunteer doctor` reports free space, Lettuce's own measured usage,
   and — per leaf — whether fetching is currently gated, including the
-  usage-plus-need arithmetic against your allowance. The usage figure is read
-  from the **running daemon** (whose measurement — work folders plus downloaded
-  container images — is the one the gate enforces); with the daemon stopped on
-  a container host, doctor says the figure is partial rather than calling the
-  budget healthy. If your home volume is small, point `--data-dir` at a
-  roomier disk; if the image store is small, see the remedies below.
+  usage-plus-need arithmetic against your allowance. While the daemon runs,
+  those per-leaf verdicts (and the usage figure feeding them) are quoted from
+  the **running daemon itself** — the exact gate the fetcher enforces,
+  including whether a leaf's container image is already downloaded, which
+  lowers what the fetch still needs. With the daemon stopped, doctor computes
+  a conservative reading instead and says so: on a container host the usage
+  figure is reported as partial rather than the budget called healthy, and
+  each per-leaf disk verdict is labelled as assuming a fresh image download.
+  If your home volume is small, point `--data-dir` at a roomier disk; if the
+  image store is small, see the remedies below.
 - **`max_disk_gb` is the capacity you offer, in both directions.** It is the
   disk budget your client advertises to each head — a head only sends you a
   leaf whose declared disk requirement fits inside it, so a leaf needing 15 GB
@@ -141,7 +145,12 @@ work files.
   (that is always the leaf's own requirement, above). `lettuce-volunteer
   doctor` prints the allowance next to your memory and CPU limits and names any
   leaf blocked by it, and `leafs list` marks it `WILL FETCH: no` with the
-  remedy underneath. Raise it with
+  remedy underneath — including when the leaf's requirement fits your allowance
+  but the daemon's own fetch gate is skipping it right now because current
+  usage plus the leaf's need would exceed it. The suggested `max_disk_gb`
+  value is computed from **today's usage as well as the leaf's requirement**
+  (when the daemon is running), so one paste clears the gate — no
+  raise-and-check-again loop. Raise it with
   `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
   daemon, which is when the new figure is re-advertised.
 - **`max_gpu_vram_pct` is the same kind of trap, and sharper, because it is a
