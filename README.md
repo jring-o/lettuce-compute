@@ -65,6 +65,7 @@ anything long-running.
    [Releases](https://github.com/jring-o/lettuce-compute/releases)
 2. Set up your identity and resource limits:
    ```bash
+   chmod u+x lettuce-volunteer
    ./lettuce-volunteer init
    ```
 3. Attach to a head. The command asks what that head may run on your machine;
