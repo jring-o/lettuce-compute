@@ -1,13 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { OverviewPage } from "./overview";
 import { makeTask } from "@/components/tasks/test-helpers";
+import type { HeadsResponse, Notice } from "@/api/client";
 
 // Mock all hooks used by the page
 const mockUseDaemonStatus = vi.fn();
 const mockUseMetrics = vi.fn();
+const mockUseSystemMetrics = vi.fn();
 const mockUseCredit = vi.fn();
+const mockUseApiQuery = vi.fn();
+const mockUseNotices = vi.fn();
 const mockClient = {
   pause: vi.fn(),
   resume: vi.fn(),
@@ -25,6 +29,7 @@ vi.mock("@/hooks/use-daemon-status", () => ({
 
 vi.mock("@/hooks/use-metrics", () => ({
   useMetrics: () => mockUseMetrics(),
+  useSystemMetrics: () => mockUseSystemMetrics(),
 }));
 
 vi.mock("@/hooks/use-credit", () => ({
@@ -33,11 +38,50 @@ vi.mock("@/hooks/use-credit", () => ({
 
 vi.mock("@/hooks/use-api", () => ({
   useClient: () => mockUseClient(),
+  useApiQuery: (...args: unknown[]) => mockUseApiQuery(...args),
+}));
+
+vi.mock("@/hooks/use-notices", () => ({
+  useNotices: () => mockUseNotices(),
 }));
 
 vi.mock("@/hooks/use-container-runtime", () => ({
   useContainerRuntime: () => mockUseContainerRuntime(),
 }));
+
+const noGpuMachine: HeadsResponse["machine"] = {
+  runtimes: ["wasm"],
+  has_gpu: false,
+  max_memory_mb: 4096,
+  max_disk_mb: 10240,
+  max_cpu_cores: 4,
+  max_gpu_vram_mb: 0,
+  gpu_card_vram_mb: 0,
+  gpu_vram_pct: 0,
+  gpu_vendors: [],
+  gpu_compute_capabilities: [],
+};
+
+function setHeads(resp: HeadsResponse | null) {
+  mockUseApiQuery.mockReturnValue({
+    data: resp,
+    isLoading: false,
+    error: null,
+    refetch: vi.fn(),
+  });
+}
+
+function makeNotice(overrides: Partial<Notice> & { id: number }): Notice {
+  return {
+    level: "warn",
+    code: "TEST",
+    message: "Something needs attention",
+    count: 1,
+    first_at: new Date(Date.now() - 60_000).toISOString(),
+    at: new Date(Date.now() - 60_000).toISOString(),
+    ...overrides,
+  };
+}
 
 describe("OverviewPage", () => {
   beforeEach(() => {
@@ -55,6 +99,12 @@ describe("OverviewPage", () => {
       error: null,
       refresh: vi.fn(),
     });
+    mockUseSystemMetrics.mockReturnValue({
+      system: { cpu_usage_pct: 45, memory_used_mb: 8192, memory_total_mb: 16384 },
+      error: null,
+    });
+    mockUseNotices.mockReturnValue({ notices: [], supported: true, dismiss: vi.fn() });
+    setHeads({ heads: [], machine: noGpuMachine });
   });
 
   function setupDefaultMocks(overrides?: {
@@ -68,7 +118,10 @@ describe("OverviewPage", () => {
         uptime_seconds: 3600,
         connected_servers: 2,
         active_tasks: [],
+        queued_tasks: [],
+        failing_leafs: [],
         paused_reason: null,
+        client_version: "1.4.0",
       },
       isLoading: false,
       error: null,
@@ -78,14 +131,15 @@ describe("OverviewPage", () => {
 
     mockUseMetrics.mockReturnValue({
       metrics: {
-        cpu_usage_pct: 45,
+        cpu_usage_pct: 0,
         gpu_usage_pct: 0,
-        memory_used_mb: 8192,
-        memory_total_mb: 16384,
-        disk_used_gb: 100,
-        disk_total_gb: 500,
-        cpu_temp_c: 65,
+        memory_used_mb: 0,
+        memory_total_mb: 0,
+        cpu_temp_c: 0,
         gpu_temp_c: 0,
+        disk_used_mb: 2048,
+        disk_allowance_mb: 10240,
+        disk_usage_known: true,
       },
       isLoading: false,
       error: null,
@@ -102,6 +156,8 @@ describe("OverviewPage", () => {
           { leaf_id: "p1", leaf_name: "Climate", credit: 3000 },
           { leaf_id: "p2", leaf_name: "Biology", credit: 2000 },
         ],
+        by_head: [],
+        source: "head",
       },
       isLoading: false,
       error: null,
@@ -256,20 +312,74 @@ describe("OverviewPage", () => {
     expect(screen.getByText("63%")).toBeInTheDocument();
   });
 
-  it("renders resource gauges section", () => {
+  it("renders CPU and memory gauges from the app's own measurement and disk from the daemon", () => {
     setupDefaultMocks();
     render(<OverviewPage />);
     expect(screen.getByText("Resources")).toBeInTheDocument();
     expect(screen.getByText("CPU")).toBeInTheDocument();
-    expect(screen.getByText("GPU")).toBeInTheDocument();
     expect(screen.getByText("Memory")).toBeInTheDocument();
     expect(screen.getByText("Disk")).toBeInTheDocument();
+    // The GPU-usage gauge was never measured and is gone.
+    expect(screen.queryByText("GPU")).not.toBeInTheDocument();
+    // CPU comes from useSystemMetrics (45%), not the daemon's zeros.
+    expect(screen.getByText("45%")).toBeInTheDocument();
+    expect(
+      screen.getByText("Lettuce is using 2.0 GB of your 10.0 GB allowance")
+    ).toBeInTheDocument();
   });
 
-  it("does not render resources section when metrics is null", () => {
+  it("hides the disk gauge when the daemon does not know its disk usage", () => {
+    setupDefaultMocks({
+      metrics: {
+        metrics: {
+          cpu_usage_pct: 0,
+          gpu_usage_pct: 0,
+          memory_used_mb: 0,
+          memory_total_mb: 0,
+          cpu_temp_c: 0,
+          gpu_temp_c: 0,
+          disk_used_mb: 0,
+          disk_allowance_mb: 10240,
+          disk_usage_known: false,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(screen.getByText("CPU")).toBeInTheDocument();
+    expect(screen.queryByText("Disk")).not.toBeInTheDocument();
+    expect(screen.queryByText(/allowance/)).not.toBeInTheDocument();
+  });
+
+  it("does not render resources section when neither measurement is available", () => {
     setupDefaultMocks({ metrics: { metrics: null } });
+    mockUseSystemMetrics.mockReturnValue({ system: null, error: null });
     render(<OverviewPage />);
     expect(screen.queryByText("Resources")).not.toBeInTheDocument();
+  });
+
+  it("describes the GPU and its allowance from the machine capabilities", () => {
+    setupDefaultMocks();
+    setHeads({
+      heads: [],
+      machine: {
+        ...noGpuMachine,
+        has_gpu: true,
+        gpu_vendors: ["NVIDIA"],
+        gpu_card_vram_mb: 8192,
+        gpu_vram_pct: 70,
+        max_gpu_vram_mb: 5734,
+      },
+    });
+    render(<OverviewPage />);
+    expect(
+      screen.getByText("GPU: NVIDIA, 8.0 GB card, 5.6 GB allowed for Lettuce")
+    ).toBeInTheDocument();
+  });
+
+  it("does not describe a GPU when the machine has none", () => {
+    setupDefaultMocks();
+    render(<OverviewPage />);
+    expect(screen.queryByText(/^GPU:/)).not.toBeInTheDocument();
   });
 
   it("renders credit section", () => {
@@ -354,13 +464,12 @@ describe("OverviewPage", () => {
           by_head: [
             {
               head_name: "lettuce.science",
-              credit: 3000,
-              leafs: [
-                { leaf_slug: "prime", leaf_name: "Prime Study", credit: 2000 },
-                { leaf_slug: "mandel", leaf_name: "Mandelbrot", credit: 1000 },
-              ],
+              volunteer_id: "vol-1234567890",
+              total_credit: 3000,
+              available: true,
             },
           ],
+          source: "head",
         },
       },
     });
@@ -369,7 +478,7 @@ describe("OverviewPage", () => {
     expect(screen.getByText("Credit Breakdown")).toBeInTheDocument();
   });
 
-  it("quick stats footer shows leaf count from by_head when available", () => {
+  it("quick stats footer counts leaves from by_leaf", () => {
     setupDefaultMocks({
       credit: {
         credit: {
@@ -377,24 +486,264 @@ describe("OverviewPage", () => {
           today: 50,
           this_week: 200,
           this_month: 800,
-          by_leaf: [],
+          by_leaf: [
+            { leaf_id: "a", leaf_name: "A", credit: 1000 },
+            { leaf_id: "b", leaf_name: "B", credit: 1000 },
+            { leaf_id: "c", leaf_name: "C", credit: 1000 },
+          ],
           by_head: [
             {
               head_name: "lettuce.science",
-              credit: 3000,
-              leafs: [
-                { leaf_slug: "a", leaf_name: "A", credit: 1000 },
-                { leaf_slug: "b", leaf_name: "B", credit: 1000 },
-                { leaf_slug: "c", leaf_name: "C", credit: 1000 },
-              ],
+              volunteer_id: "vol-1",
+              total_credit: 3000,
+              available: true,
             },
           ],
+          source: "head",
         },
       },
     });
 
     render(<OverviewPage />);
     expect(screen.getByText(/Leafs: 3/)).toBeInTheDocument();
+  });
+
+  it("marks an unreachable head in the credit breakdown and formats decimals", async () => {
+    const user = userEvent.setup();
+    setupDefaultMocks({
+      credit: {
+        credit: {
+          total_credit: 1234.5678,
+          today: 0.5,
+          this_week: 12.25,
+          this_month: 100,
+          by_leaf: [{ leaf_id: "p1", leaf_name: "Climate", credit: 1234.5678 }],
+          by_head: [
+            { head_name: "alpha.example", volunteer_id: "v-a", total_credit: 1234.5678, available: true },
+            { head_name: "beta.example", volunteer_id: "v-b", total_credit: 0, available: false },
+          ],
+          source: "head",
+        },
+      },
+    });
+
+    render(<OverviewPage />);
+    // Stat cards: fractions are cut to two decimals, whole numbers stay grouped.
+    expect(screen.getAllByText("1,234.57").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("0.5")).toBeInTheDocument();
+    expect(screen.getByText("12.25")).toBeInTheDocument();
+
+    await user.click(screen.getByText("Credit Breakdown"));
+    expect(screen.getByText("beta.example")).toBeInTheDocument();
+    expect(screen.getByText("unreachable")).toBeInTheDocument();
+  });
+
+  it("explains local-only credit figures when no head could be reached", () => {
+    setupDefaultMocks({
+      credit: {
+        credit: {
+          total_credit: 12,
+          today: 1,
+          this_week: 2,
+          this_month: 3,
+          by_leaf: [],
+          by_head: [],
+          source: "local",
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(
+      screen.getByText(/Figures from this machine's local history — no head could be reached/)
+    ).toBeInTheDocument();
+  });
+
+  it("explains that credit moves only when a head validates results", () => {
+    setupDefaultMocks();
+    render(<OverviewPage />);
+    expect(screen.getByText(/Credit moves only when a head validates your results/)).toBeInTheDocument();
+  });
+
+  it("shows the client version in the footer", () => {
+    setupDefaultMocks();
+    render(<OverviewPage />);
+    expect(screen.getByText(/Client v1\.4\.0/)).toBeInTheDocument();
+  });
+
+  it("falls back to the bundled CLI version when the daemon does not report one", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    mockInvoke.mockImplementation((cmd: string) =>
+      Promise.resolve(cmd === "get_client_version" ? "1.3.9" : undefined)
+    );
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "active",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [],
+          queued_tasks: [],
+          failing_leafs: [],
+          paused_reason: null,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    await waitFor(() => {
+      expect(screen.getByText(/Client v1\.3\.9/)).toBeInTheDocument();
+    });
+    mockInvoke.mockImplementation(() => Promise.resolve(undefined));
+  });
+
+  it("shows 'Paused — outside your schedule' for the scheduled pause reason", () => {
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "paused",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [],
+          queued_tasks: [],
+          failing_leafs: [],
+          paused_reason: "scheduled",
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(screen.getByText("Paused — outside your schedule")).toBeInTheDocument();
+  });
+
+  it("renders a task suspended without a reported reason", () => {
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "active",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [
+            makeTask({
+              work_unit_id: "wu-suspended-plain",
+              leaf_name: "Frozen Task",
+              task_status: "suspended",
+            }),
+          ],
+          queued_tasks: [],
+          failing_leafs: [],
+          paused_reason: null,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(screen.getByText("Paused (reason not reported)")).toBeInTheDocument();
+    expect(document.querySelector(".bg-yellow-500.rounded-full")).toBeInTheDocument();
+  });
+
+  it("lists leaves failing on this machine with their reason and pause", () => {
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "active",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [],
+          queued_tasks: [],
+          failing_leafs: [
+            {
+              leaf_id: "leaf-1",
+              leaf_name: "Protein Fold",
+              consecutive_failures: 3,
+              total_failures: 7,
+              last_reason: "exit status 137 (out of memory)",
+              last_failed_at: new Date().toISOString(),
+              paused: true,
+              paused_until: "2030-01-02T03:04:00Z",
+            },
+            {
+              leaf_id: "leaf-2",
+              leaf_name: "Prime Gap",
+              consecutive_failures: 1,
+              total_failures: 1,
+              paused: false,
+            },
+          ],
+          paused_reason: null,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(screen.getByText("Failing on this machine")).toBeInTheDocument();
+    expect(screen.getByText("Protein Fold")).toBeInTheDocument();
+    expect(screen.getByText(/3 in a row/)).toBeInTheDocument();
+    expect(screen.getByText(/7 total/)).toBeInTheDocument();
+    expect(screen.getByText("exit status 137 (out of memory)")).toBeInTheDocument();
+    expect(screen.getByText(/Not requesting more of this leaf until/)).toBeInTheDocument();
+    expect(screen.getByText("Prime Gap")).toBeInTheDocument();
+    expect(screen.getByText(/1 in a row/)).toBeInTheDocument();
+  });
+
+  it("does not render the failing block when nothing is failing", () => {
+    setupDefaultMocks();
+    render(<OverviewPage />);
+    expect(screen.queryByText("Failing on this machine")).not.toBeInTheDocument();
+  });
+
+  it("shows an update-required banner for heads that refuse this client", () => {
+    setupDefaultMocks();
+    setHeads({
+      heads: [
+        { name: "lettuce.science", grpc_address: "a:1", status: "connected", weight: 100, leafs: [], update_required: true },
+        { name: "other.example", grpc_address: "b:1", status: "connected", weight: 100, leafs: [] },
+      ],
+      machine: noGpuMachine,
+    });
+    render(<OverviewPage />);
+    expect(
+      screen.getByText("This app is too old for lettuce.science — update Lettuce Compute")
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/too old for other.example/)).not.toBeInTheDocument();
+  });
+
+  it("renders the notices panel above the task list with newest first and a dismiss", async () => {
+    const user = userEvent.setup();
+    const dismiss = vi.fn();
+    mockUseNotices.mockReturnValue({
+      supported: true,
+      dismiss,
+      notices: [
+        makeNotice({ id: 5, level: "error", message: "Head rejected result", head: "lettuce.science", leaf: "prime", count: 3 }),
+        makeNotice({ id: 2, level: "warn", message: "Disk allowance nearly full" }),
+      ],
+    });
+    setupDefaultMocks();
+    render(<OverviewPage />);
+
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
+    expect(screen.getByText("Head rejected result")).toBeInTheDocument();
+    expect(screen.getByText("Disk allowance nearly full")).toBeInTheDocument();
+    expect(screen.getByText(/lettuce\.science \/ prime/)).toBeInTheDocument();
+    expect(screen.getByText(/3 times/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Error")).toBeInTheDocument();
+    expect(screen.getByLabelText("Warning")).toBeInTheDocument();
+
+    // Panel sits above the task list.
+    const panel = screen.getByLabelText("Notices");
+    const tasksHeader = screen.getByText("Active Tasks");
+    expect(panel.compareDocumentPosition(tasksHeader) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await user.click(screen.getAllByLabelText("Dismiss notice")[0]);
+    expect(dismiss).toHaveBeenCalledWith(expect.objectContaining({ id: 5 }));
+  });
+
+  it("hides the notices panel when the CLI build has no notices route", () => {
+    mockUseNotices.mockReturnValue({
+      supported: false,
+      dismiss: vi.fn(),
+      notices: [makeNotice({ id: 1, message: "ignored" })],
+    });
+    setupDefaultMocks();
+    render(<OverviewPage />);
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
   });
 
   it("renders task with zero progress as indeterminate", () => {
@@ -487,17 +836,19 @@ describe("OverviewPage", () => {
           today: 50,
           this_week: 200,
           this_month: 800,
-          by_leaf: [],
+          by_leaf: [
+            { leaf_id: "prime", leaf_name: "Prime Study", credit: 2000 },
+            { leaf_id: "mandel", leaf_name: "Mandelbrot", credit: 1000 },
+          ],
           by_head: [
             {
               head_name: "lettuce.science",
-              credit: 3000,
-              leafs: [
-                { leaf_slug: "prime", leaf_name: "Prime Study", credit: 2000 },
-                { leaf_slug: "mandel", leaf_name: "Mandelbrot", credit: 1000 },
-              ],
+              volunteer_id: "vol-abcdef12",
+              total_credit: 3000,
+              available: true,
             },
           ],
+          source: "head",
         },
       },
     });
@@ -508,21 +859,22 @@ describe("OverviewPage", () => {
     await user.click(screen.getByText("Credit Breakdown"));
 
     expect(screen.getByText("lettuce.science")).toBeInTheDocument();
+    expect(screen.getByText("3,000")).toBeInTheDocument();
     expect(screen.getByText("Prime Study")).toBeInTheDocument();
     expect(screen.getByText("Mandelbrot")).toBeInTheDocument();
   });
 
-  it("credit breakdown section not rendered when by_head is empty", () => {
+  it("credit breakdown section not rendered when there is nothing to break down", () => {
     setupDefaultMocks({
       credit: {
         credit: {
-          total_credit: 5000,
-          today: 50,
-          this_week: 200,
-          this_month: 800,
-          by_leaf: [
-            { leaf_id: "p1", leaf_name: "Climate", credit: 3000 },
-          ],
+          total_credit: 0,
+          today: 0,
+          this_week: 0,
+          this_month: 0,
+          by_leaf: [],
+          by_head: [],
+          source: "local",
         },
       },
     });

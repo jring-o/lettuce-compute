@@ -84,6 +84,43 @@ struct StatusResponse {
     active_tasks: Vec<serde_json::Value>,
 }
 
+/// One entry of `GET /api/v1/notices`: something the daemon wants the
+/// volunteer to know about (a head rejecting results, a leaf failing here,
+/// disk running out). `count` is how many times it has repeated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notice {
+    pub id: i64,
+    pub level: String,
+    pub code: String,
+    pub message: String,
+    pub head: Option<String>,
+    pub leaf: Option<String>,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct NoticesResponse {
+    notices: Vec<Notice>,
+    latest_id: i64,
+}
+
+/// The slice of `GET /api/v1/heads` the notifier reads: which heads refuse this
+/// client version until the app is updated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct HeadsResponse {
+    heads: Vec<HeadEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct HeadEntry {
+    name: String,
+    update_required: bool,
+}
+
 struct NotificationState {
     prev_credit: i64,
     prev_task_count: usize,
@@ -91,6 +128,16 @@ struct NotificationState {
     prev_connected: i64,
     milestones: MilestoneState,
     prefs: NotificationPreferences,
+    /// Notices: `None` until the first successful poll establishes where "new"
+    /// begins, then the highest id seen. Notices already retained by the
+    /// daemon when the app starts are shown in the window, not notified.
+    notices_since: Option<i64>,
+    /// False once the daemon answered 404: this CLI build has no notices route.
+    notices_supported: bool,
+    /// Notice ids already notified, so a repeat (same id, higher count) is quiet.
+    notified_notice_ids: HashSet<i64>,
+    /// Heads whose update-required state was notified this session.
+    update_required_notified: HashSet<String>,
 }
 
 pub fn start_notification_poll(app: AppHandle) {
@@ -101,6 +148,10 @@ pub fn start_notification_poll(app: AppHandle) {
         prev_connected: 0,
         milestones: load_milestone_state(),
         prefs: NotificationPreferences::default(),
+        notices_since: None,
+        notices_supported: true,
+        notified_notice_ids: HashSet::new(),
+        update_required_notified: HashSet::new(),
     }));
 
     tauri::async_runtime::spawn(async move {
@@ -137,6 +188,12 @@ async fn poll_and_notify(app: &AppHandle, state: &Arc<Mutex<NotificationState>>)
     // Fetch credit
     let credit: Option<CreditResponse> = client.get_json("/api/v1/credit").await.ok();
 
+    // Fetch new notices (only once the baseline is known and the route exists).
+    let notices = fetch_notices(&client, state).await;
+
+    // Heads refusing this client version.
+    let heads: Option<HeadsResponse> = client.get_json("/api/v1/heads").await.ok();
+
     let mut s = state.lock().await;
 
     // Check credit milestones
@@ -163,8 +220,129 @@ async fn poll_and_notify(app: &AppHandle, state: &Arc<Mutex<NotificationState>>)
         check_error_conditions(app, &s, &status);
     }
 
+    // Daemon notices: warnings and errors, each id once.
+    if let Some(list) = notices {
+        for n in notice_titles(&list, &s.prefs) {
+            if s.notified_notice_ids.insert(n.0) {
+                send_notification(app, &n.1, &n.2);
+            }
+        }
+    }
+
+    // Update required by a head: once per head per app session. This is both
+    // an update matter and an error (no work flows until the app is updated),
+    // so either preference enables it.
+    if let Some(heads) = heads {
+        if s.prefs.updates || s.prefs.errors {
+            for head in heads.heads.iter().filter(|h| h.update_required) {
+                if s.update_required_notified.insert(head.name.clone()) {
+                    send_notification(
+                        app,
+                        "Update required",
+                        &format!(
+                            "This app is too old for {} — update Lettuce Compute to keep receiving work from it.",
+                            head.name
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     s.prev_state = status.state;
     s.prev_connected = status.connected_servers;
+}
+
+/// Poll `GET /api/v1/notices`. The first successful call only records the
+/// daemon's `latest_id` (nothing is notified for notices that predate the
+/// app), later calls ask for everything newer. A 404 marks the route as
+/// unsupported by this CLI build and no further requests are made.
+async fn fetch_notices(
+    client: &ManagementClient,
+    state: &Arc<Mutex<NotificationState>>,
+) -> Option<Vec<Notice>> {
+    let (supported, since) = {
+        let s = state.lock().await;
+        (s.notices_supported, s.notices_since)
+    };
+    if !supported {
+        return None;
+    }
+
+    let path = match since {
+        Some(id) => format!("/api/v1/notices?since={id}"),
+        None => "/api/v1/notices".to_string(),
+    };
+    let value = match client
+        .request_value(reqwest::Method::GET, &path, None, crate::api::DEFAULT_TIMEOUT)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if e.status == 404 {
+                state.lock().await.notices_supported = false;
+            }
+            return None;
+        }
+    };
+    let resp: NoticesResponse = serde_json::from_value(value).ok()?;
+
+    let mut s = state.lock().await;
+    let newest = resp
+        .notices
+        .iter()
+        .map(|n| n.id)
+        .fold(resp.latest_id, i64::max);
+    match s.notices_since {
+        None => {
+            // Baseline: remember where "new" starts; do not notify the backlog.
+            s.notices_since = Some(newest);
+            None
+        }
+        Some(prev) => {
+            if resp.latest_id < prev {
+                // The daemon restarted and its ids began again; re-baseline so
+                // the retained backlog of the new daemon is not replayed.
+                s.notices_since = Some(newest);
+                s.notified_notice_ids.clear();
+                return None;
+            }
+            s.notices_since = Some(newest.max(prev));
+            Some(resp.notices)
+        }
+    }
+}
+
+/// Which of `notices` deserve an OS notification under `prefs`, as
+/// (id, title, body). Only warnings and errors qualify, and only when the
+/// "errors requiring attention" preference is on.
+fn notice_titles(notices: &[Notice], prefs: &NotificationPreferences) -> Vec<(i64, String, String)> {
+    if !prefs.errors {
+        return Vec::new();
+    }
+    notices
+        .iter()
+        .filter(|n| n.level == "warn" || n.level == "error")
+        .map(|n| {
+            let title = match n.level.as_str() {
+                "error" => "Lettuce needs attention",
+                _ => "Lettuce warning",
+            };
+            let scope: Vec<&str> = [n.head.as_deref(), n.leaf.as_deref()]
+                .into_iter()
+                .flatten()
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut body = n.message.clone();
+            if !scope.is_empty() {
+                body = format!("{} — {}", scope.join(" / "), body);
+            }
+            if n.count > 1 {
+                body = format!("{body} ({}×)", n.count);
+            }
+            (n.id, title.to_string(), body)
+        })
+        .collect()
 }
 
 fn check_credit_milestones(app: &AppHandle, state: &mut NotificationState, total_credit: i64) {
@@ -232,3 +410,50 @@ fn send_notification(app: &AppHandle, title: &str, body: &str) {
         .show();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice(id: i64, level: &str) -> Notice {
+        Notice {
+            id,
+            level: level.into(),
+            code: "X".into(),
+            message: format!("message {id}"),
+            head: None,
+            leaf: None,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn only_warn_and_error_notices_are_notified() {
+        let prefs = NotificationPreferences::default();
+        let out = notice_titles(
+            &[notice(1, "info"), notice(2, "warn"), notice(3, "error")],
+            &prefs,
+        );
+        assert_eq!(out.iter().map(|n| n.0).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(out[0].1, "Lettuce warning");
+        assert_eq!(out[1].1, "Lettuce needs attention");
+    }
+
+    #[test]
+    fn errors_preference_silences_notices() {
+        let prefs = NotificationPreferences {
+            errors: false,
+            ..Default::default()
+        };
+        assert!(notice_titles(&[notice(1, "error")], &prefs).is_empty());
+    }
+
+    #[test]
+    fn body_carries_scope_and_repeat_count() {
+        let mut n = notice(4, "error");
+        n.head = Some("lettuce.science".into());
+        n.leaf = Some("prime".into());
+        n.count = 3;
+        let out = notice_titles(&[n], &NotificationPreferences::default());
+        assert_eq!(out[0].2, "lettuce.science / prime — message 4 (3×)");
+    }
+}

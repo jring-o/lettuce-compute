@@ -1,7 +1,6 @@
 import { useDaemonStatus } from "@/hooks/use-daemon-status";
-import { useApiQuery } from "@/hooks/use-api";
-import { cn, formatBytes } from "@/lib/utils";
-import type { ManagementClient } from "@/api/client";
+import { useSystemMetrics } from "@/hooks/use-metrics";
+import { cn, formatBytes, pausedLabel } from "@/lib/utils";
 
 function StatusDot({ state }: { state: string }) {
   const color =
@@ -21,17 +20,16 @@ function statusLabel(state: string, taskCount: number, pausedReason: string | nu
       : "Active — waiting for tasks";
   }
   if (state === "paused") {
-    return pausedReason ? `Paused — ${pausedReason}` : "Paused";
+    return pausedLabel(pausedReason);
   }
   return "Stopped";
 }
 
 export function StatusBar() {
   const { status } = useDaemonStatus(3000);
-  const { data: metrics } = useApiQuery(
-    (client: ManagementClient) => client.metrics(),
-    5000
-  );
+  // Host CPU and memory come from the app itself; the daemon's /metrics
+  // reports zeros for both.
+  const { system } = useSystemMetrics(5000);
 
   const state = status?.state ?? "stopped";
   const taskCount = status?.active_tasks?.length ?? 0;
@@ -43,11 +41,11 @@ export function StatusBar() {
         <StatusDot state={state} />
         <span>{statusLabel(state, taskCount, pausedReason)}</span>
       </div>
-      {metrics && (
+      {system && (
         <div className="flex items-center gap-3">
-          <span>CPU {Math.round(metrics.cpu_usage_pct)}%</span>
+          <span>CPU {Math.round(system.cpu_usage_pct)}%</span>
           <span>·</span>
-          <span>MEM {formatBytes(metrics.memory_used_mb)}</span>
+          <span>MEM {formatBytes(system.memory_used_mb)}</span>
         </div>
       )}
     </div>
