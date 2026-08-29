@@ -43,9 +43,6 @@
     "externalBin": [
       "binaries/lettuce-volunteer"
     ],
-    "resources": [
-      "resources/podman-installer-windows-amd64.msi"
-    ],
     "windows": {
       "wix": {
         "language": "en-US"
