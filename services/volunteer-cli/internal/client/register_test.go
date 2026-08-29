@@ -101,7 +101,7 @@ func TestRegisterNewVolunteer(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestRegisterUpdateExisting(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestRegisterSendsPublicKey(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestRegisterDetectsHardware(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestRegisterRPCError(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error from Register when RPC fails")
 	}
@@ -286,7 +286,7 @@ func TestRegisterConfigSaveError(t *testing.T) {
 	// Try to save config inside a file (not a directory) — should fail.
 	configPath := filepath.Join(tmpFile, "subdir", "config.yaml")
 
-	volID, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath)
+	volID, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error when config save fails")
 	}
@@ -335,7 +335,7 @@ func TestRegisterCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	_, _, _, err = Register(ctx, client, pub, nil, "", cfg, configPath)
+	_, _, _, err = Register(ctx, client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error with cancelled context")
 	}

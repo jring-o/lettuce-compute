@@ -40,6 +40,9 @@ func TestMain(m *testing.M) {
 	runtime.CommandExecutorCtx = func(_ context.Context, name string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("BLOCKED: client test tried to execute real command %q (use withMockHardware to mock)", name)
 	}
+	runtime.DisplayAdapterSource = func() (runtime.DisplayAdapterReader, error) {
+		return nil, fmt.Errorf("BLOCKED: client test tried to read the display-adapter registry (use withMockHardware to mock)")
+	}
 
 	os.Exit(m.Run())
 }

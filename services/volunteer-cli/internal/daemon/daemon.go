@@ -276,6 +276,11 @@ type DaemonConfig struct {
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
 
+	// Hardware is the machine's already-detected capabilities (client.DetectHardware),
+	// advertised to heads and consulted for GPU budgets. Start-up detects once and
+	// passes the result here; when nil the daemon detects for itself (tests, and
+	// any caller without a prior detection).
+	Hardware *lettucev1.HardwareCapabilities
 	// ClientVersion is this build's version string (the value `--version`
 	// prints), surfaced on GET /api/v1/status as client_version.
 	ClientVersion string
@@ -403,9 +408,14 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	multiClient := NewMultiServerClient(servers, cfg.Logger)
 
-	// Detect hardware once at startup (avoid repeated exec calls that
-	// trigger DiskPart/UAC popups on Windows).
-	hw := client.DetectHardware(cfg.Config)
+	// Use the hardware start-up already detected; detect here only when the
+	// caller did not. Detection launches vendor tools and reads platform
+	// registries, and a second probe per start is exactly what once raised a
+	// second UAC prompt on Windows.
+	hw := cfg.Hardware
+	if hw == nil {
+		hw = client.DetectHardware(cfg.Config)
+	}
 
 	// Run or load CPU benchmark for runtime estimation.
 	var benchFPOPS float64

@@ -6,6 +6,22 @@ import (
 	"strings"
 )
 
+// platformGPUDetectors: the vendor command-line tools are safe to launch on
+// macOS, and Apple GPUs are read from system_profiler.
+func platformGPUDetectors() []gpuDetector {
+	return []gpuDetector{
+		{label: "nvidia", fn: detectNVIDIAGPUs},
+		{label: "amd", fn: detectAMDGPUs},
+		{label: "apple", fn: detectPlatformGPUs},
+	}
+}
+
+// platformDisplayAdapterSource: macOS has no device registry to enumerate;
+// GPUs are found through the tools above.
+func platformDisplayAdapterSource() (DisplayAdapterReader, error) {
+	return nil, ErrDisplayAdaptersUnsupported
+}
+
 func detectPlatformGPUs() ([]*GpuDetectionResult, error) {
 	out, err := runDetectionCommand("system_profiler", "SPDisplaysDataType")
 	if err != nil {

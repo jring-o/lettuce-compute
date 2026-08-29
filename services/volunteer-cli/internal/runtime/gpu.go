@@ -13,7 +13,7 @@ import (
 // GpuDetectionResult holds detected GPU information.
 type GpuDetectionResult struct {
 	Model             string
-	Vendor            string // "nvidia", "amd", "apple"
+	Vendor            string // "nvidia", "amd", "intel", "apple"
 	VRAMMB            int32
 	ComputeCapability string
 }
@@ -43,9 +43,19 @@ func runDetectionCommand(name string, args ...string) ([]byte, error) {
 	return CommandExecutorCtx(ctx, name, args...)
 }
 
+// gpuDetector is one vendor- or platform-specific GPU probe. The set that runs
+// is chosen per platform (platformGPUDetectors): the vendor command-line tools
+// are safe to launch on Linux and macOS, but on Windows AMD's amd-smi requests
+// UAC elevation the moment it starts — so Windows enumerates display adapters
+// from the registry instead and launches only nvidia-smi.
+type gpuDetector struct {
+	label string
+	fn    func() ([]*GpuDetectionResult, error)
+}
+
 // DetectGPUs discovers all available GPUs across vendors.
 //
-// Vendor sub-detections run in parallel under an aggregate timeout
+// The platform's sub-detections run in parallel under an aggregate timeout
 // (DetectHardwareTimeout) so a single hung CLI cannot serialize the others
 // and so the total wall time is bounded even if every sub-call hits its own
 // per-command timeout. Any sub-detection that errors or times out is treated
@@ -92,16 +102,19 @@ func DetectGPUs() []*GpuDetectionResult {
 		mu.Unlock()
 	}
 
-	wg.Add(3)
-	go collect("nvidia", detectNVIDIAGPUs)
-	go collect("amd", detectAMDGPUs)
-	go collect("platform", detectPlatformGPUs)
+	detectors := platformGPUDetectors()
+	wg.Add(len(detectors))
+	for _, d := range detectors {
+		go collect(d.label, d.fn)
+	}
 	wg.Wait()
 
 	return results
 }
 
-// detectNVIDIAGPUs uses nvidia-smi to detect NVIDIA GPUs.
+// detectNVIDIAGPUs uses nvidia-smi to detect NVIDIA GPUs. nvidia-smi ships
+// with NVIDIA's driver on every platform, runs unelevated, and is the only
+// source of CUDA compute capability, so it is used everywhere.
 func detectNVIDIAGPUs() ([]*GpuDetectionResult, error) {
 	out, err := runDetectionCommand("nvidia-smi",
 		"--query-gpu=name,memory.total,compute_cap",
@@ -152,50 +165,9 @@ func parseNvidiaSmiCSV(output string) []*GpuDetectionResult {
 	return results
 }
 
-// detectAMDGPUs uses rocm-smi to detect AMD GPUs.
-//
-// Each external call is bounded by DetectionCommandTimeout via
-// runDetectionCommand. On any failure (missing binary, non-zero exit, or
-// timeout — e.g. the ~3min amd-smi hang observed on hosts without a working
-// ROCm driver) we treat the vendor as "no GPUs detected" rather than
-// propagating the error.
-func detectAMDGPUs() ([]*GpuDetectionResult, error) {
-	usedRocm := false
-	out, err := runDetectionCommand("rocm-smi",
-		"--showid", "--showproductname", "--showmeminfo", "vram", "--csv")
-	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			// Try amd-smi as fallback.
-			out, err = runDetectionCommand("amd-smi", "list", "--csv")
-			if err != nil {
-				if errors.Is(err, exec.ErrNotFound) {
-					return nil, nil
-				}
-				slog.Warn("amd-smi command failed", "error", err)
-				return nil, nil
-			}
-		} else {
-			slog.Warn("rocm-smi command failed", "error", err)
-			return nil, nil
-		}
-	} else {
-		usedRocm = true
-	}
-
-	results := parseRocmSmiCSV(string(out))
-
-	// Fetch GFX versions for compute capability (only available via rocm-smi).
-	if usedRocm {
-		gfxOut, err := runDetectionCommand("rocm-smi", "--showgfxversion", "--csv")
-		if err == nil {
-			applyGfxVersions(results, string(gfxOut))
-		}
-	}
-
-	return results, nil
-}
-
-// parseRocmSmiCSV parses rocm-smi --csv output.
+// parseRocmSmiCSV parses rocm-smi --csv output (also the shape of
+// amd-smi list --csv). The command itself is only launched on non-Windows
+// platforms — see gpu_amd_cli.go.
 func parseRocmSmiCSV(output string) []*GpuDetectionResult {
 	var results []*GpuDetectionResult
 	lines := strings.Split(strings.TrimSpace(output), "\n")
