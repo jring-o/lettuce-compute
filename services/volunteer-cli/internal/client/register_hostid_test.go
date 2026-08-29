@@ -42,7 +42,7 @@ func TestRegister_PersistsMintedHostID(t *testing.T) {
 	store := newTestStore(t)
 	const headKey = "head-a:443"
 
-	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestRegister_EchoesKnownHostID(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestRegister_DiscardsHostIDOnEmptyResponse(t *testing.T) {
 		t.Fatalf("seed store: %v", err)
 	}
 
-	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	_, _, hostID, err := Register(context.Background(), client, pub, store, headKey, cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestRegister_PowRequired_SolvesAndRetries(t *testing.T) {
 	cfg := config.Defaults()
 	store := newTestStore(t)
 
-	volID, registered, hostID, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	volID, registered, hostID, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register with pow-required: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestRegister_PowRejected_FetchesFreshChallenge(t *testing.T) {
 	cfg := config.Defaults()
 	store := newTestStore(t)
 
-	volID, _, _, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	volID, _, _, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register with pow-rejected-then-accepted: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestRegister_NonPowError_DoesNotSolve(t *testing.T) {
 	cfg := config.Defaults()
 	store := newTestStore(t)
 
-	_, _, _, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"))
+	_, _, _, err := Register(context.Background(), client, pub, store, "head-a:443", cfg, filepath.Join(t.TempDir(), "config.yaml"), DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected the non-pow error to surface")
 	}

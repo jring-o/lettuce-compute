@@ -186,7 +186,7 @@ func TestE2EV04FullLifecycle(t *testing.T) {
 	// Advertise NATIVE explicitly: the leafs below are NATIVE, and the advertised
 	// runtimes are exactly what the caller passes (TB-25 — no config fallback).
 	hostStore := identity.NewHostIDStore(filepath.Join(volDir, "host-ids.json"))
-	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath, "NATIVE", "WASM")
+	volID, _, hostID, err := client.Register(ctx, grpcClient, pub, hostStore, grpcAddr, cfg, cfgPath, client.DetectHardware(cfg), "NATIVE", "WASM")
 	if err != nil {
 		t.Fatalf("registering: %v", err)
 	}

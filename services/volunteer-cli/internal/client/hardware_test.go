@@ -94,13 +94,18 @@ func withMockHardware(t *testing.T) {
 	origDisk := detectDiskAvailableMB
 	origGPU := gpudetect.CommandExecutor
 	origGPUCtx := gpudetect.CommandExecutorCtx
+	origAdapters := gpudetect.DisplayAdapterSource
 	t.Cleanup(func() {
 		detectCPUModel = origCPU
 		detectTotalMemoryMB = origMem
 		detectDiskAvailableMB = origDisk
 		gpudetect.CommandExecutor = origGPU
 		gpudetect.CommandExecutorCtx = origGPUCtx
+		gpudetect.DisplayAdapterSource = origAdapters
 	})
+	gpudetect.DisplayAdapterSource = func() (gpudetect.DisplayAdapterReader, error) {
+		return nil, gpudetect.ErrDisplayAdaptersUnsupported
+	}
 	detectCPUModel = func() string { return "Mock CPU" }
 	detectTotalMemoryMB = func() int32 { return 16384 }
 	detectDiskAvailableMB = func(path string) int64 { return 500000 }
@@ -121,13 +126,18 @@ func withMockGPUs(t *testing.T) {
 	origDisk := detectDiskAvailableMB
 	origGPU := gpudetect.CommandExecutor
 	origGPUCtx := gpudetect.CommandExecutorCtx
+	origAdapters := gpudetect.DisplayAdapterSource
 	t.Cleanup(func() {
 		detectCPUModel = origCPU
 		detectTotalMemoryMB = origMem
 		detectDiskAvailableMB = origDisk
 		gpudetect.CommandExecutor = origGPU
 		gpudetect.CommandExecutorCtx = origGPUCtx
+		gpudetect.DisplayAdapterSource = origAdapters
 	})
+	gpudetect.DisplayAdapterSource = func() (gpudetect.DisplayAdapterReader, error) {
+		return nil, gpudetect.ErrDisplayAdaptersUnsupported
+	}
 	detectCPUModel = func() string { return "Mock CPU" }
 	detectTotalMemoryMB = func() int32 { return 16384 }
 	detectDiskAvailableMB = func(path string) int64 { return 500000 }
@@ -466,13 +476,18 @@ func TestDetectHardwareCPUSlowDegrades(t *testing.T) {
 	origDisk := detectDiskAvailableMB
 	origGPU := gpudetect.CommandExecutor
 	origGPUCtx := gpudetect.CommandExecutorCtx
+	origAdapters := gpudetect.DisplayAdapterSource
 	t.Cleanup(func() {
 		detectCPUModel = origCPU
 		detectTotalMemoryMB = origMem
 		detectDiskAvailableMB = origDisk
 		gpudetect.CommandExecutor = origGPU
 		gpudetect.CommandExecutorCtx = origGPUCtx
+		gpudetect.DisplayAdapterSource = origAdapters
 	})
+	gpudetect.DisplayAdapterSource = func() (gpudetect.DisplayAdapterReader, error) {
+		return nil, gpudetect.ErrDisplayAdaptersUnsupported
+	}
 
 	detectCPUModel = func() string {
 		time.Sleep(30 * time.Second) // far beyond DetectHardwareTimeout

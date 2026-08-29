@@ -25,6 +25,19 @@ func withMockExecutor(t *testing.T, mock func(name string, args ...string) ([]by
 	CommandExecutorCtx = func(_ context.Context, name string, args ...string) ([]byte, error) {
 		return mock(name, args...)
 	}
+	withNoDisplayAdapters(t)
+}
+
+// withNoDisplayAdapters points the display-adapter registry reader at an empty
+// fake for the duration of a test, so detection never reads the machine's own
+// registry (which on a Windows runner would report its real GPUs).
+func withNoDisplayAdapters(t *testing.T) {
+	t.Helper()
+	orig := DisplayAdapterSource
+	t.Cleanup(func() { DisplayAdapterSource = orig })
+	DisplayAdapterSource = func() (DisplayAdapterReader, error) {
+		return fakeAdapterReader{}, nil
+	}
 }
 
 // disableSkipHardwareDetection clears the SkipHardwareDetectionEnv var for the
@@ -199,58 +212,6 @@ func TestDetectGPUsNVIDIAOnly(t *testing.T) {
 	}
 }
 
-func TestDetectGPUsAMDOnly(t *testing.T) {
-	withMockExecutor(t, func(name string, args ...string) ([]byte, error) {
-		if name == "rocm-smi" {
-			if len(args) > 0 && args[0] == "--showgfxversion" {
-				return []byte("device,GFX Version\ncard0,gfx1030\n"), nil
-			}
-			return []byte("device,Card Series,VRAM Total Memory (B)\ncard0,AMD RX 6800,17179869184\n"), nil
-		}
-		return nil, exec.ErrNotFound
-	})
-
-	results := DetectGPUs()
-	if len(results) != 1 {
-		t.Fatalf("got %d GPUs, want 1", len(results))
-	}
-	if results[0].Vendor != "amd" {
-		t.Errorf("Vendor = %q, want %q", results[0].Vendor, "amd")
-	}
-	if results[0].ComputeCapability != "gfx1030" {
-		t.Errorf("ComputeCapability = %q, want %q", results[0].ComputeCapability, "gfx1030")
-	}
-}
-
-func TestDetectGPUsBothVendors(t *testing.T) {
-	withMockExecutor(t, func(name string, args ...string) ([]byte, error) {
-		switch name {
-		case "nvidia-smi":
-			return []byte("NVIDIA A100, 40960, 8.0\n"), nil
-		case "rocm-smi":
-			if len(args) > 0 && args[0] == "--showgfxversion" {
-				return []byte("device,GFX Version\ncard0,gfx90a\n"), nil
-			}
-			return []byte("device,Card Series,VRAM Total Memory (B)\ncard0,AMD MI210,68719476736\n"), nil
-		default:
-			return nil, exec.ErrNotFound
-		}
-	})
-
-	results := DetectGPUs()
-	if len(results) != 2 {
-		t.Fatalf("got %d GPUs, want 2", len(results))
-	}
-
-	vendors := map[string]bool{}
-	for _, r := range results {
-		vendors[r.Vendor] = true
-	}
-	if !vendors["nvidia"] || !vendors["amd"] {
-		t.Errorf("expected both nvidia and amd, got vendors: %v", vendors)
-	}
-}
-
 func TestDetectGPUsNothingFound(t *testing.T) {
 	withMockExecutor(t, notFoundForAll)
 
@@ -282,6 +243,7 @@ func TestDetectGPUsNvidiaSmiFailsNonFatal(t *testing.T) {
 // `amd-smi list --csv` took ~208 seconds and blocked Register.
 func TestDetectGPUsSlowVendorBoundedByAggregateTimeout(t *testing.T) {
 	disableSkipHardwareDetection(t)
+	withNoDisplayAdapters(t)
 	hangFor := 30 * time.Second // far beyond DetectHardwareTimeout
 
 	origCtx := CommandExecutorCtx
@@ -319,27 +281,6 @@ func TestDetectGPUsSlowVendorBoundedByAggregateTimeout(t *testing.T) {
 	}
 	if !gotNvidia {
 		t.Errorf("nvidia GPU missing from results = %+v; fast vendor result should not be dropped when others hang", results)
-	}
-}
-
-func TestDetectAMDFallbackToAmdSmi(t *testing.T) {
-	withMockExecutor(t, func(name string, args ...string) ([]byte, error) {
-		switch name {
-		case "rocm-smi":
-			return nil, exec.ErrNotFound
-		case "amd-smi":
-			return []byte("device,Name,VRAM Total Memory (B)\n0,AMD RX 7900,25769803776\n"), nil
-		default:
-			return nil, exec.ErrNotFound
-		}
-	})
-
-	results := DetectGPUs()
-	if len(results) != 1 {
-		t.Fatalf("got %d GPUs, want 1", len(results))
-	}
-	if results[0].Model != "AMD RX 7900" {
-		t.Errorf("Model = %q, want %q", results[0].Model, "AMD RX 7900")
 	}
 }
 

@@ -177,6 +177,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var connections []*daemon.ServerConnection
 	var stateServers []daemon.ServerState
 
+	// Detect hardware exactly once per start. Detection launches vendor tools
+	// and reads platform registries; registration used to run it again for
+	// every head and the daemon a further time, so a single start probed the
+	// machine at least twice — and on Windows each probe could raise its own
+	// UAC prompt. The one result is advertised to every head and handed to the
+	// daemon.
+	hardware := client.DetectHardware(cfg)
+
 	// Volunteer-facing notices and per-head version/update state are created
 	// here, before the daemon exists, because registration below is one of the
 	// two places a head can reject this build as too old — and a head that does
@@ -232,7 +240,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		// trusted to run (WASM always; CONTAINER/NATIVE per the attach-time trust choice).
 		advertised := advertisedForServer(registry, srv)
 		logger.Info("advertising runtimes to head", "server", name, "advertised", advertised)
-		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, advertised...)
+		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, hardware, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
@@ -329,6 +337,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		RuntimeRegistry: registry,
 		MachineManager:  machineManager,
 		Logger:          logger,
+		Hardware:        hardware,
 		ClientVersion:   version,
 		Notices:         notices,
 		HeadStatus:      headStatus,

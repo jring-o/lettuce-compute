@@ -42,10 +42,15 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev
 	}
 }
 
-// Register performs the full registration flow against one head: detect hardware,
-// echo the stored per-head host id (empty to mint), call RegisterVolunteer (riding out
-// rate limits and solving a registration proof-of-work challenge if the head demands
-// one), then persist the head-issued host id and volunteer id.
+// Register performs the full registration flow against one head: echo the stored
+// per-head host id (empty to mint), call RegisterVolunteer (riding out rate limits and
+// solving a registration proof-of-work challenge if the head demands one), then persist
+// the head-issued host id and volunteer id.
+//
+// hw is the machine's already-detected hardware (DetectHardware), advertised as-is.
+// Detection is the caller's job, done once per process: it launches vendor tools and
+// reads platform registries, and running it again for every head — as Register used to —
+// doubled every start-up probe (on Windows, each probe once raised its own UAC prompt).
 //
 // store/headKey identify where this head's issued host id is persisted (headKey is the
 // head's gRPC address). On return the stored id is EXACTLY what the head sent: a fresh
@@ -59,9 +64,7 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev
 //
 // Returns the account's volunteer id, whether this was a new registration, and the
 // head-issued host id (possibly empty).
-func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, store *identity.HostIDStore, headKey string, cfg *config.Config, configPath string, availableRuntimes ...string) (string, bool, string, error) {
-	hw := DetectHardware(cfg)
-
+func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, store *identity.HostIDStore, headKey string, cfg *config.Config, configPath string, hw *lettucev1.HardwareCapabilities, availableRuntimes ...string) (string, bool, string, error) {
 	// Echo the stored per-head id (empty on first contact => the head mints one under
 	// the per-account cap). A read error is non-fatal: fall back to empty and let the
 	// head mint a fresh id.

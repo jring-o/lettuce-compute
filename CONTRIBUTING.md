@@ -121,9 +121,11 @@ name should be gone.
 
 ### Windows caveat
 
-`TestE2EV04FullLifecycle` can hang on Windows hosts when `wmic` / `amd-smi`
-are slow or missing; it passes on Linux CI. If you're on Windows and only
-that one test fails, suspect the environment before your change.
+Hardware detection on Windows no longer launches `wmic` or `amd-smi` (both
+could raise UAC elevation prompts or stall); CPU and display adapters are read
+from the registry. If `TestE2EV04FullLifecycle` is the only test failing on a
+Windows host, suspect the environment (container backend, ports) before your
+change; it passes on Linux CI.
 
 ---
 
