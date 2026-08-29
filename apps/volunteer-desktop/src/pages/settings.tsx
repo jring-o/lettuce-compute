@@ -176,16 +176,9 @@ function Toggle({
   );
 }
 
-/** Daemon default for `work_buffer_hours` (hours of work buffered per running task). */
-const DEFAULT_WORK_BUFFER_HOURS = 2;
-
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
   const { metrics } = useMetrics(5000);
-  // GET /api/v1/config does not return work_buffer_hours (it is write-only on
-  // the daemon side), so the slider shows the last value set in this session,
-  // starting from the daemon default.
-  const [workBufferHours, setWorkBufferHours] = useState(DEFAULT_WORK_BUFFER_HOURS);
 
   const { client } = useClient();
 
@@ -265,6 +258,9 @@ export function SettingsPage() {
 
   const totalCores = navigator.hardwareConcurrency ?? 4;
   const totalMemMB = metrics?.memory_total_mb ?? 8192;
+  // 0 is the daemon's unit-count fallback; a daemon too old to report the
+  // field reads as the daemon default (2 h).
+  const workBufferHours = config.work_buffer_hours ?? 2;
   const hasGPU = metrics ? metrics.gpu_usage_pct >= 0 : false;
 
   const handleSignChallenge = async () => {
@@ -422,14 +418,15 @@ export function SettingsPage() {
         <ResourceSlider
           label="Work Buffer"
           value={workBufferHours}
-          min={0.5}
+          min={0}
           max={12}
           step={0.5}
-          displayValue={`${workBufferHours} h of work per task`}
-          onChange={(v) => {
-            setWorkBufferHours(v);
-            updateConfig({ work_buffer_hours: v });
-          }}
+          displayValue={
+            workBufferHours > 0
+              ? `${workBufferHours} h of work per task`
+              : "Fixed unit count (daemon fallback)"
+          }
+          onChange={(v) => updateConfig({ work_buffer_hours: v })}
         />
         <p className="text-xs text-muted-foreground">
           How many hours of work to download and keep ready for each running task. More buffer means less idle time if the server is slow.

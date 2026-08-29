@@ -247,6 +247,7 @@ describe("ManagementClient", () => {
     it("sends GET /api/v1/config and normalises trusted_runtimes", async () => {
       respond({
         data_dir: "/tmp",
+        work_buffer_hours: 2,
         servers: [
           { grpc_address: "a:443", name: "a", leaf_preferences: { mode: "ALL" }, trusted_runtimes: null },
           { grpc_address: "b:443", name: "b", leaf_preferences: { mode: "ALL" }, trusted_runtimes: ["CONTAINER"] },
@@ -254,6 +255,7 @@ describe("ManagementClient", () => {
       });
       const result = await client.config();
       expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/config", body: null });
+      expect(result.work_buffer_hours).toBe(2);
       expect(result.servers[0].trusted_runtimes).toEqual([]);
       expect(result.servers[1].trusted_runtimes).toEqual(["CONTAINER"]);
     });

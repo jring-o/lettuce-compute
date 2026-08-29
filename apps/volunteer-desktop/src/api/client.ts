@@ -318,6 +318,11 @@ export interface ConfigResponse {
   servers: ServerConfig[];
   log_level: string;
   max_concurrent_tasks: number;
+  /**
+   * Hours of work kept buffered per concurrent task (daemon default 2).
+   * 0 means the daemon's small fixed unit-count fallback.
+   */
+  work_buffer_hours: number;
 }
 
 /** Per-head fields `PUT /api/v1/config` merges, matched by `name`. */
@@ -331,8 +336,7 @@ export interface ServerConfigUpdate {
 
 /**
  * Body of `PUT /api/v1/config`: a partial update. Only the listed keys are
- * applied; anything else is ignored. Note that `work_buffer_hours` is
- * write-only today — `GET /api/v1/config` does not return it.
+ * applied; anything else is ignored.
  */
 export interface ConfigUpdate {
   resource_limits?: Partial<ResourceLimits>;
@@ -348,9 +352,9 @@ export interface ConfigUpdate {
 }
 
 /**
- * Response of `PUT /api/v1/config`. The current daemon echoes the full config;
- * the CLI is adding these two fields so the app can tell when a change
- * (for example runtime trust) needs `restartDaemon()` to take effect.
+ * Response of `PUT /api/v1/config`. The daemon echoes the saved config and
+ * adds `restart_required` so the app can tell when a change (for example
+ * runtime trust) needs `restartDaemon()` to take effect.
  */
 export interface ConfigUpdateResponse {
   status?: string;
