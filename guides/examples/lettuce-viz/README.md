@@ -123,7 +123,10 @@ segment is refused, and symbolic links that leave the directory are ignored.
 | `{ type: "unwatchFile", path }` | — | Stops the poll. |
 
 `id` is any string unique to the request; the host echoes it so the page can match
-replies. Watches are stopped while the unit is paused and when the frame closes.
+replies. The desktop app drops every watch when the unit is paused (and when the frame
+closes) and does not restore them on resume, without telling the page — a page that must
+keep following a file across a pause should re-issue `watchFile` when its data stops
+arriving, or poll with `readFile` on its own timer.
 
 In **replay** mode these four requests are ignored (no reply is sent): there is no work
 directory any more. A page that supports both modes should branch on `vizInit.mode`.
