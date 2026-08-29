@@ -1,13 +1,14 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { useDaemonStatus } from "@/hooks/use-daemon-status";
-import { useMetrics } from "@/hooks/use-metrics";
+import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
 import { useCredit } from "@/hooks/use-credit";
-import { useClient } from "@/hooks/use-api";
+import { useClient, useApiQuery } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import { VizFrame } from "@/components/viz/VizFrame";
 import { ResourceGauge } from "@/components/resource-gauge";
 import { CreditDisplay } from "@/components/credit-display";
+import { NoticesPanel } from "@/components/notices-panel";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { TaskContextMenu, type TaskActions } from "@/components/tasks/task-context-menu";
@@ -15,8 +16,26 @@ import { ActiveTaskTable } from "@/components/tasks/active-task-table";
 import { TaskDetailPanel } from "@/components/tasks/task-detail-panel";
 import { TaskFilters, applyTaskFilters, isQueuedTask, type TaskFilterState } from "@/components/tasks/task-filters";
 import { STATUS_DOT_COLOR, STATUS_TEXT, RUNTIME_BADGE } from "@/components/tasks/task-status";
-import { cn, formatDuration, formatTimeAgo, formatBytes, formatCredit } from "@/lib/utils";
-import type { ActiveTaskInfo, QueuedTaskInfo, CreditSummary } from "@/api/client";
+import {
+  cn,
+  formatDuration,
+  formatTimeAgo,
+  formatBytes,
+  formatCredit,
+  formatGb,
+  formatDateTime,
+  pausedLabel,
+} from "@/lib/utils";
+import {
+  getClientVersion,
+  type ActiveTaskInfo,
+  type QueuedTaskInfo,
+  type CreditSummary,
+  type FailingLeaf,
+  type HeadInfo,
+  type MachineCapabilities,
+  type ManagementClient,
+} from "@/api/client";
 
 function StatusBadge({
   state,
@@ -28,7 +47,7 @@ function StatusBadge({
   const config = {
     active: { label: "Active", bg: "bg-green-500/10 text-green-600 border-green-500/20" },
     paused: {
-      label: pausedReason ? `Paused — ${pausedReason}` : "Paused",
+      label: pausedLabel(pausedReason),
       bg: "bg-yellow-500/10 text-yellow-600 border-yellow-500/20",
     },
     stopped: { label: "Stopped", bg: "bg-gray-500/10 text-gray-500 border-gray-500/20" },
@@ -191,7 +210,7 @@ function PulsingDot() {
 function CreditBreakdownSection({ credit }: { credit: CreditSummary }) {
   const [expanded, setExpanded] = useState(false);
 
-  if (!credit.by_head || credit.by_head.length === 0) return null;
+  if (credit.by_head.length === 0 && credit.by_leaf.length === 0) return null;
 
   return (
     <div className="space-y-2">
@@ -205,30 +224,112 @@ function CreditBreakdownSection({ credit }: { credit: CreditSummary }) {
         Credit Breakdown
       </button>
       {expanded && (
-        <div className="space-y-2 pl-4">
-          {credit.by_head.map((head) => (
-            <div key={head.head_name} className="space-y-1">
-              <div className="flex justify-between text-xs">
-                <span className="font-medium">{head.head_name}</span>
-                <span className="text-muted-foreground">
-                  {head.available ? formatCredit(head.total_credit) : "unavailable"}
-                </span>
-              </div>
+        <div className="space-y-3 pl-4">
+          {credit.by_head.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground">By head</p>
+              {credit.by_head.map((head) => (
+                <div key={head.head_name} className="flex justify-between text-xs">
+                  <span className="font-medium">
+                    {head.head_name}
+                    {head.volunteer_id && (
+                      <span className="ml-2 font-normal text-muted-foreground font-mono">
+                        {head.volunteer_id.slice(0, 8)}
+                      </span>
+                    )}
+                  </span>
+                  <span className={cn("text-muted-foreground", !head.available && "italic")}>
+                    {head.available ? formatCredit(head.total_credit) : "unreachable"}
+                  </span>
+                </div>
+              ))}
             </div>
-          ))}
-          {credit.by_leaf.map((leaf) => (
-            <div
-              key={leaf.leaf_id}
-              className="flex justify-between text-xs pl-3 text-muted-foreground"
-            >
-              <span>{leaf.leaf_name}</span>
-              <span>{formatCredit(leaf.credit)}</span>
+          )}
+          {credit.by_leaf.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground">By leaf</p>
+              {credit.by_leaf.map((leaf) => (
+                <div
+                  key={leaf.leaf_id}
+                  className="flex justify-between text-xs text-muted-foreground"
+                >
+                  <span>{leaf.leaf_name}</span>
+                  <span>{formatCredit(leaf.credit)}</span>
+                </div>
+              ))}
             </div>
-          ))}
+          )}
         </div>
       )}
     </div>
   );
+}
+
+/** Leaves whose work units keep failing here, from `status.failing_leafs`. */
+function FailingLeafsSection({ failing }: { failing: FailingLeaf[] }) {
+  if (failing.length === 0) return null;
+  return (
+    <section className="space-y-2" aria-label="Failing on this machine">
+      <h2 className="text-sm font-medium text-muted-foreground">Failing on this machine</h2>
+      <ul className="space-y-2">
+        {failing.map((f) => (
+          <li
+            key={f.leaf_id}
+            className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-sm space-y-1"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className="font-medium">{f.leaf_name}</span>
+              <span className="text-xs text-muted-foreground">
+                {f.consecutive_failures} in a row
+                {f.total_failures > f.consecutive_failures && ` · ${f.total_failures} total`}
+              </span>
+            </div>
+            {f.last_reason && (
+              <p className="text-xs text-muted-foreground break-words">{f.last_reason}</p>
+            )}
+            {f.paused && (
+              <p className="text-xs text-red-600">
+                Not requesting more of this leaf
+                {f.paused_until ? ` until ${formatDateTime(f.paused_until)}` : " for now"}.
+              </p>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** Heads that refuse this client version until the app is updated. */
+function UpdateRequiredBanner({ heads }: { heads: HeadInfo[] }) {
+  const stale = heads.filter((h) => h.update_required);
+  if (stale.length === 0) return null;
+  return (
+    <div
+      role="alert"
+      className="rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-700 dark:text-red-300 space-y-1"
+    >
+      {stale.map((h) => (
+        <p key={h.name} className="font-medium">
+          This app is too old for {h.name} — update Lettuce Compute
+        </p>
+      ))}
+      <p className="text-xs opacity-80">
+        The head will not send work to this version. Install the update from the banner at
+        the top of the window, or from the download page, then restart Lettuce.
+      </p>
+    </div>
+  );
+}
+
+function gpuSummary(machine: MachineCapabilities): string {
+  const vendor = machine.gpu_vendors[0] ?? "GPU";
+  const card = machine.gpu_card_vram_mb > 0 ? `${formatGb(machine.gpu_card_vram_mb)} card` : "card size unknown";
+  const allowed =
+    machine.max_gpu_vram_mb > 0
+      ? `${formatGb(machine.max_gpu_vram_mb)} allowed for Lettuce`
+      : "GPU work disabled (allowance 0%)";
+  return `GPU: ${vendor}, ${card}, ${allowed}`;
 }
 
 type ViewMode = "cards" | "table";
@@ -237,9 +338,33 @@ const VIEW_MODE_KEY = "lettuce-task-view-mode";
 export function OverviewPage() {
   const { status } = useDaemonStatus(3000);
   const { metrics } = useMetrics(3000);
+  const { system } = useSystemMetrics(3000);
   const { credit } = useCredit(10000);
   const { client } = useClient();
   const { status: containerStatus } = useContainerRuntime();
+  const { data: headsResp } = useApiQuery(
+    (c: ManagementClient) => c.headsAndMachine(),
+    30000
+  );
+  const heads = headsResp?.heads ?? [];
+  const machine = headsResp?.machine ?? null;
+
+  // The daemon reports its version in /status on current builds; older builds
+  // do not, so fall back to asking the bundled CLI once.
+  const [cliVersion, setCliVersion] = useState<string | null>(null);
+  useEffect(() => {
+    if (status?.client_version || cliVersion) return;
+    let cancelled = false;
+    getClientVersion()
+      .then((v) => {
+        if (!cancelled && typeof v === "string" && v) setCliVersion(v);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [status?.client_version, cliVersion]);
+  const clientVersion = status?.client_version ?? cliVersion;
 
   const [detailTaskId, setDetailTaskId] = useState<string | null>(null);
   const [filters, setFilters] = useState<TaskFilterState>({
@@ -321,6 +446,8 @@ export function OverviewPage() {
 
   return (
     <div className="p-6 space-y-6 max-w-3xl mx-auto">
+      <UpdateRequiredBanner heads={heads} />
+
       {/* Status section */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -364,6 +491,10 @@ export function OverviewPage() {
           </div>
         )}
       </div>
+
+      <NoticesPanel />
+
+      <FailingLeafsSection failing={status?.failing_leafs ?? []} />
 
       {/* Active tasks */}
       <div className="space-y-3">
@@ -448,50 +579,53 @@ export function OverviewPage() {
         </div>
       )}
 
-      {/* Resource gauges */}
-      {metrics && (
+      {/* Machine gauges: CPU and memory are measured by the app itself (the
+          daemon reports zeros for them); disk is the daemon's own footprint
+          against its allowance. */}
+      {(system || metrics) && (
         <div className="space-y-3">
           <h2 className="text-sm font-medium text-muted-foreground">Resources</h2>
-          <div className="grid grid-cols-2 gap-4 justify-items-center sm:grid-cols-4">
-            <ResourceGauge
-              label="CPU"
-              value={metrics.cpu_usage_pct}
-              displayValue={`${Math.round(metrics.cpu_usage_pct)}%`}
-              temperature={metrics.cpu_temp_c}
-            />
-            <ResourceGauge
-              label="GPU"
-              value={metrics.gpu_usage_pct}
-              displayValue={
-                metrics.gpu_usage_pct > 0
-                  ? `${Math.round(metrics.gpu_usage_pct)}%`
-                  : "No GPU"
-              }
-              temperature={metrics.gpu_temp_c}
-            />
-            <ResourceGauge
-              label="Memory"
-              value={
-                metrics.memory_total_mb > 0
-                  ? (metrics.memory_used_mb / metrics.memory_total_mb) * 100
-                  : 0
-              }
-              displayValue={`${formatBytes(metrics.memory_used_mb)} / ${formatBytes(metrics.memory_total_mb)}`}
-            />
-            <ResourceGauge
-              label="Disk"
-              value={
-                metrics.disk_usage_known && metrics.disk_allowance_mb > 0
-                  ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
-                  : 0
-              }
-              displayValue={
-                metrics.disk_usage_known
-                  ? `${(metrics.disk_used_mb / 1024).toFixed(1)} / ${(metrics.disk_allowance_mb / 1024).toFixed(1)} GB`
-                  : "Unknown"
-              }
-            />
+          <div className="grid grid-cols-2 gap-4 justify-items-center sm:grid-cols-3">
+            {system && (
+              <ResourceGauge
+                label="CPU"
+                value={system.cpu_usage_pct}
+                displayValue={`${Math.round(system.cpu_usage_pct)}%`}
+                temperature={metrics?.cpu_temp_c}
+              />
+            )}
+            {system && (
+              <ResourceGauge
+                label="Memory"
+                value={
+                  system.memory_total_mb > 0
+                    ? (system.memory_used_mb / system.memory_total_mb) * 100
+                    : 0
+                }
+                displayValue={`${formatBytes(system.memory_used_mb)} / ${formatBytes(system.memory_total_mb)}`}
+              />
+            )}
+            {metrics && metrics.disk_usage_known && (
+              <ResourceGauge
+                label="Disk"
+                value={
+                  metrics.disk_allowance_mb > 0
+                    ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
+                    : 0
+                }
+                displayValue={`${(metrics.disk_used_mb / 1024).toFixed(1)} / ${(metrics.disk_allowance_mb / 1024).toFixed(1)} GB`}
+              />
+            )}
           </div>
+          {metrics && metrics.disk_usage_known && (
+            <p className="text-xs text-muted-foreground text-center">
+              Lettuce is using {formatGb(metrics.disk_used_mb)} of your{" "}
+              {formatGb(metrics.disk_allowance_mb)} allowance
+            </p>
+          )}
+          {machine?.has_gpu && (
+            <p className="text-xs text-muted-foreground text-center">{gpuSummary(machine)}</p>
+          )}
         </div>
       )}
 
@@ -537,6 +671,16 @@ export function OverviewPage() {
             total={credit.total_credit}
             leafCount={leafCount}
           />
+          {credit.source === "local" && (
+            <p className="text-xs text-yellow-600">
+              Figures from this machine's local history — no head could be reached.
+            </p>
+          )}
+          <p className="text-xs text-muted-foreground">
+            Credit moves only when a head validates your results, so these counters can
+            sit still for a while on leaves that check each result against other
+            volunteers' copies.
+          </p>
           <CreditBreakdownSection credit={credit} />
         </div>
       )}
@@ -547,6 +691,7 @@ export function OverviewPage() {
           Active tasks: {tasks.length} · Queued: {status.queued_tasks?.length ?? 0} ·
           Connected servers: {status.connected_servers} ·
           Leafs: {leafCount}
+          {clientVersion && ` · Client v${clientVersion.replace(/^v/, "")}`}
         </p>
       )}
 

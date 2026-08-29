@@ -37,6 +37,10 @@ describe("useCredit", () => {
         { leaf_id: "p1", leaf_name: "Climate", credit: 3000 },
         { leaf_id: "p2", leaf_name: "Biology", credit: 2000 },
       ],
+      by_head: [
+        { head_name: "lettuce.science", volunteer_id: "vol-1", total_credit: 5000, available: true },
+      ],
+      source: "head",
     };
 
     mockUseApiQuery.mockReturnValue({

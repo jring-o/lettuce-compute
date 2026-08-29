@@ -1,5 +1,17 @@
-import { describe, it, expect } from "vitest";
-import { cn, formatBytes, formatDuration, formatPercent, formatCredit } from "./utils";
+import { describe, it, expect, beforeEach } from "vitest";
+import {
+  cn,
+  formatBytes,
+  formatDuration,
+  formatPercent,
+  formatCredit,
+  formatGb,
+  pausedLabel,
+  formatDateTime,
+  readStoredTheme,
+  storeTheme,
+  applyTheme,
+} from "./utils";
 
 describe("cn", () => {
   it("merges class names", () => {
@@ -111,5 +123,96 @@ describe("formatCredit", () => {
   it("formats negative numbers", () => {
     const result = formatCredit(-500);
     expect(result).toContain("500");
+  });
+});
+
+describe("formatCredit with decimals", () => {
+  it("keeps whole numbers grouped and cuts fractions to two decimals", () => {
+    expect(formatCredit(1234)).toBe("1,234");
+    expect(formatCredit(1234.5678)).toBe("1,234.57");
+    expect(formatCredit(0.5)).toBe("0.5");
+    expect(formatCredit(NaN)).toBe("0");
+  });
+});
+
+describe("formatGb", () => {
+  it("renders megabytes as gigabytes with one decimal", () => {
+    expect(formatGb(1024)).toBe("1.0 GB");
+    expect(formatGb(5734)).toBe("5.6 GB");
+    expect(formatGb(0)).toBe("0.0 GB");
+  });
+});
+
+describe("pausedLabel", () => {
+  it("words the scheduled reason and passes others through", () => {
+    expect(pausedLabel(null)).toBe("Paused");
+    expect(pausedLabel(undefined)).toBe("Paused");
+    expect(pausedLabel("scheduled")).toBe("Paused — outside your schedule");
+    expect(pausedLabel("thermal")).toBe("Paused — thermal");
+    expect(pausedLabel("user")).toBe("Paused — user");
+  });
+});
+
+describe("formatDateTime", () => {
+  it("returns the input when it is not a date", () => {
+    expect(formatDateTime("not a date")).toBe("not a date");
+  });
+
+  it("formats a valid timestamp as a short local date and time", () => {
+    const out = formatDateTime("2030-01-02T03:04:00Z");
+    expect(out).toMatch(/Jan/);
+    expect(out).toMatch(/\d/);
+  });
+});
+
+describe("theme helpers", () => {
+  beforeEach(() => {
+    localStorage.removeItem("lettuce-theme");
+    document.documentElement.classList.remove("dark");
+  });
+
+  it("defaults to system and round-trips a stored choice", () => {
+    expect(readStoredTheme()).toBe("system");
+    storeTheme("dark");
+    expect(readStoredTheme()).toBe("dark");
+    localStorage.setItem("lettuce-theme", "purple");
+    expect(readStoredTheme()).toBe("system");
+  });
+
+  it("applies dark and light directly", () => {
+    applyTheme("dark");
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    applyTheme("light");
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
+  });
+
+  it("follows the OS preference for system and stops on cleanup", () => {
+    const listeners: Array<() => void> = [];
+    const original = window.matchMedia;
+    let matches = true;
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: () => ({
+        get matches() {
+          return matches;
+        },
+        addEventListener: (_: string, fn: () => void) => listeners.push(fn),
+        removeEventListener: (_: string, fn: () => void) => {
+          const i = listeners.indexOf(fn);
+          if (i >= 0) listeners.splice(i, 1);
+        },
+      }),
+    });
+    try {
+      const stop = applyTheme("system");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
+      matches = false;
+      listeners.forEach((fn) => fn());
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
+      stop();
+      expect(listeners).toHaveLength(0);
+    } finally {
+      Object.defineProperty(window, "matchMedia", { writable: true, value: original });
+    }
   });
 });

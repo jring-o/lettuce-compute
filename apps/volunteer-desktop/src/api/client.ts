@@ -318,6 +318,11 @@ export interface ConfigResponse {
   servers: ServerConfig[];
   log_level: string;
   max_concurrent_tasks: number;
+  /**
+   * Hours of work kept fetched ahead per running task. Being added to the GET
+   * response by the CLI; absent on older builds (the daemon default is 2).
+   */
+  work_buffer_hours?: number;
 }
 
 /** Per-head fields `PUT /api/v1/config` merges, matched by `name`. */

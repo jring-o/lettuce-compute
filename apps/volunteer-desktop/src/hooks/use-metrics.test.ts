@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook, waitFor } from "@testing-library/react";
-import { useMetrics } from "./use-metrics";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+import { useMetrics, useSystemMetrics } from "./use-metrics";
+import { invoke } from "@tauri-apps/api/core";
 
 // Mock the useApiQuery hook
 const mockUseApiQuery = vi.fn();
@@ -29,14 +30,15 @@ describe("useMetrics", () => {
 
   it("returns metrics data when loaded", () => {
     const metricsData = {
-      cpu_usage_pct: 45.2,
-      gpu_usage_pct: 80,
-      memory_used_mb: 8192,
-      memory_total_mb: 16384,
-      disk_used_gb: 100,
-      disk_total_gb: 500,
-      cpu_temp_c: 65,
-      gpu_temp_c: 72,
+      cpu_usage_pct: 0,
+      gpu_usage_pct: 0,
+      memory_used_mb: 0,
+      memory_total_mb: 0,
+      cpu_temp_c: 0,
+      gpu_temp_c: 0,
+      disk_used_mb: 1024,
+      disk_allowance_mb: 10240,
+      disk_usage_known: true,
     };
 
     mockUseApiQuery.mockReturnValue({
@@ -104,5 +106,52 @@ describe("useMetrics", () => {
     renderHook(() => useMetrics());
 
     expect(mockMetrics).toHaveBeenCalled();
+  });
+});
+
+describe("useSystemMetrics", () => {
+  const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockInvoke.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    mockInvoke.mockImplementation(() => Promise.resolve(undefined));
+  });
+
+  it("samples the Rust system_metrics command on mount and on every interval", async () => {
+    mockInvoke.mockResolvedValue({ cpu_usage_pct: 12.5, memory_used_mb: 4096, memory_total_mb: 16384 });
+
+    const { result } = renderHook(() => useSystemMetrics(3000));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("system_metrics");
+    expect(result.current.system).toEqual({ cpu_usage_pct: 12.5, memory_used_mb: 4096, memory_total_mb: 16384 });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(mockInvoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports an error and keeps the last good sample when the command fails", async () => {
+    mockInvoke
+      .mockResolvedValueOnce({ cpu_usage_pct: 1, memory_used_mb: 1, memory_total_mb: 2 })
+      .mockRejectedValueOnce(new Error("no sysinfo"));
+
+    const { result } = renderHook(() => useSystemMetrics(1000));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current.error).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(result.current.error?.message).toBe("no sysinfo");
+    expect(result.current.system?.cpu_usage_pct).toBe(1);
   });
 });

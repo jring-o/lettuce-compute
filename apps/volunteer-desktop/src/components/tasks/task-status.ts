@@ -3,6 +3,7 @@
 /** Maps task_status values to Tailwind dot color classes. */
 export const STATUS_DOT_COLOR: Record<string, string> = {
   running: "bg-green-500",
+  suspended: "bg-yellow-500",
   suspended_user: "bg-yellow-500",
   suspended_thermal: "bg-yellow-500",
   suspended_scheduled: "bg-yellow-500",
@@ -13,6 +14,7 @@ export const STATUS_DOT_COLOR: Record<string, string> = {
 /** Full status labels for card view (more descriptive). */
 export const STATUS_TEXT: Record<string, string> = {
   running: "Running",
+  suspended: "Paused (reason not reported)",
   suspended_user: "Suspended",
   suspended_thermal: "Suspended \u2014 thermal",
   suspended_scheduled: "Suspended \u2014 scheduled",
@@ -30,6 +32,7 @@ export const RUNTIME_BADGE: Record<string, { label: string; className: string }>
 /** Compact status labels for table view (space-constrained). */
 export const STATUS_TEXT_SHORT: Record<string, string> = {
   running: "Running",
+  suspended: "Paused",
   suspended_user: "Suspended",
   suspended_thermal: "Thermal",
   suspended_scheduled: "Scheduled",
