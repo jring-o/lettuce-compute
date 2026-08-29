@@ -14,7 +14,7 @@ import { AddServerDialog } from "@/components/heads/add-server-dialog";
 import { markRestartRequired } from "@/hooks/use-restart-required";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { ApiError } from "@/api/client";
+import { ApiError, type HeadInfo } from "@/api/client";
 
 function SkeletonCard() {
   return (
@@ -49,11 +49,13 @@ export function ProjectsPage() {
     }
   }, [toast]);
 
+  // Detach by gRPC address: the daemon matches `server_name` against the
+  // config alias, which is not the display name the heads response carries.
   const handleDetach = useCallback(
-    async (headName: string) => {
+    async (head: HeadInfo) => {
       if (!client) return;
       try {
-        await client.detachHead({ server_name: headName });
+        await client.detachHead({ server_address: head.grpc_address });
         refetch();
       } catch (err) {
         setToastType("error");
@@ -64,10 +66,7 @@ export function ProjectsPage() {
   );
 
   const handleLeafToggle = useCallback(
-    (headName: string, leafSlug: string, enabled: boolean) => {
-      const head = heads.find((h) => h.name === headName);
-      if (!head) return;
-
+    (head: HeadInfo, leafSlug: string, enabled: boolean) => {
       // Warn if enabling a container leaf without a running container runtime
       if (enabled) {
         const leaf = head.leafs.find((l) => l.slug === leafSlug);
@@ -80,7 +79,7 @@ export function ProjectsPage() {
       // Update local state immediately — UI is source of truth
       setHeads((prev) =>
         prev.map((h) =>
-          h.name === headName
+          h.grpc_address === head.grpc_address
             ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, enabled } : l) }
             : h
         )
@@ -95,11 +94,11 @@ export function ProjectsPage() {
         ? { mode: "ALL" as const }
         : { mode: "SPECIFIC" as const, enabled: enabledSlugs };
 
-      writeLeafPrefs(headName, prefs).catch(() => {
+      writeLeafPrefs(head, prefs).catch(() => {
         // Roll back on failure
         setHeads((prev) =>
           prev.map((h) =>
-            h.name === headName
+            h.grpc_address === head.grpc_address
               ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, enabled: !enabled } : l) }
               : h
           )
@@ -108,37 +107,38 @@ export function ProjectsPage() {
         setToast("Error: Failed to save leaf preference");
       });
     },
-    [heads, setHeads, writeLeafPrefs, containerStatus]
+    [setHeads, writeLeafPrefs, containerStatus]
   );
 
   const handleLeafWeightChange = useCallback(
-    (headName: string, leafSlug: string, weight: number) => {
+    (head: HeadInfo, leafSlug: string, weight: number) => {
       // Update local state immediately
       setHeads((prev) =>
         prev.map((h) =>
-          h.name === headName
+          h.grpc_address === head.grpc_address
             ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, effective_weight: weight } : l) }
             : h
         )
       );
 
-      // Debounced write for continuous slider input
-      writeLeafWeight(headName, leafSlug, weight, heads);
+      // Debounced write for continuous slider input, from the leaf list as
+      // rendered (it already carries this slider's earlier moves).
+      writeLeafWeight(head, leafSlug, weight);
     },
-    [heads, setHeads, writeLeafWeight]
+    [setHeads, writeLeafWeight]
   );
 
   const handleResetDefaults = useCallback(
-    (headName: string) => {
+    (head: HeadInfo) => {
       // Update local state immediately
       setHeads((prev) =>
         prev.map((h) =>
-          h.name === headName
+          h.grpc_address === head.grpc_address
             ? { ...h, leafs: h.leafs.map((l) => ({ ...l, enabled: true, effective_weight: 100 })) }
             : h
         )
       );
-      writeLeafPrefs(headName, { mode: "ALL" });
+      writeLeafPrefs(head, { mode: "ALL" });
     },
     [setHeads, writeLeafPrefs]
   );
@@ -146,9 +146,9 @@ export function ProjectsPage() {
   // `useWriteHeadTrust` records the pending restart itself (trust is read
   // when the daemon starts); this page only mirrors the saved list locally.
   const handleTrustChange = useCallback(
-    async (headName: string, trustedRuntimes: string[]) => {
-      await writeHeadTrust(headName, trustedRuntimes);
-      setTrustByHead((prev) => ({ ...prev, [headName]: trustedRuntimes }));
+    async (head: HeadInfo, trustedRuntimes: string[]) => {
+      await writeHeadTrust(head, trustedRuntimes);
+      setTrustByHead((prev) => ({ ...prev, [head.grpc_address]: trustedRuntimes }));
     },
     [writeHeadTrust, setTrustByHead]
   );
@@ -224,22 +224,22 @@ export function ProjectsPage() {
           showHeadWeight={showHeadWeight}
           containerStatus={containerStatus}
           machine={machine}
-          trustedRuntimes={trustByHead[head.name] ?? null}
+          trustedRuntimes={trustByHead[head.grpc_address] ?? null}
           onHeadWeightChange={(weight) => {
             setHeads((prev) =>
-              prev.map((h) => h.name === head.name ? { ...h, weight } : h)
+              prev.map((h) => h.grpc_address === head.grpc_address ? { ...h, weight } : h)
             );
-            writeHeadWeight(head.name, weight);
+            writeHeadWeight(head, weight);
           }}
           onLeafToggle={(slug, enabled) =>
-            handleLeafToggle(head.name, slug, enabled)
+            handleLeafToggle(head, slug, enabled)
           }
           onLeafWeightChange={(slug, weight) =>
-            handleLeafWeightChange(head.name, slug, weight)
+            handleLeafWeightChange(head, slug, weight)
           }
-          onResetDefaults={() => handleResetDefaults(head.name)}
-          onDetach={() => handleDetach(head.name)}
-          onTrustChange={(runtimes) => handleTrustChange(head.name, runtimes)}
+          onResetDefaults={() => handleResetDefaults(head)}
+          onDetach={() => handleDetach(head)}
+          onTrustChange={(runtimes) => handleTrustChange(head, runtimes)}
           onRaiseDisk={handleRaiseDisk}
         />
       ))}

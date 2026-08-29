@@ -3,10 +3,14 @@ import { renderHook, act, waitFor } from "@testing-library/react";
 import {
   useHeads,
   useDebouncedHeadWeight,
+  useDebouncedLeafWeight,
   useWriteLeafPreferences,
   useWriteHeadTrust,
   useRaiseDiskAllowance,
   trustByHeadFromConfig,
+  findServerConfig,
+  resolveServerName,
+  type HeadRef,
 } from "./use-heads";
 import {
   resetRestartRequiredForTest,
@@ -66,6 +70,16 @@ const mockMachine: MachineCapabilities = {
   gpu_compute_capabilities: [],
 };
 
+/** The head as the heads response identifies it, matching `makeServer()`. */
+const headRef: HeadRef = { name: "lettuce.science", grpc_address: "lettuce.science:443" };
+
+/**
+ * A head whose display title (what GET /api/v1/heads reports as `name`)
+ * differs from the alias stored in config.yaml at attach time — the live
+ * case that made every name-keyed write a silent no-op.
+ */
+const titledHead: HeadRef = { name: "LBRY.Science - Lettuce Rip", grpc_address: "lbry.science:50051" };
+
 const mockConfigFn = vi.fn<() => Promise<ConfigResponse>>();
 const mockUpdateConfigFn = vi.fn<(partial: ConfigUpdate) => Promise<ConfigUpdateResponse>>();
 const mockHeadsAndMachineFn = vi.fn<() => Promise<HeadsResponse>>();
@@ -93,6 +107,17 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     trusted_runtimes: ["CONTAINER"],
     ...overrides,
   };
+}
+
+/** The config entry `titledHead` was attached under. */
+function makeLbryServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+  return makeServer({
+    grpc_address: "lbry.science:50051",
+    http_address: "https://lbry.science",
+    name: "lbry.science",
+    trusted_runtimes: ["CONTAINER"],
+    ...overrides,
+  });
 }
 
 function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
@@ -140,19 +165,42 @@ function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
 
 // --- Tests ---
 
+describe("findServerConfig / resolveServerName", () => {
+  it("finds the config entry by gRPC address when the display title differs from the alias", () => {
+    const servers = [makeServer(), makeLbryServer()];
+    expect(findServerConfig(servers, titledHead)).toBe(servers[1]);
+    expect(resolveServerName(servers, titledHead)).toBe("lbry.science");
+  });
+
+  it("falls back to the name only for an entry without an address", () => {
+    const servers = [makeServer({ grpc_address: "", name: "LBRY.Science - Lettuce Rip" })];
+    expect(resolveServerName(servers, titledHead)).toBe("LBRY.Science - Lettuce Rip");
+    // A different head's address never matches by title alone.
+    expect(findServerConfig([makeServer()], titledHead)).toBeUndefined();
+  });
+
+  it("uses the address as the name for an alias-less entry, as the daemon does", () => {
+    const servers = [makeServer({ name: "" })];
+    expect(resolveServerName(servers, headRef)).toBe("lettuce.science:443");
+  });
+
+  it("throws when the head has no config entry", () => {
+    expect(() => resolveServerName([], titledHead)).toThrow(
+      "LBRY.Science - Lettuce Rip (lbry.science:50051) is not in the daemon's configuration"
+    );
+  });
+});
+
 describe("trustByHeadFromConfig", () => {
-  it("matches a head to its config entry by gRPC address, then by name", () => {
+  it("keys each head by gRPC address and reads trust from the matching config entry", () => {
     const heads: HeadInfo[] = [
       { ...mockHeadsData[0], name: "Renamed", grpc_address: "lettuce.science:443" },
-      { ...mockHeadsData[0], name: "einstein", grpc_address: "" },
+      { ...mockHeadsData[0], ...titledHead },
     ];
-    const servers = [
-      makeServer({ trusted_runtimes: ["container"] }),
-      makeServer({ name: "einstein", grpc_address: "einstein:443", trusted_runtimes: ["NATIVE"] }),
-    ];
+    const servers = [makeServer({ trusted_runtimes: ["container"] }), makeLbryServer({ trusted_runtimes: ["NATIVE"] })];
     expect(trustByHeadFromConfig(heads, servers)).toEqual({
-      Renamed: ["CONTAINER"],
-      einstein: ["NATIVE"],
+      "lettuce.science:443": ["CONTAINER"],
+      "lbry.science:50051": ["NATIVE"],
     });
   });
 
@@ -192,7 +240,7 @@ describe("useHeads", () => {
     expect(result.current.heads).toEqual(mockHeadsData);
     expect(result.current.machine).toEqual(mockMachine);
     await waitFor(() => {
-      expect(result.current.trustByHead).toEqual({ "lettuce.science": ["CONTAINER"] });
+      expect(result.current.trustByHead).toEqual({ "lettuce.science:443": ["CONTAINER"] });
     });
     expect(result.current.error).toBeNull();
   });
@@ -287,11 +335,11 @@ describe("useHeads", () => {
 
     act(() => {
       result.current.setHeads(mockHeadsData);
-      result.current.setTrustByHead({ "lettuce.science": ["NATIVE"] });
+      result.current.setTrustByHead({ "lettuce.science:443": ["NATIVE"] });
     });
 
     expect(result.current.heads).toEqual(mockHeadsData);
-    expect(result.current.trustByHead).toEqual({ "lettuce.science": ["NATIVE"] });
+    expect(result.current.trustByHead).toEqual({ "lettuce.science:443": ["NATIVE"] });
   });
 });
 
@@ -300,6 +348,7 @@ describe("useWriteHeadTrust", () => {
     vi.clearAllMocks();
     resetRestartRequiredForTest();
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer()]));
   });
 
   it("records a pending restart when the daemon asks for one", async () => {
@@ -310,7 +359,7 @@ describe("useWriteHeadTrust", () => {
       restart: useRestartRequired(),
     }));
     await act(async () => {
-      await result.current.trust.write("lettuce.science", ["NATIVE"]);
+      await result.current.trust.write(headRef, ["NATIVE"]);
     });
 
     expect(result.current.restart.reasons).toEqual([
@@ -327,7 +376,7 @@ describe("useWriteHeadTrust", () => {
       restart: useRestartRequired(),
     }));
     await act(async () => {
-      await result.current.trust.write("lettuce.science", []);
+      await result.current.trust.write(headRef, []);
     });
 
     expect(result.current.restart.restartRequired).toBe(true);
@@ -341,7 +390,7 @@ describe("useWriteHeadTrust", () => {
       restart: useRestartRequired(),
     }));
     await act(async () => {
-      await result.current.trust.write("lettuce.science", ["CONTAINER"]);
+      await result.current.trust.write(headRef, ["CONTAINER"]);
     });
 
     expect(result.current.restart.restartRequired).toBe(false);
@@ -355,7 +404,7 @@ describe("useWriteHeadTrust", () => {
       restart: useRestartRequired(),
     }));
     await act(async () => {
-      await expect(result.current.trust.write("lettuce.science", ["NATIVE"])).rejects.toThrow(
+      await expect(result.current.trust.write(headRef, ["NATIVE"])).rejects.toThrow(
         "unknown runtime"
       );
     });
@@ -363,17 +412,18 @@ describe("useWriteHeadTrust", () => {
     expect(result.current.restart.restartRequired).toBe(false);
   });
 
-  it("PUTs exactly the head name and the new trusted runtimes, and returns the daemon's answer", async () => {
+  it("PUTs exactly the config alias and the new trusted runtimes, and returns the daemon's answer", async () => {
     mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true });
 
     const { result } = renderHook(() => useWriteHeadTrust());
 
     let resp: ConfigUpdateResponse | null = null;
     await act(async () => {
-      resp = await result.current.write("lettuce.science", ["CONTAINER", "NATIVE"]);
+      resp = await result.current.write(headRef, ["CONTAINER", "NATIVE"]);
     });
 
-    expect(mockConfigFn).not.toHaveBeenCalled();
+    // One config read to resolve the alias, then one PUT carrying only it.
+    expect(mockConfigFn).toHaveBeenCalledOnce();
     expect(mockUpdateConfigFn).toHaveBeenCalledOnce();
     expect(mockUpdateConfigFn).toHaveBeenCalledWith({
       servers: [{ name: "lettuce.science", trusted_runtimes: ["CONTAINER", "NATIVE"] }],
@@ -381,12 +431,45 @@ describe("useWriteHeadTrust", () => {
     expect(resp).toEqual({ status: "ok", restart_required: true });
   });
 
+  it("sends the config alias, not the display title, when the two differ", async () => {
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true });
+
+    const { result } = renderHook(() => ({
+      trust: useWriteHeadTrust(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.trust.write(titledHead, ["CONTAINER", "NATIVE"]);
+    });
+
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      servers: [{ name: "lbry.science", trusted_runtimes: ["CONTAINER", "NATIVE"] }],
+    });
+    // The person-facing message still uses the title they see on screen.
+    expect(result.current.restart.reasons).toEqual([
+      "Trust settings for LBRY.Science - Lettuce Rip are saved. Lettuce applies them the next time it starts.",
+    ]);
+  });
+
+  it("rejects without writing when the head has no config entry", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer()]));
+
+    const { result } = renderHook(() => useWriteHeadTrust());
+    await act(async () => {
+      await expect(result.current.write(titledHead, ["NATIVE"])).rejects.toThrow(
+        "is not in the daemon's configuration"
+      );
+    });
+
+    expect(mockUpdateConfigFn).not.toHaveBeenCalled();
+  });
+
   it("sends an empty list to revoke all opt-in trust", async () => {
     mockUpdateConfigFn.mockResolvedValue({ status: "ok" });
 
     const { result } = renderHook(() => useWriteHeadTrust());
     await act(async () => {
-      await result.current.write("lettuce.science", []);
+      await result.current.write(headRef, []);
     });
 
     expect(mockUpdateConfigFn).toHaveBeenCalledWith({
@@ -400,10 +483,11 @@ describe("useWriteHeadTrust", () => {
     const { result } = renderHook(() => useWriteHeadTrust());
     let resp: ConfigUpdateResponse | null = { status: "x" };
     await act(async () => {
-      resp = await result.current.write("lettuce.science", ["NATIVE"]);
+      resp = await result.current.write(headRef, ["NATIVE"]);
     });
 
     expect(resp).toBeNull();
+    expect(mockConfigFn).not.toHaveBeenCalled();
     expect(mockUpdateConfigFn).not.toHaveBeenCalled();
   });
 });
@@ -495,7 +579,7 @@ describe("useDebouncedHeadWeight", () => {
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
     act(() => {
-      result.current.write("lettuce.science", 50);
+      result.current.write(headRef, 50);
     });
 
     // config should not have been called yet
@@ -526,13 +610,13 @@ describe("useDebouncedHeadWeight", () => {
 
     // Rapid-fire updates
     act(() => {
-      result.current.write("lettuce.science", 50);
+      result.current.write(headRef, 50);
     });
     act(() => {
-      result.current.write("lettuce.science", 60);
+      result.current.write(headRef, 60);
     });
     act(() => {
-      result.current.write("lettuce.science", 80);
+      result.current.write(headRef, 80);
     });
 
     // Only after debounce should it fire
@@ -551,7 +635,7 @@ describe("useDebouncedHeadWeight", () => {
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
     act(() => {
-      result.current.write("lettuce.science", 50);
+      result.current.write(headRef, 50);
     });
 
     await act(async () => {
@@ -561,7 +645,7 @@ describe("useDebouncedHeadWeight", () => {
     expect(mockConfigFn).not.toHaveBeenCalled();
   });
 
-  it("only updates the matching server by name", async () => {
+  it("only updates the matching server, found by gRPC address", async () => {
     const cfg = makeConfig([
       makeServer(),
       makeServer({
@@ -577,7 +661,7 @@ describe("useDebouncedHeadWeight", () => {
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
     act(() => {
-      result.current.write("lettuce.science", 90);
+      result.current.write(headRef, 90);
     });
 
     await act(async () => {
@@ -588,6 +672,73 @@ describe("useDebouncedHeadWeight", () => {
       servers: [
         expect.objectContaining({ name: "lettuce.science", weight: 90 }),
         expect.objectContaining({ name: "einstein", weight: 30 }),
+      ],
+    });
+  });
+
+  it("writes to the config alias when the head's display title differs from it", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer({ weight: 100 })]));
+    mockUpdateConfigFn.mockResolvedValue({});
+
+    const { result } = renderHook(() => useDebouncedHeadWeight());
+
+    act(() => {
+      result.current.write(titledHead, 40);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      servers: [
+        expect.objectContaining({ name: "lettuce.science", weight: 70 }),
+        expect.objectContaining({ name: "lbry.science", grpc_address: "lbry.science:50051", weight: 40 }),
+      ],
+    });
+  });
+});
+
+describe("useDebouncedLeafWeight", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("writes the head's leaf weights to its config alias after the debounce", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer()]));
+    mockUpdateConfigFn.mockResolvedValue({});
+    const head: HeadInfo = {
+      ...mockHeadsData[0],
+      ...titledHead,
+      leafs: [
+        { ...mockHeadsData[0].leafs[0], slug: "prime", effective_weight: 50 },
+        { ...mockHeadsData[0].leafs[0], id: "leaf-2", slug: "mandel", effective_weight: 30, enabled: false },
+      ],
+    };
+
+    const { result } = renderHook(() => useDebouncedLeafWeight());
+
+    act(() => {
+      result.current.write(head, "prime", 80);
+    });
+    expect(mockConfigFn).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      servers: [
+        expect.objectContaining({ name: "lettuce.science" }),
+        expect.objectContaining({
+          name: "lbry.science",
+          leaf_preferences: { mode: "SPECIFIC", weights: { prime: 80, mandel: 30 }, enabled: ["prime"] },
+        }),
       ],
     });
   });
@@ -612,7 +763,7 @@ describe("useWriteLeafPreferences", () => {
     };
 
     await act(async () => {
-      await result.current.write("lettuce.science", newPrefs);
+      await result.current.write(headRef, newPrefs);
     });
 
     expect(mockConfigFn).toHaveBeenCalledOnce();
@@ -634,7 +785,7 @@ describe("useWriteLeafPreferences", () => {
     const { result } = renderHook(() => useWriteLeafPreferences());
 
     await act(async () => {
-      await result.current.write("lettuce.science", { mode: "SPECIFIC", enabled: ["prime"] });
+      await result.current.write(headRef, { mode: "SPECIFIC", enabled: ["prime"] });
     });
 
     const updatedServers = mockUpdateConfigFn.mock.calls[0][0].servers as ServerConfig[];
@@ -650,9 +801,37 @@ describe("useWriteLeafPreferences", () => {
     const { result } = renderHook(() => useWriteLeafPreferences());
 
     await act(async () => {
-      await result.current.write("lettuce.science", { mode: "ALL" });
+      await result.current.write(headRef, { mode: "ALL" });
     });
 
     expect(mockConfigFn).not.toHaveBeenCalled();
+  });
+
+  it("writes to the config alias when the head's display title differs from it", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer()]));
+    mockUpdateConfigFn.mockResolvedValue({});
+
+    const { result } = renderHook(() => useWriteLeafPreferences());
+    await act(async () => {
+      await result.current.write(titledHead, { mode: "SPECIFIC", enabled: ["prime"] });
+    });
+
+    const updatedServers = mockUpdateConfigFn.mock.calls[0][0].servers as ServerConfig[];
+    expect(updatedServers.map((s) => s.name)).toEqual(["lettuce.science", "lbry.science"]);
+    expect(updatedServers[0].leaf_preferences).toEqual({ mode: "ALL" });
+    expect(updatedServers[1].leaf_preferences).toEqual({ mode: "SPECIFIC", enabled: ["prime"] });
+  });
+
+  it("rejects without writing when the head has no config entry", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer()]));
+
+    const { result } = renderHook(() => useWriteLeafPreferences());
+    await act(async () => {
+      await expect(result.current.write(titledHead, { mode: "ALL" })).rejects.toThrow(
+        "LBRY.Science - Lettuce Rip (lbry.science:50051) is not in the daemon's configuration"
+      );
+    });
+
+    expect(mockUpdateConfigFn).not.toHaveBeenCalled();
   });
 });

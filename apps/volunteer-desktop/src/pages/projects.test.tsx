@@ -144,7 +144,7 @@ function headsState(overrides: Partial<ReturnType<typeof mockUseHeads>> = {}) {
   return {
     heads: mockHeads,
     machine: mockMachine,
-    trustByHead: { "lettuce.science": ["CONTAINER"], "einstein@home": [] },
+    trustByHead: { "lettuce.science:443": ["CONTAINER"], "einstein.phys.uwm.edu:443": [] },
     isLoading: false,
     error: null,
     refetch: mockRefetch,
@@ -234,7 +234,7 @@ describe("ProjectsPage", () => {
     await user.click(defaultBtns[0]);
 
     expect(mockWriteLeafPrefs).toHaveBeenCalledWith(
-      "lettuce.science",
+      expect.objectContaining({ name: "lettuce.science", grpc_address: "lettuce.science:443" }),
       { mode: "ALL" }
     );
   });
@@ -293,7 +293,7 @@ describe("ProjectsPage", () => {
     await user.click(screen.getAllByText("Confirm")[0]);
 
     expect(mockClient.detachHead).toHaveBeenCalledWith({
-      server_name: "lettuce.science",
+      server_address: "lettuce.science:443",
     });
 
     await waitFor(() => {
@@ -340,7 +340,7 @@ describe("ProjectsPage", () => {
 
     // When all 3 leafs become enabled, mode should be ALL
     expect(mockWriteLeafPrefs).toHaveBeenCalledWith(
-      "lettuce.science",
+      expect.objectContaining({ grpc_address: "lettuce.science:443" }),
       { mode: "ALL" }
     );
   });
@@ -358,7 +358,7 @@ describe("ProjectsPage", () => {
     await user.click(firstChecked!);
 
     expect(mockWriteLeafPrefs).toHaveBeenCalledWith(
-      "lettuce.science",
+      expect.objectContaining({ grpc_address: "lettuce.science:443" }),
       expect.objectContaining({ mode: "SPECIFIC" })
     );
   });
@@ -529,11 +529,50 @@ describe("ProjectsPage", () => {
     await user.click(screen.getByText("Save trust settings"));
 
     await waitFor(() => {
-      expect(mockWriteHeadTrust).toHaveBeenCalledWith("lettuce.science", ["CONTAINER", "NATIVE"]);
+      expect(mockWriteHeadTrust).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "lettuce.science", grpc_address: "lettuce.science:443" }),
+        ["CONTAINER", "NATIVE"]
+      );
     });
     expect(mockSetTrustByHead).toHaveBeenCalled();
     const updater = mockSetTrustByHead.mock.calls[0][0];
-    expect(updater({ other: [] })).toEqual({ other: [], "lettuce.science": ["CONTAINER", "NATIVE"] });
+    expect(updater({ other: [] })).toEqual({ other: [], "lettuce.science:443": ["CONTAINER", "NATIVE"] });
+  });
+
+  it("identifies a head by gRPC address in every write when its display title differs from the config alias", async () => {
+    const user = userEvent.setup();
+    const titled: HeadInfo = {
+      ...mockHeads[0],
+      name: "LBRY.Science - Lettuce Rip",
+      grpc_address: "lbry.science:50051",
+      leafs: [makeLeaf(), makeLeaf({ id: "leaf-2", slug: "mandelbrot", name: "Mandelbrot Analysis" })],
+    };
+    mockUseHeads.mockReturnValue(
+      headsState({ heads: [titled], trustByHead: { "lbry.science:50051": ["CONTAINER"] } })
+    );
+    const ref = expect.objectContaining({
+      name: "LBRY.Science - Lettuce Rip",
+      grpc_address: "lbry.science:50051",
+    });
+
+    render(<ProjectsPage />);
+
+    // Trust is looked up by address, so the chips reflect the config entry.
+    expect(screen.getByText("Container")).toHaveTextContent("Container ✓");
+
+    await user.click(screen.getByText("Change..."));
+    await user.click(screen.getByText("Save trust settings"));
+    await waitFor(() => expect(mockWriteHeadTrust).toHaveBeenCalledWith(ref, ["CONTAINER"]));
+
+    await user.click(screen.getAllByRole("checkbox")[0]);
+    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "SPECIFIC", enabled: ["mandelbrot"] });
+
+    await user.click(screen.getByText("Use Defaults"));
+    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "ALL" });
+
+    await user.click(screen.getByText("Detach"));
+    await user.click(screen.getByText("Confirm"));
+    expect(mockClient.detachHead).toHaveBeenCalledWith({ server_address: "lbry.science:50051" });
   });
 
   it("shows the daemon's error in the trust editor when the save fails", async () => {
