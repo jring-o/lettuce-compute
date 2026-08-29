@@ -19,7 +19,7 @@
 # `docker compose down` (no -p) so they do not linger. This is a comment; the CI
 # guardrail that forbids un-pinned `docker compose` invocations ignores comments.
 
-.PHONY: dev-up dev-down dev-logs dev-rebuild dev-reset
+.PHONY: dev-up dev-down dev-logs dev-rebuild dev-reset desktop-sidecar desktop-build
 
 COMPOSE_DEV := docker compose -f compose.yaml -p lettuce-dev
 
@@ -37,3 +37,22 @@ dev-rebuild:
 
 dev-reset:
 	@printf "This DELETES the dev database volume (project lettuce-dev). Type 'dev' to continue: " && read ans && [ "$$ans" = "dev" ] && $(COMPOSE_DEV) down -v || { echo "aborted — nothing was removed"; exit 1; }
+
+# Desktop app (apps/volunteer-desktop). These are local build shortcuts; they never touch a
+# compose stack. See apps/volunteer-desktop/README.md for prerequisites, the signing key the
+# installer build needs, and the release procedure.
+
+DESKTOP_DIR := apps/volunteer-desktop
+
+# Compile the volunteer command-line client the app bundles (its "sidecar") for this machine.
+desktop-sidecar:
+	cd $(DESKTOP_DIR) && ./scripts/build-sidecar.sh
+
+# Build an installer for this machine: sidecar, web dependencies, then `tauri build`.
+# On Windows the bundle also needs the pinned Podman installer, which the PowerShell script
+# downloads once and verifies.
+desktop-build: desktop-sidecar
+ifeq ($(OS),Windows_NT)
+	cd $(DESKTOP_DIR) && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-podman-installer.ps1
+endif
+	cd $(DESKTOP_DIR) && npm ci && npm run tauri build

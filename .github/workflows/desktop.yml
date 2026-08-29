@@ -1,0 +1,270 @@
+# Desktop app (apps/volunteer-desktop): checks, release builds, and updater promotion.
+#
+# Three jobs share this file because they share triggers and paths; each is gated by an
+# `if:` on the event that concerns it.
+#
+#   desktop-check    pull requests and pushes to main that touch the app or the volunteer
+#                    client it bundles. Builds the sidecar, runs the unit tests, the web
+#                    build, and a Rust type-check on Windows.
+#   desktop-release  a pushed tag desktop-vX.Y.Z (or a manual run). Builds signed
+#                    installers for Windows, macOS (Apple Silicon and Intel) and Linux
+#                    with tauri-action, which attaches them, their .sig files and the
+#                    updater manifest (latest.json) to a DRAFT GitHub release. The
+#                    operator reviews the draft, writes the notes, and publishes it.
+#   desktop-promote  the moment a desktop-v* release is published. Copies latest.json
+#                    onto the fixed "desktop-latest" release the app's updater polls and
+#                    re-points the desktop-latest tag. Nothing reaches installed apps
+#                    until this job has run against a PUBLIC release, which is why it is
+#                    tied to publication rather than to the build.
+#
+# Path filters are not evaluated for tag pushes (a GitHub rule), so the `paths:` under
+# `push:` only narrows branch pushes; every desktop-v* tag push starts the workflow.
+name: Desktop app
+
+on:
+  pull_request:
+    paths:
+      - 'apps/volunteer-desktop/**'
+      - 'services/volunteer-cli/**'
+      - '.github/workflows/desktop.yml'
+  push:
+    branches: [main]
+    tags: ['desktop-v*']
+    paths:
+      - 'apps/volunteer-desktop/**'
+      - 'services/volunteer-cli/**'
+      - '.github/workflows/desktop.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: >-
+          Leave empty to build a release from this ref. To re-run only the promotion step,
+          give an already PUBLISHED desktop release tag (for example desktop-v2.0.0) whose
+          latest.json should become the updater manifest.
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  desktop-check:
+    name: Desktop app (check)
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/volunteer-desktop
+        shell: pwsh
+    steps:
+      # Actions are pinned by commit SHA (BG-31), as in ci.yml and release.yml: a mutable
+      # tag could be re-pointed by a compromised action repository. Update pins
+      # deliberately by editing the SHA (the trailing comment names the release).
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history and tags: the sidecar's version stamp comes from `git describe --tags`.
+          fetch-depth: 0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: services/volunteer-cli/go.mod
+          cache-dependency-path: services/volunteer-cli/go.sum
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/volunteer-desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/volunteer-desktop/src-tauri
+      - name: Build the volunteer client sidecar
+        run: ./scripts/build-sidecar.ps1
+      - name: Fetch the pinned Podman installer (bundled on Windows)
+        run: ./scripts/fetch-podman-installer.ps1
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Type-check the Rust shell
+        working-directory: apps/volunteer-desktop/src-tauri
+        run: cargo check --locked
+
+  desktop-release:
+    name: Desktop app (release, ${{ matrix.name }})
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.promote == '')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ''
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            args: '--target aarch64-apple-darwin'
+          - name: macos-x86_64
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            args: '--target x86_64-apple-darwin'
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: ''
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      # tauri-action names the release after the version in tauri.conf.json, so a tag that
+      # disagrees with the configured version would silently produce a release under a
+      # different name. Refuse to build in that case, and insist the three version fields
+      # agree with each other.
+      - name: Check that the tag and the app version agree
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          conf=$(jq -r .version apps/volunteer-desktop/src-tauri/tauri.conf.json)
+          pkg=$(jq -r .version apps/volunteer-desktop/package.json)
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' apps/volunteer-desktop/src-tauri/Cargo.toml | head -n 1)
+          if [ "$conf" != "$pkg" ] || [ "$conf" != "$cargo" ]; then
+            echo "::error::version fields disagree: tauri.conf.json=$conf package.json=$pkg Cargo.toml=$cargo"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "desktop-v$conf" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the app version $conf (expected desktop-v$conf)"
+            exit 1
+          fi
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: services/volunteer-cli/go.mod
+          cache-dependency-path: services/volunteer-cli/go.sum
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/volunteer-desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-05
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/volunteer-desktop/src-tauri
+          key: ${{ matrix.target }}
+      # Tauri renders the interface in the system web view; on Linux that is WebKitGTK,
+      # and the AppImage packager needs patchelf. See https://v2.tauri.app/start/prerequisites/
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: Build the volunteer client sidecar
+        if: runner.os == 'Windows'
+        working-directory: apps/volunteer-desktop
+        shell: pwsh
+        run: ./scripts/build-sidecar.ps1 -Target ${{ matrix.target }}
+      - name: Build the volunteer client sidecar
+        if: runner.os != 'Windows'
+        working-directory: apps/volunteer-desktop
+        shell: bash
+        run: ./scripts/build-sidecar.sh --target ${{ matrix.target }}
+      - name: Fetch the pinned Podman installer (bundled on Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/volunteer-desktop
+        shell: pwsh
+        run: ./scripts/fetch-podman-installer.ps1
+      - name: Install web dependencies
+        working-directory: apps/volunteer-desktop
+        run: npm ci
+      # Builds the app (running `npm run build` first, per tauri.conf.json), signs the
+      # update bundles with the private key, and uploads installers, .sig files and
+      # latest.json to a draft release named after the app version. __VERSION__ is
+      # replaced by tauri-action with the version from tauri.conf.json.
+      - name: Build, sign and upload the installers
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          projectPath: apps/volunteer-desktop
+          tagName: desktop-v__VERSION__
+          releaseName: 'Lettuce Compute desktop v__VERSION__'
+          releaseBody: |
+            Draft created by the desktop release workflow. Before publishing:
+
+            1. Replace this text with release notes a newcomer can follow (see "Releases"
+               in apps/volunteer-desktop/README.md for what they must contain).
+            2. Leave "Set as the latest release" UNCHECKED. The volunteer command-line client
+               updates itself from the repository's latest release, which must stay a
+               client (v*) release.
+
+            Publishing this release moves the desktop app's auto-updater to this version.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+  desktop-promote:
+    name: Point desktop-latest at the published release
+    if: (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'desktop-v')) || (github.event_name == 'workflow_dispatch' && inputs.promote != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.promote }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Check the release is public and its manifest matches the tag
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            desktop-v*) ;;
+            *) echo "::error::'$TAG' is not a desktop release tag (expected desktop-vX.Y.Z)"; exit 1 ;;
+          esac
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "false" ]; then
+            echo "::error::$TAG is still a draft. Publish it first; the updater must never point at assets the public cannot download."
+            exit 1
+          fi
+          gh release download "$TAG" --pattern latest.json --dir manifest --clobber
+          version="${TAG#desktop-v}"
+          if ! jq -e --arg v "$version" '.version == $v' manifest/latest.json > /dev/null; then
+            echo "::error::latest.json on $TAG carries version $(jq -r .version manifest/latest.json), not $version"
+            exit 1
+          fi
+          echo "Manifest for $version covers: $(jq -r '.platforms | keys | join(", ")' manifest/latest.json)"
+      # The volunteer command-line client's `update` command reads this repository's
+      # "latest" release (releases/latest) and expects client binaries in it. A desktop
+      # release must never occupy that slot.
+      - name: Keep the desktop release out of the repository's "latest" slot
+        run: gh release edit "$TAG" --latest=false
+      - name: Move the desktop-latest tag to the released commit
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          sha=$(git rev-list -n 1 "refs/tags/$TAG")
+          git push --force origin "$sha:refs/tags/desktop-latest"
+      - name: Publish the manifest on the desktop-latest release
+        run: |
+          set -euo pipefail
+          notes="Not a release to install. This fixed tag carries only latest.json, the manifest the desktop app's auto-updater polls. It currently points at $TAG; the installers are on that release. Re-pointed automatically by the desktop workflow whenever a desktop-v* release is published."
+          if gh release view desktop-latest > /dev/null 2>&1; then
+            gh release edit desktop-latest --title "Desktop updater manifest" --notes "$notes" --latest=false
+          else
+            gh release create desktop-latest --title "Desktop updater manifest" --notes "$notes" --latest=false
+          fi
+          gh release upload desktop-latest manifest/latest.json --clobber
+          echo "Updater manifest now serves $TAG from https://github.com/${GITHUB_REPOSITORY}/releases/download/desktop-latest/latest.json"
