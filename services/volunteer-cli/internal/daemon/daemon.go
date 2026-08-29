@@ -891,11 +891,19 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	// nothing about whether the artifact runs here.
 	d.noteLeafSuccess(wu)
 
-	// Persist result JSON for replay if the leaf has a viz bundle.
+	// Persist result JSON for replay if the leaf has a viz bundle. The bundle
+	// the runtime extracted into the work directory is already gone (the slot
+	// removed the work directory on completion), so SaveResult re-extracts a
+	// persistent copy from the cached tarball, identified by the spec's URL
+	// and checksum.
 	if result.VizBundlePath != "" && len(result.Result.OutputData) > 0 {
 		leafName, leafSlug := d.resolveLeafInfo(wu.LeafID)
 		maxBytes := int64(d.cfg.ResultCacheMaxMB) * 1024 * 1024
-		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, result.VizBundlePath, maxBytes); err != nil {
+		viz := VizBundleSource{
+			URL:      wu.ExecutionSpec.Binaries["viz"],
+			Checksum: strings.ToLower(wu.ExecutionSpec.BinaryChecksums["viz"]),
+		}
+		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, viz, maxBytes); err != nil {
 			d.logger.Warn("failed to persist result for replay",
 				"work_unit_id", wu.ID,
 				"error", err,

@@ -1,6 +1,9 @@
 package management
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -275,7 +278,7 @@ func TestHandleGetHistory(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 			WorkUnitID:       fmt.Sprintf("wu-%d", i),
-			LeafID:        "proj-1",
+			LeafID:           "proj-1",
 			CompletedAt:      time.Now().UTC().Add(-time.Duration(i) * time.Hour),
 			WallClockSeconds: 100,
 			ResultAccepted:   true,
@@ -391,21 +394,21 @@ func TestHandleGetCredit(t *testing.T) {
 	// Write history entries.
 	daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 		WorkUnitID:       "wu-1",
-		LeafID:        "proj-a",
+		LeafID:           "proj-a",
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: 60,
 		ResultAccepted:   true,
 	})
 	daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 		WorkUnitID:       "wu-2",
-		LeafID:        "proj-a",
+		LeafID:           "proj-a",
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: 120,
 		ResultAccepted:   true,
 	})
 	daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 		WorkUnitID:       "wu-3",
-		LeafID:        "proj-b",
+		LeafID:           "proj-b",
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: 30,
 		ResultAccepted:   false, // rejected — should not count
@@ -548,13 +551,13 @@ func TestHistoryWithTimeFilter(t *testing.T) {
 	// Write entries at different times.
 	daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 		WorkUnitID:     "wu-old",
-		LeafID:      "proj-1",
+		LeafID:         "proj-1",
 		CompletedAt:    now.Add(-48 * time.Hour),
 		ResultAccepted: true,
 	})
 	daemon.AppendHistory(env.dataDir, daemon.HistoryEntry{
 		WorkUnitID:     "wu-recent",
-		LeafID:      "proj-1",
+		LeafID:         "proj-1",
 		CompletedAt:    now.Add(-1 * time.Hour),
 		ResultAccepted: true,
 	})
@@ -943,9 +946,9 @@ func TestHandleGetHeads_WithCachedLeafs(t *testing.T) {
 				ActiveVolunteers: 7,
 			},
 			{
-				ID:   "leaf-2",
-				Slug: "protein-fold",
-				Name: "Protein Folding",
+				ID:    "leaf-2",
+				Slug:  "protein-fold",
+				Name:  "Protein Folding",
 				State: "ACTIVE",
 			},
 		},
@@ -1492,9 +1495,9 @@ func (m *e2eMockRuntime) Execute(ctx context.Context, wu *runtime.WorkUnit, prep
 	}
 	return &runtime.ExecutionResult{OutputData: []byte("ok"), ExitCode: 0}, nil
 }
-func (m *e2eMockRuntime) Cleanup(prep *runtime.PrepareResult) error { return nil }
+func (m *e2eMockRuntime) Cleanup(prep *runtime.PrepareResult) error  { return nil }
 func (m *e2eMockRuntime) CanHandle(spec *runtime.ExecutionSpec) bool { return true }
-func (m *e2eMockRuntime) Name() string                              { return "native" }
+func (m *e2eMockRuntime) Name() string                               { return "native" }
 
 // e2eMockProcessHandle satisfies daemon.ProcessHandle for per-task suspend/resume.
 type e2eMockProcessHandle struct {
@@ -1575,8 +1578,7 @@ func setupTestEnvWithActiveTask(t *testing.T) (env *testEnv, workUnitID string, 
 			Runtime:         "native",
 			DeadlineSeconds: 3600,
 		},
-		WUResp: &lettucev1.WorkUnitAssignment{
-			},
+		WUResp: &lettucev1.WorkUnitAssignment{},
 		Prep: &runtime.PrepareResult{
 			WorkDir: workDir,
 		},
@@ -1881,10 +1883,13 @@ func TestHandleListResults_WithEntries(t *testing.T) {
 	env := setupTestEnv(t)
 
 	// Save some results directly using the daemon package. IDs must be canonical
-	// UUIDs (H2 path-traversal fix in SaveResult/GetResultData).
+	// UUIDs (H2 path-traversal fix in SaveResult/GetResultData). SaveResult
+	// re-extracts the leaf's visualization bundle from the cached tarball into
+	// its persistent replay copy, so one must exist.
+	viz := seedVizTarballForTest(t, env.dataDir, "https://head.example.org/viz/test-leaf.tar.gz")
 	for _, id := range []string{"11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"} {
 		err := daemon.SaveResult(env.dataDir, id, "Test Leaf", "test-leaf", "test-head",
-			[]byte(`{"data": "ok"}`), "/viz/bundle.html", 0)
+			[]byte(`{"data": "ok"}`), viz, 0)
 		if err != nil {
 			t.Fatalf("SaveResult(%s) error: %v", id, err)
 		}
@@ -1912,9 +1917,42 @@ func TestHandleListResults_WithEntries(t *testing.T) {
 	if first["head_name"] != "test-head" {
 		t.Errorf("head_name = %v, want test-head", first["head_name"])
 	}
-	if first["viz_bundle_path"] != "/viz/bundle.html" {
-		t.Errorf("viz_bundle_path = %v, want /viz/bundle.html", first["viz_bundle_path"])
+	// The replay path must be the daemon's persistent copy — never a path
+	// inside a work directory, which is deleted on completion.
+	vizPath, _ := first["viz_bundle_path"].(string)
+	if !strings.HasPrefix(vizPath, daemon.VizBundlesDir(env.dataDir)) {
+		t.Errorf("viz_bundle_path = %q, want a path under %s", vizPath, daemon.VizBundlesDir(env.dataDir))
 	}
+	if _, err := os.Stat(filepath.Join(vizPath, "index.html")); err != nil {
+		t.Errorf("viz_bundle_path does not hold a replayable bundle: %v", err)
+	}
+}
+
+// seedVizTarballForTest writes a minimal gzipped tar (index.html only) where
+// the runtime would have cached the bundle for this URL, and returns the
+// matching source for SaveResult.
+func seedVizTarballForTest(t *testing.T, dataDir, url string) daemon.VizBundleSource {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	content := "<html>viz</html>"
+	if err := tw.WriteHeader(&tar.Header{Name: "index.html", Mode: 0o644, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tw.Close()
+	gw.Close()
+	path := runtime.VizTarballPath(dataDir, runtime.VizBundleKey(url, ""))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return daemon.VizBundleSource{URL: url}
 }
 
 func TestHandleGetResult_Found(t *testing.T) {
@@ -1922,7 +1960,7 @@ func TestHandleGetResult_Found(t *testing.T) {
 
 	outputData := []byte(`{"answer": 42, "details": "computed"}`)
 	const wuID = "33333333-3333-4333-8333-333333333333"
-	err := daemon.SaveResult(env.dataDir, wuID, "Leaf", "leaf", "head", outputData, "", 0)
+	err := daemon.SaveResult(env.dataDir, wuID, "Leaf", "leaf", "head", outputData, daemon.VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
