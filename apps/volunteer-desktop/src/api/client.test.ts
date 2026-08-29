@@ -185,46 +185,6 @@ describe("ManagementClient", () => {
     });
   });
 
-  describe("leaf listings", () => {
-    it("attachedLeafs sends GET /api/v1/leafs and unwraps", async () => {
-      const rows = [
-        {
-          server_name: "lettuce.science",
-          server_address: "lettuce.science:443",
-          leaf_id: "leaf-1",
-          status: "connected",
-          credit_earned: 3,
-          work_units_completed: 3,
-        },
-      ];
-      respond({ leafs: rows });
-      expect(await client.attachedLeafs()).toEqual(rows);
-      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/leafs", body: null });
-    });
-
-    it("availableLeafs sends GET /api/v1/leafs/browse without params", async () => {
-      respond({ leafs: null });
-      expect(await client.availableLeafs()).toEqual([]);
-      expect(mgmtCall().path).toBe("/api/v1/leafs/browse");
-    });
-
-    it("availableLeafs encodes search and research_area", async () => {
-      respond({ leafs: [] });
-      await client.availableLeafs({ query: "climate", research_area: "earth" });
-      const { path } = mgmtCall();
-      expect(path).toContain("/api/v1/leafs/browse?");
-      expect(path).toContain("search=climate");
-      expect(path).toContain("research_area=earth");
-    });
-
-    it("catalogLeafs sends GET /api/v1/leafs/available and normalises research_area", async () => {
-      respond({ leafs: [{ id: "l1", slug: "prime", name: "Prime" }] });
-      const result = await client.catalogLeafs();
-      expect(mgmtCall().path).toBe("/api/v1/leafs/available");
-      expect(result[0].research_area).toEqual([]);
-    });
-  });
-
   describe("history", () => {
     it("sends GET /api/v1/history without params", async () => {
       const body = { entries: [], pagination: { next_cursor: "", has_more: false } };
@@ -343,13 +303,6 @@ describe("ManagementClient", () => {
       expect(result.machine.gpu_vendors).toEqual([]);
       expect(result.machine.gpu_compute_capabilities).toEqual([]);
       expect(result.machine.max_disk_mb).toBe(10240);
-    });
-
-    it("heads returns only the head list", async () => {
-      respond({ heads: [head], machine });
-      const result = await client.heads();
-      expect(result).toHaveLength(1);
-      expect(result[0].name).toBe("lettuce.science");
     });
 
     it("tolerates a missing machine block", async () => {

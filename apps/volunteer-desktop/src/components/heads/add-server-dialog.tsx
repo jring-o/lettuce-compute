@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
 import { useClient } from "@/hooks/use-api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ApiError, type HeadPreview, type MachineCapabilities } from "@/api/client";
+import {
+  ApiError,
+  fetchHeadInfo,
+  testServerConnection,
+  type HeadPreview,
+  type MachineCapabilities,
+} from "@/api/client";
 import {
   RuntimeTrustFields,
   trustedRuntimesFromChoice,
@@ -18,18 +23,6 @@ interface AddServerDialogProps {
   onServerAdded: (headName: string) => void;
   /** This machine's capabilities; decides whether container trust can be offered. */
   machine: MachineCapabilities | null;
-}
-
-/** Shape of the `fetch_head_info` command's result (the head's public `GET /api/v1/head`). */
-interface RawHeadInfo {
-  name?: string;
-  description?: string;
-  leafs?: Array<{
-    slug: string;
-    name: string;
-    research_area?: string | string[] | null;
-    state?: string;
-  }>;
 }
 
 function researchAreas(value: string | string[] | null | undefined): string[] {
@@ -85,15 +78,15 @@ export function AddServerDialog({
     setTestError(null);
     setHeadPreview(null);
     try {
-      await invoke<{ status: string }>("test_server_connection", { url: url.trim() });
+      await testServerConnection(url.trim());
 
       let preview: HeadPreview = { name: url.trim(), description: "", leafs: [] };
       try {
-        const headData = await invoke<RawHeadInfo>("fetch_head_info", { url: url.trim() });
+        const head = await fetchHeadInfo(url.trim());
         preview = {
-          name: headData.name || url.trim(),
-          description: headData.description ?? "",
-          leafs: (headData.leafs ?? [])
+          name: head.name || url.trim(),
+          description: head.description,
+          leafs: head.leafs
             .filter((l) => !l.state || l.state === "ACTIVE")
             .map((l) => ({ slug: l.slug, name: l.name, research_area: researchAreas(l.research_area) })),
         };

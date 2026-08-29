@@ -21,7 +21,7 @@ export function choiceFromTrustedRuntimes(runtimes: string[]): RuntimeTrustChoic
  * The note shown under the container option when this machine has no
  * container engine the daemon can use.
  */
-export const CONTAINER_UNAVAILABLE_NOTE =
+const CONTAINER_UNAVAILABLE_NOTE =
   "No Docker or Podman backend was detected on this machine, so container tasks cannot be offered.";
 
 interface RuntimeTrustFieldsProps {

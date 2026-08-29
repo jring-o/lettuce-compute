@@ -8,10 +8,11 @@ import lettuceLeaf from "@/assets/lettuce-leaf.png";
 
 /**
  * Emitted once the setup wizard has finished and the daemon is up. The Rust
- * host listens for it to start the tray poll, notifications and the container
- * runtime without the app being relaunched.
+ * host listens for it (`APP_INITIALIZED_EVENT` in `main.rs`) to start the
+ * tray poll, notifications and the container runtime without the app being
+ * relaunched.
  */
-export const APP_INITIALIZED_EVENT = "app_initialized";
+const APP_INITIALIZED_EVENT = "app_initialized";
 
 function LoadingScreen() {
   return (

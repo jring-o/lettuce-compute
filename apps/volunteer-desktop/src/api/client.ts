@@ -131,41 +131,6 @@ export interface MetricsResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Leafs: GET /api/v1/leafs, GET /api/v1/leafs/browse, GET /api/v1/leafs/available
-// ---------------------------------------------------------------------------
-
-/**
- * One row of `GET /api/v1/leafs`: a configured head, or — when the head has
- * explicitly pinned leaf IDs — one row per pinned leaf (`leaf_id` set).
- */
-export interface AttachedLeaf {
-  server_name: string;
-  server_address: string;
-  leaf_id?: string;
-  leaf_name?: string;
-  status: "connected" | "disconnected";
-  /** Accepted work units on this head, from local history (one unit = one credit). */
-  credit_earned: number;
-  work_units_completed: number;
-}
-
-/** One row of `GET /api/v1/leafs/browse`: a pinned leaf on a configured head. */
-export interface AvailableLeaf {
-  server_name: string;
-  leaf_id: string;
-  leaf_name: string;
-  description?: string;
-  research_area?: string;
-}
-
-/** Query parameters of `GET /api/v1/leafs/browse`. Both match case-insensitively. */
-export interface SearchParams {
-  /** Substring of the leaf name or ID (`search` on the wire). */
-  query?: string;
-  research_area?: string;
-}
-
-// ---------------------------------------------------------------------------
 // GET /api/v1/history
 // ---------------------------------------------------------------------------
 
@@ -365,7 +330,7 @@ export interface ConfigUpdateResponse {
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/heads (and GET /api/v1/leafs/available, which returns LeafInfo[])
+// GET /api/v1/heads
 // ---------------------------------------------------------------------------
 
 export interface ExecutionSpec {
@@ -1012,47 +977,12 @@ export class ManagementClient {
     };
   }
 
-  /** The `heads` half of `headsAndMachine()`. */
-  async heads(): Promise<HeadInfo[]> {
-    return (await this.headsAndMachine()).heads;
-  }
-
   async attachHead(req: AttachRequest): Promise<void> {
     await this.request("POST", "/api/v1/leafs/attach", req);
   }
 
   async detachHead(req: DetachRequest): Promise<void> {
     await this.request("POST", "/api/v1/leafs/detach", req);
-  }
-
-  /** `GET /api/v1/leafs`: one row per configured head, or per pinned leaf. */
-  async attachedLeafs(): Promise<AttachedLeaf[]> {
-    const resp = await this.request<{ leafs: AttachedLeaf[] | null }>(
-      "GET",
-      "/api/v1/leafs"
-    );
-    return list(resp.leafs);
-  }
-
-  /** `GET /api/v1/leafs/browse`: pinned leafs across heads, filtered by `params`. */
-  async availableLeafs(params?: SearchParams): Promise<AvailableLeaf[]> {
-    const query = new URLSearchParams();
-    if (params?.query) query.set("search", params.query);
-    if (params?.research_area) query.set("research_area", params.research_area);
-    const resp = await this.request<{ leafs: AvailableLeaf[] | null }>(
-      "GET",
-      withQuery("/api/v1/leafs/browse", query)
-    );
-    return list(resp.leafs);
-  }
-
-  /** `GET /api/v1/leafs/available`: every leaf of every configured head (same rows as `heads()[].leafs`). */
-  async catalogLeafs(): Promise<LeafInfo[]> {
-    const resp = await this.request<{ leafs: RawLeafInfo[] | null }>(
-      "GET",
-      "/api/v1/leafs/available"
-    );
-    return list(resp.leafs).map(normaliseLeaf);
   }
 
   // --- history, credit, results ---
