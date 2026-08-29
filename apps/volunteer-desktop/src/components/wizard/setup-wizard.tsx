@@ -1,19 +1,33 @@
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { cn, detectPlatform } from "@/lib/utils";
+import {
+  buildInitSchedule,
+  describeWindow,
+  formatHour,
+  WEEKDAYS,
+  WEEKDAY_LABELS,
+  type Weekday,
+  type WizardScheduleMode,
+} from "@/lib/schedule-mode";
 import lettuceLeaf from "@/assets/lettuce-leaf.png";
-import type { HeadPreview, ContainerRuntimeStatus, PodmanPrerequisites } from "@/api/client";
-import { getContainerRuntimeStatus, checkPodmanPrerequisites, installPodman, getSystemMemoryMb } from "@/api/client";
+import type { HeadPreview, ContainerRuntimeDetection, PodmanPrerequisites } from "@/api/client";
+import {
+  checkPodmanPrerequisites,
+  detectContainerRuntime,
+  fetchHeadInfo,
+  getSystemMemoryMb,
+  installPodman,
+  runInit,
+  testServerConnection,
+} from "@/api/client";
 
 interface WizardProps {
   onComplete: () => void;
 }
-
-type ScheduleMode = "ALWAYS" | "IDLE" | "CRON";
 
 interface WizardState {
   cpuCores: number;
@@ -21,13 +35,21 @@ interface WizardState {
   gpuVramPct: number;
   diskGb: number;
   totalMemoryMb: number;
-  scheduleMode: ScheduleMode;
+  scheduleMode: WizardScheduleMode;
   idleThresholdMins: number;
-  scheduleStartHour: number;
-  scheduleEndHour: number;
+  scheduleFromHour: number;
+  scheduleToHour: number;
+  scheduleDays: Weekday[];
+  /** A container engine answered in the Container Runtime step. */
+  containerRuntimeDetected: boolean;
   serverUrl: string;
+  /** "Test Connection" succeeded for the current `serverUrl`. */
+  connectionOk: boolean;
   headPreview: HeadPreview | null;
   enabledLeafSlugs: string[];
+  /** Runtime-trust consent for the head at `serverUrl` (WASM is always allowed). */
+  trustContainer: boolean;
+  trustNative: boolean;
 }
 
 const maxCpuCores = navigator.hardwareConcurrency || 4;
@@ -36,6 +58,10 @@ const maxCpuCores = navigator.hardwareConcurrency || 4;
 // capped the memory slider at ~7.4 GB, below the floor of large-memory leaves
 // (e.g. extract2 needs ≥28 GB), so those volunteers were never matched to work.
 const FALLBACK_TOTAL_MEMORY_MB = 8192;
+
+const SKIP_CONTAINER_LABEL = "Skip — WASM and native only";
+
+const HOURS = Array.from({ length: 24 }, (_, h) => h);
 
 function StepIndicator({ current, total }: { current: number; total: number }) {
   return (
@@ -81,21 +107,37 @@ function IdentityStep({
       <div className="text-center space-y-2">
         <h2 className="text-2xl font-bold">Identity</h2>
         <p className="text-muted-foreground">
-          We'll generate a cryptographic identity for you when setup completes.
+          Your account is a keypair on this computer. Setup creates it for you.
         </p>
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Cryptographic Identity</CardTitle>
+          <CardTitle className="text-base">The keypair is the account</CardTitle>
           <CardDescription>
-            Your Ed25519 keypair will be generated automatically.
+            When setup completes, Lettuce generates two files in{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.lettuce/</code>:{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.key</code> (private)
+            and <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.pub</code>. There
+            is no username or password — those two files are your account, and credit for
+            completed work is recorded against them.
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          <div className="rounded-md bg-muted p-3 text-xs font-mono text-muted-foreground">
-            Key will be generated at ~/.lettuce/identity.key
-          </div>
+        <CardContent className="space-y-3 text-sm text-muted-foreground">
+          <p>
+            <span className="font-medium text-foreground">Several machines, one account.</span>{" "}
+            A head tracks up to 10 machines per account separately (its default); more still run,
+            but share one work allowance. To use this account on another machine, copy{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.key</code> and{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.pub</code> into that
+            machine's data directory (<code className="rounded bg-muted px-1 py-0.5 text-xs">~/.lettuce/</code>)
+            before Lettuce starts there for the first time.
+          </p>
+          <p>
+            <span className="font-medium text-foreground">Never run setup again to "fix" a key.</span>{" "}
+            Setup would generate a new keypair, which is a new account, and the credit on the old
+            one stays behind. If a key will not load, restore it from your copy instead.
+          </p>
         </CardContent>
       </Card>
 
@@ -199,6 +241,36 @@ function ResourcesStep({
   );
 }
 
+function HourSelect({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  onChange: (hour: number) => void;
+}) {
+  return (
+    <label htmlFor={id} className="flex flex-col gap-1 text-sm">
+      <span>{label}</span>
+      <select
+        id={id}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="h-10 rounded-md border border-input bg-background px-3 text-sm"
+      >
+        {HOURS.map((h) => (
+          <option key={h} value={h}>
+            {formatHour(h)}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function ScheduleStep({
   state,
   onChange,
@@ -210,11 +282,33 @@ function ScheduleStep({
   onNext: () => void;
   onBack: () => void;
 }) {
-  const modes: { value: ScheduleMode; label: string; desc: string }[] = [
-    { value: "ALWAYS", label: "Always On", desc: "Compute whenever possible" },
-    { value: "IDLE", label: "When Idle", desc: "Only when you're not using your computer" },
-    { value: "CRON", label: "Scheduled", desc: "During specific hours" },
+  const modes: { value: WizardScheduleMode; label: string; desc: string }[] = [
+    { value: "always", label: "Always", desc: "Compute whenever Lettuce is running." },
+    {
+      value: "idle",
+      label: "When idle",
+      desc: "Only after you have not used this computer for a while.",
+    },
+    {
+      value: "scheduled",
+      label: "Scheduled windows",
+      desc: "Only inside a daily time window, on the days you choose.",
+    },
   ];
+
+  const window = {
+    from_hour: state.scheduleFromHour,
+    to_hour: state.scheduleToHour,
+    days: state.scheduleDays,
+  };
+  const noDays = state.scheduleMode === "scheduled" && state.scheduleDays.length === 0;
+
+  const toggleDay = (day: Weekday) => {
+    const days = state.scheduleDays.includes(day)
+      ? state.scheduleDays.filter((d) => d !== day)
+      : [...state.scheduleDays, day];
+    onChange({ scheduleDays: days });
+  };
 
   return (
     <div className="space-y-6 max-w-md mx-auto">
@@ -227,6 +321,8 @@ function ScheduleStep({
         {modes.map((mode) => (
           <button
             key={mode.value}
+            type="button"
+            aria-pressed={state.scheduleMode === mode.value}
             onClick={() => onChange({ scheduleMode: mode.value })}
             className={cn(
               "rounded-lg border p-4 text-left transition-colors",
@@ -241,46 +337,66 @@ function ScheduleStep({
         ))}
       </div>
 
-      {state.scheduleMode === "IDLE" && (
+      {state.scheduleMode === "idle" && (
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
-            <span>Idle threshold</span>
+            <span>Start after this much idle time</span>
             <span className="font-medium">{state.idleThresholdMins} min</span>
           </div>
           <Slider
             min={1}
-            max={30}
+            max={60}
             value={state.idleThresholdMins}
             onChange={(v) => onChange({ idleThresholdMins: v })}
           />
         </div>
       )}
 
-      {state.scheduleMode === "CRON" && (
+      {state.scheduleMode === "scheduled" && (
         <div className="space-y-4">
-          <div className="space-y-2">
-            <div className="flex justify-between text-sm">
-              <span>Start hour</span>
-              <span className="font-medium">{state.scheduleStartHour}:00</span>
-            </div>
-            <Slider
-              min={0}
-              max={23}
-              value={state.scheduleStartHour}
-              onChange={(v) => onChange({ scheduleStartHour: v })}
+          <div className="grid grid-cols-2 gap-3">
+            <HourSelect
+              id="schedule-from"
+              label="From"
+              value={state.scheduleFromHour}
+              onChange={(h) => onChange({ scheduleFromHour: h })}
+            />
+            <HourSelect
+              id="schedule-to"
+              label="To"
+              value={state.scheduleToHour}
+              onChange={(h) => onChange({ scheduleToHour: h })}
             />
           </div>
+          <p className="text-xs text-muted-foreground">
+            Whole hours only. A window may run past midnight, so 20:00 to 06:00 is
+            "overnight". The same hour for both means the whole day.
+          </p>
           <div className="space-y-2">
-            <div className="flex justify-between text-sm">
-              <span>End hour</span>
-              <span className="font-medium">{state.scheduleEndHour}:00</span>
+            <span className="text-sm">On these days</span>
+            <div className="flex flex-wrap gap-2">
+              {WEEKDAYS.map((day) => (
+                <label
+                  key={day}
+                  className={cn(
+                    "flex cursor-pointer items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-sm",
+                    state.scheduleDays.includes(day) ? "border-primary bg-primary/5" : ""
+                  )}
+                >
+                  <input
+                    type="checkbox"
+                    aria-label={WEEKDAY_LABELS[day]}
+                    checked={state.scheduleDays.includes(day)}
+                    onChange={() => toggleDay(day)}
+                    className="h-4 w-4 rounded border-input accent-primary"
+                  />
+                  {WEEKDAY_LABELS[day]}
+                </label>
+              ))}
             </div>
-            <Slider
-              min={0}
-              max={23}
-              value={state.scheduleEndHour}
-              onChange={(v) => onChange({ scheduleEndHour: v })}
-            />
+          </div>
+          <div className="rounded-md bg-muted p-3 text-sm">
+            {noDays ? "Choose at least one day." : `Lettuce will compute ${describeWindow(window)}.`}
           </div>
         </div>
       )}
@@ -289,163 +405,146 @@ function ScheduleStep({
         <Button variant="ghost" onClick={onBack}>
           Back
         </Button>
-        <Button onClick={onNext}>Next</Button>
+        <Button onClick={onNext} disabled={noDays}>
+          Next
+        </Button>
       </div>
     </div>
   );
 }
 
-type InstallStage = "checking" | "prerequisites" | "installing" | "initializing" | "starting" | "done" | "error" | "wsl_required";
+type RuntimeStage =
+  | "checking"
+  | "ready"
+  | "guidance"
+  | "wsl_required"
+  | "installing"
+  | "initializing"
+  | "error";
+
+function backendLabel(backend: ContainerRuntimeDetection["backend"]): string {
+  return backend === "docker" ? "Docker" : "Podman";
+}
 
 function ContainerRuntimeStep({
   state,
+  onDetected,
   onNext,
   onBack,
 }: {
   state: WizardState;
+  onDetected: (detected: boolean) => void;
   onNext: () => void;
   onBack: () => void;
 }) {
-  const [runtimeStatus, setRuntimeStatus] =
-    useState<ContainerRuntimeStatus | null>(null);
+  const [detection, setDetection] = useState<ContainerRuntimeDetection | null>(null);
   const [prereqs, setPrereqs] = useState<PodmanPrerequisites | null>(null);
-  const [installStage, setInstallStage] = useState<InstallStage>("checking");
-  const [stageMessage, setStageMessage] = useState("Checking system...");
+  const [stage, setStage] = useState<RuntimeStage>("checking");
   const [installError, setInstallError] = useState<string | null>(null);
   const [autoAdvanced, setAutoAdvanced] = useState(false);
 
   const platform = detectPlatform();
 
-  // On mount: check runtime status, then check prerequisites
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      // First check if runtime is already available (Docker running, or Podman already set up)
+  // Probe the machine directly (`detect_container_runtime`); the daemon does
+  // not exist yet during first-run setup, so its status API cannot be asked.
+  const check = useCallback(async () => {
+    setStage("checking");
+    setInstallError(null);
+    let found: ContainerRuntimeDetection;
+    try {
+      found = await detectContainerRuntime();
+    } catch (err) {
+      setDetection(null);
+      onDetected(false);
+      setInstallError(String(err));
+      setStage("error");
+      return;
+    }
+    setDetection(found);
+    onDetected(found.responding);
+    if (found.responding) {
+      setStage("ready");
+      return;
+    }
+    if (platform === "windows") {
+      // The bundled installer needs WSL2; find out before offering it.
       try {
-        const status = await getContainerRuntimeStatus();
-        if (!cancelled) {
-          setRuntimeStatus(status);
-          if (status.status === "running") {
-            setInstallStage("done");
-            return;
-          }
-          if (status.status === "not_initialized") {
-            // Podman exists but needs machine init — go straight to setup
-            setInstallStage("prerequisites");
-            setPrereqs({
-              wsl_available: true,
-              podman_installed: true,
-              podman_path: null,
-              needs_install: false,
-            });
-            return;
-          }
+        const p = await checkPodmanPrerequisites();
+        setPrereqs(p);
+        if (!p.wsl_available) {
+          setStage("wsl_required");
+          return;
         }
       } catch {
-        // Daemon not ready yet — expected during wizard before init
+        setPrereqs(null);
       }
+    }
+    setStage("guidance");
+  }, [platform, onDetected]);
 
-      // Check Podman prerequisites on Windows
-      if (platform === "windows") {
-        try {
-          const p = await checkPodmanPrerequisites();
-          if (!cancelled) {
-            setPrereqs(p);
-            if (!p.wsl_available) {
-              setInstallStage("wsl_required");
-            } else if (p.podman_installed) {
-              setInstallStage("prerequisites");
-            } else {
-              setInstallStage("prerequisites");
-            }
-          }
-        } catch {
-          if (!cancelled) setInstallStage("prerequisites");
-        }
-      } else if (platform === "linux") {
-        // Linux should have bundled Podman
-        setInstallStage("done");
-      } else {
-        // macOS — fall back to guidance
-        setInstallStage("prerequisites");
-      }
-    };
-    check();
-    return () => { cancelled = true; };
-  }, [platform]);
-
-  // Auto-advance when done
   useEffect(() => {
-    if (installStage === "done" && !autoAdvanced) {
+    void check();
+  }, [check]);
+
+  // Auto-advance when the engine is ready.
+  useEffect(() => {
+    if (stage === "ready" && !autoAdvanced) {
       setAutoAdvanced(true);
       const timer = setTimeout(onNext, 2000);
       return () => clearTimeout(timer);
     }
-  }, [installStage, onNext, autoAdvanced]);
+  }, [stage, onNext, autoAdvanced]);
 
-  // Automated install flow for Windows
-  const handleAutoInstall = async () => {
+  // Windows only: install the bundled Podman if needed, then create and start
+  // its machine. `install_podman` refuses to run anywhere else.
+  const handleWindowsInstall = async (alreadyInstalled: boolean) => {
     setInstallError(null);
+    setStage(alreadyInstalled ? "initializing" : "installing");
     try {
-      setInstallStage("installing");
-      setStageMessage("Installing Podman... This may take a minute.");
-
       await installPodman(state.cpuCores, state.memoryMb, state.diskGb);
-
-      setInstallStage("done");
-      setStageMessage("Container runtime is ready!");
-
-      // Refresh status from daemon
+      let found: ContainerRuntimeDetection | null = null;
       try {
-        const status = await getContainerRuntimeStatus();
-        setRuntimeStatus(status);
+        found = await detectContainerRuntime();
       } catch {
-        // Daemon may need restart to detect new Podman — that's OK
+        // Fall through: the installer reported success, which is what matters.
       }
+      if (found && !found.responding) {
+        // Installed and started, but the probe disagrees — say so rather than
+        // claiming readiness.
+        setDetection(found);
+        onDetected(false);
+        setInstallError(found.detail || "Podman was set up but is not answering yet.");
+        setStage("error");
+        return;
+      }
+      setDetection(found ?? { backend: "podman", version: "", binary_path: "", responding: true, detail: "" });
+      onDetected(true);
+      setStage("ready");
     } catch (err) {
-      setInstallStage("error");
+      setStage("error");
       setInstallError(String(err));
     }
   };
 
-  // Manual setup for when Podman exists but machine needs init
-  // Uses installPodman (which calls podman directly) instead of setupContainerRuntime
-  // (which requires the daemon to be running — but the daemon isn't started until
-  // the final wizard step calls run_init).
-  const handleSetup = async () => {
-    setInstallError(null);
-    setInstallStage("initializing");
-    setStageMessage("Initializing container runtime...");
-    try {
-      await installPodman(state.cpuCores, state.memoryMb, state.diskGb);
-      setInstallStage("done");
-      setStageMessage("Container runtime is ready!");
+  const header = (subtitle: string) => (
+    <div className="text-center space-y-2">
+      <h2 className="text-2xl font-bold">Container Runtime</h2>
+      <p className="text-muted-foreground">{subtitle}</p>
+    </div>
+  );
 
-      // Refresh status from daemon if available
-      try {
-        const status = await getContainerRuntimeStatus();
-        setRuntimeStatus(status);
-      } catch {
-        // Daemon not running yet — expected during wizard
-      }
-    } catch (err) {
-      setInstallStage("error");
-      setInstallError(String(err));
-    }
-  };
+  const skipButton = (
+    <Button variant="outline" onClick={onNext}>
+      {SKIP_CONTAINER_LABEL}
+    </Button>
+  );
 
-  // --- Render states ---
-
-  // Already running
-  if (installStage === "done" || runtimeStatus?.status === "running") {
+  if (stage === "ready") {
+    const label = detection ? backendLabel(detection.backend) : "Podman";
+    const version = detection?.version ? ` ${detection.version}` : "";
     return (
       <div className="space-y-6 max-w-md mx-auto">
-        <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Container Runtime</h2>
-          <p className="text-muted-foreground">
-            Container runtime is ready for running projects.
-          </p>
-        </div>
+        {header("Container tasks can run on this machine.")}
         <Card>
           <CardContent className="flex items-center gap-3 pt-6">
             <div className="h-8 w-8 rounded-full bg-green-100 flex items-center justify-center text-green-600">
@@ -453,11 +552,11 @@ function ContainerRuntimeStep({
             </div>
             <div>
               <div className="font-medium">
-                {runtimeStatus?.backend === "docker" ? "Docker" : "Podman"}{" "}
-                {runtimeStatus?.version && `v${runtimeStatus.version}`}
+                Ready ({label}
+                {version})
               </div>
               <div className="text-sm text-muted-foreground">
-                Container runtime ready
+                Detected and answering. You can allow container tasks per head in the next step.
               </div>
             </div>
           </CardContent>
@@ -470,16 +569,10 @@ function ContainerRuntimeStep({
     );
   }
 
-  // WSL2 not available — user needs to enable it (requires admin + reboot)
-  if (installStage === "wsl_required") {
+  if (stage === "wsl_required") {
     return (
       <div className="space-y-6 max-w-md mx-auto">
-        <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Container Runtime</h2>
-          <p className="text-muted-foreground">
-            One more thing before we can run container projects.
-          </p>
-        </div>
+        {header("One more thing before container tasks can run here.")}
         <Card>
           <CardHeader>
             <CardTitle className="text-base">Enable WSL2</CardTitle>
@@ -489,42 +582,38 @@ function ContainerRuntimeStep({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="rounded-md bg-muted p-3 text-xs font-mono">
-              1. Open PowerShell as Administrator{"\n"}
-              2. Run: <span className="text-primary">wsl --install</span>{"\n"}
-              3. Restart your computer{"\n"}
-              4. Re-open Lettuce Compute
+            <div className="rounded-md bg-muted p-3 text-xs font-mono whitespace-pre-line">
+              {"1. Open PowerShell as Administrator\n2. Run: wsl --install\n3. Restart your computer\n4. Re-open Lettuce Compute"}
             </div>
             <p className="text-xs text-muted-foreground">
-              After enabling WSL2, Lettuce will automatically install and
-              configure the container runtime on next launch.
+              After WSL2 is enabled, run setup again and Lettuce will install and configure the
+              container runtime for you.
             </p>
           </CardContent>
         </Card>
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>Back</Button>
-          <Button variant="outline" onClick={onNext}>
-            Skip — native projects only
-          </Button>
+          {skipButton}
         </div>
       </div>
     );
   }
 
-  // Installing / initializing / starting — progress view
-  if (installStage === "installing" || installStage === "initializing" || installStage === "starting") {
+  if (stage === "installing" || stage === "initializing") {
     const stages = [
       { key: "installing", label: "Installing Podman" },
-      { key: "initializing", label: "Setting up container VM" },
-      { key: "starting", label: "Starting runtime" },
+      { key: "initializing", label: "Setting up the container VM" },
     ];
-    const currentIdx = stages.findIndex((s) => s.key === installStage);
-
+    const currentIdx = stages.findIndex((s) => s.key === stage);
     return (
       <div className="space-y-6 max-w-md mx-auto">
         <div className="text-center space-y-2">
           <h2 className="text-2xl font-bold">Setting Up Containers</h2>
-          <p className="text-muted-foreground">{stageMessage}</p>
+          <p className="text-muted-foreground">
+            {stage === "installing"
+              ? "Installing Podman... This may take a minute."
+              : "Creating and starting the Podman machine..."}
+          </p>
         </div>
         <Card>
           <CardContent className="pt-6 space-y-4">
@@ -539,10 +628,7 @@ function ContainerRuntimeStep({
                 ) : (
                   <div className="h-6 w-6 rounded-full bg-muted" />
                 )}
-                <span className={cn(
-                  "text-sm",
-                  i <= currentIdx ? "font-medium" : "text-muted-foreground"
-                )}>
+                <span className={cn("text-sm", i <= currentIdx ? "font-medium" : "text-muted-foreground")}>
                   {s.label}
                 </span>
               </div>
@@ -556,154 +642,182 @@ function ContainerRuntimeStep({
     );
   }
 
-  // Error state
-  if (installStage === "error") {
+  if (stage === "error") {
     return (
       <div className="space-y-6 max-w-md mx-auto">
-        <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Container Runtime</h2>
-          <p className="text-muted-foreground">
-            Something went wrong during setup.
-          </p>
-        </div>
+        {header("Something went wrong while checking or setting up the container runtime.")}
         <div className="rounded-md bg-destructive/10 p-3 text-sm text-destructive">
           {installError}
         </div>
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>Back</Button>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={onNext}>
-              Skip
-            </Button>
-            <Button onClick={() => {
-              setInstallStage("prerequisites");
-              setInstallError(null);
-            }}>
-              Retry
-            </Button>
+            {skipButton}
+            <Button onClick={check}>Retry</Button>
           </div>
         </div>
       </div>
     );
   }
 
-  // Prerequisites / ready to install — main action screen
-  if (installStage === "prerequisites") {
-    // macOS: fall back to manual guidance (no bundled installer yet)
-    if (platform === "macos") {
-      return (
-        <div className="space-y-6 max-w-md mx-auto">
-          <div className="text-center space-y-2">
-            <h2 className="text-2xl font-bold">Container Runtime</h2>
-            <p className="text-muted-foreground">
-              A container runtime is needed to run containerized projects.
+  if (stage === "guidance") {
+    const installed = detection !== null && detection.backend !== "none";
+    const label = detection ? backendLabel(detection.backend) : "";
+    const podmanInstalled = detection?.backend === "podman";
+
+    let body: ReactNode;
+    let action: ReactNode = null;
+
+    if (platform === "windows") {
+      if (podmanInstalled) {
+        body = (
+          <>
+            <p>{detection?.detail || "Podman is installed but its machine is not running."}</p>
+            <p>
+              Lettuce can create and start the Podman machine (a small Linux VM) for you.
+              No administrator rights are needed.
             </p>
-          </div>
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Install Podman</CardTitle>
-              <CardDescription>
-                Install Podman via Homebrew:{" "}
+          </>
+        );
+        action = <Button onClick={() => handleWindowsInstall(true)}>Set Up</Button>;
+      } else if (installed) {
+        body = (
+          <>
+            <p>{detection?.detail || `${label} is installed but not running.`}</p>
+            <p>Start Docker Desktop and wait until it reports that the engine is running, then check again.</p>
+          </>
+        );
+      } else {
+        body = (
+          <>
+            <p>
+              No Docker or Podman was found. Lettuce can install Podman, an open-source container
+              engine, from the installer bundled with this app (about 26 MB, no download) and create
+              a small Linux VM for it. No administrator rights are needed.
+            </p>
+            {prereqs && prereqs.podman_installed && (
+              <p className="text-muted-foreground">
+                A Podman installation was found at {prereqs.podman_path}; only the machine setup will run.
+              </p>
+            )}
+          </>
+        );
+        action = (
+          <Button onClick={() => handleWindowsInstall(Boolean(prereqs?.podman_installed))}>
+            Install & Set Up
+          </Button>
+        );
+      }
+    } else if (platform === "macos") {
+      if (installed) {
+        body = (
+          <>
+            <p>{detection?.detail || `${label} is installed but not running.`}</p>
+            {podmanInstalled ? (
+              <p>
+                Start it from Podman Desktop, or in a terminal run{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">podman machine init</code>{" "}
+                (first time only) and then{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">podman machine start</code>.
+                Then check again.
+              </p>
+            ) : (
+              <p>Start Docker Desktop and wait until it reports that the engine is running, then check again.</p>
+            )}
+          </>
+        );
+      } else {
+        body = (
+          <>
+            <p>No Docker or Podman was found on this Mac.</p>
+            <p>
+              Install <span className="font-medium">Podman Desktop</span> or{" "}
+              <span className="font-medium">Docker Desktop</span>, open it, and make sure its
+              machine (a small Linux VM) is started. Then check again.
+            </p>
+          </>
+        );
+      }
+    } else {
+      // Linux
+      if (installed) {
+        body = (
+          <>
+            <p>{detection?.detail || `${label} is installed but not running.`}</p>
+            {podmanInstalled ? (
+              <p>
+                Start the Podman API socket as your normal user (not with sudo):{" "}
                 <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                  brew install podman
+                  systemctl --user enable --now podman.socket
                 </code>
-                . After installation, restart Lettuce Compute.
-              </CardDescription>
-            </CardHeader>
-          </Card>
-          <div className="flex justify-between">
-            <Button variant="ghost" onClick={onBack}>Back</Button>
-            <Button variant="outline" onClick={onNext}>Skip</Button>
-          </div>
-        </div>
-      );
-    }
-
-    // Linux: bundled, shouldn't need install
-    if (platform === "linux") {
-      return (
-        <div className="space-y-6 max-w-md mx-auto">
-          <div className="text-center space-y-2">
-            <h2 className="text-2xl font-bold">Container Runtime</h2>
-            <p className="text-muted-foreground">
-              Bundled Podman is available. Setting up...
+                . Then check again.
+              </p>
+            ) : (
+              <p>
+                Start the Docker service (for example{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">sudo systemctl start docker</code>)
+                and make sure your user is allowed to use it. Then check again.
+              </p>
+            )}
+          </>
+        );
+      } else {
+        body = (
+          <>
+            <p>No Docker or Podman was found.</p>
+            <p>
+              Install Podman from your distribution's packages (for example{" "}
+              <code className="rounded bg-muted px-1.5 py-0.5 text-xs">sudo apt install podman</code>{" "}
+              or <code className="rounded bg-muted px-1.5 py-0.5 text-xs">sudo dnf install podman</code>),
+              then start its API socket as your normal user:
             </p>
-          </div>
-          <div className="flex justify-between">
-            <Button variant="ghost" onClick={onBack}>Back</Button>
-            <Button onClick={handleSetup}>Set Up</Button>
-          </div>
-        </div>
-      );
+            <div className="rounded-md bg-muted p-3 text-xs font-mono whitespace-pre-line">
+              {"systemctl --user enable --now podman.socket\nloginctl enable-linger \"$USER\""}
+            </div>
+            <p>Docker also works when your user can reach its socket. Then check again.</p>
+          </>
+        );
+      }
     }
-
-    // Windows: automated install
-    const alreadyInstalled = prereqs?.podman_installed;
 
     return (
       <div className="space-y-6 max-w-md mx-auto">
-        <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Container Runtime</h2>
-          <p className="text-muted-foreground">
-            {alreadyInstalled
-              ? "Podman is installed. We'll set up the container environment."
-              : "We'll install a lightweight container runtime so you can run containerized science projects."}
-          </p>
-        </div>
+        {header(
+          installed
+            ? `${label} is installed but not answering.`
+            : "Container tasks need Docker or Podman. WASM and native tasks run without it."
+        )}
         <Card>
-          <CardContent className="pt-6 space-y-3">
-            <div className="flex items-start gap-3">
-              <div className="h-8 w-8 rounded-full bg-primary/10 flex items-center justify-center text-primary shrink-0 mt-0.5">
-                📦
-              </div>
-              <div>
-                <div className="font-medium text-sm">
-                  {alreadyInstalled ? "Initialize Container VM" : "Podman Container Runtime"}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {alreadyInstalled
-                    ? "Creates a lightweight Linux VM for running containers."
-                    : "Installs Podman and creates a lightweight Linux VM for running containers. No admin privileges required."}
-                </div>
-              </div>
-            </div>
-            {!alreadyInstalled && (
-              <div className="text-xs text-muted-foreground border-t pt-2">
-                Podman is an open-source container engine by Red Hat. ~26 MB download, already bundled with this app.
-              </div>
-            )}
-          </CardContent>
+          <CardHeader>
+            <CardTitle className="text-base">
+              {installed ? `${label} found${detection?.version ? ` (${detection.version})` : ""}` : "No container runtime detected"}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">{body}</CardContent>
         </Card>
         <div className="flex justify-between">
           <Button variant="ghost" onClick={onBack}>Back</Button>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={onNext}>
-              Skip
-            </Button>
-            <Button onClick={alreadyInstalled ? handleSetup : handleAutoInstall}>
-              {alreadyInstalled ? "Set Up" : "Install & Set Up"}
-            </Button>
+            {skipButton}
+            {action ?? (
+              <Button onClick={check}>Check again</Button>
+            )}
           </div>
         </div>
       </div>
     );
   }
 
-  // Checking / loading state
+  // checking
   return (
     <div className="space-y-6 max-w-md mx-auto">
-      <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Container Runtime</h2>
-        <p className="text-muted-foreground">
-          Checking your system...
-        </p>
-      </div>
+      {header("Checking your system...")}
       <div className="flex justify-center">
         <div className="animate-spin h-8 w-8 border-2 border-primary border-t-transparent rounded-full" />
       </div>
       <div className="flex justify-between">
         <Button variant="ghost" onClick={onBack}>Back</Button>
-        <Button variant="outline" onClick={onNext}>Skip</Button>
+        {skipButton}
       </div>
     </div>
   );
@@ -713,48 +827,65 @@ function ConnectStep({
   state,
   onChange,
   onComplete,
+  onSkip,
   onBack,
   isSubmitting,
 }: {
   state: WizardState;
   onChange: (s: Partial<WizardState>) => void;
   onComplete: () => void;
+  onSkip: () => void;
   onBack: () => void;
   isSubmitting: boolean;
 }) {
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<"success" | "error" | null>(null);
   const [isTesting, setIsTesting] = useState(false);
 
+  const hasUrl = state.serverUrl.trim() !== "";
+  const leafsOffered = state.headPreview !== null && state.headPreview.leafs.length > 0;
+  const noLeafSelected = leafsOffered && state.enabledLeafSlugs.length === 0;
+  const canStart = !hasUrl || (state.connectionOk && !noLeafSelected);
+
   const testConnection = async () => {
-    if (!state.serverUrl) return;
+    if (!hasUrl) return;
     setIsTesting(true);
     setTestResult(null);
-    onChange({ headPreview: null, enabledLeafSlugs: [] });
+    onChange({ headPreview: null, enabledLeafSlugs: [], connectionOk: false });
     try {
-      const health = await invoke<{ status: string }>("test_server_connection", { url: state.serverUrl });
-      if (health.status === "healthy") {
-        setTestResult("success");
-
-        // Fetch head info for preview
-        try {
-          const headData = await invoke<{ name: string; description: string; leafs: Array<{ slug: string; name: string; research_area: string; state: string }> }>("fetch_head_info", { url: state.serverUrl });
-          const activeLeafs = (headData.leafs ?? []).filter(
-            (l) => l.state === "ACTIVE"
-          );
-          onChange({
-            headPreview: {
-              name: headData.name ?? "",
-              description: headData.description ?? "",
-              leafs: activeLeafs,
-            },
-            enabledLeafSlugs: activeLeafs.map((l) => l.slug),
-          });
-        } catch {
-          // Head info not available, proceed without preview
-        }
-      } else {
+      const health = await testServerConnection(state.serverUrl.trim());
+      if (health.status !== "healthy") {
         setTestResult("error");
+        return;
       }
+      setTestResult("success");
+      let preview: HeadPreview | null = null;
+      let slugs: string[] = [];
+      try {
+        const head = await fetchHeadInfo(state.serverUrl.trim());
+        const activeLeafs = head.leafs.filter((l) => l.state === "ACTIVE");
+        preview = {
+          name: head.name,
+          description: head.description,
+          leafs: activeLeafs.map((l) => ({
+            slug: l.slug,
+            name: l.name,
+            research_area: l.research_area,
+          })),
+        };
+        slugs = activeLeafs.map((l) => l.slug);
+      } catch {
+        // The head answered its health check but not its info endpoint;
+        // attaching still works, only the preview is missing.
+      }
+      // A fresh head means a fresh consent: container defaults to allowed
+      // only when an engine actually answered, native is always off.
+      onChange({
+        connectionOk: true,
+        headPreview: preview,
+        enabledLeafSlugs: slugs,
+        trustContainer: state.containerRuntimeDetected,
+        trustNative: false,
+      });
     } catch {
       setTestResult("error");
     } finally {
@@ -785,7 +916,12 @@ function ConnectStep({
           placeholder="https://compute.example.org"
           value={state.serverUrl}
           onChange={(e) => {
-            onChange({ serverUrl: e.target.value, headPreview: null, enabledLeafSlugs: [] });
+            onChange({
+              serverUrl: e.target.value,
+              connectionOk: false,
+              headPreview: null,
+              enabledLeafSlugs: [],
+            });
             setTestResult(null);
           }}
         />
@@ -793,7 +929,7 @@ function ConnectStep({
           <Button
             variant="outline"
             onClick={testConnection}
-            disabled={!state.serverUrl || isTesting}
+            disabled={!hasUrl || isTesting}
           >
             {isTesting ? "Testing..." : "Test Connection"}
           </Button>
@@ -804,6 +940,11 @@ function ConnectStep({
             <span className="text-sm text-destructive">Connection failed</span>
           )}
         </div>
+        {hasUrl && !state.connectionOk && testResult !== "error" && (
+          <p className="text-xs text-muted-foreground">
+            Test the connection to see what this head offers and choose what it may run.
+          </p>
+        )}
       </div>
 
       {/* Head info preview */}
@@ -829,18 +970,93 @@ function ConnectStep({
                 >
                   <input
                     type="checkbox"
+                    aria-label={leaf.name}
                     checked={state.enabledLeafSlugs.includes(leaf.slug)}
                     onChange={() => toggleLeaf(leaf.slug)}
                     className="h-4 w-4 rounded border-input accent-primary"
                   />
                   <span>{leaf.name}</span>
-                  <span className="inline-flex items-center rounded-full bg-secondary px-1.5 py-0.5 text-[10px]">
-                    {leaf.research_area}
-                  </span>
+                  {leaf.research_area && (
+                    <span className="inline-flex items-center rounded-full bg-secondary px-1.5 py-0.5 text-[10px]">
+                      {leaf.research_area}
+                    </span>
+                  )}
                 </label>
               ))}
+              {noLeafSelected && (
+                <p className="text-xs text-destructive">Select at least one leaf, or skip adding a server.</p>
+              )}
             </CardContent>
           )}
+        </Card>
+      )}
+
+      {/* Runtime-trust consent: what this head may run here beyond WASM. */}
+      {state.connectionOk && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">What may this head run on your machine?</CardTitle>
+            <CardDescription>
+              A head is a trust domain: attaching to it means trusting its operator to run code on
+              this computer. Choose how far that trust goes. You can change it later.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm">
+            <div className="space-y-1">
+              <label
+                className={cn(
+                  "flex items-start gap-2",
+                  state.containerRuntimeDetected ? "cursor-pointer" : "cursor-not-allowed opacity-70"
+                )}
+              >
+                <input
+                  type="checkbox"
+                  aria-label="Allow container tasks"
+                  checked={state.trustContainer && state.containerRuntimeDetected}
+                  disabled={!state.containerRuntimeDetected}
+                  onChange={(e) => onChange({ trustContainer: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
+                />
+                <span>
+                  <span className="font-medium">Container tasks</span>
+                  <span className="block text-muted-foreground">
+                    Run isolated inside Docker or Podman.
+                  </span>
+                </span>
+              </label>
+              {!state.containerRuntimeDetected && (
+                <p className="pl-6 text-xs text-muted-foreground">
+                  No Docker/Podman detected — container tasks are not available.
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-1">
+              <label className="flex cursor-pointer items-start gap-2">
+                <input
+                  type="checkbox"
+                  aria-label="Allow native tasks"
+                  checked={state.trustNative}
+                  onChange={(e) => onChange({ trustNative: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
+                />
+                <span>
+                  <span className="font-medium">Native tasks</span>
+                  <span className="block text-muted-foreground">Run directly on this computer.</span>
+                </span>
+              </label>
+              <p className="pl-6 text-xs text-destructive">
+                A native program runs directly on this machine with no sandbox. It can read your
+                files — including your identity key — and use your network. Allow this only for an
+                operator you fully trust.
+              </p>
+            </div>
+
+            <p className="text-xs text-muted-foreground">
+              WASM tasks are always allowed (sandboxed): they cannot touch anything outside their own
+              work folder.
+            </p>
+          </CardContent>
         </Card>
       )}
 
@@ -850,16 +1066,14 @@ function ConnectStep({
         </Button>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => {
-              onChange({ serverUrl: "", headPreview: null, enabledLeafSlugs: [] });
-              onComplete();
-            }}
+            type="button"
+            onClick={onSkip}
             className="text-sm text-muted-foreground hover:underline"
             disabled={isSubmitting}
           >
             Skip — I'll add one later
           </button>
-          <Button onClick={onComplete} disabled={isSubmitting}>
+          <Button onClick={onComplete} disabled={isSubmitting || !canStart}>
             {isSubmitting ? "Setting up..." : "Start Contributing"}
           </Button>
         </div>
@@ -878,18 +1092,28 @@ export function SetupWizard({ onComplete }: WizardProps) {
     gpuVramPct: 50,
     diskGb: 10,
     totalMemoryMb: FALLBACK_TOTAL_MEMORY_MB,
-    scheduleMode: "ALWAYS",
+    scheduleMode: "always",
     idleThresholdMins: 5,
-    scheduleStartHour: 22,
-    scheduleEndHour: 8,
+    scheduleFromHour: 20,
+    scheduleToHour: 6,
+    scheduleDays: [...WEEKDAYS],
+    containerRuntimeDetected: false,
     serverUrl: "",
+    connectionOk: false,
     headPreview: null,
     enabledLeafSlugs: [],
+    trustContainer: false,
+    trustNative: false,
   });
 
-  const update = (partial: Partial<WizardState>) => {
+  const update = useCallback((partial: Partial<WizardState>) => {
     setState((prev) => ({ ...prev, ...partial }));
-  };
+  }, []);
+
+  const setContainerDetected = useCallback(
+    (detected: boolean) => update({ containerRuntimeDetected: detected }),
+    [update]
+  );
 
   // Detect real total RAM once on mount and size the memory slider / default to
   // it. Without this the slider was capped at ~7.4 GB (hardcoded 8 GB), which is
@@ -914,26 +1138,45 @@ export function SetupWizard({ onComplete }: WizardProps) {
     };
   }, []);
 
-  const handleComplete = async () => {
+  /**
+   * Run `init` with everything chosen so far. `withServer` false is the
+   * "Skip — I'll add one later" path: no head is attached and no trust is
+   * recorded, whatever the URL field holds.
+   */
+  const handleComplete = async (withServer: boolean) => {
     setIsSubmitting(true);
     setError(null);
+    const serverUrl = state.serverUrl.trim();
+    const hasServer = withServer && serverUrl !== "";
+    const schedule = buildInitSchedule({
+      mode: state.scheduleMode,
+      idleThresholdMins: state.idleThresholdMins,
+      window: {
+        from_hour: state.scheduleFromHour,
+        to_hour: state.scheduleToHour,
+        days: state.scheduleDays,
+      },
+    });
+    const trust: Array<"container" | "native"> = [];
+    if (hasServer && state.trustContainer && state.containerRuntimeDetected) trust.push("container");
+    if (hasServer && state.trustNative) trust.push("native");
+    const partialSelection =
+      hasServer &&
+      state.headPreview !== null &&
+      state.enabledLeafSlugs.length > 0 &&
+      state.enabledLeafSlugs.length < state.headPreview.leafs.length;
     try {
-      await invoke("run_init", {
-        config: {
-          cpu_cores: state.cpuCores,
-          memory_mb: state.memoryMb,
-          gpu_vram_pct: state.gpuVramPct,
-          disk_gb: state.diskGb,
-          schedule_mode: state.scheduleMode,
-          idle_threshold_mins: state.idleThresholdMins,
-          server_url: state.serverUrl || null,
-          enabled_leafs:
-            state.enabledLeafSlugs.length > 0 &&
-            state.headPreview &&
-            state.enabledLeafSlugs.length < state.headPreview.leafs.length
-              ? state.enabledLeafSlugs
-              : null,
-        },
+      await runInit({
+        cpu_cores: state.cpuCores,
+        memory_mb: state.memoryMb,
+        gpu_vram_pct: state.gpuVramPct,
+        disk_gb: state.diskGb,
+        schedule_mode: schedule.schedule_mode,
+        idle_threshold_mins: schedule.idle_threshold_mins,
+        schedule_window: schedule.schedule_window,
+        server_url: hasServer ? serverUrl : null,
+        trust,
+        enabled_leafs: partialSelection ? state.enabledLeafSlugs : null,
       });
       onComplete();
     } catch (err) {
@@ -979,6 +1222,7 @@ export function SetupWizard({ onComplete }: WizardProps) {
         {step === 4 && (
           <ContainerRuntimeStep
             state={state}
+            onDetected={setContainerDetected}
             onNext={() => setStep(5)}
             onBack={() => setStep(3)}
           />
@@ -987,7 +1231,8 @@ export function SetupWizard({ onComplete }: WizardProps) {
           <ConnectStep
             state={state}
             onChange={update}
-            onComplete={handleComplete}
+            onComplete={() => handleComplete(true)}
+            onSkip={() => handleComplete(false)}
             onBack={() => setStep(4)}
             isSubmitting={isSubmitting}
           />

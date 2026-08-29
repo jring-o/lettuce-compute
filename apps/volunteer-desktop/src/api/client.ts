@@ -473,6 +473,56 @@ export interface HeadPreview {
   leafs: Array<{ slug: string; name: string; research_area: string }>;
 }
 
+/**
+ * One leaf in `fetchHeadInfo()`'s result. The head sends `research_area` as a
+ * list of strings; it is joined here so callers can render it directly.
+ * `state` is the leaf lifecycle state (`ACTIVE`, `PAUSED`, ...).
+ */
+export interface HeadInfoLeaf {
+  slug: string;
+  name: string;
+  research_area: string;
+  state: string;
+}
+
+export interface HeadInfoResponse {
+  name: string;
+  description: string;
+  leafs: HeadInfoLeaf[];
+}
+
+/**
+ * Probe a head's `GET /api/v1/health` through the Rust host (the `test_server_connection`
+ * command). Resolves to `{ status: "healthy" }` on success; rejects with the
+ * command's message otherwise. `url` may omit the scheme (https is assumed).
+ */
+export async function testServerConnection(url: string): Promise<{ status: string }> {
+  return invoke("test_server_connection", { url });
+}
+
+/** The head's public `GET /api/v1/head` (the `fetch_head_info` command), with fields normalised. */
+export async function fetchHeadInfo(url: string): Promise<HeadInfoResponse> {
+  const raw = await invoke<{
+    name?: string;
+    description?: string;
+    leafs?: Array<{ slug?: string; name?: string; research_area?: unknown; state?: string }> | null;
+  }>("fetch_head_info", { url });
+  return {
+    name: raw.name ?? "",
+    description: raw.description ?? "",
+    leafs: (raw.leafs ?? []).map((l) => ({
+      slug: l.slug ?? "",
+      name: l.name ?? "",
+      research_area: Array.isArray(l.research_area)
+        ? l.research_area.filter((s): s is string => typeof s === "string").join(", ")
+        : typeof l.research_area === "string"
+          ? l.research_area
+          : "",
+      state: l.state ?? "",
+    })),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/credit
 // ---------------------------------------------------------------------------
@@ -650,9 +700,67 @@ export async function installPodman(
   });
 }
 
+/**
+ * What the `detect_container_runtime` command found on this machine. Unlike
+ * `getContainerRuntimeStatus` it needs no daemon, so the setup wizard can use
+ * it before `init` has run. `responding` means the engine answers: a running
+ * Podman machine (Windows/macOS), a Podman API socket (Linux), or a Docker
+ * server that replied. `detail` says why not, in plain language.
+ */
+export interface ContainerRuntimeDetection {
+  backend: "podman" | "docker" | "none";
+  version: string;
+  binary_path: string;
+  responding: boolean;
+  detail: string;
+}
+
+export async function detectContainerRuntime(): Promise<ContainerRuntimeDetection> {
+  return invoke("detect_container_runtime");
+}
+
 // ---------------------------------------------------------------------------
 // Host-side commands (Rust, no daemon involved)
 // ---------------------------------------------------------------------------
+
+/** Names accepted by `schedule set --days`. */
+export type ScheduleWeekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+/** A daily window for `run_init` (`from_hour`/`to_hour` are 0–23; `to <= from` wraps midnight). */
+export interface InitScheduleWindow {
+  from_hour: number;
+  to_hour: number;
+  days: ScheduleWeekday[];
+}
+
+/**
+ * The `run_init` payload. `schedule_mode` is the CLI's `init --schedule-mode`
+ * value; `schedule_window` makes the Rust side run `schedule set` after
+ * `init`. `trust` lists the runtimes the head at `server_url` may run beyond
+ * the always-allowed WASM sandbox (`"container"`, `"native"`); it is sent as
+ * `--trust` and an empty list records an explicit WASM-only decision.
+ */
+export interface InitRequest {
+  cpu_cores: number | null;
+  memory_mb: number | null;
+  gpu_vram_pct: number | null;
+  disk_gb: number | null;
+  schedule_mode: "always" | "idle" | "scheduled" | null;
+  idle_threshold_mins: number | null;
+  schedule_window: InitScheduleWindow | null;
+  server_url: string | null;
+  trust: Array<"container" | "native">;
+  enabled_leafs: string[] | null;
+}
+
+/**
+ * Run `lettuce-volunteer init` with the wizard's choices, apply any schedule
+ * window, then start the daemon and wait for it. Rejects with the CLI's
+ * error text when any step fails.
+ */
+export async function runInit(config: InitRequest): Promise<void> {
+  await invoke("run_init", { config });
+}
 
 /**
  * Total physical system memory in MB, read from the OS by the Rust backend.

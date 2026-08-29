@@ -7,7 +7,9 @@ use tauri::AppHandle;
 
 use crate::api::ManagementClient;
 use crate::autostart;
-use crate::container_runtime::{ContainerRuntimeStatus, SetupRequest, SetupResponse};
+use crate::container_runtime::{
+    self, ContainerRuntimeDetection, ContainerRuntimeStatus, SetupRequest, SetupResponse,
+};
 use crate::podman_installer::{self, PodmanPrerequisites};
 use crate::sidecar;
 use crate::updater;
@@ -81,6 +83,18 @@ fn daemon_client() -> Result<ManagementClient, String> {
     Ok(ManagementClient::from_daemon_info(&info))
 }
 
+/// One daily computing window, applied with `lettuce-volunteer schedule set`
+/// after `init`. Hours are whole hours 0–23; `to_hour <= from_hour` wraps past
+/// midnight (equal hours mean the whole day). `days` are the CLI's own names
+/// (`mon` … `sun`).
+#[derive(Debug, Deserialize)]
+pub struct ScheduleWindow {
+    pub from_hour: u32,
+    pub to_hour: u32,
+    #[serde(default)]
+    pub days: Vec<String>,
+}
+
 /// Choices the setup wizard hands to `lettuce-volunteer init`.
 #[derive(Debug, Deserialize)]
 pub struct InitConfig {
@@ -88,8 +102,16 @@ pub struct InitConfig {
     pub memory_mb: Option<u32>,
     pub gpu_vram_pct: Option<u32>,
     pub disk_gb: Option<u32>,
+    /// `init --schedule-mode`: `always`, `idle` or `scheduled`. The wizard
+    /// sends `always` together with `schedule_window` for a scheduled setup,
+    /// because a non-interactive `init --schedule-mode scheduled` has no
+    /// window to write and fails the CLI's validation.
     pub schedule_mode: Option<String>,
     pub idle_threshold_mins: Option<u32>,
+    /// When present, `schedule set` runs after `init` and before the daemon
+    /// starts, which switches the mode to `SCHEDULED` with this window.
+    #[serde(default)]
+    pub schedule_window: Option<ScheduleWindow>,
     pub server_url: Option<String>,
     /// Runtimes the volunteer trusts the head at `server_url` to run on this
     /// machine beyond the always-allowed WASM sandbox: any of `container`,
@@ -127,6 +149,66 @@ fn trust_flag_value(trust: &[String]) -> Result<String, String> {
     }
     chosen.sort();
     Ok(chosen.join(","))
+}
+
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// The argument list for `lettuce-volunteer schedule set` describing
+/// `window`: `--from HH:00 --to HH:00 --days mon,tue,...`. Hours must be
+/// 0–23 and every day must be one of the CLI's names; the days are emitted in
+/// week order without duplicates (the `--days` syntax is a comma list, see
+/// `parseScheduleDays` in the CLI's `schedule.go`).
+fn schedule_set_args(window: &ScheduleWindow) -> Result<Vec<String>, String> {
+    if window.from_hour > 23 || window.to_hour > 23 {
+        return Err(format!(
+            "Schedule hours must be 0-23 (got from {} to {})",
+            window.from_hour, window.to_hour
+        ));
+    }
+    let mut chosen: Vec<&str> = Vec::new();
+    for raw in &window.days {
+        let name = raw.trim().to_ascii_lowercase();
+        match WEEKDAYS.iter().find(|d| **d == name) {
+            Some(day) => {
+                if !chosen.contains(day) {
+                    chosen.push(day);
+                }
+            }
+            None => {
+                return Err(format!(
+                    "Unknown schedule day {raw:?} (valid: {})",
+                    WEEKDAYS.join(", ")
+                ))
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return Err("A schedule window needs at least one day".into());
+    }
+    chosen.sort_by_key(|d| WEEKDAYS.iter().position(|w| w == d));
+    Ok(vec![
+        "schedule".into(),
+        "set".into(),
+        "--from".into(),
+        format!("{:02}:00", window.from_hour),
+        "--to".into(),
+        format!("{:02}:00", window.to_hour),
+        "--days".into(),
+        chosen.join(","),
+    ])
+}
+
+/// Apply a schedule window with `lettuce-volunteer schedule set`. Must run
+/// after `init` (the CLI loads config.yaml first) and before `start` (the
+/// daemon reads the schedule at boot).
+fn apply_schedule_window(window: &ScheduleWindow) -> Result<(), String> {
+    let args = schedule_set_args(window)?;
+    let output = sidecar::run_sidecar(&args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Schedule setup failed: {}", stderr.trim()));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -190,6 +272,10 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Init failed: {}", stderr));
+    }
+
+    if let Some(window) = &config.schedule_window {
+        apply_schedule_window(window)?;
     }
 
     // Start the daemon after init
@@ -266,11 +352,24 @@ pub async fn stop_container_runtime() -> Result<SetupResponse, String> {
     daemon_client()?.stop_container_runtime().await
 }
 
+/// Probe this machine for a container engine without the daemon (the setup
+/// wizard runs before one exists). Works on every platform; see
+/// `container_runtime::detect`.
+#[tauri::command]
+pub async fn detect_container_runtime() -> Result<ContainerRuntimeDetection, String> {
+    tokio::task::spawn_blocking(container_runtime::detect)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn check_podman_prerequisites() -> Result<PodmanPrerequisites, String> {
     Ok(podman_installer::check_prerequisites())
 }
 
+/// Windows only: install the bundled Podman MSI if needed, then create and
+/// start its machine. Other platforms have no bundled installer, so the call
+/// is refused up front rather than failing on the WSL check.
 #[tauri::command]
 pub async fn install_podman(
     app: AppHandle,
@@ -278,6 +377,13 @@ pub async fn install_podman(
     memory_mb: Option<i32>,
     disk_gb: Option<i32>,
 ) -> Result<String, String> {
+    if !cfg!(target_os = "windows") {
+        return Err(
+            "The bundled Podman installer is only available on Windows. Install Podman Desktop or Docker Desktop (macOS) or Podman from your distribution's packages (Linux)."
+                .into(),
+        );
+    }
+
     let prereqs = podman_installer::check_prerequisites();
 
     if !prereqs.wsl_available {
@@ -376,10 +482,45 @@ pub fn get_system_memory_mb() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::trust_flag_value;
+    use super::{schedule_set_args, trust_flag_value, ScheduleWindow};
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn schedule_window_becomes_schedule_set_args() {
+        let window = ScheduleWindow {
+            from_hour: 20,
+            to_hour: 6,
+            days: strings(&["sun", "Mon", "sun"]),
+        };
+        assert_eq!(
+            schedule_set_args(&window).unwrap(),
+            strings(&["schedule", "set", "--from", "20:00", "--to", "06:00", "--days", "mon,sun"])
+        );
+    }
+
+    #[test]
+    fn schedule_window_rejects_bad_input() {
+        assert!(schedule_set_args(&ScheduleWindow {
+            from_hour: 24,
+            to_hour: 6,
+            days: strings(&["mon"]),
+        })
+        .is_err());
+        assert!(schedule_set_args(&ScheduleWindow {
+            from_hour: 1,
+            to_hour: 2,
+            days: strings(&["funday"]),
+        })
+        .is_err());
+        assert!(schedule_set_args(&ScheduleWindow {
+            from_hour: 1,
+            to_hour: 2,
+            days: vec![],
+        })
+        .is_err());
     }
 
     #[test]

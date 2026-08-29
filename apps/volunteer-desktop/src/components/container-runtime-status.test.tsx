@@ -309,10 +309,13 @@ describe("ContainerRuntimeStatusCard", () => {
       screen.getByText("No container runtime installed")
     ).toBeInTheDocument();
     expect(
-      screen.getByText(
-        "Container leafs will be unavailable until a runtime is installed."
-      )
+      screen.getByText(/Container leafs will be unavailable until a runtime is installed/)
     ).toBeInTheDocument();
+    // jsdom reports no Windows/Mac user agent, so the Linux guidance renders:
+    // it must point at the real install path, never a bundled binary.
+    expect(screen.getByText(/systemctl --user enable --now podman.socket/)).toBeInTheDocument();
+    expect(screen.queryByText(/bundled Podman binary/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Install Podman")).not.toBeInTheDocument();
   });
 
   // State: Error
