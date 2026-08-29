@@ -181,11 +181,11 @@ export function ContainerRuntimeStatusCard() {
         </div>
         <p className="text-xs text-muted-foreground">
           {platform === "linux" &&
-            "Reinstall the desktop app to restore the bundled Podman binary."}
+            "Install Podman from your distribution's packages, then start its API socket as your normal user: systemctl --user enable --now podman.socket. Docker also works when your user can reach its socket."}
           {platform === "windows" &&
-            "Podman can be installed automatically from the bundled installer."}
+            "Podman can be installed automatically from the installer bundled with this app (WSL2 required)."}
           {platform === "macos" &&
-            "Install Podman via `brew install podman` or Podman Desktop."}
+            "Install Podman Desktop or Docker Desktop and start it; its machine (a small Linux VM) must be running."}
         </p>
         {platform === "windows" && (
           <Button
@@ -198,7 +198,8 @@ export function ContainerRuntimeStatusCard() {
           </Button>
         )}
         <p className="text-xs text-muted-foreground">
-          Container leafs will be unavailable until a runtime is installed.
+          Container leafs will be unavailable until a runtime is installed. WASM and native leafs
+          run without one.
         </p>
         {actionError && <p className="text-xs text-destructive">{actionError}</p>}
       </div>
