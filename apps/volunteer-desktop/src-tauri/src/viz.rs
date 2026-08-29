@@ -11,9 +11,12 @@ pub struct VizBaseDir(pub Arc<Mutex<Option<String>>>);
 /// bundle's `index.html`. The daemon already resolves a tarball that wraps
 /// everything in one top-level folder (`runtime.resolveVizRoot`), and the same
 /// tolerance is applied here so a path to the unresolved extraction directory
-/// still works. Fails with a readable message when the directory is gone
-/// (the unit's work directory, which holds the bundle, is removed once the
-/// unit completes) or holds no `index.html`.
+/// still works. Fails with a readable message when the directory is gone or
+/// holds no `index.html`. A live path lives inside the unit's work directory,
+/// which is removed once the unit completes; a stored result's path is the
+/// daemon's kept copy under `<data dir>/results/viz/`, which survives — a
+/// result recorded by an older client still names the deleted work directory,
+/// and that is the case the message is for.
 #[tauri::command]
 pub fn set_viz_base(state: tauri::State<'_, VizBaseDir>, path: String) -> Result<(), String> {
     let root = resolve_bundle_root(Path::new(&path))?;

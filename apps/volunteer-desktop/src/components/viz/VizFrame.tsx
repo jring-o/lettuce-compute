@@ -4,9 +4,11 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 interface VizFrameProps {
   /**
    * Directory holding the bundle's `index.html`. The daemon reports it as
-   * `viz_bundle_path`: the bundle extracted into the unit's work directory
-   * (`{work_dir}/.lettuce-viz`, or that directory's single wrapper folder when
-   * the tarball had one — the daemon resolves it before reporting).
+   * `viz_bundle_path`. For a running unit it is the bundle extracted into the
+   * unit's work directory (`{work_dir}/.lettuce-viz`, or that directory's
+   * single wrapper folder when the tarball had one — the daemon resolves it
+   * before reporting). For a stored result it is the daemon's kept copy under
+   * `<data dir>/results/viz/<bundle key>/`, which outlives the work directory.
    */
   vizBundlePath: string;
   /** The unit's work directory; `readFile` / `listFiles` / `watchFile` are resolved inside it. Live mode only. */

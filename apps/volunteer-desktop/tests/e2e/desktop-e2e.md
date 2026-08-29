@@ -15,6 +15,12 @@ you ship. Record the build number, the OS, and the outcome of every numbered ste
   `beyblade-arena` leaf, a container leaf with a visualization bundle whose work units
   take roughly 12 minutes on a typical desktop.
 - About 45 minutes; the first work unit dominates.
+- For the replay step (6.8), the bundled `lettuce-volunteer` client must be a build that
+  keeps an extracted copy of each visualization bundle under `~/.lettuce/results/viz/`
+  and points each stored result's `viz_bundle_path` there. Older clients recorded the
+  path inside the unit's work directory, which is deleted when the unit completes, so
+  replay can only report that the files are gone. Check the bundled client's version
+  against the release notes before starting.
 
 Whenever a step fails, the first place to look is the daemon log:
 
@@ -32,8 +38,9 @@ Other files that help when diagnosing:
 | `~/.lettuce/config.yaml` | What the wizard and Settings actually wrote. |
 | `~/.lettuce/daemon.json` | The running daemon's port, token, and PID. Missing = no daemon. |
 | `~/.lettuce/history.jsonl` | One line per completed work unit; what the History page reads. |
-| `~/.lettuce/results/index.jsonl` | Results kept for replay. |
-| `~/.lettuce/cache/viz/` | Downloaded visualization bundles. |
+| `~/.lettuce/results/index.jsonl` | Results kept for replay, each naming the `viz_bundle_path` replay opens. |
+| `~/.lettuce/results/viz/<bundle key>/` | The extracted visualization bundles kept for replay (one copy per bundle). |
+| `~/.lettuce/cache/viz/` | Downloaded visualization bundle archives. |
 
 ## 1. Clean install
 
@@ -121,10 +128,11 @@ Precondition: at least one unit completed (section 3).
 | 6.5 | Date range: **Last 7 days**, **All time**, **Custom** with a range that excludes today. | Entries appear or disappear accordingly. |
 | 6.6 | Export **CSV**. | A file `lettuce-history.csv` is saved with the header `work_unit_id,leaf_name,head_name,completed_at,duration_seconds,cpu_seconds,credit_earned,head_accepted` and one row per entry (`head_accepted` is `true`/`false`). |
 | 6.7 | Export **JSON**. | `lettuce-history.json` holds an array with the same entries as the daemon reports them. |
-| 6.8 | Replay: expand the beyblade-arena row and click **View Visualization**. | A dialog opens and replays the unit's result in the visualization. Escape or the close button closes it. If the dialog instead reports that the visualization files are no longer on this machine, record it — it means the bundle directory was removed after completion, and the replay path needs the client to keep it (known limitation to confirm against the release notes). |
+| 6.8 | Replay (requires the client build described under "Before you start"): expand the beyblade-arena row and click **View Visualization**. | A dialog opens and replays the unit's result in the visualization. Escape or the close button closes it. The result's `viz_bundle_path` in `~/.lettuce/results/index.jsonl` points under `~/.lettuce/results/viz/`. If the dialog instead reports that the visualization files are no longer on this machine, the step fails: either the bundled client is too old (its recorded path was inside the deleted work directory) or the kept copy is missing — note which. |
 
 On failure: History reads `~/.lettuce/history.jsonl`; compare the file with the page.
-Replay reads `~/.lettuce/results/index.jsonl` and the `viz_bundle_path` it names.
+Replay reads `~/.lettuce/results/index.jsonl` and opens the `viz_bundle_path` it names;
+that directory must exist and hold an `index.html`.
 
 ## 7. Tray
 

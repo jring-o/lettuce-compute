@@ -155,8 +155,11 @@ bundle itself and serves it from a dedicated visualization origin (`VIZ_ORIGIN`)
 
 **In the desktop app**, the volunteer client keeps a copy of each result it produced for a
 leaf that has a bundle (under `~/.lettuce/results/`, oldest evicted first when the cache
-exceeds its size limit). The History page offers **View Visualization** for those units
-and replays them in the same frame used for live view.
+exceeds its size limit) together with one extracted copy of the bundle itself (under
+`~/.lettuce/results/viz/`), because the unit's work directory — where the bundle is
+unpacked for live view — is deleted when the unit completes. The History page offers
+**View Visualization** for those units and replays them in the same frame used for live
+view.
 
 ## Minimal example
 
