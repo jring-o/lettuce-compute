@@ -8,18 +8,33 @@ import {
   Monitor,
   Sun,
   Moon,
+  AlertTriangle,
+  RefreshCw,
 } from "lucide-react";
-import { useConfig } from "@/hooks/use-config";
-import { useMetrics } from "@/hooks/use-metrics";
-import { useClient } from "@/hooks/use-api";
+import { useConfig, useRestartRequired } from "@/hooks/use-config";
+import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
+import { useClient, useApiQuery } from "@/hooks/use-api";
 import { ScheduleBuilder } from "@/components/schedule-builder";
 import { ContainerRuntimeStatusCard } from "@/components/container-runtime-status";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Card, CardContent } from "@/components/ui/card";
-import { cn, formatBytes } from "@/lib/utils";
-import type { ScheduleRange } from "@/api/client";
+import {
+  cn,
+  formatBytes,
+  formatGb,
+  readStoredTheme,
+  storeTheme,
+  applyTheme,
+  type Theme,
+} from "@/lib/utils";
+import {
+  restartDaemon,
+  type ScheduleRange,
+  type ThermalConfig,
+  type ManagementClient,
+} from "@/api/client";
 
 // Collapsible section
 function Section({
@@ -123,6 +138,69 @@ function ResourceSlider({
   );
 }
 
+/**
+ * A number input that saves when the user leaves the field or presses Enter,
+ * so a value typed digit by digit is not written to the daemon on every
+ * keystroke.
+ */
+function NumberField({
+  label,
+  value,
+  min,
+  max,
+  step,
+  suffix,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  suffix?: string;
+  disabled?: boolean;
+  onCommit: (v: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const parsed = Number(draft);
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(value));
+      return;
+    }
+    if (parsed !== value) onCommit(parsed);
+  };
+
+  return (
+    <label className="flex items-center justify-between gap-3 text-sm">
+      <span>{label}</span>
+      <span className="flex items-center gap-1.5">
+        <Input
+          type="number"
+          value={draft}
+          min={min}
+          max={max}
+          step={step}
+          disabled={disabled}
+          aria-label={label}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+          className="h-7 w-24 text-xs"
+        />
+        {suffix && <span className="text-xs text-muted-foreground w-8">{suffix}</span>}
+      </span>
+    </label>
+  );
+}
+
 // Copy button
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -149,15 +227,18 @@ function Toggle({
   checked,
   onChange,
   disabled,
+  label,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  label?: string;
 }) {
   return (
     <button
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cn(
@@ -176,23 +257,88 @@ function Toggle({
   );
 }
 
+/**
+ * Restart the daemon from the app. Used by the "restart required" banner and
+ * the General section. `restartDaemon()` stops the running daemon (waiting up
+ * to 30 s, then forcing it) and starts a fresh one; in-progress work is
+ * checkpointed by the daemon and resumed after the restart.
+ */
+function RestartButton({
+  onDone,
+  variant = "outline",
+}: {
+  onDone?: () => void;
+  variant?: "outline" | "default" | "secondary";
+}) {
+  const [restarting, setRestarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  const handleRestart = async () => {
+    setRestarting(true);
+    setError(null);
+    setDone(false);
+    try {
+      await restartDaemon();
+      setDone(true);
+      onDone?.();
+      setTimeout(() => setDone(false), 4000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRestarting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-3">
+        <Button variant={variant} size="sm" onClick={handleRestart} disabled={restarting}>
+          <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", restarting && "animate-spin")} />
+          {restarting ? "Restarting Lettuce…" : "Restart Lettuce"}
+        </Button>
+        {restarting && (
+          <span className="text-xs text-muted-foreground">
+            Stopping the current daemon and starting a new one — this can take up to a minute.
+          </span>
+        )}
+        {done && !restarting && (
+          <span className="text-xs text-green-600">Lettuce restarted.</span>
+        )}
+      </div>
+      {error && <p className="text-xs text-destructive">Restart failed: {error}</p>}
+    </div>
+  );
+}
+
 /** Daemon default for `work_buffer_hours` (hours of work buffered per running task). */
 const DEFAULT_WORK_BUFFER_HOURS = 2;
 
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
+  const { restartRequired, clearRestartRequired } = useRestartRequired();
   const { metrics } = useMetrics(5000);
-  // GET /api/v1/config does not return work_buffer_hours (it is write-only on
-  // the daemon side), so the slider shows the last value set in this session,
-  // starting from the daemon default.
-  const [workBufferHours, setWorkBufferHours] = useState(DEFAULT_WORK_BUFFER_HOURS);
+  const { system } = useSystemMetrics(3000);
+  const { data: headsResp, refetch: refetchHeads } = useApiQuery(
+    (c: ManagementClient) => c.headsAndMachine(),
+    60000
+  );
+  const machine = headsResp?.machine ?? null;
+  const heads = headsResp?.heads ?? [];
+
+  // Older CLI builds do not return work_buffer_hours from GET /api/v1/config;
+  // until the daemon reports it, the slider shows the last value saved in this
+  // session, starting from the daemon default.
+  const [workBufferDraft, setWorkBufferDraft] = useState<number | null>(null);
+  const workBufferHours =
+    workBufferDraft ?? config?.work_buffer_hours ?? DEFAULT_WORK_BUFFER_HOURS;
 
   const { client } = useClient();
 
   // Local state for settings that need immediate feedback
   const [confirmRegenerate, setConfirmRegenerate] = useState(false);
   const [regenerateError, setRegenerateError] = useState<string | null>(null);
-  const [theme, setTheme] = useState<"system" | "light" | "dark">("system");
+  const [theme, setTheme] = useState<Theme>(() => readStoredTheme());
   const [autostart, setAutostart] = useState(true);
 
   // Verify identity state
@@ -233,25 +379,25 @@ export function SettingsPage() {
     [config, updateConfig]
   );
 
-  // Apply theme to document
+  const updateThermal = useCallback(
+    (patch: Partial<ThermalConfig>) => {
+      if (!config) return;
+      updateConfig({ thermal: { ...config.thermal, ...patch } });
+    },
+    [config, updateConfig]
+  );
+
+  // Apply the theme to the document and remember it for the next launch.
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "dark") {
-      root.classList.add("dark");
-    } else if (theme === "light") {
-      root.classList.remove("dark");
-    } else {
-      // System preference
-      const mq = window.matchMedia("(prefers-color-scheme: dark)");
-      const apply = () => {
-        if (mq.matches) root.classList.add("dark");
-        else root.classList.remove("dark");
-      };
-      apply();
-      mq.addEventListener("change", apply);
-      return () => mq.removeEventListener("change", apply);
-    }
+    storeTheme(theme);
+    return applyTheme(theme);
   }, [theme]);
+
+  const handleRestartDone = useCallback(() => {
+    clearRestartRequired();
+    refetch();
+    refetchHeads();
+  }, [clearRestartRequired, refetch, refetchHeads]);
 
   if (isLoading || !config) {
     return (
@@ -264,8 +410,13 @@ export function SettingsPage() {
   }
 
   const totalCores = navigator.hardwareConcurrency ?? 4;
-  const totalMemMB = metrics?.memory_total_mb ?? 8192;
-  const hasGPU = metrics ? metrics.gpu_usage_pct >= 0 : false;
+  const totalMemMB =
+    system && system.memory_total_mb > 0 ? system.memory_total_mb : 8192;
+  const hasGPU = machine?.has_gpu ?? false;
+  const gpuPct = config.resource_limits.max_gpu_vram_pct;
+  const gpuCardMb = machine?.gpu_card_vram_mb ?? 0;
+  const gpuAllowedMb = Math.round((gpuCardMb * gpuPct) / 100);
+  const thermal = config.thermal;
 
   const handleSignChallenge = async () => {
     if (!client || !challengeHex.trim()) return;
@@ -298,6 +449,27 @@ export function SettingsPage() {
         </div>
       )}
 
+      {/* Restart required */}
+      {restartRequired && (
+        <div
+          role="status"
+          className="rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-3 space-y-2"
+        >
+          <div className="flex items-start gap-2 text-sm">
+            <AlertTriangle className="h-4 w-4 mt-0.5 text-yellow-600 shrink-0" />
+            <div>
+              <p className="font-medium">Restart required</p>
+              <p className="text-xs text-muted-foreground">
+                A setting you saved is one Lettuce reads only when it starts (resource
+                limits, schedule, thermal limits, concurrent tasks or log level). It is
+                saved, but the running daemon is still using the old value.
+              </p>
+            </div>
+          </div>
+          <RestartButton variant="default" onDone={handleRestartDone} />
+        </div>
+      )}
+
       {/* Section 1: Resource Limits */}
       <Section title="Resource Limits">
         <ResourceSlider
@@ -307,7 +479,7 @@ export function SettingsPage() {
           max={totalCores}
           step={1}
           displayValue={`${config.resource_limits.max_cpu_cores} / ${totalCores} cores`}
-          usagePct={metrics?.cpu_usage_pct}
+          usagePct={system?.cpu_usage_pct}
           onChange={(v) =>
             updateConfig({
               resource_limits: { ...config.resource_limits, max_cpu_cores: v },
@@ -323,8 +495,8 @@ export function SettingsPage() {
           step={256}
           displayValue={`${formatBytes(config.resource_limits.max_memory_mb)} / ${formatBytes(totalMemMB)}`}
           usagePct={
-            metrics && metrics.memory_total_mb > 0
-              ? (metrics.memory_used_mb / metrics.memory_total_mb) * 100
+            system && system.memory_total_mb > 0
+              ? (system.memory_used_mb / system.memory_total_mb) * 100
               : undefined
           }
           onChange={(v) =>
@@ -335,18 +507,13 @@ export function SettingsPage() {
         />
 
         <ResourceSlider
-          label="GPU VRAM"
-          value={config.resource_limits.max_gpu_vram_pct}
+          label="GPU allowance"
+          value={gpuPct}
           min={0}
           max={100}
           step={5}
-          displayValue={
-            config.resource_limits.max_gpu_vram_pct === 0
-              ? "GPU disabled"
-              : `${config.resource_limits.max_gpu_vram_pct}%`
-          }
+          displayValue={gpuPct === 0 ? "GPU disabled" : `${gpuPct}%`}
           disabled={!hasGPU}
-          usagePct={metrics?.gpu_usage_pct}
           onChange={(v) =>
             updateConfig({
               resource_limits: {
@@ -356,7 +523,15 @@ export function SettingsPage() {
             })
           }
         />
-        {!hasGPU && (
+        {hasGPU ? (
+          <p className="text-xs text-muted-foreground">
+            Leaves compare their VRAM need against this share of your card:
+            {gpuCardMb > 0
+              ? ` your card ${formatGb(gpuCardMb)} × ${gpuPct}% = ${formatGb(gpuAllowedMb)} allowed.`
+              : ` ${gpuPct}% of your ${machine?.gpu_vendors[0] ?? ""} card.`}
+            {gpuPct === 0 && " At 0% no GPU work is fetched."}
+          </p>
+        ) : (
           <p className="text-xs text-muted-foreground">No GPU detected</p>
         )}
 
@@ -378,6 +553,13 @@ export function SettingsPage() {
             })
           }
         />
+        <p className="text-xs text-muted-foreground">
+          A cap on what Lettuce may use for work files and cached container images, not
+          space it reserves. A leaf is fetched only when its declared need plus 2 GB of
+          headroom fits inside this allowance.
+          {metrics?.disk_usage_known &&
+            ` Lettuce is using ${formatGb(metrics.disk_used_mb)} right now.`}
+        </p>
 
         <ResourceSlider
           label="Network Bandwidth"
@@ -420,19 +602,21 @@ export function SettingsPage() {
         />
 
         <ResourceSlider
-          label="Work Buffer"
+          label="Work buffer"
           value={workBufferHours}
           min={0.5}
-          max={12}
+          max={24}
           step={0.5}
-          displayValue={`${workBufferHours} h of work per task`}
+          displayValue={`${workBufferHours} h`}
           onChange={(v) => {
-            setWorkBufferHours(v);
+            setWorkBufferDraft(v);
             updateConfig({ work_buffer_hours: v });
           }}
         />
         <p className="text-xs text-muted-foreground">
-          How many hours of work to download and keep ready for each running task. More buffer means less idle time if the server is slow.
+          How many hours of work to keep fetched ahead for each running task, so
+          computing continues if a head is slow or briefly unreachable. Applies
+          straight away.
         </p>
       </Section>
 
@@ -466,12 +650,92 @@ export function SettingsPage() {
         />
       </Section>
 
-      {/* Section 3: Container Runtime */}
+      {/* Section 3: Thermal */}
+      <Section title="Thermal" defaultOpen={false}>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">Pause when hot</p>
+            <p className="text-xs text-muted-foreground">
+              Freeze work when a sensor passes the pause temperature; continue once it
+              cools below the resume temperature.
+            </p>
+          </div>
+          <Toggle
+            label="Pause when hot"
+            checked={thermal.enabled}
+            onChange={(v) => updateThermal({ enabled: v })}
+          />
+        </div>
+        <div className="space-y-2">
+          <NumberField
+            label="CPU pause above"
+            value={thermal.cpu_pause_threshold}
+            min={40}
+            max={110}
+            suffix="°C"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ cpu_pause_threshold: v })}
+          />
+          <NumberField
+            label="CPU resume below"
+            value={thermal.cpu_resume_threshold}
+            min={30}
+            max={110}
+            suffix="°C"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ cpu_resume_threshold: v })}
+          />
+          <NumberField
+            label="GPU pause above"
+            value={thermal.gpu_pause_threshold}
+            min={40}
+            max={110}
+            suffix="°C"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ gpu_pause_threshold: v })}
+          />
+          <NumberField
+            label="GPU resume below"
+            value={thermal.gpu_resume_threshold}
+            min={30}
+            max={110}
+            suffix="°C"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ gpu_resume_threshold: v })}
+          />
+          <NumberField
+            label="Check every"
+            value={thermal.poll_interval_seconds}
+            min={1}
+            max={600}
+            suffix="s"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ poll_interval_seconds: v })}
+          />
+          <NumberField
+            label="Longest thermal pause"
+            value={thermal.max_throttle_minutes}
+            min={-1}
+            max={1440}
+            suffix="min"
+            disabled={!thermal.enabled}
+            onCommit={(v) => updateThermal({ max_throttle_minutes: v })}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">
+          The longest a thermal pause may hold before Lettuce releases it and checks the
+          sensors again — a guard against a sensor that never reports cool. Work is never
+          released while the sensor still reads above the resume temperature. 0 uses the
+          default (30 minutes); -1 waits as long as it takes.
+        </p>
+      </Section>
+
+      {/* Section 4: Container Runtime */}
       <Section title="Container Runtime">
         <ContainerRuntimeStatusCard />
       </Section>
 
-      {/* Section 4: Identity */}
+      {/* Section 5: Identity */}
       <Section title="Identity" defaultOpen={false}>
         <div className="space-y-3">
           {/* Public Key */}
@@ -486,6 +750,47 @@ export function SettingsPage() {
                 </code>
                 <CopyButton text={config.public_key} />
               </div>
+            </div>
+          )}
+
+          <div className="text-xs text-muted-foreground space-y-1">
+            <p>
+              Your keypair is your account. Every head you attach to recognises you by
+              this public key, and credit from every machine using the same key is added
+              together. One key can run on up to 10 machines.
+            </p>
+            <p>
+              To move or copy your account to another computer, copy{" "}
+              <code className="font-mono">identity.key</code> and{" "}
+              <code className="font-mono">identity.pub</code> from{" "}
+              <code className="font-mono">{config.data_dir}</code> into the same folder
+              there. Never re-run setup to fix a key problem — setup creates a new key,
+              which is a new account with no credit.
+            </p>
+          </div>
+
+          {heads.length > 0 && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Volunteer IDs by head
+              </label>
+              <ul className="space-y-1">
+                {heads.map((h) => (
+                  <li key={h.name} className="flex items-center justify-between gap-3 text-xs">
+                    <span className="font-medium">{h.name}</span>
+                    {h.volunteer_id ? (
+                      <span className="flex items-center gap-1">
+                        <code className="font-mono bg-muted rounded px-2 py-0.5 truncate max-w-[16rem]">
+                          {h.volunteer_id}
+                        </code>
+                        <CopyButton text={h.volunteer_id} />
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground italic">not registered yet</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
@@ -585,8 +890,9 @@ export function SettingsPage() {
               <Card className="border-destructive">
                 <CardContent className="p-4 space-y-3">
                   <p className="text-sm">
-                    This will generate a new identity. Your existing credit
-                    history will not transfer to the new identity. Are you sure?
+                    This will generate a new identity — a new account. Credit earned
+                    under the current key stays with that key on every head and does not
+                    transfer. Are you sure?
                   </p>
                   <div className="flex gap-2">
                     <Button
@@ -625,7 +931,7 @@ export function SettingsPage() {
         </div>
       </Section>
 
-      {/* Section 5: General */}
+      {/* Section 6: General */}
       <Section title="General" defaultOpen={false}>
         <div className="space-y-4">
           {/* Theme */}
@@ -663,6 +969,7 @@ export function SettingsPage() {
               </p>
             </div>
             <Toggle
+              label="Start on boot"
               checked={autostart}
               onChange={handleAutostartToggle}
             />
@@ -742,6 +1049,16 @@ export function SettingsPage() {
               <option value="info">Info</option>
               <option value="debug">Debug</option>
             </select>
+          </div>
+
+          {/* Restart */}
+          <div className="space-y-2 pt-2 border-t">
+            <p className="text-sm font-medium">Lettuce service</p>
+            <p className="text-xs text-muted-foreground">
+              Stops the background daemon and starts it again. Running work is
+              checkpointed and picked up after the restart.
+            </p>
+            <RestartButton onDone={handleRestartDone} />
           </div>
         </div>
       </Section>

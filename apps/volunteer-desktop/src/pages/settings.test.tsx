@@ -2,15 +2,20 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsPage } from "./settings";
-import type { ConfigResponse, MetricsResponse } from "@/api/client";
+import { mockManagementApi } from "@tauri-apps/api/core";
+import type { ConfigResponse } from "@/api/client";
 
 // Mock hooks
+const mockUseRestartRequired = vi.fn();
 vi.mock("@/hooks/use-config", () => ({
   useConfig: vi.fn(),
+  useRestartRequired: () => mockUseRestartRequired(),
 }));
 
+const mockUseSystemMetrics = vi.fn();
 vi.mock("@/hooks/use-metrics", () => ({
   useMetrics: vi.fn(),
+  useSystemMetrics: () => mockUseSystemMetrics(),
 }));
 
 // Mock lucide-react icons
@@ -20,6 +25,7 @@ vi.mock("lucide-react", () => ({
   Copy: (props: any) => <span data-testid="copy-icon" {...props} />,
   Check: (props: any) => <span data-testid="check-icon" {...props} />,
   AlertTriangle: (props: any) => <span data-testid="alert-icon" {...props} />,
+  RefreshCw: (props: any) => <span data-testid="refresh-icon" {...props} />,
   Monitor: (props: any) => <span data-testid="monitor-icon" {...props} />,
   Sun: (props: any) => <span data-testid="sun-icon" {...props} />,
   Moon: (props: any) => <span data-testid="moon-icon" {...props} />,
@@ -59,6 +65,7 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
       max_disk_gb: 10,
       max_bandwidth_mbps: 0,
       max_gpu_vram_pct: 50,
+      max_pids: 0,
     },
     scheduling: {
       mode: "ALWAYS",
@@ -77,6 +84,7 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
       gpu_pause_threshold: 80,
       gpu_resume_threshold: 70,
       poll_interval_seconds: 10,
+      max_throttle_minutes: 30,
     },
     notifications: {
       credit_milestones: true,
@@ -88,19 +96,47 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
     servers: [],
     log_level: "info",
     max_concurrent_tasks: 1,
-    available_runtimes: ["NATIVE"],
     ...overrides,
   };
+}
+
+const noGpuMachine = {
+  runtimes: ["wasm"],
+  has_gpu: false,
+  max_memory_mb: 2048,
+  max_disk_mb: 10240,
+  max_cpu_cores: 4,
+  max_gpu_vram_mb: 0,
+  gpu_card_vram_mb: 0,
+  gpu_vram_pct: 0,
+  gpu_vendors: [],
+  gpu_compute_capabilities: [],
+};
+
+/** Route the daemon's `/api/v1/heads` (machine capabilities and per-head ids). */
+function mockHeads(resp: { heads: unknown[]; machine: typeof noGpuMachine }) {
+  mockManagementApi({ "GET /api/v1/heads": resp, "GET /api/v1/status": {} });
 }
 
 describe("SettingsPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.removeItem("lettuce-theme");
     mockUseMetrics.mockReturnValue({
       metrics: null,
       isLoading: false,
       error: null,
     });
+    mockUseSystemMetrics.mockReturnValue({
+      system: { cpu_usage_pct: 12, memory_used_mb: 4096, memory_total_mb: 16384 },
+      error: null,
+    });
+    mockUseRestartRequired.mockReturnValue({
+      restartRequired: false,
+      markRestartRequired: vi.fn(),
+      clearRestartRequired: vi.fn(),
+    });
+    mockHeads({ heads: [], machine: noGpuMachine });
   });
 
   it("renders loading skeleton when config is loading", () => {
@@ -152,7 +188,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Memory")).toBeInTheDocument();
   });
 
-  it("renders GPU VRAM slider", () => {
+  it("renders GPU allowance slider", () => {
     mockUseConfig.mockReturnValue({
       config: makeConfig(),
       isLoading: false,
@@ -161,7 +197,302 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText("GPU VRAM")).toBeInTheDocument();
+    expect(screen.getByText("GPU allowance")).toBeInTheDocument();
+    expect(screen.queryByText("GPU VRAM")).not.toBeInTheDocument();
+  });
+
+  it("explains the GPU allowance arithmetic from the machine capabilities", async () => {
+    mockHeads({
+      heads: [],
+      machine: {
+        ...noGpuMachine,
+        has_gpu: true,
+        gpu_vendors: ["NVIDIA"],
+        gpu_card_vram_mb: 8192,
+        gpu_vram_pct: 50,
+        max_gpu_vram_mb: 4096,
+      },
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await waitFor(() => {
+      expect(
+        screen.getByText(/your card 8\.0 GB × 50% = 4\.0 GB allowed/)
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText("No GPU detected")).not.toBeInTheDocument();
+  });
+
+  it("sizes the memory slider from the app's own memory measurement", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.getByText("2.0 GB / 16.0 GB")).toBeInTheDocument();
+  });
+
+  it("explains the disk allowance and the 2 GB headroom rule", () => {
+    mockUseMetrics.mockReturnValue({
+      metrics: {
+        cpu_usage_pct: 0,
+        gpu_usage_pct: 0,
+        memory_used_mb: 0,
+        memory_total_mb: 0,
+        cpu_temp_c: 0,
+        gpu_temp_c: 0,
+        disk_used_mb: 3072,
+        disk_allowance_mb: 10240,
+        disk_usage_known: true,
+      },
+      isLoading: false,
+      error: null,
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(
+      screen.getByText(/A leaf is fetched only when its declared need plus 2 GB of headroom fits/)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Lettuce is using 3\.0 GB right now/)).toBeInTheDocument();
+  });
+
+  it("offers the work buffer in hours from 0.5 to 24 and saves work_buffer_hours", () => {
+    const updateConfig = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.getByText("Work buffer")).toBeInTheDocument();
+    expect(screen.getByText("2 h")).toBeInTheDocument();
+    expect(screen.getByText(/How many hours of work to keep fetched ahead/)).toBeInTheDocument();
+
+    // The work-buffer slider is the second slider of the Compute section.
+    const sliders = screen.getAllByRole("slider") as HTMLInputElement[];
+    const buffer = sliders.find((el) => el.min === "0.5" && el.max === "24");
+    expect(buffer).toBeDefined();
+    expect(buffer!.step).toBe("0.5");
+    fireEvent.change(buffer!, { target: { value: "6" } });
+    expect(updateConfig).toHaveBeenCalledWith({ work_buffer_hours: 6 });
+    expect(screen.getByText("6 h")).toBeInTheDocument();
+  });
+
+  it("starts the work buffer from the daemon's reported value when present", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ work_buffer_hours: 4.5 }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.getByText("4.5 h")).toBeInTheDocument();
+  });
+
+  it("renders the thermal section and saves a threshold on blur", async () => {
+    const user = userEvent.setup();
+    const updateConfig = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+
+    expect(screen.getByText("Pause when hot")).toBeInTheDocument();
+    expect(screen.getByLabelText("CPU pause above")).toHaveValue(85);
+    expect(screen.getByLabelText("CPU resume below")).toHaveValue(75);
+    expect(screen.getByLabelText("GPU pause above")).toHaveValue(80);
+    expect(screen.getByLabelText("GPU resume below")).toHaveValue(70);
+    expect(screen.getByLabelText("Check every")).toHaveValue(10);
+    expect(screen.getByLabelText("Longest thermal pause")).toHaveValue(30);
+    expect(
+      screen.getByText(/Work is never released while the sensor still reads above the resume temperature/)
+    ).toBeInTheDocument();
+
+    const field = screen.getByLabelText("Longest thermal pause");
+    await user.clear(field);
+    await user.type(field, "45");
+    // Nothing is saved while typing.
+    expect(updateConfig).not.toHaveBeenCalled();
+    await user.tab();
+    expect(updateConfig).toHaveBeenCalledWith({
+      thermal: expect.objectContaining({ max_throttle_minutes: 45, cpu_pause_threshold: 85 }),
+    });
+  });
+
+  it("toggles thermal monitoring", async () => {
+    const user = userEvent.setup();
+    const updateConfig = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+    await user.click(screen.getByRole("switch", { name: "Pause when hot" }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      thermal: expect.objectContaining({ enabled: false }),
+    });
+  });
+
+  it("shows the restart-required note with a working restart button", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "is_autostart_enabled") return Promise.resolve(false);
+      if (cmd === "restart_daemon") return Promise.resolve(undefined);
+      if (cmd === "mgmt_request") return Promise.resolve({});
+      return Promise.resolve(undefined);
+    });
+    const clearRestartRequired = vi.fn();
+    mockUseRestartRequired.mockReturnValue({
+      restartRequired: true,
+      markRestartRequired: vi.fn(),
+      clearRestartRequired,
+    });
+    const refetch = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+      refetch,
+    });
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    expect(screen.getByText("Restart required")).toBeInTheDocument();
+    expect(screen.getByText(/reads only when it starts/)).toBeInTheDocument();
+
+    const buttons = screen.getAllByRole("button", { name: /Restart Lettuce/ });
+    await user.click(buttons[0]);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("restart_daemon");
+    });
+    await waitFor(() => {
+      expect(clearRestartRequired).toHaveBeenCalled();
+    });
+    expect(refetch).toHaveBeenCalled();
+  });
+
+  it("does not show the restart-required note when nothing is pending", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.queryByText("Restart required")).not.toBeInTheDocument();
+  });
+
+  it("reports a failed restart", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "restart_daemon") return Promise.reject(new Error("Timed out waiting for the restarted daemon to start"));
+      if (cmd === "mgmt_request") return Promise.resolve({});
+      return Promise.resolve(undefined);
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+      refetch: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    await user.click(screen.getByText("General"));
+    await user.click(screen.getByRole("button", { name: /Restart Lettuce/ }));
+    await waitFor(() => {
+      expect(screen.getByText(/Restart failed: Timed out/)).toBeInTheDocument();
+    });
+  });
+
+  it("explains the account model and lists per-head volunteer ids", async () => {
+    mockHeads({
+      heads: [
+        { name: "lettuce.science", grpc_address: "a:1", status: "connected", weight: 100, leafs: [], volunteer_id: "vol-11111111" },
+        { name: "pending.example", grpc_address: "b:1", status: "disconnected", weight: 100, leafs: [] },
+      ],
+      machine: noGpuMachine,
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ public_key: "abc123-test-key" }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Identity"));
+
+    expect(screen.getByText(/Your keypair is your account/)).toBeInTheDocument();
+    expect(screen.getByText(/up to 10 machines/)).toBeInTheDocument();
+    expect(screen.getByText("identity.key")).toBeInTheDocument();
+    expect(screen.getByText("identity.pub")).toBeInTheDocument();
+    expect(screen.getByText(/Never re-run setup to fix a key problem/)).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("vol-11111111")).toBeInTheDocument();
+    });
+    expect(screen.getByText("lettuce.science")).toBeInTheDocument();
+    expect(screen.getByText("pending.example")).toBeInTheDocument();
+    expect(screen.getByText("not registered yet")).toBeInTheDocument();
+  });
+
+  it("remembers the chosen theme in localStorage and restores it", async () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    const user = userEvent.setup();
+    const first = render(<SettingsPage />);
+    await user.click(screen.getByText("General"));
+    await user.click(screen.getByText("Dark"));
+    expect(localStorage.getItem("lettuce-theme")).toBe("dark");
+    first.unmount();
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("General"));
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    // The Dark button is the selected one.
+    expect(screen.getByText("Dark").closest("button")?.className).toContain("bg-background");
+
+    // Leave the document clean for other tests.
+    await user.click(screen.getByText("Light"));
   });
 
   it("renders Disk Storage slider", () => {
@@ -236,6 +567,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Schedule")).toBeInTheDocument();
 
     // Collapsed sections (still render headers)
+    expect(screen.getByText("Thermal")).toBeInTheDocument();
     expect(screen.getByText("Container Runtime")).toBeInTheDocument();
     expect(screen.getByText("Identity")).toBeInTheDocument();
     expect(screen.getByText("General")).toBeInTheDocument();
@@ -386,6 +718,7 @@ describe("SettingsPage", () => {
           max_disk_gb: 10,
           max_bandwidth_mbps: 0,
           max_gpu_vram_pct: 0,
+          max_pids: 0,
         },
       }),
       isLoading: false,
@@ -406,6 +739,7 @@ describe("SettingsPage", () => {
           max_disk_gb: 10,
           max_bandwidth_mbps: 0,
           max_gpu_vram_pct: 50,
+          max_pids: 0,
         },
       }),
       isLoading: false,
@@ -535,27 +869,12 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("shows 'No GPU detected' when no GPU is available", () => {
+  it("shows 'No GPU detected' when the machine has no GPU", () => {
     mockUseConfig.mockReturnValue({
       config: makeConfig(),
       isLoading: false,
       updateConfig: vi.fn(),
       toast: null,
-    });
-
-    mockUseMetrics.mockReturnValue({
-      metrics: {
-        cpu_usage_pct: 45,
-        gpu_usage_pct: -1,
-        memory_used_mb: 4096,
-        memory_total_mb: 8192,
-        disk_used_gb: 50,
-        disk_total_gb: 200,
-        cpu_temp_c: 60,
-        gpu_temp_c: 0,
-      },
-      isLoading: false,
-      error: null,
     });
 
     render(<SettingsPage />);

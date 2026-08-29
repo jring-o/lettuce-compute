@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { useConfig } from "./use-config";
 import type { ConfigResponse, ManagementClient } from "@/api/client";
@@ -51,6 +51,7 @@ function makeConfig(): ConfigResponse {
       max_disk_gb: 10,
       max_bandwidth_mbps: 0,
       max_gpu_vram_pct: 50,
+      max_pids: 0,
     },
     scheduling: {
       mode: "ALWAYS",
@@ -69,6 +70,7 @@ function makeConfig(): ConfigResponse {
       gpu_pause_threshold: 80,
       gpu_resume_threshold: 70,
       poll_interval_seconds: 10,
+      max_throttle_minutes: 30,
     },
     notifications: {
       credit_milestones: true,
@@ -80,7 +82,6 @@ function makeConfig(): ConfigResponse {
     servers: [],
     log_level: "info",
     max_concurrent_tasks: 1,
-    available_runtimes: ["NATIVE"],
   };
 }
 
@@ -183,5 +184,67 @@ describe("useConfig", () => {
     });
 
     expect(result.current.saving).toBe(false);
+  });
+});
+
+describe("needsRestart / useRestartRequired", () => {
+  it("flags only the settings the daemon reads at start", async () => {
+    const { needsRestart } = await import("./use-config");
+    expect(needsRestart({ scheduling: { mode: "ALWAYS" } })).toBe(true);
+    expect(needsRestart({ thermal: { enabled: false } })).toBe(true);
+    expect(needsRestart({ resource_limits: { max_cpu_cores: 2 } })).toBe(true);
+    expect(needsRestart({ max_concurrent_tasks: 2 })).toBe(true);
+    expect(needsRestart({ log_level: "debug" })).toBe(true);
+    expect(needsRestart({ work_buffer_hours: 3 })).toBe(false);
+    expect(needsRestart({ notifications: { errors: false } })).toBe(false);
+    expect(needsRestart({ leafs: { mode: "ALL" } })).toBe(false);
+    expect(needsRestart({ servers: [] })).toBe(false);
+  });
+
+  it("marks a restart as required after saving a restart-only setting and clears it on demand", async () => {
+    const { useRestartRequired, resetRestartRequiredForTest } = await import("./use-config");
+    resetRestartRequiredForTest();
+    const cfg = makeConfig();
+    mockConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue(cfg);
+
+    const { result } = renderHook(() => ({ cfg: useConfig(), restart: useRestartRequired() }));
+    await vi.waitFor(() => {
+      expect(result.current.cfg.isLoading).toBe(false);
+    });
+    expect(result.current.restart.restartRequired).toBe(false);
+
+    await act(async () => {
+      await result.current.cfg.updateConfig({ work_buffer_hours: 3 });
+    });
+    expect(result.current.restart.restartRequired).toBe(false);
+
+    await act(async () => {
+      await result.current.cfg.updateConfig({ log_level: "debug" });
+    });
+    expect(result.current.restart.restartRequired).toBe(true);
+
+    act(() => {
+      result.current.restart.clearRestartRequired();
+    });
+    expect(result.current.restart.restartRequired).toBe(false);
+  });
+
+  it("honours the daemon's own restart_required flag", async () => {
+    const { useRestartRequired, resetRestartRequiredForTest } = await import("./use-config");
+    resetRestartRequiredForTest();
+    const cfg = makeConfig();
+    mockConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true } as any);
+
+    const { result } = renderHook(() => ({ cfg: useConfig(), restart: useRestartRequired() }));
+    await vi.waitFor(() => {
+      expect(result.current.cfg.isLoading).toBe(false);
+    });
+    await act(async () => {
+      await result.current.cfg.updateConfig({ servers: [] });
+    });
+    expect(result.current.restart.restartRequired).toBe(true);
+    resetRestartRequiredForTest();
   });
 });
