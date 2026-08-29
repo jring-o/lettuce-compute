@@ -44,6 +44,12 @@ describe("leafRuntimes", () => {
     ).toEqual(["native", "wasm"]);
   });
 
+  it("does not count a visualization bundle as a native binary", () => {
+    expect(
+      leafRuntimes({ execution_spec: { image: "lbry.science/beyblade:2.1", binaries: { viz: "https://x/viz.tar.gz" } } } as never),
+    ).toEqual(["container"]);
+  });
+
   it("does not count a wgsl shader as a native binary", () => {
     expect(leafRuntimes(makeLeaf({ execution_spec: { binaries: { wgsl: "k.wgsl", wasm: "m.wasm" } } }))).toEqual(["wasm"]);
   });

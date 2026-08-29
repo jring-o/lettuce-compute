@@ -8,12 +8,15 @@ export type LeafRuntime = "container" | "native" | "wasm";
  * Which runtimes a leaf's execution spec offers: an image means container,
  * a `wasm` binary means WASM, any other binary key means native.
  */
+/** Binary-map keys that never denote a native executable. */
+const NON_NATIVE_BINARY_KEYS = new Set(["wasm", "wgsl", "viz"]);
+
 export function leafRuntimes(leaf: LeafInfo): LeafRuntime[] {
   const spec = leaf.execution_spec;
   const out: LeafRuntime[] = [];
   if (spec?.image) out.push("container");
   const keys = Object.keys(spec?.binaries ?? {});
-  if (keys.some((k) => k !== "wasm" && k !== "wgsl")) out.push("native");
+  if (keys.some((k) => !NON_NATIVE_BINARY_KEYS.has(k))) out.push("native");
   if (spec?.binaries?.wasm) out.push("wasm");
   return out;
 }
