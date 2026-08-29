@@ -1,6 +1,15 @@
 import "@testing-library/jest-dom/vitest";
 
-// Polyfill browser APIs not available in jsdom
+/**
+ * Global test setup (vitest `setupFiles`).
+ *
+ * Tauri's `@tauri-apps/api/core` and `@tauri-apps/api/event` are aliased to
+ * the mocks under `src/__mocks__/@tauri-apps/api/` by `vitest.config.ts`, so
+ * every `invoke` resolves to a typed default (`hostCommandDefaults` in
+ * `core.ts`) unless a test overrides it, and management-API calls can be
+ * routed with `mockManagementApi`. This file only fills in the browser APIs
+ * jsdom lacks.
+ */
 
 // IntersectionObserver (used by history page infinite scroll)
 class MockIntersectionObserver {

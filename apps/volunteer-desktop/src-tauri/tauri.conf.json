@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src http://127.0.0.1:* https://* http://ipc.localhost http://tauri.localhost; style-src 'self' 'unsafe-inline'; frame-src http://lettuce-viz.localhost",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; frame-src http://lettuce-viz.localhost lettuce-viz://localhost",
       "assetProtocol": {
         "enable": true,
         "scope": ["$HOME/.lettuce/**", "$HOME/.lettuce/work/**", "$HOME/.lettuce/work/*/.lettuce-viz/**", "$HOME/.lettuce/work/*/.lettuce-viz/*"]
