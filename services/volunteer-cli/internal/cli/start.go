@@ -177,6 +177,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var connections []*daemon.ServerConnection
 	var stateServers []daemon.ServerState
 
+	// Volunteer-facing notices and per-head version/update state are created
+	// here, before the daemon exists, because registration below is one of the
+	// two places a head can reject this build as too old — and a head that does
+	// so never becomes a connection the daemon could report on. Both are handed
+	// to the daemon so the management API serves what start-up observed.
+	notices := daemon.NewNoticeLog()
+	headStatus := daemon.NewHeadStatusTracker()
+
 	for _, srv := range cfg.Servers {
 		name := srv.Name
 		if name == "" {
@@ -218,6 +226,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		} else {
 			headVersion = statusResp.Version
 		}
+		headStatus.SetVersion(srv.GRPCAddress, headVersion)
 
 		// Advertise per-head: only the runtimes this machine can run AND this head is
 		// trusted to run (WASM always; CONTAINER/NATIVE per the attach-time trust choice).
@@ -228,6 +237,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
 					"server", name, "error", err)
+				headStatus.MarkUpdateRequired(srv.GRPCAddress)
+				notices.Notify(daemon.NoticeWarn, "update_required",
+					fmt.Sprintf("Head %q rejected this volunteer build as too old at registration; it will not serve work until the volunteer is updated. Run 'lettuce-volunteer update'. (%v)", name, err),
+					name, "")
 			}
 			logger.Warn("failed to register with server, skipping",
 				"server", name, "error", err)
@@ -316,6 +329,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		RuntimeRegistry: registry,
 		MachineManager:  machineManager,
 		Logger:          logger,
+		ClientVersion:   version,
+		Notices:         notices,
+		HeadStatus:      headStatus,
 	})
 
 	// Start management API server.

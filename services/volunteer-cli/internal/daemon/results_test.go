@@ -7,31 +7,34 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // Canonical-UUID fixtures. SaveResult/GetResultData now require the work unit ID
 // to be a strict UUID (H2 path-traversal fix), so test fixtures use real UUIDs.
 const (
-	uuidWU001   = "00000000-0000-4000-8000-000000000001"
-	uuidWU002   = "00000000-0000-4000-8000-000000000002"
-	uuidWU003   = "00000000-0000-4000-8000-000000000003"
-	uuidFetch   = "11111111-1111-4111-8111-111111111111"
-	uuidOld     = "aaaaaaaa-0000-4000-8000-000000000001"
-	uuidMid     = "aaaaaaaa-0000-4000-8000-000000000002"
-	uuidNew     = "aaaaaaaa-0000-4000-8000-000000000003"
-	uuidOnly    = "bbbbbbbb-0000-4000-8000-000000000001"
-	uuidFirst   = "cccccccc-0000-4000-8000-000000000001"
-	uuidSecond  = "cccccccc-0000-4000-8000-000000000002"
-	uuidDup     = "dddddddd-0000-4000-8000-000000000001"
-	uuidLegit   = "eeeeeeee-0000-4000-8000-000000000001"
-	uuidNoViz   = "ffffffff-0000-4000-8000-000000000001"
+	uuidWU001  = "00000000-0000-4000-8000-000000000001"
+	uuidWU002  = "00000000-0000-4000-8000-000000000002"
+	uuidWU003  = "00000000-0000-4000-8000-000000000003"
+	uuidFetch  = "11111111-1111-4111-8111-111111111111"
+	uuidOld    = "aaaaaaaa-0000-4000-8000-000000000001"
+	uuidMid    = "aaaaaaaa-0000-4000-8000-000000000002"
+	uuidNew    = "aaaaaaaa-0000-4000-8000-000000000003"
+	uuidOnly   = "bbbbbbbb-0000-4000-8000-000000000001"
+	uuidFirst  = "cccccccc-0000-4000-8000-000000000001"
+	uuidSecond = "cccccccc-0000-4000-8000-000000000002"
+	uuidDup    = "dddddddd-0000-4000-8000-000000000001"
+	uuidLegit  = "eeeeeeee-0000-4000-8000-000000000001"
+	uuidNoViz  = "ffffffff-0000-4000-8000-000000000001"
 )
 
 func TestSaveResult_WritesFileAndIndex(t *testing.T) {
 	dataDir := t.TempDir()
 
 	outputData := []byte(`{"answer": 42}`)
-	err := SaveResult(dataDir, uuidWU001, "Prime Gaps", "prime-gaps", "example.com", outputData, "/viz/bundle.html", 0)
+	viz := seedVizTarball(t, dataDir, "https://head.example.org/viz/prime-gaps.tar.gz", "", map[string]string{"index.html": "<html>prime gaps</html>"})
+	err := SaveResult(dataDir, uuidWU001, "Prime Gaps", "prime-gaps", "example.com", outputData, viz, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
@@ -68,8 +71,12 @@ func TestSaveResult_WritesFileAndIndex(t *testing.T) {
 	if e.HeadName != "example.com" {
 		t.Errorf("HeadName = %q, want example.com", e.HeadName)
 	}
-	if e.VizBundlePath != "/viz/bundle.html" {
-		t.Errorf("VizBundlePath = %q, want /viz/bundle.html", e.VizBundlePath)
+	wantViz := filepath.Join(VizBundlesDir(dataDir), runtime.VizBundleKey(viz.URL, ""))
+	if e.VizBundlePath != wantViz {
+		t.Errorf("VizBundlePath = %q, want the persistent copy %q", e.VizBundlePath, wantViz)
+	}
+	if e.VizBundleKey != runtime.VizBundleKey(viz.URL, "") {
+		t.Errorf("VizBundleKey = %q, want %q", e.VizBundleKey, runtime.VizBundleKey(viz.URL, ""))
 	}
 	if e.SizeBytes != int64(len(outputData)) {
 		t.Errorf("SizeBytes = %d, want %d", e.SizeBytes, len(outputData))
@@ -84,7 +91,7 @@ func TestSaveResult_MultipleEntries(t *testing.T) {
 
 	for i, id := range []string{uuidWU001, uuidWU002, uuidWU003} {
 		data := []byte(`{"iteration": ` + string(rune('0'+i)) + `}`)
-		err := SaveResult(dataDir, id, "Leaf "+id, "leaf-"+id, "head", data, "", 0)
+		err := SaveResult(dataDir, id, "Leaf "+id, "leaf-"+id, "head", data, VizBundleSource{}, 0)
 		if err != nil {
 			t.Fatalf("SaveResult(%s) error: %v", id, err)
 		}
@@ -175,7 +182,7 @@ func TestGetResultData_ReturnsCorrectData(t *testing.T) {
 	dataDir := t.TempDir()
 	outputData := []byte(`{"result": "computed"}`)
 
-	err := SaveResult(dataDir, uuidFetch, "Fetch Leaf", "fetch-leaf", "head", outputData, "", 0)
+	err := SaveResult(dataDir, uuidFetch, "Fetch Leaf", "fetch-leaf", "head", outputData, VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
@@ -213,7 +220,7 @@ func TestEvictResults_RemovesOldestWhenOverLimit(t *testing.T) {
 
 	// Save with small time gaps so ordering is deterministic.
 	for i, id := range []string{uuidOld, uuidMid, uuidNew} {
-		err := SaveResult(dataDir, id, "Leaf", "leaf", "head", payload, "", 0)
+		err := SaveResult(dataDir, id, "Leaf", "leaf", "head", payload, VizBundleSource{}, 0)
 		if err != nil {
 			t.Fatalf("SaveResult(%s) error: %v", id, err)
 		}
@@ -270,7 +277,7 @@ func TestEvictResults_NoEvictionWhenUnderLimit(t *testing.T) {
 	dataDir := t.TempDir()
 
 	payload := []byte(`{"small": true}`)
-	err := SaveResult(dataDir, uuidOnly, "Leaf", "leaf", "head", payload, "", 0)
+	err := SaveResult(dataDir, uuidOnly, "Leaf", "leaf", "head", payload, VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
@@ -310,7 +317,7 @@ func TestSaveResult_EvictionTriggeredByMaxBytes(t *testing.T) {
 		payload[i] = byte('X')
 	}
 
-	err := SaveResult(dataDir, uuidFirst, "Leaf", "leaf", "head", payload, "", 0)
+	err := SaveResult(dataDir, uuidFirst, "Leaf", "leaf", "head", payload, VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult(%s) error: %v", uuidFirst, err)
 	}
@@ -321,7 +328,7 @@ func TestSaveResult_EvictionTriggeredByMaxBytes(t *testing.T) {
 	rewriteResultIndex(dataDir, entries)
 
 	// Save second result with maxBytes=150 (total would be 200, over limit).
-	err = SaveResult(dataDir, uuidSecond, "Leaf", "leaf", "head", payload, "", 150)
+	err = SaveResult(dataDir, uuidSecond, "Leaf", "leaf", "head", payload, VizBundleSource{}, 150)
 	if err != nil {
 		t.Fatalf("SaveResult(%s) error: %v", uuidSecond, err)
 	}
@@ -359,12 +366,12 @@ func TestSaveResult_DuplicateWorkUnitID(t *testing.T) {
 	dataDir := t.TempDir()
 
 	// Save the same work unit ID twice with different data.
-	err := SaveResult(dataDir, uuidDup, "Leaf A", "leaf-a", "head", []byte(`{"v":1}`), "", 0)
+	err := SaveResult(dataDir, uuidDup, "Leaf A", "leaf-a", "head", []byte(`{"v":1}`), VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("first SaveResult() error: %v", err)
 	}
 
-	err = SaveResult(dataDir, uuidDup, "Leaf A", "leaf-a", "head", []byte(`{"v":2}`), "", 0)
+	err = SaveResult(dataDir, uuidDup, "Leaf A", "leaf-a", "head", []byte(`{"v":2}`), VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("second SaveResult() error: %v", err)
 	}
@@ -426,7 +433,7 @@ func TestGetResultData_PathTraversal(t *testing.T) {
 	}
 
 	// Verify legitimate (canonical UUID) IDs still work.
-	err := SaveResult(dataDir, uuidLegit, "Leaf", "leaf", "head", []byte(`{"ok":true}`), "", 0)
+	err := SaveResult(dataDir, uuidLegit, "Leaf", "leaf", "head", []byte(`{"ok":true}`), VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
@@ -442,7 +449,7 @@ func TestGetResultData_PathTraversal(t *testing.T) {
 func TestSaveResult_VizBundlePathEmpty(t *testing.T) {
 	dataDir := t.TempDir()
 
-	err := SaveResult(dataDir, uuidNoViz, "Leaf", "leaf", "head", []byte(`{}`), "", 0)
+	err := SaveResult(dataDir, uuidNoViz, "Leaf", "leaf", "head", []byte(`{}`), VizBundleSource{}, 0)
 	if err != nil {
 		t.Fatalf("SaveResult() error: %v", err)
 	}
