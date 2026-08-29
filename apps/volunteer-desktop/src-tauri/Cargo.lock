@@ -2106,6 +2106,7 @@ version = "2.0.0"
 dependencies = [
  "dirs 5.0.1",
  "http",
+ "libc",
  "percent-encoding",
  "reqwest 0.12.28",
  "serde",
