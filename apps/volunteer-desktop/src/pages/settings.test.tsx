@@ -94,6 +94,7 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
     servers: [],
     log_level: "info",
     max_concurrent_tasks: 1,
+    work_buffer_hours: 2,
     ...overrides,
   };
 }
@@ -264,10 +265,10 @@ describe("SettingsPage", () => {
     expect(screen.getByText(/Lettuce is using 3\.0 GB right now/)).toBeInTheDocument();
   });
 
-  it("offers the work buffer in hours from 0.5 to 24 and saves work_buffer_hours", () => {
+  it("shows the daemon's work buffer in hours (0–12, step 0.5) and saves work_buffer_hours", () => {
     const updateConfig = vi.fn();
     mockUseConfig.mockReturnValue({
-      config: makeConfig(),
+      config: makeConfig({ work_buffer_hours: 4.5 }),
       isLoading: false,
       updateConfig,
       toast: null,
@@ -275,29 +276,26 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     expect(screen.getByText("Work buffer")).toBeInTheDocument();
-    expect(screen.getByText("2 h")).toBeInTheDocument();
+    expect(screen.getByText("4.5 h of work per task")).toBeInTheDocument();
     expect(screen.getByText(/How many hours of work to keep fetched ahead/)).toBeInTheDocument();
 
-    // The work-buffer slider is the second slider of the Compute section.
     const sliders = screen.getAllByRole("slider") as HTMLInputElement[];
-    const buffer = sliders.find((el) => el.min === "0.5" && el.max === "24");
+    const buffer = sliders.find((el) => el.min === "0" && el.max === "12" && el.step === "0.5");
     expect(buffer).toBeDefined();
-    expect(buffer!.step).toBe("0.5");
     fireEvent.change(buffer!, { target: { value: "6" } });
     expect(updateConfig).toHaveBeenCalledWith({ work_buffer_hours: 6 });
-    expect(screen.getByText("6 h")).toBeInTheDocument();
   });
 
-  it("starts the work buffer from the daemon's reported value when present", () => {
+  it("describes a zero work buffer as the daemon's fixed unit-count fallback", () => {
     mockUseConfig.mockReturnValue({
-      config: makeConfig({ work_buffer_hours: 4.5 }),
+      config: makeConfig({ work_buffer_hours: 0 }),
       isLoading: false,
       updateConfig: vi.fn(),
       toast: null,
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText("4.5 h")).toBeInTheDocument();
+    expect(screen.getByText("Fixed unit count (daemon fallback)")).toBeInTheDocument();
   });
 
   it("renders the thermal section and saves a threshold on blur", async () => {

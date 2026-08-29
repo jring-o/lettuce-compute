@@ -304,9 +304,6 @@ function RestartButton() {
   );
 }
 
-/** Daemon default for `work_buffer_hours` (hours of work buffered per running task). */
-const DEFAULT_WORK_BUFFER_HOURS = 2;
-
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
   const { metrics } = useMetrics(5000);
@@ -320,13 +317,6 @@ export function SettingsPage() {
   // The restarted daemon re-detects the machine and reconnects to heads
   // (`useConfig` refetches the config itself).
   useOnDaemonRestart(refetchHeads);
-
-  // Older CLI builds do not return work_buffer_hours from GET /api/v1/config;
-  // until the daemon reports it, the slider shows the last value saved in this
-  // session, starting from the daemon default.
-  const [workBufferDraft, setWorkBufferDraft] = useState<number | null>(null);
-  const workBufferHours =
-    workBufferDraft ?? config?.work_buffer_hours ?? DEFAULT_WORK_BUFFER_HOURS;
 
   const { client } = useClient();
 
@@ -410,6 +400,9 @@ export function SettingsPage() {
   const totalCores = navigator.hardwareConcurrency ?? 4;
   const totalMemMB =
     system && system.memory_total_mb > 0 ? system.memory_total_mb : 8192;
+  // 0 is the daemon's unit-count fallback; a daemon too old to report the
+  // field reads as the daemon default (2 h).
+  const workBufferHours = config.work_buffer_hours ?? 2;
   const hasGPU = machine?.has_gpu ?? false;
   const gpuPct = config.resource_limits.max_gpu_vram_pct;
   const gpuCardMb = machine?.gpu_card_vram_mb ?? 0;
@@ -582,19 +575,20 @@ export function SettingsPage() {
         <ResourceSlider
           label="Work buffer"
           value={workBufferHours}
-          min={0.5}
-          max={24}
+          min={0}
+          max={12}
           step={0.5}
-          displayValue={`${workBufferHours} h`}
-          onChange={(v) => {
-            setWorkBufferDraft(v);
-            updateConfig({ work_buffer_hours: v });
-          }}
+          displayValue={
+            workBufferHours > 0
+              ? `${workBufferHours} h of work per task`
+              : "Fixed unit count (daemon fallback)"
+          }
+          onChange={(v) => updateConfig({ work_buffer_hours: v })}
         />
         <p className="text-xs text-muted-foreground">
           How many hours of work to keep fetched ahead for each running task, so
-          computing continues if a head is slow or briefly unreachable. Applies
-          straight away.
+          computing continues if a head is slow or briefly unreachable. At 0 the
+          daemon keeps a small fixed number of units instead. Applies straight away.
         </p>
       </Section>
 

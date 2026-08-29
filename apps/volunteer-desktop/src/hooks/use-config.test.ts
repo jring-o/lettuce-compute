@@ -82,6 +82,7 @@ function makeConfig(): ConfigResponse {
     servers: [],
     log_level: "info",
     max_concurrent_tasks: 1,
+    work_buffer_hours: 2,
   };
 }
 
