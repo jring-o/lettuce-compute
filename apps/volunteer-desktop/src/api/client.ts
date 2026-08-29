@@ -895,6 +895,14 @@ type RawConfigResponse = Omit<ConfigResponse, "servers"> & {
   servers?: RawServerConfig[] | null;
 };
 
+/**
+ * The daemon reports `runtime_type` in upper case ("CONTAINER"); the app keys
+ * its badges and filters on the lower-case form. Normalise once, at the edge.
+ */
+function normalizeTask<T extends { runtime_type: string }>(task: T): T {
+  return { ...task, runtime_type: String(task.runtime_type ?? "").toLowerCase() };
+}
+
 export class ManagementClient {
   private constructor() {}
 
@@ -937,7 +945,7 @@ export class ManagementClient {
     const resp = await this.request<StatusResponse>("GET", "/api/v1/status");
     return {
       ...resp,
-      active_tasks: list(resp.active_tasks),
+      active_tasks: list(resp.active_tasks).map(normalizeTask),
       queued_tasks: list(resp.queued_tasks),
       failing_leafs: list(resp.failing_leafs),
     };
@@ -1055,6 +1063,7 @@ export class ManagementClient {
   }
 
   async taskDetails(workUnitId: string): Promise<TaskDetail> {
-    return this.request("GET", `/api/v1/tasks/${workUnitId}/details`);
+    const detail = await this.request<TaskDetail>("GET", `/api/v1/tasks/${workUnitId}/details`);
+    return normalizeTask(detail);
   }
 }
