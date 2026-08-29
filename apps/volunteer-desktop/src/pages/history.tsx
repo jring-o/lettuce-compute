@@ -1,12 +1,18 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { Download, Filter, ChevronRight, ChevronDown, Copy, Eye, X } from "lucide-react";
-import { useHistory, filtersToParams, type HistoryFilters } from "@/hooks/use-history";
+import {
+  useHistory,
+  filtersToParams,
+  applyClientFilters,
+  hasClientFilter,
+  type HistoryFilters,
+} from "@/hooks/use-history";
 import { useCredit } from "@/hooks/use-credit";
 import { useHeads } from "@/hooks/use-heads";
 import { useClient } from "@/hooks/use-api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn, formatDuration, formatCredit } from "@/lib/utils";
+import { cn, formatDuration, formatCreditAmount } from "@/lib/utils";
 import { VizFrame } from "@/components/viz/VizFrame";
 import type { HistoryEntry, CreditSummary, ResultEntry } from "@/api/client";
 
@@ -42,17 +48,28 @@ function groupByDay(entries: HistoryEntry[]): Map<string, HistoryEntry[]> {
   return groups;
 }
 
-const STATUS_STYLES = {
+/**
+ * `validation_status` records whether the head accepted the submission when
+ * it arrived — not whether the result later passed validation, which (like
+ * credit) is decided on the head afterwards. The labels say exactly that.
+ */
+const HEAD_ACCEPTED_STYLES = {
   accepted: "bg-green-500/10 text-green-600 border-green-500/20",
-  pending: "bg-yellow-500/10 text-yellow-600 border-yellow-500/20",
   rejected: "bg-red-500/10 text-red-600 border-red-500/20",
 } as const;
 
-const STATUS_LABELS = {
-  accepted: "Validated",
-  pending: "Pending",
-  rejected: "Rejected",
+const HEAD_ACCEPTED_LABELS = {
+  accepted: "Head accepted",
+  rejected: "Head rejected",
 } as const;
+
+export const HEAD_ACCEPTED_TOOLTIP =
+  "Whether the head accepted this submission when it arrived. Validation and credit are decided later on the head and are not shown here.";
+
+/** `HistoryEntry.credit_earned` is 0 until the daemon tracks per-unit credit; a zero is not shown. */
+function creditLabel(credit: number): string | null {
+  return credit > 0 ? `+${formatCreditAmount(credit)}` : null;
+}
 
 interface HistoryRowProps {
   entry: HistoryEntry;
@@ -64,6 +81,7 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const pausedSeconds = entry.duration_seconds - entry.cpu_seconds;
+  const credit = creditLabel(entry.credit_earned);
 
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -78,7 +96,7 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
   };
 
   return (
-    <div>
+    <div data-testid="history-row">
       <div
         className="flex items-center gap-3 py-2 px-3 rounded-md hover:bg-muted/50 transition-colors cursor-pointer"
         onClick={() => setExpanded(!expanded)}
@@ -103,16 +121,17 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
             <span>{formatDuration(entry.cpu_seconds)}</span>
           </div>
         </div>
-        <span className="text-sm font-medium text-primary shrink-0">
-          +{formatCredit(entry.credit_earned)}
-        </span>
+        {credit && (
+          <span className="text-sm font-medium text-primary shrink-0">{credit}</span>
+        )}
         <span
+          title={HEAD_ACCEPTED_TOOLTIP}
           className={cn(
             "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium shrink-0",
-            STATUS_STYLES[entry.validation_status]
+            HEAD_ACCEPTED_STYLES[entry.validation_status]
           )}
         >
-          {STATUS_LABELS[entry.validation_status]}
+          {HEAD_ACCEPTED_LABELS[entry.validation_status]}
         </span>
       </div>
       {expanded && (
@@ -133,6 +152,15 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
             <div>
               <span className="text-muted-foreground">Head</span>
               <span className="ml-2 font-medium">{entry.head_name || "—"}</span>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Head accepted</span>
+              <span className="ml-2 font-medium">
+                {entry.validation_status === "accepted" ? "Yes" : "No"}
+              </span>
+              <span className="ml-2 text-muted-foreground">
+                — on submission; validation and credit are decided later on the head
+              </span>
             </div>
             <div className="col-span-2 flex items-center gap-2">
               <span className="text-muted-foreground">Work Unit ID</span>
@@ -195,7 +223,7 @@ function CreditBreakdown({ credit }: { credit: CreditSummary }) {
                   <span className="font-medium">{head.head_name}</span>
                   <span className="text-muted-foreground">
                     {head.available
-                      ? `${formatCredit(head.total_credit)} (${Math.round(headPct)}%)`
+                      ? `${formatCreditAmount(head.total_credit)} (${Math.round(headPct)}%)`
                       : "unavailable"}
                   </span>
                 </div>
@@ -235,7 +263,7 @@ function CreditBreakdown({ credit }: { credit: CreditSummary }) {
               <div className="flex justify-between text-xs">
                 <span className="font-medium truncate">{p.leaf_name}</span>
                 <span className="text-muted-foreground shrink-0 ml-2">
-                  {formatCredit(p.credit)} ({Math.round(pct)}%)
+                  {formatCreditAmount(p.credit)} ({Math.round(pct)}%)
                 </span>
               </div>
               <div className="h-2 bg-secondary rounded-full overflow-hidden">
@@ -261,12 +289,46 @@ interface ReplayModalState {
   error: string | null;
 }
 
+const CLOSED_REPLAY_MODAL: ReplayModalState = {
+  open: false,
+  leafSlug: "",
+  vizBundlePath: "",
+  replayData: null,
+  loading: false,
+  error: null,
+};
+
+/** CSV header of the export. `head_accepted` is `validation_status` as true/false. */
+export const HISTORY_CSV_HEADER =
+  "work_unit_id,leaf_name,head_name,completed_at,duration_seconds,cpu_seconds,credit_earned,head_accepted";
+
+function csvCell(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+export function historyToCsv(entries: HistoryEntry[], leafToHead: Map<string, string>): string {
+  const rows = entries.map((e) =>
+    [
+      e.work_unit_id,
+      csvCell(e.leaf_name),
+      csvCell(e.head_name || (leafToHead.get(e.leaf_name) ?? "")),
+      e.completed_at,
+      e.duration_seconds,
+      e.cpu_seconds,
+      e.credit_earned,
+      e.validation_status === "accepted" ? "true" : "false",
+    ].join(",")
+  );
+  return HISTORY_CSV_HEADER + "\n" + rows.join("\n");
+}
+
 export function HistoryPage() {
   const [filters, setFilters] = useState<HistoryFilters>({
     dateRange: "30d",
-    validationStatus: "all",
+    headAccepted: "all",
   });
-  const { entries, hasMore, isLoading, loadMore, error } = useHistory(filters);
+  const { entries, loadedCount, leafNames, hasMore, isLoading, loadMore, error } =
+    useHistory(filters);
   const { credit } = useCredit(30000);
   const { heads } = useHeads();
   const { client } = useClient();
@@ -274,74 +336,59 @@ export function HistoryPage() {
   const [exportProgress, setExportProgress] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Available results for replay
+  // Locally persisted results (a result is kept only for leafs with a visualization bundle)
   const [availableResults, setAvailableResults] = useState<Map<string, ResultEntry>>(new Map());
-  const [replayModal, setReplayModal] = useState<ReplayModalState>({
-    open: false,
-    leafSlug: "",
-    vizBundlePath: "",
-    replayData: null,
-    loading: false,
-    error: null,
-  });
+  const [replayModal, setReplayModal] = useState<ReplayModalState>(CLOSED_REPLAY_MODAL);
 
-  // Fetch available results on mount
   useEffect(() => {
     if (!client) return;
-    client.results().then((resp) => {
-      const map = new Map<string, ResultEntry>();
-      for (const r of resp.results) {
-        map.set(r.work_unit_id, r);
-      }
-      setAvailableResults(map);
-    }).catch(() => {
-      // Results endpoint not available — no replay buttons shown
-    });
+    let cancelled = false;
+    client
+      .results()
+      .then((resp) => {
+        if (cancelled) return;
+        const map = new Map<string, ResultEntry>();
+        for (const r of resp.results) map.set(r.work_unit_id, r);
+        setAvailableResults(map);
+      })
+      .catch(() => {
+        // No local results — no replay buttons shown
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [client]);
 
-  // Handle View button click
-  const handleViewResult = useCallback(async (workUnitId: string) => {
-    if (!client) return;
+  const handleViewResult = useCallback(
+    async (workUnitId: string) => {
+      if (!client) return;
+      const resultEntry = availableResults.get(workUnitId);
+      if (!resultEntry) return;
 
-    const resultEntry = availableResults.get(workUnitId);
-    if (!resultEntry) return;
+      setReplayModal({
+        open: true,
+        leafSlug: resultEntry.leaf_slug,
+        vizBundlePath: resultEntry.viz_bundle_path,
+        replayData: null,
+        loading: true,
+        error: null,
+      });
 
-    setReplayModal({
-      open: true,
-      leafSlug: resultEntry.leaf_slug,
-      vizBundlePath: resultEntry.viz_bundle_path,
-      replayData: null,
-      loading: true,
-      error: null,
-    });
+      try {
+        const data = await client.resultData(workUnitId);
+        setReplayModal((prev) => ({ ...prev, replayData: data, loading: false }));
+      } catch {
+        setReplayModal((prev) => ({
+          ...prev,
+          loading: false,
+          error: "This result is no longer stored on this machine.",
+        }));
+      }
+    },
+    [client, availableResults]
+  );
 
-    try {
-      const data = await client.resultData(workUnitId);
-      setReplayModal((prev) => ({
-        ...prev,
-        replayData: data,
-        loading: false,
-      }));
-    } catch {
-      setReplayModal((prev) => ({
-        ...prev,
-        loading: false,
-        error: "Result no longer available locally.",
-      }));
-    }
-  }, [client, availableResults]);
-
-  // Close modal
-  const closeModal = useCallback(() => {
-    setReplayModal({
-      open: false,
-      leafSlug: "",
-      vizBundlePath: "",
-      replayData: null,
-      loading: false,
-      error: null,
-    });
-  }, []);
+  const closeModal = useCallback(() => setReplayModal(CLOSED_REPLAY_MODAL), []);
 
   // Close on Escape
   useEffect(() => {
@@ -371,12 +418,18 @@ export function HistoryPage() {
     return () => observer.disconnect();
   }, [hasMore, isLoading, loadMore, entries.length]);
 
-  // Unique leaf names from history
-  const leafNames = useMemo(() => {
-    const names = new Set<string>();
-    for (const e of entries) names.add(e.leaf_name);
-    return Array.from(names).sort();
-  }, [entries]);
+  // The selected leaf stays listed even before a page mentioning it has loaded.
+  const leafOptions = useMemo(() => {
+    if (filters.leafName && !leafNames.includes(filters.leafName)) {
+      return [...leafNames, filters.leafName].sort();
+    }
+    return leafNames;
+  }, [leafNames, filters.leafName]);
+
+  const filtered = hasClientFilter(filters);
+  const countLabel = filtered
+    ? `${entries.length} matching of ${loadedCount} loaded`
+    : `${loadedCount} ${loadedCount === 1 ? "entry" : "entries"} loaded`;
 
   // Export
   const handleExport = useCallback(
@@ -389,21 +442,9 @@ export function HistoryPage() {
         const baseParams = filtersToParams(filters);
 
         while (true) {
-          const resp = await client.history({
-            ...baseParams,
-            limit: 200,
-            cursor,
-          });
-
-          let filtered = resp.entries;
-          if (filters.validationStatus !== "all") {
-            filtered = filtered.filter(
-              (e) => e.validation_status === filters.validationStatus
-            );
-          }
-          allEntries.push(...filtered);
+          const resp = await client.history({ ...baseParams, limit: 200, cursor });
+          allEntries.push(...applyClientFilters(resp.entries, filters));
           setExportProgress(`Exporting... ${allEntries.length} entries`);
-
           if (!resp.pagination.has_more) break;
           cursor = resp.pagination.next_cursor;
         }
@@ -412,23 +453,12 @@ export function HistoryPage() {
         let filename: string;
 
         if (format === "csv") {
-          // Build leaf->head lookup from heads data
+          // Fill in the head for entries that predate the daemon recording it
           const leafToHead = new Map<string, string>();
           for (const head of heads) {
-            for (const leaf of head.leafs) {
-              leafToHead.set(leaf.name, head.name);
-            }
+            for (const leaf of head.leafs) leafToHead.set(leaf.name, head.name);
           }
-
-          const header =
-            "work_unit_id,leaf_name,head_name,completed_at,duration_seconds,cpu_seconds,credit_earned,validation_status";
-          const rows = allEntries.map(
-            (e) =>
-              `${e.work_unit_id},"${e.leaf_name}","${e.head_name || (leafToHead.get(e.leaf_name) ?? "")}",${e.completed_at},${e.duration_seconds},${e.cpu_seconds},${e.credit_earned},${e.validation_status}`
-          );
-          blob = new Blob([header + "\n" + rows.join("\n")], {
-            type: "text/csv",
-          });
+          blob = new Blob([historyToCsv(allEntries, leafToHead)], { type: "text/csv" });
           filename = "lettuce-history.csv";
         } else {
           blob = new Blob([JSON.stringify(allEntries, null, 2)], {
@@ -459,19 +489,20 @@ export function HistoryPage() {
       <div className="flex flex-wrap items-center gap-3">
         <Filter className="h-4 w-4 text-muted-foreground" />
 
-        {/* Leaf filter */}
+        {/* Leaf filter (client-side, by name) */}
         <select
-          value={filters.leafId ?? ""}
+          aria-label="Leaf"
+          value={filters.leafName ?? ""}
           onChange={(e) =>
             setFilters((f) => ({
               ...f,
-              leafId: e.target.value || undefined,
+              leafName: e.target.value || undefined,
             }))
           }
           className="h-9 rounded-md border border-input bg-background px-3 text-sm"
         >
           <option value="">All Leafs</option>
-          {leafNames.map((name) => (
+          {leafOptions.map((name) => (
             <option key={name} value={name}>
               {name}
             </option>
@@ -480,6 +511,7 @@ export function HistoryPage() {
 
         {/* Date range */}
         <select
+          aria-label="Date range"
           value={filters.dateRange}
           onChange={(e) =>
             setFilters((f) => ({
@@ -500,6 +532,7 @@ export function HistoryPage() {
           <>
             <input
               type="date"
+              aria-label="From date"
               value={filters.customFrom?.split("T")[0] ?? ""}
               onChange={(e) =>
                 setFilters((f) => ({
@@ -514,14 +547,13 @@ export function HistoryPage() {
             <span className="text-xs text-muted-foreground">to</span>
             <input
               type="date"
+              aria-label="To date"
               value={filters.customTo?.split("T")[0] ?? ""}
               onChange={(e) =>
                 setFilters((f) => ({
                   ...f,
                   customTo: e.target.value
-                    ? new Date(
-                        e.target.value + "T23:59:59"
-                      ).toISOString()
+                    ? new Date(e.target.value + "T23:59:59").toISOString()
                     : undefined,
                 }))
               }
@@ -530,22 +562,22 @@ export function HistoryPage() {
           </>
         )}
 
-        {/* Validation status */}
+        {/* Head accepted (client-side) */}
         <select
-          value={filters.validationStatus}
+          aria-label="Head accepted"
+          title={HEAD_ACCEPTED_TOOLTIP}
+          value={filters.headAccepted}
           onChange={(e) =>
             setFilters((f) => ({
               ...f,
-              validationStatus:
-                e.target.value as HistoryFilters["validationStatus"],
+              headAccepted: e.target.value as HistoryFilters["headAccepted"],
             }))
           }
           className="h-9 rounded-md border border-input bg-background px-3 text-sm"
         >
-          <option value="all">All Status</option>
-          <option value="accepted">Validated</option>
-          <option value="pending">Pending</option>
-          <option value="rejected">Rejected</option>
+          <option value="all">All submissions</option>
+          <option value="accepted">Head accepted</option>
+          <option value="rejected">Head rejected</option>
         </select>
 
         {/* Export */}
@@ -585,12 +617,28 @@ export function HistoryPage() {
             </p>
           )}
 
-          {entries.length === 0 && !isLoading && (
+          {(loadedCount > 0 || entries.length > 0) && (
+            <p
+              data-testid="history-count"
+              className="px-3 text-xs text-muted-foreground"
+              title={HEAD_ACCEPTED_TOOLTIP}
+            >
+              {countLabel}
+            </p>
+          )}
+
+          {entries.length === 0 && !isLoading && !error && (
             <div className="text-center py-12 text-muted-foreground">
-              <p className="text-sm">No completed work units yet.</p>
-              <p className="text-xs mt-1">
-                Start contributing to see your history here.
-              </p>
+              {loadedCount > 0 ? (
+                <p className="text-sm">No entries match the current filters.</p>
+              ) : (
+                <>
+                  <p className="text-sm">No completed work units yet.</p>
+                  <p className="text-xs mt-1">
+                    Start contributing to see your history here.
+                  </p>
+                </>
+              )}
             </div>
           )}
 
@@ -612,7 +660,7 @@ export function HistoryPage() {
             </div>
           ))}
 
-          {/* Loading / sentinel */}
+          {/* Loading / sentinel / end marker */}
           <div ref={scrollRef}>
             {isLoading && (
               <div className="space-y-1">
@@ -622,6 +670,16 @@ export function HistoryPage() {
               </div>
             )}
             {hasMore && <div data-sentinel className="h-4" />}
+            {!hasMore && !isLoading && entries.length > 0 && (
+              <p
+                data-testid="history-end"
+                className="mt-2 border-t py-4 text-center text-xs text-muted-foreground"
+              >
+                End of history — {entries.length}{" "}
+                {entries.length === 1 ? "entry" : "entries"}
+                {filtered ? " match the current filters" : ""}
+              </p>
+            )}
           </div>
         </div>
 
@@ -643,6 +701,8 @@ export function HistoryPage() {
       {/* Replay Modal */}
       {replayModal.open && (
         <div
+          role="dialog"
+          aria-label="Visualization replay"
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={(e) => {
             if (e.target === e.currentTarget) closeModal();
@@ -656,6 +716,7 @@ export function HistoryPage() {
                 size="sm"
                 onClick={closeModal}
                 className="h-8 w-8 p-0"
+                aria-label="Close"
               >
                 <X className="h-4 w-4" />
               </Button>

@@ -1,14 +1,35 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 
 interface VizFrameProps {
+  /**
+   * Directory holding the bundle's `index.html`. The daemon reports it as
+   * `viz_bundle_path`: the bundle extracted into the unit's work directory
+   * (`{work_dir}/.lettuce-viz`, or that directory's single wrapper folder when
+   * the tarball had one — the daemon resolves it before reporting).
+   */
   vizBundlePath: string;
+  /** The unit's work directory; `readFile` / `listFiles` / `watchFile` are resolved inside it. Live mode only. */
   workDir?: string;
+  /**
+   * Passed to the bundle as `vizInit.leafSlug`. For a live task the daemon
+   * reports only the leaf's display name, so the app sends that; the head's
+   * dashboard and replay send the real slug.
+   */
   leafSlug: string;
   paused: boolean;
   mode?: "live" | "replay";
   replayData?: Record<string, unknown>;
 }
+
+/**
+ * Custom-protocol name under which the Rust host serves the active bundle
+ * (`register_uri_scheme_protocol("lettuce-viz", ...)` in `main.rs`). Its URL
+ * form differs by platform — `http://lettuce-viz.localhost/...` on Windows,
+ * `lettuce-viz://localhost/...` on macOS and Linux — so it must be built with
+ * `convertFileSrc`, never hard-coded.
+ */
+export const VIZ_PROTOCOL = "lettuce-viz";
 
 /** Hash an ArrayBuffer for change detection (simple FNV-1a). */
 function hashBytes(data: number[]): number {
@@ -21,7 +42,7 @@ function hashBytes(data: number[]): number {
 }
 
 /** Validate a relative path — reject traversal and absolute paths. */
-function isValidRelPath(path: string): boolean {
+export function isValidRelPath(path: string): boolean {
   if (!path || path.startsWith("/") || path.startsWith("\\")) return false;
   const parts = path.replace(/\\/g, "/").split("/");
   return !parts.some((p) => p === ".." || p === "");
@@ -41,18 +62,28 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
   const watchHashesRef = useRef<Map<string, number>>(new Map());
   const readyRef = useRef(false);
   const [vizReady, setVizReady] = useState(false);
+  const [vizError, setVizError] = useState<string | null>(null);
 
   const isReplay = mode === "replay";
 
-  // Tell the Rust backend which directory to serve, then load via custom protocol.
-  const indexUrl = "http://lettuce-viz.localhost/index.html";
+  const indexUrl = convertFileSrc("index.html", VIZ_PROTOCOL);
 
+  // Tell the Rust backend which directory to serve, then load via the custom protocol.
   useEffect(() => {
     setVizReady(false);
+    setVizError(null);
     readyRef.current = false;
+    let cancelled = false;
     invoke("set_viz_base", { path: vizBundlePath })
-      .then(() => setVizReady(true))
-      .catch(console.error);
+      .then(() => {
+        if (!cancelled) setVizReady(true);
+      })
+      .catch((e) => {
+        if (!cancelled) setVizError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [vizBundlePath]);
 
   /** Post a message to the iframe. */
@@ -205,6 +236,38 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
       }
     }, 150);
   }, [sendInit]);
+
+  if (vizError) {
+    // The bundle directory could not be opened — typically because the unit's
+    // work directory (which holds the extracted bundle) has been removed.
+    return (
+      <div
+        data-testid="viz-error"
+        role="alert"
+        style={{
+          width: "100%",
+          height: "100%",
+          background: "#0a0a0f",
+          color: "#a1a1aa",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: "0.5rem",
+          padding: "1.5rem",
+          textAlign: "center",
+          fontSize: "0.875rem",
+        }}
+      >
+        <span style={{ color: "#e4e4e7", fontWeight: 500 }}>
+          {isReplay
+            ? "The visualization files for this result are no longer on this machine."
+            : "The visualization files could not be opened."}
+        </span>
+        <code style={{ fontSize: "0.75rem", wordBreak: "break-all" }}>{vizError}</code>
+      </div>
+    );
+  }
 
   if (!vizReady) {
     return <div style={{ width: "100%", height: "100%", background: "#0a0a0f" }} />;

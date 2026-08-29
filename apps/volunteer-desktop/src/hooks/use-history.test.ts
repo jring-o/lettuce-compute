@@ -1,7 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
-import { useHistory, filtersToParams, type HistoryFilters } from "./use-history";
-import type { HistoryResponse, ManagementClient } from "@/api/client";
+import {
+  useHistory,
+  filtersToParams,
+  applyClientFilters,
+  hasClientFilter,
+  HISTORY_PAGE_SIZE,
+  type HistoryFilters,
+} from "./use-history";
+import type { HistoryEntry, HistoryResponse, ManagementClient } from "@/api/client";
 
 // Mock use-api
 const mockHistory = vi.fn<(params?: any) => Promise<HistoryResponse>>();
@@ -14,13 +21,27 @@ vi.mock("./use-api", () => ({
 function defaultFilters(overrides: Partial<HistoryFilters> = {}): HistoryFilters {
   return {
     dateRange: "all",
-    validationStatus: "all",
+    headAccepted: "all",
+    ...overrides,
+  };
+}
+
+function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
+  return {
+    work_unit_id: "wu-" + Math.random().toString(36).slice(2, 10),
+    leaf_name: "Test",
+    completed_at: new Date().toISOString(),
+    duration_seconds: 60,
+    cpu_seconds: 50,
+    credit_earned: 0,
+    validation_status: "accepted",
+    head_name: "lettuce.science",
     ...overrides,
   };
 }
 
 function makeResponse(
-  entries: HistoryResponse["entries"],
+  entries: HistoryEntry[],
   nextCursor = "",
   hasMore = false
 ): HistoryResponse {
@@ -36,18 +57,7 @@ describe("useHistory", () => {
   });
 
   it("fetches initial page on mount", async () => {
-    mockHistory.mockResolvedValueOnce(
-      makeResponse([
-        {
-          work_unit_id: "wu-1",
-          leaf_name: "Test",
-          completed_at: new Date().toISOString(),
-          duration_seconds: 60,
-          credit_earned: 10,
-          validation_status: "accepted",
-        },
-      ])
-    );
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ work_unit_id: "wu-1" })]));
 
     const { result } = renderHook(() => useHistory(defaultFilters()));
 
@@ -57,26 +67,14 @@ describe("useHistory", () => {
 
     expect(result.current.entries).toHaveLength(1);
     expect(result.current.entries[0].work_unit_id).toBe("wu-1");
+    expect(result.current.loadedCount).toBe(1);
     expect(result.current.hasMore).toBe(false);
     expect(result.current.error).toBeNull();
   });
 
   it("sets hasMore when pagination indicates more pages", async () => {
     mockHistory.mockResolvedValueOnce(
-      makeResponse(
-        [
-          {
-            work_unit_id: "wu-1",
-            leaf_name: "Test",
-            completed_at: new Date().toISOString(),
-            duration_seconds: 60,
-            credit_earned: 10,
-            validation_status: "accepted",
-          },
-        ],
-        "50",
-        true
-      )
+      makeResponse([entry({ work_unit_id: "wu-1" })], "50", true)
     );
 
     const { result } = renderHook(() => useHistory(defaultFilters()));
@@ -88,23 +86,9 @@ describe("useHistory", () => {
     expect(result.current.hasMore).toBe(true);
   });
 
-  it("appends entries on loadMore", async () => {
-    // First page
+  it("appends entries on loadMore and passes the cursor", async () => {
     mockHistory.mockResolvedValueOnce(
-      makeResponse(
-        [
-          {
-            work_unit_id: "wu-1",
-            leaf_name: "Test",
-            completed_at: new Date().toISOString(),
-            duration_seconds: 60,
-            credit_earned: 10,
-            validation_status: "accepted",
-          },
-        ],
-        "1",
-        true
-      )
+      makeResponse([entry({ work_unit_id: "wu-1" })], "1", true)
     );
 
     const { result } = renderHook(() => useHistory(defaultFilters()));
@@ -115,19 +99,7 @@ describe("useHistory", () => {
 
     expect(result.current.entries).toHaveLength(1);
 
-    // Second page
-    mockHistory.mockResolvedValueOnce(
-      makeResponse([
-        {
-          work_unit_id: "wu-2",
-          leaf_name: "Test",
-          completed_at: new Date().toISOString(),
-          duration_seconds: 120,
-          credit_earned: 20,
-          validation_status: "accepted",
-        },
-      ])
-    );
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ work_unit_id: "wu-2" })]));
 
     act(() => {
       result.current.loadMore();
@@ -139,21 +111,43 @@ describe("useHistory", () => {
 
     expect(result.current.entries[0].work_unit_id).toBe("wu-1");
     expect(result.current.entries[1].work_unit_id).toBe("wu-2");
+    expect(result.current.loadedCount).toBe(2);
+    expect(mockHistory.mock.calls[1][0].cursor).toBe("1");
+    expect(result.current.hasMore).toBe(false);
   });
 
-  it("passes leaf_id filter to API", async () => {
+  it("never sends the leaf name as the daemon's leaf_id filter", async () => {
     mockHistory.mockResolvedValueOnce(makeResponse([]));
 
-    renderHook(() =>
-      useHistory(defaultFilters({ leafId: "leaf-abc" }))
-    );
+    renderHook(() => useHistory(defaultFilters({ leafName: "Beyblade Arena" })));
 
     await waitFor(() => {
       expect(mockHistory).toHaveBeenCalled();
     });
 
     const params = mockHistory.mock.calls[0][0];
-    expect(params.leaf_id).toBe("leaf-abc");
+    expect(params.leaf_id).toBeUndefined();
+  });
+
+  it("filters entries by leaf name client-side", async () => {
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([
+        entry({ work_unit_id: "wu-1", leaf_name: "Alpha" }),
+        entry({ work_unit_id: "wu-2", leaf_name: "Beta" }),
+        entry({ work_unit_id: "wu-3", leaf_name: "Alpha" }),
+      ])
+    );
+
+    const { result } = renderHook(() => useHistory(defaultFilters({ leafName: "Alpha" })));
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-1", "wu-3"]);
+    // Counts and leaf names reflect everything the daemon returned
+    expect(result.current.loadedCount).toBe(3);
+    expect(result.current.leafNames).toEqual(["Alpha", "Beta"]);
   });
 
   it("passes from date for 7d filter", async () => {
@@ -174,30 +168,16 @@ describe("useHistory", () => {
     expect(daysAgo).toBeLessThanOrEqual(7.1);
   });
 
-  it("filters entries by validation status client-side", async () => {
+  it("filters entries by head acceptance client-side", async () => {
     mockHistory.mockResolvedValueOnce(
       makeResponse([
-        {
-          work_unit_id: "wu-1",
-          leaf_name: "Test",
-          completed_at: new Date().toISOString(),
-          duration_seconds: 60,
-          credit_earned: 10,
-          validation_status: "accepted",
-        },
-        {
-          work_unit_id: "wu-2",
-          leaf_name: "Test",
-          completed_at: new Date().toISOString(),
-          duration_seconds: 60,
-          credit_earned: 0,
-          validation_status: "rejected",
-        },
+        entry({ work_unit_id: "wu-1", validation_status: "accepted" }),
+        entry({ work_unit_id: "wu-2", validation_status: "rejected" }),
       ])
     );
 
     const { result } = renderHook(() =>
-      useHistory(defaultFilters({ validationStatus: "accepted" }))
+      useHistory(defaultFilters({ headAccepted: "rejected" }))
     );
 
     await waitFor(() => {
@@ -205,7 +185,53 @@ describe("useHistory", () => {
     });
 
     expect(result.current.entries).toHaveLength(1);
-    expect(result.current.entries[0].validation_status).toBe("accepted");
+    expect(result.current.entries[0].work_unit_id).toBe("wu-2");
+  });
+
+  it("walks further pages when a client-side filter matches nothing on the first", async () => {
+    mockHistory
+      .mockResolvedValueOnce(makeResponse([entry({ leaf_name: "Beta" })], "1", true))
+      .mockResolvedValueOnce(makeResponse([entry({ leaf_name: "Beta" })], "2", true))
+      .mockResolvedValueOnce(
+        makeResponse([entry({ work_unit_id: "wu-alpha", leaf_name: "Alpha" })], "3", true)
+      );
+
+    const { result } = renderHook(() => useHistory(defaultFilters({ leafName: "Alpha" })));
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    expect(mockHistory).toHaveBeenCalledTimes(3);
+    expect(mockHistory.mock.calls[1][0].cursor).toBe("1");
+    expect(mockHistory.mock.calls[2][0].cursor).toBe("2");
+    expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-alpha"]);
+    expect(result.current.loadedCount).toBe(3);
+    expect(result.current.hasMore).toBe(true);
+  });
+
+  it("keeps every leaf name seen, even after narrowing to one leaf", async () => {
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([entry({ leaf_name: "Alpha" }), entry({ leaf_name: "Beta" })])
+    );
+
+    const { result, rerender } = renderHook((filters: HistoryFilters) => useHistory(filters), {
+      initialProps: defaultFilters(),
+    });
+
+    await waitFor(() => {
+      expect(result.current.leafNames).toEqual(["Alpha", "Beta"]);
+    });
+
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ leaf_name: "Alpha" })]));
+    rerender(defaultFilters({ leafName: "Alpha" }));
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+      expect(result.current.entries).toHaveLength(1);
+    });
+
+    expect(result.current.leafNames).toEqual(["Alpha", "Beta"]);
   });
 
   it("sets error on fetch failure", async () => {
@@ -240,37 +266,44 @@ describe("useHistory", () => {
   });
 });
 
+describe("applyClientFilters", () => {
+  const entries = [
+    entry({ work_unit_id: "a1", leaf_name: "Alpha", validation_status: "accepted" }),
+    entry({ work_unit_id: "a2", leaf_name: "Alpha", validation_status: "rejected" }),
+    entry({ work_unit_id: "b1", leaf_name: "Beta", validation_status: "accepted" }),
+  ];
+
+  it("returns everything when no client filter is set", () => {
+    expect(applyClientFilters(entries, { headAccepted: "all" })).toHaveLength(3);
+    expect(hasClientFilter({ headAccepted: "all" })).toBe(false);
+  });
+
+  it("matches the leaf name exactly", () => {
+    const out = applyClientFilters(entries, { leafName: "Alpha", headAccepted: "all" });
+    expect(out.map((e) => e.work_unit_id)).toEqual(["a1", "a2"]);
+    expect(hasClientFilter({ leafName: "Alpha", headAccepted: "all" })).toBe(true);
+  });
+
+  it("combines leaf name and head acceptance", () => {
+    const out = applyClientFilters(entries, { leafName: "Alpha", headAccepted: "accepted" });
+    expect(out.map((e) => e.work_unit_id)).toEqual(["a1"]);
+  });
+});
+
 describe("filtersToParams", () => {
-  it("returns default limit of 50", () => {
-    const params = filtersToParams({
-      dateRange: "all",
-      validationStatus: "all",
-    });
+  it("requests the daemon's page size", () => {
+    const params = filtersToParams(defaultFilters());
+    expect(params.limit).toBe(HISTORY_PAGE_SIZE);
     expect(params.limit).toBe(50);
   });
 
-  it("sets leaf_id when leafId is provided", () => {
-    const params = filtersToParams({
-      dateRange: "all",
-      validationStatus: "all",
-      leafId: "proj-abc",
-    });
-    expect(params.leaf_id).toBe("proj-abc");
-  });
-
-  it("does not set leaf_id when leafId is undefined", () => {
-    const params = filtersToParams({
-      dateRange: "all",
-      validationStatus: "all",
-    });
+  it("does not set leaf_id: the daemon filters by leaf ID and the app only has names", () => {
+    const params = filtersToParams(defaultFilters({ leafName: "Alpha" }));
     expect(params.leaf_id).toBeUndefined();
   });
 
   it("sets from to ~7 days ago for dateRange '7d'", () => {
-    const params = filtersToParams({
-      dateRange: "7d",
-      validationStatus: "all",
-    });
+    const params = filtersToParams(defaultFilters({ dateRange: "7d" }));
     expect(params.from).toBeDefined();
     const from = new Date(params.from!);
     const daysAgo = (Date.now() - from.getTime()) / (1000 * 60 * 60 * 24);
@@ -279,10 +312,7 @@ describe("filtersToParams", () => {
   });
 
   it("sets from to ~30 days ago for dateRange '30d'", () => {
-    const params = filtersToParams({
-      dateRange: "30d",
-      validationStatus: "all",
-    });
+    const params = filtersToParams(defaultFilters({ dateRange: "30d" }));
     expect(params.from).toBeDefined();
     const from = new Date(params.from!);
     const daysAgo = (Date.now() - from.getTime()) / (1000 * 60 * 60 * 24);
@@ -291,50 +321,41 @@ describe("filtersToParams", () => {
   });
 
   it("does not set from or to for dateRange 'all'", () => {
-    const params = filtersToParams({
-      dateRange: "all",
-      validationStatus: "all",
-    });
+    const params = filtersToParams(defaultFilters());
     expect(params.from).toBeUndefined();
     expect(params.to).toBeUndefined();
   });
 
   it("uses customFrom and customTo for dateRange 'custom'", () => {
-    const params = filtersToParams({
-      dateRange: "custom",
-      validationStatus: "all",
-      customFrom: "2026-01-01T00:00:00Z",
-      customTo: "2026-01-31T23:59:59Z",
-    });
+    const params = filtersToParams(
+      defaultFilters({
+        dateRange: "custom",
+        customFrom: "2026-01-01T00:00:00Z",
+        customTo: "2026-01-31T23:59:59Z",
+      })
+    );
     expect(params.from).toBe("2026-01-01T00:00:00Z");
     expect(params.to).toBe("2026-01-31T23:59:59Z");
   });
 
   it("handles custom range with only from set", () => {
-    const params = filtersToParams({
-      dateRange: "custom",
-      validationStatus: "all",
-      customFrom: "2026-01-01T00:00:00Z",
-    });
+    const params = filtersToParams(
+      defaultFilters({ dateRange: "custom", customFrom: "2026-01-01T00:00:00Z" })
+    );
     expect(params.from).toBe("2026-01-01T00:00:00Z");
     expect(params.to).toBeUndefined();
   });
 
   it("handles custom range with only to set", () => {
-    const params = filtersToParams({
-      dateRange: "custom",
-      validationStatus: "all",
-      customTo: "2026-01-31T23:59:59Z",
-    });
+    const params = filtersToParams(
+      defaultFilters({ dateRange: "custom", customTo: "2026-01-31T23:59:59Z" })
+    );
     expect(params.from).toBeUndefined();
     expect(params.to).toBe("2026-01-31T23:59:59Z");
   });
 
   it("handles custom range with neither from nor to set", () => {
-    const params = filtersToParams({
-      dateRange: "custom",
-      validationStatus: "all",
-    });
+    const params = filtersToParams(defaultFilters({ dateRange: "custom" }));
     expect(params.from).toBeUndefined();
     expect(params.to).toBeUndefined();
   });

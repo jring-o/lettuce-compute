@@ -32,6 +32,17 @@ export function formatCredit(n: number): string {
   return n.toLocaleString();
 }
 
+/**
+ * Format a credit amount. Credit is a decimal (a head credits a unit by its
+ * leaf's per-unit figure, which need not be a whole number), so keep up to two
+ * decimals and drop trailing zeros: 1250 -> "1,250", 0.5 -> "0.5",
+ * 12.3456 -> "12.35". Non-finite input renders as "0".
+ */
+export function formatCreditAmount(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
 export function formatTimeAgo(isoString: string): string {
   const diff = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
   if (diff < 60) return `${diff}s ago`;

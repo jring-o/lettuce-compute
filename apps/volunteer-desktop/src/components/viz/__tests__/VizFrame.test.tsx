@@ -4,7 +4,11 @@ import { render, cleanup, waitFor, act } from "@testing-library/react";
 // Mock Tauri APIs before imports.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
-  convertFileSrc: vi.fn((path: string) => `https://asset.localhost/${path}`),
+  // The Windows/Android URL form of a custom protocol; macOS and Linux use
+  // `<protocol>://localhost/<path>`. Tests assert on protocol name and path.
+  convertFileSrc: vi.fn(
+    (path: string, protocol: string = "asset") => `http://${protocol}.localhost/${path}`
+  ),
 }));
 
 import { invoke } from "@tauri-apps/api/core";
@@ -276,5 +280,138 @@ describe("VizFrame path validation behavior", () => {
   it("iframe renders regardless of path validation logic", async () => {
     const { container } = await renderReady();
     expect(container.querySelector("iframe")).toBeTruthy();
+  });
+});
+
+// ============================================================
+// Bundle URL, failure state, and path validation
+// ============================================================
+
+import { isValidRelPath, VIZ_PROTOCOL } from "../VizFrame";
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+describe("VizFrame bundle URL", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockInvoke.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("builds the index.html URL with convertFileSrc so the platform's custom-protocol form is used", async () => {
+    const { container } = await renderReady();
+    expect(VIZ_PROTOCOL).toBe("lettuce-viz");
+    expect(vi.mocked(convertFileSrc)).toHaveBeenCalledWith("index.html", "lettuce-viz");
+    // The real convertFileSrc yields http://lettuce-viz.localhost/index.html
+    // on Windows and lettuce-viz://localhost/index.html on macOS and Linux.
+    expect(container.querySelector("iframe")?.getAttribute("src")).toBe(
+      "http://lettuce-viz.localhost/index.html"
+    );
+  });
+
+  it("sets the bundle directory before loading the frame", async () => {
+    await renderReady({ vizBundlePath: "/home/u/.lettuce/work/abc/.lettuce-viz" });
+    expect(mockInvoke).toHaveBeenCalledWith("set_viz_base", {
+      path: "/home/u/.lettuce/work/abc/.lettuce-viz",
+    });
+  });
+});
+
+describe("VizFrame failure state", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows the host's error instead of a blank frame when the bundle cannot be opened", async () => {
+    mockInvoke.mockRejectedValue("visualization bundle not found at /gone/.lettuce-viz");
+
+    let result!: ReturnType<typeof render>;
+    await act(async () => {
+      result = render(
+        <VizFrame vizBundlePath="/gone/.lettuce-viz" workDir="/gone" leafSlug="t" paused={false} />
+      );
+    });
+
+    await waitFor(() => {
+      expect(result.getByTestId("viz-error")).toBeInTheDocument();
+    });
+    expect(result.getByTestId("viz-error")).toHaveTextContent(
+      "The visualization files could not be opened."
+    );
+    expect(result.getByTestId("viz-error")).toHaveTextContent(
+      "visualization bundle not found at /gone/.lettuce-viz"
+    );
+    expect(result.container.querySelector("iframe")).toBeNull();
+  });
+
+  it("explains a missing bundle in replay terms", async () => {
+    mockInvoke.mockRejectedValue("visualization bundle not found at /gone/.lettuce-viz");
+
+    let result!: ReturnType<typeof render>;
+    await act(async () => {
+      result = render(
+        <VizFrame
+          vizBundlePath="/gone/.lettuce-viz"
+          leafSlug="t"
+          paused={false}
+          mode="replay"
+          replayData={{ frames: [] }}
+        />
+      );
+    });
+
+    await waitFor(() => {
+      expect(result.getByTestId("viz-error")).toHaveTextContent(
+        "The visualization files for this result are no longer on this machine."
+      );
+    });
+  });
+
+  it("recovers when the bundle path changes to one that opens", async () => {
+    mockInvoke.mockRejectedValueOnce("visualization bundle not found at /gone");
+    mockInvoke.mockResolvedValue(undefined);
+
+    let result!: ReturnType<typeof render>;
+    await act(async () => {
+      result = render(
+        <VizFrame vizBundlePath="/gone" workDir="/w" leafSlug="t" paused={false} />
+      );
+    });
+    await waitFor(() => {
+      expect(result.getByTestId("viz-error")).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      result.rerender(
+        <VizFrame vizBundlePath="/w/.lettuce-viz" workDir="/w" leafSlug="t" paused={false} />
+      );
+    });
+    await waitFor(() => {
+      expect(result.container.querySelector("iframe")).toBeTruthy();
+    });
+    expect(result.queryByTestId("viz-error")).toBeNull();
+  });
+});
+
+describe("isValidRelPath", () => {
+  it("accepts relative paths inside the work directory", () => {
+    expect(isValidRelPath("state.json")).toBe(true);
+    expect(isValidRelPath("frames/0001.bin")).toBe(true);
+    expect(isValidRelPath("frames\\0001.bin")).toBe(true);
+  });
+
+  it("rejects empty, absolute, traversing, and double-slash paths", () => {
+    expect(isValidRelPath("")).toBe(false);
+    expect(isValidRelPath("/etc/passwd")).toBe(false);
+    expect(isValidRelPath("\\windows\\system32")).toBe(false);
+    expect(isValidRelPath("../secret")).toBe(false);
+    expect(isValidRelPath("frames/../../secret")).toBe(false);
+    expect(isValidRelPath("frames//0001.bin")).toBe(false);
   });
 });
