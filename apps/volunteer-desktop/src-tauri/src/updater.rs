@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,12 @@ async fn is_update_notification_enabled() -> bool {
     }
 }
 
+/// Whether a failed update check has already been logged this process. The
+/// check runs every six hours for the life of the app; an endpoint that is
+/// down (or, as today, a signing key that is not configured yet) would
+/// otherwise repeat the same line indefinitely.
+static CHECK_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 async fn do_update_check(app: &AppHandle) {
     match check_for_updates(app).await {
         Ok(Some(info)) => {
@@ -157,7 +164,9 @@ async fn do_update_check(app: &AppHandle) {
         }
         Ok(None) => {}
         Err(e) => {
-            eprintln!("Update check failed: {}", e);
+            if !CHECK_FAILURE_LOGGED.swap(true, Ordering::SeqCst) {
+                eprintln!("[warn] update check failed (further failures are not logged): {e}");
+            }
         }
     }
 }

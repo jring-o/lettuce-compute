@@ -5,17 +5,34 @@ use tauri_plugin_autostart::ManagerExt;
 
 use crate::sidecar;
 
+/// Passed on the command line of the login-time launch so `main.rs` keeps the
+/// window hidden and the app lives in the tray until the user opens it.
+pub const MINIMIZED_FLAG: &str = "--minimized";
+
+/// Arguments the autostart entry (registry value, LaunchAgent or .desktop
+/// file) launches the app with.
+pub fn launch_args() -> Vec<&'static str> {
+    vec![MINIMIZED_FLAG]
+}
+
 fn first_launch_marker() -> PathBuf {
     sidecar::lettuce_dir().join(".first_launch_done")
 }
 
-/// Set up auto-start on first launch. After the first explicit app launch,
-/// auto-start is enabled by default so the app starts minimized to tray on boot.
+/// Set up auto-start. On the first explicit app launch it is enabled by
+/// default so the app starts minimized to the tray at login. On later
+/// launches an already-enabled entry is re-registered so the stored command
+/// line carries the current arguments (installs that enabled autostart before
+/// the `--minimized` flag existed registered without it).
 pub fn setup_autostart(app: &AppHandle) {
     let marker = first_launch_marker();
     if !marker.exists() {
         // First launch: create marker and enable autostart
         let _ = std::fs::write(&marker, "");
+        let _ = app.autolaunch().enable();
+        return;
+    }
+    if let Ok(true) = app.autolaunch().is_enabled() {
         let _ = app.autolaunch().enable();
     }
 }

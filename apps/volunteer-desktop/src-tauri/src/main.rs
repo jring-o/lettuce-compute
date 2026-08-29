@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tauri::Manager;
+use tauri::{AppHandle, Listener, Manager};
 
 use lettuce_compute_desktop_lib::api;
 use lettuce_compute_desktop_lib::autostart;
@@ -15,6 +16,12 @@ use lettuce_compute_desktop_lib::sidecar;
 use lettuce_compute_desktop_lib::tray;
 use lettuce_compute_desktop_lib::updater;
 use lettuce_compute_desktop_lib::viz;
+
+/// Event the web view emits once the setup wizard has finished and the daemon
+/// is up (see `App.tsx`). Starting the daemon-backed services on it means a
+/// fresh install gets its tray status, notifications and container runtime
+/// without relaunching the app.
+const APP_INITIALIZED_EVENT: &str = "app_initialized";
 
 /// MIME type from file extension.
 fn mime_for_path(path: &Path) -> &'static str {
@@ -33,10 +40,51 @@ fn mime_for_path(path: &Path) -> &'static str {
     }
 }
 
+/// Guard so the daemon-backed background tasks start exactly once per process,
+/// whether `setup` starts them (already-initialized install) or the wizard's
+/// completion event does (fresh install).
+static SERVICES_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Start everything that needs an initialized install: the daemon itself if it
+/// is not running, the tray status poll, the notification poll, and the
+/// container runtime. Safe to call more than once; only the first call acts.
+///
+/// The tray and notification polls tolerate an unreachable daemon (they show
+/// "Stopped" / skip a tick), so they start immediately; only the container
+/// runtime step waits for the daemon to be up, on a background thread.
+fn start_daemon_services(app: AppHandle, tray_icon: tauri::tray::TrayIcon, tray_items: tray::TrayMenuItems) {
+    if SERVICES_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tray::start_status_poll(app.clone(), tray_icon, tray_items);
+    notifications::start_notification_poll(app);
+
+    std::thread::spawn(move || {
+        if !sidecar::is_daemon_running() {
+            if let Err(e) = sidecar::start_sidecar() {
+                eprintln!("[warn] failed to start the volunteer daemon: {e}");
+                return;
+            }
+        }
+        match sidecar::wait_for_daemon(Duration::from_secs(30)) {
+            Ok(info) => {
+                // Auto-start the container runtime if the Podman machine is stopped.
+                container_runtime::ensure_podman_state(&info, "running");
+            }
+            Err(e) => eprintln!("[warn] volunteer daemon did not come up: {e}"),
+        }
+    });
+}
+
 fn main() {
     // Shared state: the current viz bundle directory. Updated by the frontend via a command.
     let viz_base: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let viz_base_proto = viz_base.clone();
+
+    let launch_minimized = std::env::args()
+        .skip(1)
+        .any(|a| a == autostart::MINIMIZED_FLAG);
 
     tauri::Builder::default()
         .manage(viz::VizBaseDir(viz_base))
@@ -97,7 +145,7 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(autostart::launch_args()),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
@@ -127,63 +175,41 @@ fn main() {
             viz::viz_list_files,
             viz::set_viz_base,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
 
             // Set up system tray
             let (tray_icon, tray_items) =
                 tray::setup_tray(&app_handle).expect("Failed to set up system tray");
+            tray::start_version_tooltip(&app_handle, tray_icon.clone());
 
-            // Set up auto-start (enables on first launch)
+            // Set up auto-start (enables on first launch, refreshes the entry after)
             autostart::setup_autostart(&app_handle);
 
-            // Start sidecar if already initialized
+            // Start the daemon-backed services now if this install is already
+            // set up, otherwise when the wizard reports it is.
             let needs_wizard = sidecar::ensure_initialized().unwrap_or(true);
-
-            if !needs_wizard {
-                if !sidecar::is_daemon_running() {
-                    match sidecar::start_sidecar() {
-                        Ok(_child) => {
-                            // Wait for daemon to become available (non-blocking in background)
-                            let handle = app_handle.clone();
-                            let tray = tray_icon.clone();
-                            std::thread::spawn(move || {
-                                if let Ok(info) = sidecar::wait_for_daemon(Duration::from_secs(10))
-                                {
-                                    tray::start_status_poll(
-                                        handle,
-                                        tray,
-                                        tray_items,
-                                    );
-                                    // Auto-start container runtime if Podman machine is stopped
-                                    container_runtime::ensure_podman_state(&info, "running");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to start sidecar: {}", e);
-                        }
-                    }
-                } else {
-                    tray::start_status_poll(app_handle.clone(), tray_icon.clone(), tray_items);
-                    // Auto-start container runtime if daemon was already running
-                    if let Ok(info) = sidecar::read_daemon_json() {
-                        std::thread::spawn(move || {
-                            container_runtime::ensure_podman_state(&info, "running");
-                        });
-                    }
-                }
-
-                // Start notification polling (after daemon is available)
-                notifications::start_notification_poll(app_handle.clone());
+            if needs_wizard {
+                let handle = app_handle.clone();
+                let icon = tray_icon.clone();
+                let items = tray_items.clone();
+                app.listen(APP_INITIALIZED_EVENT, move |_event| {
+                    start_daemon_services(handle.clone(), icon.clone(), items.clone());
+                });
+            } else {
+                start_daemon_services(app_handle.clone(), tray_icon.clone(), tray_items.clone());
             }
 
             // Start update checking (runs regardless of daemon state)
             updater::start_update_poll(app_handle.clone());
 
-            // Show window (wizard or main UI)
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
+            // Show the window unless this is a login-time launch of a set-up
+            // install; the wizard is always shown, since there is nothing to
+            // run until it completes.
+            if !launch_minimized || needs_wizard {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
             }
 
             Ok(())

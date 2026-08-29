@@ -31,6 +31,17 @@ fn load_tray_icon(state: &TrayState) -> Image<'static> {
     Image::from_bytes(bytes).expect("embedded tray icon")
 }
 
+/// Human wording for the daemon's `paused_reason`. "scheduled" means outside
+/// the configured computing hours; other reasons are shown as sent so an
+/// unfamiliar value is still visible.
+fn paused_text(reason: Option<&str>) -> String {
+    match reason {
+        None | Some("") => "Paused".into(),
+        Some("scheduled") => "Paused — outside your schedule".into(),
+        Some(other) => format!("Paused — {other}"),
+    }
+}
+
 fn status_text(status: &Option<StatusResponse>) -> String {
     match status {
         Some(s) => match s.state.as_str() {
@@ -44,13 +55,7 @@ fn status_text(status: &Option<StatusResponse>) -> String {
                 )
             }
             "active" => "Active — waiting for tasks".into(),
-            "paused" => {
-                if let Some(reason) = &s.paused_reason {
-                    format!("Paused — {}", reason)
-                } else {
-                    "Paused".into()
-                }
-            }
+            "paused" => paused_text(s.paused_reason.as_deref()),
             _ => "Stopped".into(),
         },
         None => "Stopped".into(),
@@ -69,9 +74,18 @@ fn determine_state(status: &Option<StatusResponse>) -> TrayState {
 }
 
 /// Holds references to menu items we need to update dynamically.
+#[derive(Clone)]
 pub struct TrayMenuItems {
     pub status_item: MenuItem<tauri::Wry>,
     pub pause_item: MenuItem<tauri::Wry>,
+}
+
+/// Tooltip text: the app's own version plus, once known, the bundled CLI's.
+fn tooltip_text(app_version: &str, client_version: Option<&str>) -> String {
+    match client_version {
+        Some(v) => format!("Lettuce Compute {app_version} · client {v}"),
+        None => format!("Lettuce Compute {app_version}"),
+    }
 }
 
 pub fn setup_tray(app: &AppHandle) -> Result<(TrayIcon, TrayMenuItems), String> {
@@ -115,7 +129,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(TrayIcon, TrayMenuItems), String> 
     let tray = TrayIconBuilder::new()
         .menu(&menu)
         .icon(icon)
-        .tooltip("Lettuce Compute")
+        .tooltip(tooltip_text(&app.package_info().version.to_string(), None))
         .on_menu_event(move |app, event| {
             handle_menu_event(app, event.id().as_ref());
         })
@@ -128,6 +142,19 @@ pub fn setup_tray(app: &AppHandle) -> Result<(TrayIcon, TrayMenuItems), String> 
     };
 
     Ok((tray, items))
+}
+
+/// Fill in the bundled CLI's version on the tooltip. `lettuce-volunteer
+/// --version` runs a process, so this happens on a background thread and the
+/// tooltip keeps the app-only text until it answers.
+pub fn start_version_tooltip(app: &AppHandle, tray: TrayIcon) {
+    let app_version = app.package_info().version.to_string();
+    std::thread::spawn(move || match sidecar::client_version() {
+        Ok(v) => {
+            let _ = tray.set_tooltip(Some(tooltip_text(&app_version, Some(&v))));
+        }
+        Err(e) => eprintln!("[warn] could not read the bundled CLI version: {e}"),
+    });
 }
 
 fn handle_menu_event(app: &AppHandle, id: &str) {
@@ -238,4 +265,50 @@ async fn poll_status() -> Option<StatusResponse> {
     let info = sidecar::read_daemon_json().ok()?;
     let client = ManagementClient::from_daemon_info(&info);
     client.status().await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ActiveTaskInfo;
+
+    fn status(state: &str, reason: Option<&str>) -> Option<StatusResponse> {
+        Some(StatusResponse {
+            state: state.into(),
+            paused_reason: reason.map(String::from),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn scheduled_pause_is_worded_for_people() {
+        assert_eq!(
+            status_text(&status("paused", Some("scheduled"))),
+            "Paused — outside your schedule"
+        );
+        assert_eq!(status_text(&status("paused", Some("thermal"))), "Paused — thermal");
+        assert_eq!(status_text(&status("paused", None)), "Paused");
+        assert_eq!(status_text(&status("paused", Some(""))), "Paused");
+    }
+
+    #[test]
+    fn active_and_stopped_text() {
+        assert_eq!(status_text(&status("active", None)), "Active — waiting for tasks");
+        assert_eq!(status_text(&None), "Stopped");
+        let mut s = status("active", None).unwrap();
+        s.active_tasks.push(ActiveTaskInfo {
+            leaf_name: "Prime Gap".into(),
+            ..Default::default()
+        });
+        assert_eq!(status_text(&Some(s)), "Computing: Prime Gap — 1 task active");
+    }
+
+    #[test]
+    fn tooltip_includes_client_version_when_known() {
+        assert_eq!(tooltip_text("1.0.3", None), "Lettuce Compute 1.0.3");
+        assert_eq!(
+            tooltip_text("1.0.3", Some("0.9.1")),
+            "Lettuce Compute 1.0.3 · client 0.9.1"
+        );
+    }
 }
