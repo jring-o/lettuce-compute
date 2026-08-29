@@ -30,3 +30,6 @@ dirs = "5"
 http = "1"
 percent-encoding = "2"
 sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
