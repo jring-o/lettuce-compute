@@ -1,0 +1,63 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Lettuce Compute",
+  "version": "2.0.0",
+  "identifier": "com.lettuce.compute",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Lettuce Compute",
+        "width": 900,
+        "height": 700,
+        "minWidth": 700,
+        "minHeight": 500,
+        "center": true,
+        "decorations": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; frame-src http://lettuce-viz.localhost lettuce-viz://localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/.lettuce/**", "$HOME/.lettuce/work/**", "$HOME/.lettuce/work/*/.lettuce-viz/**", "$HOME/.lettuce/work/*/.lettuce-viz/*"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
+    "targets": ["msi", "nsis", "dmg", "appimage", "deb"],
+    "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/lettuce-volunteer"
+    ],
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": ["https://github.com/jring-o/lettuce-compute/releases/download/desktop-latest/latest.json"],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ5OTBGMDk5RDRDOERENjUKUldSbDNjalVtZkNRMlIrNFFNTE12NEpOYm5KMVM1S1NWaTFLcysxaUtXN1o5NTN1eXhrbWxDdnkK"
+    }
+  }
+}

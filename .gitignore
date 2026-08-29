@@ -65,8 +65,13 @@ __pycache__/
 *.swo
 *~
 
-# Bundled third-party installers (download during build)
+# Desktop app (apps/volunteer-desktop) build inputs that are produced, not authored:
+# the bundled volunteer-client sidecar for every platform (scripts/build-sidecar.*),
+# the downloaded Podman installer (scripts/fetch-podman-installer.ps1), and the
+# schema files the Tauri CLI generates next to the capability definitions.
+apps/volunteer-desktop/src-tauri/binaries/*
 apps/volunteer-desktop/src-tauri/resources/*.msi
+apps/volunteer-desktop/src-tauri/gen/
 
 # OS
 .DS_Store

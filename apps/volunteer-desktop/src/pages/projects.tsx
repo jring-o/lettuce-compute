@@ -1,0 +1,264 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  useHeads,
+  useWriteLeafPreferences,
+  useWriteHeadTrust,
+  useRaiseDiskAllowance,
+  useDebouncedHeadWeight,
+  useDebouncedLeafWeight,
+} from "@/hooks/use-heads";
+import { useClient } from "@/hooks/use-api";
+import { useContainerRuntime } from "@/hooks/use-container-runtime";
+import { HeadSection } from "@/components/heads/head-section";
+import { AddServerDialog } from "@/components/heads/add-server-dialog";
+import { markRestartRequired } from "@/hooks/use-restart-required";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { ApiError, type HeadInfo } from "@/api/client";
+
+function SkeletonCard() {
+  return (
+    <Card>
+      <CardContent className="p-4 space-y-3">
+        <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+        <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+        <div className="h-8 w-full animate-pulse rounded bg-muted" />
+      </CardContent>
+    </Card>
+  );
+}
+
+export function ProjectsPage() {
+  const { heads, machine, trustByHead, isLoading, error, refetch, setHeads, setTrustByHead } =
+    useHeads();
+  const { write: writeLeafPrefs } = useWriteLeafPreferences();
+  const { write: writeHeadTrust } = useWriteHeadTrust();
+  const { raise: raiseDiskAllowance } = useRaiseDiskAllowance();
+  const { write: writeHeadWeight } = useDebouncedHeadWeight();
+  const { write: writeLeafWeight } = useDebouncedLeafWeight();
+  const { client } = useClient();
+  const { status: containerStatus } = useContainerRuntime();
+  const [toast, setToast] = useState<string | null>(null);
+  const [toastType, setToastType] = useState<"error" | "warning">("error");
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
+
+  useEffect(() => {
+    if (toast) {
+      const id = setTimeout(() => setToast(null), 3000);
+      return () => clearTimeout(id);
+    }
+  }, [toast]);
+
+  // Detach by gRPC address: the daemon matches `server_name` against the
+  // config alias, which is not the display name the heads response carries.
+  const handleDetach = useCallback(
+    async (head: HeadInfo) => {
+      if (!client) return;
+      try {
+        await client.detachHead({ server_address: head.grpc_address });
+        refetch();
+      } catch (err) {
+        setToastType("error");
+        setToast(err instanceof ApiError ? err.message : "Failed to detach server");
+      }
+    },
+    [client, refetch]
+  );
+
+  const handleLeafToggle = useCallback(
+    (head: HeadInfo, leafSlug: string, enabled: boolean) => {
+      // Warn if enabling a container leaf without a running container runtime
+      if (enabled) {
+        const leaf = head.leafs.find((l) => l.slug === leafSlug);
+        if (leaf?.execution_spec?.image && containerStatus?.status !== "running") {
+          setToastType("warning");
+          setToast("This leaf requires a container runtime. Go to Settings to set up Podman.");
+        }
+      }
+
+      // Update local state immediately — UI is source of truth
+      setHeads((prev) =>
+        prev.map((h) =>
+          h.grpc_address === head.grpc_address
+            ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, enabled } : l) }
+            : h
+        )
+      );
+
+      // Write to config immediately (no debounce for discrete actions)
+      const enabledSlugs = head.leafs
+        .filter((l) => (l.slug === leafSlug ? enabled : l.enabled))
+        .map((l) => l.slug);
+
+      const prefs = enabledSlugs.length === head.leafs.length
+        ? { mode: "ALL" as const }
+        : { mode: "SPECIFIC" as const, enabled: enabledSlugs };
+
+      writeLeafPrefs(head, prefs).catch(() => {
+        // Roll back on failure
+        setHeads((prev) =>
+          prev.map((h) =>
+            h.grpc_address === head.grpc_address
+              ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, enabled: !enabled } : l) }
+              : h
+          )
+        );
+        setToastType("error");
+        setToast("Error: Failed to save leaf preference");
+      });
+    },
+    [setHeads, writeLeafPrefs, containerStatus]
+  );
+
+  const handleLeafWeightChange = useCallback(
+    (head: HeadInfo, leafSlug: string, weight: number) => {
+      // Update local state immediately
+      setHeads((prev) =>
+        prev.map((h) =>
+          h.grpc_address === head.grpc_address
+            ? { ...h, leafs: h.leafs.map((l) => l.slug === leafSlug ? { ...l, effective_weight: weight } : l) }
+            : h
+        )
+      );
+
+      // Debounced write for continuous slider input, from the leaf list as
+      // rendered (it already carries this slider's earlier moves).
+      writeLeafWeight(head, leafSlug, weight);
+    },
+    [setHeads, writeLeafWeight]
+  );
+
+  const handleResetDefaults = useCallback(
+    (head: HeadInfo) => {
+      // Update local state immediately
+      setHeads((prev) =>
+        prev.map((h) =>
+          h.grpc_address === head.grpc_address
+            ? { ...h, leafs: h.leafs.map((l) => ({ ...l, enabled: true, effective_weight: 100 })) }
+            : h
+        )
+      );
+      writeLeafPrefs(head, { mode: "ALL" });
+    },
+    [setHeads, writeLeafPrefs]
+  );
+
+  // `useWriteHeadTrust` records the pending restart itself (trust is read
+  // when the daemon starts); this page only mirrors the saved list locally.
+  const handleTrustChange = useCallback(
+    async (head: HeadInfo, trustedRuntimes: string[]) => {
+      await writeHeadTrust(head, trustedRuntimes);
+      setTrustByHead((prev) => ({ ...prev, [head.grpc_address]: trustedRuntimes }));
+    },
+    [writeHeadTrust, setTrustByHead]
+  );
+
+  // Re-read the heads so a cleared disk gate shows straight away; the hook
+  // records a restart when the daemon asks for one.
+  const handleRaiseDisk = useCallback(
+    async (gb: number) => {
+      await raiseDiskAllowance(gb);
+      refetch();
+    },
+    [raiseDiskAllowance, refetch]
+  );
+
+  /**
+   * The daemon connects to its heads when it starts, so a newly attached
+   * head sends no work until the next restart.
+   */
+  const handleServerAdded = useCallback(
+    (headName: string) => {
+      refetch();
+      markRestartRequired(
+        `${headName} is attached. Lettuce starts fetching work from it the next time it starts.`
+      );
+    },
+    [refetch]
+  );
+
+  const showHeadWeight = heads.length >= 2;
+
+  return (
+    <div className="p-6 space-y-4 max-w-3xl mx-auto">
+      {/* Toast */}
+      {toast && (
+        <div
+          className={
+            toastType === "warning"
+              ? "fixed top-4 right-4 z-50 rounded-md px-4 py-2 text-sm font-medium shadow-lg bg-yellow-100 text-yellow-800 border border-yellow-300"
+              : "fixed top-4 right-4 z-50 rounded-md px-4 py-2 text-sm font-medium shadow-lg bg-destructive text-destructive-foreground"
+          }
+        >
+          {toast}
+        </div>
+      )}
+
+      {/* Loading state */}
+      {isLoading && heads.length === 0 && (
+        <div className="space-y-4">
+          <SkeletonCard />
+          <SkeletonCard />
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!isLoading && heads.length === 0 && (
+        <p className="text-sm text-muted-foreground py-8 text-center">
+          No servers connected. Add a server to start contributing.
+        </p>
+      )}
+
+      {/* Error state */}
+      {error && (
+        <p className="text-sm text-destructive py-4 text-center">
+          Failed to load servers: {error.message}
+        </p>
+      )}
+
+      {/* Head sections */}
+      {heads.map((head) => (
+        <HeadSection
+          key={head.grpc_address}
+          head={head}
+          showHeadWeight={showHeadWeight}
+          containerStatus={containerStatus}
+          machine={machine}
+          trustedRuntimes={trustByHead[head.grpc_address] ?? null}
+          onHeadWeightChange={(weight) => {
+            setHeads((prev) =>
+              prev.map((h) => h.grpc_address === head.grpc_address ? { ...h, weight } : h)
+            );
+            writeHeadWeight(head, weight);
+          }}
+          onLeafToggle={(slug, enabled) =>
+            handleLeafToggle(head, slug, enabled)
+          }
+          onLeafWeightChange={(slug, weight) =>
+            handleLeafWeightChange(head, slug, weight)
+          }
+          onResetDefaults={() => handleResetDefaults(head)}
+          onDetach={() => handleDetach(head)}
+          onTrustChange={(runtimes) => handleTrustChange(head, runtimes)}
+          onRaiseDisk={handleRaiseDisk}
+        />
+      ))}
+
+      {/* Add Server button */}
+      <Button
+        variant="outline"
+        className="w-full"
+        onClick={() => setAddDialogOpen(true)}
+      >
+        + Add Server
+      </Button>
+
+      <AddServerDialog
+        open={addDialogOpen}
+        onOpenChange={setAddDialogOpen}
+        onServerAdded={handleServerAdded}
+        machine={machine}
+      />
+    </div>
+  );
+}
