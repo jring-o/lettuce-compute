@@ -38,6 +38,44 @@ The interface is a React application (`src/`) rendered by [Tauri 2](https://v2.t
 operating system's web view; the Rust side (`src-tauri/src/`) owns process management, the tray,
 notifications, and the updater.
 
+## Data directory
+
+Everything a volunteer's install persists lives in one **data directory**: the client's
+`config.yaml`, the identity key pair (the account), work directories, logs and `daemon.json`, plus
+the app's own small files (its credit-milestone record and first-launch marker). By default that is
+`~/.lettuce` (`C:\Users\<you>\.lettuce` on Windows), the same directory the command-line client
+uses, which is why the app and the client can be used interchangeably on one install.
+
+Setting the environment variable **`LETTUCE_DATA_DIR`** to a path before launching the app moves
+the whole profile there. The app reads and writes its files under that path and passes
+`--data-dir <path>` to every `lettuce-volunteer` command it runs (`init`, `schedule set`, `start`,
+`stop`), so the client keeps its config, keys and work in the same place; the client relocates
+`config.yaml` into the profile whenever `--data-dir` is given. An empty or whitespace-only value is
+the same as not setting it, and a relative path is resolved against the app's working directory
+once, at startup. Settings → Identity shows the directory in use.
+
+Two uses:
+
+- **A second, isolated volunteer on one machine** — for example a separate account for a different
+  head, or a profile that trusts different runtimes. Each profile has its own keys, config and
+  daemon; two apps with different values run side by side without touching each other.
+- **Testing.** Point a build at a throwaway directory and the first-run wizard, `init` and the
+  daemon all happen there, leaving the real `~/.lettuce` alone.
+
+```powershell
+# Windows: set it in the shell, then start the installed app from that same shell.
+$env:LETTUCE_DATA_DIR = "D:\lettuce-profiles\second"
+Start-Process "$env:ProgramFiles\Lettuce Compute\Lettuce Compute.exe"
+```
+
+```bash
+# During development
+LETTUCE_DATA_DIR=~/lettuce-second npm run tauri dev
+```
+
+The variable is read when the app starts; a Start-menu shortcut or the login-time autostart entry
+does not carry it, so a second profile is launched from a shell (or a shortcut) that sets it.
+
 ## Prerequisites
 
 - **Node.js 24** and npm.

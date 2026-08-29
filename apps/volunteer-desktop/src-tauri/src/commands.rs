@@ -406,6 +406,14 @@ pub async fn restart_daemon() -> Result<(), String> {
         .map(|_| ())
 }
 
+/// The data directory the app and its bundled client use: `~/.lettuce`, or
+/// the `LETTUCE_DATA_DIR` override (see `sidecar::data_dir`). Shown in
+/// Settings so a volunteer running a second profile can see which one this is.
+#[tauri::command]
+pub fn get_data_dir() -> String {
+    sidecar::data_dir().to_string_lossy().into_owned()
+}
+
 /// The bundled CLI's version string (`lettuce-volunteer --version`).
 #[tauri::command]
 pub async fn get_client_version() -> Result<String, String> {

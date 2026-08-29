@@ -16,6 +16,7 @@ export const hostCommandDefaults: Record<string, unknown> = {
   is_initialized: true,
   run_init: undefined,
   restart_daemon: undefined,
+  get_data_dir: "/home/test/.lettuce",
   get_client_version: "0.0.0-test",
   // Host measurements
   system_metrics: { cpu_usage_pct: 0, memory_used_mb: 0, memory_total_mb: 0 },

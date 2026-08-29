@@ -20,6 +20,7 @@ import {
   checkPodmanPrerequisites,
   detectContainerRuntime,
   fetchHeadInfo,
+  getDataDir,
   getSystemMemoryMb,
   installPodman,
   runInit,
@@ -105,9 +106,12 @@ function WelcomeStep({ onNext }: { onNext: () => void }) {
 }
 
 function IdentityStep({
+  dataDir,
   onNext,
   onBack,
 }: {
+  /** Where the keys will be written: the app's data directory. */
+  dataDir: string;
   onNext: () => void;
   onBack: () => void;
 }) {
@@ -125,7 +129,7 @@ function IdentityStep({
           <CardTitle className="text-base">The keypair is the account</CardTitle>
           <CardDescription>
             When setup completes, Lettuce generates two files in{" "}
-            <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.lettuce/</code>:{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">{dataDir}</code>:{" "}
             <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.key</code> (private)
             and <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.pub</code>. There
             is no username or password — those two files are your account, and credit for
@@ -139,8 +143,8 @@ function IdentityStep({
             but share one work allowance. To use this account on another machine, copy{" "}
             <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.key</code> and{" "}
             <code className="rounded bg-muted px-1 py-0.5 text-xs">identity.pub</code> into that
-            machine's data directory (<code className="rounded bg-muted px-1 py-0.5 text-xs">~/.lettuce/</code>)
-            before Lettuce starts there for the first time.
+            machine's data directory (the same folder, unless it was moved) before Lettuce starts
+            there for the first time.
           </p>
           <p>
             <span className="font-medium text-foreground">Never run setup again to "fix" a key.</span>{" "}
@@ -1077,6 +1081,24 @@ export function SetupWizard({ onComplete }: WizardProps) {
     [update]
   );
 
+  // Where setup will put the keys: the app's data directory (`~/.lettuce`, or
+  // the `LETTUCE_DATA_DIR` override). Shown on the Identity step so the folder
+  // named there is the real one.
+  const [dataDir, setDataDir] = useState("~/.lettuce");
+  useEffect(() => {
+    let cancelled = false;
+    getDataDir()
+      .then((dir) => {
+        if (!cancelled && typeof dir === "string" && dir) setDataDir(dir);
+      })
+      .catch(() => {
+        // Keep the conventional default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Detect real total RAM once on mount and size the memory slider / default to
   // it. Without this the slider was capped at ~7.4 GB (hardcoded 8 GB), which is
   // below the memory floor of large leaves (e.g. extract2 ≥28 GB), so the
@@ -1161,6 +1183,7 @@ export function SetupWizard({ onComplete }: WizardProps) {
         {step === 0 && <WelcomeStep onNext={() => setStep(1)} />}
         {step === 1 && (
           <IdentityStep
+            dataDir={dataDir}
             onNext={() => setStep(2)}
             onBack={() => setStep(0)}
           />

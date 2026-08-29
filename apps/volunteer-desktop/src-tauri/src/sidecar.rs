@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -6,18 +6,62 @@ use std::time::{Duration, Instant};
 
 use crate::api::DaemonInfo;
 
-pub fn lettuce_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Could not determine home directory")
+/// Environment variable that relocates the data directory. When set to a
+/// non-empty path, the app reads and writes everything under that path
+/// instead of `~/.lettuce` (`daemon.json`, `config.yaml`, its own
+/// `milestones.json` and first-launch marker), and passes `--data-dir <path>`
+/// to every `lettuce-volunteer` command it runs, so the bundled client keeps
+/// the whole profile — config, identity keys, work directories, logs — in the
+/// same place. Two copies of the app with different values run as two
+/// independent volunteers on one machine; it is also how tests point a build
+/// at a throwaway profile.
+pub const DATA_DIR_ENV: &str = "LETTUCE_DATA_DIR";
+
+/// The directory the app and its bundled client keep their state in: the
+/// `LETTUCE_DATA_DIR` override when set, else `~/.lettuce`. Always absolute.
+pub fn data_dir() -> PathBuf {
+    resolve_data_dir(std::env::var_os(DATA_DIR_ENV), dirs::home_dir())
+}
+
+/// `data_dir()` for a given override value and home directory. A missing,
+/// empty or whitespace-only override means the default. A relative override
+/// is made absolute against the current directory once, here, so the app and
+/// the client (which absolutizes `--data-dir` against its own working
+/// directory) agree on the same folder.
+fn resolve_data_dir(override_value: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = override_path(override_value) {
+        return std::path::absolute(&dir).unwrap_or(dir);
+    }
+    home.expect("Could not determine home directory")
         .join(".lettuce")
 }
 
+/// The override as a path, or `None` when unset, empty or whitespace-only.
+fn override_path(override_value: Option<OsString>) -> Option<PathBuf> {
+    let raw = override_value?;
+    let value = match raw.to_str() {
+        Some(s) => PathBuf::from(s.trim()),
+        None => PathBuf::from(raw),
+    };
+    (!value.as_os_str().is_empty()).then_some(value)
+}
+
+/// Arguments that make a `lettuce-volunteer` command use the app's data
+/// directory: `--data-dir <dir>` under the override, nothing otherwise (the
+/// client's own default is the same `~/.lettuce`).
+fn profile_args() -> Vec<OsString> {
+    match override_path(std::env::var_os(DATA_DIR_ENV)) {
+        Some(_) => vec![OsString::from("--data-dir"), data_dir().into_os_string()],
+        None => Vec::new(),
+    }
+}
+
 fn daemon_json_path() -> PathBuf {
-    lettuce_dir().join("daemon.json")
+    data_dir().join("daemon.json")
 }
 
 fn config_yaml_path() -> PathBuf {
-    lettuce_dir().join("config.yaml")
+    data_dir().join("config.yaml")
 }
 
 fn sidecar_binary_name() -> &'static str {
@@ -58,10 +102,21 @@ fn sidecar_command(binary: &Path) -> Command {
     cmd
 }
 
-/// Run the sidecar with the given arguments and wait for it to exit, capturing
-/// its output. Used for the CLI's one-shot subcommands (`init`, `stop`,
-/// `--version`); the long-running daemon is launched with `start_sidecar`.
+/// Run the sidecar with the given arguments against the app's data directory
+/// and wait for it to exit, capturing its output. Used for the CLI's one-shot
+/// subcommands (`init`, `schedule set`, `stop`); the long-running daemon is
+/// launched with `start_sidecar`. Under `LETTUCE_DATA_DIR` the command gets
+/// `--data-dir` first, before the subcommand, where the CLI accepts its
+/// persistent flags.
 pub fn run_sidecar<S: AsRef<OsStr>>(args: &[S]) -> Result<Output, String> {
+    let mut full: Vec<OsString> = profile_args();
+    full.extend(args.iter().map(|a| a.as_ref().to_os_string()));
+    run_sidecar_bare(&full)
+}
+
+/// Run the sidecar exactly as given, with no data-directory argument. Only
+/// for commands that do not touch the profile (`--version`).
+fn run_sidecar_bare<S: AsRef<OsStr>>(args: &[S]) -> Result<Output, String> {
     let binary = find_sidecar_binary()?;
     let mut cmd = sidecar_command(&binary);
     cmd.args(args).stdin(Stdio::null());
@@ -74,6 +129,9 @@ pub fn run_sidecar<S: AsRef<OsStr>>(args: &[S]) -> Result<Output, String> {
     })
 }
 
+/// Launch the daemon (`lettuce-volunteer start`) against the app's data
+/// directory and return without waiting; `wait_for_daemon` watches for its
+/// `daemon.json`.
 pub fn start_sidecar() -> Result<Child, String> {
     if is_daemon_running() {
         return Err("Daemon is already running".into());
@@ -82,7 +140,8 @@ pub fn start_sidecar() -> Result<Child, String> {
     let binary = find_sidecar_binary()?;
 
     let mut cmd = sidecar_command(&binary);
-    cmd.arg("start")
+    cmd.args(profile_args())
+        .arg("start")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -96,8 +155,9 @@ pub fn start_sidecar() -> Result<Child, String> {
 
 /// The sidecar's version string, from `lettuce-volunteer --version`. The CLI
 /// prints `lettuce-volunteer version <v>`; only the version token is returned.
+/// Reads no profile, so no `--data-dir` is passed.
 pub fn client_version() -> Result<String, String> {
-    let out = run_sidecar(&["--version"])?;
+    let out = run_sidecar_bare(&["--version"])?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(format!(
@@ -282,6 +342,59 @@ pub fn is_pid_alive(pid: u32) -> bool {
         let result = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
         result != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_data_dir;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn home() -> Option<PathBuf> {
+        Some(PathBuf::from(if cfg!(windows) { r"C:\Users\vol" } else { "/home/vol" }))
+    }
+
+    #[test]
+    fn defaults_to_dot_lettuce_under_home() {
+        assert_eq!(resolve_data_dir(None, home()), home().unwrap().join(".lettuce"));
+    }
+
+    #[test]
+    fn empty_or_blank_override_means_the_default() {
+        assert_eq!(
+            resolve_data_dir(Some(OsString::from("")), home()),
+            home().unwrap().join(".lettuce")
+        );
+        assert_eq!(
+            resolve_data_dir(Some(OsString::from("  \t ")), home()),
+            home().unwrap().join(".lettuce")
+        );
+    }
+
+    #[test]
+    fn absolute_override_is_used_as_given() {
+        let dir = if cfg!(windows) { r"D:\profiles\second" } else { "/srv/profiles/second" };
+        assert_eq!(
+            resolve_data_dir(Some(OsString::from(format!("  {dir}  "))), home()),
+            PathBuf::from(dir)
+        );
+    }
+
+    #[test]
+    fn relative_override_is_made_absolute() {
+        let resolved = resolve_data_dir(Some(OsString::from("rel-profile")), home());
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().join("rel-profile")
+        );
+    }
+
+    #[test]
+    fn override_wins_even_without_a_home_directory() {
+        let dir = if cfg!(windows) { r"D:\p" } else { "/p" };
+        assert_eq!(resolve_data_dir(Some(OsString::from(dir)), None), PathBuf::from(dir));
     }
 }
 

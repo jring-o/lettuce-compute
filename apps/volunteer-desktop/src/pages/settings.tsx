@@ -29,7 +29,12 @@ import {
   applyTheme,
   type Theme,
 } from "@/lib/utils";
-import type { ScheduleRange, ThermalConfig, ManagementClient } from "@/api/client";
+import {
+  getDataDir,
+  type ScheduleRange,
+  type ThermalConfig,
+  type ManagementClient,
+} from "@/api/client";
 
 // Collapsible section
 function Section({
@@ -348,6 +353,15 @@ export function SettingsPage() {
       .catch(() => {});
   }, []);
 
+  // The data directory as the app resolves it (`LETTUCE_DATA_DIR` or
+  // ~/.lettuce); the daemon's own `config.data_dir` is the fallback.
+  const [hostDataDir, setHostDataDir] = useState<string | null>(null);
+  useEffect(() => {
+    getDataDir()
+      .then((dir) => setHostDataDir(typeof dir === "string" && dir ? dir : null))
+      .catch(() => {});
+  }, []);
+
   const handleAutostartToggle = useCallback(async (enabled: boolean) => {
     setAutostart(enabled);
     try {
@@ -401,6 +415,7 @@ export function SettingsPage() {
   const gpuCardMb = machine?.gpu_card_vram_mb ?? 0;
   const gpuAllowedMb = Math.round((gpuCardMb * gpuPct) / 100);
   const thermal = config.thermal;
+  const dataDir = hostDataDir ?? config.data_dir;
 
   const handleSignChallenge = async () => {
     if (!client || !challengeHex.trim()) return;
@@ -716,6 +731,21 @@ export function SettingsPage() {
             </div>
           )}
 
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-muted-foreground">
+              Data directory
+            </label>
+            <div className="flex items-center gap-2">
+              <code
+                className="flex-1 text-xs bg-muted rounded-md px-3 py-2 font-mono truncate"
+                title={dataDir}
+              >
+                {dataDir}
+              </code>
+              <CopyButton text={dataDir} />
+            </div>
+          </div>
+
           <div className="text-xs text-muted-foreground space-y-1">
             <p>
               Your keypair is your account. Every head you attach to recognises you by
@@ -725,10 +755,9 @@ export function SettingsPage() {
             <p>
               To move or copy your account to another computer, copy{" "}
               <code className="font-mono">identity.key</code> and{" "}
-              <code className="font-mono">identity.pub</code> from{" "}
-              <code className="font-mono">{config.data_dir}</code> into the same folder
-              there. Never re-run setup to fix a key problem — setup creates a new key,
-              which is a new account with no credit.
+              <code className="font-mono">identity.pub</code> from the data directory
+              above into the same folder there. Never re-run setup to fix a key problem —
+              setup creates a new key, which is a new account with no credit.
             </p>
           </div>
 

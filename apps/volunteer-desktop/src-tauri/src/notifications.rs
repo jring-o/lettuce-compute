@@ -43,7 +43,7 @@ struct MilestoneState {
 const DEFAULT_MILESTONES: &[i64] = &[100, 500, 1000, 5000, 10000, 50000, 100000];
 
 fn milestones_path() -> std::path::PathBuf {
-    sidecar::lettuce_dir().join("milestones.json")
+    sidecar::data_dir().join("milestones.json")
 }
 
 fn load_milestone_state() -> MilestoneState {

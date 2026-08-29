@@ -154,6 +154,7 @@ fn main() {
             commands::is_initialized,
             commands::run_init,
             commands::restart_daemon,
+            commands::get_data_dir,
             commands::get_client_version,
             commands::system_metrics,
             commands::is_autostart_enabled,

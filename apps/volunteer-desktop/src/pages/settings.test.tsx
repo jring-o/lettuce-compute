@@ -449,6 +449,50 @@ describe("SettingsPage", () => {
     expect(screen.getByText("not registered yet")).toBeInTheDocument();
   });
 
+  it("shows the data directory the app resolved, falling back to the daemon's", async () => {
+    mockHeads({ heads: [], machine: noGpuMachine });
+    mockManagementApi(
+      { "GET /api/v1/heads": { heads: [], machine: noGpuMachine }, "GET /api/v1/status": {} },
+      (cmd) => (cmd === "get_data_dir" ? "D:\profiles\second" : undefined)
+    );
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ data_dir: "/home/test/.lettuce" }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Identity"));
+
+    expect(screen.getByText("Data directory")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText("D:\profiles\second")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("/home/test/.lettuce")).not.toBeInTheDocument();
+    expect(screen.getByText(/from the data directory above/)).toBeInTheDocument();
+  });
+
+  it("falls back to the daemon's data_dir when the host cannot report one", async () => {
+    mockManagementApi(
+      { "GET /api/v1/heads": { heads: [], machine: noGpuMachine }, "GET /api/v1/status": {} },
+      (cmd) => (cmd === "get_data_dir" ? Promise.reject("no host") : undefined)
+    );
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ data_dir: "/home/test/.lettuce" }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Identity"));
+
+    expect(screen.getByText("/home/test/.lettuce")).toBeInTheDocument();
+  });
+
   it("remembers the chosen theme in localStorage and restores it", async () => {
     mockUseConfig.mockReturnValue({
       config: makeConfig(),

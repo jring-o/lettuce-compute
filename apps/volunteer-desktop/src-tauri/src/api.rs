@@ -2,7 +2,8 @@
 //!
 //! The daemon (`lettuce-volunteer start`) serves a small HTTP API on a random
 //! loopback port and advertises the port, a bearer token and its PID in
-//! `~/.lettuce/daemon.json`. It accepts only requests whose Host header is the
+//! `daemon.json` in the data directory (`~/.lettuce` unless `LETTUCE_DATA_DIR`
+//! relocates it; see `sidecar::data_dir`). It accepts only requests whose Host header is the
 //! loopback address it is bound to and deliberately sets no CORS headers, so the
 //! app's web view cannot call it directly: every call — from the web view via the
 //! `mgmt_request` command, and from the Rust host itself (tray, notifications,
@@ -17,8 +18,8 @@ use serde_json::Value;
 
 use crate::sidecar;
 
-/// Contents of `~/.lettuce/daemon.json`, written by the daemon when it starts
-/// and removed when it shuts down cleanly.
+/// Contents of the data directory's `daemon.json`, written by the daemon when
+/// it starts and removed when it shuts down cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub port: u16,
@@ -179,9 +180,9 @@ impl ManagementClient {
         Self::new(info.port, info.token.clone())
     }
 
-    /// Locate the running daemon through `~/.lettuce/daemon.json`. The file is
-    /// read on every call so a restarted daemon (new port, new token) is picked
-    /// up without any client state.
+    /// Locate the running daemon through the data directory's `daemon.json`.
+    /// The file is read on every call so a restarted daemon (new port, new
+    /// token) is picked up without any client state.
     pub fn discover() -> Result<Self, MgmtError> {
         let info = sidecar::read_daemon_json().map_err(MgmtError::unreachable)?;
         Ok(Self::from_daemon_info(&info))

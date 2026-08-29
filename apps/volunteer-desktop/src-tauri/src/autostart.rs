@@ -16,7 +16,7 @@ pub fn launch_args() -> Vec<&'static str> {
 }
 
 fn first_launch_marker() -> PathBuf {
-    sidecar::lettuce_dir().join(".first_launch_done")
+    sidecar::data_dir().join(".first_launch_done")
 }
 
 /// Set up auto-start. On the first explicit app launch it is enabled by

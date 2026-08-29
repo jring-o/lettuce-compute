@@ -15,6 +15,9 @@ import { invoke } from "@tauri-apps/api/core";
  * `handlers.go`). A Go `omitempty` field is optional here; a Go pointer field
  * without `omitempty` is `T | null`. Where the daemon may send `null` for a
  * list, the client normalises it to `[]` so callers never branch on null.
+ *
+ * "`~/.lettuce`" below means the data directory, which `LETTUCE_DATA_DIR`
+ * can relocate; the Rust host resolves it (`getDataDir()`).
  */
 
 // ---------------------------------------------------------------------------
@@ -798,6 +801,15 @@ export async function restartDaemon(): Promise<void> {
 /** Version of the bundled `lettuce-volunteer` CLI (`--version`). */
 export async function getClientVersion(): Promise<string> {
   return invoke("get_client_version");
+}
+
+/**
+ * The data directory the app and its bundled client use: `~/.lettuce`, or
+ * the `LETTUCE_DATA_DIR` override for a second, isolated profile (see the
+ * README). Absolute.
+ */
+export async function getDataDir(): Promise<string> {
+  return invoke("get_data_dir");
 }
 
 // ---------------------------------------------------------------------------

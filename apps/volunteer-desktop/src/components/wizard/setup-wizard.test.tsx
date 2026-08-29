@@ -136,6 +136,18 @@ describe("SetupWizard", () => {
       expect(screen.getByText(/before Lettuce starts there for the first time/)).toBeInTheDocument();
       expect(screen.getByText(/Never run setup again to "fix" a key/)).toBeInTheDocument();
     });
+
+    it("names the data directory the host resolved as where the keys will be written", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, get_data_dir: "D:\profiles\second" });
+      render(<SetupWizard onComplete={vi.fn()} />);
+      await user.click(screen.getByText("Get Started"));
+
+      await waitFor(() => {
+        expect(screen.getByText("D:\profiles\second")).toBeInTheDocument();
+      });
+      expect(screen.queryByText("~/.lettuce")).not.toBeInTheDocument();
+    });
   });
 
   describe("ScheduleStep", () => {
