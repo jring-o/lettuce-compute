@@ -1,7 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
-import { useHeads, useDebouncedHeadWeight, useWriteLeafPreferences } from "./use-heads";
-import type { ConfigResponse, HeadInfo, LeafPreferences } from "@/api/client";
+import {
+  useHeads,
+  useDebouncedHeadWeight,
+  useWriteLeafPreferences,
+  useWriteHeadTrust,
+  useRaiseDiskAllowance,
+  trustByHeadFromConfig,
+} from "./use-heads";
+import type {
+  ConfigResponse,
+  ConfigUpdate,
+  ConfigUpdateResponse,
+  HeadInfo,
+  HeadsResponse,
+  LeafPreferences,
+  MachineCapabilities,
+  ServerConfig,
+} from "@/api/client";
 
 // --- Mocks ---
 
@@ -19,11 +35,12 @@ const mockHeadsData: HeadInfo[] = [
         slug: "prime",
         name: "Prime Study",
         description: "Primes",
-        research_area: "math",
+        research_area: ["math"],
         task_pattern: "PARAMETER_SWEEP",
         state: "ACTIVE",
         queued_work_units: 100,
         active_volunteers: 5,
+        active_hosts: 6,
         enabled: true,
         effective_weight: 50,
       },
@@ -31,21 +48,47 @@ const mockHeadsData: HeadInfo[] = [
   },
 ];
 
+const mockMachine: MachineCapabilities = {
+  runtimes: ["container", "wasm"],
+  has_gpu: false,
+  max_memory_mb: 2048,
+  max_disk_mb: 10240,
+  max_cpu_cores: 4,
+  max_gpu_vram_mb: 0,
+  gpu_card_vram_mb: 0,
+  gpu_vram_pct: 50,
+  gpu_vendors: [],
+  gpu_compute_capabilities: [],
+};
+
 const mockConfigFn = vi.fn<() => Promise<ConfigResponse>>();
-const mockUpdateConfigFn = vi.fn<(partial: any) => Promise<ConfigResponse>>();
-const mockHeadsFn = vi.fn<() => Promise<HeadInfo[]>>();
+const mockUpdateConfigFn = vi.fn<(partial: ConfigUpdate) => Promise<ConfigUpdateResponse>>();
+const mockHeadsAndMachineFn = vi.fn<() => Promise<HeadsResponse>>();
 
 const mockClient = {
-  heads: mockHeadsFn,
+  headsAndMachine: mockHeadsAndMachineFn,
   config: mockConfigFn,
   updateConfig: mockUpdateConfigFn,
-} as unknown as { heads: typeof mockHeadsFn; config: typeof mockConfigFn; updateConfig: typeof mockUpdateConfigFn };
+};
 
 const mockUseClient = vi.fn();
 
 vi.mock("./use-api", () => ({
   useClient: () => mockUseClient(),
 }));
+
+function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
+  return {
+    grpc_address: "lettuce.science:443",
+    http_address: "https://lettuce.science",
+    name: "lettuce.science",
+    insecure: false,
+    weight: 70,
+    leaf_preferences: { mode: "ALL" },
+    trusted_runtimes: ["CONTAINER"],
+    ...overrides,
+  };
+}
 
 function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
   return {
@@ -56,6 +99,7 @@ function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
       max_disk_gb: 10,
       max_bandwidth_mbps: 0,
       max_gpu_vram_pct: 50,
+      max_pids: 0,
     },
     scheduling: {
       mode: "ALWAYS",
@@ -74,6 +118,7 @@ function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
       gpu_pause_threshold: 80,
       gpu_resume_threshold: 70,
       poll_interval_seconds: 10,
+      max_throttle_minutes: 0,
     },
     notifications: {
       credit_milestones: true,
@@ -85,15 +130,36 @@ function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
     servers,
     log_level: "info",
     max_concurrent_tasks: 1,
-    available_runtimes: ["NATIVE"],
   };
 }
 
 // --- Tests ---
 
+describe("trustByHeadFromConfig", () => {
+  it("matches a head to its config entry by gRPC address, then by name", () => {
+    const heads: HeadInfo[] = [
+      { ...mockHeadsData[0], name: "Renamed", grpc_address: "lettuce.science:443" },
+      { ...mockHeadsData[0], name: "einstein", grpc_address: "" },
+    ];
+    const servers = [
+      makeServer({ trusted_runtimes: ["container"] }),
+      makeServer({ name: "einstein", grpc_address: "einstein:443", trusted_runtimes: ["NATIVE"] }),
+    ];
+    expect(trustByHeadFromConfig(heads, servers)).toEqual({
+      Renamed: ["CONTAINER"],
+      einstein: ["NATIVE"],
+    });
+  });
+
+  it("leaves a head out when no config entry matches", () => {
+    expect(trustByHeadFromConfig(mockHeadsData, [])).toEqual({});
+  });
+});
+
 describe("useHeads", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer()]));
   });
 
   it("returns empty array and loading state initially when client is null", () => {
@@ -102,13 +168,15 @@ describe("useHeads", () => {
     const { result } = renderHook(() => useHeads());
 
     expect(result.current.heads).toEqual([]);
+    expect(result.current.machine).toBeNull();
+    expect(result.current.trustByHead).toEqual({});
     expect(result.current.isLoading).toBe(true);
     expect(result.current.error).toBeNull();
   });
 
-  it("returns heads data when client fetches successfully", async () => {
+  it("returns heads, machine and per-head trust when the client fetches successfully", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
-    mockHeadsFn.mockResolvedValue(mockHeadsData);
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: mockHeadsData, machine: mockMachine });
 
     const { result } = renderHook(() => useHeads());
 
@@ -117,12 +185,32 @@ describe("useHeads", () => {
     });
 
     expect(result.current.heads).toEqual(mockHeadsData);
+    expect(result.current.machine).toEqual(mockMachine);
+    await waitFor(() => {
+      expect(result.current.trustByHead).toEqual({ "lettuce.science": ["CONTAINER"] });
+    });
+    expect(result.current.error).toBeNull();
+  });
+
+  it("keeps the heads and leaves trust unknown when config cannot be read", async () => {
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: mockHeadsData, machine: mockMachine });
+    mockConfigFn.mockRejectedValue(new Error("config unreadable"));
+
+    const { result } = renderHook(() => useHeads());
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    expect(result.current.heads).toEqual(mockHeadsData);
+    expect(result.current.trustByHead).toEqual({});
     expect(result.current.error).toBeNull();
   });
 
   it("returns error when fetch fails", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
-    mockHeadsFn.mockRejectedValue(new Error("Network error"));
+    mockHeadsAndMachineFn.mockRejectedValue(new Error("Network error"));
 
     const { result } = renderHook(() => useHeads());
 
@@ -134,20 +222,20 @@ describe("useHeads", () => {
     expect(result.current.error).toEqual(new Error("Network error"));
   });
 
-  it("calls client.heads() on mount", async () => {
+  it("calls client.headsAndMachine() on mount", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
-    mockHeadsFn.mockResolvedValue([]);
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: [], machine: mockMachine });
 
     renderHook(() => useHeads());
 
     await waitFor(() => {
-      expect(mockHeadsFn).toHaveBeenCalledOnce();
+      expect(mockHeadsAndMachineFn).toHaveBeenCalledOnce();
     });
   });
 
-  it("exposes refetch that calls client.heads() again", async () => {
+  it("exposes refetch that calls client.headsAndMachine() again", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
-    mockHeadsFn.mockResolvedValue(mockHeadsData);
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: mockHeadsData, machine: mockMachine });
 
     const { result } = renderHook(() => useHeads());
 
@@ -155,17 +243,17 @@ describe("useHeads", () => {
       expect(result.current.isLoading).toBe(false);
     });
 
-    mockHeadsFn.mockResolvedValue([]);
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: [], machine: mockMachine });
     await act(async () => {
       result.current.refetch();
     });
 
-    expect(mockHeadsFn).toHaveBeenCalledTimes(2);
+    expect(mockHeadsAndMachineFn).toHaveBeenCalledTimes(2);
   });
 
-  it("exposes setHeads for local state updates", async () => {
+  it("exposes setHeads and setTrustByHead for local state updates", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
-    mockHeadsFn.mockResolvedValue([]);
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: [], machine: mockMachine });
 
     const { result } = renderHook(() => useHeads());
 
@@ -175,9 +263,107 @@ describe("useHeads", () => {
 
     act(() => {
       result.current.setHeads(mockHeadsData);
+      result.current.setTrustByHead({ "lettuce.science": ["NATIVE"] });
     });
 
     expect(result.current.heads).toEqual(mockHeadsData);
+    expect(result.current.trustByHead).toEqual({ "lettuce.science": ["NATIVE"] });
+  });
+});
+
+describe("useWriteHeadTrust", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  it("PUTs exactly the head name and the new trusted runtimes, and returns the daemon's answer", async () => {
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true });
+
+    const { result } = renderHook(() => useWriteHeadTrust());
+
+    let resp: ConfigUpdateResponse | null = null;
+    await act(async () => {
+      resp = await result.current.write("lettuce.science", ["CONTAINER", "NATIVE"]);
+    });
+
+    expect(mockConfigFn).not.toHaveBeenCalled();
+    expect(mockUpdateConfigFn).toHaveBeenCalledOnce();
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      servers: [{ name: "lettuce.science", trusted_runtimes: ["CONTAINER", "NATIVE"] }],
+    });
+    expect(resp).toEqual({ status: "ok", restart_required: true });
+  });
+
+  it("sends an empty list to revoke all opt-in trust", async () => {
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok" });
+
+    const { result } = renderHook(() => useWriteHeadTrust());
+    await act(async () => {
+      await result.current.write("lettuce.science", []);
+    });
+
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      servers: [{ name: "lettuce.science", trusted_runtimes: [] }],
+    });
+  });
+
+  it("resolves to null without writing when there is no client", async () => {
+    mockUseClient.mockReturnValue({ client: null, error: null });
+
+    const { result } = renderHook(() => useWriteHeadTrust());
+    let resp: ConfigUpdateResponse | null = { status: "x" };
+    await act(async () => {
+      resp = await result.current.write("lettuce.science", ["NATIVE"]);
+    });
+
+    expect(resp).toBeNull();
+    expect(mockUpdateConfigFn).not.toHaveBeenCalled();
+  });
+});
+
+describe("useRaiseDiskAllowance", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  it("reads the current limits and PUTs the whole object with the new max_disk_gb", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig());
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: false });
+
+    const { result } = renderHook(() => useRaiseDiskAllowance());
+
+    let resp: ConfigUpdateResponse | null = null;
+    await act(async () => {
+      resp = await result.current.raise(25);
+    });
+
+    expect(mockConfigFn).toHaveBeenCalledOnce();
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      resource_limits: {
+        max_cpu_cores: 4,
+        max_memory_mb: 2048,
+        max_disk_gb: 25,
+        max_bandwidth_mbps: 0,
+        max_gpu_vram_pct: 50,
+        max_pids: 0,
+      },
+    });
+    expect(resp).toEqual({ status: "ok", restart_required: false });
+  });
+
+  it("resolves to null without writing when there is no client", async () => {
+    mockUseClient.mockReturnValue({ client: null, error: null });
+
+    const { result } = renderHook(() => useRaiseDiskAllowance());
+    let resp: ConfigUpdateResponse | null = { status: "x" };
+    await act(async () => {
+      resp = await result.current.raise(25);
+    });
+
+    expect(resp).toBeNull();
+    expect(mockConfigFn).not.toHaveBeenCalled();
   });
 });
 
@@ -193,20 +379,9 @@ describe("useDebouncedHeadWeight", () => {
   });
 
   it("calls config then updateConfig with updated weight after debounce", async () => {
-    const servers = [
-      {
-        grpc_address: "lettuce.science:443",
-        http_address: "https://lettuce.science",
-        leaf_id: "",
-        name: "lettuce.science",
-        insecure: false,
-        weight: 70,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-    ];
-    const cfg = makeConfig(servers);
+    const cfg = makeConfig([makeServer()]);
     mockConfigFn.mockResolvedValue(cfg);
-    mockUpdateConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({});
 
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
@@ -234,20 +409,9 @@ describe("useDebouncedHeadWeight", () => {
   });
 
   it("debounces rapid updates - only fires once", async () => {
-    const servers = [
-      {
-        grpc_address: "lettuce.science:443",
-        http_address: "https://lettuce.science",
-        leaf_id: "",
-        name: "lettuce.science",
-        insecure: false,
-        weight: 70,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-    ];
-    const cfg = makeConfig(servers);
+    const cfg = makeConfig([makeServer()]);
     mockConfigFn.mockResolvedValue(cfg);
-    mockUpdateConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({});
 
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
@@ -289,29 +453,17 @@ describe("useDebouncedHeadWeight", () => {
   });
 
   it("only updates the matching server by name", async () => {
-    const servers = [
-      {
-        grpc_address: "lettuce.science:443",
-        http_address: "https://lettuce.science",
-        leaf_id: "",
-        name: "lettuce.science",
-        insecure: false,
-        weight: 70,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-      {
+    const cfg = makeConfig([
+      makeServer(),
+      makeServer({
         grpc_address: "einstein:443",
         http_address: "https://einstein.example",
-        leaf_id: "",
         name: "einstein",
-        insecure: false,
         weight: 30,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-    ];
-    const cfg = makeConfig(servers);
+      }),
+    ]);
     mockConfigFn.mockResolvedValue(cfg);
-    mockUpdateConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({});
 
     const { result } = renderHook(() => useDebouncedHeadWeight());
 
@@ -339,20 +491,9 @@ describe("useWriteLeafPreferences", () => {
   });
 
   it("calls config then updateConfig with updated leaf_preferences immediately", async () => {
-    const servers = [
-      {
-        grpc_address: "lettuce.science:443",
-        http_address: "https://lettuce.science",
-        leaf_id: "",
-        name: "lettuce.science",
-        insecure: false,
-        weight: 70,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-    ];
-    const cfg = makeConfig(servers);
+    const cfg = makeConfig([makeServer()]);
     mockConfigFn.mockResolvedValue(cfg);
-    mockUpdateConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({});
 
     const { result } = renderHook(() => useWriteLeafPreferences());
 
@@ -376,21 +517,10 @@ describe("useWriteLeafPreferences", () => {
     });
   });
 
-  it("preserves other server fields when updating leaf preferences", async () => {
-    const servers = [
-      {
-        grpc_address: "lettuce.science:443",
-        http_address: "https://lettuce.science",
-        leaf_id: "proj-1",
-        name: "lettuce.science",
-        insecure: false,
-        weight: 70,
-        leaf_preferences: { mode: "ALL" as const },
-      },
-    ];
-    const cfg = makeConfig(servers);
+  it("preserves other server fields, including trust, when updating leaf preferences", async () => {
+    const cfg = makeConfig([makeServer({ pinned_leaf_ids: ["proj-1"] })]);
     mockConfigFn.mockResolvedValue(cfg);
-    mockUpdateConfigFn.mockResolvedValue(cfg);
+    mockUpdateConfigFn.mockResolvedValue({});
 
     const { result } = renderHook(() => useWriteLeafPreferences());
 
@@ -398,10 +528,11 @@ describe("useWriteLeafPreferences", () => {
       await result.current.write("lettuce.science", { mode: "SPECIFIC", enabled: ["prime"] });
     });
 
-    const updatedServers = mockUpdateConfigFn.mock.calls[0][0].servers;
+    const updatedServers = mockUpdateConfigFn.mock.calls[0][0].servers as ServerConfig[];
     expect(updatedServers[0].grpc_address).toBe("lettuce.science:443");
     expect(updatedServers[0].weight).toBe(70);
-    expect(updatedServers[0].leaf_id).toBe("proj-1");
+    expect(updatedServers[0].pinned_leaf_ids).toEqual(["proj-1"]);
+    expect(updatedServers[0].trusted_runtimes).toEqual(["CONTAINER"]);
   });
 
   it("does nothing when client is null", async () => {
