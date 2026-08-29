@@ -77,6 +77,10 @@ type StatusResponse struct {
 	ActiveTasks      []ActiveTaskInfo `json:"active_tasks"`
 	QueuedTasks      []QueuedTaskInfo `json:"queued_tasks"`
 	PausedReason     *string          `json:"paused_reason"`
+	// ClientVersion is this volunteer build's version string (what
+	// `lettuce-volunteer --version` prints), so a client can compare it with
+	// each head's head_version on GET /api/v1/heads.
+	ClientVersion string `json:"client_version"`
 	// FailingLeafs lists every leaf whose units have failed locally since the
 	// daemon started, newest failure first. It exists so a volunteer can see that
 	// work IS arriving and failing, rather than concluding they are never sent
@@ -286,7 +290,25 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 		QueuedTasks:      queuedTasks,
 		PausedReason:     pausedReasonPtr,
 		FailingLeafs:     b.failingLeafs(),
+		ClientVersion:    b.daemon.ClientVersion(),
 	}
+}
+
+// NoticesResponse is the response for GET /api/v1/notices.
+type NoticesResponse struct {
+	// Notices is most recently updated first.
+	Notices []daemon.Notice `json:"notices"`
+	// LatestID is the highest notice id ever assigned by this daemon run (0
+	// when none). A client polls with ?since=<latest_id> to receive only
+	// notices created after its last poll.
+	LatestID uint64 `json:"latest_id"`
+}
+
+// GetNotices returns the volunteer-facing notices created after since (all of
+// them when since is 0).
+func (b *DaemonBridge) GetNotices(since uint64) NoticesResponse {
+	notices, latest := b.daemon.Notices().Since(since)
+	return NoticesResponse{Notices: notices, LatestID: latest}
 }
 
 // failingLeafs renders the daemon's per-leaf failure records for the API,
@@ -444,6 +466,66 @@ type AttachRequest struct {
 	ServerAddress string `json:"server_address"`
 	LeafID        string `json:"leaf_id,omitempty"`
 	Name          string `json:"name,omitempty"`
+	// TrustedRuntimes is the runtime trust to record for the new head: which
+	// runtime kinds beyond WASM ("CONTAINER", "NATIVE"; case-insensitive) its
+	// operator may run on this machine. Absent or empty means WASM only — the
+	// safe default when the client offered no consent step. See
+	// parseTrustedRuntimes for validation.
+	TrustedRuntimes []string `json:"trusted_runtimes,omitempty"`
+}
+
+// parseTrustedRuntimes validates and normalises a trusted_runtimes list from
+// an API request into the stored form: UPPERCASE, de-duplicated, sorted, and
+// never nil — an explicit empty list is the recorded "WASM only" decision
+// (PB-28), and a nil would be re-pinned by the load-time migration as a
+// legacy blank. Only CONTAINER and NATIVE are accepted: WASM is always
+// trusted and is never stored, so listing it is a caller error rather than a
+// no-op, and any other token is rejected so a typo cannot silently narrow or
+// widen trust. Mirrors the CLI's `heads trust` semantics: the list REPLACES
+// the head's trust rather than merging into it.
+func parseTrustedRuntimes(raw []string) ([]string, error) {
+	seen := make(map[string]bool, len(raw))
+	out := []string{}
+	for _, r := range raw {
+		u := strings.ToUpper(strings.TrimSpace(r))
+		switch u {
+		case "CONTAINER", "NATIVE":
+			if !seen[u] {
+				seen[u] = true
+				out = append(out, u)
+			}
+		default:
+			return nil, fmt.Errorf("trusted_runtimes: unknown runtime %q (valid: CONTAINER, NATIVE; WASM is always allowed and is not listed)", strings.TrimSpace(r))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// trustedRuntimesEqual reports whether two trust lists grant the same
+// runtimes, ignoring case, order and duplicates — so a PUT that re-sends the
+// current trust is not reported as a change needing a restart.
+func trustedRuntimesEqual(a, b []string) bool {
+	set := func(list []string) map[string]bool {
+		m := make(map[string]bool, len(list))
+		for _, r := range list {
+			u := strings.ToUpper(strings.TrimSpace(r))
+			if u != "" && u != "WASM" {
+				m[u] = true
+			}
+		}
+		return m
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for r := range sa {
+		if !sb[r] {
+			return false
+		}
+	}
+	return true
 }
 
 // loadWriteBase returns the config a bridge write-back must start from: the
@@ -481,6 +563,12 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	if req.ServerAddress == "" {
 		return fmt.Errorf("server_address is required")
 	}
+	// Validate before taking the lock or touching disk: a bad trust list must
+	// leave the config untouched.
+	trusted, err := parseTrustedRuntimes(req.TrustedRuntimes)
+	if err != nil {
+		return err
+	}
 
 	b.cfgMu.Lock()
 	defer b.cfgMu.Unlock()
@@ -507,10 +595,10 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	sc := config.ServerConfig{
 		GRPCAddress: req.ServerAddress,
 		Name:        name,
-		// Explicit empty, not nil: attaching through the bridge has no consent
-		// step, so the new head starts WASM-only as a recorded decision, not a
-		// legacy blank (PB-28).
-		TrustedRuntimes: []string{},
+		// Exactly what the request granted — the client's consent step, if it
+		// had one — and an explicit empty list otherwise, so the new head starts
+		// WASM-only as a recorded decision, not a legacy blank (PB-28).
+		TrustedRuntimes: trusted,
 	}
 	if req.LeafID != "" {
 		sc.PinnedLeafIDs = []string{req.LeafID}
@@ -626,7 +714,7 @@ func containsIgnoreCase(s, substr string) bool {
 // HistoryResponse is the response for GET /api/v1/history.
 type HistoryResponse struct {
 	Entries    []HistoryEntryInfo `json:"entries"`
-	Pagination PaginationInfo    `json:"pagination"`
+	Pagination PaginationInfo     `json:"pagination"`
 }
 
 // HistoryEntryInfo describes a completed work unit.
@@ -768,16 +856,16 @@ func readAllHistory(dataDir string) []daemon.HistoryEntry {
 
 // ConfigResponse is the response for GET /api/v1/config.
 type ConfigResponse struct {
-	DataDir           string                    `json:"data_dir"`
-	PublicKey         string                    `json:"public_key,omitempty"`
-	ResourceLimits    config.ResourceLimits     `json:"resource_limits"`
-	Scheduling        config.Scheduling         `json:"scheduling"`
-	Leafs             config.LeafFilter `json:"leafs"`
-	Thermal           config.ThermalConfig      `json:"thermal"`
-	Notifications     config.NotificationConfig `json:"notifications"`
-	Servers           []config.ServerConfig     `json:"servers"`
-	LogLevel          string                    `json:"log_level"`
-	MaxConcurrent     int                       `json:"max_concurrent_tasks"`
+	DataDir        string                    `json:"data_dir"`
+	PublicKey      string                    `json:"public_key,omitempty"`
+	ResourceLimits config.ResourceLimits     `json:"resource_limits"`
+	Scheduling     config.Scheduling         `json:"scheduling"`
+	Leafs          config.LeafFilter         `json:"leafs"`
+	Thermal        config.ThermalConfig      `json:"thermal"`
+	Notifications  config.NotificationConfig `json:"notifications"`
+	Servers        []config.ServerConfig     `json:"servers"`
+	LogLevel       string                    `json:"log_level"`
+	MaxConcurrent  int                       `json:"max_concurrent_tasks"`
 }
 
 // GetConfig returns the current configuration (with sensitive paths redacted).
@@ -790,21 +878,34 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 	}
 
 	return ConfigResponse{
-		DataDir:           cfg.DataDir,
-		PublicKey:          pubKeyStr,
-		ResourceLimits:    cfg.ResourceLimits,
-		Scheduling:        cfg.Scheduling,
-		Leafs:             cfg.Leafs,
-		Thermal:           cfg.Thermal,
-		Notifications:     cfg.Notifications,
-		Servers:           cfg.Servers,
-		LogLevel:          cfg.LogLevel,
-		MaxConcurrent:     cfg.MaxConcurrentTasks,
+		DataDir:        cfg.DataDir,
+		PublicKey:      pubKeyStr,
+		ResourceLimits: cfg.ResourceLimits,
+		Scheduling:     cfg.Scheduling,
+		Leafs:          cfg.Leafs,
+		Thermal:        cfg.Thermal,
+		Notifications:  cfg.Notifications,
+		Servers:        cfg.Servers,
+		LogLevel:       cfg.LogLevel,
+		MaxConcurrent:  cfg.MaxConcurrentTasks,
 	}
 }
 
+// UpdateConfigResponse is the response for PUT /api/v1/config: the resulting
+// configuration plus whether the daemon must be restarted for part of the
+// change to take effect.
+type UpdateConfigResponse struct {
+	ConfigResponse
+	// RestartRequired is true when a head's trusted_runtimes changed. Runtime
+	// trust is applied when the daemon builds its runtime registry and
+	// advertises runtimes to each head at start-up, so a change saved here is
+	// on disk but not yet in force — exactly what `heads trust` tells the
+	// user after saving.
+	RestartRequired bool `json:"restart_required"`
+}
+
 // UpdateConfig applies a partial config update, validates, persists, and applies.
-func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, error) {
+func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigResponse, error) {
 	b.cfgMu.Lock()
 	defer b.cfgMu.Unlock()
 
@@ -852,9 +953,14 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 	if v, ok := partial["work_buffer_hours"]; ok {
 		newCfg.WorkBufferHours = toFloat(v)
 	}
+	trustChanged := false
 	if v, ok := partial["servers"]; ok {
 		if serverList, ok := v.([]any); ok {
-			applyServers(newCfg, serverList)
+			changed, err := applyServers(newCfg, serverList)
+			if err != nil {
+				return nil, err
+			}
+			trustChanged = changed
 		}
 	}
 
@@ -868,20 +974,29 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 
 	b.daemon.ApplyConfig(newCfg)
 
-	resp := b.GetConfig()
-	return &resp, nil
+	return &UpdateConfigResponse{
+		ConfigResponse:  b.GetConfig(),
+		RestartRequired: trustChanged,
+	}, nil
 }
 
 // HeadInfo describes a connected head (server) with its leaf info.
 type HeadInfo struct {
-	Name        string       `json:"name"`
-	Description string       `json:"description,omitempty"`
-	URL         string       `json:"url,omitempty"`
-	GRPCAddress string       `json:"grpc_address"`
-	Status      string       `json:"status"` // "connected", "disconnected"
-	Weight      int          `json:"weight"`
-	VolunteerID string       `json:"volunteer_id,omitempty"`
-	Leafs       []LeafDetail `json:"leafs"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url,omitempty"`
+	GRPCAddress string `json:"grpc_address"`
+	Status      string `json:"status"` // "connected", "disconnected"
+	Weight      int    `json:"weight"`
+	VolunteerID string `json:"volunteer_id,omitempty"`
+	// HeadVersion is the head's build version as it reported it at start-up
+	// (empty when unknown). UpdateRequired is true once this head has
+	// rejected this volunteer build as too old — at registration or on a
+	// work request — and stays true until a later request to the head
+	// succeeds; the remedy is `lettuce-volunteer update`.
+	HeadVersion    string       `json:"head_version"`
+	UpdateRequired bool         `json:"update_required"`
+	Leafs          []LeafDetail `json:"leafs"`
 	// LeafsRefreshedAt is when this head's leaf figures below were last fetched.
 	// The daemon refreshes the leaf cache only inside the fetch path, so their age
 	// is unbounded: a host with a full buffer, or one slot held by a long unit,
@@ -1057,11 +1172,14 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 			w = 100
 		}
 
+		hs := b.daemon.HeadStatus().Get(srv.GRPCAddress)
 		hi := HeadInfo{
-			GRPCAddress:  srv.GRPCAddress,
-			Status:       connStatus,
-			Weight:       w,
-			VolunteerID:  serverVolunteerID[name],
+			GRPCAddress:    srv.GRPCAddress,
+			Status:         connStatus,
+			Weight:         w,
+			VolunteerID:    serverVolunteerID[name],
+			HeadVersion:    hs.HeadVersion,
+			UpdateRequired: hs.UpdateRequired,
 		}
 
 		// Fill from cache if available.
@@ -1586,9 +1704,16 @@ func applyNotifications(n *config.NotificationConfig, m map[string]any) {
 	}
 }
 
-// applyServers merges incoming server updates into the config.
-// Matches by server name; only updates weight and leaf_preferences.
-func applyServers(cfg *config.Config, serverList []any) {
+// applyServers merges incoming server updates into the config. Entries are
+// matched by server name; weight, leaf_preferences and trusted_runtimes are
+// updated when present and left untouched when absent — so a PUT that does
+// not mention trust can never revert an on-disk `heads trust <head> none`
+// (PB-28). trusted_runtimes, when present, REPLACES the head's trust with
+// exactly the validated list (widening or narrowing alike: the client's
+// consent step decided). It reports whether any head's trust actually
+// changed, which is what makes a restart necessary; an invalid trust token
+// fails the whole update before anything is saved.
+func applyServers(cfg *config.Config, serverList []any) (trustChanged bool, err error) {
 	for _, item := range serverList {
 		sm, ok := item.(map[string]any)
 		if !ok {
@@ -1610,9 +1735,32 @@ func applyServers(cfg *config.Config, serverList []any) {
 					applyLeafPreferences(&cfg.Servers[i].LeafPreferences, lp)
 				}
 			}
+			if v, ok := sm["trusted_runtimes"]; ok {
+				arr, ok := v.([]any)
+				if !ok {
+					return false, fmt.Errorf("servers[%q].trusted_runtimes must be a list of runtime names", name)
+				}
+				raw := make([]string, 0, len(arr))
+				for _, item := range arr {
+					s, ok := item.(string)
+					if !ok {
+						return false, fmt.Errorf("servers[%q].trusted_runtimes must contain only runtime names, got %v", name, item)
+					}
+					raw = append(raw, s)
+				}
+				trusted, perr := parseTrustedRuntimes(raw)
+				if perr != nil {
+					return false, fmt.Errorf("servers[%q].%w", name, perr)
+				}
+				if !trustedRuntimesEqual(cfg.Servers[i].TrustedRuntimes, trusted) {
+					trustChanged = true
+				}
+				cfg.Servers[i].TrustedRuntimes = trusted
+			}
 			break
 		}
 	}
+	return trustChanged, nil
 }
 
 func applyLeafPreferences(lp *config.LeafPreferences, m map[string]any) {
@@ -1694,16 +1842,16 @@ func toStringSlice(arr []any) []string {
 
 // ContainerRuntimeStatusResponse is the response for GET /api/v1/container-runtime.
 type ContainerRuntimeStatusResponse struct {
-	Backend        string  `json:"backend"`
-	Status         string  `json:"status"`
-	Version        string  `json:"version"`
-	SocketPath     string  `json:"socket_path"`
-	MachineRequired bool   `json:"machine_required"`
-	MachineName    string  `json:"machine_name"`
-	MachineCPUs    int     `json:"machine_cpus"`
-	MachineMemoryMB int   `json:"machine_memory_mb"`
-	MachineDiskGB  int     `json:"machine_disk_gb"`
-	Error          *string `json:"error"`
+	Backend         string  `json:"backend"`
+	Status          string  `json:"status"`
+	Version         string  `json:"version"`
+	SocketPath      string  `json:"socket_path"`
+	MachineRequired bool    `json:"machine_required"`
+	MachineName     string  `json:"machine_name"`
+	MachineCPUs     int     `json:"machine_cpus"`
+	MachineMemoryMB int     `json:"machine_memory_mb"`
+	MachineDiskGB   int     `json:"machine_disk_gb"`
+	Error           *string `json:"error"`
 }
 
 // GetContainerRuntimeStatus returns the current container runtime state.
