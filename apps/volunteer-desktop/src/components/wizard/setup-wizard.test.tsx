@@ -276,7 +276,8 @@ describe("SetupWizard", () => {
       await goToConnect(user);
       await testConnection(user);
 
-      expect(screen.getByText("Science Server")).toBeInTheDocument();
+      // The head's name is also named in the trust consent wording below the preview.
+      expect(screen.getByText("Science Server", { selector: "div" })).toBeInTheDocument();
       expect(screen.getByText("A compute server for science")).toBeInTheDocument();
       // Only ACTIVE leafs are offered; research areas are joined for display.
       expect(screen.getByText("Prime Study")).toBeInTheDocument();
@@ -450,11 +451,11 @@ describe("SetupWizard", () => {
       await goToConnect(user);
       await testConnection(user);
 
-      const container = screen.getByRole("checkbox", { name: "Allow container tasks" });
+      const container = screen.getByRole("checkbox", { name: "Allow container tasks from this head" });
       expect(container).not.toBeChecked();
       expect(container).toBeDisabled();
       expect(
-        screen.getByText("No Docker/Podman detected — container tasks are not available.")
+        screen.getByText(/No Docker or Podman answered in the previous step, so container tasks cannot be offered/)
       ).toBeInTheDocument();
     });
 
@@ -465,11 +466,11 @@ describe("SetupWizard", () => {
       await goToConnect(user);
       await testConnection(user);
 
-      const container = screen.getByRole("checkbox", { name: "Allow container tasks" });
+      const container = screen.getByRole("checkbox", { name: "Allow container tasks from this head" });
       expect(container).toBeChecked();
       expect(container).toBeEnabled();
-      expect(screen.getByRole("checkbox", { name: "Allow native tasks" })).not.toBeChecked();
-      expect(screen.queryByText(/No Docker\/Podman detected/)).not.toBeInTheDocument();
+      expect(screen.getByRole("checkbox", { name: "Allow native tasks from this head" })).not.toBeChecked();
+      expect(screen.queryByText(/No Docker or Podman answered/)).not.toBeInTheDocument();
     });
 
     it("shows the native warning in plain language", async () => {
@@ -481,7 +482,7 @@ describe("SetupWizard", () => {
 
       expect(
         screen.getByText(
-          /runs directly on this machine with no sandbox\. It can read your files — including your identity key — and use your network\. Allow this only for an operator you fully trust\./
+          /runs a program directly on this machine with no sandbox\. It can read your files, including your identity key, and use your network\. Allow this only for an operator you fully trust\./
         )
       ).toBeInTheDocument();
     });
@@ -506,7 +507,7 @@ describe("SetupWizard", () => {
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
       await testConnection(user);
-      await user.click(screen.getByRole("checkbox", { name: "Allow native tasks" }));
+      await user.click(screen.getByRole("checkbox", { name: "Allow native tasks from this head" }));
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
@@ -520,7 +521,7 @@ describe("SetupWizard", () => {
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
       await testConnection(user);
-      await user.click(screen.getByRole("checkbox", { name: "Allow container tasks" }));
+      await user.click(screen.getByRole("checkbox", { name: "Allow container tasks from this head" }));
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
@@ -535,7 +536,7 @@ describe("SetupWizard", () => {
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
       await testConnection(user);
-      await user.click(screen.getByRole("checkbox", { name: "Allow native tasks" }));
+      await user.click(screen.getByRole("checkbox", { name: "Allow native tasks from this head" }));
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({ trust: ["native"] }));

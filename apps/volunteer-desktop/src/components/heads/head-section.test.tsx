@@ -401,7 +401,7 @@ describe("HeadSection", () => {
     const native = screen.getByLabelText("Allow native tasks from this head");
     expect(container).toBeChecked();
     expect(native).not.toBeChecked();
-    expect(screen.getByText(/Enable it only for an operator you fully trust/)).toBeInTheDocument();
+    expect(screen.getByText(/Allow this only for an operator you fully trust/)).toBeInTheDocument();
 
     await user.click(native);
     await user.click(screen.getByText("Save trust settings"));

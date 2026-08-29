@@ -14,6 +14,7 @@ import {
   type WizardScheduleMode,
 } from "@/lib/schedule-mode";
 import lettuceLeaf from "@/assets/lettuce-leaf.png";
+import { RuntimeTrustFields } from "@/components/heads/runtime-trust-fields";
 import type { HeadPreview, ContainerRuntimeDetection, PodmanPrerequisites } from "@/api/client";
 import {
   checkPodmanPrerequisites,
@@ -60,6 +61,14 @@ const maxCpuCores = navigator.hardwareConcurrency || 4;
 const FALLBACK_TOTAL_MEMORY_MB = 8192;
 
 const SKIP_CONTAINER_LABEL = "Skip — WASM and native only";
+
+/**
+ * Why the Connect step cannot offer container trust: the Container Runtime
+ * step just probed this machine and no engine answered (or the step was
+ * skipped). Trust can be widened later from the Projects page.
+ */
+const WIZARD_CONTAINER_UNAVAILABLE_NOTE =
+  "No Docker or Podman answered in the previous step, so container tasks cannot be offered. Once an engine is running you can allow them from the Projects page.";
 
 const HOURS = Array.from({ length: 24 }, (_, h) => h);
 
@@ -991,71 +1000,24 @@ function ConnectStep({
         </Card>
       )}
 
-      {/* Runtime-trust consent: what this head may run here beyond WASM. */}
+      {/* Runtime-trust consent: what this head may run here beyond WASM. The
+          same block the Projects page uses; the wizard only adds a heading
+          and explains why container tasks are missing when its own probe in
+          the previous step found no engine. */}
       {state.connectionOk && (
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-base">What may this head run on your machine?</CardTitle>
-            <CardDescription>
-              A head is a trust domain: attaching to it means trusting its operator to run code on
-              this computer. Choose how far that trust goes. You can change it later.
-            </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4 text-sm">
-            <div className="space-y-1">
-              <label
-                className={cn(
-                  "flex items-start gap-2",
-                  state.containerRuntimeDetected ? "cursor-pointer" : "cursor-not-allowed opacity-70"
-                )}
-              >
-                <input
-                  type="checkbox"
-                  aria-label="Allow container tasks"
-                  checked={state.trustContainer && state.containerRuntimeDetected}
-                  disabled={!state.containerRuntimeDetected}
-                  onChange={(e) => onChange({ trustContainer: e.target.checked })}
-                  className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
-                />
-                <span>
-                  <span className="font-medium">Container tasks</span>
-                  <span className="block text-muted-foreground">
-                    Run isolated inside Docker or Podman.
-                  </span>
-                </span>
-              </label>
-              {!state.containerRuntimeDetected && (
-                <p className="pl-6 text-xs text-muted-foreground">
-                  No Docker/Podman detected — container tasks are not available.
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-1">
-              <label className="flex cursor-pointer items-start gap-2">
-                <input
-                  type="checkbox"
-                  aria-label="Allow native tasks"
-                  checked={state.trustNative}
-                  onChange={(e) => onChange({ trustNative: e.target.checked })}
-                  className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
-                />
-                <span>
-                  <span className="font-medium">Native tasks</span>
-                  <span className="block text-muted-foreground">Run directly on this computer.</span>
-                </span>
-              </label>
-              <p className="pl-6 text-xs text-destructive">
-                A native program runs directly on this machine with no sandbox. It can read your
-                files — including your identity key — and use your network. Allow this only for an
-                operator you fully trust.
-              </p>
-            </div>
-
-            <p className="text-xs text-muted-foreground">
-              WASM tasks are always allowed (sandboxed): they cannot touch anything outside their own
-              work folder.
-            </p>
+          <CardContent>
+            <RuntimeTrustFields
+              headName={state.headPreview?.name || state.serverUrl.trim()}
+              value={{ container: state.trustContainer, native: state.trustNative }}
+              onChange={(next) => onChange({ trustContainer: next.container, trustNative: next.native })}
+              containerAvailable={state.containerRuntimeDetected}
+              containerUnavailableNote={WIZARD_CONTAINER_UNAVAILABLE_NOTE}
+              disabled={isSubmitting}
+            />
           </CardContent>
         </Card>
       )}
