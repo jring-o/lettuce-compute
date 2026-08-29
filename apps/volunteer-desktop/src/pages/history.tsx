@@ -180,7 +180,7 @@ function SkeletonRow() {
 
 function CreditBreakdown({ credit }: { credit: CreditSummary }) {
   if (credit.by_head && credit.by_head.length > 0) {
-    const totalHead = credit.by_head.reduce((s, h) => s + h.credit, 0);
+    const totalHead = credit.by_head.reduce((s, h) => s + h.total_credit, 0);
     return (
       <Card>
         <CardHeader className="pb-3">
@@ -188,35 +188,23 @@ function CreditBreakdown({ credit }: { credit: CreditSummary }) {
         </CardHeader>
         <CardContent className="space-y-3">
           {credit.by_head.map((head) => {
-            const headPct = totalHead > 0 ? (head.credit / totalHead) * 100 : 0;
+            const headPct = totalHead > 0 ? (head.total_credit / totalHead) * 100 : 0;
             return (
               <div key={head.head_name} className="space-y-2">
                 <div className="flex justify-between text-xs">
                   <span className="font-medium">{head.head_name}</span>
                   <span className="text-muted-foreground">
-                    {formatCredit(head.credit)} ({Math.round(headPct)}%)
+                    {head.available
+                      ? `${formatCredit(head.total_credit)} (${Math.round(headPct)}%)`
+                      : "unavailable"}
                   </span>
                 </div>
-                {head.leafs.map((leaf) => {
-                  const leafPct =
-                    head.credit > 0 ? (leaf.credit / head.credit) * 100 : 0;
-                  return (
-                    <div key={leaf.leaf_slug} className="space-y-1 pl-3">
-                      <div className="flex justify-between text-xs">
-                        <span className="truncate">{leaf.leaf_name}</span>
-                        <span className="text-muted-foreground shrink-0 ml-2">
-                          {formatCredit(leaf.credit)}
-                        </span>
-                      </div>
-                      <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-primary rounded-full transition-all"
-                          style={{ width: `${leafPct}%` }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
+                <div className="h-1.5 bg-secondary rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-primary rounded-full transition-all"
+                    style={{ width: `${headPct}%` }}
+                  />
+                </div>
               </div>
             );
           })}

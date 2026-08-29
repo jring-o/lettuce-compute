@@ -17,6 +17,7 @@ export function makeTask(
     runtime_type: "native",
     process_id: 1234,
     work_dir: "/tmp/wu",
+    viz_bundle_path: null,
     ...overrides,
   };
 }

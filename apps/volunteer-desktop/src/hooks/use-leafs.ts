@@ -35,7 +35,7 @@ export function useAvailableLeafs(params: SearchParams): {
       return;
     }
     fetch();
-  }, [fetch, clientError, params.query, params.server_address]);
+  }, [fetch, clientError, params.query, params.research_area]);
 
   return { leafs, isLoading, error };
 }

@@ -27,7 +27,8 @@ export function applyTaskFilters(
         case "suspended":
           return t.task_status.startsWith("suspended");
         case "error":
-          return t.task_status === "error";
+          // The daemon never reports an "error" status today; kept for the filter option.
+          return (t.task_status as string) === "error";
         default:
           return true;
       }
@@ -44,7 +45,7 @@ export function applyTaskFilters(
           leaf_name: qt.leaf_name,
           progress_pct: 0,
           elapsed_seconds: 0,
-          estimated_remaining_seconds: null,
+          estimated_remaining_seconds: undefined,
           work_dir: "",
           viz_bundle_path: null,
           checkpoint_sequence: 0,

@@ -7,61 +7,49 @@ import {
   setupContainerRuntime,
   startContainerRuntime,
   stopContainerRuntime,
+  getSystemMetrics,
+  getClientVersion,
+  restartDaemon,
 } from "./client";
 
-// The invoke mock is set up via the alias in vitest.config.ts
+// `invoke` is the mock in src/__mocks__/@tauri-apps/api/core.ts (aliased in
+// vitest.config.ts). Every management-API call must arrive as
+// invoke("mgmt_request", { method, path, body }); no browser fetch is used.
 
-// Mock global fetch
-const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch);
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText: status === 200 ? "OK" : "Error",
-    json: () => Promise.resolve(body),
-    headers: new Headers(),
-    redirected: false,
-    type: "basic",
-    url: "",
-    clone: () => ({} as Response),
-    body: null,
-    bodyUsed: false,
-    arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
-    blob: () => Promise.resolve(new Blob()),
-    formData: () => Promise.resolve(new FormData()),
-    text: () => Promise.resolve(""),
-  } as Response;
+interface MgmtArgs {
+  method: string;
+  path: string;
+  body: unknown;
 }
 
-function noContentResponse(): Response {
-  return {
-    ok: true,
-    status: 204,
-    statusText: "No Content",
-    json: () => Promise.reject(new Error("No body")),
-    headers: new Headers(),
-    redirected: false,
-    type: "basic",
-    url: "",
-    clone: () => ({} as Response),
-    body: null,
-    bodyUsed: false,
-    arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
-    blob: () => Promise.resolve(new Blob()),
-    formData: () => Promise.resolve(new FormData()),
-    text: () => Promise.resolve(""),
-  } as Response;
+/** Arguments of the n-th `mgmt_request` invoke (default: the last one). */
+function mgmtCall(index?: number): MgmtArgs {
+  const calls = vi
+    .mocked(invoke)
+    .mock.calls.filter(([cmd]) => cmd === "mgmt_request");
+  const call = calls[index ?? calls.length - 1];
+  if (!call) throw new Error("no mgmt_request invoke recorded");
+  return call[1] as MgmtArgs;
+}
+
+/** Make the next `mgmt_request` invoke resolve with `value`. */
+function respond(value: unknown) {
+  vi.mocked(invoke).mockResolvedValueOnce(value);
+}
+
+/** Make the next `mgmt_request` invoke reject the way the Rust command does. */
+function fail(err: unknown) {
+  vi.mocked(invoke).mockRejectedValueOnce(err);
 }
 
 describe("ManagementClient", () => {
   let client: ManagementClient;
 
   beforeEach(async () => {
-    vi.mocked(invoke).mockResolvedValue({ port: 9876, token: "test-token-abc" });
-    mockFetch.mockReset();
+    vi.mocked(invoke).mockReset();
+    vi.mocked(invoke).mockResolvedValue(undefined);
     client = await ManagementClient.create();
+    vi.mocked(invoke).mockClear();
   });
 
   afterEach(() => {
@@ -69,357 +57,391 @@ describe("ManagementClient", () => {
   });
 
   describe("create", () => {
-    it("calls invoke with get_daemon_info", async () => {
-      expect(invoke).toHaveBeenCalledWith("get_daemon_info");
+    it("probes GET /api/v1/status through mgmt_request", async () => {
+      vi.mocked(invoke).mockReset();
+      vi.mocked(invoke).mockResolvedValue({ state: "active" });
+      await ManagementClient.create();
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(invoke).toHaveBeenCalledWith("mgmt_request", {
+        method: "GET",
+        path: "/api/v1/status",
+        body: null,
+      });
     });
 
-    it("configures base URL from port", async () => {
-      // Verify by making a request and checking the URL
-      mockFetch.mockResolvedValue(jsonResponse({ state: "active" }));
-      await client.status();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/status",
-        expect.any(Object)
-      );
+    it("rejects with DAEMON_UNREACHABLE while the daemon is not up", async () => {
+      vi.mocked(invoke).mockReset();
+      vi.mocked(invoke).mockRejectedValue({
+        code: "DAEMON_UNREACHABLE",
+        message: "Failed to read daemon.json",
+        status: 0,
+      });
+      await expect(ManagementClient.create()).rejects.toMatchObject({
+        name: "ApiError",
+        code: "DAEMON_UNREACHABLE",
+        status: 0,
+      });
     });
-  });
 
-  describe("auth headers", () => {
-    it("sends Bearer token in Authorization header", async () => {
-      mockFetch.mockResolvedValue(jsonResponse({ state: "active" }));
+    it("never calls browser fetch", async () => {
+      const fetchSpy = vi.fn();
+      vi.stubGlobal("fetch", fetchSpy);
+      respond({ state: "active" });
       await client.status();
-      const [, opts] = mockFetch.mock.calls[0];
-      expect(opts.headers.Authorization).toBe("Bearer test-token-abc");
-      expect(opts.headers["Content-Type"]).toBe("application/json");
+      expect(fetchSpy).not.toHaveBeenCalled();
+      vi.unstubAllGlobals();
     });
   });
 
   describe("status", () => {
-    it("sends GET to /api/v1/status", async () => {
-      const body = {
-        state: "active",
+    it("sends GET /api/v1/status and normalises list fields", async () => {
+      respond({
+        state: "paused",
         uptime_seconds: 3600,
         connected_servers: 2,
-        active_tasks: [],
-        paused_reason: null,
-      };
-      mockFetch.mockResolvedValue(jsonResponse(body));
+        active_tasks: null,
+        queued_tasks: undefined,
+        paused_reason: "scheduled",
+        failing_leafs: [{ leaf_id: "l1", leaf_name: "L", consecutive_failures: 1, total_failures: 1, paused: false }],
+      });
       const result = await client.status();
-      expect(result).toEqual(body);
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/status",
-        expect.objectContaining({ method: "GET" })
-      );
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/status", body: null });
+      expect(result.state).toBe("paused");
+      expect(result.paused_reason).toBe("scheduled");
+      expect(result.active_tasks).toEqual([]);
+      expect(result.queued_tasks).toEqual([]);
+      expect(result.failing_leafs).toHaveLength(1);
     });
   });
 
-  describe("pause", () => {
-    it("sends POST to /api/v1/daemon/pause", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
-      await client.pause();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/daemon/pause",
-        expect.objectContaining({ method: "POST" })
-      );
+  describe("pause / resume", () => {
+    it("sends POST /api/v1/daemon/pause with no body", async () => {
+      respond({ state: "paused" });
+      const result = await client.pause();
+      expect(result).toBeUndefined();
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/daemon/pause", body: null });
     });
-  });
 
-  describe("resume", () => {
-    it("sends POST to /api/v1/daemon/resume", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+    it("sends POST /api/v1/daemon/resume", async () => {
+      respond({ state: "active" });
       await client.resume();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/daemon/resume",
-        expect.objectContaining({ method: "POST" })
-      );
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/daemon/resume", body: null });
     });
   });
 
   describe("metrics", () => {
-    it("sends GET to /api/v1/metrics", async () => {
+    it("sends GET /api/v1/metrics and returns the current shape", async () => {
       const body = {
-        cpu_usage_pct: 45.2,
+        cpu_usage_pct: 0,
         gpu_usage_pct: 0,
-        memory_used_mb: 8192,
-        memory_total_mb: 16384,
-        disk_used_gb: 100,
-        disk_total_gb: 500,
-        cpu_temp_c: 65,
+        memory_used_mb: 0,
+        memory_total_mb: 0,
+        cpu_temp_c: 0,
         gpu_temp_c: 0,
+        disk_used_mb: 2048,
+        disk_allowance_mb: 10240,
+        disk_usage_known: true,
       };
-      mockFetch.mockResolvedValue(jsonResponse(body));
+      respond(body);
       const result = await client.metrics();
       expect(result).toEqual(body);
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/metrics", body: null });
     });
   });
 
-  describe("attachHead", () => {
-    it("sends POST with body to /api/v1/leafs/attach", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
-      const req = { server_address: "grpc://example.com:50051", leaf_id: "leaf-1" };
+  describe("notices", () => {
+    it("sends GET /api/v1/notices without since", async () => {
+      respond({ notices: [], latest_id: 0 });
+      const result = await client.notices();
+      expect(mgmtCall().path).toBe("/api/v1/notices");
+      expect(result).toEqual({ notices: [], latest_id: 0 });
+    });
+
+    it("passes since as a query parameter and normalises a null list", async () => {
+      respond({ notices: null, latest_id: 7 });
+      const result = await client.notices(7);
+      expect(mgmtCall().path).toBe("/api/v1/notices?since=7");
+      expect(result).toEqual({ notices: [], latest_id: 7 });
+    });
+  });
+
+  describe("attachHead / detachHead", () => {
+    it("sends POST /api/v1/leafs/attach with the request body", async () => {
+      respond({ status: "attached" });
+      const req = {
+        server_address: "grpc://example.com:50051",
+        leaf_id: "leaf-1",
+        trusted_runtimes: ["CONTAINER"],
+      };
       await client.attachHead(req);
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/leafs/attach");
-      expect(opts.method).toBe("POST");
-      expect(JSON.parse(opts.body)).toEqual(req);
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/leafs/attach", body: req });
     });
-  });
 
-  describe("detachHead", () => {
-    it("sends POST with body to /api/v1/leafs/detach", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+    it("sends POST /api/v1/leafs/detach with the request body", async () => {
+      respond({ status: "detached" });
       const req = { server_name: "my-server" };
       await client.detachHead(req);
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/leafs/detach");
-      expect(opts.method).toBe("POST");
-      expect(JSON.parse(opts.body)).toEqual(req);
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/leafs/detach", body: req });
     });
   });
 
-  describe("availableLeafs", () => {
-    it("sends GET to /api/v1/leafs/available without params", async () => {
-      mockFetch.mockResolvedValue(jsonResponse({ leafs: [] }));
-      await client.availableLeafs();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/leafs/available",
-        expect.any(Object)
-      );
+  describe("leaf listings", () => {
+    it("attachedLeafs sends GET /api/v1/leafs and unwraps", async () => {
+      const rows = [
+        {
+          server_name: "lettuce.science",
+          server_address: "lettuce.science:443",
+          leaf_id: "leaf-1",
+          status: "connected",
+          credit_earned: 3,
+          work_units_completed: 3,
+        },
+      ];
+      respond({ leafs: rows });
+      expect(await client.attachedLeafs()).toEqual(rows);
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/leafs", body: null });
     });
 
-    it("appends query params when provided", async () => {
-      mockFetch.mockResolvedValue(jsonResponse({ leafs: [] }));
-      await client.availableLeafs({ query: "climate", server_address: "grpc://s.com:50051" });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("/api/v1/leafs/available?");
-      expect(url).toContain("search=climate");
-      expect(url).toContain("server_address=");
+    it("availableLeafs sends GET /api/v1/leafs/browse without params", async () => {
+      respond({ leafs: null });
+      expect(await client.availableLeafs()).toEqual([]);
+      expect(mgmtCall().path).toBe("/api/v1/leafs/browse");
+    });
+
+    it("availableLeafs encodes search and research_area", async () => {
+      respond({ leafs: [] });
+      await client.availableLeafs({ query: "climate", research_area: "earth" });
+      const { path } = mgmtCall();
+      expect(path).toContain("/api/v1/leafs/browse?");
+      expect(path).toContain("search=climate");
+      expect(path).toContain("research_area=earth");
+    });
+
+    it("catalogLeafs sends GET /api/v1/leafs/available and normalises research_area", async () => {
+      respond({ leafs: [{ id: "l1", slug: "prime", name: "Prime" }] });
+      const result = await client.catalogLeafs();
+      expect(mgmtCall().path).toBe("/api/v1/leafs/available");
+      expect(result[0].research_area).toEqual([]);
     });
   });
 
   describe("history", () => {
-    it("sends GET to /api/v1/history without params", async () => {
+    it("sends GET /api/v1/history without params", async () => {
       const body = { entries: [], pagination: { next_cursor: "", has_more: false } };
-      mockFetch.mockResolvedValue(jsonResponse(body));
-      await client.history();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/history",
-        expect.any(Object)
-      );
+      respond(body);
+      expect(await client.history()).toEqual(body);
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/history", body: null });
     });
 
     it("appends cursor and limit params", async () => {
-      const body = { entries: [], pagination: { next_cursor: "", has_more: false } };
-      mockFetch.mockResolvedValue(jsonResponse(body));
+      respond({ entries: [], pagination: { next_cursor: "", has_more: false } });
       await client.history({ cursor: "abc123", limit: 25 });
-      const [url] = mockFetch.mock.calls[0];
-      expect(url).toContain("cursor=abc123");
-      expect(url).toContain("limit=25");
+      const { path } = mgmtCall();
+      expect(path).toContain("/api/v1/history?");
+      expect(path).toContain("cursor=abc123");
+      expect(path).toContain("limit=25");
     });
   });
 
   describe("config", () => {
-    it("sends GET to /api/v1/config", async () => {
-      const body = { data_dir: "/tmp", servers: [] };
-      mockFetch.mockResolvedValue(jsonResponse(body));
-      await client.config();
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/config",
-        expect.objectContaining({ method: "GET" })
-      );
+    it("sends GET /api/v1/config and normalises trusted_runtimes", async () => {
+      respond({
+        data_dir: "/tmp",
+        servers: [
+          { grpc_address: "a:443", name: "a", leaf_preferences: { mode: "ALL" }, trusted_runtimes: null },
+          { grpc_address: "b:443", name: "b", leaf_preferences: { mode: "ALL" }, trusted_runtimes: ["CONTAINER"] },
+        ],
+      });
+      const result = await client.config();
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/config", body: null });
+      expect(result.servers[0].trusted_runtimes).toEqual([]);
+      expect(result.servers[1].trusted_runtimes).toEqual(["CONTAINER"]);
     });
-  });
 
-  describe("updateConfig", () => {
-    it("sends PUT with body to /api/v1/config", async () => {
-      const partial = { log_level: "debug" };
-      const returned = { data_dir: "/tmp", log_level: "debug", servers: [] };
-      mockFetch.mockResolvedValue(jsonResponse(returned));
+    it("sends PUT /api/v1/config with the partial body", async () => {
+      const partial = { log_level: "debug", work_buffer_hours: 3 };
+      respond({ status: "ok", restart_required: false });
       const result = await client.updateConfig(partial);
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/config");
-      expect(opts.method).toBe("PUT");
-      expect(JSON.parse(opts.body)).toEqual(partial);
-      expect(result).toEqual(returned);
+      expect(mgmtCall()).toEqual({ method: "PUT", path: "/api/v1/config", body: partial });
+      expect(result).toEqual({ status: "ok", restart_required: false });
     });
   });
 
   describe("credit", () => {
-    it("sends GET to /api/v1/credit", async () => {
-      const body = { total_credit: 1000, today: 50, this_week: 200, this_month: 800, by_leaf: [] };
-      mockFetch.mockResolvedValue(jsonResponse(body));
+    it("sends GET /api/v1/credit and keeps decimal figures", async () => {
+      const body = {
+        total_credit: 1234.5,
+        today: 12.25,
+        this_week: 100,
+        this_month: 800.75,
+        by_leaf: [{ leaf_id: "p1", leaf_name: "Primes", credit: 1234.5 }],
+        by_head: [{ head_name: "lettuce.science", volunteer_id: "v1", total_credit: 1234.5, available: true }],
+        source: "head",
+      };
+      respond(body);
+      expect(await client.credit()).toEqual(body);
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/credit", body: null });
+    });
+
+    it("normalises null by_leaf and by_head", async () => {
+      respond({ total_credit: 0, today: 0, this_week: 0, this_month: 0, by_leaf: null, by_head: null, source: "local" });
       const result = await client.credit();
-      expect(result).toEqual(body);
+      expect(result.by_leaf).toEqual([]);
+      expect(result.by_head).toEqual([]);
     });
   });
 
   describe("heads", () => {
-    it("sends GET to /api/v1/heads and unwraps response", async () => {
-      const headsData = [
-        {
-          name: "lettuce.science",
-          description: "Open science",
-          url: "https://lettuce.science",
-          grpc_address: "lettuce.science:443",
-          status: "connected",
-          weight: 70,
-          leafs: [
-            {
-              id: "leaf-1",
-              slug: "prime",
-              name: "Prime Study",
-              description: "Primes",
-              research_area: "math",
-              task_pattern: "PARAMETER_SWEEP",
-              state: "ACTIVE",
-              queued_work_units: 100,
-              active_volunteers: 5,
-              enabled: true,
-              effective_weight: 50,
-            },
-          ],
-        },
-      ];
-      mockFetch.mockResolvedValue(jsonResponse({ heads: headsData }));
+    const leaf = {
+      id: "leaf-1",
+      slug: "prime",
+      name: "Prime Study",
+      description: "Primes",
+      task_pattern: "PARAMETER_SWEEP",
+      state: "ACTIVE",
+      queued_work_units: 100,
+      active_volunteers: 5,
+      active_hosts: 7,
+      enabled: true,
+      effective_weight: 50,
+      resource_requirements: { min_disk_mb: 2048, gpu_required: false },
+      disk_gate: { blocked: false },
+    };
+    const head = {
+      name: "lettuce.science",
+      description: "Open science",
+      url: "https://lettuce.science",
+      grpc_address: "lettuce.science:443",
+      status: "connected",
+      weight: 70,
+      leafs_refreshed_at: "2026-08-29T10:00:00Z",
+      leafs: [{ ...leaf, research_area: ["math"] }, { ...leaf, id: "leaf-2", slug: "two" }],
+    };
+    const machine = {
+      runtimes: ["container", "wasm"],
+      has_gpu: false,
+      max_memory_mb: 4096,
+      max_disk_mb: 10240,
+      max_cpu_cores: 4,
+      max_gpu_vram_mb: 0,
+      gpu_card_vram_mb: 0,
+      gpu_vram_pct: 50,
+      gpu_vendors: null,
+      gpu_compute_capabilities: null,
+    };
+
+    it("headsAndMachine sends GET /api/v1/heads and normalises arrays", async () => {
+      respond({ heads: [head], machine });
+      const result = await client.headsAndMachine();
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/heads", body: null });
+      expect(result.heads[0].leafs[0].research_area).toEqual(["math"]);
+      expect(result.heads[0].leafs[1].research_area).toEqual([]);
+      expect(result.heads[0].leafs_refreshed_at).toBe("2026-08-29T10:00:00Z");
+      expect(result.machine.runtimes).toEqual(["container", "wasm"]);
+      expect(result.machine.gpu_vendors).toEqual([]);
+      expect(result.machine.gpu_compute_capabilities).toEqual([]);
+      expect(result.machine.max_disk_mb).toBe(10240);
+    });
+
+    it("heads returns only the head list", async () => {
+      respond({ heads: [head], machine });
       const result = await client.heads();
-      expect(result).toEqual(headsData);
-      expect(mockFetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:9876/api/v1/heads",
-        expect.objectContaining({ method: "GET" })
-      );
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe("lettuce.science");
+    });
+
+    it("tolerates a missing machine block", async () => {
+      respond({ heads: null });
+      const result = await client.headsAndMachine();
+      expect(result.heads).toEqual([]);
+      expect(result.machine.runtimes).toEqual([]);
+      expect(result.machine.has_gpu).toBe(false);
     });
   });
 
   describe("signChallenge", () => {
-    it("sends POST to /api/v1/identity/sign with challenge hex", async () => {
-      const body = { public_key: "ed25519-pub-key", signature: "sig-hex" };
-      mockFetch.mockResolvedValue(jsonResponse(body));
+    it("sends POST /api/v1/identity/sign with challenge hex", async () => {
+      const body = { public_key: "ed25519-pub-key", signature: "sig" };
+      respond(body);
       const result = await client.signChallenge("deadbeef");
       expect(result).toEqual(body);
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/identity/sign");
-      expect(opts.method).toBe("POST");
-      expect(JSON.parse(opts.body)).toEqual({ challenge_hex: "deadbeef" });
+      expect(mgmtCall()).toEqual({
+        method: "POST",
+        path: "/api/v1/identity/sign",
+        body: { challenge_hex: "deadbeef" },
+      });
     });
   });
 
   describe("error handling", () => {
-    it("throws ApiError with code and message on structured error response", async () => {
-      mockFetch.mockResolvedValue(
-        jsonResponse(
-          { error: { code: "NOT_FOUND", message: "Resource not found" } },
-          404
-        )
-      );
-      await expect(client.status()).rejects.toThrow(ApiError);
-      try {
-        await client.status();
-      } catch (err) {
-        expect(err).toBeInstanceOf(ApiError);
-        expect((err as ApiError).code).toBe("NOT_FOUND");
-        expect((err as ApiError).message).toBe("Resource not found");
-      }
+    it("maps the Rust error object to ApiError with code, message and status", async () => {
+      fail({ code: "NOT_FOUND", message: "Resource not found", status: 404 });
+      const err = await client.status().catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe("NOT_FOUND");
+      expect(err.message).toBe("Resource not found");
+      expect(err.status).toBe(404);
     });
 
-    it("throws ApiError with UNKNOWN code when response is not JSON", async () => {
-      const resp = {
-        ok: false,
-        status: 500,
-        statusText: "Internal Server Error",
-        json: () => Promise.reject(new Error("not json")),
-        headers: new Headers(),
-        redirected: false,
-        type: "basic" as ResponseType,
-        url: "",
-        clone: () => ({} as Response),
-        body: null,
-        bodyUsed: false,
-        arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
-        blob: () => Promise.resolve(new Blob()),
-        formData: () => Promise.resolve(new FormData()),
-        text: () => Promise.resolve(""),
-      } as Response;
-      mockFetch.mockResolvedValue(resp);
-      await expect(client.status()).rejects.toThrow(ApiError);
-      try {
-        await client.status();
-      } catch (err) {
-        expect((err as ApiError).code).toBe("UNKNOWN");
-        expect((err as ApiError).message).toContain("500");
-      }
+    it("maps a transport failure to DAEMON_UNREACHABLE", async () => {
+      fail({ code: "DAEMON_UNREACHABLE", message: "connection refused", status: 0 });
+      await expect(client.metrics()).rejects.toMatchObject({
+        code: "DAEMON_UNREACHABLE",
+        status: 0,
+      });
+    });
+
+    it("wraps a plain string rejection as UNKNOWN", async () => {
+      fail("something odd");
+      const err = await client.status().catch((e) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe("UNKNOWN");
+      expect(err.message).toBe("something odd");
+      expect(err.status).toBe(0);
+    });
+
+    it("passes an ApiError through unchanged", async () => {
+      fail(new ApiError("CONFLICT", "already paused", 409));
+      const err = await client.pause().catch((e) => e);
+      expect(err.code).toBe("CONFLICT");
+      expect(err.status).toBe(409);
     });
   });
 
-  describe("no body on 204", () => {
-    it("returns undefined for 204 responses", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+  describe("empty responses", () => {
+    it("returns undefined when the Rust side yields null (204)", async () => {
+      respond(null);
       const result = await client.pause();
       expect(result).toBeUndefined();
     });
   });
 
-  // --- S102: Task management methods ---
-
-  describe("suspendTask", () => {
-    it("sends POST to /api/v1/tasks/:id/suspend", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
-      await client.suspendTask("wu-abc-123");
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/tasks/wu-abc-123/suspend");
-      expect(opts.method).toBe("POST");
-    });
-
-    it("returns undefined on success", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+  describe("task management", () => {
+    it("suspendTask sends POST /api/v1/tasks/:id/suspend", async () => {
+      respond({ status: "suspended" });
       const result = await client.suspendTask("wu-abc-123");
       expect(result).toBeUndefined();
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/tasks/wu-abc-123/suspend", body: null });
     });
-  });
 
-  describe("resumeTask", () => {
-    it("sends POST to /api/v1/tasks/:id/resume", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+    it("resumeTask sends POST /api/v1/tasks/:id/resume", async () => {
+      respond({ status: "resumed" });
       await client.resumeTask("wu-def-456");
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/tasks/wu-def-456/resume");
-      expect(opts.method).toBe("POST");
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/tasks/wu-def-456/resume", body: null });
     });
 
-    it("returns undefined on success", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
-      const result = await client.resumeTask("wu-def-456");
-      expect(result).toBeUndefined();
-    });
-  });
-
-  describe("abortTask", () => {
-    it("sends POST to /api/v1/tasks/:id/abort", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
+    it("abortTask sends POST /api/v1/tasks/:id/abort", async () => {
+      respond({ status: "aborted" });
       await client.abortTask("wu-ghi-789");
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/tasks/wu-ghi-789/abort");
-      expect(opts.method).toBe("POST");
+      expect(mgmtCall()).toEqual({ method: "POST", path: "/api/v1/tasks/wu-ghi-789/abort", body: null });
     });
 
-    it("returns undefined on success", async () => {
-      mockFetch.mockResolvedValue(noContentResponse());
-      const result = await client.abortTask("wu-ghi-789");
-      expect(result).toBeUndefined();
-    });
-
-    it("throws ApiError on 404", async () => {
-      mockFetch.mockResolvedValue(
-        jsonResponse(
-          { error: { code: "NOT_FOUND", message: "Task not found" } },
-          404
-        )
-      );
+    it("abortTask throws ApiError on 404", async () => {
+      fail({ code: "NOT_FOUND", message: "Task not found", status: 404 });
       await expect(client.abortTask("wu-missing")).rejects.toThrow(ApiError);
     });
-  });
 
-  describe("taskDetails", () => {
-    it("sends GET to /api/v1/tasks/:id/details", async () => {
+    it("taskDetails sends GET /api/v1/tasks/:id/details", async () => {
       const detail = {
         work_unit_id: "wu-detail-001",
         leaf_name: "Climate Model",
@@ -430,9 +452,10 @@ describe("ManagementClient", () => {
         status_reason: null,
         deadline_seconds: 86400,
         head_name: "lettuce.science",
-        runtime_type: "native",
-        process_id: 12345,
+        runtime_type: "container",
+        process_id: null,
         work_dir: "/tmp/wu-detail-001",
+        viz_bundle_path: null,
         memory_rss_mb: 512,
         virtual_memory_mb: 1024,
         cpu_usage_pct: 98.5,
@@ -441,48 +464,57 @@ describe("ManagementClient", () => {
         time_since_checkpoint_seconds: 120,
         estimated_completion_at: "2026-03-29T12:00:00Z",
         progress_rate_pct_per_hour: 2.5,
-        fraction_done: 0.55,
-        container_image: null,
-      };
-      mockFetch.mockResolvedValue(jsonResponse(detail));
-      const result = await client.taskDetails("wu-detail-001");
-      expect(result).toEqual(detail);
-      const [url, opts] = mockFetch.mock.calls[0];
-      expect(url).toBe("http://127.0.0.1:9876/api/v1/tasks/wu-detail-001/details");
-      expect(opts.method).toBe("GET");
-    });
-
-    it("returns TaskDetail with container_image for container tasks", async () => {
-      const detail = {
-        work_unit_id: "wu-container-001",
-        leaf_name: "Docker Task",
-        progress_pct: 30,
-        elapsed_seconds: 500,
-        cpu_seconds: 480,
-        task_status: "running",
-        status_reason: null,
-        deadline_seconds: 43200,
-        head_name: "compute.example.com",
-        runtime_type: "container",
-        process_id: null,
-        work_dir: "/tmp/wu-container-001",
-        memory_rss_mb: 256,
-        virtual_memory_mb: 512,
-        cpu_usage_pct: 45.0,
-        disk_read_mb: 2,
-        disk_written_mb: 1,
-        time_since_checkpoint_seconds: null,
-        estimated_completion_at: null,
-        progress_rate_pct_per_hour: null,
-        fraction_done: 0.30,
+        fraction_done: 55,
         container_image: "ghcr.io/research/climate:latest",
       };
-      mockFetch.mockResolvedValue(jsonResponse(detail));
-      const result = await client.taskDetails("wu-container-001");
-      expect(result.container_image).toBe("ghcr.io/research/climate:latest");
-      expect(result.runtime_type).toBe("container");
-      expect(result.process_id).toBeNull();
+      respond(detail);
+      const result = await client.taskDetails("wu-detail-001");
+      expect(result).toEqual(detail);
+      expect(mgmtCall()).toEqual({ method: "GET", path: "/api/v1/tasks/wu-detail-001/details", body: null });
     });
+  });
+
+  describe("results", () => {
+    it("results sends GET /api/v1/results and normalises a null list", async () => {
+      respond({ results: null });
+      expect(await client.results()).toEqual({ results: [] });
+      expect(mgmtCall().path).toBe("/api/v1/results");
+    });
+
+    it("resultData sends GET /api/v1/results/:id", async () => {
+      respond({ answer: 42 });
+      expect(await client.resultData("wu-1")).toEqual({ answer: 42 });
+      expect(mgmtCall().path).toBe("/api/v1/results/wu-1");
+    });
+  });
+});
+
+describe("Host-side command wrappers", () => {
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("getSystemMetrics invokes system_metrics", async () => {
+    const metrics = { cpu_usage_pct: 12.5, memory_used_mb: 4096, memory_total_mb: 16384 };
+    vi.mocked(invoke).mockResolvedValue(metrics);
+    expect(await getSystemMetrics()).toEqual(metrics);
+    expect(invoke).toHaveBeenCalledWith("system_metrics");
+  });
+
+  it("getClientVersion invokes get_client_version", async () => {
+    vi.mocked(invoke).mockResolvedValue("1.4.0");
+    expect(await getClientVersion()).toBe("1.4.0");
+    expect(invoke).toHaveBeenCalledWith("get_client_version");
+  });
+
+  it("restartDaemon invokes restart_daemon", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await restartDaemon();
+    expect(invoke).toHaveBeenCalledWith("restart_daemon");
   });
 });
 

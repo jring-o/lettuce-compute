@@ -176,9 +176,16 @@ function Toggle({
   );
 }
 
+/** Daemon default for `work_buffer_hours` (hours of work buffered per running task). */
+const DEFAULT_WORK_BUFFER_HOURS = 2;
+
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
   const { metrics } = useMetrics(5000);
+  // GET /api/v1/config does not return work_buffer_hours (it is write-only on
+  // the daemon side), so the slider shows the last value set in this session,
+  // starting from the daemon default.
+  const [workBufferHours, setWorkBufferHours] = useState(DEFAULT_WORK_BUFFER_HOURS);
 
   const { client } = useClient();
 
@@ -361,8 +368,8 @@ export function SettingsPage() {
           step={1}
           displayValue={`${config.resource_limits.max_disk_gb} GB`}
           usagePct={
-            metrics && metrics.disk_total_gb > 0
-              ? (metrics.disk_used_gb / metrics.disk_total_gb) * 100
+            metrics && metrics.disk_usage_known && metrics.disk_allowance_mb > 0
+              ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
               : undefined
           }
           onChange={(v) =>
@@ -414,15 +421,18 @@ export function SettingsPage() {
 
         <ResourceSlider
           label="Work Buffer"
-          value={config.work_buffer_size || config.max_concurrent_tasks + 2}
-          min={1}
-          max={Math.max(20, totalCores * 3)}
-          step={1}
-          displayValue={`${config.work_buffer_size || config.max_concurrent_tasks + 2} tasks queued`}
-          onChange={(v) => updateConfig({ work_buffer_size: v })}
+          value={workBufferHours}
+          min={0.5}
+          max={12}
+          step={0.5}
+          displayValue={`${workBufferHours} h of work per task`}
+          onChange={(v) => {
+            setWorkBufferHours(v);
+            updateConfig({ work_buffer_hours: v });
+          }}
         />
         <p className="text-xs text-muted-foreground">
-          How many work units to download and keep ready. More buffer means less idle time if the server is slow.
+          How many hours of work to download and keep ready for each running task. More buffer means less idle time if the server is slow.
         </p>
       </Section>
 

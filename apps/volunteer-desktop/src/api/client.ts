@@ -1,37 +1,68 @@
 import { invoke } from "@tauri-apps/api/core";
 
-interface DaemonConnection {
-  port: number;
-  token: string;
-}
+/**
+ * Client for the volunteer daemon's local management API.
+ *
+ * Every call is relayed through the Rust host process (the `mgmt_request`
+ * Tauri command). The daemon accepts only loopback Host headers and sets no
+ * CORS headers, so a browser `fetch` from this web view is refused at the
+ * preflight, while the Rust process reaches it directly. The Rust side reads
+ * `~/.lettuce/daemon.json` (port and bearer token) on every call, so nothing
+ * here needs to know either, and a restarted daemon is picked up automatically.
+ *
+ * The types below mirror the daemon's response structs in
+ * `services/volunteer-cli/internal/management/daemon_bridge.go` (routes in
+ * `handlers.go`). A Go `omitempty` field is optional here; a Go pointer field
+ * without `omitempty` is `T | null`. Where the daemon may send `null` for a
+ * list, the client normalises it to `[]` so callers never branch on null.
+ */
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/status
+// ---------------------------------------------------------------------------
+
+export type DaemonState = "active" | "paused" | "stopped";
+
+/**
+ * Why the daemon is paused: "user" (pause button or CLI), "thermal" (CPU or
+ * GPU over the configured temperature), "scheduled" (outside the configured
+ * computing hours).
+ */
+export type PausedReason = "user" | "thermal" | "scheduled";
+
+/**
+ * "suspended" (without a suffix) is a task frozen while the daemon is paused
+ * for a reason it did not report; the suffixed values name the cause.
+ */
+export type TaskStatus =
+  | "running"
+  | "suspended"
+  | "suspended_user"
+  | "suspended_thermal"
+  | "suspended_scheduled";
+
+export type RuntimeType = "native" | "container" | "wasm";
 
 export interface ActiveTaskInfo {
   work_unit_id: string;
   leaf_name: string;
   progress_pct: number;
+  /** Seconds actually run under a live daemon (excludes time the daemon was stopped). */
   elapsed_seconds: number;
-  estimated_remaining_seconds?: number | null;
+  estimated_remaining_seconds?: number;
   work_dir: string;
-  viz_bundle_path?: string | null;
+  viz_bundle_path: string | null;
   checkpoint_sequence?: number;
   last_checkpoint_at?: string;
   resumed_from_checkpoint?: boolean;
   cpu_seconds: number;
-  task_status: "running" | "suspended_user" | "suspended_thermal" | "suspended_scheduled" | "error";
+  task_status: TaskStatus;
   status_reason: string | null;
+  /** Seconds left before the work unit's deadline; 0 when the unit has none. */
   deadline_seconds: number;
   head_name: string;
-  runtime_type: "native" | "container" | "wasm";
+  runtime_type: RuntimeType;
   process_id: number | null;
-}
-
-export interface StatusResponse {
-  state: "active" | "paused" | "stopped";
-  uptime_seconds: number;
-  connected_servers: number;
-  active_tasks: ActiveTaskInfo[];
-  queued_tasks: QueuedTaskInfo[];
-  paused_reason: string | null;
 }
 
 export interface QueuedTaskInfo {
@@ -42,17 +73,80 @@ export interface QueuedTaskInfo {
   server_name: string;
 }
 
+/**
+ * A leaf whose work units have failed on this machine since the daemon
+ * started. Also carried per leaf on `HeadInfo.leafs[].failures`.
+ */
+export interface FailingLeaf {
+  leaf_id: string;
+  leaf_name: string;
+  consecutive_failures: number;
+  total_failures: number;
+  last_reason?: string;
+  last_failed_at?: string;
+  /** The per-leaf breaker has stopped requesting this leaf until `paused_until`. */
+  paused: boolean;
+  paused_until?: string;
+}
+
+export interface StatusResponse {
+  state: DaemonState;
+  uptime_seconds: number;
+  connected_servers: number;
+  active_tasks: ActiveTaskInfo[];
+  queued_tasks: QueuedTaskInfo[];
+  paused_reason: PausedReason | null;
+  /** Newest failure first. Empty when nothing has failed. */
+  failing_leafs: FailingLeaf[];
+  /** Version of the running daemon (being added by the CLI; absent on older builds). */
+  client_version?: string;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * CPU, GPU, memory and temperature figures are reported as 0 by the daemon
+ * (it has no platform collector yet); use `getSystemMetrics()` for host CPU
+ * and memory. The disk figures are the fetch gate's own: `disk_used_mb` is
+ * Lettuce's measured footprint (data directory plus cached container images)
+ * and `disk_allowance_mb` the configured `max_disk_gb` it is budgeted
+ * against. When `disk_usage_known` is false, `disk_used_mb` is not a
+ * measurement and must be shown as unknown, never as 0.
+ */
 export interface MetricsResponse {
   cpu_usage_pct: number;
   gpu_usage_pct: number;
   memory_used_mb: number;
   memory_total_mb: number;
-  disk_used_gb: number;
-  disk_total_gb: number;
   cpu_temp_c: number;
   gpu_temp_c: number;
+  disk_used_mb: number;
+  disk_allowance_mb: number;
+  disk_usage_known: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Leafs: GET /api/v1/leafs, GET /api/v1/leafs/browse, GET /api/v1/leafs/available
+// ---------------------------------------------------------------------------
+
+/**
+ * One row of `GET /api/v1/leafs`: a configured head, or — when the head has
+ * explicitly pinned leaf IDs — one row per pinned leaf (`leaf_id` set).
+ */
+export interface AttachedLeaf {
+  server_name: string;
+  server_address: string;
+  leaf_id?: string;
+  leaf_name?: string;
+  status: "connected" | "disconnected";
+  /** Accepted work units on this head, from local history (one unit = one credit). */
+  credit_earned: number;
+  work_units_completed: number;
+}
+
+/** One row of `GET /api/v1/leafs/browse`: a pinned leaf on a configured head. */
 export interface AvailableLeaf {
   server_name: string;
   leaf_id: string;
@@ -61,28 +155,27 @@ export interface AvailableLeaf {
   research_area?: string;
 }
 
+/** Query parameters of `GET /api/v1/leafs/browse`. Both match case-insensitively. */
+export interface SearchParams {
+  /** Substring of the leaf name or ID (`search` on the wire). */
+  query?: string;
+  research_area?: string;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/history
+// ---------------------------------------------------------------------------
+
 export interface HistoryEntry {
   work_unit_id: string;
   leaf_name: string;
   completed_at: string;
   duration_seconds: number;
-  credit_earned: number;
-  validation_status: "accepted" | "rejected" | "pending";
   cpu_seconds: number;
+  /** Always 0 today: per-unit credit is not tracked locally. */
+  credit_earned: number;
+  validation_status: "accepted" | "rejected";
   head_name: string;
-}
-
-export interface TaskDetail extends ActiveTaskInfo {
-  memory_rss_mb: number | null;
-  virtual_memory_mb: number | null;
-  cpu_usage_pct: number | null;
-  disk_read_mb: number | null;
-  disk_written_mb: number | null;
-  time_since_checkpoint_seconds: number | null;
-  estimated_completion_at: string | null;
-  progress_rate_pct_per_hour: number | null;
-  fraction_done: number;
-  container_image: string | null;
 }
 
 export interface HistoryResponse {
@@ -93,71 +186,184 @@ export interface HistoryResponse {
   };
 }
 
+export interface HistoryParams {
+  cursor?: string;
+  /** 1–200, default 50. */
+  limit?: number;
+  leaf_id?: string;
+  /** RFC 3339. */
+  from?: string;
+  /** RFC 3339. */
+  to?: string;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/tasks/{work_unit_id}/details
+// ---------------------------------------------------------------------------
+
+export interface TaskDetail extends ActiveTaskInfo {
+  memory_rss_mb: number | null;
+  virtual_memory_mb: number | null;
+  cpu_usage_pct: number | null;
+  disk_read_mb: number | null;
+  disk_written_mb: number | null;
+  time_since_checkpoint_seconds: number | null;
+  estimated_completion_at: string | null;
+  progress_rate_pct_per_hour: number | null;
+  /** Same figure as `progress_pct` (0–100), not a 0–1 fraction. */
+  fraction_done: number;
+  container_image: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/config and PUT /api/v1/config
+// ---------------------------------------------------------------------------
+
+export interface ResourceLimits {
+  max_cpu_cores: number;
+  max_memory_mb: number;
+  max_disk_gb: number;
+  /** 0 = unlimited. */
+  max_bandwidth_mbps: number;
+  /** 0–100; 0 disables GPU tasks. */
+  max_gpu_vram_pct: number;
+  /** Max processes per container; <= 0 uses the built-in default. */
+  max_pids: number;
+}
+
+export interface ScheduleRange {
+  /** 0 = Monday … 6 = Sunday. */
+  days: number[];
+  /** 0–23. */
+  start_hour: number;
+  /** 0–23; may be less than `start_hour` for a window that wraps midnight. */
+  end_hour: number;
+}
+
+export interface Scheduling {
+  /** "ALWAYS", "WHEN_IDLE" or "SCHEDULED". */
+  mode: string;
+  idle_threshold_mins: number;
+  cron_expression?: string;
+  /** SCHEDULED mode: active windows. Take precedence over `cron_expression`. */
+  schedule_ranges?: ScheduleRange[];
+}
+
+export interface LeafFilter {
+  /** "ALL", "SPECIFIC" or "BLOCKLIST". */
+  mode: string;
+  leaf_ids?: string[];
+  blocked_ids?: string[];
+}
+
+export interface ThermalConfig {
+  enabled: boolean;
+  cpu_pause_threshold: number;
+  cpu_resume_threshold: number;
+  gpu_pause_threshold: number;
+  gpu_resume_threshold: number;
+  poll_interval_seconds: number;
+  /** Longest single throttle in minutes; 0 = default (30), negative = unbounded. */
+  max_throttle_minutes: number;
+}
+
+export interface NotificationConfig {
+  credit_milestones: boolean;
+  credit_milestone_threshold: number;
+  work_unit_completed: boolean;
+  errors: boolean;
+  updates: boolean;
+}
+
+export interface LeafPreferences {
+  /** "ALL" (head defaults), "SPECIFIC" (only `enabled`) or "BLOCKLIST" (all but `disabled`). */
+  mode: "ALL" | "SPECIFIC" | "BLOCKLIST";
+  /** Leaf slug -> weight override. */
+  weights?: Record<string, number>;
+  /** Leaf slugs, SPECIFIC mode. */
+  enabled?: string[];
+  /** Leaf slugs, BLOCKLIST mode. */
+  disabled?: string[];
+}
+
+/** One configured head, as stored in config.yaml. */
+export interface ServerConfig {
+  grpc_address: string;
+  http_address?: string;
+  /** Leaf IDs explicitly attached on this head (fetched by ID even if unlisted). */
+  pinned_leaf_ids?: string[];
+  name: string;
+  insecure?: boolean;
+  ca_cert?: string;
+  cert?: string;
+  key?: string;
+  /** Head-level share of this machine's work; absent = 100. */
+  weight?: number;
+  leaf_preferences: LeafPreferences;
+  /**
+   * Runtimes this head is trusted to run here, uppercase ("CONTAINER",
+   * "NATIVE"). Always present; `[]` means WASM only (WASM is always allowed).
+   */
+  trusted_runtimes: string[];
+}
+
 export interface ConfigResponse {
   data_dir: string;
   public_key?: string;
-  resource_limits: {
-    max_cpu_cores: number;
-    max_memory_mb: number;
-    max_disk_gb: number;
-    max_bandwidth_mbps: number;
-    max_gpu_vram_pct: number;
-  };
-  scheduling: {
-    mode: string;
-    idle_threshold_mins: number;
-    cron_expression: string;
-    schedule_ranges?: ScheduleRange[];
-  };
-  leafs: {
-    mode: string;
-    leaf_ids: string[];
-    blocked_ids: string[];
-  };
-  thermal: {
-    enabled: boolean;
-    cpu_pause_threshold: number;
-    cpu_resume_threshold: number;
-    gpu_pause_threshold: number;
-    gpu_resume_threshold: number;
-    poll_interval_seconds: number;
-  };
-  notifications: {
-    credit_milestones: boolean;
-    credit_milestone_threshold: number;
-    work_unit_completed: boolean;
-    errors: boolean;
-    updates: boolean;
-  };
-  servers: Array<{
-    grpc_address: string;
-    http_address: string;
-    leaf_id: string;
-    name: string;
-    insecure: boolean;
-    weight: number;
-    leaf_preferences: LeafPreferences;
-  }>;
+  resource_limits: ResourceLimits;
+  scheduling: Scheduling;
+  leafs: LeafFilter;
+  thermal: ThermalConfig;
+  notifications: NotificationConfig;
+  servers: ServerConfig[];
   log_level: string;
   max_concurrent_tasks: number;
-  work_buffer_size: number;
-  available_runtimes: string[];
 }
 
-export interface HeadInfo {
+/** Per-head fields `PUT /api/v1/config` merges, matched by `name`. */
+export interface ServerConfigUpdate {
   name: string;
-  description: string;
-  url: string;
-  grpc_address: string;
-  status: "connected" | "disconnected";
-  weight: number;
-  volunteer_id?: string;
-  leafs: LeafInfo[];
+  weight?: number;
+  leaf_preferences?: LeafPreferences;
+  /** Uppercase runtime names; being added by the CLI alongside the GET field. */
+  trusted_runtimes?: string[];
 }
+
+/**
+ * Body of `PUT /api/v1/config`: a partial update. Only the listed keys are
+ * applied; anything else is ignored. Note that `work_buffer_hours` is
+ * write-only today — `GET /api/v1/config` does not return it.
+ */
+export interface ConfigUpdate {
+  resource_limits?: Partial<ResourceLimits>;
+  scheduling?: Partial<Scheduling>;
+  thermal?: Partial<ThermalConfig>;
+  notifications?: Partial<NotificationConfig>;
+  leafs?: Partial<LeafFilter>;
+  log_level?: string;
+  max_concurrent_tasks?: number;
+  /** Hours of work to keep buffered per concurrent task (daemon default 2). */
+  work_buffer_hours?: number;
+  servers?: ServerConfigUpdate[];
+}
+
+/**
+ * Response of `PUT /api/v1/config`. The current daemon echoes the full config;
+ * the CLI is adding these two fields so the app can tell when a change
+ * (for example runtime trust) needs `restartDaemon()` to take effect.
+ */
+export interface ConfigUpdateResponse {
+  status?: string;
+  restart_required?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/heads (and GET /api/v1/leafs/available, which returns LeafInfo[])
+// ---------------------------------------------------------------------------
 
 export interface ExecutionSpec {
-  image?: string;
   binaries?: Record<string, string>;
+  image?: string;
   gpu_required?: boolean;
   gpu_type?: string;
   max_memory_mb?: number;
@@ -165,59 +371,148 @@ export interface ExecutionSpec {
   network_access?: boolean;
 }
 
+/**
+ * What the head requires of this machine before it dispatches this leaf's
+ * work. Compare against `MachineCapabilities`. Absent from heads too old to
+ * report it.
+ */
+export interface LeafResourceRequirements {
+  min_disk_mb?: number;
+  min_cpu_cores?: number;
+  /** Compared against the machine's ALLOWED VRAM (`max_gpu_vram_mb`), not the card size. */
+  min_gpu_vram_mb?: number;
+  gpu_type?: string;
+  gpu_compute_capability?: string;
+  /** A GPU is required when this OR `execution_spec.gpu_required` is set. */
+  gpu_required?: boolean;
+}
+
+/**
+ * The running daemon's live verdict on whether its fetcher is skipping this
+ * leaf for disk reasons, and the `max_disk_gb` that would clear it.
+ */
+export interface LeafDiskGate {
+  blocked: boolean;
+  reason?: string;
+  raise_to_gb?: number;
+}
+
 export interface LeafInfo {
   id: string;
   slug: string;
   name: string;
-  description: string;
-  research_area: string;
+  description?: string;
+  /** Normalised: `[]` when the head reports none. */
+  research_area: string[];
   task_pattern: string;
   state: string;
   queued_work_units: number;
   active_volunteers: number;
+  active_hosts: number;
+  /** Whether this machine's leaf preferences allow the leaf. */
   enabled: boolean;
   effective_weight: number;
   execution_spec?: ExecutionSpec;
+  resource_requirements?: LeafResourceRequirements;
+  /** Present only when the leaf has failed on this machine. */
+  failures?: FailingLeaf;
+  disk_gate?: LeafDiskGate;
 }
 
-export interface LeafPreferences {
-  mode: "ALL" | "SPECIFIC" | "BLOCKLIST";
-  weights?: Record<string, number>;
-  enabled?: string[];
-  disabled?: string[];
+export interface HeadInfo {
+  name: string;
+  description?: string;
+  url?: string;
+  grpc_address: string;
+  status: "connected" | "disconnected";
+  weight: number;
+  volunteer_id?: string;
+  leafs: LeafInfo[];
+  /**
+   * When the leaf figures were last fetched (RFC 3339). Absent when nothing
+   * has been cached yet — show as unknown, never as "now".
+   */
+  leafs_refreshed_at?: string;
+  /** Head software version (being added by the CLI). */
+  head_version?: string;
+  /** The head requires a newer volunteer client (being added by the CLI). */
+  update_required?: boolean;
 }
 
+/** This machine's capabilities as the RUNNING daemon sees them. Arrays are normalised to `[]`. */
+export interface MachineCapabilities {
+  /** Runtime kinds the daemon registered, lowercase (e.g. ["container","wasm"]). */
+  runtimes: string[];
+  has_gpu: boolean;
+  max_memory_mb: number;
+  /** `max_disk_gb` as advertised to heads, in MB. */
+  max_disk_mb: number;
+  max_cpu_cores: number;
+  /** ALLOWED VRAM: card size × `max_gpu_vram_pct` / 100 — the figure dispatch compares against. */
+  max_gpu_vram_mb: number;
+  gpu_card_vram_mb: number;
+  gpu_vram_pct: number;
+  /** Uppercase, e.g. "NVIDIA". */
+  gpu_vendors: string[];
+  gpu_compute_capabilities: string[];
+}
+
+export interface HeadsResponse {
+  heads: HeadInfo[];
+  machine: MachineCapabilities;
+}
+
+/** Shape of the head's public `GET /api/v1/head` as returned by the `fetch_head_info` command. */
 export interface HeadPreview {
   name: string;
   description: string;
   leafs: Array<{ slug: string; name: string; research_area: string }>;
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/credit
+// ---------------------------------------------------------------------------
+
+export interface LeafCredit {
+  leaf_id: string;
+  leaf_name: string;
+  credit: number;
+}
+
+export interface HeadCredit {
+  head_name: string;
+  volunteer_id: string;
+  total_credit: number;
+  /** False when the head was unreachable or too old to report credit. */
+  available: boolean;
+}
+
+/**
+ * Credit for the volunteer ACCOUNT, summed over all of its machines. Numbers
+ * are decimals. `source` is "head" when at least one head answered
+ * (authoritative) or "local" when derived from local history because no head
+ * could be reached (one accepted unit counted as one credit).
+ */
 export interface CreditSummary {
   total_credit: number;
   today: number;
   this_week: number;
   this_month: number;
-  by_leaf: Array<{
-    leaf_id: string;
-    leaf_name: string;
-    credit: number;
-  }>;
-  by_head?: Array<{
-    head_name: string;
-    credit: number;
-    leafs: Array<{
-      leaf_slug: string;
-      leaf_name: string;
-      credit: number;
-    }>;
-  }>;
+  by_leaf: LeafCredit[];
+  by_head: HeadCredit[];
+  source: "head" | "local";
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/leafs/attach and /detach
+// ---------------------------------------------------------------------------
 
 export interface AttachRequest {
   server_address: string;
   leaf_id?: string;
   name?: string;
+  /** Uppercase runtime names to trust the head with (being added by the CLI; omitted = WASM only). */
+  trusted_runtimes?: string[];
 }
 
 export interface DetachRequest {
@@ -225,24 +520,9 @@ export interface DetachRequest {
   server_address?: string;
 }
 
-export interface SearchParams {
-  query?: string;
-  server_address?: string;
-}
-
-export interface ScheduleRange {
-  days: number[];
-  start_hour: number;
-  end_hour: number;
-}
-
-export interface HistoryParams {
-  cursor?: string;
-  limit?: number;
-  leaf_id?: string;
-  from?: string;
-  to?: string;
-}
+// ---------------------------------------------------------------------------
+// GET /api/v1/results
+// ---------------------------------------------------------------------------
 
 export interface ResultEntry {
   work_unit_id: string;
@@ -258,10 +538,42 @@ export interface ResultsResponse {
   results: ResultEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/v1/identity/sign
+// ---------------------------------------------------------------------------
+
 export interface SignChallengeResponse {
   public_key: string;
   signature: string;
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/notices?since=<id> (being added by the CLI)
+// ---------------------------------------------------------------------------
+
+export type NoticeLevel = "info" | "warn" | "error";
+
+export interface Notice {
+  id: number;
+  level: NoticeLevel;
+  code: string;
+  message: string;
+  head?: string;
+  leaf?: string;
+  /** Times this notice repeated; `first_at` is the first occurrence, `at` the latest. */
+  count: number;
+  first_at: string;
+  at: string;
+}
+
+export interface NoticesResponse {
+  notices: Notice[];
+  latest_id: number;
+}
+
+// ---------------------------------------------------------------------------
+// Container runtime (dedicated Rust commands, used before the daemon exists)
+// ---------------------------------------------------------------------------
 
 export interface ContainerRuntimeStatus {
   backend: "podman" | "docker" | "none";
@@ -334,6 +646,10 @@ export async function installPodman(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Host-side commands (Rust, no daemon involved)
+// ---------------------------------------------------------------------------
+
 /**
  * Total physical system memory in MB, read from the OS by the Rust backend.
  * Used by the setup wizard to size the memory slider to real hardware.
@@ -343,109 +659,275 @@ export async function getSystemMemoryMb(): Promise<number> {
   return invoke("get_system_memory_mb");
 }
 
-interface ApiErrorBody {
-  error: {
-    code: string;
-    message: string;
-  };
+/** Host CPU and memory usage measured by the app itself (the daemon reports zeros). */
+export interface SystemMetrics {
+  cpu_usage_pct: number;
+  memory_used_mb: number;
+  memory_total_mb: number;
 }
 
+export async function getSystemMetrics(): Promise<SystemMetrics> {
+  return invoke("system_metrics");
+}
+
+/**
+ * Stop the daemon (gracefully, forced after 30 s) and start a fresh one.
+ * Resolves once the new daemon has written daemon.json; may take up to about
+ * a minute. Callers should re-run their queries afterwards.
+ */
+export async function restartDaemon(): Promise<void> {
+  await invoke("restart_daemon");
+}
+
+/** Version of the bundled `lettuce-volunteer` CLI (`--version`). */
+export async function getClientVersion(): Promise<string> {
+  return invoke("get_client_version");
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/**
+ * A failed management-API call. `code` is the daemon's own error code
+ * (`VALIDATION_ERROR`, `NOT_FOUND`, `CONFLICT`, `INTERNAL_ERROR`, ...),
+ * `UNKNOWN` when the response carried no parseable error envelope, or
+ * `DAEMON_UNREACHABLE` when no request reached the daemon (not running,
+ * still starting, or timed out). `status` is the HTTP status, 0 when there
+ * was no response.
+ */
 export class ApiError extends Error {
   code: string;
+  status: number;
 
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, status: number = 0) {
     super(message);
     this.code = code;
+    this.status = status;
     this.name = "ApiError";
   }
 }
 
+/** Shape of the rejection value the `mgmt_request` command produces. */
+interface MgmtErrorShape {
+  code: string;
+  message: string;
+  status?: number;
+}
+
+function isMgmtError(err: unknown): err is MgmtErrorShape {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    typeof (err as MgmtErrorShape).code === "string" &&
+    typeof (err as MgmtErrorShape).message === "string"
+  );
+}
+
+function toApiError(err: unknown): ApiError {
+  if (err instanceof ApiError) return err;
+  if (isMgmtError(err)) {
+    return new ApiError(
+      err.code,
+      err.message,
+      typeof err.status === "number" ? err.status : 0
+    );
+  }
+  return new ApiError("UNKNOWN", typeof err === "string" ? err : String(err));
+}
+
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+function withQuery(path: string, query: URLSearchParams): string {
+  const qs = query.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
+function list<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/** `LeafInfo` as the daemon sends it: `research_area` may be absent. */
+type RawLeafInfo = Omit<LeafInfo, "research_area"> & {
+  research_area?: string[] | null;
+};
+
+type RawHeadInfo = Omit<HeadInfo, "leafs"> & { leafs?: RawLeafInfo[] | null };
+
+type RawMachineCapabilities = Omit<
+  MachineCapabilities,
+  "runtimes" | "gpu_vendors" | "gpu_compute_capabilities"
+> & {
+  runtimes?: string[] | null;
+  gpu_vendors?: string[] | null;
+  gpu_compute_capabilities?: string[] | null;
+};
+
+interface RawHeadsResponse {
+  heads?: RawHeadInfo[] | null;
+  machine?: RawMachineCapabilities | null;
+}
+
+function normaliseLeaf(leaf: RawLeafInfo): LeafInfo {
+  return { ...leaf, research_area: list(leaf.research_area) };
+}
+
+function normaliseHead(head: RawHeadInfo): HeadInfo {
+  return { ...head, leafs: list(head.leafs).map(normaliseLeaf) };
+}
+
+function normaliseMachine(
+  machine: RawMachineCapabilities | null | undefined
+): MachineCapabilities {
+  const m = machine ?? ({} as RawMachineCapabilities);
+  return {
+    runtimes: list(m.runtimes),
+    has_gpu: m.has_gpu ?? false,
+    max_memory_mb: m.max_memory_mb ?? 0,
+    max_disk_mb: m.max_disk_mb ?? 0,
+    max_cpu_cores: m.max_cpu_cores ?? 0,
+    max_gpu_vram_mb: m.max_gpu_vram_mb ?? 0,
+    gpu_card_vram_mb: m.gpu_card_vram_mb ?? 0,
+    gpu_vram_pct: m.gpu_vram_pct ?? 0,
+    gpu_vendors: list(m.gpu_vendors),
+    gpu_compute_capabilities: list(m.gpu_compute_capabilities),
+  };
+}
+
+type RawServerConfig = Omit<ServerConfig, "trusted_runtimes"> & {
+  trusted_runtimes?: string[] | null;
+};
+
+type RawConfigResponse = Omit<ConfigResponse, "servers"> & {
+  servers?: RawServerConfig[] | null;
+};
+
 export class ManagementClient {
-  private baseUrl: string;
-  private token: string;
+  private constructor() {}
 
-  private constructor(port: number, token: string) {
-    this.baseUrl = `http://127.0.0.1:${port}`;
-    this.token = token;
-  }
-
+  /**
+   * Resolves once the daemon answers. Rejects with `ApiError`
+   * (`DAEMON_UNREACHABLE`) while the daemon is not running or still starting,
+   * so `useClient` keeps retrying until it is up.
+   */
   static async create(): Promise<ManagementClient> {
-    const conn = await invoke<DaemonConnection>("get_daemon_info");
-    return new ManagementClient(conn.port, conn.token);
+    const client = new ManagementClient();
+    await client.request("GET", "/api/v1/status");
+    return client;
   }
 
+  /**
+   * Relay one request through the Rust host. A 204 / empty response resolves
+   * to `undefined`; any failure rejects with `ApiError`.
+   */
   private async request<T>(
-    method: string,
+    method: HttpMethod,
     path: string,
     body?: unknown
   ): Promise<T> {
-    const resp = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-
-    if (!resp.ok) {
-      let errBody: ApiErrorBody;
-      try {
-        errBody = await resp.json();
-      } catch {
-        throw new ApiError("UNKNOWN", `HTTP ${resp.status}: ${resp.statusText}`);
-      }
-      throw new ApiError(errBody.error.code, errBody.error.message);
+    let result: unknown;
+    try {
+      result = await invoke<unknown>("mgmt_request", {
+        method,
+        path,
+        body: body ?? null,
+      });
+    } catch (err) {
+      throw toApiError(err);
     }
-
-    if (resp.status === 204) {
-      return undefined as T;
-    }
-
-    return resp.json();
+    return (result === null ? undefined : result) as T;
   }
 
+  // --- daemon ---
+
   async status(): Promise<StatusResponse> {
-    return this.request("GET", "/api/v1/status");
+    const resp = await this.request<StatusResponse>("GET", "/api/v1/status");
+    return {
+      ...resp,
+      active_tasks: list(resp.active_tasks),
+      queued_tasks: list(resp.queued_tasks),
+      failing_leafs: list(resp.failing_leafs),
+    };
   }
 
   async pause(): Promise<void> {
-    return this.request("POST", "/api/v1/daemon/pause");
+    await this.request("POST", "/api/v1/daemon/pause");
   }
 
   async resume(): Promise<void> {
-    return this.request("POST", "/api/v1/daemon/resume");
+    await this.request("POST", "/api/v1/daemon/resume");
   }
 
   async metrics(): Promise<MetricsResponse> {
     return this.request("GET", "/api/v1/metrics");
   }
 
+  /** Notices newer than `since` (omit for all retained notices). */
+  async notices(since?: number): Promise<NoticesResponse> {
+    const query = new URLSearchParams();
+    if (since !== undefined) query.set("since", String(since));
+    const resp = await this.request<NoticesResponse>(
+      "GET",
+      withQuery("/api/v1/notices", query)
+    );
+    return { notices: list(resp.notices), latest_id: resp.latest_id ?? 0 };
+  }
+
+  // --- heads and leafs ---
+
+  /** Configured heads with their leafs, plus this machine's capabilities. */
+  async headsAndMachine(): Promise<HeadsResponse> {
+    const resp = await this.request<RawHeadsResponse>("GET", "/api/v1/heads");
+    return {
+      heads: list(resp.heads).map(normaliseHead),
+      machine: normaliseMachine(resp.machine),
+    };
+  }
+
+  /** The `heads` half of `headsAndMachine()`. */
   async heads(): Promise<HeadInfo[]> {
-    const resp = await this.request<{ heads: HeadInfo[] }>("GET", "/api/v1/heads");
-    return resp.heads;
+    return (await this.headsAndMachine()).heads;
   }
 
   async attachHead(req: AttachRequest): Promise<void> {
-    return this.request("POST", "/api/v1/leafs/attach", req);
+    await this.request("POST", "/api/v1/leafs/attach", req);
   }
 
   async detachHead(req: DetachRequest): Promise<void> {
-    return this.request("POST", "/api/v1/leafs/detach", req);
+    await this.request("POST", "/api/v1/leafs/detach", req);
   }
 
+  /** `GET /api/v1/leafs`: one row per configured head, or per pinned leaf. */
+  async attachedLeafs(): Promise<AttachedLeaf[]> {
+    const resp = await this.request<{ leafs: AttachedLeaf[] | null }>(
+      "GET",
+      "/api/v1/leafs"
+    );
+    return list(resp.leafs);
+  }
+
+  /** `GET /api/v1/leafs/browse`: pinned leafs across heads, filtered by `params`. */
   async availableLeafs(params?: SearchParams): Promise<AvailableLeaf[]> {
     const query = new URLSearchParams();
     if (params?.query) query.set("search", params.query);
-    if (params?.server_address)
-      query.set("server_address", params.server_address);
-    const qs = query.toString();
-    const resp = await this.request<{ leafs: AvailableLeaf[] }>(
+    if (params?.research_area) query.set("research_area", params.research_area);
+    const resp = await this.request<{ leafs: AvailableLeaf[] | null }>(
       "GET",
-      `/api/v1/leafs/available${qs ? `?${qs}` : ""}`
+      withQuery("/api/v1/leafs/browse", query)
     );
-    return resp.leafs;
+    return list(resp.leafs);
   }
+
+  /** `GET /api/v1/leafs/available`: every leaf of every configured head (same rows as `heads()[].leafs`). */
+  async catalogLeafs(): Promise<LeafInfo[]> {
+    const resp = await this.request<{ leafs: RawLeafInfo[] | null }>(
+      "GET",
+      "/api/v1/leafs/available"
+    );
+    return list(resp.leafs).map(normaliseLeaf);
+  }
+
+  // --- history, credit, results ---
 
   async history(params?: HistoryParams): Promise<HistoryResponse> {
     const query = new URLSearchParams();
@@ -454,21 +936,45 @@ export class ManagementClient {
     if (params?.leaf_id) query.set("leaf_id", params.leaf_id);
     if (params?.from) query.set("from", params.from);
     if (params?.to) query.set("to", params.to);
-    const qs = query.toString();
-    return this.request("GET", `/api/v1/history${qs ? `?${qs}` : ""}`);
-  }
-
-  async config(): Promise<ConfigResponse> {
-    return this.request("GET", "/api/v1/config");
-  }
-
-  async updateConfig(partial: Partial<ConfigResponse>): Promise<ConfigResponse> {
-    return this.request("PUT", "/api/v1/config", partial);
+    const resp = await this.request<HistoryResponse>(
+      "GET",
+      withQuery("/api/v1/history", query)
+    );
+    return { ...resp, entries: list(resp.entries) };
   }
 
   async credit(): Promise<CreditSummary> {
-    return this.request("GET", "/api/v1/credit");
+    const resp = await this.request<CreditSummary>("GET", "/api/v1/credit");
+    return { ...resp, by_leaf: list(resp.by_leaf), by_head: list(resp.by_head) };
   }
+
+  async results(): Promise<ResultsResponse> {
+    const resp = await this.request<ResultsResponse>("GET", "/api/v1/results");
+    return { results: list(resp.results) };
+  }
+
+  async resultData(workUnitId: string): Promise<Record<string, unknown>> {
+    return this.request("GET", `/api/v1/results/${workUnitId}`);
+  }
+
+  // --- config ---
+
+  async config(): Promise<ConfigResponse> {
+    const resp = await this.request<RawConfigResponse>("GET", "/api/v1/config");
+    return {
+      ...resp,
+      servers: list(resp.servers).map((s) => ({
+        ...s,
+        trusted_runtimes: list(s.trusted_runtimes),
+      })),
+    };
+  }
+
+  async updateConfig(partial: ConfigUpdate): Promise<ConfigUpdateResponse> {
+    return this.request("PUT", "/api/v1/config", partial);
+  }
+
+  // --- identity ---
 
   async signChallenge(challengeHex: string): Promise<SignChallengeResponse> {
     return this.request("POST", "/api/v1/identity/sign", {
@@ -476,27 +982,21 @@ export class ManagementClient {
     });
   }
 
+  // --- tasks ---
+
   async suspendTask(workUnitId: string): Promise<void> {
-    return this.request("POST", `/api/v1/tasks/${workUnitId}/suspend`);
+    await this.request("POST", `/api/v1/tasks/${workUnitId}/suspend`);
   }
 
   async resumeTask(workUnitId: string): Promise<void> {
-    return this.request("POST", `/api/v1/tasks/${workUnitId}/resume`);
+    await this.request("POST", `/api/v1/tasks/${workUnitId}/resume`);
   }
 
   async abortTask(workUnitId: string): Promise<void> {
-    return this.request("POST", `/api/v1/tasks/${workUnitId}/abort`);
+    await this.request("POST", `/api/v1/tasks/${workUnitId}/abort`);
   }
 
   async taskDetails(workUnitId: string): Promise<TaskDetail> {
     return this.request("GET", `/api/v1/tasks/${workUnitId}/details`);
-  }
-
-  async results(): Promise<ResultsResponse> {
-    return this.request("GET", "/api/v1/results");
-  }
-
-  async resultData(workUnitId: string): Promise<Record<string, unknown>> {
-    return this.request("GET", `/api/v1/results/${workUnitId}`);
   }
 }

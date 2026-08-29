@@ -211,18 +211,18 @@ function CreditBreakdownSection({ credit }: { credit: CreditSummary }) {
               <div className="flex justify-between text-xs">
                 <span className="font-medium">{head.head_name}</span>
                 <span className="text-muted-foreground">
-                  {formatCredit(head.credit)}
+                  {head.available ? formatCredit(head.total_credit) : "unavailable"}
                 </span>
               </div>
-              {head.leafs.map((leaf) => (
-                <div
-                  key={leaf.leaf_slug}
-                  className="flex justify-between text-xs pl-3 text-muted-foreground"
-                >
-                  <span>{leaf.leaf_name}</span>
-                  <span>{formatCredit(leaf.credit)}</span>
-                </div>
-              ))}
+            </div>
+          ))}
+          {credit.by_leaf.map((leaf) => (
+            <div
+              key={leaf.leaf_id}
+              className="flex justify-between text-xs pl-3 text-muted-foreground"
+            >
+              <span>{leaf.leaf_name}</span>
+              <span>{formatCredit(leaf.credit)}</span>
             </div>
           ))}
         </div>
@@ -273,9 +273,7 @@ export function OverviewPage() {
 
   const leafCount = useMemo(() => {
     if (!credit) return 0;
-    return credit.by_head
-      ? credit.by_head.reduce((s, h) => s + h.leafs.length, 0)
-      : credit.by_leaf.length;
+    return credit.by_leaf.length;
   }, [credit]);
 
   const filteredTasks = useMemo(
@@ -483,11 +481,15 @@ export function OverviewPage() {
             <ResourceGauge
               label="Disk"
               value={
-                metrics.disk_total_gb > 0
-                  ? (metrics.disk_used_gb / metrics.disk_total_gb) * 100
+                metrics.disk_usage_known && metrics.disk_allowance_mb > 0
+                  ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
                   : 0
               }
-              displayValue={`${metrics.disk_used_gb.toFixed(1)} / ${metrics.disk_total_gb.toFixed(1)} GB`}
+              displayValue={
+                metrics.disk_usage_known
+                  ? `${(metrics.disk_used_mb / 1024).toFixed(1)} / ${(metrics.disk_allowance_mb / 1024).toFixed(1)} GB`
+                  : "Unknown"
+              }
             />
           </div>
         </div>
