@@ -1,36 +1,93 @@
+import { useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Slider } from "@/components/ui/slider";
 import { cn } from "@/lib/utils";
-import type { LeafInfo, ContainerRuntimeStatus } from "@/api/client";
+import type { LeafInfo, ContainerRuntimeStatus, MachineCapabilities } from "@/api/client";
+import {
+  leafRuntimes,
+  leafRequirementItems,
+  runtimeTrusted,
+  type LeafRuntime,
+} from "./leaf-requirements";
 
 interface LeafCardProps {
   leaf: LeafInfo;
   showWeightSlider: boolean;
   containerStatus: ContainerRuntimeStatus | null;
+  /** This machine's capabilities from the running daemon; null until loaded. */
+  machine: MachineCapabilities | null;
+  /** The head's `trusted_runtimes` (uppercase); null when not known. */
+  trustedRuntimes: string[] | null;
   onToggle: (enabled: boolean) => void;
   onWeightChange: (weight: number) => void;
+  /** Raise `resource_limits.max_disk_gb` to the given whole-GB value. */
+  onRaiseDisk?: (gb: number) => Promise<void>;
   dashboardUrl?: string;
   volunteerId?: string;
+}
+
+const runtimeBadge: Record<LeafRuntime, { label: string; className: string }> = {
+  container: {
+    label: "Container",
+    className: "border-blue-200 bg-blue-100 text-blue-700",
+  },
+  native: {
+    label: "Native",
+    className: "border-green-200 bg-green-100 text-green-700",
+  },
+  wasm: {
+    label: "WASM",
+    className: "border-purple-200 bg-purple-100 text-purple-700",
+  },
+};
+
+function formatClock(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 export function LeafCard({
   leaf,
   showWeightSlider,
   containerStatus,
+  machine,
+  trustedRuntimes,
   onToggle,
   onWeightChange,
+  onRaiseDisk,
   dashboardUrl,
   volunteerId,
 }: LeafCardProps) {
+  const [raising, setRaising] = useState(false);
+  const [raiseError, setRaiseError] = useState<string | null>(null);
+
   const spec = leaf.execution_spec;
-  const requiresContainer = !!spec?.image;
-  const hasWasmBinary = !!spec?.binaries?.wasm;
-  const hasNativeBinaries = !!spec?.binaries && Object.keys(spec.binaries).some(
-    (k) => k !== "wasm" && k !== "wgsl"
-  );
-  const requiresGpu = !!spec?.gpu_required;
+  const runtimes = leafRuntimes(leaf);
+  const untrusted = runtimes.filter((r) => !runtimeTrusted(r, trustedRuntimes));
+  const requiresContainer = runtimes.includes("container");
+  const requiresGpu = !!spec?.gpu_required || !!leaf.resource_requirements?.gpu_required;
+  const gpuLabel = leaf.resource_requirements?.gpu_type || spec?.gpu_type || "GPU";
   const containerUnavailable = requiresContainer && containerStatus?.status !== "running";
+  const requirements = leafRequirementItems(leaf, machine);
+  const failures = leaf.failures;
+  const diskGate = leaf.disk_gate;
+  const raiseTo = diskGate?.raise_to_gb ?? 0;
+  const researchArea = leaf.research_area.join(", ");
+
+  const handleRaiseDisk = async (gb: number) => {
+    if (!onRaiseDisk) return;
+    setRaising(true);
+    setRaiseError(null);
+    try {
+      await onRaiseDisk(gb);
+    } catch (err) {
+      setRaiseError(err instanceof Error ? err.message : "Could not raise the disk allowance");
+    } finally {
+      setRaising(false);
+    }
+  };
 
   return (
     <div
@@ -50,39 +107,110 @@ export function LeafCard({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm">{leaf.name}</span>
-            <span className="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[10px] font-medium">
-              {leaf.research_area}
-            </span>
+            {researchArea && (
+              <span className="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[10px] font-medium">
+                {researchArea}
+              </span>
+            )}
             <span className="inline-flex items-center rounded-full border px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-muted-foreground">
               {leaf.task_pattern}
             </span>
-            {requiresContainer && (
-              <span className="inline-flex items-center rounded-full border border-blue-200 bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">
-                Container
-              </span>
-            )}
-            {hasNativeBinaries && (
-              <span className="inline-flex items-center rounded-full border border-green-200 bg-green-100 px-2 py-0.5 text-[10px] font-medium text-green-700">
-                Native
-              </span>
-            )}
-            {hasWasmBinary && (
-              <span className="inline-flex items-center rounded-full border border-purple-200 bg-purple-100 px-2 py-0.5 text-[10px] font-medium text-purple-700">
-                WASM
-              </span>
-            )}
+            {runtimes.map((rt) => {
+              const trusted = runtimeTrusted(rt, trustedRuntimes);
+              const badge = runtimeBadge[rt];
+              return (
+                <span
+                  key={rt}
+                  data-testid={`runtime-badge-${rt}`}
+                  data-trusted={trusted ? "true" : "false"}
+                  title={
+                    trusted ? undefined : `${badge.label} is not allowed by your trust settings for this head`
+                  }
+                  className={cn(
+                    "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                    trusted
+                      ? badge.className
+                      : "border-muted bg-muted text-muted-foreground line-through"
+                  )}
+                >
+                  {badge.label}
+                </span>
+              );
+            })}
             {requiresGpu && (
               <span className="inline-flex items-center rounded-full border border-orange-200 bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
-                {spec?.gpu_type || "GPU"}
+                {gpuLabel}
               </span>
             )}
             {!leaf.enabled && (
               <span className="text-xs text-muted-foreground">(disabled)</span>
             )}
           </div>
+
           <p className="text-xs text-muted-foreground mt-0.5">
-            {leaf.queued_work_units} queued &middot; {leaf.active_volunteers} volunteers
+            {leaf.queued_work_units} queued &middot; {leaf.active_volunteers} volunteers &middot;{" "}
+            {leaf.active_hosts} hosts
           </p>
+
+          {untrusted.length > 0 && (
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {untrusted.map((r) => runtimeBadge[r].label).join(" and ")}{" "}
+              {untrusted.length === 1 ? "is" : "are"} not allowed by your trust settings for this
+              head.
+            </p>
+          )}
+
+          {requirements.length > 0 && (
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Needs:{" "}
+              {requirements.map((item, i) => (
+                <span key={item.key}>
+                  {i > 0 && " · "}
+                  <span
+                    data-testid={`requirement-${item.key}`}
+                    data-short={item.shortfall ? "true" : "false"}
+                    className={cn(
+                      item.shortfall && "font-medium text-amber-700 dark:text-amber-400"
+                    )}
+                  >
+                    {item.label}
+                    {item.shortfall && ` (${item.shortfall})`}
+                  </span>
+                </span>
+              ))}
+            </p>
+          )}
+
+          {diskGate?.blocked && (
+            <div className="mt-1 space-y-1">
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Will not fetch: {diskGate.reason || "blocked by the disk allowance"}
+              </p>
+              {raiseTo > 0 && onRaiseDisk && (
+                <button
+                  onClick={() => handleRaiseDisk(raiseTo)}
+                  disabled={raising}
+                  className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+                >
+                  {raising ? "Raising..." : `Raise disk allowance to ${raiseTo} GB`}
+                </button>
+              )}
+              {raiseError && <p className="text-xs text-destructive">{raiseError}</p>}
+            </div>
+          )}
+
+          {failures && failures.total_failures > 0 && (
+            <p className="text-xs text-red-600 dark:text-red-400 mt-0.5">
+              Failing on this machine: {failures.consecutive_failures} in a row,{" "}
+              {failures.total_failures} total
+              {failures.last_reason && ` (last: ${failures.last_reason})`}
+              {failures.paused &&
+                failures.paused_until &&
+                `. Paused here until ${formatClock(failures.paused_until)}`}
+              {failures.paused && !failures.paused_until && ". Paused here for now"}
+            </p>
+          )}
+
           {containerUnavailable && (
             <button
               onClick={() => emit("navigate:settings")}
@@ -91,12 +219,16 @@ export function LeafCard({
               Container runtime required
             </button>
           )}
+
           {dashboardUrl && volunteerId && (
             <button
-              onClick={() => openUrl(`${dashboardUrl}/leafs/${leaf.slug}/visualize?volunteer=${volunteerId}`)}
-              className="text-xs text-blue-500 hover:underline mt-0.5"
+              onClick={() =>
+                openUrl(`${dashboardUrl}/leafs/${leaf.slug}/visualize?volunteer=${volunteerId}`)
+              }
+              title="Opens in your browser. Only works when the head has made this leaf's visualization public."
+              className="text-xs text-muted-foreground hover:underline mt-0.5"
             >
-              View My Results
+              View results on the head's website
             </button>
           )}
         </div>

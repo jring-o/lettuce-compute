@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { useHeads, useWriteLeafPreferences, useDebouncedHeadWeight, useDebouncedLeafWeight } from "@/hooks/use-heads";
+import {
+  useHeads,
+  useWriteLeafPreferences,
+  useWriteHeadTrust,
+  useRaiseDiskAllowance,
+  useDebouncedHeadWeight,
+  useDebouncedLeafWeight,
+} from "@/hooks/use-heads";
 import { useClient } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import { HeadSection } from "@/components/heads/head-section";
 import { AddServerDialog } from "@/components/heads/add-server-dialog";
+import { RestartRequiredBanner } from "@/components/restart-required-banner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ApiError } from "@/api/client";
@@ -21,8 +29,11 @@ function SkeletonCard() {
 }
 
 export function ProjectsPage() {
-  const { heads, isLoading, error, refetch, setHeads } = useHeads();
+  const { heads, machine, trustByHead, isLoading, error, refetch, setHeads, setTrustByHead } =
+    useHeads();
   const { write: writeLeafPrefs } = useWriteLeafPreferences();
+  const { write: writeHeadTrust } = useWriteHeadTrust();
+  const { raise: raiseDiskAllowance } = useRaiseDiskAllowance();
   const { write: writeHeadWeight } = useDebouncedHeadWeight();
   const { write: writeLeafWeight } = useDebouncedLeafWeight();
   const { client } = useClient();
@@ -30,6 +41,8 @@ export function ProjectsPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [toastType, setToastType] = useState<"error" | "warning">("error");
   const [addDialogOpen, setAddDialogOpen] = useState(false);
+  /** Why the daemon needs a restart, or null when it does not. */
+  const [restartNotice, setRestartNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (toast) {
@@ -132,6 +145,52 @@ export function ProjectsPage() {
     [setHeads, writeLeafPrefs]
   );
 
+  /**
+   * Runtime trust is read when the daemon starts (the per-head clients are
+   * built then), so a change waits for a restart unless the daemon explicitly
+   * answers `restart_required: false`. An older daemon that does not report
+   * the field at all still needs the restart.
+   */
+  const handleTrustChange = useCallback(
+    async (headName: string, trustedRuntimes: string[]) => {
+      const resp = await writeHeadTrust(headName, trustedRuntimes);
+      setTrustByHead((prev) => ({ ...prev, [headName]: trustedRuntimes }));
+      if (resp?.restart_required !== false) {
+        setRestartNotice(
+          `Trust settings for ${headName} are saved. Lettuce applies them the next time it starts.`
+        );
+      }
+    },
+    [writeHeadTrust, setTrustByHead]
+  );
+
+  const handleRaiseDisk = useCallback(
+    async (gb: number) => {
+      const resp = await raiseDiskAllowance(gb);
+      refetch();
+      if (resp?.restart_required === true) {
+        setRestartNotice(
+          `Your disk allowance is now ${gb} GB. Lettuce applies it the next time it starts.`
+        );
+      }
+    },
+    [raiseDiskAllowance, refetch]
+  );
+
+  /**
+   * The daemon connects to its heads when it starts, so a newly attached
+   * head sends no work until the next restart.
+   */
+  const handleServerAdded = useCallback(
+    (headName: string) => {
+      refetch();
+      setRestartNotice(
+        `${headName} is attached. Lettuce starts fetching work from it the next time it starts.`
+      );
+    },
+    [refetch]
+  );
+
   const showHeadWeight = heads.length >= 2;
 
   return (
@@ -147,6 +206,17 @@ export function ProjectsPage() {
         >
           {toast}
         </div>
+      )}
+
+      {restartNotice && (
+        <RestartRequiredBanner
+          message={restartNotice}
+          onRestarted={() => {
+            setRestartNotice(null);
+            refetch();
+          }}
+          onDismiss={() => setRestartNotice(null)}
+        />
       )}
 
       {/* Loading state */}
@@ -178,6 +248,8 @@ export function ProjectsPage() {
           head={head}
           showHeadWeight={showHeadWeight}
           containerStatus={containerStatus}
+          machine={machine}
+          trustedRuntimes={trustByHead[head.name] ?? null}
           onHeadWeightChange={(weight) => {
             setHeads((prev) =>
               prev.map((h) => h.name === head.name ? { ...h, weight } : h)
@@ -192,6 +264,8 @@ export function ProjectsPage() {
           }
           onResetDefaults={() => handleResetDefaults(head.name)}
           onDetach={() => handleDetach(head.name)}
+          onTrustChange={(runtimes) => handleTrustChange(head.name, runtimes)}
+          onRaiseDisk={handleRaiseDisk}
         />
       ))}
 
@@ -207,7 +281,8 @@ export function ProjectsPage() {
       <AddServerDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
-        onServerAdded={refetch}
+        onServerAdded={handleServerAdded}
+        machine={machine}
       />
     </div>
   );

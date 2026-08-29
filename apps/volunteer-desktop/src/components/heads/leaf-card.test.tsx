@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { LeafCard } from "./leaf-card";
-import type { LeafInfo, ContainerRuntimeStatus } from "@/api/client";
+import type { LeafInfo, ContainerRuntimeStatus, MachineCapabilities } from "@/api/client";
 
 // Mock @tauri-apps/api/event
 const mockEmit = vi.fn();
@@ -23,11 +23,12 @@ function makeLeaf(overrides: Partial<LeafInfo> = {}): LeafInfo {
     slug: "prime-gap-study",
     name: "Prime Gap Study",
     description: "Finding prime gaps",
-    research_area: "mathematics",
+    research_area: ["mathematics"],
     task_pattern: "PARAMETER_SWEEP",
     state: "ACTIVE",
     queued_work_units: 450,
     active_volunteers: 3,
+    active_hosts: 5,
     enabled: true,
     effective_weight: 50,
     ...overrides,
@@ -52,9 +53,27 @@ function makeContainerStatus(
   };
 }
 
+function makeMachine(overrides: Partial<MachineCapabilities> = {}): MachineCapabilities {
+  return {
+    runtimes: ["container", "wasm"],
+    has_gpu: true,
+    max_memory_mb: 8192,
+    max_disk_mb: 10240,
+    max_cpu_cores: 4,
+    max_gpu_vram_mb: 2048,
+    gpu_card_vram_mb: 4096,
+    gpu_vram_pct: 50,
+    gpu_vendors: ["NVIDIA"],
+    gpu_compute_capabilities: ["8.6"],
+    ...overrides,
+  };
+}
+
 const defaultProps = {
   showWeightSlider: false,
   containerStatus: null as ContainerRuntimeStatus | null,
+  machine: null as MachineCapabilities | null,
+  trustedRuntimes: null as string[] | null,
   onToggle: vi.fn(),
   onWeightChange: vi.fn(),
 };
@@ -70,6 +89,17 @@ describe("LeafCard", () => {
     expect(screen.getByText("PARAMETER_SWEEP")).toBeInTheDocument();
     expect(screen.getByText(/450 queued/)).toBeInTheDocument();
     expect(screen.getByText(/3 volunteers/)).toBeInTheDocument();
+    expect(screen.getByText(/5 hosts/)).toBeInTheDocument();
+  });
+
+  it("joins several research areas and hides the chip when there are none", () => {
+    const { rerender } = render(
+      <LeafCard leaf={makeLeaf({ research_area: ["physics", "astronomy"] })} {...defaultProps} />
+    );
+    expect(screen.getByText("physics, astronomy")).toBeInTheDocument();
+
+    rerender(<LeafCard leaf={makeLeaf({ research_area: [] })} {...defaultProps} />);
+    expect(screen.queryByText("physics, astronomy")).not.toBeInTheDocument();
   });
 
   it("checkbox reflects enabled state when true", () => {
@@ -272,6 +302,19 @@ describe("LeafCard", () => {
     expect(screen.getByText("GPU")).toBeInTheDocument();
   });
 
+  it("shows the GPU badge when only the resource requirements ask for a GPU", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          resource_requirements: { gpu_required: true, gpu_type: "NVIDIA" },
+        })}
+        {...defaultProps}
+      />
+    );
+
+    expect(screen.getByText("NVIDIA")).toBeInTheDocument();
+  });
+
   it("does not show GPU badge when gpu_required is false", () => {
     render(
       <LeafCard
@@ -368,6 +411,228 @@ describe("LeafCard", () => {
     expect(screen.getByText("Native")).toBeInTheDocument();
   });
 
+  // --- Runtime trust ---
+
+  it("greys the Container badge and says so when the head is not trusted with containers", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({ execution_spec: { image: "ghcr.io/lettuce/nbody:latest" } })}
+        {...defaultProps}
+        trustedRuntimes={[]}
+      />
+    );
+
+    const badge = screen.getByTestId("runtime-badge-container");
+    expect(badge).toHaveAttribute("data-trusted", "false");
+    expect(badge).toHaveAttribute("title", "Container is not allowed by your trust settings for this head");
+    expect(
+      screen.getByText("Container is not allowed by your trust settings for this head.")
+    ).toBeInTheDocument();
+  });
+
+  it("greys only the untrusted runtime and never WASM", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          execution_spec: { binaries: { wasm: "m.wasm", "linux-amd64": "/bin" } },
+        })}
+        {...defaultProps}
+        trustedRuntimes={["CONTAINER"]}
+      />
+    );
+
+    expect(screen.getByTestId("runtime-badge-native")).toHaveAttribute("data-trusted", "false");
+    expect(screen.getByTestId("runtime-badge-wasm")).toHaveAttribute("data-trusted", "true");
+    expect(
+      screen.getByText("Native is not allowed by your trust settings for this head.")
+    ).toBeInTheDocument();
+  });
+
+  it("does not grey anything when the runtime is trusted or trust is unknown", () => {
+    const leaf = makeLeaf({ execution_spec: { image: "ghcr.io/lettuce/nbody:latest" } });
+    const { rerender } = render(
+      <LeafCard leaf={leaf} {...defaultProps} trustedRuntimes={["CONTAINER"]} />
+    );
+    expect(screen.getByTestId("runtime-badge-container")).toHaveAttribute("data-trusted", "true");
+    expect(screen.queryByText(/not allowed by your trust settings/)).not.toBeInTheDocument();
+
+    rerender(<LeafCard leaf={leaf} {...defaultProps} trustedRuntimes={null} />);
+    expect(screen.getByTestId("runtime-badge-container")).toHaveAttribute("data-trusted", "true");
+  });
+
+  // --- Requirements ---
+
+  it("renders the requirements line with no marks on a capable machine", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          execution_spec: { max_memory_mb: 7168, gpu_required: true },
+          resource_requirements: {
+            min_disk_mb: 5120,
+            min_cpu_cores: 1,
+            min_gpu_vram_mb: 1024,
+            gpu_type: "NVIDIA",
+          },
+        })}
+        {...defaultProps}
+        machine={makeMachine()}
+      />
+    );
+
+    const line = screen.getByText(/^Needs:/);
+    expect(line).toHaveTextContent("Needs: 5 GB disk · 7 GB RAM · 1 core · NVIDIA GPU, 1 GB VRAM");
+    expect(screen.getByTestId("requirement-disk")).toHaveAttribute("data-short", "false");
+    expect(screen.getByTestId("requirement-gpu")).toHaveAttribute("data-short", "false");
+  });
+
+  it("marks the items this machine falls short on and explains the VRAM allowance", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          execution_spec: { max_memory_mb: 2048, gpu_required: true },
+          resource_requirements: { min_disk_mb: 15360, min_gpu_vram_mb: 3072, gpu_type: "NVIDIA" },
+        })}
+        {...defaultProps}
+        machine={makeMachine()}
+      />
+    );
+
+    const disk = screen.getByTestId("requirement-disk");
+    expect(disk).toHaveAttribute("data-short", "true");
+    expect(disk).toHaveTextContent("15 GB disk (you allow 10 GB)");
+    expect(screen.getByTestId("requirement-memory")).toHaveAttribute("data-short", "false");
+    const gpu = screen.getByTestId("requirement-gpu");
+    expect(gpu).toHaveAttribute("data-short", "true");
+    expect(gpu).toHaveTextContent(
+      "NVIDIA GPU, 3 GB VRAM (your allowance is 2 GB (50% of a 4 GB card))"
+    );
+  });
+
+  it("renders no requirements line for a leaf without requirements", () => {
+    render(<LeafCard leaf={makeLeaf()} {...defaultProps} machine={makeMachine()} />);
+    expect(screen.queryByText(/^Needs:/)).not.toBeInTheDocument();
+  });
+
+  // --- Disk gate ---
+
+  it("shows the daemon's disk-gate verdict and a button to raise the allowance", async () => {
+    const user = userEvent.setup();
+    const onRaiseDisk = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          disk_gate: {
+            blocked: true,
+            reason: "needs 15 GB of free allowance; 4 GB left of your 10 GB",
+            raise_to_gb: 21,
+          },
+        })}
+        {...defaultProps}
+        onRaiseDisk={onRaiseDisk}
+      />
+    );
+
+    expect(
+      screen.getByText("Will not fetch: needs 15 GB of free allowance; 4 GB left of your 10 GB")
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
+    expect(onRaiseDisk).toHaveBeenCalledWith(21);
+  });
+
+  it("shows the verdict without a button when the daemon gives no figure to raise to", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({ disk_gate: { blocked: true, reason: "image not cached yet" } })}
+        {...defaultProps}
+        onRaiseDisk={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Will not fetch: image not cached yet")).toBeInTheDocument();
+    expect(screen.queryByText(/Raise disk allowance/)).not.toBeInTheDocument();
+  });
+
+  it("shows the error when raising the allowance fails", async () => {
+    const user = userEvent.setup();
+    const onRaiseDisk = vi.fn().mockRejectedValue(new Error("VALIDATION_ERROR: max_disk_gb too large"));
+
+    render(
+      <LeafCard
+        leaf={makeLeaf({ disk_gate: { blocked: true, reason: "r", raise_to_gb: 21 } })}
+        {...defaultProps}
+        onRaiseDisk={onRaiseDisk}
+      />
+    );
+
+    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
+    await waitFor(() => {
+      expect(screen.getByText("VALIDATION_ERROR: max_disk_gb too large")).toBeInTheDocument();
+    });
+  });
+
+  it("shows nothing about the disk gate when the leaf is not blocked", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({ disk_gate: { blocked: false } })}
+        {...defaultProps}
+        onRaiseDisk={vi.fn()}
+      />
+    );
+    expect(screen.queryByText(/Will not fetch/)).not.toBeInTheDocument();
+  });
+
+  // --- Failures ---
+
+  it("shows the failure record with the pause time", () => {
+    const pausedUntil = new Date("2026-08-29T14:32:00Z");
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          failures: {
+            leaf_id: "leaf-1",
+            leaf_name: "Prime Gap Study",
+            consecutive_failures: 3,
+            total_failures: 5,
+            last_reason: "exit status 1",
+            last_failed_at: "2026-08-29T14:22:00Z",
+            paused: true,
+            paused_until: pausedUntil.toISOString(),
+          },
+        })}
+        {...defaultProps}
+      />
+    );
+
+    const expectedClock = pausedUntil.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    expect(screen.getByText(/Failing on this machine/)).toHaveTextContent(
+      `Failing on this machine: 3 in a row, 5 total (last: exit status 1). Paused here until ${expectedClock}`
+    );
+  });
+
+  it("shows failures that have not paused the leaf without a pause time", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          failures: {
+            leaf_id: "leaf-1",
+            leaf_name: "Prime Gap Study",
+            consecutive_failures: 1,
+            total_failures: 1,
+            paused: false,
+          },
+        })}
+        {...defaultProps}
+      />
+    );
+
+    expect(screen.getByText(/Failing on this machine/)).toHaveTextContent(
+      "Failing on this machine: 1 in a row, 1 total"
+    );
+    expect(screen.queryByText(/Paused here/)).not.toBeInTheDocument();
+  });
+
   // --- Container unavailability warning tests (S89) ---
 
   it("shows 'Container runtime required' when container leaf and runtime not running", () => {
@@ -437,7 +702,7 @@ describe("LeafCard", () => {
     expect(card?.className).toContain("opacity-60");
   });
 
-  it("does NOT show container warning when containerStatus is null", () => {
+  it("shows container warning when containerStatus is null", () => {
     render(
       <LeafCard
         leaf={makeLeaf({
@@ -451,8 +716,6 @@ describe("LeafCard", () => {
 
     expect(screen.getByText("Container runtime required")).toBeInTheDocument();
   });
-
-  // --- Coverage gap: Container + Native combined leaf shows both badges ---
 
   it("shows both Container and Native badges when leaf has image and binaries", () => {
     render(
@@ -470,8 +733,6 @@ describe("LeafCard", () => {
     expect(screen.getByText("Container")).toBeInTheDocument();
     expect(screen.getByText("Native")).toBeInTheDocument();
   });
-
-  // --- Coverage gap: "Container runtime required" click emits navigate:settings ---
 
   it("clicking 'Container runtime required' emits navigate:settings", async () => {
     const user = userEvent.setup();
@@ -494,8 +755,6 @@ describe("LeafCard", () => {
     expect(mockEmit).toHaveBeenCalledWith("navigate:settings");
   });
 
-  // --- Coverage gap: container unavailable with not_initialized status ---
-
   it("shows warning when container leaf and runtime not_initialized", () => {
     render(
       <LeafCard
@@ -510,8 +769,6 @@ describe("LeafCard", () => {
 
     expect(screen.getByText("Container runtime required")).toBeInTheDocument();
   });
-
-  // --- Coverage gap: container unavailable does NOT apply opacity when disabled ---
 
   it("container unavailable + disabled leaf uses opacity-50 not opacity-60", () => {
     const { container } = render(
@@ -530,9 +787,9 @@ describe("LeafCard", () => {
     expect(card?.className).toContain("opacity-50");
   });
 
-  // --- S109: "View My Results" link tests ---
+  // --- Results link ---
 
-  it("renders 'View My Results' button and opens URL via opener plugin", async () => {
+  it("renders the results link and opens the head's visualization page", async () => {
     const user = userEvent.setup();
     render(
       <LeafCard
@@ -543,7 +800,7 @@ describe("LeafCard", () => {
       />
     );
 
-    const button = screen.getByText("View My Results");
+    const button = screen.getByText("View results on the head's website");
     expect(button).toBeInTheDocument();
     expect(button.tagName).toBe("BUTTON");
 
@@ -553,7 +810,7 @@ describe("LeafCard", () => {
     );
   });
 
-  it("does not render 'View My Results' link when dashboardUrl is missing", () => {
+  it("does not render the results link when dashboardUrl is missing", () => {
     render(
       <LeafCard
         leaf={makeLeaf()}
@@ -562,10 +819,10 @@ describe("LeafCard", () => {
       />
     );
 
-    expect(screen.queryByText("View My Results")).not.toBeInTheDocument();
+    expect(screen.queryByText("View results on the head's website")).not.toBeInTheDocument();
   });
 
-  it("does not render 'View My Results' link when volunteerId is missing", () => {
+  it("does not render the results link when volunteerId is missing", () => {
     render(
       <LeafCard
         leaf={makeLeaf()}
@@ -574,17 +831,6 @@ describe("LeafCard", () => {
       />
     );
 
-    expect(screen.queryByText("View My Results")).not.toBeInTheDocument();
-  });
-
-  it("does not render 'View My Results' link when both dashboardUrl and volunteerId are missing", () => {
-    render(
-      <LeafCard
-        leaf={makeLeaf()}
-        {...defaultProps}
-      />
-    );
-
-    expect(screen.queryByText("View My Results")).not.toBeInTheDocument();
+    expect(screen.queryByText("View results on the head's website")).not.toBeInTheDocument();
   });
 });

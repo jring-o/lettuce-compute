@@ -1,16 +1,48 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import { useClient } from "./use-api";
-import type { HeadInfo, LeafPreferences, ConfigResponse } from "../api/client";
+import type {
+  ConfigResponse,
+  ConfigUpdateResponse,
+  HeadInfo,
+  LeafPreferences,
+  MachineCapabilities,
+  ServerConfig,
+} from "../api/client";
+
+/** Head name -> its `trusted_runtimes` (uppercase). Absent when not known. */
+export type TrustByHead = Record<string, string[]>;
+
+/**
+ * Map each head to the `trusted_runtimes` of its config entry. Entries are
+ * matched by gRPC address first (the stable identity), then by name, which
+ * is how the daemon itself matches a `servers[]` update.
+ */
+export function trustByHeadFromConfig(heads: HeadInfo[], servers: ServerConfig[]): TrustByHead {
+  const out: TrustByHead = {};
+  for (const head of heads) {
+    const server =
+      servers.find((s) => s.grpc_address === head.grpc_address) ??
+      servers.find((s) => s.name === head.name);
+    if (server) out[head.name] = server.trusted_runtimes.map((r) => r.toUpperCase());
+  }
+  return out;
+}
 
 export function useHeads(): {
   heads: HeadInfo[];
+  /** This machine's capabilities as the running daemon sees them; null until loaded. */
+  machine: MachineCapabilities | null;
+  trustByHead: TrustByHead;
   isLoading: boolean;
   error: Error | null;
   refetch: () => void;
   setHeads: React.Dispatch<React.SetStateAction<HeadInfo[]>>;
+  setTrustByHead: React.Dispatch<React.SetStateAction<TrustByHead>>;
 } {
   const { client } = useClient();
   const [heads, setHeads] = useState<HeadInfo[]>([]);
+  const [machine, setMachine] = useState<MachineCapabilities | null>(null);
+  const [trustByHead, setTrustByHead] = useState<TrustByHead>({});
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const fetchedRef = useRef(false);
@@ -18,9 +50,18 @@ export function useHeads(): {
   const fetchHeads = useCallback(async () => {
     if (!client) return;
     try {
-      const result = await client.heads();
-      setHeads(result);
+      const result = await client.headsAndMachine();
+      setHeads(result.heads);
+      setMachine(result.machine);
       setError(null);
+      // Trust lives in config, not in the heads response. A config failure
+      // leaves trust unknown rather than hiding the heads.
+      try {
+        const config = await client.config();
+        setTrustByHead(trustByHeadFromConfig(result.heads, config.servers));
+      } catch {
+        setTrustByHead({});
+      }
     } catch (err) {
       setError(err instanceof Error ? err : new Error("Failed to fetch heads"));
     } finally {
@@ -36,7 +77,16 @@ export function useHeads(): {
     }
   }, [client, fetchHeads]);
 
-  return { heads, isLoading, error, refetch: fetchHeads, setHeads };
+  return {
+    heads,
+    machine,
+    trustByHead,
+    isLoading,
+    error,
+    refetch: fetchHeads,
+    setHeads,
+    setTrustByHead,
+  };
 }
 
 // Helper: read current config, apply a server-level update, write it back.
@@ -70,6 +120,55 @@ export function useWriteLeafPreferences(): {
   );
 
   return { write };
+}
+
+/**
+ * Set a head's `trusted_runtimes` exactly. Sends only the name and the new
+ * list — `PUT /api/v1/config` merges per-head fields by name — and returns
+ * the daemon's answer so the caller can see `restart_required`. Resolves to
+ * null when there is no client yet.
+ */
+export function useWriteHeadTrust(): {
+  write: (serverName: string, trustedRuntimes: string[]) => Promise<ConfigUpdateResponse | null>;
+} {
+  const { client } = useClient();
+
+  const write = useCallback(
+    async (serverName: string, trustedRuntimes: string[]) => {
+      if (!client) return null;
+      return client.updateConfig({
+        servers: [{ name: serverName, trusted_runtimes: trustedRuntimes }],
+      });
+    },
+    [client]
+  );
+
+  return { write };
+}
+
+/**
+ * Raise `resource_limits.max_disk_gb`. Reads the current limits first and
+ * sends the whole object with the new figure, as the settings page does, so
+ * no other limit is disturbed. Returns the daemon's answer for
+ * `restart_required`; null when there is no client yet.
+ */
+export function useRaiseDiskAllowance(): {
+  raise: (gb: number) => Promise<ConfigUpdateResponse | null>;
+} {
+  const { client } = useClient();
+
+  const raise = useCallback(
+    async (gb: number) => {
+      if (!client) return null;
+      const config = await client.config();
+      return client.updateConfig({
+        resource_limits: { ...config.resource_limits, max_disk_gb: gb },
+      });
+    },
+    [client]
+  );
+
+  return { raise };
 }
 
 // Debounced write — for continuous inputs (sliders).
