@@ -1,7 +1,13 @@
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useState } from "react";
 import { useApiQuery } from "./use-api";
 import type { ConfigResponse, ConfigUpdate } from "../api/client";
 import { useClient } from "./use-api";
+import {
+  DAEMON_FLAGGED_REASON,
+  RESTART_ONLY_SETTINGS_REASON,
+  markRestartRequired,
+  useOnDaemonRestart,
+} from "./use-restart-required";
 
 /**
  * Settings the daemon reads only when it starts. `PUT /api/v1/config` saves
@@ -34,48 +40,6 @@ export function needsRestart(partial: ConfigUpdate): boolean {
   return RESTART_ONLY_KEYS.some((key) => partial[key] !== undefined);
 }
 
-// A "restart required" flag shared by every mount of the hook: it must
-// outlive the Settings page (which unmounts on a tab switch) and is cleared
-// only when the daemon is restarted from the app.
-let restartRequired = false;
-const restartListeners = new Set<() => void>();
-
-function setRestartRequired(value: boolean) {
-  if (restartRequired === value) return;
-  restartRequired = value;
-  for (const l of restartListeners) l();
-}
-
-function subscribeRestart(listener: () => void) {
-  restartListeners.add(listener);
-  return () => {
-    restartListeners.delete(listener);
-  };
-}
-
-function readRestart() {
-  return restartRequired;
-}
-
-/** Whether a saved setting is waiting for a daemon restart to take effect. */
-export function useRestartRequired(): {
-  restartRequired: boolean;
-  markRestartRequired: () => void;
-  clearRestartRequired: () => void;
-} {
-  const value = useSyncExternalStore(subscribeRestart, readRestart);
-  return {
-    restartRequired: value,
-    markRestartRequired: () => setRestartRequired(true),
-    clearRestartRequired: () => setRestartRequired(false),
-  };
-}
-
-/** Visible for tests. */
-export function resetRestartRequiredForTest(): void {
-  setRestartRequired(false);
-}
-
 export function useConfig() {
   const { client } = useClient();
   const {
@@ -87,14 +51,19 @@ export function useConfig() {
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
+  // A restarted daemon re-reads config.yaml; show what it now holds.
+  useOnDaemonRestart(refetch);
+
   const updateConfig = useCallback(
     async (partial: ConfigUpdate) => {
       if (!client) return;
       setSaving(true);
       try {
         const resp = await client.updateConfig(partial);
-        if (needsRestart(partial) || resp?.restart_required === true) {
-          setRestartRequired(true);
+        if (needsRestart(partial)) {
+          markRestartRequired(RESTART_ONLY_SETTINGS_REASON);
+        } else if (resp?.restart_required === true) {
+          markRestartRequired(DAEMON_FLAGGED_REASON);
         }
         refetch();
         setToast("Saved");

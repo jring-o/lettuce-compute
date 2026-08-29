@@ -1,15 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, renderHook } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsPage } from "./settings";
 import { mockManagementApi } from "@tauri-apps/api/core";
 import type { ConfigResponse } from "@/api/client";
 
 // Mock hooks
-const mockUseRestartRequired = vi.fn();
 vi.mock("@/hooks/use-config", () => ({
   useConfig: vi.fn(),
-  useRestartRequired: () => mockUseRestartRequired(),
 }));
 
 const mockUseSystemMetrics = vi.fn();
@@ -130,11 +128,6 @@ describe("SettingsPage", () => {
     mockUseSystemMetrics.mockReturnValue({
       system: { cpu_usage_pct: 12, memory_used_mb: 4096, memory_total_mb: 16384 },
       error: null,
-    });
-    mockUseRestartRequired.mockReturnValue({
-      restartRequired: false,
-      markRestartRequired: vi.fn(),
-      clearRestartRequired: vi.fn(),
     });
     mockHeads({ heads: [], machine: noGpuMachine });
   });
@@ -360,7 +353,7 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("shows the restart-required note with a working restart button", async () => {
+  it("restarts Lettuce from the General section and clears any pending restart notice", async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const mockInvoke = invoke as ReturnType<typeof vi.fn>;
     mockInvoke.mockImplementation((cmd: string) => {
@@ -369,47 +362,33 @@ describe("SettingsPage", () => {
       if (cmd === "mgmt_request") return Promise.resolve({});
       return Promise.resolve(undefined);
     });
-    const clearRestartRequired = vi.fn();
-    mockUseRestartRequired.mockReturnValue({
-      restartRequired: true,
-      markRestartRequired: vi.fn(),
-      clearRestartRequired,
-    });
-    const refetch = vi.fn();
+    const { markRestartRequired, resetRestartRequiredForTest, useRestartRequired } =
+      await import("@/hooks/use-restart-required");
+    resetRestartRequiredForTest();
+    markRestartRequired("A setting is waiting.");
+    const { result: restart } = renderHook(() => useRestartRequired());
     mockUseConfig.mockReturnValue({
       config: makeConfig(),
       isLoading: false,
       updateConfig: vi.fn(),
       toast: null,
-      refetch,
+      refetch: vi.fn(),
     });
 
     const user = userEvent.setup();
     render(<SettingsPage />);
-    expect(screen.getByText("Restart required")).toBeInTheDocument();
-    expect(screen.getByText(/reads only when it starts/)).toBeInTheDocument();
+    // The notice itself lives in the tab layout, not on this page.
+    expect(screen.queryByText("Restart required")).not.toBeInTheDocument();
 
-    const buttons = screen.getAllByRole("button", { name: /Restart Lettuce/ });
-    await user.click(buttons[0]);
+    await user.click(screen.getByText("General"));
+    await user.click(screen.getByRole("button", { name: /Restart Lettuce/ }));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("restart_daemon");
     });
     await waitFor(() => {
-      expect(clearRestartRequired).toHaveBeenCalled();
+      expect(screen.getByText("Lettuce restarted.")).toBeInTheDocument();
     });
-    expect(refetch).toHaveBeenCalled();
-  });
-
-  it("does not show the restart-required note when nothing is pending", () => {
-    mockUseConfig.mockReturnValue({
-      config: makeConfig(),
-      isLoading: false,
-      updateConfig: vi.fn(),
-      toast: null,
-    });
-
-    render(<SettingsPage />);
-    expect(screen.queryByText("Restart required")).not.toBeInTheDocument();
+    expect(restart.current.restartRequired).toBe(false);
   });
 
   it("reports a failed restart", async () => {

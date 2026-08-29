@@ -8,10 +8,10 @@ import {
   Monitor,
   Sun,
   Moon,
-  AlertTriangle,
   RefreshCw,
 } from "lucide-react";
-import { useConfig, useRestartRequired } from "@/hooks/use-config";
+import { useConfig } from "@/hooks/use-config";
+import { restartLettuce, useOnDaemonRestart } from "@/hooks/use-restart-required";
 import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
 import { useClient, useApiQuery } from "@/hooks/use-api";
 import { ScheduleBuilder } from "@/components/schedule-builder";
@@ -29,12 +29,7 @@ import {
   applyTheme,
   type Theme,
 } from "@/lib/utils";
-import {
-  restartDaemon,
-  type ScheduleRange,
-  type ThermalConfig,
-  type ManagementClient,
-} from "@/api/client";
+import type { ScheduleRange, ThermalConfig, ManagementClient } from "@/api/client";
 
 // Collapsible section
 function Section({
@@ -258,18 +253,12 @@ function Toggle({
 }
 
 /**
- * Restart the daemon from the app. Used by the "restart required" banner and
- * the General section. `restartDaemon()` stops the running daemon (waiting up
- * to 30 s, then forcing it) and starts a fresh one; in-progress work is
+ * Restart the daemon from the General section. `restartLettuce()` stops the
+ * running daemon (waiting up to 30 s, then forcing it), starts a fresh one,
+ * and clears any pending "restart required" notice; in-progress work is
  * checkpointed by the daemon and resumed after the restart.
  */
-function RestartButton({
-  onDone,
-  variant = "outline",
-}: {
-  onDone?: () => void;
-  variant?: "outline" | "default" | "secondary";
-}) {
+function RestartButton() {
   const [restarting, setRestarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
@@ -279,9 +268,8 @@ function RestartButton({
     setError(null);
     setDone(false);
     try {
-      await restartDaemon();
+      await restartLettuce();
       setDone(true);
-      onDone?.();
       setTimeout(() => setDone(false), 4000);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -293,7 +281,7 @@ function RestartButton({
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-3">
-        <Button variant={variant} size="sm" onClick={handleRestart} disabled={restarting}>
+        <Button variant="outline" size="sm" onClick={handleRestart} disabled={restarting}>
           <RefreshCw className={cn("h-3.5 w-3.5 mr-1.5", restarting && "animate-spin")} />
           {restarting ? "Restarting Lettuce…" : "Restart Lettuce"}
         </Button>
@@ -316,7 +304,6 @@ const DEFAULT_WORK_BUFFER_HOURS = 2;
 
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
-  const { restartRequired, clearRestartRequired } = useRestartRequired();
   const { metrics } = useMetrics(5000);
   const { system } = useSystemMetrics(3000);
   const { data: headsResp, refetch: refetchHeads } = useApiQuery(
@@ -325,6 +312,9 @@ export function SettingsPage() {
   );
   const machine = headsResp?.machine ?? null;
   const heads = headsResp?.heads ?? [];
+  // The restarted daemon re-detects the machine and reconnects to heads
+  // (`useConfig` refetches the config itself).
+  useOnDaemonRestart(refetchHeads);
 
   // Older CLI builds do not return work_buffer_hours from GET /api/v1/config;
   // until the daemon reports it, the slider shows the last value saved in this
@@ -393,12 +383,6 @@ export function SettingsPage() {
     return applyTheme(theme);
   }, [theme]);
 
-  const handleRestartDone = useCallback(() => {
-    clearRestartRequired();
-    refetch();
-    refetchHeads();
-  }, [clearRestartRequired, refetch, refetchHeads]);
-
   if (isLoading || !config) {
     return (
       <div className="p-6 max-w-3xl mx-auto space-y-4">
@@ -446,27 +430,6 @@ export function SettingsPage() {
           )}
         >
           {toast}
-        </div>
-      )}
-
-      {/* Restart required */}
-      {restartRequired && (
-        <div
-          role="status"
-          className="rounded-lg border border-yellow-500/40 bg-yellow-500/10 px-4 py-3 space-y-2"
-        >
-          <div className="flex items-start gap-2 text-sm">
-            <AlertTriangle className="h-4 w-4 mt-0.5 text-yellow-600 shrink-0" />
-            <div>
-              <p className="font-medium">Restart required</p>
-              <p className="text-xs text-muted-foreground">
-                A setting you saved is one Lettuce reads only when it starts (resource
-                limits, schedule, thermal limits, concurrent tasks or log level). It is
-                saved, but the running daemon is still using the old value.
-              </p>
-            </div>
-          </div>
-          <RestartButton variant="default" onDone={handleRestartDone} />
         </div>
       )}
 
@@ -1058,7 +1021,7 @@ export function SettingsPage() {
               Stops the background daemon and starts it again. Running work is
               checkpointed and picked up after the restart.
             </p>
-            <RestartButton onDone={handleRestartDone} />
+            <RestartButton />
           </div>
         </div>
       </Section>

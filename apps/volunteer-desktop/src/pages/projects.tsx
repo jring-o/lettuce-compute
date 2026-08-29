@@ -11,7 +11,7 @@ import { useClient } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import { HeadSection } from "@/components/heads/head-section";
 import { AddServerDialog } from "@/components/heads/add-server-dialog";
-import { RestartRequiredBanner } from "@/components/restart-required-banner";
+import { markRestartRequired } from "@/hooks/use-restart-required";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ApiError } from "@/api/client";
@@ -41,8 +41,6 @@ export function ProjectsPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [toastType, setToastType] = useState<"error" | "warning">("error");
   const [addDialogOpen, setAddDialogOpen] = useState(false);
-  /** Why the daemon needs a restart, or null when it does not. */
-  const [restartNotice, setRestartNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (toast) {
@@ -145,34 +143,22 @@ export function ProjectsPage() {
     [setHeads, writeLeafPrefs]
   );
 
-  /**
-   * Runtime trust is read when the daemon starts (the per-head clients are
-   * built then), so a change waits for a restart unless the daemon explicitly
-   * answers `restart_required: false`. An older daemon that does not report
-   * the field at all still needs the restart.
-   */
+  // `useWriteHeadTrust` records the pending restart itself (trust is read
+  // when the daemon starts); this page only mirrors the saved list locally.
   const handleTrustChange = useCallback(
     async (headName: string, trustedRuntimes: string[]) => {
-      const resp = await writeHeadTrust(headName, trustedRuntimes);
+      await writeHeadTrust(headName, trustedRuntimes);
       setTrustByHead((prev) => ({ ...prev, [headName]: trustedRuntimes }));
-      if (resp?.restart_required !== false) {
-        setRestartNotice(
-          `Trust settings for ${headName} are saved. Lettuce applies them the next time it starts.`
-        );
-      }
     },
     [writeHeadTrust, setTrustByHead]
   );
 
+  // Re-read the heads so a cleared disk gate shows straight away; the hook
+  // records a restart when the daemon asks for one.
   const handleRaiseDisk = useCallback(
     async (gb: number) => {
-      const resp = await raiseDiskAllowance(gb);
+      await raiseDiskAllowance(gb);
       refetch();
-      if (resp?.restart_required === true) {
-        setRestartNotice(
-          `Your disk allowance is now ${gb} GB. Lettuce applies it the next time it starts.`
-        );
-      }
     },
     [raiseDiskAllowance, refetch]
   );
@@ -184,7 +170,7 @@ export function ProjectsPage() {
   const handleServerAdded = useCallback(
     (headName: string) => {
       refetch();
-      setRestartNotice(
+      markRestartRequired(
         `${headName} is attached. Lettuce starts fetching work from it the next time it starts.`
       );
     },
@@ -206,17 +192,6 @@ export function ProjectsPage() {
         >
           {toast}
         </div>
-      )}
-
-      {restartNotice && (
-        <RestartRequiredBanner
-          message={restartNotice}
-          onRestarted={() => {
-            setRestartNotice(null);
-            refetch();
-          }}
-          onDismiss={() => setRestartNotice(null)}
-        />
       )}
 
       {/* Loading state */}

@@ -8,6 +8,11 @@ import {
   useRaiseDiskAllowance,
   trustByHeadFromConfig,
 } from "./use-heads";
+import {
+  resetRestartRequiredForTest,
+  restartLettuce,
+  useRestartRequired,
+} from "./use-restart-required";
 import type {
   ConfigResponse,
   ConfigUpdate,
@@ -251,6 +256,25 @@ describe("useHeads", () => {
     expect(mockHeadsAndMachineFn).toHaveBeenCalledTimes(2);
   });
 
+  it("re-reads the heads after an in-app restart", async () => {
+    resetRestartRequiredForTest();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+    mockHeadsAndMachineFn.mockResolvedValue({ heads: mockHeadsData, machine: mockMachine });
+
+    const { result } = renderHook(() => useHeads());
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+    expect(mockHeadsAndMachineFn).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      await restartLettuce();
+    });
+    await waitFor(() => {
+      expect(mockHeadsAndMachineFn).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("exposes setHeads and setTrustByHead for local state updates", async () => {
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
     mockHeadsAndMachineFn.mockResolvedValue({ heads: [], machine: mockMachine });
@@ -274,7 +298,69 @@ describe("useHeads", () => {
 describe("useWriteHeadTrust", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRestartRequiredForTest();
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  it("records a pending restart when the daemon asks for one", async () => {
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true });
+
+    const { result } = renderHook(() => ({
+      trust: useWriteHeadTrust(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.trust.write("lettuce.science", ["NATIVE"]);
+    });
+
+    expect(result.current.restart.reasons).toEqual([
+      "Trust settings for lettuce.science are saved. Lettuce applies them the next time it starts.",
+    ]);
+  });
+
+  it("still records a restart when an older daemon reports no restart_required at all", async () => {
+    // An older daemon echoes the whole config with no restart hint.
+    mockUpdateConfigFn.mockResolvedValue({ data_dir: "/x" } as unknown as ConfigUpdateResponse);
+
+    const { result } = renderHook(() => ({
+      trust: useWriteHeadTrust(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.trust.write("lettuce.science", []);
+    });
+
+    expect(result.current.restart.restartRequired).toBe(true);
+  });
+
+  it("records nothing when the daemon says trust applied live", async () => {
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: false });
+
+    const { result } = renderHook(() => ({
+      trust: useWriteHeadTrust(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.trust.write("lettuce.science", ["CONTAINER"]);
+    });
+
+    expect(result.current.restart.restartRequired).toBe(false);
+  });
+
+  it("records nothing when the write fails", async () => {
+    mockUpdateConfigFn.mockRejectedValue(new Error("unknown runtime"));
+
+    const { result } = renderHook(() => ({
+      trust: useWriteHeadTrust(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await expect(result.current.trust.write("lettuce.science", ["NATIVE"])).rejects.toThrow(
+        "unknown runtime"
+      );
+    });
+
+    expect(result.current.restart.restartRequired).toBe(false);
   });
 
   it("PUTs exactly the head name and the new trusted runtimes, and returns the daemon's answer", async () => {
@@ -325,7 +411,30 @@ describe("useWriteHeadTrust", () => {
 describe("useRaiseDiskAllowance", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRestartRequiredForTest();
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  it("records a pending restart only when the daemon asks for one", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig());
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: false });
+
+    const { result } = renderHook(() => ({
+      disk: useRaiseDiskAllowance(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.disk.raise(21);
+    });
+    expect(result.current.restart.restartRequired).toBe(false);
+
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: true });
+    await act(async () => {
+      await result.current.disk.raise(25);
+    });
+    expect(result.current.restart.reasons).toEqual([
+      "Your disk allowance is now 25 GB. Lettuce applies it the next time it starts.",
+    ]);
   });
 
   it("reads the current limits and PUTs the whole object with the new max_disk_gb", async () => {

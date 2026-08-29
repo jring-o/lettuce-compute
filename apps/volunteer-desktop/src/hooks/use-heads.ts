@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import { useClient } from "./use-api";
+import { markRestartRequired, useOnDaemonRestart } from "./use-restart-required";
 import type {
   ConfigResponse,
   ConfigUpdateResponse,
@@ -77,6 +78,10 @@ export function useHeads(): {
     }
   }, [client, fetchHeads]);
 
+  // A restarted daemon reconnects to its heads and applies saved trust and
+  // limits; show what it now reports.
+  useOnDaemonRestart(fetchHeads);
+
   return {
     heads,
     machine,
@@ -125,8 +130,12 @@ export function useWriteLeafPreferences(): {
 /**
  * Set a head's `trusted_runtimes` exactly. Sends only the name and the new
  * list — `PUT /api/v1/config` merges per-head fields by name — and returns
- * the daemon's answer so the caller can see `restart_required`. Resolves to
- * null when there is no client yet.
+ * the daemon's answer. Resolves to null when there is no client yet.
+ *
+ * Runtime trust is read when the daemon starts (the per-head clients are
+ * built then), so the change is recorded as waiting for a restart unless
+ * the daemon explicitly answers `restart_required: false`. An older daemon
+ * that does not report the field at all still needs the restart.
  */
 export function useWriteHeadTrust(): {
   write: (serverName: string, trustedRuntimes: string[]) => Promise<ConfigUpdateResponse | null>;
@@ -136,9 +145,15 @@ export function useWriteHeadTrust(): {
   const write = useCallback(
     async (serverName: string, trustedRuntimes: string[]) => {
       if (!client) return null;
-      return client.updateConfig({
+      const resp = await client.updateConfig({
         servers: [{ name: serverName, trusted_runtimes: trustedRuntimes }],
       });
+      if (resp?.restart_required !== false) {
+        markRestartRequired(
+          `Trust settings for ${serverName} are saved. Lettuce applies them the next time it starts.`
+        );
+      }
+      return resp;
     },
     [client]
   );
@@ -149,8 +164,9 @@ export function useWriteHeadTrust(): {
 /**
  * Raise `resource_limits.max_disk_gb`. Reads the current limits first and
  * sends the whole object with the new figure, as the settings page does, so
- * no other limit is disturbed. Returns the daemon's answer for
- * `restart_required`; null when there is no client yet.
+ * no other limit is disturbed. Returns the daemon's answer; null when there
+ * is no client yet. The disk gate reads the allowance live, so a restart is
+ * recorded only when the daemon says one is needed.
  */
 export function useRaiseDiskAllowance(): {
   raise: (gb: number) => Promise<ConfigUpdateResponse | null>;
@@ -161,9 +177,15 @@ export function useRaiseDiskAllowance(): {
     async (gb: number) => {
       if (!client) return null;
       const config = await client.config();
-      return client.updateConfig({
+      const resp = await client.updateConfig({
         resource_limits: { ...config.resource_limits, max_disk_gb: gb },
       });
+      if (resp?.restart_required === true) {
+        markRestartRequired(
+          `Your disk allowance is now ${gb} GB. Lettuce applies it the next time it starts.`
+        );
+      }
+      return resp;
     },
     [client]
   );

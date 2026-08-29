@@ -187,7 +187,11 @@ describe("useConfig", () => {
   });
 });
 
-describe("needsRestart / useRestartRequired", () => {
+describe("needsRestart and the shared restart store", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("flags only the settings the daemon reads at start", async () => {
     const { needsRestart } = await import("./use-config");
     expect(needsRestart({ scheduling: { mode: "ALWAYS" } })).toBe(true);
@@ -201,8 +205,9 @@ describe("needsRestart / useRestartRequired", () => {
     expect(needsRestart({ servers: [] })).toBe(false);
   });
 
-  it("marks a restart as required after saving a restart-only setting and clears it on demand", async () => {
-    const { useRestartRequired, resetRestartRequiredForTest } = await import("./use-config");
+  it("records a restart-only save in the shared store, with the settings reason, and clears it on demand", async () => {
+    const { useRestartRequired, resetRestartRequiredForTest, RESTART_ONLY_SETTINGS_REASON } =
+      await import("./use-restart-required");
     resetRestartRequiredForTest();
     const cfg = makeConfig();
     mockConfigFn.mockResolvedValue(cfg);
@@ -223,6 +228,7 @@ describe("needsRestart / useRestartRequired", () => {
       await result.current.cfg.updateConfig({ log_level: "debug" });
     });
     expect(result.current.restart.restartRequired).toBe(true);
+    expect(result.current.restart.reasons).toEqual([RESTART_ONLY_SETTINGS_REASON]);
 
     act(() => {
       result.current.restart.clearRestartRequired();
@@ -230,8 +236,9 @@ describe("needsRestart / useRestartRequired", () => {
     expect(result.current.restart.restartRequired).toBe(false);
   });
 
-  it("honours the daemon's own restart_required flag", async () => {
-    const { useRestartRequired, resetRestartRequiredForTest } = await import("./use-config");
+  it("honours the daemon's own restart_required flag with its own reason", async () => {
+    const { useRestartRequired, resetRestartRequiredForTest, DAEMON_FLAGGED_REASON } =
+      await import("./use-restart-required");
     resetRestartRequiredForTest();
     const cfg = makeConfig();
     mockConfigFn.mockResolvedValue(cfg);
@@ -245,6 +252,26 @@ describe("needsRestart / useRestartRequired", () => {
       await result.current.cfg.updateConfig({ servers: [] });
     });
     expect(result.current.restart.restartRequired).toBe(true);
+    expect(result.current.restart.reasons).toEqual([DAEMON_FLAGGED_REASON]);
     resetRestartRequiredForTest();
+  });
+
+  it("re-reads the config after an in-app restart", async () => {
+    const { restartLettuce, resetRestartRequiredForTest } = await import("./use-restart-required");
+    resetRestartRequiredForTest();
+    mockConfigFn.mockResolvedValue(makeConfig());
+
+    const { result } = renderHook(() => useConfig());
+    await vi.waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+    expect(mockConfigFn).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await restartLettuce();
+    });
+    await vi.waitFor(() => {
+      expect(mockConfigFn).toHaveBeenCalledTimes(2);
+    });
   });
 });

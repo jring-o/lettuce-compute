@@ -3,6 +3,9 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectsPage } from "./projects";
+import { RestartRequiredBanner } from "@/components/restart-required-banner";
+import { resetRestartRequiredForTest, useRestartRequired } from "@/hooks/use-restart-required";
+import { renderHook } from "@testing-library/react";
 import type { HeadInfo, LeafInfo, MachineCapabilities } from "@/api/client";
 
 const mockRefetch = vi.fn();
@@ -154,6 +157,7 @@ function headsState(overrides: Partial<ReturnType<typeof mockUseHeads>> = {}) {
 describe("ProjectsPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetRestartRequiredForTest();
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue(undefined);
     mockUseClient.mockReturnValue({ client: mockClient, error: null });
@@ -514,7 +518,7 @@ describe("ProjectsPage", () => {
     expect(containerChips[1]).toHaveTextContent("Container ✗");
   });
 
-  it("saves trust for the right head, updates it locally and asks for a restart", async () => {
+  it("saves trust for the right head and mirrors it locally", async () => {
     const user = userEvent.setup();
     mockUseHeads.mockReturnValue(headsState({ heads: [mockHeads[0]] }));
 
@@ -530,43 +534,6 @@ describe("ProjectsPage", () => {
     expect(mockSetTrustByHead).toHaveBeenCalled();
     const updater = mockSetTrustByHead.mock.calls[0][0];
     expect(updater({ other: [] })).toEqual({ other: [], "lettuce.science": ["CONTAINER", "NATIVE"] });
-
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Trust settings for lettuce.science are saved. Lettuce applies them the next time it starts."
-    );
-    expect(screen.getByText("Restart Lettuce now")).toBeInTheDocument();
-  });
-
-  it("still asks for a restart after a trust change when the daemon does not report restart_required", async () => {
-    const user = userEvent.setup();
-    mockUseHeads.mockReturnValue(headsState({ heads: [mockHeads[0]] }));
-    // An older daemon echoes the whole config with no restart hint.
-    mockWriteHeadTrust.mockResolvedValue({ data_dir: "/x" });
-
-    render(<ProjectsPage />);
-
-    await user.click(screen.getByText("Change..."));
-    await user.click(screen.getByText("Save trust settings"));
-
-    await waitFor(() => {
-      expect(screen.getByText("Restart Lettuce now")).toBeInTheDocument();
-    });
-  });
-
-  it("does not ask for a restart when the daemon says trust applied live", async () => {
-    const user = userEvent.setup();
-    mockUseHeads.mockReturnValue(headsState({ heads: [mockHeads[0]] }));
-    mockWriteHeadTrust.mockResolvedValue({ status: "ok", restart_required: false });
-
-    render(<ProjectsPage />);
-
-    await user.click(screen.getByText("Change..."));
-    await user.click(screen.getByText("Save trust settings"));
-
-    await waitFor(() => {
-      expect(mockWriteHeadTrust).toHaveBeenCalled();
-    });
-    expect(screen.queryByText("Restart Lettuce now")).not.toBeInTheDocument();
   });
 
   it("shows the daemon's error in the trust editor when the save fails", async () => {
@@ -585,7 +552,6 @@ describe("ProjectsPage", () => {
       expect(screen.getByText("unknown runtime")).toBeInTheDocument();
     });
     expect(mockSetTrustByHead).not.toHaveBeenCalled();
-    expect(screen.queryByText("Restart Lettuce now")).not.toBeInTheDocument();
   });
 
   // --- Disk gate ---
@@ -618,89 +584,80 @@ describe("ProjectsPage", () => {
     await waitFor(() => {
       expect(mockRefetch).toHaveBeenCalled();
     });
-    // The daemon applied it live: no restart banner.
-    expect(screen.queryByText("Restart Lettuce now")).not.toBeInTheDocument();
-  });
-
-  it("asks for a restart after raising the allowance only when the daemon says so", async () => {
-    const user = userEvent.setup();
-    mockUseHeads.mockReturnValue(headsState({ heads: gatedHeads() }));
-    mockRaiseDisk.mockResolvedValue({ status: "ok", restart_required: true });
-
-    render(<ProjectsPage />);
-
-    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
-
-    await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent(
-        "Your disk allowance is now 21 GB. Lettuce applies it the next time it starts."
-      );
-    });
   });
 
   // --- Add server ---
 
-  it("attaching a head refreshes the list and asks for a restart", async () => {
-    const user = userEvent.setup();
+  /** Attach a head through the dialog; the page records the pending restart. */
+  async function attachNewHead(user: ReturnType<typeof userEvent.setup>) {
     mockInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "test_server_connection") return { status: "healthy" };
       if (cmd === "fetch_head_info") return { name: "New Head", description: "", leafs: [] };
       return undefined;
     });
-
-    render(<ProjectsPage />);
-
     await user.click(screen.getByText("+ Add Server"));
     await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://new.example.org");
     await user.click(screen.getByText("Test Connection"));
     await waitFor(() => expect(screen.getByText("Attach")).toBeInTheDocument());
     await user.click(screen.getByText("Attach"));
+    await waitFor(() => expect(mockClient.attachHead).toHaveBeenCalled());
+  }
 
-    await waitFor(() => {
-      expect(mockClient.attachHead).toHaveBeenCalledWith({
-        server_address: "https://new.example.org",
-        name: undefined,
-        trusted_runtimes: ["CONTAINER"],
-      });
+  it("attaching a head refreshes the list and records a pending restart", async () => {
+    const user = userEvent.setup();
+    const { result: restart } = renderHook(() => useRestartRequired());
+
+    render(<ProjectsPage />);
+    await attachNewHead(user);
+
+    expect(mockClient.attachHead).toHaveBeenCalledWith({
+      server_address: "https://new.example.org",
+      name: undefined,
+      trusted_runtimes: ["CONTAINER"],
     });
     expect(mockRefetch).toHaveBeenCalled();
+    expect(restart.current.reasons).toEqual([
+      "New Head is attached. Lettuce starts fetching work from it the next time it starts.",
+    ]);
+  });
+
+  // --- Restart banner (mounted once in the tab layout, above every page) ---
+
+  it("the app-wide banner shows the attach reason and restarting from it hides it", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <>
+        <RestartRequiredBanner />
+        <ProjectsPage />
+      </>
+    );
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    await attachNewHead(user);
+
     expect(screen.getByRole("status")).toHaveTextContent(
       "New Head is attached. Lettuce starts fetching work from it the next time it starts."
     );
-  });
 
-  // --- Restart banner ---
-
-  it("restarting from the banner restarts the daemon, hides the banner and refetches", async () => {
-    const user = userEvent.setup();
-    mockUseHeads.mockReturnValue(headsState({ heads: [mockHeads[0]] }));
-
-    render(<ProjectsPage />);
-
-    await user.click(screen.getByText("Change..."));
-    await user.click(screen.getByText("Save trust settings"));
-    await waitFor(() => expect(screen.getByText("Restart Lettuce now")).toBeInTheDocument());
-
-    mockRefetch.mockClear();
     await user.click(screen.getByText("Restart Lettuce now"));
-
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("restart_daemon");
     });
     await waitFor(() => {
       expect(screen.queryByRole("status")).not.toBeInTheDocument();
     });
-    expect(mockRefetch).toHaveBeenCalled();
   });
 
   it("the banner can be dismissed without restarting", async () => {
     const user = userEvent.setup();
-    mockUseHeads.mockReturnValue(headsState({ heads: [mockHeads[0]] }));
 
-    render(<ProjectsPage />);
-
-    await user.click(screen.getByText("Change..."));
-    await user.click(screen.getByText("Save trust settings"));
+    render(
+      <>
+        <RestartRequiredBanner />
+        <ProjectsPage />
+      </>
+    );
+    await attachNewHead(user);
     await waitFor(() => expect(screen.getByText("Restart Lettuce now")).toBeInTheDocument());
 
     await user.click(screen.getByLabelText("Dismiss restart notice"));

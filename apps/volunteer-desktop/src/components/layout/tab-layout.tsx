@@ -4,6 +4,7 @@ import { Activity, FolderKanban, Clock, Settings } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { StatusBar } from "./status-bar";
 import { UpdateBanner } from "@/components/update-banner";
+import { RestartRequiredBanner } from "@/components/restart-required-banner";
 import { OverviewPage } from "@/pages/overview";
 import { ProjectsPage } from "@/pages/projects";
 import { HistoryPage } from "@/pages/history";
@@ -43,6 +44,7 @@ export function TabLayout() {
         </div>
 
         <UpdateBanner />
+        <RestartRequiredBanner />
         <div className="flex-1 overflow-auto">
           <TabsContent value="overview">
             <OverviewPage />
