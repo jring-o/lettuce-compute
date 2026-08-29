@@ -30,6 +30,11 @@ type Fetcher struct {
 	maxBackoff  time.Duration
 	cachedHW    *lettucev1.HardwareCapabilities
 	pubKey      ed25519.PublicKey
+	// notices receives the fetcher's volunteer-facing escalations (too-old
+	// rejection, runtime breaker trip, no-work diagnostic); headStatus keeps
+	// each head's update-required flag current. Both are nil-safe.
+	notices    *NoticeLog
+	headStatus *HeadStatusTracker
 
 	// reRegisterFn re-registers this machine against one head after a host-unknown
 	// work-path refusal (BG-25 self-heal): it discards the refused id, registers with an
@@ -232,6 +237,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		maxBackoff:               d.maxBackoff,
 		cachedHW:                 d.cachedHW,
 		pubKey:                   d.pubKey,
+		notices:                  d.notices,
+		headStatus:               d.headStatus,
 		reRegisterFn:             d.reRegisterHost,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
@@ -450,11 +457,19 @@ func (f *Fetcher) warnNoWork() {
 	if totalLeafs > 0 && containerBlocked == totalLeafs {
 		f.logger.Warn("connected but getting no work: every attached leaf needs a container runtime this volunteer doesn't have — install Docker or Podman (see the volunteer setup docs), or attach a head with native leafs",
 			"runtimes", runtimes, "leafs", totalLeafs)
+		f.notices.Notify(NoticeWarn, "no_work",
+			fmt.Sprintf("Connected but getting no work: all %d attached leaf(s) need a container runtime this machine does not have (available: %s). Install Docker or Podman, or attach a head with native leafs.",
+				totalLeafs, strings.Join(runtimes, ", ")),
+			"", "")
 		return
 	}
 	f.logger.Warn("connected but getting no work after repeated polls — the head has no matching units for this volunteer right now",
 		"runtimes", runtimes, "attached_leafs", totalLeafs,
 		"hint", "normal if the queue is just empty; if it persists, check that your runtimes match the leafs and that disk/scheduling aren't pausing fetches")
+	f.notices.Notify(NoticeWarn, "no_work",
+		fmt.Sprintf("Connected but getting no work after repeated polls: the attached heads have no units matching this machine right now (%d attached leaf(s); runtimes: %s). This is normal when a queue is empty; if it persists, check that the leafs match this machine's runtimes and that disk space or the schedule is not pausing fetches.",
+			totalLeafs, strings.Join(runtimes, ", ")),
+		"", "")
 }
 
 // fetchOne issues at most one RequestWorkUnit (to the first eligible head/leaf
@@ -743,6 +758,10 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		if client.IsVolunteerTooOldError(err) {
 			f.logger.Warn("fetcher: this volunteer build is too old for the head; run 'lettuce-volunteer update'",
 				"server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+			f.headStatus.MarkUpdateRequired(head.Config.GRPCAddress)
+			f.notices.Notify(NoticeWarn, "update_required",
+				fmt.Sprintf("Head %q rejected this volunteer build as too old; it will not serve work until the volunteer is updated. Run 'lettuce-volunteer update'. (%s)", head.Name, st.Message()),
+				head.Name, "")
 		} else {
 			// Connection error (Unavailable/Internal/etc.): no delay to obey, so fall
 			// back to the per-head exponential reconnect backoff.
@@ -762,9 +781,11 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	}
 
 	// Success: obey the server-directed retry delay on EVERY reply, including the
-	// no-work path.
+	// no-work path. A head that answered is not rejecting this build, so any
+	// update-required flag it earned is cleared.
 	head.Available = true
 	head.Backoff = 0
+	f.headStatus.MarkContactOK(head.Config.GRPCAddress)
 	f.applyServerRetryDelay(head, resp.RetryAfterSeconds)
 
 	// No-work is an OK response carrying an empty assignments list (the
@@ -1088,6 +1109,10 @@ func (f *Fetcher) recordRuntimeAbandon(name string, err error) {
 		"last_error", err,
 		"remedy", remedyForRuntime(name),
 		"cooldown", runtimeAbandonCooldown)
+	f.notices.Notify(NoticeWarn, "prepare_failed",
+		fmt.Sprintf("The %s runtime failed to prepare work %d times in a row (last error: %v). Requests for leafs that need it are paused for %s, then retried once. %s",
+			name, count, err, runtimeAbandonCooldown, remedyForRuntime(name)),
+		"", "")
 }
 
 // resetRuntimeAbandon clears the abandon counter and any pause for a runtime
