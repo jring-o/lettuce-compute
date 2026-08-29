@@ -1,7 +1,11 @@
 use crate::api::{DaemonInfo, ManagementClient};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// `GET /api/v1/container-runtime`. Every field defaults when absent; the
+/// machine sizes are integers on the daemon side but are read as i64 so a
+/// future change in width cannot fail deserialization.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct ContainerRuntimeStatus {
     pub backend: String,
     pub status: String,
@@ -9,9 +13,9 @@ pub struct ContainerRuntimeStatus {
     pub socket_path: String,
     pub machine_required: bool,
     pub machine_name: String,
-    pub machine_cpus: i32,
-    pub machine_memory_mb: i32,
-    pub machine_disk_gb: i32,
+    pub machine_cpus: i64,
+    pub machine_memory_mb: i64,
+    pub machine_disk_gb: i64,
     pub error: Option<String>,
 }
 
@@ -22,7 +26,8 @@ pub struct SetupRequest {
     pub disk_gb: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 pub struct SetupResponse {
     pub status: String,
     pub message: String,

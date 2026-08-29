@@ -10,7 +10,10 @@ use tokio::sync::Mutex;
 use crate::api::ManagementClient;
 use crate::sidecar;
 
+/// The `notifications` block of `GET /api/v1/config`. Fields the daemon does
+/// not send fall back to the app defaults below rather than failing the parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NotificationPreferences {
     pub credit_milestones: bool,
     pub credit_milestone_threshold: i64,
@@ -58,20 +61,26 @@ fn save_milestone_state(state: &MilestoneState) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct ConfigResponse {
     notifications: NotificationPreferences,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `GET /api/v1/credit`, reduced to the total. Credit is a decimal on the
+/// daemon side (heads report fractional credit), so it must be read as f64;
+/// milestone arithmetic below works on the whole-credit floor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct CreditResponse {
-    total_credit: i64,
+    total_credit: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct StatusResponse {
     state: String,
-    connected_servers: u32,
+    connected_servers: i64,
     active_tasks: Vec<serde_json::Value>,
 }
 
@@ -79,7 +88,7 @@ struct NotificationState {
     prev_credit: i64,
     prev_task_count: usize,
     prev_state: String,
-    prev_connected: u32,
+    prev_connected: i64,
     milestones: MilestoneState,
     prefs: NotificationPreferences,
 }
@@ -132,10 +141,11 @@ async fn poll_and_notify(app: &AppHandle, state: &Arc<Mutex<NotificationState>>)
 
     // Check credit milestones
     if let Some(credit_resp) = &credit {
+        let total_credit = credit_resp.total_credit.max(0.0).floor() as i64;
         if s.prefs.credit_milestones && s.prev_credit >= 0 {
-            check_credit_milestones(app, &mut s, credit_resp.total_credit);
+            check_credit_milestones(app, &mut s, total_credit);
         }
-        s.prev_credit = credit_resp.total_credit;
+        s.prev_credit = total_credit;
     }
 
     // Check work unit completion (task count decreased = something finished)

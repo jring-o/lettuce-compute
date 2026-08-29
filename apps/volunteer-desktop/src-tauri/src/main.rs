@@ -102,9 +102,12 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            commands::get_daemon_info,
+            api::mgmt_request,
             commands::is_initialized,
             commands::run_init,
+            commands::restart_daemon,
+            commands::get_client_version,
+            commands::system_metrics,
             commands::quit_app,
             commands::is_autostart_enabled,
             commands::set_autostart,

@@ -1,6 +1,8 @@
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sysinfo::System;
 use tauri::AppHandle;
 
 use crate::api::ManagementClient;
@@ -79,12 +81,7 @@ fn daemon_client() -> Result<ManagementClient, String> {
     Ok(ManagementClient::from_daemon_info(&info))
 }
 
-#[derive(Debug, Serialize)]
-pub struct DaemonConnection {
-    pub port: u16,
-    pub token: String,
-}
-
+/// Choices the setup wizard hands to `lettuce-volunteer init`.
 #[derive(Debug, Deserialize)]
 pub struct InitConfig {
     pub cpu_cores: Option<u32>,
@@ -93,19 +90,43 @@ pub struct InitConfig {
     pub disk_gb: Option<u32>,
     pub schedule_mode: Option<String>,
     pub idle_threshold_mins: Option<u32>,
-    pub schedule_start_hour: Option<u32>,
-    pub schedule_end_hour: Option<u32>,
     pub server_url: Option<String>,
+    /// Runtimes the volunteer trusts the head at `server_url` to run on this
+    /// machine beyond the always-allowed WASM sandbox: any of `container`,
+    /// `native` (case-insensitive). Empty means WASM only. Sent as `--trust`
+    /// whenever `--server` is sent.
+    #[serde(default)]
+    pub trust: Vec<String>,
     pub enabled_leafs: Option<Vec<String>>,
 }
 
-#[tauri::command]
-pub async fn get_daemon_info() -> Result<DaemonConnection, String> {
-    let info = sidecar::read_daemon_json()?;
-    Ok(DaemonConnection {
-        port: info.port,
-        token: info.token,
-    })
+/// Build the `--trust` value for `lettuce-volunteer init`. The accepted names
+/// mirror the CLI's `parseTrustRuntimes`: `container` and `native` opt in,
+/// `wasm` and `none` are no-ops (WASM is always allowed). An empty selection is
+/// sent as `none` so the head is recorded as an explicit WASM-only decision.
+fn trust_flag_value(trust: &[String]) -> Result<String, String> {
+    let mut chosen: Vec<String> = Vec::new();
+    for raw in trust {
+        let name = raw.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "" | "none" | "wasm" => {}
+            "container" | "native" => {
+                if !chosen.contains(&name) {
+                    chosen.push(name);
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Unknown runtime trust value {other:?} (valid: container, native)"
+                ))
+            }
+        }
+    }
+    if chosen.is_empty() {
+        return Ok("none".into());
+    }
+    chosen.sort();
+    Ok(chosen.join(","))
 }
 
 #[tauri::command]
@@ -152,6 +173,8 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
         if !url.is_empty() {
             args.push("--server".into());
             args.push(url.clone());
+            args.push("--trust".into());
+            args.push(trust_flag_value(&config.trust)?);
         }
     }
 
@@ -162,12 +185,7 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
         }
     }
 
-    let binary = sidecar::find_sidecar_binary()?;
-
-    let output = std::process::Command::new(&binary)
-        .args(&args)
-        .output()
-        .map_err(|e| format!("Failed to run init: {}", e))?;
+    let output = sidecar::run_sidecar(&args)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -284,6 +302,66 @@ pub async fn install_podman(
     Ok(podman_path)
 }
 
+/// Restart the volunteer daemon (graceful stop, forced after 30 s, then start).
+/// Blocks for up to about 70 s in the worst case, off the async runtime.
+#[tauri::command]
+pub async fn restart_daemon() -> Result<(), String> {
+    tokio::task::spawn_blocking(sidecar::restart_daemon)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|_| ())
+}
+
+/// The bundled CLI's version string (`lettuce-volunteer --version`).
+#[tauri::command]
+pub async fn get_client_version() -> Result<String, String> {
+    tokio::task::spawn_blocking(sidecar::client_version)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Host-wide resource usage read by the app itself. The daemon's
+/// `GET /api/v1/metrics` reports zeros for these (it has no platform collector).
+#[derive(Debug, Clone, Serialize)]
+pub struct SystemMetrics {
+    pub cpu_usage_pct: f64,
+    pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
+}
+
+/// One `sysinfo::System` kept for the life of the process. CPU usage is the
+/// change between two samples, so a fresh `System` per call would always read
+/// zero; keeping one means each call measures since the previous call.
+fn shared_system() -> &'static Mutex<System> {
+    static SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        let mut sys = System::new();
+        // Prime the first sample so the very first reading is real, not zero.
+        sys.refresh_cpu_usage();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_cpu_usage();
+        Mutex::new(sys)
+    })
+}
+
+#[tauri::command]
+pub async fn system_metrics() -> Result<SystemMetrics, String> {
+    tokio::task::spawn_blocking(|| {
+        let mut sys = shared_system()
+            .lock()
+            .map_err(|_| "system metrics state is poisoned".to_string())?;
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
+        Ok(SystemMetrics {
+            cpu_usage_pct: f64::from(sys.global_cpu_usage()),
+            memory_used_mb: sys.used_memory() / 1024 / 1024,
+            memory_total_mb: sys.total_memory() / 1024 / 1024,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Total physical system memory in MB. The setup wizard uses this to size the
 /// memory slider to real hardware instead of a hardcoded 8 GB assumption — the
 /// old hardcode capped advertised memory at ~7.4 GB, below the floor of
@@ -291,8 +369,35 @@ pub async fn install_podman(
 /// matched to that work. Returns 0 on failure; the caller falls back.
 #[tauri::command]
 pub fn get_system_memory_mb() -> u64 {
-    use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
     sys.total_memory() / 1024 / 1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trust_flag_value;
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_trust_is_none() {
+        assert_eq!(trust_flag_value(&[]).unwrap(), "none");
+        assert_eq!(trust_flag_value(&strings(&["wasm", "none", ""])).unwrap(), "none");
+    }
+
+    #[test]
+    fn trust_is_normalised_and_deduplicated() {
+        assert_eq!(
+            trust_flag_value(&strings(&["Native", "container", "CONTAINER"])).unwrap(),
+            "container,native"
+        );
+    }
+
+    #[test]
+    fn unknown_trust_is_rejected() {
+        assert!(trust_flag_value(&strings(&["docker"])).is_err());
+    }
 }
