@@ -5,7 +5,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::api::DaemonInfo;
-use crate::container_runtime;
 
 pub fn lettuce_dir() -> PathBuf {
     dirs::home_dir()
@@ -215,37 +214,6 @@ pub fn wait_for_daemon(timeout: Duration) -> Result<DaemonInfo, String> {
     }
 }
 
-pub fn stop_sidecar(pid: u32) -> Result<(), String> {
-    terminate_process(pid)?;
-
-    let timeout = Duration::from_secs(30);
-    let start = Instant::now();
-    let poll_interval = Duration::from_millis(200);
-
-    loop {
-        if !is_pid_alive(pid) {
-            let _ = fs::remove_file(daemon_json_path());
-            return Ok(());
-        }
-
-        if start.elapsed() > timeout {
-            force_kill(pid)?;
-            let _ = fs::remove_file(daemon_json_path());
-            return Ok(());
-        }
-
-        std::thread::sleep(poll_interval);
-    }
-}
-
-pub fn shutdown(app: &tauri::AppHandle) {
-    if let Ok(info) = read_daemon_json() {
-        container_runtime::ensure_podman_state(&info, "stopped");
-        let _ = stop_sidecar(info.pid);
-    }
-    app.exit(0);
-}
-
 /// Ask the daemon to suspend all compute, save PIDs, release Job Object, and exit.
 /// Frozen processes survive as orphans for the next launch.
 pub fn suspend_and_quit_sidecar() -> Result<(), String> {
@@ -325,17 +293,21 @@ extern "system" {
     fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
 }
 
+/// Kill `pid` outright (SIGKILL). The last resort after `lettuce-volunteer
+/// stop --force` and the management API's suspend-and-quit have both failed.
 #[cfg(unix)]
-fn terminate_process(pid: u32) -> Result<(), String> {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+fn force_kill(pid: u32) -> Result<(), String> {
+    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     if result != 0 {
-        return Err(format!("Failed to send SIGTERM to PID {}", pid));
+        return Err(format!("Failed to send SIGKILL to PID {}", pid));
     }
     Ok(())
 }
 
+/// Kill `pid` outright. Windows has no graceful signal; `TerminateProcess`
+/// is the only kill there is.
 #[cfg(windows)]
-fn terminate_process(pid: u32) -> Result<(), String> {
+fn force_kill(pid: u32) -> Result<(), String> {
     const PROCESS_TERMINATE: u32 = 0x0001;
 
     unsafe {
@@ -350,19 +322,4 @@ fn terminate_process(pid: u32) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn force_kill(pid: u32) -> Result<(), String> {
-    let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if result != 0 {
-        return Err(format!("Failed to send SIGKILL to PID {}", pid));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn force_kill(pid: u32) -> Result<(), String> {
-    // On Windows, TerminateProcess is already a force kill
-    terminate_process(pid)
 }

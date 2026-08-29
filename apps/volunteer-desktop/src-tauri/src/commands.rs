@@ -288,13 +288,6 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn quit_app(app: AppHandle) -> Result<(), String> {
-    let _ = tokio::task::spawn_blocking(|| sidecar::suspend_and_quit_sidecar()).await;
-    app.exit(0);
-    Ok(())
-}
-
-#[tauri::command]
 pub async fn is_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     autostart::is_autostart_enabled(&app)
 }
@@ -307,11 +300,6 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> 
 #[tauri::command]
 pub async fn regenerate_keypair() -> Result<String, String> {
     daemon_client()?.regenerate_keypair().await
-}
-
-#[tauri::command]
-pub async fn check_update(app: AppHandle) -> Result<Option<updater::UpdateInfo>, String> {
-    updater::check_for_updates(&app).await
 }
 
 #[tauri::command]

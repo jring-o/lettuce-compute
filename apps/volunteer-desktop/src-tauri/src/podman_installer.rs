@@ -14,14 +14,6 @@ pub struct PodmanPrerequisites {
     pub needs_install: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct InstallProgress {
-    pub stage: String,
-    pub message: String,
-    pub done: bool,
-    pub error: Option<String>,
-}
-
 /// Check if WSL2 is available on this Windows machine.
 fn check_wsl_available() -> bool {
     // Try `wsl --status` — returns 0 if WSL is installed and configured

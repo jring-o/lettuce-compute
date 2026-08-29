@@ -53,24 +53,6 @@ pub struct ActiveTaskInfo {
     pub work_dir: String,
 }
 
-/// `GET /api/v1/metrics`. The daemon reports zeros for CPU, GPU, memory and
-/// temperatures (no platform collector yet); the disk figures are the fetch
-/// gate's own measurement of Lettuce's footprint against its allowance, in MB.
-/// `disk_usage_known` false means `disk_used_mb` is not a measurement.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MetricsResponse {
-    pub cpu_usage_pct: f64,
-    pub gpu_usage_pct: f64,
-    pub memory_used_mb: i64,
-    pub memory_total_mb: i64,
-    pub disk_used_mb: i64,
-    pub disk_allowance_mb: i64,
-    pub disk_usage_known: bool,
-    pub cpu_temp_c: i64,
-    pub gpu_temp_c: i64,
-}
-
 /// A failed management-API call, in the shape the web view receives when
 /// `mgmt_request` rejects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,10 +268,6 @@ impl ManagementClient {
 
     pub async fn suspend_and_quit(&self) -> Result<(), String> {
         self.post("/api/v1/daemon/suspend-and-quit").await
-    }
-
-    pub async fn metrics(&self) -> Result<MetricsResponse, String> {
-        self.get("/api/v1/metrics").await
     }
 
     pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
