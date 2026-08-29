@@ -1,0 +1,4 @@
+# Shell scripts must keep Unix line endings on every checkout: bash treats a carriage
+# return as part of the command, so a CRLF checkout on Windows (core.autocrlf=true)
+# would break the desktop app's build-sidecar.sh under Git Bash.
+*.sh text eol=lf
