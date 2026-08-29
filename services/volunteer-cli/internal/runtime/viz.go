@@ -23,6 +23,25 @@ func vizCacheDir(dataDir string) string {
 // vizBundleDir is the directory name within a work directory for extracted viz bundles.
 const vizBundleDir = ".lettuce-viz"
 
+// VizBundleKey is the identity of a visualization bundle on this machine: its
+// expected SHA-256 (lowercase hex) when the execution spec carries one, else
+// the SHA-256 of its URL. It names the cached tarball (see VizTarballPath) and
+// the daemon's persistent extracted copy for result replay, so the two always
+// agree on which bundle is which.
+func VizBundleKey(vizURL, expectedChecksum string) string {
+	if expectedChecksum != "" {
+		return expectedChecksum
+	}
+	h := sha256.Sum256([]byte(vizURL))
+	return hex.EncodeToString(h[:])
+}
+
+// VizTarballPath returns where EnsureVizBundle caches the bundle with the
+// given key: {dataDir}/cache/viz/<key>.tar.gz.
+func VizTarballPath(dataDir, key string) string {
+	return filepath.Join(vizCacheDir(dataDir), key+".tar.gz")
+}
+
 // EnsureVizBundle downloads a viz bundle tarball if not cached, returning the cached path.
 //
 // SECURITY (C2): when expectedChecksum is set (lowercase hex SHA-256) the cache is
@@ -37,15 +56,10 @@ func EnsureVizBundle(ctx context.Context, dataDir string, vizURL string, expecte
 		return "", fmt.Errorf("create viz cache dir: %w", err)
 	}
 
-	var cacheKey string
-	if expectedChecksum != "" {
-		cacheKey = expectedChecksum + ".tar.gz"
-	} else {
-		h := sha256.Sum256([]byte(vizURL))
-		cacheKey = hex.EncodeToString(h[:]) + ".tar.gz"
+	if expectedChecksum == "" {
 		logger.Warn("viz bundle has no checksum in execution spec; proceeding unverified (sandboxed)", "url", vizURL)
 	}
-	cachePath := filepath.Join(cacheDir, cacheKey)
+	cachePath := VizTarballPath(dataDir, VizBundleKey(vizURL, expectedChecksum))
 
 	// Check cache.
 	if _, err := os.Stat(cachePath); err == nil {
@@ -153,7 +167,16 @@ const (
 // breach the partially-extracted destDir is removed so the caller cannot
 // observe (or later run from) a torn extraction.
 func ExtractVizBundle(tarballPath string, workDir string) (string, error) {
-	destDir := filepath.Join(workDir, vizBundleDir)
+	return ExtractVizBundleTo(tarballPath, filepath.Join(workDir, vizBundleDir))
+}
+
+// ExtractVizBundleTo extracts a viz tarball into destDir (created if absent)
+// under the same traversal and size caps as ExtractVizBundle, and returns the
+// bundle root — destDir itself, or its single wrapper directory — that holds
+// index.html. On any failure the partially-extracted destDir is removed. The
+// daemon uses this to keep a persistent extracted copy for result replay
+// outside the work directory, which is deleted on completion.
+func ExtractVizBundleTo(tarballPath string, destDir string) (string, error) {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return "", fmt.Errorf("create viz bundle dir: %w", err)
 	}

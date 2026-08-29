@@ -246,6 +246,21 @@ type Daemon struct {
 	slotStarveMu       sync.Mutex
 	slotStarvedSince   time.Time
 	slotStarveWarnedAt time.Time
+
+	// Volunteer-facing notices (see notices.go): the log's WARN/escalation
+	// sites mirrored into a ring the management API serves, so a desktop
+	// client can show what the log would otherwise say only to a reader of
+	// the log. Shared with the thermal monitor and the fetcher.
+	notices *NoticeLog
+
+	// Per-head version and update-required state (see head_status.go),
+	// keyed by gRPC address. Seeded at start-up from registration, then kept
+	// current by the fetcher on every work request to the head.
+	headStatus *HeadStatusTracker
+
+	// clientVersion is this build's version string, reported on the
+	// management API's status so a client can compare it with each head's.
+	clientVersion string
 }
 
 // DaemonConfig holds all dependencies for creating a Daemon.
@@ -260,6 +275,16 @@ type DaemonConfig struct {
 
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
+
+	// ClientVersion is this build's version string (the value `--version`
+	// prints), surfaced on GET /api/v1/status as client_version.
+	ClientVersion string
+	// Notices and HeadStatus are created by the daemon when nil. Start-up
+	// passes its own so notices and head state observed BEFORE the daemon
+	// exists — a too-old rejection at registration, a head's reported version
+	// — are carried into the running daemon rather than lost.
+	Notices    *NoticeLog
+	HeadStatus *HeadStatusTracker
 
 	// Legacy single-server fields (used if Servers is empty).
 	Client      WorkClient
@@ -345,6 +370,20 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	thermalMonitor := runtime.NewThermalMonitor(thermalCfg, thermalPauseCh, cfg.Logger)
 
+	// Notices and per-head state: adopt start-up's instances when given (they
+	// may already hold a registration-time rejection), else start empty.
+	notices := cfg.Notices
+	if notices == nil {
+		notices = NewNoticeLog()
+	}
+	headStatus := cfg.HeadStatus
+	if headStatus == nil {
+		headStatus = NewHeadStatusTracker()
+	}
+	// The thermal monitor emits its own throttle notices (it alone knows the
+	// temperatures and the cause); it only needs somewhere to put them.
+	thermalMonitor.SetNoticeSink(notices)
+
 	// Build multi-server client. Support both new Servers field and legacy
 	// Client/VolunteerID for backward compatibility with existing tests.
 	servers := cfg.Servers
@@ -424,7 +463,25 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		benchmarkFPOPS:   benchFPOPS,
 		dcfTracker:       dcfTracker,
 		arrivalEstSec:    make(map[string]float64),
+		notices:          notices,
+		headStatus:       headStatus,
+		clientVersion:    cfg.ClientVersion,
 	}
+}
+
+// Notices returns the daemon's volunteer-facing notice ring.
+func (d *Daemon) Notices() *NoticeLog {
+	return d.notices
+}
+
+// HeadStatus returns the per-head version and update-required tracker.
+func (d *Daemon) HeadStatus() *HeadStatusTracker {
+	return d.headStatus
+}
+
+// ClientVersion returns this build's version string as configured at start-up.
+func (d *Daemon) ClientVersion() string {
+	return d.clientVersion
 }
 
 // Run starts the coordinator loop. It blocks until ctx is cancelled or Stop() is called.
@@ -834,11 +891,19 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	// nothing about whether the artifact runs here.
 	d.noteLeafSuccess(wu)
 
-	// Persist result JSON for replay if the leaf has a viz bundle.
+	// Persist result JSON for replay if the leaf has a viz bundle. The bundle
+	// the runtime extracted into the work directory is already gone (the slot
+	// removed the work directory on completion), so SaveResult re-extracts a
+	// persistent copy from the cached tarball, identified by the spec's URL
+	// and checksum.
 	if result.VizBundlePath != "" && len(result.Result.OutputData) > 0 {
 		leafName, leafSlug := d.resolveLeafInfo(wu.LeafID)
 		maxBytes := int64(d.cfg.ResultCacheMaxMB) * 1024 * 1024
-		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, result.VizBundlePath, maxBytes); err != nil {
+		viz := VizBundleSource{
+			URL:      wu.ExecutionSpec.Binaries["viz"],
+			Checksum: strings.ToLower(wu.ExecutionSpec.BinaryChecksums["viz"]),
+		}
+		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, viz, maxBytes); err != nil {
 			d.logger.Warn("failed to persist result for replay",
 				"work_unit_id", wu.ID,
 				"error", err,
@@ -1268,7 +1333,7 @@ func (d *Daemon) shouldFetch() bool {
 	// The absolute floor: below this nothing runs at all.
 	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, DiskFloorMB); err != nil {
 		d.warnDiskGateOnce(fmt.Sprintf("free space on the data dir (%s) is below the %d MB floor the fetch gate needs to run any work: %v",
-			d.cfg.DataDir, DiskFloorMB, err))
+			d.cfg.DataDir, DiskFloorMB, err), "", "", 0)
 		return false
 	}
 
@@ -1278,14 +1343,15 @@ func (d *Daemon) shouldFetch() bool {
 		// gate the any-leaf request on the unknown-need fallback, since the
 		// leaf's real requirement is unknowable here.
 		if ok, reason := d.leafDiskGate(anyLeafInfo); !ok {
-			d.warnDiskGateOnce(reason)
+			d.warnDiskGateOnce(reason, "", "", d.leafRaiseToGB(anyLeafInfo))
 			return false
 		}
 		d.clearDiskGateWarning()
 		return true
 	}
 
-	var gatedLabel, gatedReason string
+	var gatedLabel, gatedLeafID, gatedReason string
+	var gatedRaiseToGB int
 	sawFetchable := false
 	for _, leaf := range leafs {
 		// A leaf that requires a GPU this machine does not offer is refused by
@@ -1306,7 +1372,9 @@ func (d *Daemon) shouldFetch() bool {
 			if gatedLabel == "" {
 				gatedLabel = leaf.ID
 			}
+			gatedLeafID = leaf.ID
 			gatedReason = reason
+			gatedRaiseToGB = d.leafRaiseToGB(leaf)
 		}
 	}
 	if !sawFetchable {
@@ -1319,7 +1387,8 @@ func (d *Daemon) shouldFetch() bool {
 	// Every fetchable leaf is disk-gated; surface one representative reason,
 	// naming its leaf — an unnamed "this leaf" sent a tester hunting through
 	// the catalog for which leaf the numbers belonged to (TB-30).
-	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason))
+	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason),
+		gatedLabel, gatedLeafID, gatedRaiseToGB)
 	return false
 }
 
@@ -1811,10 +1880,15 @@ func (d *Daemon) trackSlotStarvation() {
 	if len(items) > 0 && items[0].WU != nil {
 		_, reason = d.canAccommodateWU(items[0].WU)
 	}
+	idleFor := now.Sub(d.slotStarvedSince).Round(time.Second).String()
 	d.logger.Warn("an execution slot is idle but none of the buffered work units can start on this machine — requesting admissible work from the attached heads, but none has served any",
-		"idle_for", now.Sub(d.slotStarvedSince).Round(time.Second).String(),
+		"idle_for", idleFor,
 		"buffered_units", len(items),
 		"head_of_buffer_reason", reason)
+	d.notices.Notify(NoticeWarn, "buffer_unrunnable",
+		fmt.Sprintf("An execution slot has been idle for %s: %d work unit(s) are buffered but none can start on this machine (%s). The daemon is asking the attached heads for work that fits, but none has served any yet.",
+			idleFor, len(items), reason),
+		"", "")
 }
 
 // warnDiskGateOnce surfaces the disk-space stall. The first time the gate
@@ -1822,7 +1896,14 @@ func (d *Daemon) trackSlotStarvation() {
 // reason (which names the numbers and the setting involved); subsequent blocked
 // polls stay at Debug so the log isn't spammed. clearDiskGateWarning resets it
 // so a later recovery and re-stall warns again.
-func (d *Daemon) warnDiskGateOnce(reason string) {
+//
+// leafLabel and leafID name the representative gated leaf (empty when the
+// stall is the absolute floor or the any-leaf fallback); raiseToGB is the
+// max_disk_gb that would cover that leaf on this machine today (0 = not
+// applicable). Both go into the volunteer-facing notice, which must name the
+// leaf and the allowance that clears it — a refusal that names neither sent a
+// tester on a raise-and-chase (TB-41).
+func (d *Daemon) warnDiskGateOnce(reason, leafLabel, leafID string, raiseToGB int) {
 	d.diskGateMu.Lock()
 	already := d.diskGateWarned
 	d.diskGateWarned = true
@@ -1836,6 +1917,16 @@ func (d *Daemon) warnDiskGateOnce(reason string) {
 	d.logger.Warn("not fetching work: disk-gated — this volunteer stays idle until it clears",
 		"reason", reason,
 		"data_dir_free_mb", client.DiskAvailableMB(d.cfg.DataDir))
+
+	msg := "Not fetching work: " + reason + "."
+	if leafLabel != "" && raiseToGB > 0 {
+		msg += fmt.Sprintf(" Leaf %q would be covered by max_disk_gb = %d (currently %d).",
+			leafLabel, raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
+	} else if raiseToGB > 0 {
+		msg += fmt.Sprintf(" The attached leafs would be covered by max_disk_gb = %d (currently %d).",
+			raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
+	}
+	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, "", leafID)
 }
 
 // clearDiskGateWarning re-arms the disk-gate WARN after the gate clears.
@@ -2087,6 +2178,17 @@ func (d *Daemon) noteLeafFailure(wu *runtime.WorkUnit, reason string) {
 		"last_reason", reason,
 		"cooldown", leafFailureCooldown,
 		"remedy", "this leaf's work fails locally every time, so requesting more of it only churns units; the daemon will retry it after the cooldown. Check the log lines above for the process output, and report it to the head's operator if it persists")
+	label := name
+	if label == "" {
+		label = slug
+	}
+	if label == "" {
+		label = wu.LeafID
+	}
+	d.notices.Notify(NoticeWarn, "leaf_failing",
+		fmt.Sprintf("Leaf %q keeps failing on this machine (%d consecutive failures; last reason: %s). Requests for it are paused for %s, then retried once. If it persists, report it to the head's operator.",
+			label, count, reason, leafFailureCooldown),
+		"", wu.LeafID)
 }
 
 // noteLeafSuccess clears a leaf's failure streak after a clean run, marking the

@@ -200,16 +200,23 @@ type LeafDiskGateStatus struct {
 // covering-allowance arithmetic, for the management API.
 func (d *Daemon) LeafDiskGateStatus(leaf CachedLeafInfo) LeafDiskGateStatus {
 	ok, reason := d.leafDiskGate(leaf)
+	return LeafDiskGateStatus{
+		Blocked:   !ok,
+		Reason:    reason,
+		RaiseToGB: d.leafRaiseToGB(leaf),
+	}
+}
+
+// leafRaiseToGB is the max_disk_gb that would cover this leaf on this machine
+// today (see DiskAllowanceGBToCover), computed from the gate's own inputs so
+// the API verdict and the disk-gate notice quote the same figure.
+func (d *Daemon) leafRaiseToGB(leaf CachedLeafInfo) int {
 	need, isContainer, cached := d.leafDiskGateInputs(leaf)
 	var usedMB int64
 	if mb, measured := d.lettuceDiskUsageMB(); measured {
 		usedMB = mb
 	}
-	return LeafDiskGateStatus{
-		Blocked:   !ok,
-		Reason:    reason,
-		RaiseToGB: DiskAllowanceGBToCover(need, isContainer, cached, usedMB),
-	}
+	return DiskAllowanceGBToCover(need, isContainer, cached, usedMB)
 }
 
 // leafDiskGate is the live per-leaf disk gate: whether fetching work for this

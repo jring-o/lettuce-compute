@@ -123,10 +123,33 @@ type ThermalMonitor struct {
 	gpuCollectors []*GPUMetricsCollector
 	pollOverride  time.Duration    // for testing; 0 = use config
 	nowFn         func() time.Time // for testing; nil = time.Now
+	notices       NoticeSink       // optional; nil discards notices
 
 	mu      sync.Mutex
 	stopCh  chan struct{}
 	stopped bool
+}
+
+// NoticeSink receives volunteer-facing notices — the throttle activated /
+// released escalations that the monitor otherwise only logs. The daemon's
+// notice ring implements it; declared here (not imported) because this
+// package cannot depend on the daemon package that depends on it.
+type NoticeSink interface {
+	Notify(level, code, message, head, leaf string)
+}
+
+// SetNoticeSink routes the monitor's throttle notices to the given sink. Must
+// be called before Start.
+func (t *ThermalMonitor) SetNoticeSink(sink NoticeSink) {
+	t.notices = sink
+}
+
+// notify forwards a notice to the sink, if one is set.
+func (t *ThermalMonitor) notify(level, message string) {
+	if t.notices == nil {
+		return
+	}
+	t.notices.Notify(level, "thermal_throttle", message, "", "")
 }
 
 // SetClockForTest overrides the monitor's clock (for testing only).
@@ -225,6 +248,9 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 						"gpu_threshold", t.config.GPUPauseThresholdC,
 						"sensors", describeSensors(critPausing),
 					)
+					t.notify("warn", fmt.Sprintf("Computing paused: thermal throttle activated (cause: %s; CPU %d°C, pause threshold %d°C; GPU %d°C, pause threshold %d°C%s). Work resumes when temperatures fall below the resume thresholds.",
+						throttleCause(cpuHot, gpuHot, critPausing), cpuTemp, t.config.CPUPauseThresholdC, gpuTemp, t.config.GPUPauseThresholdC,
+						sensorSuffix(critPausing)))
 					t.signal(ctx, true)
 				}
 				continue
@@ -235,11 +261,14 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 
 			if cpuOK && gpuOK && len(critStillHot) == 0 {
 				throttled = false
+				pausedFor := t.now().Sub(throttledSince).Round(time.Second).String()
 				t.logger.Info("thermal throttle released",
 					"cpu_temp", cpuTemp,
 					"gpu_temp", gpuTemp,
-					"paused_for", t.now().Sub(throttledSince).Round(time.Second).String(),
+					"paused_for", pausedFor,
 				)
+				t.notify("info", fmt.Sprintf("Thermal throttle released after %s (CPU %d°C, GPU %d°C); computing resumed.",
+					pausedFor, cpuTemp, gpuTemp))
 				t.signal(ctx, false)
 				continue
 			}
@@ -279,6 +308,8 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 					"suppressed_for", suppressionCooldown.String(),
 					"note", "the CPU and GPU are within their thresholds; this reading is not clearing while work is suspended, so suspending is not helping it. Resuming, and ignoring these sensors for the cooldown. Hardware thermal protection is unaffected.",
 				)
+				t.notify("warn", fmt.Sprintf("Thermal throttle force-released after %s: the CPU (%d°C) and GPU (%d°C) are within their thresholds, but %s stayed past its own critical point and suspending work was not helping it. Computing resumed; those sensors are ignored for %s. Hardware thermal protection is unaffected.",
+					held.Round(time.Second).String(), cpuTemp, gpuTemp, describeSensors(critStillHot), suppressionCooldown.String()))
 				t.signal(ctx, false)
 				continue
 			}
@@ -332,6 +363,15 @@ func throttleCause(cpuHot, gpuHot bool, crit []Sensor) string {
 		return "unknown"
 	}
 	return strings.Join(causes, "+")
+}
+
+// sensorSuffix renders sensors for a notice sentence — "; sensors: ..." — or
+// nothing when there are none, so the sentence reads cleanly either way.
+func sensorSuffix(sensors []Sensor) string {
+	if len(sensors) == 0 {
+		return ""
+	}
+	return "; sensors: " + describeSensors(sensors)
 }
 
 // describeSensors renders sensors for a log line: "thermal_zone2(nvme) 96C/95C".
