@@ -462,11 +462,15 @@ export interface HeadsResponse {
   machine: MachineCapabilities;
 }
 
-/** Shape of the head's public `GET /api/v1/head` as returned by the `fetch_head_info` command. */
+/**
+ * Shape of the head's public `GET /api/v1/head` as returned by the
+ * `fetch_head_info` command. Heads send `research_area` as a single string or
+ * as a list; callers must accept both.
+ */
 export interface HeadPreview {
   name: string;
   description: string;
-  leafs: Array<{ slug: string; name: string; research_area: string }>;
+  leafs: Array<{ slug: string; name: string; research_area: string | string[] }>;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { cn, formatBytes, formatDuration, formatPercent, formatCredit } from "./utils";
+import {
+  cn,
+  formatBytes,
+  formatDuration,
+  formatPercent,
+  formatCredit,
+  formatAge,
+  formatSizeMb,
+} from "./utils";
 
 describe("cn", () => {
   it("merges class names", () => {
@@ -111,5 +119,43 @@ describe("formatCredit", () => {
   it("formats negative numbers", () => {
     const result = formatCredit(-500);
     expect(result).toContain("500");
+  });
+});
+
+describe("formatAge", () => {
+  const now = Date.parse("2026-08-29T12:00:00Z");
+
+  it("renders under a minute as just now", () => {
+    expect(formatAge("2026-08-29T11:59:30Z", now)).toBe("just now");
+  });
+
+  it("renders minutes, hours and days", () => {
+    expect(formatAge("2026-08-29T11:45:00Z", now)).toBe("15m ago");
+    expect(formatAge("2026-08-29T09:00:00Z", now)).toBe("3h ago");
+    expect(formatAge("2026-08-27T11:00:00Z", now)).toBe("2d ago");
+  });
+
+  it("clamps a timestamp in the future to just now", () => {
+    expect(formatAge("2026-08-29T12:05:00Z", now)).toBe("just now");
+  });
+
+  it("renders an unparseable timestamp as unknown", () => {
+    expect(formatAge("not a date", now)).toBe("unknown");
+  });
+});
+
+describe("formatSizeMb", () => {
+  it("renders whole gigabytes without a decimal", () => {
+    expect(formatSizeMb(15360)).toBe("15 GB");
+    expect(formatSizeMb(1024)).toBe("1 GB");
+  });
+
+  it("renders fractional gigabytes with one decimal", () => {
+    expect(formatSizeMb(1536)).toBe("1.5 GB");
+    expect(formatSizeMb(7000)).toBe("6.8 GB");
+  });
+
+  it("renders under a gigabyte in MB", () => {
+    expect(formatSizeMb(512)).toBe("512 MB");
   });
 });
