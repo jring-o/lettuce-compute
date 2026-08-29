@@ -901,11 +901,11 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 // change to take effect.
 type UpdateConfigResponse struct {
 	ConfigResponse
-	// RestartRequired is true when a head's trusted_runtimes changed. Runtime
-	// trust is applied when the daemon builds its runtime registry and
-	// advertises runtimes to each head at start-up, so a change saved here is
-	// on disk but not yet in force — exactly what `heads trust` tells the
-	// user after saving.
+	// RestartRequired is true when a setting that is only read at start-up
+	// changed: a head's trusted_runtimes (applied when the daemon builds its
+	// runtime registry and advertises runtimes to each head), or
+	// max_concurrent_tasks (the slot count). Such a change is on disk but not
+	// yet in force — exactly what `heads trust` tells the user after saving.
 	RestartRequired bool `json:"restart_required"`
 }
 
@@ -947,8 +947,14 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigRespon
 			newCfg.LogLevel = s
 		}
 	}
+	// The slot count is fixed when the daemon starts, so a change here is on
+	// disk but not in force until restart (ApplyConfig logs the same).
+	maxConcurrentChanged := false
 	if v, ok := partial["max_concurrent_tasks"]; ok {
-		newCfg.MaxConcurrentTasks = toInt(v)
+		if n := toInt(v); n != newCfg.MaxConcurrentTasks {
+			newCfg.MaxConcurrentTasks = n
+			maxConcurrentChanged = true
+		}
 	}
 	if v, ok := partial["leafs"]; ok {
 		if p, ok := v.(map[string]any); ok {
@@ -981,7 +987,7 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigRespon
 
 	return &UpdateConfigResponse{
 		ConfigResponse:  b.GetConfig(),
-		RestartRequired: trustChanged,
+		RestartRequired: trustChanged || maxConcurrentChanged,
 	}, nil
 }
 
