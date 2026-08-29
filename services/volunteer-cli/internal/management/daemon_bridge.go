@@ -866,6 +866,10 @@ type ConfigResponse struct {
 	Servers        []config.ServerConfig     `json:"servers"`
 	LogLevel       string                    `json:"log_level"`
 	MaxConcurrent  int                       `json:"max_concurrent_tasks"`
+	// WorkBufferHours is how many hours of work the daemon keeps buffered per
+	// execution slot (0 = a small unit-count fallback). PUT already accepted it;
+	// it is returned here so a client can show the current value it writes.
+	WorkBufferHours float64 `json:"work_buffer_hours"`
 }
 
 // GetConfig returns the current configuration (with sensitive paths redacted).
@@ -878,16 +882,17 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 	}
 
 	return ConfigResponse{
-		DataDir:        cfg.DataDir,
-		PublicKey:      pubKeyStr,
-		ResourceLimits: cfg.ResourceLimits,
-		Scheduling:     cfg.Scheduling,
-		Leafs:          cfg.Leafs,
-		Thermal:        cfg.Thermal,
-		Notifications:  cfg.Notifications,
-		Servers:        cfg.Servers,
-		LogLevel:       cfg.LogLevel,
-		MaxConcurrent:  cfg.MaxConcurrentTasks,
+		DataDir:         cfg.DataDir,
+		PublicKey:       pubKeyStr,
+		ResourceLimits:  cfg.ResourceLimits,
+		Scheduling:      cfg.Scheduling,
+		Leafs:           cfg.Leafs,
+		Thermal:         cfg.Thermal,
+		Notifications:   cfg.Notifications,
+		Servers:         cfg.Servers,
+		LogLevel:        cfg.LogLevel,
+		MaxConcurrent:   cfg.MaxConcurrentTasks,
+		WorkBufferHours: cfg.WorkBufferHours,
 	}
 }
 

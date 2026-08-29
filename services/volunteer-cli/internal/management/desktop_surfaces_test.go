@@ -400,3 +400,36 @@ func TestNotices_LeafBreakerTripEmits(t *testing.T) {
 		t.Errorf("message should carry the last failure reason: %q", msg)
 	}
 }
+
+// --- GET /api/v1/config: work_buffer_hours ---
+
+// PUT already accepted work_buffer_hours, but GET never returned it, so a
+// client could write the setting and not display it. The default (2.0) must
+// be present on a fresh config, and a PUT must be readable back.
+func TestGetConfigCarriesWorkBufferHours(t *testing.T) {
+	env := setupTestEnv(t)
+
+	body := decodeJSON(t, env.doRequest(t, "GET", "/api/v1/config", ""))
+	if got, ok := body["work_buffer_hours"]; !ok || got != float64(2) {
+		t.Fatalf("fresh work_buffer_hours = %v (present=%v), want the 2.0 default", got, ok)
+	}
+
+	resp, put := putServers(t, env, `{"work_buffer_hours": 3.5}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT expected 200, got %d: %v", resp.StatusCode, put)
+	}
+	if put["work_buffer_hours"] != float64(3.5) {
+		t.Errorf("PUT response work_buffer_hours = %v, want 3.5", put["work_buffer_hours"])
+	}
+	body = decodeJSON(t, env.doRequest(t, "GET", "/api/v1/config", ""))
+	if body["work_buffer_hours"] != float64(3.5) {
+		t.Errorf("GET after PUT work_buffer_hours = %v, want 3.5", body["work_buffer_hours"])
+	}
+	loaded, err := config.Load(env.cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.WorkBufferHours != 3.5 {
+		t.Errorf("on-disk work_buffer_hours = %g, want 3.5", loaded.WorkBufferHours)
+	}
+}
