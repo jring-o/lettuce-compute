@@ -1,0 +1,67 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Lettuce Compute",
+  "version": "1.0.3",
+  "identifier": "com.lettuce.compute",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Lettuce Compute",
+        "width": 900,
+        "height": 700,
+        "minWidth": 700,
+        "minHeight": 500,
+        "center": true,
+        "decorations": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src http://127.0.0.1:* https://* http://ipc.localhost http://tauri.localhost; style-src 'self' 'unsafe-inline'; frame-src http://lettuce-viz.localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/.lettuce/**", "$HOME/.lettuce/work/**", "$HOME/.lettuce/work/*/.lettuce-viz/**", "$HOME/.lettuce/work/*/.lettuce-viz/*"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico",
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
+    "targets": ["msi", "dmg", "appimage", "deb"],
+    "externalBin": [
+      "binaries/lettuce-volunteer"
+    ],
+    "resources": [
+      "resources/podman-installer-windows-amd64.msi"
+    ],
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://releases.lettuce.science/desktop/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "pubkey": "TO_BE_GENERATED_BEFORE_RELEASE"
+    }
+  }
+}
