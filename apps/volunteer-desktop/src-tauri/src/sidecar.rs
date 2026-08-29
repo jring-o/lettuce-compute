@@ -252,8 +252,14 @@ pub fn restart_daemon() -> Result<DaemonInfo, String> {
     }
 
     start_sidecar()?;
-    wait_for_fresh_daemon(previous.map(|p| p.pid), Duration::from_secs(30))
+    wait_for_fresh_daemon(previous.map(|p| p.pid), DAEMON_START_TIMEOUT)
 }
+
+/// How long a fresh daemon may take to publish its management API before the
+/// host gives up: starting a container engine and registering with each head
+/// happen before the API listens, and a cold Podman machine alone can take a
+/// minute on Windows.
+pub const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub fn wait_for_daemon(timeout: Duration) -> Result<DaemonInfo, String> {
     let start = Instant::now();

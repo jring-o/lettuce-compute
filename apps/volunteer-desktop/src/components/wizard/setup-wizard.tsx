@@ -1043,6 +1043,12 @@ function ConnectStep({
             {isSubmitting ? "Setting up..." : "Start Contributing"}
           </Button>
         </div>
+        {isSubmitting && (
+          <p className="text-xs text-muted-foreground text-right">
+            Starting Lettuce. The first start can take a minute or two: the container engine
+            has to come up and Lettuce registers with the server before it is ready.
+          </p>
+        )}
       </div>
     </div>
   );

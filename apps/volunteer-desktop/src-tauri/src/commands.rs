@@ -281,8 +281,11 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
     // Start the daemon after init
     sidecar::start_sidecar().map_err(|e| format!("Failed to start daemon: {}", e))?;
 
-    // Wait for daemon to become available
-    sidecar::wait_for_daemon(Duration::from_secs(30))?;
+    // Wait for the daemon to publish its management API. A first start can
+    // take well over a minute: the daemon may have to start the Podman machine
+    // and then register with every head before it listens (a live run on a
+    // Windows host took 57 s), so the wait is generous.
+    sidecar::wait_for_daemon(sidecar::DAEMON_START_TIMEOUT)?;
 
     Ok(())
 }
