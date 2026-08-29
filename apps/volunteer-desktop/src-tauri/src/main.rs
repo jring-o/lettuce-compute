@@ -120,6 +120,7 @@ fn main() {
             commands::stop_container_runtime,
             commands::check_podman_prerequisites,
             commands::install_podman,
+            commands::detect_container_runtime,
             commands::get_system_memory_mb,
             commands::test_server_connection,
             commands::fetch_head_info,
