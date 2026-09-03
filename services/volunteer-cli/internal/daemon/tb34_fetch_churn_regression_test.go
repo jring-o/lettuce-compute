@@ -59,14 +59,14 @@ func TestTB34_ArrivalEstimateCorrectsOverAsk(t *testing.T) {
 	d := newBufferTestDaemon(t, 2.0, 1, 1.0) // 7200 s target, empty buffer
 	leaf := CachedLeafInfo{ID: "leaf-x", EstimatedDurationSeconds: 60}
 
-	first := d.requestBatchSize(d.leafEstSeconds(leaf))
+	first := d.requestBatchSize(leaf, d.leafEstSeconds(leaf))
 	if first != maxBatchPerRequest {
 		t.Fatalf("first ask = %d, want %d (the over-ask this bug is about)", first, maxBatchPerRequest)
 	}
 
 	// One 3600 s unit arrives (benchmark 1 ⇒ fpops == seconds); the estimate learns.
 	d.noteArrivalEstimate("leaf-x", 3600)
-	second := d.requestBatchSize(d.leafEstSeconds(leaf))
+	second := d.requestBatchSize(leaf, d.leafEstSeconds(leaf))
 	if second != 2 {
 		t.Errorf("ask after a 3600s arrival = %d, want 2 (7200s deficit ÷ learned 3600s/unit)", second)
 	}
@@ -100,7 +100,7 @@ func TestTB34_ReturnedTailCapsNextAsk(t *testing.T) {
 	d := newFetcherTestDaemon(servers)
 	queue := NewPreFetchQueue(16, d.logger)
 	f := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
-	f.batchSizeFn = func(float64) int32 { return 64 }
+	f.batchSizeFn = func(CachedLeafInfo, float64) int32 { return 64 }
 	// Accept the first arrival of each round, refuse the rest — the arrival guard's
 	// shape when a batch overshoots the target.
 	acceptedThisRound := 0

@@ -651,8 +651,8 @@ func TestFetcher_SkipsPausedRuntimeLeafOnly(t *testing.T) {
 					},
 				}, nil
 			}
-			// container leaf: serve a container WU so SelectRuntime fails (no
-			// container runtime registered) -> abandon -> escalate.
+			// container leaf: serve a container WU whose Prepare fails (the
+			// registered container runtime is broken) -> abandon -> escalate.
 			containerReqs++
 			return &lettucev1.RequestWorkUnitResponse{
 				Assignments: []*lettucev1.WorkUnitAssignment{
@@ -693,9 +693,16 @@ func TestFetcher_SkipsPausedRuntimeLeafOnly(t *testing.T) {
 	})
 	d.weightedSelector.SetLeafWeights("server-a", map[string]int{"leaf-native": 100, "leaf-container": 100})
 
-	// Only the native runtime is registered, so container WUs can't be handled.
+	// Both runtimes are registered — since TB-49 a leaf whose runtime is NOT
+	// registered is skipped before any request and never reaches the breaker —
+	// but the container runtime fails every Prepare (a broken engine), the
+	// capability abandon the breaker counts.
 	d.runtimeRegistry = NewRuntimeRegistry()
 	d.runtimeRegistry.Register(&mockRuntime{canHandle: true, name: "native"})
+	d.runtimeRegistry.Register(&mockRuntime{canHandle: true, name: "container",
+		prepareFn: func(context.Context, *runtime.WorkUnit) (*runtime.PrepareResult, error) {
+			return nil, fmt.Errorf("image pull failed: engine unreachable")
+		}})
 
 	queue := NewPreFetchQueue(64, d.logger)
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)

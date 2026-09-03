@@ -57,6 +57,7 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
 | `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `connected but getting no work: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
 | `docker is not available … Is the docker daemon running?` | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
@@ -341,6 +342,20 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   top-ups at the target line. Buffered work is reserved for you by the head (not
   yet started), so it is cheap to hand back if you stop, and it is only
   downloaded/prepared right before it runs.
+- **GPU work is buffered per GPU, not per task slot.** A unit that needs a GPU
+  runs one at a time per physical GPU, however many concurrent tasks you allow.
+  So on a machine with one GPU and eight task slots the buffer holds at most
+  `work_buffer_hours` of GPU units (2 h by default), not eight times that, and
+  requests for a GPU leaf are sized to that smaller target; CPU leafs still fill
+  the full per-slot buffer beside it. Without this bound such a machine hoarded
+  GPU units only one slot could ever run and handed most of them back unrun at
+  the deadline.
+- **It only asks for work it could be handed.** A leaf whose runtime this
+  machine does not have, or that you have not trusted its head to run
+  (`lettuce-volunteer heads trust <head> <runtime>` opts in), is never requested
+  — the head would refuse it anyway. If every attached leaf is excluded this
+  way, the "getting no work" warning says which runtime is missing or untrusted
+  instead of blaming an empty queue (see the table near the top of this guide).
 - **"Full" also means usable.** If a slot is idle but nothing in the buffer can
   start beside what's already running (say every buffered unit needs more memory
   than you have left), the buffer does not count as full: the volunteer keeps
@@ -404,8 +419,8 @@ Two things make this volunteer-friendly:
 
 | Config key | Default | What it does |
 |---|---|---|
-| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task. Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
-| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this. |
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task (per GPU for GPU-required units, which run one per GPU). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this, except that GPU units are bounded by the number of GPUs when that is smaller. |
 
 ```bash
 ./lettuce-volunteer config set work_buffer_hours 4

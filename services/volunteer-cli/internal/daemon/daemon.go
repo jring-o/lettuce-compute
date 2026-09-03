@@ -1402,8 +1402,16 @@ func (d *Daemon) shouldFetch() bool {
 	return false
 }
 
-// leafNeedsAbsentGPU reports whether this leaf requires a GPU (either of the
-// two gpu_required flags — dispatch ORs them, TB-21) on a machine that
+// leafRequiresGPU reports whether this leaf's units need a GPU: either of the
+// two gpu_required flags, because dispatch ORs them (TB-21).
+func leafRequiresGPU(leaf CachedLeafInfo) bool {
+	if leaf.ExecutionSpec != nil && leaf.ExecutionSpec.GPURequired {
+		return true
+	}
+	return leaf.ResourceRequirements != nil && leaf.ResourceRequirements.GPURequired
+}
+
+// leafNeedsAbsentGPU reports whether this leaf requires a GPU on a machine that
 // advertises none. Presence-only deliberately: VRAM, vendor and compute
 // capability shortfalls stay the head's call, so this can never skip a leaf
 // the head would actually dispatch.
@@ -1411,10 +1419,49 @@ func (d *Daemon) leafNeedsAbsentGPU(leaf CachedLeafInfo) bool {
 	if d.HasGPU() {
 		return false
 	}
-	if leaf.ExecutionSpec != nil && leaf.ExecutionSpec.GPURequired {
-		return true
+	return leafRequiresGPU(leaf)
+}
+
+// leafRuntimeVerdict classifies a leaf against what this machine advertised to
+// one head, mirroring the head's own dispatch gate: a leaf's runtime must be
+// among the runtimes the volunteer advertised to that head, and what it
+// advertises is the registered runtimes filtered by per-head trust
+// (advertisedForServer). It returns the runtime the leaf needs — "container",
+// "native", or "" for a leaf that is never refused on runtime grounds (a WASM-
+// capable leaf, since WASM is always registered and always trusted, or a leaf
+// with no published spec, where the per-unit gates decide) — plus whether that
+// runtime is missing from this machine's registry and whether the head is
+// untrusted for it. A container leaf needs a registered container runtime and
+// per-head CONTAINER trust; a native-only leaf (native binaries, no wasm) needs
+// per-head NATIVE trust (a trusted head implies the runtime is registered —
+// buildRuntimeRegistry constructs native when any head is trusted for it). A
+// nil registry reports nothing missing. Shared by the readiness banner
+// (readinessCounts, PB-5) and the fetcher's pre-request skip (TB-49), so the two
+// cannot disagree about which leafs this machine can be handed.
+func leafRuntimeVerdict(leaf CachedLeafInfo, registry *RuntimeRegistry, srv config.ServerConfig) (rt string, missing, untrusted bool) {
+	es := leaf.ExecutionSpec
+	if es == nil {
+		return "", false, false
 	}
-	return leaf.ResourceRequirements != nil && leaf.ResourceRequirements.GPURequired
+	if es.Image != "" {
+		rt = "container"
+	} else {
+		wasmCapable, nativeCapable := false, false
+		for k := range es.Binaries {
+			if strings.EqualFold(k, "wasm") {
+				wasmCapable = true
+			} else {
+				nativeCapable = true
+			}
+		}
+		if !nativeCapable || wasmCapable {
+			return "", false, false
+		}
+		rt = "native"
+	}
+	missing = registry != nil && registry.GetRuntime(rt) == nil
+	untrusted = !srv.TrustsRuntime(rt)
+	return rt, missing, untrusted
 }
 
 // allEnabledLeafs returns the enabled leafs across every attached head.
@@ -1555,6 +1602,103 @@ func (d *Daemon) bufferTargetSeconds() float64 {
 		return 0
 	}
 	return hours * 3600 * float64(d.maxSlots())
+}
+
+// gpuSlots is how many execution slots GPU-required units can occupy at once:
+// one per physical GPU (canAccommodateWU's exclusivity guard), never more than
+// the slot count. With no GPU detected there is no GPU-specific bound — the
+// head should not be dispatching GPU work here at all (leafNeedsAbsentGPU) —
+// so the slot count is returned and the GPU class collapses into the whole.
+func (d *Daemon) gpuSlots() int {
+	slots := d.maxSlots()
+	if d.cachedHW == nil {
+		return slots
+	}
+	if n := len(d.cachedHW.GetGpus()); n > 0 && n < slots {
+		return n
+	}
+	return slots
+}
+
+// gpuBufferTargetSeconds is the hours target for the GPU class of buffered work:
+// work_buffer_hours per GPU-capable slot (TB-48). The global target sizes the
+// buffer by slots alone, but GPU-required units can only ever drain through
+// gpuSlots of them, so on a one-GPU host with many CPU slots the global figure
+// let the buffer hold slots × hours of GPU units of which one ran, the rest
+// waiting until the 90 %-of-deadline drop. GPU units count against BOTH this
+// and the global target (they occupy slots too); everything else counts against
+// the global target only. Returns 0 when buffering is disabled (hours == 0).
+func (d *Daemon) gpuBufferTargetSeconds() float64 {
+	hours := d.cfg.WorkBufferHours
+	if hours <= 0 {
+		return 0
+	}
+	return hours * 3600 * float64(d.gpuSlots())
+}
+
+// bufferedGPUSeconds is bufferedSeconds restricted to GPU-required units —
+// the fill measured against gpuBufferTargetSeconds. Same full-booking
+// (conservative, acceptance-side) view as bufferedSeconds.
+func (d *Daemon) bufferedGPUSeconds() float64 {
+	var total float64
+	for _, wu := range d.heldWorkUnits() {
+		if wu.ExecutionSpec.GPURequired {
+			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		}
+	}
+	return total
+}
+
+// bufferedGPUUnitCount counts held GPU-required units (the unit-count fallback
+// view of the GPU class).
+func (d *Daemon) bufferedGPUUnitCount() int {
+	n := 0
+	for _, wu := range d.heldWorkUnits() {
+		if wu.ExecutionSpec.GPURequired {
+			n++
+		}
+	}
+	return n
+}
+
+// fallbackGPUBufferUnits is the GPU class's unit-count cap when no hours
+// estimate is available: the same per-slot multiple as fallbackBufferUnits,
+// over GPU-capable slots.
+func (d *Daemon) fallbackGPUBufferUnits() int {
+	return fallbackBufferUnitsPerSlot * d.gpuSlots()
+}
+
+// gpuBufferHoursFull is workBufferHoursFull for the GPU class (TB-48): the GPU
+// units held reach the GPU hours target, or — when none of them can be
+// estimated — the GPU unit-count fallback. Like its global counterpart it says
+// nothing about runnability; bufferAccepts and the fetcher's pre-request skip
+// apply it, and the TB-32 idle-slot escape still governs acceptance over it.
+func (d *Daemon) gpuBufferHoursFull() bool {
+	target := d.gpuBufferTargetSeconds()
+	if target <= 0 {
+		return d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits()
+	}
+	sec := d.bufferedGPUSeconds()
+	if sec <= 0 && d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits() {
+		return true
+	}
+	return sec >= target
+}
+
+// leafClassBufferFull reports whether the resource class this leaf's units
+// belong to has already reached its own hours target, so the fetcher can skip
+// the leaf BEFORE issuing RequestWorkUnit (TB-48). Today the only class bounded
+// tighter than the slot count is GPU work; a CPU leaf is never class-full here
+// (the global target and workBufferFull govern it). Without this skip a one-GPU
+// host under its global target asked for GPU units every round and returned
+// each within seconds — the request-and-refuse churn TB-34 ended for the
+// global buffer.
+func (d *Daemon) leafClassBufferFull(leaf CachedLeafInfo) (bool, string) {
+	if !leafRequiresGPU(leaf) || !d.gpuBufferHoursFull() {
+		return false, ""
+	}
+	return true, fmt.Sprintf("GPU work buffer full (%.1f h of GPU units held against a target of %.1f h for %d GPU slot(s))",
+		d.bufferedGPUSeconds()/3600, d.gpuBufferTargetSeconds()/3600, d.gpuSlots())
 }
 
 // bufferedSeconds sums the estimated seconds of work currently held: queued,
@@ -1760,15 +1904,26 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 // idle slot — and only if it can start now; anything else is returned to the
 // head immediately (abandon → instant re-dispatch) instead of being held for
 // hours and dropped. Refusal reasons travel to the head as the abandon reason.
+//
+// A GPU-required unit is also measured against the GPU class's own target
+// (gpuBufferHoursFull, TB-48): under the global target but over the GPU one it
+// is refused the same way, because only gpuSlots of the slots can ever drain it
+// — on a one-GPU host the global target admitted slots × hours of GPU units, of
+// which one ran and the rest waited for the deadline drop.
 func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
-	if !d.workBufferHoursFull() {
+	full, reason := d.workBufferHoursFull(), "work buffer full (over the hours target)"
+	if !full && wu.ExecutionSpec.GPURequired && d.gpuBufferHoursFull() {
+		full = true
+		reason = fmt.Sprintf("GPU work buffer full (over the hours target for %d GPU slot(s))", d.gpuSlots())
+	}
+	if !full {
 		return true, ""
 	}
 	if !d.idleSlotStarved() {
-		return false, "work buffer full (over the hours target)"
+		return false, reason
 	}
-	if ok, reason := d.canAccommodateWU(wu); !ok {
-		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", reason)
+	if ok, why := d.canAccommodateWU(wu); !ok {
+		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", why)
 	}
 	return true, ""
 }
@@ -1797,13 +1952,25 @@ func (d *Daemon) bufferedUnitCount() int {
 // rsc_fpops_est — it falls back to averaging the seconds-per-unit of work already
 // buffered; failing that, it requests a full batch whenever the buffer is below
 // its hours target so batching still happens, and 1 otherwise.
-func (d *Daemon) requestBatchSize(estSecondsPerUnit float64) int32 {
+//
+// For a GPU-required leaf the deficit is the smaller of the global deficit and
+// the GPU class's own (gpuBufferTargetSeconds − bufferedGPUSeconds, TB-48), and
+// the no-estimate fallback is bounded by the GPU unit-count cap rather than a
+// full batch: a one-GPU host asking a head for 64 GPU units — the ask clamp the
+// head's logs showed every five minutes — can drain them only one at a time.
+func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64) int32 {
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
 		// Buffering disabled (hours == 0): unit-count fallback, one at a time.
 		return 1
 	}
 	deficit := target - d.bufferedSeconds()
+	gpu := leafRequiresGPU(leaf)
+	if gpu {
+		if gpuDeficit := d.gpuBufferTargetSeconds() - d.bufferedGPUSeconds(); gpuDeficit < deficit {
+			deficit = gpuDeficit
+		}
+	}
 	if deficit <= 0 {
 		return 1
 	}
@@ -1813,16 +1980,23 @@ func (d *Daemon) requestBatchSize(estSecondsPerUnit float64) int32 {
 		per = d.avgBufferedSecondsPerUnit()
 	}
 	if per <= 0 {
-		// No estimate at all: request a full batch to refill the deficit quickly.
+		// No estimate at all: request a full batch to refill the deficit quickly —
+		// except for the GPU class, whose unit-count fallback bounds the ask.
+		if gpu {
+			return clampBatch(int32(d.fallbackGPUBufferUnits() - d.bufferedGPUUnitCount()))
+		}
 		return maxBatchPerRequest
 	}
+	return clampBatch(int32(deficit / per))
+}
 
-	n := int32(deficit / per)
+// clampBatch bounds a computed ask to [1, maxBatchPerRequest].
+func clampBatch(n int32) int32 {
 	if n < 1 {
-		n = 1
+		return 1
 	}
 	if n > maxBatchPerRequest {
-		n = maxBatchPerRequest
+		return maxBatchPerRequest
 	}
 	return n
 }
@@ -1952,37 +2126,21 @@ func (d *Daemon) clearDiskGateWarning() {
 
 // readinessCounts tallies, per attached head, how many enabled leafs this
 // volunteer can ACTUALLY receive and run — applying the same gates the fetcher
-// applies: a container leaf needs a registered container runtime AND per-head
-// CONTAINER trust; a native-only leaf needs per-head NATIVE trust (native code
-// is always machine-runnable, so trust is its only gate); WASM is always
-// trusted. Counting a leaf the per-head trust would refuse produced the
-// "eligible: 1" line for a volunteer that could never receive work (PB-5).
+// applies (leafRuntimeVerdict): a container leaf needs a registered container
+// runtime AND per-head CONTAINER trust; a native-only leaf needs per-head
+// NATIVE trust (native code is always machine-runnable, so trust is its only
+// gate); WASM is always trusted. Counting a leaf the per-head trust would
+// refuse produced the "eligible: 1" line for a volunteer that could never
+// receive work (PB-5).
 func (d *Daemon) readinessCounts() (total, eligible, containerBlocked, trustBlocked int) {
-	hasContainer := d.runtimeRegistry.GetRuntime("container") != nil
 	for _, srv := range d.multiClient.Servers() {
 		for _, lf := range d.enabledLeafs(srv.Name) {
 			total++
-			es := lf.ExecutionSpec
-			if es == nil {
-				// No spec info from the head: don't over-block on unknowns.
-				eligible++
-				continue
-			}
-			needsContainer := es.Image != ""
-			wasmCapable, nativeCapable := false, false
-			for k := range es.Binaries {
-				if strings.EqualFold(k, "wasm") {
-					wasmCapable = true
-				} else {
-					nativeCapable = true
-				}
-			}
+			rt, missing, untrusted := leafRuntimeVerdict(lf, d.runtimeRegistry, srv.Config)
 			switch {
-			case needsContainer && !hasContainer:
+			case rt == "container" && missing:
 				containerBlocked++
-			case needsContainer && !srv.Config.TrustsRuntime("CONTAINER"):
-				trustBlocked++
-			case !needsContainer && nativeCapable && !wasmCapable && !srv.Config.TrustsRuntime("NATIVE"):
+			case untrusted:
 				trustBlocked++
 			default:
 				eligible++
