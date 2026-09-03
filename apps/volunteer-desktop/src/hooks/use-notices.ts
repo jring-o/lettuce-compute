@@ -5,56 +5,102 @@ import { useClient } from "./use-api";
 /** Notices kept in memory; older ones fall off the end. */
 const MAX_NOTICES = 100;
 
+/** localStorage key under which dismissed episode keys are kept. */
+const DISMISSED_STORAGE_KEY = "lettuce.notices.dismissed";
+
 /**
  * Notice state shared across mounts of the hook, so leaving the Overview tab
- * and coming back neither re-shows dismissed notices nor loses the polling
- * position. It lives for the app process, like the management client itself.
+ * and coming back neither re-shows dismissed notices nor repeats work. It
+ * lives for the web view; dismissals also live in localStorage, so a reload
+ * or an app restart does not resurrect a warning the person already closed.
  */
 interface NoticesCache {
-  /** Warn and error notices, newest (highest id) first. */
+  /** Live warn and error notices from the last poll, newest (highest id) first. */
   notices: Notice[];
-  /** Highest notice id seen; the `since` of the next poll. 0 = nothing seen. */
-  latestId: number;
   /** False once the daemon answered 404: this CLI build has no notices route. */
   supported: boolean;
-  /** Keys (`id@at`) of notices the user dismissed. A repeat with a newer `at` returns. */
+  /** Episode keys (see noticeKey) of notices the user dismissed. */
   dismissed: Set<string>;
 }
 
 const cache: NoticesCache = {
   notices: [],
-  latestId: 0,
   supported: true,
-  dismissed: new Set(),
+  dismissed: loadDismissed(),
 };
 
-/** Visible for tests: forget everything, as if the app had just started. */
+/**
+ * Visible for tests: forget everything held in memory, as if the web view had
+ * just loaded — dismissals persisted in localStorage are read back, as they
+ * would be.
+ */
 export function resetNoticesCacheForTest(): void {
   cache.notices = [];
-  cache.latestId = 0;
   cache.supported = true;
-  cache.dismissed = new Set();
+  cache.dismissed = loadDismissed();
 }
 
-function noticeKey(n: Notice): string {
-  return `${n.id}@${n.at}`;
+/**
+ * A notice's episode: the condition (code, head, leaf) and when this
+ * occurrence of it began. The daemon refreshes a repeating condition in
+ * place (same id and first_at, newer at and count), so dismissing an episode
+ * keeps it dismissed however often it repeats; a condition that returns
+ * after ending is a new episode with a new first_at, and shows again.
+ */
+export function noticeKey(n: Notice): string {
+  return `${n.code}|${n.head ?? ""}|${n.leaf ?? ""}|${n.first_at}`;
 }
 
-/** Merge a poll's notices into `current`: replace by id, drop info, newest first. */
-export function mergeNotices(current: Notice[], incoming: Notice[]): Notice[] {
-  const byId = new Map<number, Notice>();
-  for (const n of current) byId.set(n.id, n);
-  for (const n of incoming) {
-    if (n.level === "info") continue;
-    byId.set(n.id, n);
+function loadDismissed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DISMISSED_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((k): k is string => typeof k === "string"));
+  } catch {
+    // Storage unavailable or unreadable: dismissals last for this web view only.
+    return new Set();
   }
-  return Array.from(byId.values())
+}
+
+function saveDismissed(keys: Set<string>): void {
+  try {
+    localStorage.setItem(DISMISSED_STORAGE_KEY, JSON.stringify(Array.from(keys)));
+  } catch {
+    // Storage unavailable: dismissals last for this web view only.
+  }
+}
+
+/**
+ * The notices worth showing from one poll of the daemon's whole ring: warnings
+ * and errors whose condition has not ended, newest first.
+ */
+export function liveNotices(incoming: Notice[]): Notice[] {
+  return incoming
+    .filter((n) => n.level !== "info" && !n.resolved_at)
     .sort((a, b) => b.id - a.id)
     .slice(0, MAX_NOTICES);
 }
 
+/**
+ * Forget dismissals of episodes the daemon no longer retains — they fell off
+ * its ring, or it restarted — so the stored set never grows past the ring.
+ */
+function pruneDismissed(retained: Notice[]): void {
+  const present = new Set(retained.map(noticeKey));
+  let changed = false;
+  for (const key of cache.dismissed) {
+    if (!present.has(key)) {
+      cache.dismissed.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) saveDismissed(cache.dismissed);
+}
+
 export interface NoticesView {
-  /** Warn/error notices the user has not dismissed, newest first. */
+  /** Live warn/error notices the user has not dismissed, newest first. */
   notices: Notice[];
   /** False when the running CLI build has no `GET /api/v1/notices`. */
   supported: boolean;
@@ -63,8 +109,14 @@ export interface NoticesView {
 
 /**
  * Poll `GET /api/v1/notices` every `intervalMs` for warnings and errors the
- * daemon wants the volunteer to see. A 404 means the CLI build predates the
- * route; polling stops and `supported` turns false so the panel can hide.
+ * daemon wants the volunteer to see. Every poll reads the whole ring (at most
+ * a hundred entries) rather than only ids newer than the last one, because a
+ * notice changes after it is created: the daemon refreshes a repeating
+ * condition in place and marks a condition that has ended `resolved_at`, and
+ * a panel that only ever heard about new ids showed a "no work" warning for
+ * twelve hours beside a machine that was working. A 404 means the CLI build
+ * predates the route; polling stops and `supported` turns false so the panel
+ * can hide.
  */
 export function useNotices(intervalMs: number = 10000): NoticesView {
   const { client } = useClient();
@@ -88,18 +140,10 @@ export function useNotices(intervalMs: number = 10000): NoticesView {
         return;
       }
       try {
-        let resp = await client.notices(cache.latestId > 0 ? cache.latestId : undefined);
+        const resp = await client.notices();
         if (cancelled) return;
-        if (resp.latest_id < cache.latestId) {
-          // The daemon restarted and its ids began again: forget what was
-          // seen and take everything it retains.
-          cache.notices = [];
-          cache.latestId = 0;
-          resp = await client.notices(undefined);
-          if (cancelled) return;
-        }
-        cache.notices = mergeNotices(cache.notices, resp.notices);
-        cache.latestId = Math.max(cache.latestId, resp.latest_id);
+        pruneDismissed(resp.notices);
+        cache.notices = liveNotices(resp.notices);
         setNotices(cache.notices);
       } catch (err) {
         if (cancelled) return;
@@ -122,6 +166,7 @@ export function useNotices(intervalMs: number = 10000): NoticesView {
 
   const dismiss = useCallback((notice: Notice) => {
     cache.dismissed.add(noticeKey(notice));
+    saveDismissed(cache.dismissed);
     setDismissedVersion((v) => v + 1);
   }, []);
 
