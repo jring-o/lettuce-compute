@@ -87,7 +87,15 @@ func NewContainerRuntimeForBackend(dataDir string, logger *slog.Logger, backend 
 		if err != nil {
 			return nil, fmt.Errorf("connect to docker: %w", err)
 		}
-		logger.Info("using Docker container backend")
+		// Label by what answers the socket, not by which probe found it: a
+		// Podman Desktop / podman-mac-helper host serves the Docker socket from
+		// Podman, and "using Docker" sent a tester chasing Docker settings that
+		// do not exist there (TB-54).
+		if backend.Engine == "podman" {
+			logger.Info("using Docker-compatible container backend served by Podman", "engine", backend.Engine)
+		} else {
+			logger.Info("using Docker container backend", "engine", backend.Engine)
+		}
 	default:
 		return nil, fmt.Errorf("no container runtime available")
 	}

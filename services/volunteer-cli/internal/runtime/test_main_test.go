@@ -33,6 +33,9 @@ func TestMain(m *testing.M) {
 	// don't accidentally find a podman that's actually installed on the host
 	// running the suite. Individual tests override this to exercise the fallback.
 	podmanInstallPathFunc = func() string { return "" }
+	// Likewise never ask a real Docker socket which engine serves it; tests that
+	// care about the label override this explicitly.
+	dockerEngineFunc = func() string { return "" }
 
 	os.Exit(m.Run())
 }

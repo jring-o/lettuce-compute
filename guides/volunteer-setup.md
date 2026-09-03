@@ -110,6 +110,18 @@ Install **Podman Desktop** or **Docker Desktop** and make sure the machine/VM is
 started. If you have the Podman CLI, the bundled lettuce binary will create and
 start a Podman machine for you on first `start`.
 
+- **macOS: Podman does not need to be on the app's PATH.** An app launched from
+  Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official
+  installer and Podman Desktop), `/opt/homebrew/bin` and `/usr/local/bin`
+  (Homebrew), so lettuce probes those locations itself, in that order, and
+  drives the binary it finds by absolute path. `CONTAINER_HOST` / `DOCKER_HOST`
+  (`unix:///path/to.sock`) override the socket on macOS exactly as on Linux.
+- **"Docker-compatible … served by Podman".** When the only thing lettuce finds
+  is the Docker socket and Podman is behind it (Podman Desktop's Docker
+  compatibility switch, `podman-mac-helper`), the log and `doctor` say so
+  instead of calling it Docker; rootful/rootless and the compatibility switch
+  only decide whether that socket exists, not whether containers run.
+
 ---
 
 ## Disk and the data directory

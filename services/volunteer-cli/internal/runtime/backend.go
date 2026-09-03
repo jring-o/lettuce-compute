@@ -23,6 +23,13 @@ type BackendInfo struct {
 	SocketPath string // Unix socket path or Windows named pipe
 	Version    string // e.g., "4.9.0"
 	BinaryPath string // Path to podman/docker binary (empty if using socket only)
+	// Engine names what actually answers a Docker-compatible socket found by
+	// the Docker probe: "podman" when Podman serves it (Podman Desktop's
+	// Docker-compatibility helper, podman-mac-helper), "docker" for Docker
+	// itself, "" when the API could not be asked. The Docker probe finds
+	// whatever listens on the Docker socket, so the label used to say "Docker"
+	// for a Podman machine (TB-54); the connection path is unchanged either way.
+	Engine string
 }
 
 // lookPathFunc is overridden in tests to mock exec.LookPath.
@@ -34,6 +41,14 @@ var isDockerAvailableFunc = IsDockerAvailable
 // podmanInstallPathFunc resolves a podman binary in a standard install location.
 // Overridden in tests.
 var podmanInstallPathFunc = defaultPodmanInstallPath
+
+// dockerEngineFunc names the engine behind the Docker-compatible socket the
+// Docker probe reached. Overridden in tests.
+var dockerEngineFunc = DockerEngineName
+
+// detectGOOS is the platform the install-location lists are chosen for.
+// Overridden in tests so every platform's list is exercised on any host.
+var detectGOOS = goruntime.GOOS
 
 // DetectContainerBackend probes for available container runtimes using the
 // historical default priority (Podman first, Docker second). Equivalent to
@@ -55,7 +70,7 @@ func DetectContainerBackend(bundledPodmanPath string) BackendInfo {
 func DetectContainerBackendPreferred(bundledPodmanPath string, preferred ContainerBackend) BackendInfo {
 	if preferred == BackendDocker {
 		if isDockerAvailableFunc() {
-			return BackendInfo{Backend: BackendDocker}
+			return dockerBackendInfo()
 		}
 		// Preferred Docker isn't available — fall back to Podman if present.
 		if info, ok := detectPodman(bundledPodmanPath); ok {
@@ -69,9 +84,15 @@ func DetectContainerBackendPreferred(bundledPodmanPath string, preferred Contain
 		return info
 	}
 	if isDockerAvailableFunc() {
-		return BackendInfo{Backend: BackendDocker}
+		return dockerBackendInfo()
 	}
 	return BackendInfo{Backend: BackendNone}
+}
+
+// dockerBackendInfo describes a backend reached through the Docker probe,
+// labelled by the engine that actually answered.
+func dockerBackendInfo() BackendInfo {
+	return BackendInfo{Backend: BackendDocker, Engine: dockerEngineFunc()}
 }
 
 // detectPodman looks for a Podman binary and resolves its socket path and version.
@@ -147,26 +168,48 @@ func BundledPodmanPath() string {
 }
 
 // defaultPodmanInstallPath returns the path to a podman binary in a standard
-// install location, or "" if none is found. On Windows the per-user MSI installs
-// to %LOCALAPPDATA%\Programs\Podman and the machine-scope MSI to
-// C:\Program Files\RedHat\Podman. This mirrors the desktop app's Rust-side
-// find_podman so the daemon can use a freshly wizard-installed podman even when
-// the running process's PATH predates the install.
+// install location for this platform, or "" if none is found. This mirrors the
+// desktop app's Rust-side find_podman so the daemon can use a Podman the
+// running process's PATH does not include.
 func defaultPodmanInstallPath() string {
-	if goruntime.GOOS != "windows" {
-		return ""
-	}
-	var candidates []string
-	if la := os.Getenv("LOCALAPPDATA"); la != "" {
-		candidates = append(candidates, filepath.Join(la, "Programs", "Podman", "podman.exe"))
-	}
-	candidates = append(candidates, `C:\Program Files\RedHat\Podman\podman.exe`)
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	for _, candidate := range podmanInstallCandidates(detectGOOS) {
+		if fileExists(candidate) {
+			return candidate
 		}
 	}
 	return ""
+}
+
+// podmanInstallCandidates lists where a standard Podman install puts its
+// binary on goos, in probe order, for a process whose PATH does not include it.
+//
+//   - Windows: the per-user MSI installs to %LOCALAPPDATA%\Programs\Podman and the
+//     machine-scope MSI to C:\Program Files\RedHat\Podman; the desktop wizard
+//     installs via MSI while the app is running, so its PATH predates the install.
+//   - macOS: the official installer package (also what Podman Desktop installs)
+//     puts the CLI in /opt/podman/bin and adds it to login shells through
+//     /etc/paths.d, which a Finder-launched app never reads — such an app runs
+//     with /usr/bin:/bin:/usr/sbin:/sbin, so PATH lookup found nothing and the
+//     Docker-socket probe won (or nothing did) (TB-54). Homebrew installs to
+//     /opt/homebrew/bin (Apple silicon) or /usr/local/bin (Intel).
+//   - Linux: nothing beyond PATH; distro packages land in /usr/bin, which every
+//     desktop session includes.
+func podmanInstallCandidates(goos string) []string {
+	switch goos {
+	case "windows":
+		var candidates []string
+		if la := os.Getenv("LOCALAPPDATA"); la != "" {
+			candidates = append(candidates, filepath.Join(la, "Programs", "Podman", "podman.exe"))
+		}
+		return append(candidates, `C:\Program Files\RedHat\Podman\podman.exe`)
+	case "darwin":
+		return []string{
+			"/opt/podman/bin/podman",
+			"/opt/homebrew/bin/podman",
+			"/usr/local/bin/podman",
+		}
+	}
+	return nil
 }
 
 // podmanHostString converts a socket path to a Docker client host string.
