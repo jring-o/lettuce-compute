@@ -82,26 +82,26 @@ func TestWorkBufferFull_UnitCountFallback(t *testing.T) {
 func TestRequestBatchSize(t *testing.T) {
 	d := newBufferTestDaemon(t, 1.0, 1, 1.0) // target 3600s
 	// With a 600s/unit estimate and an empty buffer: 3600/600 = 6, capped at 8.
-	if got := d.requestBatchSize(600); got != 6 {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 600); got != 6 {
 		t.Errorf("requestBatchSize(600) = %d, want 6", got)
 	}
 	// A tiny per-unit estimate is capped at maxBatchPerRequest.
-	if got := d.requestBatchSize(1); got != maxBatchPerRequest {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 1); got != maxBatchPerRequest {
 		t.Errorf("requestBatchSize(1) = %d, want %d (cap)", got, maxBatchPerRequest)
 	}
 	// No estimate and an empty buffer => full batch to refill quickly.
-	if got := d.requestBatchSize(0); got != maxBatchPerRequest {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 0); got != maxBatchPerRequest {
 		t.Errorf("requestBatchSize(0) on empty buffer = %d, want %d", got, maxBatchPerRequest)
 	}
 	// A per-unit estimate larger than the whole deficit yields a single unit.
-	if got := d.requestBatchSize(100000); got != 1 {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 100000); got != 1 {
 		t.Errorf("requestBatchSize(huge) = %d, want 1", got)
 	}
 }
 
 func TestRequestBatchSize_BufferingDisabled(t *testing.T) {
 	d := newBufferTestDaemon(t, 0, 1, 1.0) // hours == 0 disables hours target
-	if got := d.requestBatchSize(600); got != 1 {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 600); got != 1 {
 		t.Errorf("requestBatchSize with buffering disabled = %d, want 1", got)
 	}
 }
@@ -145,7 +145,7 @@ func TestRequestBatchSize_ShortUnitLeafFillsPastEight(t *testing.T) {
 	// 1 hour * 3600 * 1 slot = 3600s target, empty buffer.
 	d := newBufferTestDaemon(t, 1.0, 1, 1.0)
 	// 30s/unit short units: 3600/30 = 120 desired, clamped to the 64 ceiling.
-	got := d.requestBatchSize(30)
+	got := d.requestBatchSize(CachedLeafInfo{}, 30)
 	if got <= 8 {
 		t.Errorf("short-unit batch = %d, want > 8 (old flat cap should no longer bind)", got)
 	}
@@ -153,7 +153,7 @@ func TestRequestBatchSize_ShortUnitLeafFillsPastEight(t *testing.T) {
 		t.Errorf("short-unit batch = %d, want %d (deficit exceeds ceiling)", got, maxBatchPerRequest)
 	}
 	// A 60s/unit leaf: 3600/60 = 60, under the 64 ceiling, so the deficit math binds.
-	if got := d.requestBatchSize(60); got != 60 {
+	if got := d.requestBatchSize(CachedLeafInfo{}, 60); got != 60 {
 		t.Errorf("60s-unit batch = %d, want 60 (deficit math, not ceiling)", got)
 	}
 }
