@@ -5,7 +5,6 @@ package runtime
 import (
 	"fmt"
 	"os"
-	"strings"
 )
 
 // rootfulPodmanSocket is the system/rootful Podman API socket, owned by root.
