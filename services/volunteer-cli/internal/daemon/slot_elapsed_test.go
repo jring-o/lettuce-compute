@@ -53,7 +53,7 @@ func TestResumedTask_ElapsedExcludesDaemonDownGap(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, func(string) float64 { return 0 })
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("got %d active tasks, want 1", len(tasks))
 	}
@@ -121,7 +121,7 @@ func TestFreshTask_ElapsedStartsAtZero(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, func(string) float64 { return 0 })
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("got %d active tasks, want 1", len(tasks))
 	}

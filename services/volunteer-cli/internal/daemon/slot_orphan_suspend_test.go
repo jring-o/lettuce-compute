@@ -108,7 +108,7 @@ func daemonForOrphan(t *testing.T, pid int) (*Daemon, context.Context, context.C
 }
 
 func orphanTask(d *Daemon) (CurrentTask, bool) {
-	for _, task := range d.slotManager.GetCurrentTasks(0, func(string) float64 { return 0 }) {
+	for _, task := range d.slotManager.GetCurrentTasks(nil) {
 		if task.WorkUnitID == "wu-orphan" {
 			return task, true
 		}

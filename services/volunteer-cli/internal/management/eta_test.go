@@ -46,8 +46,8 @@ func TestETA_BlendTamesSlowStart(t *testing.T) {
 		t.Errorf("first estimate = %d, want far below the naive %.0f (blend should tame it)", first, naive)
 	}
 	// As progress accrues at a steady rate, the estimate should decrease, not lurch.
-	second, _ := e.estimate("wu", 11, 110, static)
-	third, _ := e.estimate("wu", 21, 120, static)
+	second, _ := e.estimate("wu", 11, 130, static)
+	third, _ := e.estimate("wu", 21, 160, static)
 	if !(first > second && second > third) {
 		t.Errorf("estimate did not converge downward: %d, %d, %d", first, second, third)
 	}
@@ -62,13 +62,13 @@ func TestETA_BlendTamesSlowStart(t *testing.T) {
 func TestETA_SmoothedRateIgnoresStall(t *testing.T) {
 	e := newETATracker()
 	const static = 1000.0
-	// Establish a steady 1%/s rate.
-	e.estimate("wu", 10, 10, static)
-	e.estimate("wu", 20, 20, static)
-	steady, _ := e.estimate("wu", 30, 30, static)
+	// Establish a steady 1%/3s rate over windows the sampler accepts.
+	e.estimate("wu", 10, 30, static)
+	e.estimate("wu", 20, 60, static)
+	steady, _ := e.estimate("wu", 30, 90, static)
 	// A stall: progress unchanged while elapsed advances. Rate sample is skipped, so
 	// the smoothed rate (and thus the estimate) should not explode.
-	stalled, _ := e.estimate("wu", 30, 40, static)
+	stalled, _ := e.estimate("wu", 30, 120, static)
 	if stalled > steady*3 {
 		t.Errorf("estimate exploded on a single stall: steady=%d stalled=%d", steady, stalled)
 	}

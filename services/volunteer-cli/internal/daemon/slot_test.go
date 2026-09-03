@@ -47,9 +47,9 @@ func TestSlotManager_ConcurrentExecution(t *testing.T) {
 
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
-			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
-			WUResp:  &lettucev1.WorkUnitAssignment{},
-			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
+			WU:     &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
+			WUResp: &lettucev1.WorkUnitAssignment{},
+			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
 				executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
@@ -118,9 +118,9 @@ func TestSlotManager_GetCurrentTasks(t *testing.T) {
 	blockCh := make(chan struct{})
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
-			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-" + id},
-			WUResp:  &lettucev1.WorkUnitAssignment{},
-			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
+			WU:     &runtime.WorkUnit{ID: id, LeafID: "proj-" + id},
+			WUResp: &lettucev1.WorkUnitAssignment{},
+			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
 				executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
@@ -148,7 +148,7 @@ func TestSlotManager_GetCurrentTasks(t *testing.T) {
 	// Give slots time to start.
 	time.Sleep(50 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 2 {
 		t.Fatalf("GetCurrentTasks returned %d tasks, want 2", len(tasks))
 	}
@@ -211,7 +211,7 @@ func TestSlotManager_GetCurrentTasks_WorkDirNilPrep(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("GetCurrentTasks returned %d tasks, want 1", len(tasks))
 	}
@@ -232,9 +232,9 @@ func TestSlotManager_StopAll(t *testing.T) {
 
 	makeItem := func(id string) *PreFetchItem {
 		return &PreFetchItem{
-			WU:      &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
-			WUResp:  &lettucev1.WorkUnitAssignment{},
-			Prep:    &runtime.PrepareResult{WorkDir: "/tmp/" + id},
+			WU:     &runtime.WorkUnit{ID: id, LeafID: "proj-1"},
+			WUResp: &lettucev1.WorkUnitAssignment{},
+			Prep:   &runtime.PrepareResult{WorkDir: "/tmp/" + id},
 			Runtime: &mockRuntime{
 				canHandle: true,
 				executeFn: func(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult) (*runtime.ExecutionResult, error) {
@@ -278,7 +278,7 @@ func TestSlotManager_TotalActiveMemoryMB(t *testing.T) {
 	makeItem := func(id string, memMB int32) *PreFetchItem {
 		return &PreFetchItem{
 			WU: &runtime.WorkUnit{
-				ID:        id,
+				ID:     id,
 				LeafID: "proj-1",
 				ExecutionSpec: runtime.ExecutionSpec{
 					MaxMemoryMB: memMB,
@@ -375,7 +375,7 @@ func TestSuspendAll_ResumeAll_PauseDurationAccumulation(t *testing.T) {
 	sm.ResumeAll()
 
 	// Check accumulated pause duration via GetCurrentTasks.
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -452,7 +452,7 @@ func TestGetCurrentTasks_DuringActivePause(t *testing.T) {
 	sm.SuspendAll()
 	time.Sleep(100 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -517,7 +517,7 @@ func TestSuspendAll_FailedSuspend_NoPauseAccumulation(t *testing.T) {
 	sm.SuspendAll()
 	time.Sleep(100 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -588,7 +588,7 @@ func TestResumeAll_FailedResume_StaysSuspended(t *testing.T) {
 	// Resume fails — slot should remain suspended.
 	sm.ResumeAll()
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -643,28 +643,25 @@ func TestGetCurrentTasks_EstimatedSeconds_FromBenchmark(t *testing.T) {
 	sm.StartSlot(ctx, slotID, item, d)
 	time.Sleep(50 * time.Millisecond)
 
-	// With benchmarkFPOPS=1e11 and RscFpopsEst=1e12, expected = 10.0 seconds * DCF(1.0) = 10.0
-	benchFPOPS := 1e11
-	tasks := sm.GetCurrentTasks(benchFPOPS, nil)
+	// The estimator is the daemon's (estSecondsForUnit); here a benchmark of
+	// 1e11 FP-ops/s against RscFpopsEst=1e12 gives 10.0 seconds.
+	estimate := func(leafID string, fpops float64) float64 { return fpops / 1e11 }
+	tasks := sm.GetCurrentTasks(estimate)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
-
-	// EstimatedSeconds should be 10.0 (1e12 / 1e11 * 1.0 DCF).
 	if tasks[0].EstimatedSeconds < 9.9 || tasks[0].EstimatedSeconds > 10.1 {
 		t.Errorf("EstimatedSeconds = %f, want ~10.0", tasks[0].EstimatedSeconds)
 	}
 
-	// Test with custom DCF function (2.0x correction).
-	dcfFunc := func(leafID string) float64 { return 2.0 }
-	tasks = sm.GetCurrentTasks(benchFPOPS, dcfFunc)
+	// Whatever the estimator answers is reported verbatim (a learned 2× here).
+	learned := func(leafID string, fpops float64) float64 { return fpops / 1e11 * 2.0 }
+	tasks = sm.GetCurrentTasks(learned)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
-
-	// EstimatedSeconds should be 20.0 (1e12 / 1e11 * 2.0 DCF).
 	if tasks[0].EstimatedSeconds < 19.9 || tasks[0].EstimatedSeconds > 20.1 {
-		t.Errorf("EstimatedSeconds with DCF = %f, want ~20.0", tasks[0].EstimatedSeconds)
+		t.Errorf("EstimatedSeconds from the learned estimator = %f, want ~20.0", tasks[0].EstimatedSeconds)
 	}
 
 	close(blockCh)
@@ -776,7 +773,7 @@ func TestSuspendAll_ResumeAll_MultiSlot(t *testing.T) {
 	sm.SuspendAll()
 	time.Sleep(100 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 2 {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
 	}
@@ -788,7 +785,7 @@ func TestSuspendAll_ResumeAll_MultiSlot(t *testing.T) {
 
 	// Resume all.
 	sm.ResumeAll()
-	tasks = sm.GetCurrentTasks(0, nil)
+	tasks = sm.GetCurrentTasks(nil)
 	for _, task := range tasks {
 		if task.Suspended {
 			t.Errorf("task %s should NOT be suspended after resume", task.WorkUnitID)
@@ -851,7 +848,7 @@ func TestSuspendSlot_ByWorkUnitID(t *testing.T) {
 		t.Fatalf("SuspendSlot: %v", err)
 	}
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	for _, task := range tasks {
 		if task.WorkUnitID == "wu-s1" && !task.Suspended {
 			t.Error("wu-s1 should be suspended")
@@ -965,7 +962,7 @@ func TestResumeSlot_ByWorkUnitID(t *testing.T) {
 	}
 
 	// Task should no longer be suspended.
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -1120,7 +1117,7 @@ func TestSuspendSlot_RecordsPausedAt(t *testing.T) {
 
 	// Verify via GetCurrentTasks that TotalPausedSeconds is accumulating.
 	time.Sleep(100 * time.Millisecond)
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
