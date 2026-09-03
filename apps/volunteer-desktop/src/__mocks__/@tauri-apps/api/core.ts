@@ -15,6 +15,8 @@ export const hostCommandDefaults: Record<string, unknown> = {
   // Lifecycle
   is_initialized: true,
   run_init: undefined,
+  wait_for_daemon: { state: "ready" },
+  get_daemon_process_state: { state: "running" },
   restart_daemon: undefined,
   get_data_dir: "/home/test/.lettuce",
   get_client_version: "0.0.0-test",

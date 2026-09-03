@@ -740,11 +740,44 @@ export interface InitRequest {
 
 /**
  * Run `lettuce-volunteer init` with the wizard's choices, apply any schedule
- * window, then start the daemon and wait for it. Rejects with the CLI's
- * error text when any step fails.
+ * window, then start the daemon and return without waiting for it (see
+ * `waitForDaemon`). Rejects with the CLI's error text when any step fails.
+ * Once this resolves the install is set up: `config.yaml` exists.
  */
 export async function runInit(config: InitRequest): Promise<void> {
   await invoke("run_init", { config });
+}
+
+/**
+ * The outcome of waiting for the daemon `runInit` started: `ready` when its
+ * management API is up; `starting` when it is still alive at the host's
+ * deadline (registering with the head, or waiting on the container engine —
+ * a cold Podman machine can take minutes) and the app will connect once it
+ * listens. A daemon that exits instead rejects, quoting the daemon's own
+ * reason ("Lettuce could not start: …").
+ */
+export interface DaemonStartResult {
+  state: "ready" | "starting";
+}
+
+export async function waitForDaemon(): Promise<DaemonStartResult> {
+  return invoke("wait_for_daemon");
+}
+
+/**
+ * The daemon process as the Rust host sees it. `running`: daemon.json names
+ * a live process. `starting`: the daemon this app started is alive but not
+ * yet listening. `exited`: the daemon this app started has exited, with its
+ * own last words as `reason` when it printed any. `stopped`: nothing.
+ */
+export type DaemonProcessState =
+  | { state: "running" }
+  | { state: "starting" }
+  | { state: "exited"; reason: string | null; code: number | null }
+  | { state: "stopped" };
+
+export async function getDaemonProcessState(): Promise<DaemonProcessState> {
+  return invoke("get_daemon_process_state");
 }
 
 /**

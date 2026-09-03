@@ -7,10 +7,12 @@ import { applyTheme, readStoredTheme } from "@/lib/utils";
 import lettuceLeaf from "@/assets/lettuce-leaf.png";
 
 /**
- * Emitted once the setup wizard has finished and the daemon is up. The Rust
- * host listens for it (`APP_INITIALIZED_EVENT` in `main.rs`) to start the
- * tray poll, notifications and the container runtime without the app being
- * relaunched.
+ * Emitted once the setup wizard has written the install's config, before
+ * the daemon is up. The Rust host listens for it (`APP_INITIALIZED_EVENT` in
+ * `main.rs`) to start the tray poll, notifications and the container runtime
+ * without the app being relaunched. It must not wait for the daemon: when
+ * the first start was slow or failed, waiting left those services unstarted
+ * for the whole session and the tray at "Stopped" (TB-55).
  */
 const APP_INITIALIZED_EVENT = "app_initialized";
 
@@ -49,18 +51,26 @@ export function App() {
     checkInit();
   }, []);
 
-  const handleWizardComplete = async () => {
-    const initialized = await checkInit();
-    if (initialized) {
-      try {
-        await emit(APP_INITIALIZED_EVENT);
-      } catch {
-        // Not fatal: the host also starts its services on the next launch.
-      }
+  const handleWizardInitialized = async () => {
+    try {
+      await emit(APP_INITIALIZED_EVENT);
+    } catch {
+      // Not fatal: the host also starts its services on the next launch.
     }
   };
 
+  const handleWizardComplete = async () => {
+    await checkInit();
+  };
+
   if (isLoading) return <LoadingScreen />;
-  if (!isInitialized) return <SetupWizard onComplete={handleWizardComplete} />;
+  if (!isInitialized) {
+    return (
+      <SetupWizard
+        onInitialized={handleWizardInitialized}
+        onComplete={handleWizardComplete}
+      />
+    );
+  }
   return <TabLayout />;
 }

@@ -218,16 +218,17 @@ describe("SetupWizard", () => {
   describe("run_init payload per schedule mode", () => {
     it("always: init --schedule-mode always, no threshold, no window", async () => {
       const user = setup();
-      mockInvoke({ detect_container_runtime: NO_RUNTIME });
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
+      await testConnection(user);
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
         schedule_mode: "always",
         idle_threshold_mins: null,
         schedule_window: null,
-        server_url: null,
+        server_url: "science.example.org",
         trust: [],
         enabled_leafs: null,
       }));
@@ -235,7 +236,7 @@ describe("SetupWizard", () => {
 
     it("when idle: init --schedule-mode idle with the threshold", async () => {
       const user = setup();
-      mockInvoke({ detect_container_runtime: NO_RUNTIME });
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToSchedule(user);
       await user.click(screen.getByRole("button", { name: /^When idle/ }));
@@ -243,6 +244,7 @@ describe("SetupWizard", () => {
       await screen.findByText("Container Runtime");
       await user.click(await screen.findByRole("button", { name: "Skip — WASM and native only" }));
       await screen.findByText("Add a server to start contributing compute.");
+      await testConnection(user);
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
@@ -254,7 +256,7 @@ describe("SetupWizard", () => {
 
     it("scheduled: init runs as always and the window goes to schedule set", async () => {
       const user = setup();
-      mockInvoke({ detect_container_runtime: NO_RUNTIME });
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToSchedule(user);
       await user.click(screen.getByRole("button", { name: /^Scheduled windows/ }));
@@ -266,6 +268,7 @@ describe("SetupWizard", () => {
       await screen.findByText("Container Runtime");
       await user.click(await screen.findByRole("button", { name: "Skip — WASM and native only" }));
       await screen.findByText("Add a server to start contributing compute.");
+      await testConnection(user);
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
@@ -352,22 +355,99 @@ describe("SetupWizard", () => {
       expect(screen.getByRole("button", { name: "Start Contributing" })).toBeDisabled();
     });
 
-    it("passes no server, no leafs and no trust when skipping", async () => {
+    // TB-52: the daemon refuses to start with no head attached, so a setup
+    // that skipped the head could only ever end in "Timed out waiting for
+    // daemon to start" three minutes later. There is no skip path any more
+    // and Start needs a tested head.
+    it("offers no skip path and refuses to start without a tested head", async () => {
       const user = setup();
       mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
+      render(<SetupWizard onComplete={vi.fn()} />);
+      await goToConnect(user);
+
+      expect(screen.queryByText(/Skip — I'll add one later/)).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Start Contributing" })).toBeDisabled();
+
+      // A typed but untested head is not enough either.
+      await user.type(screen.getByPlaceholderText("compute.example.org"), "science.example.org");
+      expect(screen.getByRole("button", { name: "Start Contributing" })).toBeDisabled();
+
+      await user.click(screen.getByText("Test Connection"));
+      await screen.findByText("Connected");
+      expect(screen.getByRole("button", { name: "Start Contributing" })).toBeEnabled();
+      expect(invoke).not.toHaveBeenCalledWith("run_init", expect.anything());
+    });
+
+    // TB-52: a daemon that exits during its start says why on stderr; the
+    // wizard shows those words instead of a timeout.
+    it("shows the daemon's own reason when it exits during start", async () => {
+      const user = setup();
+      mockInvoke({
+        detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
+        wait_for_daemon: () => {
+          throw "Lettuce could not start: could not connect to any configured server";
+        },
+      });
       const onComplete = vi.fn();
       render(<SetupWizard onComplete={onComplete} />);
       await goToConnect(user);
-      // Even with a tested head in the field, skipping attaches nothing.
       await testConnection(user);
+      await user.click(screen.getByText("Start Contributing"));
 
-      await user.click(screen.getByText("Skip — I'll add one later"));
+      await screen.findByText("Lettuce could not start: could not connect to any configured server");
+      expect(onComplete).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Start Contributing" })).toBeEnabled();
+    });
 
-      await waitFor(() => expect(runInitPayload()).toMatchObject({
-        server_url: null,
-        enabled_leafs: null,
-        trust: [],
-      }));
+    // TB-52: a daemon still alive at the host's deadline (a Podman machine
+    // on its first boot) is starting, not failed: the dashboard opens.
+    it("opens the dashboard when the daemon is still starting at the deadline", async () => {
+      const user = setup();
+      mockInvoke({
+        detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
+        wait_for_daemon: { state: "starting" },
+      });
+      const onComplete = vi.fn();
+      render(<SetupWizard onComplete={onComplete} />);
+      await goToConnect(user);
+      await testConnection(user);
+      await user.click(screen.getByText("Start Contributing"));
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalled());
+      expect(screen.queryByText(/could not start/)).not.toBeInTheDocument();
+    });
+
+    // TB-55: the host starts its tray poll, notifications and Podman
+    // auto-start on "initialized". That must be reported once init has
+    // written the config — before the daemon wait — or a slow or failed first
+    // start leaves the tray at "Stopped" for the whole session.
+    it("reports the install as initialized before the daemon wait resolves", async () => {
+      const user = setup();
+      let finishDaemonWait: (value: { state: "ready" }) => void = () => {};
+      mockInvoke({
+        detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
+        wait_for_daemon: () =>
+          new Promise((resolve) => {
+            finishDaemonWait = resolve;
+          }),
+      });
+      const onInitialized = vi.fn();
+      const onComplete = vi.fn();
+      render(<SetupWizard onInitialized={onInitialized} onComplete={onComplete} />);
+      await goToConnect(user);
+      await testConnection(user);
+      await user.click(screen.getByText("Start Contributing"));
+
+      await waitFor(() => expect(invoke).toHaveBeenCalledWith("wait_for_daemon"));
+      await waitFor(() => expect(onInitialized).toHaveBeenCalled());
+      expect(onComplete).not.toHaveBeenCalled();
+
+      await act(async () => {
+        finishDaemonWait({ state: "ready" });
+      });
       await waitFor(() => expect(onComplete).toHaveBeenCalled());
     });
 
@@ -421,16 +501,21 @@ describe("SetupWizard", () => {
       const user = setup();
       mockInvoke({
         detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
         run_init: () => {
           throw new Error("Init failed: bad config");
         },
       });
-      render(<SetupWizard onComplete={vi.fn()} />);
+      const onInitialized = vi.fn();
+      render(<SetupWizard onInitialized={onInitialized} onComplete={vi.fn()} />);
       await goToConnect(user);
+      await testConnection(user);
 
       await user.click(screen.getByText("Start Contributing"));
 
       await screen.findByText(/Init failed: bad config/);
+      // Nothing was written, so the host must not start its services.
+      expect(onInitialized).not.toHaveBeenCalled();
     });
 
     it("hands the bare host to the Rust command (it adds https:// itself)", async () => {

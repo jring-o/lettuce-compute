@@ -64,14 +64,15 @@ installer or platform issue — capture the OS dialog text.
 | 2.3 | Resources: set CPU cores below the machine's maximum and memory to about half of it. Note the values. | Sliders accept the values; the CPU slider's maximum is the machine's logical CPU count as the operating system reports it and its proposed default is half of that (on Linux and macOS a machine with more than 8 threads must show its real count, not 8 — the web view's own figure is capped there); the memory slider's maximum matches the machine's physical memory. |
 | 2.4 | Schedule: select **Always**. Then switch to **When idle** and set an idle threshold. Then switch to **Scheduled** and paint a window of a few hours on two days. Return to **Always** for the rest of the run. | Each mode shows its own controls (threshold field; weekly grid). Switching modes does not lose the resource values from 2.3. |
 | 2.5 | Container runtime: follow the step for your platform (Windows: WSL check then Podman install; macOS: Podman machine setup; Linux: bundled rootless Podman; or an existing Docker is detected). | The step ends in a ready state. Windows/macOS: the Podman machine is created with the CPU/memory/disk values from 2.3. |
-| 2.6 | Connect: enter `lbry.science`, test the connection. | The head is reached; its name, description, and active leaves (including **beyblade-arena**) are listed. `https://` is added when omitted. |
+| 2.6 | Connect: before typing anything, look at the buttons. Then enter `lbry.science` and test the connection. | There is no skip option and **Start Contributing** is disabled until a head has been tested successfully (the daemon cannot run without one). After the test the head is reached; its name, description, and active leaves (including **beyblade-arena**) are listed. `https://` is added when omitted. |
 | 2.7 | Runtime trust for this head: turn **container** trust **on** and leave **native** trust **off**. | Both controls show their state clearly; native stays off. |
-| 2.8 | Finish. | The wizard closes; the main window shows the Overview tab. `~/.lettuce/config.yaml` exists with the resource values from 2.3, `scheduling.mode: ALWAYS`, the `lbry.science` server with `trusted_runtimes: [CONTAINER]`, and `~/.lettuce/daemon.json` appears within about a minute. |
-| 2.9 | Tray status. | Shows the daemon as active (no work yet). |
+| 2.8 | Finish. | The wizard shows "Setting up..." and closes once the daemon is listening; the main window shows the Overview tab. `~/.lettuce/config.yaml` exists with the resource values from 2.3, `scheduling.mode: ALWAYS`, the `lbry.science` server with `trusted_runtimes: [CONTAINER]`, and `~/.lettuce/daemon.json` appears within about a minute. If the container engine takes longer than three minutes to come up (a first Podman boot on an Intel Mac can), the wizard closes anyway and the bottom status bar reads **Starting…** until the daemon connects, then **Active**. |
+| 2.9 | Tray status. | Shows the daemon as active (no work yet). The tray, notifications and the Podman auto-start are live from the moment the wizard finished `init`, even if the daemon start in 2.8 was slow. |
+| 2.10 | Daemon refusal (optional, needs a second throwaway data directory — see the README's `LETTUCE_DATA_DIR`): run the wizard again with a head address that answers the health check but that the daemon cannot register with, or edit `config.yaml` to an unreachable head and relaunch. | The wizard (or the bottom status bar after a relaunch) shows the daemon's own reason — "Lettuce could not start: could not connect to any configured server" — within seconds, never "Timed out waiting for daemon to start". |
 
 On failure: 2.5 problems are container-runtime problems — run `podman info` (or
-`docker info`) in a terminal; 2.8 problems are daemon start-up problems — the log's first
-lines after the start show why the daemon refused to run.
+`docker info`) in a terminal; 2.8 problems are daemon start-up problems — the wizard quotes
+the daemon's own reason, and the log's first lines after the start say the same.
 
 ## 3. First work unit and live visualization
 
@@ -141,10 +142,12 @@ that directory must exist and hold an `index.html`.
 | 7.1 | Tray → **Pause**. | The tray status changes to paused, the menu item becomes **Resume**, Overview shows the daemon paused (reason: user), and an active unit is suspended. |
 | 7.2 | Tray → **Resume**. | Everything returns to active; the unit continues. |
 | 7.3 | Close the main window with the window's close button. | The window hides to the tray and computing pauses; **Open Dashboard** brings the window back and resumes computing. |
-| 7.4 | With a unit running, tray → **Quit**. | The app exits within about 30 s. The daemon has exited (`daemon.json` removed); the unit's process is frozen, not killed, and its work directory is preserved (`~/.lettuce/container-work/<unit id>` still exists). |
+| 7.4 | With a unit running, tray → **Quit**. | The app exits within a few seconds (it used to take about 30 s on macOS and Linux: the app never reaped the daemon it had started, so the exited daemon lingered as a zombie that its liveness check counted as alive). The daemon has exited (`daemon.json` removed); the unit's process is frozen, not killed, and its work directory is preserved (`~/.lettuce/container-work/<unit id>` still exists). |
 | 7.5 | Relaunch the app. | The daemon starts, adopts the frozen unit, and the unit resumes from where it was (progress continues from the previous figure; the log reports the unit resumed). |
+| 7.6 | macOS only: with a unit running, quit through the application menu (**Lettuce Compute → Quit**, or ⌘Q), then repeat 7.5. | Exactly the result of 7.4 and 7.5: the daemon has exited, the unit is frozen (`ps` shows its process stopped, not running), and it resumes on relaunch. A daemon still computing after the app is gone is the bug. |
+| 7.7 | Settings → change the log level (a "restart required" change) → **Restart** in the banner. | The restart succeeds on the first try, within a few seconds: no "Daemon (PID …) did not exit after stop --force". `daemon.json` shows a new PID. |
 
-On failure: 7.4/7.5 — search the log for `preserving work directory` and `resum`.
+On failure: 7.4–7.6 — search the log for `preserving work directory` and `resum`; 7.7 — `ps -o pid,stat -p <old PID>` right after a failed restart (a `Z` state means the app did not reap its child).
 
 ## 8. Update banner
 

@@ -4,6 +4,15 @@ import { ManagementClient } from "../api/client";
 let clientPromise: Promise<ManagementClient> | null = null;
 let clientInstance: ManagementClient | null = null;
 
+/**
+ * The management-API client, connecting in the background. While the daemon
+ * is not answering (`ManagementClient.create` rejects — not running, or still
+ * starting) `error` is set and the connection is retried every 2 s; once a
+ * retry succeeds `client` is set AND `error` is cleared. The clearing matters:
+ * a hook mounted during the daemon's start (the layout's status bar, at app
+ * launch) would otherwise keep a stale error beside a live client and never
+ * start polling, reading "Stopped" until the window was reloaded (TB-55).
+ */
 export function useClient(): {
   client: ManagementClient | null;
   error: Error | null;
@@ -27,7 +36,10 @@ export function useClient(): {
       clientPromise
         .then((c) => {
           clientInstance = c;
-          if (!cancelled) setClient(c);
+          if (!cancelled) {
+            setClient(c);
+            setError(null);
+          }
         })
         .catch((err) => {
           clientPromise = null;
@@ -78,7 +90,9 @@ export function useApiQuery<T>(
   }, [client]);
 
   useEffect(() => {
-    if (clientError) {
+    // A connection error is only the answer while there is no client; once
+    // one exists the query runs against it whatever the last attempt said.
+    if (clientError && !client) {
       setError(clientError);
       setIsLoading(false);
       return;
@@ -90,7 +104,7 @@ export function useApiQuery<T>(
       const id = setInterval(fetch, intervalMs);
       return () => clearInterval(id);
     }
-  }, [fetch, intervalMs, clientError]);
+  }, [fetch, intervalMs, client, clientError]);
 
   return { data, isLoading, error, refetch: fetch };
 }

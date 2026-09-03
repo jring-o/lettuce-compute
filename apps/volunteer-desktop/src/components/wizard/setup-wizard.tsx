@@ -27,9 +27,18 @@ import {
   installPodman,
   runInit,
   testServerConnection,
+  waitForDaemon,
 } from "@/api/client";
 
 interface WizardProps {
+  /**
+   * Called as soon as `init` has written the install's config, before the
+   * daemon is up: the host starts its daemon-backed services on it (tray
+   * status, notifications, container runtime), which must not wait on a
+   * daemon start that may be slow or fail (TB-55).
+   */
+  onInitialized?: () => void;
+  /** Called when setup is finished and the dashboard can be shown. */
   onComplete: () => void;
 }
 
@@ -853,14 +862,12 @@ function ConnectStep({
   state,
   onChange,
   onComplete,
-  onSkip,
   onBack,
   isSubmitting,
 }: {
   state: WizardState;
   onChange: (s: Partial<WizardState>) => void;
   onComplete: () => void;
-  onSkip: () => void;
   onBack: () => void;
   isSubmitting: boolean;
 }) {
@@ -870,7 +877,11 @@ function ConnectStep({
   const hasUrl = state.serverUrl.trim() !== "";
   const leafsOffered = state.headPreview !== null && state.headPreview.leafs.length > 0;
   const noLeafSelected = leafsOffered && state.enabledLeafSlugs.length === 0;
-  const canStart = !hasUrl || (state.connectionOk && !noLeafSelected);
+  // A tested head is required: the daemon refuses to start with no head
+  // attached ("no servers configured"), so a setup without one could only
+  // ever end in a start failure. There used to be a "Skip — I'll add one
+  // later" path here that did exactly that (TB-52).
+  const canStart = hasUrl && state.connectionOk && !noLeafSelected;
 
   const testConnection = async () => {
     if (!hasUrl) return;
@@ -1014,7 +1025,7 @@ function ConnectStep({
                 </label>
               ))}
               {noLeafSelected && (
-                <p className="text-xs text-destructive">Select at least one leaf, or skip adding a server.</p>
+                <p className="text-xs text-destructive">Select at least one leaf.</p>
               )}
             </CardContent>
           )}
@@ -1047,23 +1058,14 @@ function ConnectStep({
         <Button variant="ghost" onClick={onBack}>
           Back
         </Button>
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={onSkip}
-            className="text-sm text-muted-foreground hover:underline"
-            disabled={isSubmitting}
-          >
-            Skip — I'll add one later
-          </button>
-          <Button onClick={onComplete} disabled={isSubmitting || !canStart}>
-            {isSubmitting ? "Setting up..." : "Start Contributing"}
-          </Button>
-        </div>
+        <Button onClick={onComplete} disabled={isSubmitting || !canStart}>
+          {isSubmitting ? "Setting up..." : "Start Contributing"}
+        </Button>
         {isSubmitting && (
           <p className="text-xs text-muted-foreground text-right">
-            Starting Lettuce. The first start can take a minute or two: the container engine
-            has to come up and Lettuce registers with the server before it is ready.
+            Starting Lettuce. The first start can take a few minutes: the container engine
+            has to come up and Lettuce registers with the server before it is ready. If it
+            takes longer than that, the dashboard opens anyway and connects once Lettuce is up.
           </p>
         )}
       </div>
@@ -1071,7 +1073,7 @@ function ConnectStep({
   );
 }
 
-export function SetupWizard({ onComplete }: WizardProps) {
+export function SetupWizard({ onInitialized, onComplete }: WizardProps) {
   const [step, setStep] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1170,15 +1172,19 @@ export function SetupWizard({ onComplete }: WizardProps) {
   }, []);
 
   /**
-   * Run `init` with everything chosen so far. `withServer` false is the
-   * "Skip — I'll add one later" path: no head is attached and no trust is
-   * recorded, whatever the URL field holds.
+   * Run `init` with everything chosen so far, then wait for the daemon it
+   * started. Two phases on purpose: the install is set up the moment `init`
+   * has written the config (`onInitialized` fires and the host starts its
+   * services), and only then does the wizard wait on the daemon — a daemon
+   * that refuses to start is reported in its own words, and one still coming
+   * up at the deadline (a slow container engine) is not an error: the
+   * dashboard opens and connects when it listens (TB-52).
    */
-  const handleComplete = async (withServer: boolean) => {
+  const handleComplete = async () => {
     setIsSubmitting(true);
     setError(null);
     const serverUrl = normalizeHeadAddress(state.serverUrl);
-    const hasServer = withServer && serverUrl !== "";
+    const hasServer = serverUrl !== "";
     const schedule = buildInitSchedule({
       mode: state.scheduleMode,
       idleThresholdMins: state.idleThresholdMins,
@@ -1209,6 +1215,8 @@ export function SetupWizard({ onComplete }: WizardProps) {
         trust,
         enabled_leafs: partialSelection ? state.enabledLeafSlugs : null,
       });
+      onInitialized?.();
+      await waitForDaemon();
       onComplete();
     } catch (err) {
       setError(String(err));
@@ -1263,8 +1271,7 @@ export function SetupWizard({ onComplete }: WizardProps) {
           <ConnectStep
             state={state}
             onChange={update}
-            onComplete={() => handleComplete(true)}
-            onSkip={() => handleComplete(false)}
+            onComplete={handleComplete}
             onBack={() => setStep(4)}
             isSubmitting={isSubmitting}
           />
