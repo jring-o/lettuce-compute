@@ -31,6 +31,7 @@ import {
 } from "@/lib/utils";
 import {
   getDataDir,
+  getSystemCpuCount,
   type ScheduleRange,
   type ThermalConfig,
   type ManagementClient,
@@ -352,6 +353,18 @@ export function SettingsPage() {
       .catch(() => {});
   }, []);
 
+  // The machine's core count as the OS reports it to the Rust host. The web
+  // view's `navigator.hardwareConcurrency` is capped at 8 by WebKit (Linux and
+  // macOS), and this number is the hard CPU quota the daemon enforces, so a
+  // browser-sized slider clamped a 256-thread host to 8 cores (TB-47). The
+  // browser figure is only the fallback while detection is pending or failed.
+  const [hostCpuCount, setHostCpuCount] = useState<number | null>(null);
+  useEffect(() => {
+    getSystemCpuCount()
+      .then((n) => setHostCpuCount(typeof n === "number" && n > 0 ? n : null))
+      .catch(() => {});
+  }, []);
+
   const handleAutostartToggle = useCallback(async (enabled: boolean) => {
     setAutostart(enabled);
     try {
@@ -397,7 +410,12 @@ export function SettingsPage() {
     );
   }
 
-  const totalCores = navigator.hardwareConcurrency ?? 4;
+  // The host's count wins; the browser figure is a fallback, never a clamp: a
+  // saved value above the known total (the CLI's default is NumCPU / 2) is
+  // shown as it is rather than truncated the first time the slider is touched.
+  const totalCores = hostCpuCount ?? navigator.hardwareConcurrency ?? 4;
+  const coresSliderMax = Math.max(totalCores, config.resource_limits.max_cpu_cores);
+  const tasksSliderMax = Math.max(totalCores, config.max_concurrent_tasks);
   const totalMemMB =
     system && system.memory_total_mb > 0 ? system.memory_total_mb : 8192;
   // 0 is the daemon's unit-count fallback; a daemon too old to report the
@@ -447,7 +465,7 @@ export function SettingsPage() {
           label="CPU Cores"
           value={config.resource_limits.max_cpu_cores}
           min={1}
-          max={totalCores}
+          max={coresSliderMax}
           step={1}
           displayValue={`${config.resource_limits.max_cpu_cores} / ${totalCores} cores`}
           usagePct={system?.cpu_usage_pct}
@@ -566,7 +584,7 @@ export function SettingsPage() {
           label="Concurrent Tasks"
           value={config.max_concurrent_tasks}
           min={1}
-          max={totalCores}
+          max={tasksSliderMax}
           step={1}
           displayValue={`${config.max_concurrent_tasks}`}
           onChange={(v) => updateConfig({ max_concurrent_tasks: v })}

@@ -479,9 +479,35 @@ pub fn get_system_memory_mb() -> u64 {
     sys.total_memory() / 1024 / 1024
 }
 
+/// Logical CPUs available to this process, as the operating system reports
+/// them. The web view cannot be asked: WebKit (the Linux and macOS web view)
+/// caps `navigator.hardwareConcurrency` at 8 to resist fingerprinting, and the
+/// number feeds `max_cpu_cores`, which the daemon enforces as a hard container
+/// CPU quota — a 256-thread host was clamped to 8 cores that way (TB-47). The
+/// setup wizard and the Settings sliders take their maximum from here and use
+/// the browser figure only when this fails. Returns 0 on failure; the caller
+/// falls back.
+#[tauri::command]
+pub fn get_system_cpu_count() -> usize {
+    system_cpu_count()
+}
+
+fn system_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{schedule_set_args, trust_flag_value, ScheduleWindow};
+    use super::{schedule_set_args, system_cpu_count, trust_flag_value, ScheduleWindow};
+
+    #[test]
+    fn cpu_count_comes_from_the_host() {
+        // The host always has at least the core this test runs on; the web
+        // view's figure is never consulted here.
+        assert!(system_cpu_count() >= 1);
+    }
 
     fn strings(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
