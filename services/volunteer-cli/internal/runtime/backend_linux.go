@@ -5,23 +5,12 @@ package runtime
 import (
 	"fmt"
 	"os"
-	"strings"
 )
 
 // rootfulPodmanSocket is the system/rootful Podman API socket, owned by root.
 // A host running only rootful Podman (e.g. the easier path under an unprivileged
 // LXC guest) exposes this and no rootless user socket.
 const rootfulPodmanSocket = "/run/podman/podman.sock"
-
-// socketExistsFunc reports whether a Unix socket path exists on disk. It is a
-// package-level seam so tests can drive the rootless/rootful probe without
-// touching real sockets under /run.
-var socketExistsFunc = defaultSocketExists
-
-func defaultSocketExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
 
 // podmanSocketPath returns the Podman API socket path on Linux, resolved in order:
 //
@@ -57,31 +46,4 @@ func rootlessPodmanSocket() string {
 		return xdg + "/podman/podman.sock"
 	}
 	return fmt.Sprintf("/run/user/%d/podman/podman.sock", os.Getuid())
-}
-
-// socketFromEnv returns the Unix socket path from a CONTAINER_HOST or DOCKER_HOST
-// override, or "" if neither names a usable Unix socket. Only "unix://" URLs and
-// bare absolute paths yield a socket path; other schemes (tcp://, ssh://) are not
-// reachable through the Unix-socket connection path used here and are ignored so
-// detection falls through to the on-disk probe.
-func socketFromEnv() string {
-	for _, key := range []string{"CONTAINER_HOST", "DOCKER_HOST"} {
-		if p := unixSocketPath(strings.TrimSpace(os.Getenv(key))); p != "" {
-			return p
-		}
-	}
-	return ""
-}
-
-// unixSocketPath extracts a filesystem socket path from a Docker/Podman host
-// string. It accepts "unix:///path/to.sock" and bare absolute paths ("/path");
-// anything else returns "".
-func unixSocketPath(host string) string {
-	if strings.HasPrefix(host, "unix://") {
-		return strings.TrimPrefix(host, "unix://")
-	}
-	if strings.HasPrefix(host, "/") {
-		return host
-	}
-	return ""
 }

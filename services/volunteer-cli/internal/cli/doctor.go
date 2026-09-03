@@ -456,6 +456,10 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 	if info.Version != "" {
 		desc += " " + info.Version
 	}
+	if info.Backend == runtime.BackendDocker && info.Engine == "podman" {
+		// The Docker socket answered, but Podman is behind it (TB-54).
+		desc += " (Docker-compatible socket served by Podman)"
+	}
 	rep.add(docOK, "container", desc+" — socket reachable", "")
 
 	// Report the image-store filesystem (TODO #31): a container leaf's image is
