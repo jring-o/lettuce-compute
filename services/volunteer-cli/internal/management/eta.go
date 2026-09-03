@@ -6,11 +6,22 @@ import "sync"
 // exponential moving average. Lower = smoother/slower to react; higher = noisier.
 const etaRateSmoothing = 0.4
 
-// etaSample is the last progress observation for one work unit, plus the smoothed
-// rate derived from the sequence of observations.
+// etaMinSampleInterval is the least run time, in seconds, between two accepted
+// rate samples. Progress is an integer percent that a leaf may advance in steps
+// minutes apart, while the status API is polled every few seconds; measuring a
+// step against the previous poll rather than against the last accepted sample
+// divided a +1 % step by the 3 s poll gap and produced a rate a hundred times
+// too fast (TB-58). So the anchor a sample is measured from moves only when a
+// sample is accepted, and a sample is accepted only over a window at least this
+// long.
+const etaMinSampleInterval = 30
+
+// etaSample is the last ACCEPTED progress observation for one work unit — the
+// anchor the next rate sample is measured from — plus the smoothed rate derived
+// from the sequence of accepted samples.
 type etaSample struct {
-	progress int     // last progress percent observed (0..100)
-	elapsed  int     // accrued run-time seconds at that observation
+	progress int     // progress percent at the anchor (0..100)
+	elapsed  int     // accrued run-time seconds at the anchor
 	emaRate  float64 // smoothed progress rate, percent per second
 }
 
@@ -20,10 +31,11 @@ type etaSample struct {
 // a slow start (binary download, input staging, warm-up) permanently drags the
 // implied average rate down, so the estimate starts huge and only deflates as real
 // progress accrues. Instead this tracker keeps an exponential moving average of the
-// RECENT progress rate and blends the resulting estimate with the static benchmark
-// estimate, weighting the dynamic estimate more heavily as the task nears completion
-// (fraction-done weighting). The number moves smoothly and converges rather than
-// lurching downward.
+// RECENT progress rate and blends the resulting estimate with the static per-unit
+// estimate (learned from the leaf's completions on this machine, or the CPU
+// benchmark before the first), weighting the dynamic estimate more heavily as the
+// task nears completion (fraction-done weighting). The number moves smoothly and
+// converges rather than lurching downward.
 type etaTracker struct {
 	mu      sync.Mutex
 	samples map[string]etaSample
@@ -35,9 +47,9 @@ func newETATracker() *etaTracker {
 
 // estimate returns the estimated remaining seconds for a task and whether an
 // estimate is available. progressPct is 0..100, elapsedSeconds is accrued run time,
-// and estimatedSeconds is the benchmark-based total estimate (0 if unknown).
+// and estimatedSeconds is the static per-unit total estimate (0 if unknown).
 func (e *etaTracker) estimate(wuID string, progressPct, elapsedSeconds int, estimatedSeconds float64) (int, bool) {
-	// Static (benchmark) estimate of remaining time, if one is available.
+	// Static estimate of remaining time, if one is available.
 	staticRemaining := -1.0
 	if estimatedSeconds > 0 {
 		staticRemaining = estimatedSeconds - float64(elapsedSeconds)
@@ -57,20 +69,26 @@ func (e *etaTracker) estimate(wuID string, progressPct, elapsedSeconds int, esti
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	emaRate := 0.0
-	if prev, seen := e.samples[wuID]; seen {
-		emaRate = prev.emaRate
-		// Only fold in a fresh rate sample on forward progress over elapsed run time.
-		if progressPct > prev.progress && elapsedSeconds > prev.elapsed {
-			inst := float64(progressPct-prev.progress) / float64(elapsedSeconds-prev.elapsed)
-			if prev.emaRate > 0 {
-				emaRate = etaRateSmoothing*inst + (1-etaRateSmoothing)*prev.emaRate
-			} else {
-				emaRate = inst
-			}
+	prev, seen := e.samples[wuID]
+	emaRate := prev.emaRate
+	switch {
+	case !seen, progressPct < prev.progress, elapsedSeconds < prev.elapsed:
+		// First observation, or the unit went backwards (a restart from an older
+		// checkpoint): anchor here, keeping whatever rate is already known.
+		e.samples[wuID] = etaSample{progress: progressPct, elapsed: elapsedSeconds, emaRate: emaRate}
+	case progressPct > prev.progress && elapsedSeconds-prev.elapsed >= etaMinSampleInterval:
+		// Forward progress over a long enough window: fold in a rate sample
+		// measured from the anchor, then move the anchor here.
+		inst := float64(progressPct-prev.progress) / float64(elapsedSeconds-prev.elapsed)
+		if emaRate > 0 {
+			emaRate = etaRateSmoothing*inst + (1-etaRateSmoothing)*emaRate
+		} else {
+			emaRate = inst
 		}
+		e.samples[wuID] = etaSample{progress: progressPct, elapsed: elapsedSeconds, emaRate: emaRate}
 	}
-	e.samples[wuID] = etaSample{progress: progressPct, elapsed: elapsedSeconds, emaRate: emaRate}
+	// Otherwise — no forward progress yet, or too soon since the anchor — the
+	// anchor stands, so the next accepted sample spans the whole window.
 
 	// Dynamic estimate: from the smoothed recent rate once we have one, otherwise the
 	// average rate since t=0 as a bootstrap.

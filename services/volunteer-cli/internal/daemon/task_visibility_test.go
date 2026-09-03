@@ -114,7 +114,7 @@ func TestCPUTimeAccumulation_DuringActivePause(t *testing.T) {
 	}
 	time.Sleep(1100 * time.Millisecond)
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
@@ -161,7 +161,7 @@ func TestCPUTimeAccumulation_SuspendAll(t *testing.T) {
 	sm.ResumeAll()
 
 	// Both tasks should have non-zero pause time.
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	if len(tasks) != 2 {
 		t.Fatalf("expected 2 tasks, got %d", len(tasks))
 	}
@@ -209,7 +209,7 @@ func TestPerTaskSuspendIsolation(t *testing.T) {
 		t.Fatalf("SuspendSlot: %v", err)
 	}
 
-	tasks := sm.GetCurrentTasks(0, nil)
+	tasks := sm.GetCurrentTasks(nil)
 	for _, task := range tasks {
 		switch task.WorkUnitID {
 		case "wu-iso-1":
@@ -235,7 +235,7 @@ func TestPerTaskSuspendIsolation(t *testing.T) {
 		t.Fatalf("ResumeSlot: %v", err)
 	}
 
-	tasks = sm.GetCurrentTasks(0, nil)
+	tasks = sm.GetCurrentTasks(nil)
 	for _, task := range tasks {
 		if task.Suspended {
 			t.Errorf("task %s should not be suspended after resume", task.WorkUnitID)

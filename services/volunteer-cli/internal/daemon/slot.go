@@ -567,10 +567,10 @@ func (sm *SlotManager) ActiveWorkDirs() []string {
 	return dirs
 }
 
-// GetCurrentTasks returns info about all active slots' work units.
-// benchmarkFPOPS is the volunteer's CPU benchmark score for time estimation.
-// dcfFunc returns the duration correction factor for a given leaf ID.
-func (sm *SlotManager) GetCurrentTasks(benchmarkFPOPS float64, dcfFunc func(leafID string) float64) []CurrentTask {
+// GetCurrentTasks returns info about all active slots' work units. estimate,
+// when non-nil, supplies each unit's expected total seconds from its leaf and
+// FP-ops estimate (the daemon's estSecondsForUnit); 0 leaves it unknown.
+func (sm *SlotManager) GetCurrentTasks(estimate func(leafID string, rscFpopsEst float64) float64) []CurrentTask {
 	var tasks []CurrentTask
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
@@ -608,13 +608,8 @@ func (sm *SlotManager) GetCurrentTasks(benchmarkFPOPS float64, dcfFunc func(leaf
 				task.CheckpointSequence = slot.checkpoint.Sequence()
 				task.LastCheckpointAt = slot.checkpoint.LastSaveAt()
 			}
-			// Compute estimated duration from benchmark + fpops + DCF.
-			if slot.wu.RscFpopsEst > 0 && benchmarkFPOPS > 0 {
-				dcf := 1.0
-				if dcfFunc != nil {
-					dcf = dcfFunc(slot.wu.LeafID)
-				}
-				task.EstimatedSeconds = (slot.wu.RscFpopsEst / benchmarkFPOPS) * dcf
+			if estimate != nil {
+				task.EstimatedSeconds = estimate(slot.wu.LeafID, slot.wu.RscFpopsEst)
 			}
 			tasks = append(tasks, task)
 		}

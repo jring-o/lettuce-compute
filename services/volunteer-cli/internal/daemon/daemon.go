@@ -179,18 +179,24 @@ type Daemon struct {
 	processGroup ProcessGroup
 	runCancel    context.CancelFunc // cancels all slot contexts on Stop()
 
-	// CPU benchmark score for runtime estimation.
+	// CPU benchmark score: the per-unit duration estimate's fallback before a
+	// leaf has completed on this machine (TB-58); also reported to heads.
 	benchmarkFPOPS float64
-	dcfTracker     *DCFTracker
+	// Unit durations learned per leaf from this machine's own completions — the
+	// per-unit estimate (estSecondsForUnit) and the first-request figure
+	// (leafEstSeconds) once a leaf has completed here.
+	durations *DurationTracker
 
-	// Per-leaf per-unit seconds observed on the most recent ARRIVED batch (TB-34):
-	// the mean estSecondsForUnit over the units a batch actually delivered. The
-	// batch-size estimate (leafEstSeconds) takes the max of this and the leaf-level
-	// figure, so one 60× over-ask corrects itself on the very next round instead of
-	// waiting on the DCF — which learns only from COMPLETIONS and so never hears
-	// about units that keep being returned un-run (the self-sustaining loop).
-	arrivalEstMu  sync.Mutex
-	arrivalEstSec map[string]float64
+	// Per-leaf FP-ops estimate of the most recent ARRIVED unit (TB-34): the
+	// batch-size estimate (leafEstSeconds) takes the max of the leaf-level figure
+	// and what this implies under the current per-unit estimate, so one 60×
+	// over-ask corrects itself on the very next round instead of waiting on
+	// completions — which never hear about units that keep being returned un-run
+	// (the self-sustaining loop). The FP-ops figure is kept rather than the
+	// seconds it implied at arrival, so the booking stays current as the leaf's
+	// learned duration changes (TB-58).
+	arrivalEstMu    sync.Mutex
+	arrivalFpopsEst map[string]float64
 
 	// Fetch-gate hysteresis (TB-34): once the buffer fills to the hours target,
 	// fetching stays closed until the REMAINING buffered work drains below the
@@ -431,8 +437,8 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		hw.BenchmarkFpops = benchFPOPS
 	}
 
-	// Load duration correction factors.
-	dcfTracker := LoadDCFTracker(cfg.Config.DataDir)
+	// Load the unit durations learned from earlier completions.
+	durations := LoadDurationTracker(cfg.Config.DataDir)
 
 	// Create leaf cache (5 min refresh) and weighted selector.
 	leafCache := NewLeafCache(5*time.Minute, cfg.Logger)
@@ -471,8 +477,8 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		userPauseCh:      make(chan bool, 1),
 		processGroup:     pg,
 		benchmarkFPOPS:   benchFPOPS,
-		dcfTracker:       dcfTracker,
-		arrivalEstSec:    make(map[string]float64),
+		durations:        durations,
+		arrivalFpopsEst:  make(map[string]float64),
 		notices:          notices,
 		headStatus:       headStatus,
 		clientVersion:    cfg.ClientVersion,
@@ -952,26 +958,29 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wallClock := result.Result.Metrics.WallClockSeconds
 	active := activeSeconds(wallClock, result.TotalPausedDur)
 
-	// Update duration correction factor from actual vs estimated time.
+	// Record the unit's duration for this leaf's estimate (TB-58).
 	//
 	// This must use the ACTIVE duration, not the raw wall clock (TB-18). The
-	// factor scales every future estimate for this leaf, ramps up aggressively
-	// (80/20) while decaying at 10% per unit, and is persisted to dcf.json — so a
-	// single unit that happened to be suspended mid-run poisoned the estimate for
-	// days across restarts, and the client throttled its own work intake in
-	// response. Observed: a unit reporting 10212 s wall clock for ~1400 s of
-	// computation after a 2 h 28 min thermal freeze, against a normal range of
-	// 146–2821 s for that leaf on that host.
+	// figure scales every future estimate for this leaf and is persisted to
+	// durations.json — so a single unit that happened to be suspended mid-run
+	// once poisoned the estimate for days across restarts, and the client
+	// throttled its own work intake in response. Observed: a unit reporting
+	// 10212 s wall clock for ~1400 s of computation after a 2 h 28 min thermal
+	// freeze, against a normal range of 146–2821 s for that leaf on that host.
 	//
 	// Elapsed rather than CPU time is deliberate and stays: competing load from
 	// the volunteer's own other work genuinely does make a unit take longer here,
 	// and the estimate should reflect that. Suspension is the opposite case —
 	// time the unit was not running at all.
-	if d.dcfTracker != nil && wu.RscFpopsEst > 0 && d.benchmarkFPOPS > 0 {
-		estimatedSec := wu.RscFpopsEst / d.benchmarkFPOPS
-		if active > 0 {
-			d.dcfTracker.Update(wu.LeafID, estimatedSec, float64(active))
-		}
+	if d.durations != nil && active > 0 {
+		d.durations.Record(wu.LeafID, wu.RscFpopsEst, float64(active))
+		d.logger.Debug("unit duration recorded for the leaf's estimate",
+			"work_unit_id", wu.ID,
+			"leaf_id", wu.LeafID,
+			"active_seconds", active,
+			"completions_held", d.durations.Completions(wu.LeafID),
+			"estimate_seconds", d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst),
+		)
 	}
 
 	d.recordHistory(wu, wallClock, active, submitResp.Accepted, conn.Name)
@@ -1519,73 +1528,74 @@ func (d *Daemon) maxSlots() int {
 }
 
 // estSecondsForUnit estimates wall-clock seconds for a unit from its FP-ops
-// estimate and this host's benchmark, applying the leaf's learned duration
-// correction factor when available. Returns 0 when no estimate is possible.
+// estimate: at the leaf's learned seconds per FP-op once the leaf has completed
+// on this machine (TB-58), else against this host's CPU benchmark. Returns 0
+// when no estimate is possible — no FP-ops figure, or no benchmark before the
+// leaf's first completion here.
 func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
-	if rscFpopsEst <= 0 || d.benchmarkFPOPS <= 0 {
+	if rscFpopsEst <= 0 {
 		return 0
 	}
-	sec := rscFpopsEst / d.benchmarkFPOPS
-	if d.dcfTracker != nil {
-		if dcf := d.dcfTracker.Get(leafID); dcf > 0 {
-			sec *= dcf
+	if d.durations != nil {
+		if rate, ok := d.durations.SecondsPerFpop(leafID); ok {
+			return rscFpopsEst * rate
 		}
 	}
-	return sec
+	if d.benchmarkFPOPS <= 0 {
+		return 0
+	}
+	return rscFpopsEst / d.benchmarkFPOPS
 }
 
 // leafEstSeconds estimates wall-clock seconds for one unit of a leaf to size the
 // FIRST batch request to it (#29), BEFORE any of that leaf's units have been
 // buffered (so estSecondsForUnit, which needs a per-unit rsc_fpops_est, can't
-// help yet). It uses the leaf-level, benchmark-INDEPENDENT estimate the head
-// carries on CachedLeafInfo, refined by this leaf's learned duration correction
-// factor when one is available. Because it does not divide by the local
-// benchmark, it stays non-zero on un-benchmarked hosts — the exact case the old
-// FP-ops-only seam tripped to 0, leaving the flat ceiling to bind. Returns 0 only
-// when the head supplied no estimate.
+// help yet). Once the leaf has completed on this machine it is the median of
+// those completions (TB-58); until then it is the leaf-level, benchmark-
+// INDEPENDENT estimate the head carries on CachedLeafInfo. Neither divides by
+// the local benchmark, so it stays non-zero on un-benchmarked hosts — the exact
+// case the old FP-ops-only seam tripped to 0, leaving the flat ceiling to bind.
+// Returns 0 only when the head supplied no estimate and nothing has been learned.
 func (d *Daemon) leafEstSeconds(leaf CachedLeafInfo) float64 {
 	sec := leaf.EstimatedDurationSeconds
-	if sec > 0 && d.dcfTracker != nil {
-		if dcf := d.dcfTracker.Get(leaf.ID); dcf > 0 {
-			sec *= dcf
+	if d.durations != nil {
+		if learned, ok := d.durations.UnitSeconds(leaf.ID); ok {
+			sec = learned
 		}
 	}
-	// TB-34: fold in what the last ARRIVED batch of this leaf actually measured
-	// (per-unit FP-ops against this host's benchmark). Taking the max corrects the
-	// over-ask case — a leaf-level estimate far below the units' real size asked for
-	// 60× what the buffer could hold, and the DCF never corrects it because it learns
-	// only from completions, which the returned tail never produces. When the head's
-	// figure is the larger one it still wins (smaller asks are the safe direction).
+	// TB-34: fold in what the last ARRIVED unit of this leaf implies under the
+	// current per-unit estimate. Taking the max corrects the over-ask case — a
+	// leaf-level estimate far below the units' real size asked for 60× what the
+	// buffer could hold, and completions never correct it because the returned
+	// tail never produces any. When the leaf-level figure is the larger one it
+	// still wins (smaller asks are the safe direction).
 	d.arrivalEstMu.Lock()
-	if arr := d.arrivalEstSec[leaf.ID]; arr > sec {
+	fpops := d.arrivalFpopsEst[leaf.ID]
+	d.arrivalEstMu.Unlock()
+	if arr := d.estSecondsForUnit(leaf.ID, fpops); arr > sec {
 		sec = arr
 	}
-	d.arrivalEstMu.Unlock()
 	if sec <= 0 {
 		return 0
 	}
 	return sec
 }
 
-// noteArrivalEstimate records the per-unit seconds a just-arrived unit of the leaf
-// implies (its rsc_fpops_est against this host's benchmark, DCF applied — see
-// arrivalEstSec). Called by the fetcher per arrival; a unit with no usable estimate
-// records nothing (the previous figure stands). Units of one leaf are near-uniform,
-// so the latest observation is the batch signal with no windowing machinery.
+// noteArrivalEstimate records the FP-ops estimate of a just-arrived unit of the
+// leaf (see arrivalFpopsEst). Called by the fetcher per arrival; a unit with no
+// FP-ops figure records nothing (the previous figure stands). Units of one leaf
+// are near-uniform, so the latest observation is the batch signal with no
+// windowing machinery.
 func (d *Daemon) noteArrivalEstimate(leafID string, rscFpopsEst float64) {
-	if leafID == "" {
-		return
-	}
-	sec := d.estSecondsForUnit(leafID, rscFpopsEst)
-	if sec <= 0 {
+	if leafID == "" || rscFpopsEst <= 0 {
 		return
 	}
 	d.arrivalEstMu.Lock()
-	if d.arrivalEstSec == nil {
+	if d.arrivalFpopsEst == nil {
 		// Lazy init: test daemons are built as struct literals without the constructor.
-		d.arrivalEstSec = make(map[string]float64)
+		d.arrivalFpopsEst = make(map[string]float64)
 	}
-	d.arrivalEstSec[leafID] = sec
+	d.arrivalFpopsEst[leafID] = rscFpopsEst
 	d.arrivalEstMu.Unlock()
 }
 
@@ -2807,7 +2817,7 @@ type CurrentTask struct {
 	CheckpointSequence    int32
 	LastCheckpointAt      time.Time
 	ResumedFromCheckpoint bool
-	EstimatedSeconds      float64 // benchmark-based estimate (0 = unknown)
+	EstimatedSeconds      float64 // expected total seconds (estSecondsForUnit; 0 = unknown)
 	Suspended             bool
 	TotalPausedSeconds    int
 	DeadlineSeconds       int32
@@ -2823,11 +2833,7 @@ func (d *Daemon) GetCurrentTasks() []CurrentTask {
 	if d.slotManager == nil {
 		return nil
 	}
-	var dcfFunc func(string) float64
-	if d.dcfTracker != nil {
-		dcfFunc = d.dcfTracker.Get
-	}
-	return d.slotManager.GetCurrentTasks(d.benchmarkFPOPS, dcfFunc)
+	return d.slotManager.GetCurrentTasks(d.estSecondsForUnit)
 }
 
 // SuspendTask suspends a single task by work unit ID.

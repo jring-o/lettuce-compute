@@ -392,6 +392,20 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   request-and-return loop. Returned units cost the work unit nothing: the head
   records them as unused give-backs (not failures) and simply avoids re-offering
   the same unit to the same machine for a few minutes.
+- **It learns how long each leaf's units really take on your machine.** Until a
+  leaf has completed a unit here, its units are booked at a rough figure derived
+  from a short single-core CPU benchmark run at first start — a poor yardstick
+  for GPU work or a container using many cores, so those first bookings can be
+  hours too high. From the first completion on, each leaf's units are booked at
+  the middle value of the last five completions on this machine (kept in
+  `durations.json` in the data directory, so a restart remembers it). That
+  figure decides how many units fill `work_buffer_hours`, how many are asked for
+  at once, and the starting point of the **remaining-time** figure shown for a
+  running unit in `status` and the desktop app. The remaining-time figure also
+  follows the unit's own progress reports as it runs, trusting them more the
+  further along the unit is, so on a leaf that is new to your machine the first
+  unit's estimate can be off; later units of the same leaf are estimated from
+  what the earlier ones actually took.
 - **Buffered units start first-fit, not strictly first-fetched.** A free slot
   takes the oldest buffered unit that fits in the memory you've allowed
   (`resource_limits.max_memory_mb`). If the oldest unit needs more memory than

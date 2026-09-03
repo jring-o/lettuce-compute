@@ -123,17 +123,17 @@ func TestLeafEstSeconds_BenchmarkIndependent(t *testing.T) {
 	}
 }
 
-// TestLeafEstSeconds_AppliesDCF verifies the learned duration-correction factor
-// refines the leaf-level estimate when one has been learned for that leaf.
-func TestLeafEstSeconds_AppliesDCF(t *testing.T) {
+// TestLeafEstSeconds_PrefersLearnedCompletions verifies this machine's own
+// completions of the leaf replace the head's leaf-level figure once they exist
+// (TB-58).
+func TestLeafEstSeconds_PrefersLearnedCompletions(t *testing.T) {
 	d := newBufferTestDaemon(t, 2.0, 1, 0)
-	d.dcfTracker = LoadDCFTracker(t.TempDir())
-	// Learn a DCF > 1: actual was twice the estimate.
-	d.dcfTracker.Update("leaf-1", 10, 20)
+	d.durations = LoadDurationTracker(t.TempDir())
+	// Units of this leaf actually took twice the head's figure here.
+	d.durations.Record("leaf-1", 10, 60)
 	leaf := CachedLeafInfo{ID: "leaf-1", EstimatedDurationSeconds: 30}
-	got := d.leafEstSeconds(leaf)
-	if got <= 30 {
-		t.Errorf("leafEstSeconds with DCF>1 = %g, want > 30 (refined upward)", got)
+	if got := d.leafEstSeconds(leaf); got != 60 {
+		t.Errorf("leafEstSeconds with a learned completion = %g, want 60 (this machine's median)", got)
 	}
 }
 

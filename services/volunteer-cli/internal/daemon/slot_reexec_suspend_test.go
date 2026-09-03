@@ -15,7 +15,7 @@ import (
 
 // currentTaskByWU returns the active slot task for a given work-unit id, if any.
 func currentTaskByWU(d *Daemon, id string) (CurrentTask, bool) {
-	for _, task := range d.slotManager.GetCurrentTasks(0, func(string) float64 { return 0 }) {
+	for _, task := range d.slotManager.GetCurrentTasks(nil) {
 		if task.WorkUnitID == id {
 			return task, true
 		}
