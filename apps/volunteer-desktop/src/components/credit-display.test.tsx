@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { CreditDisplay } from "./credit-display";
+import { CreditDisplay, UTC_DAY_NOTE } from "./credit-display";
 
 describe("CreditDisplay", () => {
   const defaultProps = {
@@ -78,5 +78,18 @@ describe("CreditDisplay", () => {
   it("shows plural 'leafs' when count is 0", () => {
     render(<CreditDisplay {...defaultProps} leafCount={0} />);
     expect(screen.getByText("Across 0 leafs")).toBeInTheDocument();
+  });
+
+  // TB-57: the head records credit by UTC date, the History page groups by the
+  // local day, and a volunteer east of Greenwich saw "Today 44" beside a Today
+  // group of 48 with nothing saying which calendar either followed.
+  it("says the day buckets follow UTC when the daemon cut them by the head's clock", () => {
+    render(<CreditDisplay {...defaultProps} dayBoundary="utc" />);
+    expect(screen.getByTestId("credit-day-boundary")).toHaveTextContent(UTC_DAY_NOTE);
+  });
+
+  it("shows no calendar note when the buckets follow this machine's day", () => {
+    render(<CreditDisplay {...defaultProps} dayBoundary="local" />);
+    expect(screen.queryByTestId("credit-day-boundary")).not.toBeInTheDocument();
   });
 });

@@ -670,6 +670,7 @@ export function OverviewPage() {
             thisMonth={credit.this_month}
             total={credit.total_credit}
             leafCount={leafCount}
+            dayBoundary={credit.day_boundary}
           />
           {credit.source === "local" && (
             <p className="text-xs text-yellow-600">

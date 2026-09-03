@@ -294,7 +294,9 @@ func (m *Manager) GetStatus(ctx context.Context) (*Status, error) {
 	return st, nil
 }
 
-// GetHistory reads the most recent entries from the history file.
-func (m *Manager) GetHistory(ctx context.Context, limit int) ([]daemon.HistoryEntry, error) {
-	return daemon.ReadHistory(m.cfg.DataDir, limit)
+// GetHistory reads every entry in the history file, newest first. The caller
+// pages it; reading it whole is what lets the `history` command say how many
+// units are not shown (TB-46).
+func (m *Manager) GetHistory(ctx context.Context) ([]daemon.HistoryEntry, error) {
+	return daemon.ReadAllHistory(m.cfg.DataDir)
 }

@@ -7,7 +7,17 @@ interface CreditDisplayProps {
   thisMonth: number;
   total: number;
   leafCount: number;
+  /**
+   * How the daemon cut the day buckets (`CreditSummary.day_boundary`). Head-derived
+   * counters are by UTC date, the History page groups by the local day, and a
+   * volunteer east of Greenwich sees the two disagree every night unless the
+   * counters say which calendar they follow (TB-57).
+   */
+  dayBoundary?: "utc" | "local";
 }
+
+export const UTC_DAY_NOTE =
+  "Days are counted in UTC, the head's clock. The History page groups by your local day.";
 
 function StatCard({
   label,
@@ -41,6 +51,7 @@ export function CreditDisplay({
   thisMonth,
   total,
   leafCount,
+  dayBoundary,
 }: CreditDisplayProps) {
   return (
     <div className="space-y-2">
@@ -53,6 +64,11 @@ export function CreditDisplay({
       <p className="text-xs text-muted-foreground text-center">
         Across {leafCount} leaf{leafCount === 1 ? "" : "s"}
       </p>
+      {dayBoundary === "utc" && (
+        <p className="text-xs text-muted-foreground text-center" data-testid="credit-day-boundary">
+          {UTC_DAY_NOTE}
+        </p>
+      )}
     </div>
   );
 }
