@@ -6,6 +6,13 @@ more **heads** (Lettuce servers), and your machine crunches **work units** for
 their **leafs** (computations). Results are validated and credit is tracked
 automatically.
 
+> **Prefer an app?** **Lettuce Compute** is the desktop version of this same program —
+> a setup wizard, task and history views, replayable visualizations, and a tray icon, for
+> Windows, macOS and Linux. Get it from this repository's GitHub Releases (the release
+> tagged `desktop-v…`). Everything in this guide still applies underneath: the app bundles
+> `lettuce-volunteer` and shares the same account and data directory, so the app and the
+> terminal client are interchangeable.
+
 > **First tool to reach for:** `lettuce-volunteer doctor`. It checks your
 > identity, disk, container runtime (it actually pings the socket), and every
 > attached head — and tells you exactly what's wrong and how to fix it. Run it
