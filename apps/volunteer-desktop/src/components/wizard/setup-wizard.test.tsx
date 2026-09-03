@@ -809,18 +809,69 @@ describe("SetupWizard", () => {
     });
   });
 
+  /**
+   * TB-47: the CPU slider's maximum and the proposed default (half of it)
+   * used to come from `navigator.hardwareConcurrency`, which WebKit (the Linux
+   * and macOS web view) caps at 8 — so every such machine was set up with 4
+   * cores, and the value is the hard CPU quota the daemon enforces. The Rust
+   * host's count is the source now; the browser figure is only a fallback.
+   */
+  describe("core count comes from the host, not the web view (TB-47)", () => {
+    beforeEach(() => {
+      // What a WebKit web view reports on any machine with 8 or more threads.
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 8,
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      delete (navigator as { hardwareConcurrency?: number }).hardwareConcurrency;
+    });
+
+    it("sizes the CPU slider and proposes half of the host's cores", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, get_system_cpu_count: 32 });
+      render(<SetupWizard onComplete={vi.fn()} />);
+      await user.click(screen.getByText("Get Started"));
+      await user.click(screen.getByText("Next"));
+
+      await screen.findByText("16 / 32");
+      // The first range input on the Resources step is the CPU slider.
+      expect(screen.getAllByRole("slider")[0]).toHaveAttribute("max", "32");
+      expect(screen.getAllByRole("slider")[0]).toHaveValue("16");
+    });
+
+    it("falls back to the web view's figure only when the host cannot report a count", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, get_system_cpu_count: 0 });
+      render(<SetupWizard onComplete={vi.fn()} />);
+      await user.click(screen.getByText("Get Started"));
+      await user.click(screen.getByText("Next"));
+
+      await screen.findByText("4 / 8");
+      expect(screen.getAllByRole("slider")[0]).toHaveAttribute("max", "8");
+    });
+  });
+
   describe("full run with an engine and a head", () => {
     it("sends every chosen value to run_init", async () => {
       const user = setup();
-      mockInvoke({ detect_container_runtime: PODMAN_READY, ...headRoutes });
+      mockInvoke({
+        detect_container_runtime: PODMAN_READY,
+        get_system_cpu_count: 32,
+        ...headRoutes,
+      });
       const onComplete = vi.fn();
       render(<SetupWizard onComplete={onComplete} />);
       await goToConnect(user);
       await testConnection(user);
       await user.click(screen.getByText("Start Contributing"));
 
+      // cpu_cores is half of the host-reported count (TB-47), not of the
+      // web view's capped figure.
       await waitFor(() => expect(runInitPayload()).toEqual({
-        cpu_cores: expect.any(Number),
+        cpu_cores: 16,
         memory_mb: expect.any(Number),
         gpu_vram_pct: 50,
         disk_gb: 10,

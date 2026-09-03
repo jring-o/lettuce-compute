@@ -1,8 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, renderHook } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SettingsPage } from "./settings";
-import { mockManagementApi } from "@tauri-apps/api/core";
+import { defaultCommandResult, invoke, mockManagementApi } from "@tauri-apps/api/core";
 import type { ConfigResponse } from "@/api/client";
 
 // Mock hooks
@@ -1113,6 +1113,102 @@ describe("SettingsPage", () => {
     // After the rejection, the toggle should revert back to true
     await waitFor(() => {
       expect(autostartToggle).toHaveAttribute("aria-checked", "true");
+    });
+  });
+
+  /**
+   * TB-47: the core maximum used to come from `navigator.hardwareConcurrency`,
+   * which WebKit (the Linux and macOS web view) caps at 8. The number is the
+   * daemon's hard CPU quota, so a 256-thread host was clamped to 8 cores the
+   * first time its slider was touched. The Rust host's count is the source
+   * now; the browser figure is only a fallback and never a clamp.
+   */
+  describe("core count comes from the host, not the web view (TB-47)", () => {
+    /** The range input of the `ResourceSlider` labelled `label`. */
+    function sliderFor(label: string): HTMLInputElement {
+      const root = screen.getByText(label).parentElement!.parentElement!;
+      return root.querySelector("input[type='range']") as HTMLInputElement;
+    }
+
+    /** Route `get_system_cpu_count` beside the usual heads/status routes. */
+    function mockHostCpuCount(count: number) {
+      mockManagementApi(
+        { "GET /api/v1/heads": { heads: [], machine: noGpuMachine }, "GET /api/v1/status": {} },
+        (cmd) => (cmd === "get_system_cpu_count" ? count : defaultCommandResult(cmd))
+      );
+    }
+
+    beforeEach(() => {
+      // What a WebKit web view reports on any machine with 8 or more threads.
+      Object.defineProperty(navigator, "hardwareConcurrency", {
+        value: 8,
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      delete (navigator as { hardwareConcurrency?: number }).hardwareConcurrency;
+    });
+
+    it("sizes the CPU cores and concurrent-tasks sliders from the host's core count", async () => {
+      mockHostCpuCount(256);
+      mockUseConfig.mockReturnValue({
+        config: makeConfig({ max_concurrent_tasks: 1 }),
+        isLoading: false,
+        updateConfig: vi.fn(),
+        toast: null,
+      });
+
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("4 / 256 cores")).toBeInTheDocument();
+      });
+      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "256");
+      expect(sliderFor("Concurrent Tasks")).toHaveAttribute("max", "256");
+    });
+
+    it("never clamps a saved core count above the detected total", async () => {
+      // The CLI's default is NumCPU / 2 (128 on the reporter's box); the app
+      // must show that value, not truncate it to the slider's maximum.
+      mockHostCpuCount(8);
+      mockUseConfig.mockReturnValue({
+        config: makeConfig({
+          resource_limits: { ...makeConfig().resource_limits, max_cpu_cores: 128 },
+        }),
+        isLoading: false,
+        updateConfig: vi.fn(),
+        toast: null,
+      });
+
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText("128 / 8 cores")).toBeInTheDocument();
+      });
+      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "128");
+      expect(sliderFor("CPU Cores")).toHaveValue("128");
+    });
+
+    it("falls back to the web view's figure only when the host cannot report a count", async () => {
+      mockHostCpuCount(0);
+      mockUseConfig.mockReturnValue({
+        config: makeConfig(),
+        isLoading: false,
+        updateConfig: vi.fn(),
+        toast: null,
+      });
+
+      render(<SettingsPage />);
+
+      // Let the (empty) host answer land before asserting on the fallback.
+      await waitFor(() => {
+        expect(
+          vi.mocked(invoke).mock.calls.some(([cmd]) => cmd === "get_system_cpu_count")
+        ).toBe(true);
+      });
+      expect(screen.getByText("4 / 8 cores")).toBeInTheDocument();
+      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "8");
     });
   });
 });

@@ -21,6 +21,7 @@ export const hostCommandDefaults: Record<string, unknown> = {
   // Host measurements
   system_metrics: { cpu_usage_pct: 0, memory_used_mb: 0, memory_total_mb: 0 },
   get_system_memory_mb: 16384,
+  get_system_cpu_count: 8,
   // Autostart and identity
   is_autostart_enabled: false,
   set_autostart: undefined,

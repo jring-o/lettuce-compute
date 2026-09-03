@@ -169,6 +169,7 @@ fn main() {
             commands::install_podman,
             commands::detect_container_runtime,
             commands::get_system_memory_mb,
+            commands::get_system_cpu_count,
             commands::test_server_connection,
             commands::fetch_head_info,
             viz::viz_read_file,

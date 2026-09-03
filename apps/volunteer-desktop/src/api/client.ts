@@ -743,6 +743,17 @@ export async function getSystemMemoryMb(): Promise<number> {
   return invoke("get_system_memory_mb");
 }
 
+/**
+ * Logical CPUs available on this machine, read from the OS by the Rust host.
+ * The web view cannot be trusted for this: WebKit (Linux and macOS) caps
+ * `navigator.hardwareConcurrency` at 8, and the number ends up as the daemon's
+ * hard container CPU quota (TB-47). Sizes the CPU-cores sliders and the wizard
+ * default. Returns 0 if detection fails (caller should fall back).
+ */
+export async function getSystemCpuCount(): Promise<number> {
+  return invoke("get_system_cpu_count");
+}
+
 /** Host CPU and memory usage measured by the app itself (the daemon reports zeros). */
 export interface SystemMetrics {
   cpu_usage_pct: number;

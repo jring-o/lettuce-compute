@@ -21,6 +21,7 @@ import {
   detectContainerRuntime,
   fetchHeadInfo,
   getDataDir,
+  getSystemCpuCount,
   getSystemMemoryMb,
   installPodman,
   runInit,
@@ -37,6 +38,8 @@ interface WizardState {
   gpuVramPct: number;
   diskGb: number;
   totalMemoryMb: number;
+  /** Logical CPUs on this machine as the Rust host reports them (see `fallbackCpuCount`). */
+  totalCpuCores: number;
   scheduleMode: WizardScheduleMode;
   idleThresholdMins: number;
   scheduleFromHour: number;
@@ -54,7 +57,16 @@ interface WizardState {
   trustNative: boolean;
 }
 
-const maxCpuCores = navigator.hardwareConcurrency || 4;
+/**
+ * Fallback core count until the Rust host answers (`get_system_cpu_count`),
+ * or if it cannot. Never the primary source: WebKit (the Linux and macOS web
+ * view) caps `navigator.hardwareConcurrency` at 8, and the wizard's choice
+ * becomes `max_cpu_cores`, the hard CPU quota the daemon enforces — a
+ * 256-thread host was set up with 4 cores this way (TB-47).
+ */
+function fallbackCpuCount(): number {
+  return navigator.hardwareConcurrency || 4;
+}
 // Fallback when OS memory detection fails. Real total RAM is detected on mount
 // (get_system_memory_mb) and stored in wizard state — the old hardcoded 8 GB
 // capped the memory slider at ~7.4 GB, below the floor of large-memory leaves
@@ -189,12 +201,12 @@ function ResourcesStep({
           <div className="flex justify-between text-sm">
             <span>CPU Cores</span>
             <span className="font-medium">
-              {state.cpuCores} / {maxCpuCores}
+              {state.cpuCores} / {state.totalCpuCores}
             </span>
           </div>
           <Slider
             min={1}
-            max={maxCpuCores}
+            max={state.totalCpuCores}
             value={state.cpuCores}
             onChange={(v) => onChange({ cpuCores: v })}
           />
@@ -1059,11 +1071,12 @@ export function SetupWizard({ onComplete }: WizardProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [state, setState] = useState<WizardState>({
-    cpuCores: Math.max(1, Math.floor(maxCpuCores / 2)),
+    cpuCores: Math.max(1, Math.floor(fallbackCpuCount() / 2)),
     memoryMb: Math.round(FALLBACK_TOTAL_MEMORY_MB * 0.5),
     gpuVramPct: 50,
     diskGb: 10,
     totalMemoryMb: FALLBACK_TOTAL_MEMORY_MB,
+    totalCpuCores: fallbackCpuCount(),
     scheduleMode: "always",
     idleThresholdMins: 5,
     scheduleFromHour: 20,
@@ -1118,6 +1131,29 @@ export function SetupWizard({ onComplete }: WizardProps) {
           ...prev,
           totalMemoryMb: mb,
           memoryMb: Math.round(mb * 0.5),
+        }));
+      })
+      .catch(() => {
+        // Detection failed — keep the fallback already in state.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Same for the core count: the Rust host reports the real number of logical
+  // CPUs, the web view's figure is capped at 8 by WebKit (see
+  // `fallbackCpuCount`). Sizes the CPU slider and proposes half of the
+  // machine, which is what the CLI's own default does.
+  useEffect(() => {
+    let cancelled = false;
+    getSystemCpuCount()
+      .then((n) => {
+        if (cancelled || typeof n !== "number" || n <= 0) return;
+        setState((prev) => ({
+          ...prev,
+          totalCpuCores: n,
+          cpuCores: Math.max(1, Math.floor(n / 2)),
         }));
       })
       .catch(() => {
