@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tauri::{AppHandle, Listener, Manager};
 
@@ -17,10 +16,13 @@ use lettuce_compute_desktop_lib::tray;
 use lettuce_compute_desktop_lib::updater;
 use lettuce_compute_desktop_lib::viz;
 
-/// Event the web view emits once the setup wizard has finished and the daemon
-/// is up (see `App.tsx`). Starting the daemon-backed services on it means a
-/// fresh install gets its tray status, notifications and container runtime
-/// without relaunching the app.
+/// Event the web view emits once the setup wizard has written the install's
+/// config — before the daemon is up (see `App.tsx`). Starting the daemon-backed
+/// services on it means a fresh install gets its tray status, notifications
+/// and container runtime without relaunching the app, and gets them even when
+/// the daemon's first start is slow or fails: the polls tolerate an
+/// unreachable daemon, so the tray reads "Stopped" until it answers instead
+/// of forever (TB-55).
 const APP_INITIALIZED_EVENT: &str = "app_initialized";
 
 /// MIME type from file extension.
@@ -61,16 +63,19 @@ fn start_daemon_services(app: AppHandle, tray_icon: tauri::tray::TrayIcon, tray_
     notifications::start_notification_poll(app);
 
     std::thread::spawn(move || {
-        if !sidecar::is_daemon_running() {
-            if let Err(e) = sidecar::start_sidecar() {
-                eprintln!("[warn] failed to start the volunteer daemon: {e}");
-                return;
-            }
+        // On a fresh install the wizard's `run_init` has usually started the
+        // daemon already; `ensure_daemon_started` then does nothing.
+        if let Err(e) = sidecar::ensure_daemon_started() {
+            eprintln!("[warn] failed to start the volunteer daemon: {e}");
+            return;
         }
-        match sidecar::wait_for_daemon(Duration::from_secs(30)) {
-            Ok(info) => {
+        match sidecar::wait_for_daemon(sidecar::DAEMON_START_TIMEOUT) {
+            Ok(sidecar::DaemonStart::Ready(info)) => {
                 // Auto-start the container runtime if the Podman machine is stopped.
                 container_runtime::ensure_podman_state(&info, "running");
+            }
+            Ok(sidecar::DaemonStart::Starting) => {
+                eprintln!("[warn] volunteer daemon is still starting after {:?}", sidecar::DAEMON_START_TIMEOUT)
             }
             Err(e) => eprintln!("[warn] volunteer daemon did not come up: {e}"),
         }
@@ -153,6 +158,8 @@ fn main() {
             api::mgmt_request,
             commands::is_initialized,
             commands::run_init,
+            commands::wait_for_daemon,
+            commands::get_daemon_process_state,
             commands::restart_daemon,
             commands::get_data_dir,
             commands::get_client_version,
@@ -235,5 +242,20 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, _event| {});
+        .run(|_app, event| {
+            // Every way out of the app must freeze the daemon's work and stop
+            // the daemon, not only the tray's Quit. On macOS the application
+            // menu's Quit (⌘Q, and the Dock) terminates the app through
+            // `applicationWillTerminate`, which Tauri delivers as this final
+            // event and nothing earlier — there is no `ExitRequested` to
+            // prevent — so the work happens here, synchronously, before the
+            // process is allowed to end (TB-56). The tray's Quit has already
+            // done it by the time its `app.exit(0)` arrives here; the call is
+            // a no-op then.
+            if let tauri::RunEvent::Exit = event {
+                if let Err(e) = sidecar::suspend_and_quit_sidecar() {
+                    eprintln!("[warn] could not suspend the volunteer daemon on exit: {e}");
+                }
+            }
+        });
 }

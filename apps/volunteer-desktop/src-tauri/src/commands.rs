@@ -1,5 +1,4 @@
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
@@ -281,16 +280,56 @@ pub async fn run_init(config: InitConfig) -> Result<(), String> {
         apply_schedule_window(window)?;
     }
 
-    // Start the daemon after init
+    // Start the daemon after init and return; `wait_for_daemon` is a separate
+    // command so the wizard can report the install as set up (config.yaml
+    // exists) before the daemon is up — a daemon that never comes up used to
+    // leave the tray poll, notifications and the Podman auto-start unstarted
+    // for the whole app session (TB-55).
     sidecar::start_sidecar().map_err(|e| format!("Failed to start daemon: {}", e))?;
 
-    // Wait for the daemon to publish its management API. A first start can
-    // take well over a minute: the daemon may have to start the Podman machine
-    // and then register with every head before it listens (a live run on a
-    // Windows host took 57 s), so the wait is generous.
-    sidecar::wait_for_daemon(sidecar::DAEMON_START_TIMEOUT)?;
-
     Ok(())
+}
+
+/// How the daemon start the wizard is waiting on ended.
+#[derive(Debug, Serialize)]
+pub struct DaemonStartResult {
+    /// `ready` — the management API is up; `starting` — the daemon is still
+    /// alive at the deadline (registering, or waiting on the container
+    /// engine) and the app connects once it listens.
+    pub state: &'static str,
+}
+
+/// Wait for the daemon `run_init` started to publish its management API. A
+/// first start can take well over a minute: the daemon may have to start the
+/// Podman machine and then register with every head before it listens (a
+/// live run on a Windows host took 57 s; an Intel Mac's first Podman boot
+/// takes longer), so the wait is generous and a daemon still alive at its
+/// end is reported as starting rather than failed. A daemon that exits is
+/// reported at once, in its own words (TB-52).
+#[tauri::command]
+pub async fn wait_for_daemon() -> Result<DaemonStartResult, String> {
+    let outcome = tokio::task::spawn_blocking(|| {
+        sidecar::wait_for_daemon(sidecar::DAEMON_START_TIMEOUT)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(DaemonStartResult {
+        state: match outcome {
+            sidecar::DaemonStart::Ready(_) => "ready",
+            sidecar::DaemonStart::Starting => "starting",
+        },
+    })
+}
+
+/// The daemon process as the host sees it (running, still starting, exited
+/// with the daemon's own reason, or stopped), for the status bar to show
+/// something truer than "Stopped" while the daemon is coming up or after it
+/// refused to start. See `sidecar::DaemonProcessState`.
+#[tauri::command]
+pub async fn get_daemon_process_state() -> Result<sidecar::DaemonProcessState, String> {
+    tokio::task::spawn_blocking(sidecar::daemon_process_state)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
