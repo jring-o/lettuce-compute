@@ -2042,6 +2042,11 @@ func (d *Daemon) trackSlotStarvation() {
 	d.slotStarveMu.Lock()
 	defer d.slotStarveMu.Unlock()
 	if !starved {
+		if !d.slotStarveWarnedAt.IsZero() {
+			// The starvation this WARNed about has ended: a buffered unit
+			// started, or the buffer drained.
+			d.notices.Resolve("buffer_unrunnable", "", "")
+		}
 		d.slotStarvedSince = time.Time{}
 		d.slotStarveWarnedAt = time.Time{}
 		return
@@ -2113,7 +2118,9 @@ func (d *Daemon) warnDiskGateOnce(reason, leafLabel, leafID string, raiseToGB in
 	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, "", leafID)
 }
 
-// clearDiskGateWarning re-arms the disk-gate WARN after the gate clears.
+// clearDiskGateWarning re-arms the disk-gate WARN after the gate clears, and
+// resolves the notice the stall raised — for every leaf, since the gate
+// passing means no leaf is blocked any more.
 func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Lock()
 	wasWarned := d.diskGateWarned
@@ -2121,6 +2128,7 @@ func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Unlock()
 	if wasWarned {
 		d.logger.Info("disk space recovered: resuming work fetching")
+		d.notices.Resolve("disk_gate_blocked", "", "")
 	}
 }
 
@@ -2369,6 +2377,7 @@ func (d *Daemon) noteLeafSuccess(wu *runtime.WorkUnit) {
 		name, slug := d.resolveLeafInfo(wu.LeafID)
 		d.logger.Info("leaf recovered, resuming requests for it",
 			"leaf_id", wu.LeafID, "leaf_name", name, "leaf_slug", slug)
+		d.notices.Resolve("leaf_failing", "", wu.LeafID)
 	}
 }
 

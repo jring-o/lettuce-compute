@@ -381,6 +381,38 @@ func TestNoticesEndpoint(t *testing.T) {
 
 // The daemon-side emission sites reachable without a running work loop: the
 // leaf failure breaker (c) must land in the ring with the leaf named.
+// TB-50: a resolved notice is still served (a client that already showed it
+// must learn it is over), carrying resolved_at; a live one omits the field.
+func TestNoticesEndpoint_ResolvedNoticeCarriesResolvedAt(t *testing.T) {
+	env := setupTestEnv(t)
+
+	env.daemon.Notices().Notify(daemon.NoticeWarn, "no_work", "no work", "", "")
+	env.daemon.Notices().Notify(daemon.NoticeWarn, "leaf_failing", "keeps failing", "", "leaf-1")
+	if got := env.daemon.Notices().Resolve("no_work", "", ""); got != 1 {
+		t.Fatalf("Resolve = %d, want 1", got)
+	}
+
+	body := decodeJSON(t, env.doRequest(t, "GET", "/api/v1/notices", ""))
+	notices := body["notices"].([]any)
+	if len(notices) != 2 {
+		t.Fatalf("got %d notices, want 2 (the resolved one stays in the ring): %v", len(notices), notices)
+	}
+	for _, raw := range notices {
+		n := raw.(map[string]any)
+		resolvedAt, has := n["resolved_at"]
+		switch n["code"] {
+		case "no_work":
+			if !has || resolvedAt == "" {
+				t.Errorf("resolved no_work notice lacks resolved_at: %v", n)
+			}
+		case "leaf_failing":
+			if has {
+				t.Errorf("live leaf_failing notice carries resolved_at: %v", n)
+			}
+		}
+	}
+}
+
 func TestNotices_LeafBreakerTripEmits(t *testing.T) {
 	env := setupTestEnv(t)
 

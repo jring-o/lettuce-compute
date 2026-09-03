@@ -131,11 +131,13 @@ type ThermalMonitor struct {
 }
 
 // NoticeSink receives volunteer-facing notices — the throttle activated /
-// released escalations that the monitor otherwise only logs. The daemon's
-// notice ring implements it; declared here (not imported) because this
-// package cannot depend on the daemon package that depends on it.
+// released escalations that the monitor otherwise only logs — and the
+// resolution of the activation notice when the throttle releases. The
+// daemon's notice ring implements it; declared here (not imported) because
+// this package cannot depend on the daemon package that depends on it.
 type NoticeSink interface {
 	Notify(level, code, message, head, leaf string)
+	Resolve(code, head, leaf string) int
 }
 
 // SetNoticeSink routes the monitor's throttle notices to the given sink. Must
@@ -150,6 +152,17 @@ func (t *ThermalMonitor) notify(level, message string) {
 		return
 	}
 	t.notices.Notify(level, "thermal_throttle", message, "", "")
+}
+
+// resolveThrottleNotice marks the activation notice resolved: the throttle
+// has released, so "computing paused" is no longer true. Called before the
+// release notice is emitted so that notice starts a fresh entry rather than
+// refreshing the warning in place.
+func (t *ThermalMonitor) resolveThrottleNotice() {
+	if t.notices == nil {
+		return
+	}
+	t.notices.Resolve("thermal_throttle", "", "")
 }
 
 // SetClockForTest overrides the monitor's clock (for testing only).
@@ -267,6 +280,7 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 					"gpu_temp", gpuTemp,
 					"paused_for", pausedFor,
 				)
+				t.resolveThrottleNotice()
 				t.notify("info", fmt.Sprintf("Thermal throttle released after %s (CPU %d°C, GPU %d°C); computing resumed.",
 					pausedFor, cpuTemp, gpuTemp))
 				t.signal(ctx, false)
@@ -308,6 +322,7 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 					"suppressed_for", suppressionCooldown.String(),
 					"note", "the CPU and GPU are within their thresholds; this reading is not clearing while work is suspended, so suspending is not helping it. Resuming, and ignoring these sensors for the cooldown. Hardware thermal protection is unaffected.",
 				)
+				t.resolveThrottleNotice()
 				t.notify("warn", fmt.Sprintf("Thermal throttle force-released after %s: the CPU (%d°C) and GPU (%d°C) are within their thresholds, but %s stayed past its own critical point and suspending work was not helping it. Computing resumed; those sensors are ignored for %s. Hardware thermal protection is unaffected.",
 					held.Round(time.Second).String(), cpuTemp, gpuTemp, describeSensors(critStillHot), suppressionCooldown.String()))
 				t.signal(ctx, false)

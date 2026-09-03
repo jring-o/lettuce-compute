@@ -10,22 +10,39 @@ import (
 	"time"
 )
 
-// recordingSink captures notices the thermal monitor emits.
+// recordingSink captures notices the thermal monitor emits, and — in order
+// with them — the resolutions it requests.
 type recordingSink struct {
 	mu      sync.Mutex
 	entries []struct{ level, code, message string }
+	// events is every call in order: "notify:<level>" or "resolve:<code>".
+	events []string
 }
 
 func (s *recordingSink) Notify(level, code, message, head, leaf string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries = append(s.entries, struct{ level, code, message string }{level, code, message})
+	s.events = append(s.events, "notify:"+level)
+}
+
+func (s *recordingSink) Resolve(code, head, leaf string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, "resolve:"+code)
+	return 1
 }
 
 func (s *recordingSink) snapshot() []struct{ level, code, message string } {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]struct{ level, code, message string }(nil), s.entries...)
+}
+
+func (s *recordingSink) eventLog() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.events...)
 }
 
 // The throttle's activation WARN and release Info are the two thermal
@@ -81,6 +98,55 @@ func TestThermalMonitor_EmitsThrottleNotices(t *testing.T) {
 	}
 	if !strings.Contains(released.message, "resumed") {
 		t.Errorf("release message must say computing resumed: %q", released.message)
+	}
+}
+
+// TB-50: the activation notice is a condition ("computing paused"), so the
+// release must resolve it — before the release notice is emitted, so that
+// notice starts its own entry instead of refreshing the warning in place.
+func TestThermalMonitor_ReleaseResolvesTheActivationNotice(t *testing.T) {
+	var polls int
+	var mu sync.Mutex
+	withMockCPUTempFunc(t, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		polls++
+		if polls <= 2 {
+			return 90
+		}
+		return 60
+	})
+	withMockExecutor(t, notFoundForAll)
+
+	sink := &recordingSink{}
+	pauseCh := make(chan bool, 10)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	monitor := NewThermalMonitor(defaultThermalConfig(), pauseCh, logger)
+	monitor.SetNoticeSink(sink)
+	monitor.SetPollIntervalForTest(20 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	monitor.Start(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(sink.snapshot()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	monitor.Stop()
+
+	got := sink.eventLog()
+	want := []string{"notify:warn", "resolve:thermal_throttle", "notify:info"}
+	if len(got) < len(want) {
+		t.Fatalf("sink saw %v, want at least %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sink saw %v, want %v (activation, then its resolution, then the release notice)", got, want)
+		}
 	}
 }
 

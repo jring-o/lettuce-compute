@@ -36,6 +36,12 @@ type Fetcher struct {
 	notices    *NoticeLog
 	headStatus *HeadStatusTracker
 
+	// emptyPolls counts consecutive fetch rounds that buffered nothing;
+	// warnedNoWork records that the streak already raised the one-time
+	// "connected but getting no work" diagnostic. See noteEmptyRound.
+	emptyPolls   int
+	warnedNoWork bool
+
 	// reRegisterFn re-registers this machine against one head after a host-unknown
 	// work-path refusal (BG-25 self-heal): it discards the refused id, registers with an
 	// empty host id (so the head mints a fresh one), persists and returns the head's
@@ -295,12 +301,6 @@ const idleWait = 5 * time.Second
 func (f *Fetcher) Run(ctx context.Context) {
 	f.logger.Info("fetcher: started", "max_batch_per_request", maxBatchPerRequest)
 
-	// Track a run of empty polls so we can surface "connected but no work — here's
-	// why" exactly once, instead of leaving the operator staring at a silent,
-	// idle daemon.
-	emptyPolls := 0
-	warnedNoWork := false
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -388,11 +388,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 
 		if round.pushed == 0 {
 			f.logger.Debug("fetcher: fetchOne buffered no work")
-			emptyPolls++
-			if emptyPolls >= noWorkWarnThreshold && !warnedNoWork {
-				f.warnNoWork()
-				warnedNoWork = true
-			}
+			f.noteEmptyRound()
 			// No work was buffered this cycle (no assignments, or every assignment
 			// was abandoned as unusable). The authoritative cadence is the head's
 			// retry delay, obeyed via NextContactAt by the head-eligibility gate at
@@ -405,11 +401,33 @@ func (f *Fetcher) Run(ctx context.Context) {
 			continue
 		}
 
-		// Got work — clear the no-work streak so the diagnostic can fire again if
-		// the volunteer later goes idle for a new reason.
-		emptyPolls = 0
-		warnedNoWork = false
+		f.noteWorkArrived()
 	}
+}
+
+// noteEmptyRound counts one fetch round that buffered nothing. When the streak
+// reaches noWorkWarnThreshold it surfaces the "connected but getting no work"
+// diagnostic exactly once, instead of leaving the operator staring at a
+// silent, idle daemon.
+func (f *Fetcher) noteEmptyRound() {
+	f.emptyPolls++
+	if f.emptyPolls >= noWorkWarnThreshold && !f.warnedNoWork {
+		f.warnNoWork()
+		f.warnedNoWork = true
+	}
+}
+
+// noteWorkArrived ends a no-work streak: the diagnostic can fire again if the
+// volunteer later goes idle for a new reason, and any live no_work notice is
+// resolved, because work arriving is exactly that condition ending — it used
+// to outlive hours of completed units (TB-50). The resolve is unconditional
+// rather than gated on this fetcher's own warnedNoWork: the fetcher is
+// recreated on every pause/resume, and the notice an earlier instance raised
+// is still in the ring.
+func (f *Fetcher) noteWorkArrived() {
+	f.emptyPolls = 0
+	f.warnedNoWork = false
+	f.notices.Resolve("no_work", "", "")
 }
 
 // sleep waits for d or until ctx is cancelled. Returns false if ctx was
@@ -873,10 +891,12 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 
 	// Success: obey the server-directed retry delay on EVERY reply, including the
 	// no-work path. A head that answered is not rejecting this build, so any
-	// update-required flag it earned is cleared.
+	// update-required flag it earned is cleared, and the notice that flag
+	// raised is resolved.
 	head.Available = true
 	head.Backoff = 0
 	f.headStatus.MarkContactOK(head.Config.GRPCAddress)
+	f.notices.Resolve("update_required", head.Name, "")
 	f.applyServerRetryDelay(head, resp.RetryAfterSeconds)
 
 	// No-work is an OK response carrying an empty assignments list (the
@@ -1215,6 +1235,7 @@ func (f *Fetcher) resetRuntimeAbandon(name string) {
 	if _, wasPaused := f.pausedRuntimes[name]; wasPaused {
 		delete(f.pausedRuntimes, name)
 		f.logger.Info("fetcher: runtime recovered, resuming requests", "runtime", name)
+		f.notices.Resolve("prepare_failed", "", "")
 	}
 }
 

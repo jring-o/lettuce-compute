@@ -590,6 +590,11 @@ export interface Notice {
   count: number;
   first_at: string;
   at: string;
+  /**
+   * When the daemon observed the condition end (work arrived after a no-work
+   * streak, the disk gate cleared, a leaf recovered). Absent while it is live.
+   */
+  resolved_at?: string;
 }
 
 export interface NoticesResponse {
