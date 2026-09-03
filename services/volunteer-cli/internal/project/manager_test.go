@@ -337,27 +337,27 @@ func TestGetHistory(t *testing.T) {
 		}
 	}
 
-	entries, err := mgr.GetHistory(context.Background(), 3)
+	entries, err := mgr.GetHistory(context.Background())
 	if err != nil {
 		t.Fatalf("GetHistory: %v", err)
 	}
 
-	if len(entries) != 3 {
-		t.Fatalf("entries = %d, want 3", len(entries))
+	if len(entries) != 5 {
+		t.Fatalf("entries = %d, want all 5", len(entries))
 	}
 	// Newest first.
 	if entries[0].WorkUnitID != "wu-4" {
 		t.Errorf("first entry = %q, want wu-4", entries[0].WorkUnitID)
 	}
-	if entries[2].WorkUnitID != "wu-2" {
-		t.Errorf("last entry = %q, want wu-2", entries[2].WorkUnitID)
+	if entries[4].WorkUnitID != "wu-0" {
+		t.Errorf("last entry = %q, want wu-0", entries[4].WorkUnitID)
 	}
 }
 
 func TestGetHistoryEmpty(t *testing.T) {
 	mgr, _ := testManager(t)
 
-	entries, err := mgr.GetHistory(context.Background(), 10)
+	entries, err := mgr.GetHistory(context.Background())
 	if err != nil {
 		t.Fatalf("GetHistory: %v", err)
 	}

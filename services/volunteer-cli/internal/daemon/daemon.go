@@ -3404,10 +3404,20 @@ func (d *Daemon) serverByName(name string) *ServerConnection {
 }
 
 // recordHistory appends a history entry and logs a warning on failure.
+//
+// The entry carries the leaf's display name alongside its id when the head cache
+// knows it, so `history` can show "extract2-student-crowd" rather than a UUID
+// prefix even with the daemon stopped (TB-46). resolveLeafInfo answers with the
+// id itself when the leaf is unknown; that is not a name and is not recorded.
 func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpuSeconds int64, accepted bool, serverName string) {
+	leafName, _ := d.resolveLeafInfo(wu.LeafID)
+	if leafName == wu.LeafID {
+		leafName = ""
+	}
 	if histErr := AppendHistory(d.cfg.DataDir, HistoryEntry{
 		WorkUnitID:       wu.ID,
 		LeafID:           wu.LeafID,
+		LeafName:         leafName,
 		ServerName:       serverName,
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: wallClockSeconds,

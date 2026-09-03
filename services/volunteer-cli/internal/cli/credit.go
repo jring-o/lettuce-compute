@@ -31,6 +31,7 @@ type creditCommandResponse struct {
 	ThisWeek    float64 `json:"this_week"`
 	ThisMonth   float64 `json:"this_month"`
 	Source      string  `json:"source"`
+	DayBoundary string  `json:"day_boundary"`
 	ByHead      []struct {
 		HeadName    string  `json:"head_name"`
 		VolunteerID string  `json:"volunteer_id"`
@@ -53,6 +54,12 @@ func runCredit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Total credit: %s\n", formatCredit(cr.TotalCredit))
 	fmt.Printf("  Today: %s    This week: %s    This month: %s\n",
 		formatCredit(cr.Today), formatCredit(cr.ThisWeek), formatCredit(cr.ThisMonth))
+	// The head records credit by UTC date, so head-derived day buckets cannot
+	// follow this machine's clock; say so rather than let "today" be misread
+	// against a local-day history list (TB-57).
+	if cr.DayBoundary == "utc" {
+		fmt.Println("  Days are counted in UTC, the head's clock; `history` shows your local day.")
+	}
 	if cr.Source == "local" {
 		fmt.Println("  Note: local estimate from this host's history — no head was reachable.")
 		fmt.Println("        Connect to a head for your authoritative, account-wide total.")

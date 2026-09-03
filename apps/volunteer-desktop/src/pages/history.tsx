@@ -537,8 +537,11 @@ export function HistoryPage() {
               onChange={(e) =>
                 setFilters((f) => ({
                   ...f,
+                  // Start of the chosen LOCAL day. A bare "YYYY-MM-DD" parses as UTC
+                  // midnight, which east of Greenwich is still the previous local
+                  // evening — while the "to" bound below is already local (TB-57).
                   customFrom: e.target.value
-                    ? new Date(e.target.value).toISOString()
+                    ? new Date(e.target.value + "T00:00:00").toISOString()
                     : undefined,
                 }))
               }

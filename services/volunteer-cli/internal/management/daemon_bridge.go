@@ -1,7 +1,6 @@
 package management
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -67,6 +66,17 @@ func (b *DaemonBridge) resolveLeafName(leafID string) string {
 		return name
 	}
 	return leafID
+}
+
+// historyLeafName is the display name for a history entry: the name the daemon
+// recorded at completion (TB-46), else the live cache's answer for the id, else
+// the id itself. Entries written before names were recorded, or whose leaf has
+// since left the cache, are why both fallbacks remain.
+func (b *DaemonBridge) historyLeafName(e daemon.HistoryEntry) string {
+	if e.LeafName != "" {
+		return e.LeafName
+	}
+	return b.resolveLeafName(e.LeafID)
 }
 
 // StatusResponse is the response for GET /api/v1/status.
@@ -812,7 +822,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 		}
 		result[i] = HistoryEntryInfo{
 			WorkUnitID:       e.WorkUnitID,
-			LeafName:         b.resolveLeafName(e.LeafID),
+			LeafName:         b.historyLeafName(e),
 			CompletedAt:      e.CompletedAt.Format(time.RFC3339),
 			DurationSeconds:  e.WallClockSeconds,
 			CPUSeconds:       e.CPUSeconds,
@@ -836,33 +846,10 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 	}
 }
 
-// readAllHistory reads all history entries (newest first).
+// readAllHistory reads all history entries (newest first). A file that cannot be
+// read is an empty history here: the surfaces built on it are secondary.
 func readAllHistory(dataDir string) []daemon.HistoryEntry {
-	path := daemon.HistoryFilePath(dataDir)
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var entries []daemon.HistoryEntry
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var e daemon.HistoryEntry
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			continue
-		}
-		entries = append(entries, e)
-	}
-
-	// Reverse for newest first.
-	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
-		entries[i], entries[j] = entries[j], entries[i]
-	}
+	entries, _ := daemon.ReadAllHistory(dataDir)
 	return entries
 }
 
@@ -1332,7 +1319,20 @@ type CreditSummary struct {
 	// or "local" when the summary was derived from the local history.jsonl proxy
 	// (no head reachable, or every head predates the GetMyContribution RPC).
 	Source string `json:"source"`
+	// DayBoundary names the calendar rule behind Today/ThisWeek/ThisMonth, so a
+	// client can label them instead of leaving the reader to guess (TB-57).
+	// "utc": the buckets came from the head's daily timeline, which the head
+	// records by UTC date, so they cannot be re-cut to this machine's day. "local":
+	// the buckets were cut from the local history file by this machine's clock,
+	// the same rule the desktop app's history list groups by.
+	DayBoundary string `json:"day_boundary"`
 }
+
+// Values of CreditSummary.DayBoundary.
+const (
+	DayBoundaryUTC   = "utc"
+	DayBoundaryLocal = "local"
+)
 
 // LeafCredit holds credit for a single leaf.
 type LeafCredit struct {
@@ -1375,7 +1375,7 @@ func (b *DaemonBridge) creditFromHeads() (CreditSummary, bool) {
 	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	summary := CreditSummary{Source: "head", ByLeaf: []LeafCredit{}, ByHead: []HeadCredit{}}
+	summary := CreditSummary{Source: "head", DayBoundary: DayBoundaryUTC, ByLeaf: []LeafCredit{}, ByHead: []HeadCredit{}}
 	leafByID := make(map[string]*LeafCredit)
 	var leafOrder []string
 	anyAnswered := false
@@ -1456,49 +1456,78 @@ func (b *DaemonBridge) creditFromHistory() CreditSummary {
 	cfg := b.daemon.GetConfig()
 	entries := readAllHistory(cfg.DataDir)
 
-	now := time.Now().UTC()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	buckets := bucketAcceptedHistory(entries, time.Now())
 
-	var total, today, week, month float64
-	byLeaf := make(map[string]float64)
-
-	for _, e := range entries {
-		if !e.ResultAccepted {
-			continue
-		}
-		total++
-		if e.CompletedAt.After(todayStart) {
-			today++
-		}
-		if e.CompletedAt.After(weekStart) {
-			week++
-		}
-		if e.CompletedAt.After(monthStart) {
-			month++
-		}
-		byLeaf[e.LeafID]++
-	}
-
-	leafCredits := make([]LeafCredit, 0, len(byLeaf))
-	for pid, credit := range byLeaf {
+	leafCredits := make([]LeafCredit, 0, len(buckets.byLeaf))
+	for _, lid := range buckets.leafOrder {
 		leafCredits = append(leafCredits, LeafCredit{
-			LeafID:   pid,
-			LeafName: b.resolveLeafName(pid),
-			Credit:   credit,
+			LeafID:   lid,
+			LeafName: b.historyLeafName(buckets.leafSample[lid]),
+			Credit:   buckets.byLeaf[lid],
 		})
 	}
 
 	return CreditSummary{
-		TotalCredit: total,
-		Today:       today,
-		ThisWeek:    week,
-		ThisMonth:   month,
+		TotalCredit: buckets.total,
+		Today:       buckets.today,
+		ThisWeek:    buckets.week,
+		ThisMonth:   buckets.month,
 		ByLeaf:      leafCredits,
 		ByHead:      []HeadCredit{},
 		Source:      "local",
+		DayBoundary: DayBoundaryLocal,
 	}
+}
+
+// historyBuckets is bucketAcceptedHistory's tally of accepted history entries.
+type historyBuckets struct {
+	total, today, week, month float64
+	byLeaf                    map[string]float64
+	leafOrder                 []string                       // leaf ids in first-seen order, for a stable response
+	leafSample                map[string]daemon.HistoryEntry // one entry per leaf, for its recorded name
+}
+
+// bucketAcceptedHistory tallies the accepted entries into all-time, today,
+// this-week and this-month counts, cutting the day boundaries in the location
+// of now.
+//
+// The daemon and the desktop app run on the same machine, so time.Now() here is
+// the same clock and zone the app's history list groups by, and "today" means
+// the same day on both surfaces (TB-57). Cutting these buckets by UTC day, as the
+// head's timeline must, made a volunteer east of Greenwich see units completed
+// after local midnight listed under Today and yet not counted in it. The week
+// starts on Sunday, matching the head-derived buckets.
+func bucketAcceptedHistory(entries []daemon.HistoryEntry, now time.Time) historyBuckets {
+	loc := now.Location()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+
+	b := historyBuckets{
+		byLeaf:     make(map[string]float64),
+		leafSample: make(map[string]daemon.HistoryEntry),
+	}
+	for _, e := range entries {
+		if !e.ResultAccepted {
+			continue
+		}
+		b.total++
+		if !e.CompletedAt.Before(todayStart) {
+			b.today++
+		}
+		if !e.CompletedAt.Before(weekStart) {
+			b.week++
+		}
+		if !e.CompletedAt.Before(monthStart) {
+			b.month++
+		}
+		if _, seen := b.byLeaf[e.LeafID]; !seen {
+			b.leafOrder = append(b.leafOrder, e.LeafID)
+			b.leafSample[e.LeafID] = e
+		}
+		b.byLeaf[e.LeafID]++
+	}
+	return b
 }
 
 // TaskDetail is the response for GET /api/v1/tasks/{work_unit_id}/details.

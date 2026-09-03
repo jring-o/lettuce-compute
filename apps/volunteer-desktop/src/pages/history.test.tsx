@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HistoryPage, HISTORY_CSV_HEADER, HEAD_ACCEPTED_TOOLTIP, historyToCsv } from "./history";
 import type { HistoryEntry, CreditSummary, ResultEntry } from "@/api/client";
@@ -273,6 +273,32 @@ describe("HistoryPage", () => {
 
     const lastCall = mockUseHistory.mock.calls[mockUseHistory.mock.calls.length - 1][0];
     expect(lastCall.headAccepted).toBe("rejected");
+  });
+
+  // TB-57: a bare "YYYY-MM-DD" parses as UTC midnight, so east of Greenwich the
+  // From bound started the previous local evening while the To bound (already
+  // local) ended at the local day's end. Run in a UTC+2 zone so the two rules
+  // actually differ on the machine running the test.
+  it("starts a custom From date at local midnight, like the To bound", async () => {
+    const prevTZ = process.env.TZ;
+    process.env.TZ = "Europe/Berlin";
+    try {
+      const user = userEvent.setup();
+      mockUseHistory.mockReturnValue(historyState());
+
+      render(<HistoryPage />);
+      await user.selectOptions(screen.getByLabelText("Date range"), "custom");
+      fireEvent.change(screen.getByLabelText("From date"), { target: { value: "2026-08-31" } });
+
+      const lastCall = mockUseHistory.mock.calls[mockUseHistory.mock.calls.length - 1][0];
+      const from = new Date(lastCall.customFrom);
+      expect([from.getFullYear(), from.getMonth() + 1, from.getDate(), from.getHours()]).toEqual([
+        2026, 8, 31, 0,
+      ]);
+    } finally {
+      if (prevTZ === undefined) delete process.env.TZ;
+      else process.env.TZ = prevTZ;
+    }
   });
 
   // --- Leaf filter: by name, applied client-side ---

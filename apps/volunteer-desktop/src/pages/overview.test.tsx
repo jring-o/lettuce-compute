@@ -478,6 +478,28 @@ describe("OverviewPage", () => {
     expect(screen.getByText("Credit Breakdown")).toBeInTheDocument();
   });
 
+  // TB-57: head-derived day buckets are by UTC date and cannot follow this
+  // machine's clock, so the Overview must say so beside the counters.
+  it("labels head-derived credit counters as UTC days", () => {
+    setupDefaultMocks({
+      credit: {
+        credit: {
+          total_credit: 48,
+          today: 44,
+          this_week: 48,
+          this_month: 48,
+          by_leaf: [],
+          by_head: [],
+          source: "head",
+          day_boundary: "utc",
+        },
+      },
+    });
+
+    render(<OverviewPage />);
+    expect(screen.getByTestId("credit-day-boundary")).toBeInTheDocument();
+  });
+
   it("quick stats footer counts leaves from by_leaf", () => {
     setupDefaultMocks({
       credit: {

@@ -527,6 +527,14 @@ export interface CreditSummary {
   by_leaf: LeafCredit[];
   by_head: HeadCredit[];
   source: "head" | "local";
+  /**
+   * The calendar rule behind `today`, `this_week` and `this_month`. "utc" when
+   * they come from the head's daily timeline (the head records credit by UTC
+   * date, so the buckets cannot follow this machine's clock); "local" when they
+   * were cut from the local history file by this machine's day, the same rule
+   * the History page groups by.
+   */
+  day_boundary: "utc" | "local";
 }
 
 // ---------------------------------------------------------------------------

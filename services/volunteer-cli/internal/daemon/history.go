@@ -12,8 +12,15 @@ import (
 
 // HistoryEntry records a completed work unit.
 type HistoryEntry struct {
-	WorkUnitID       string    `json:"work_unit_id"`
-	LeafID           string    `json:"leaf_id"`
+	WorkUnitID string `json:"work_unit_id"`
+	LeafID     string `json:"leaf_id"`
+	// LeafName is the leaf's display name as the daemon's head cache knew it when
+	// the unit completed. LeafID is the head's internal UUID, which no volunteer
+	// can read; recording the name here lets `history` stay legible with the
+	// daemon stopped and long after the cache has moved on (TB-46). Empty in
+	// entries written before the field existed or when the cache did not know
+	// the leaf — readers fall back to LeafID.
+	LeafName         string    `json:"leaf_name,omitempty"`
 	ServerName       string    `json:"server_name,omitempty"`
 	CompletedAt      time.Time `json:"completed_at"`
 	WallClockSeconds int64     `json:"wall_clock_seconds"`
@@ -50,12 +57,27 @@ func AppendHistory(dataDir string, entry HistoryEntry) error {
 	return nil
 }
 
-// ReadHistory reads the most recent entries from the history file.
+// ReadHistory reads the most recent entries from the history file, newest first,
+// at most limit of them. A limit of zero or less reads 50.
 func ReadHistory(dataDir string, limit int) ([]HistoryEntry, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	entries, err := ReadAllHistory(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
 
+// ReadAllHistory reads every entry in the history file, newest first. A missing
+// file is an empty history, not an error; malformed lines are skipped. Callers
+// that show a page of history should count from this slice rather than from the
+// page, so a "showing N of M" line can tell the volunteer how much is not shown.
+func ReadAllHistory(dataDir string) ([]HistoryEntry, error) {
 	path := HistoryFilePath(dataDir)
 	f, err := os.Open(path)
 	if err != nil {
@@ -84,14 +106,18 @@ func ReadHistory(dataDir string, limit int) ([]HistoryEntry, error) {
 		return nil, fmt.Errorf("reading history: %w", err)
 	}
 
-	// Return newest first, limited.
-	if len(entries) > limit {
-		entries = entries[len(entries)-limit:]
-	}
-	// Reverse for newest first.
+	// The file is append-only, so reversing it yields newest first.
 	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
 		entries[i], entries[j] = entries[j], entries[i]
 	}
-
 	return entries, nil
+}
+
+// DisplayLeafName is the name a person should see for this entry: the recorded
+// leaf name when the daemon knew it, else the raw leaf id.
+func (e HistoryEntry) DisplayLeafName() string {
+	if e.LeafName != "" {
+		return e.LeafName
+	}
+	return e.LeafID
 }
