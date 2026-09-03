@@ -30,7 +30,11 @@ automatically.
 ```
 
 You can `attach` to multiple heads run by different operators; the CLI spreads
-work across all of them.
+work across all of them. `--server` (on `attach` and `init`, and the address
+field in the desktop app) takes the head's host name; a pasted URL such as
+`https://head.example.com/` is accepted too — the scheme and path are dropped,
+and a port in the address (`head.example.com:8443`) is used for both gRPC and
+HTTP. An `http://` address means the head is reached without TLS.
 
 ## Logs — attach this when asking for help
 

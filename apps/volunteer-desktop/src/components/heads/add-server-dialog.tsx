@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useClient } from "@/hooks/use-api";
+import { normalizeHeadAddress } from "@/lib/head-address";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -77,14 +78,17 @@ export function AddServerDialog({
     setIsTesting(true);
     setTestError(null);
     setHeadPreview(null);
+    // What was typed may carry a scheme or a path ("https://host/"); the head
+    // is the bare host. Probe that, store that, and show it back (TB-51).
+    const address = normalizeHeadAddress(url);
     try {
-      await testServerConnection(url.trim());
+      await testServerConnection(address);
 
-      let preview: HeadPreview = { name: url.trim(), description: "", leafs: [] };
+      let preview: HeadPreview = { name: address, description: "", leafs: [] };
       try {
-        const head = await fetchHeadInfo(url.trim());
+        const head = await fetchHeadInfo(address);
         preview = {
-          name: head.name || url.trim(),
+          name: head.name || address,
           description: head.description,
           leafs: head.leafs
             .filter((l) => !l.state || l.state === "ACTIVE")
@@ -95,6 +99,7 @@ export function AddServerDialog({
         // attaching still works, so proceed with a bare preview.
       }
       setHeadPreview(preview);
+      setUrl(address);
       // Container is the safe default when a backend exists; native never is.
       setTrust({ container: containerAvailable, native: false });
     } catch {
@@ -109,9 +114,10 @@ export function AddServerDialog({
     setIsAttaching(true);
     setAttachError(null);
     const name = customName.trim() || undefined;
+    const address = normalizeHeadAddress(url);
     try {
       await client.attachHead({
-        server_address: url.trim(),
+        server_address: address,
         name,
         trusted_runtimes: trustedRuntimesFromChoice({
           container: trust.container && containerAvailable,
@@ -119,7 +125,7 @@ export function AddServerDialog({
         }),
       });
       onOpenChange(false);
-      onServerAdded(name || headPreview?.name || url.trim());
+      onServerAdded(name || headPreview?.name || address);
     } catch (err) {
       setAttachError(
         err instanceof ApiError ? err.message : "Failed to attach server"
@@ -144,7 +150,7 @@ export function AddServerDialog({
         <div className="space-y-3">
           <Input
             ref={inputRef}
-            placeholder="https://compute.example.org"
+            placeholder="compute.example.org"
             value={url}
             onChange={(e) => {
               setUrl(e.target.value);

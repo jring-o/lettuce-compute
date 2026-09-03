@@ -569,6 +569,15 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	if err != nil {
 		return err
 	}
+	// The desktop app hands over whatever the volunteer typed into its address
+	// field — possibly "https://host/" (its own Test Connection accepts that).
+	// Derive the gRPC target, the HTTP base and the default name from the
+	// parsed address, as `init` and `attach` do, instead of storing the raw
+	// string as a gRPC target that can never resolve (TB-51).
+	addr, err := config.ParseHeadAddress(req.ServerAddress)
+	if err != nil {
+		return err
+	}
 
 	b.cfgMu.Lock()
 	defer b.cfgMu.Unlock()
@@ -581,20 +590,23 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	}
 
 	// Check for duplicates.
+	grpcAddr := addr.GRPCAddress()
 	for _, s := range newCfg.Servers {
-		if s.GRPCAddress == req.ServerAddress {
-			return fmt.Errorf("already attached to %s", req.ServerAddress)
+		if s.GRPCAddress == grpcAddr {
+			return fmt.Errorf("already attached to %s", grpcAddr)
 		}
 	}
 
 	name := req.Name
 	if name == "" {
-		name = req.ServerAddress
+		name = addr.Host
 	}
 
 	sc := config.ServerConfig{
-		GRPCAddress: req.ServerAddress,
+		GRPCAddress: grpcAddr,
+		HTTPAddress: addr.HTTPAddress(),
 		Name:        name,
+		Insecure:    addr.Insecure,
 		// Exactly what the request granted — the client's consent step, if it
 		// had one — and an explicit empty list otherwise, so the new head starts
 		// WASM-only as a recorded decision, not a legacy blank (PB-28).

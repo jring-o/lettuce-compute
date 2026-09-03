@@ -28,7 +28,7 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().Int("disk-gb", 0, "Max disk storage in GB")
 	cmd.Flags().String("schedule-mode", "", "Scheduling mode (always, idle, scheduled)")
 	cmd.Flags().Int("idle-threshold", 0, "Idle threshold in minutes")
-	cmd.Flags().String("server", "", "Server host to connect to")
+	cmd.Flags().String("server", "", "Head to connect to: host, host:port, or an http(s):// URL (compute.example.org, https://compute.example.org/)")
 	cmd.Flags().String("trust", "", "With --server: runtimes to trust that head to run — comma list of container,native (wasm is always allowed). Omitted means WASM only")
 	cmd.Flags().String("enabled-leafs", "", "Comma-separated leaf slugs to enable (sets SPECIFIC mode)")
 	return cmd
@@ -188,17 +188,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 			if terr != nil {
 				return fmt.Errorf("--trust: %w", terr)
 			}
-			name := host
-			sc := config.ServerConfig{}
-			if strings.Contains(host, ":") {
-				sc.GRPCAddress = host
-				name = host[:strings.LastIndex(host, ":")]
-				sc.HTTPAddress = fmt.Sprintf("https://%s", name)
-			} else {
-				sc.GRPCAddress = host + ":443"
-				sc.HTTPAddress = fmt.Sprintf("https://%s", host)
+			sc, err := serverConfigFromAddress(host)
+			if err != nil {
+				return fmt.Errorf("--server: %w", err)
 			}
-			sc.Name = name
 			applyInitTrust(&sc, trusted)
 			c.Servers = []config.ServerConfig{sc}
 		}
@@ -369,22 +362,15 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Println("\n=== Step 7: Server ===")
 		host := promptString(scanner, "Server host (optional, press Enter to skip)", "")
 		if host != "" {
-			name := host
-			sc := config.ServerConfig{}
-			if strings.Contains(host, ":") {
-				sc.GRPCAddress = host
-				name = host[:strings.LastIndex(host, ":")]
-				sc.HTTPAddress = fmt.Sprintf("https://%s", name)
-			} else {
-				sc.GRPCAddress = host + ":443"
-				sc.HTTPAddress = fmt.Sprintf("https://%s", host)
+			sc, err := serverConfigFromAddress(host)
+			if err != nil {
+				return err
 			}
-			sc.Name = name
 			// The same consent `attach` gives, on the same prompt (TB-7). Container
 			// availability is the machine's real capability, exactly as at attach —
 			// trust is a per-head ceiling, and what the daemon actually advertises is
 			// that ceiling intersected with the runtimes it detects at start.
-			applyInitTrust(&sc, promptRuntimeTrust(scanner, name, containerBackendAvailable()))
+			applyInitTrust(&sc, promptRuntimeTrust(scanner, sc.Name, containerBackendAvailable()))
 			c.Servers = []config.ServerConfig{sc}
 		}
 	}
@@ -499,3 +485,20 @@ func splitAndTrim(s string) []string {
 }
 
 var detectContainerBackendFunc = rtdetect.DetectContainerBackend
+
+// serverConfigFromAddress builds the config entry for a head from whatever the
+// volunteer typed — a bare host, host:port, or an http(s):// URL (TB-51). The
+// entry's name is the host; gRPC and HTTP targets come from the same parsed
+// address, so a URL never reaches gRPC and "https" is never a head's name.
+func serverConfigFromAddress(input string) (config.ServerConfig, error) {
+	addr, err := config.ParseHeadAddress(input)
+	if err != nil {
+		return config.ServerConfig{}, err
+	}
+	return config.ServerConfig{
+		GRPCAddress: addr.GRPCAddress(),
+		HTTPAddress: addr.HTTPAddress(),
+		Name:        addr.Host,
+		Insecure:    addr.Insecure,
+	}, nil
+}

@@ -70,7 +70,7 @@ describe("AddServerDialog", () => {
     render(<AddServerDialog open={true} {...defaultProps} />);
 
     expect(
-      screen.getByPlaceholderText("https://compute.example.org")
+      screen.getByPlaceholderText("compute.example.org")
     ).toBeInTheDocument();
     expect(screen.getByText("Test Connection")).toBeInTheDocument();
   });
@@ -79,7 +79,7 @@ describe("AddServerDialog", () => {
     render(<AddServerDialog open={false} {...defaultProps} />);
 
     expect(
-      screen.queryByPlaceholderText("https://compute.example.org")
+      screen.queryByPlaceholderText("compute.example.org")
     ).not.toBeInTheDocument();
   });
 
@@ -115,7 +115,7 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} />);
 
-    const input = screen.getByPlaceholderText("https://compute.example.org");
+    const input = screen.getByPlaceholderText("compute.example.org");
     await user.type(input, "https://example.com");
 
     const testBtn = screen.getByText("Test Connection");
@@ -138,15 +138,15 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} />);
 
-    const input = screen.getByPlaceholderText("https://compute.example.org");
+    const input = screen.getByPlaceholderText("compute.example.org");
     await user.type(input, "https://example.com");
     await user.click(screen.getByText("Test Connection"));
 
     await waitFor(() => {
       expect(previewTitle("Test Server")).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("test_server_connection", { url: "https://example.com" });
-    expect(mockInvoke).toHaveBeenCalledWith("fetch_head_info", { url: "https://example.com" });
+    expect(mockInvoke).toHaveBeenCalledWith("test_server_connection", { url: "example.com" });
+    expect(mockInvoke).toHaveBeenCalledWith("fetch_head_info", { url: "example.com" });
     expect(screen.getByText("A test server")).toBeInTheDocument();
     expect(screen.getByText("Leaf A")).toBeInTheDocument();
     expect(screen.getByText("science, physics")).toBeInTheDocument();
@@ -161,13 +161,13 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} />);
 
-    await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://old.example.com");
+    await user.type(screen.getByPlaceholderText("compute.example.org"), "https://old.example.com");
     await user.click(screen.getByText("Test Connection"));
 
     await waitFor(() => {
       expect(screen.getByText("Attach")).toBeInTheDocument();
     });
-    expect(previewTitle("https://old.example.com")).toBeInTheDocument();
+    expect(previewTitle("old.example.com")).toBeInTheDocument();
   });
 
   it("shows test error on failed connection", async () => {
@@ -176,7 +176,7 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} />);
 
-    const input = screen.getByPlaceholderText("https://compute.example.org");
+    const input = screen.getByPlaceholderText("compute.example.org");
     await user.type(input, "https://bad.example.com");
     await user.click(screen.getByText("Test Connection"));
 
@@ -209,7 +209,7 @@ describe("AddServerDialog", () => {
       />
     );
 
-    const input = screen.getByPlaceholderText("https://compute.example.org");
+    const input = screen.getByPlaceholderText("compute.example.org");
     await user.type(input, "https://my-server.com");
     await user.click(screen.getByText("Test Connection"));
 
@@ -228,7 +228,7 @@ describe("AddServerDialog", () => {
 
     await waitFor(() => {
       expect(mockClient.attachHead).toHaveBeenCalledWith({
-        server_address: "https://my-server.com",
+        server_address: "my-server.com",
         name: undefined,
         trusted_runtimes: ["CONTAINER"],
       });
@@ -245,7 +245,7 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} onServerAdded={onServerAdded} />);
 
-    await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://my-server.com");
+    await user.type(screen.getByPlaceholderText("compute.example.org"), "https://my-server.com");
     await user.click(screen.getByText("Test Connection"));
     await waitFor(() => expect(screen.getByText("Attach")).toBeInTheDocument());
 
@@ -256,7 +256,7 @@ describe("AddServerDialog", () => {
 
     await waitFor(() => {
       expect(mockClient.attachHead).toHaveBeenCalledWith({
-        server_address: "https://my-server.com",
+        server_address: "my-server.com",
         name: "Lab",
         trusted_runtimes: ["NATIVE"],
       });
@@ -276,7 +276,7 @@ describe("AddServerDialog", () => {
       />
     );
 
-    await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://my-server.com");
+    await user.type(screen.getByPlaceholderText("compute.example.org"), "https://my-server.com");
     await user.click(screen.getByText("Test Connection"));
     await waitFor(() => expect(screen.getByText("Attach")).toBeInTheDocument());
 
@@ -303,7 +303,7 @@ describe("AddServerDialog", () => {
 
     render(<AddServerDialog open={true} {...defaultProps} />);
 
-    const input = screen.getByPlaceholderText("https://compute.example.org");
+    const input = screen.getByPlaceholderText("compute.example.org");
     await user.type(input, "https://dup.example.com");
     await user.click(screen.getByText("Test Connection"));
 
@@ -332,5 +332,30 @@ describe("AddServerDialog", () => {
     // Click the backdrop (not the dialog content)
     await user.click(backdrop!);
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  // TB-51: a pasted URL used to reach the daemon verbatim as the gRPC target.
+  // The scheme and path are dropped before the probe, the field shows the
+  // address the head will be stored under, and that address is attached.
+  it("reduces a pasted URL to the head's address, shows it back and attaches it", async () => {
+    const user = userEvent.setup();
+    mockHost({ head: { name: "My Server", description: "", leafs: [] } });
+
+    render(<AddServerDialog open={true} {...defaultProps} />);
+
+    const input = screen.getByPlaceholderText("compute.example.org");
+    await user.type(input, "https://My-Server.com/");
+    await user.click(screen.getByText("Test Connection"));
+
+    await waitFor(() => expect(screen.getByText("Attach")).toBeInTheDocument());
+    expect(mockInvoke).toHaveBeenCalledWith("test_server_connection", { url: "my-server.com" });
+    expect(input).toHaveValue("my-server.com");
+
+    await user.click(screen.getByText("Attach"));
+    await waitFor(() => {
+      expect(mockClient.attachHead).toHaveBeenCalledWith(
+        expect.objectContaining({ server_address: "my-server.com" })
+      );
+    });
   });
 });

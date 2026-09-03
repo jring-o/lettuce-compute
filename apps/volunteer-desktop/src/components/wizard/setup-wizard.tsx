@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { Slider } from "@/components/ui/slider";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { cn, detectPlatform } from "@/lib/utils";
+import { normalizeHeadAddress } from "@/lib/head-address";
 import {
   buildInitSchedule,
   describeWindow,
@@ -876,8 +877,11 @@ function ConnectStep({
     setIsTesting(true);
     setTestResult(null);
     onChange({ headPreview: null, enabledLeafSlugs: [], connectionOk: false });
+    // What was typed may carry a scheme or a path ("https://host/"); the head
+    // is the bare host. Probe that, store that, and show it back (TB-51).
+    const address = normalizeHeadAddress(state.serverUrl);
     try {
-      const health = await testServerConnection(state.serverUrl.trim());
+      const health = await testServerConnection(address);
       if (health.status !== "healthy") {
         setTestResult("error");
         return;
@@ -886,7 +890,7 @@ function ConnectStep({
       let preview: HeadPreview | null = null;
       let slugs: string[] = [];
       try {
-        const head = await fetchHeadInfo(state.serverUrl.trim());
+        const head = await fetchHeadInfo(address);
         const activeLeafs = head.leafs.filter((l) => l.state === "ACTIVE");
         preview = {
           name: head.name,
@@ -905,6 +909,7 @@ function ConnectStep({
       // A fresh head means a fresh consent: container defaults to allowed
       // only when an engine actually answered, native is always off.
       onChange({
+        serverUrl: address,
         connectionOk: true,
         headPreview: preview,
         enabledLeafSlugs: slugs,
@@ -938,7 +943,7 @@ function ConnectStep({
 
       <div className="space-y-3">
         <Input
-          placeholder="https://compute.example.org"
+          placeholder="compute.example.org"
           value={state.serverUrl}
           onChange={(e) => {
             onChange({
@@ -1172,7 +1177,7 @@ export function SetupWizard({ onComplete }: WizardProps) {
   const handleComplete = async (withServer: boolean) => {
     setIsSubmitting(true);
     setError(null);
-    const serverUrl = state.serverUrl.trim();
+    const serverUrl = normalizeHeadAddress(state.serverUrl);
     const hasServer = withServer && serverUrl !== "";
     const schedule = buildInitSchedule({
       mode: state.scheduleMode,
