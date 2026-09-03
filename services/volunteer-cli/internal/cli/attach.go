@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
+	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/project"
 	"github.com/spf13/cobra"
 )
@@ -41,7 +42,12 @@ Examples:
 
 			// Case 1: attach --server <host>
 			if server != "" {
-				return attachServer(cmd, mgr, server, grpcPort, httpPort, leafID, insecure, caCertPath, trust, logger)
+				target, err := resolveAttachTarget(server, grpcPort, httpPort,
+					cmd.Flags().Changed("grpc-port"), cmd.Flags().Changed("http-port"), insecure)
+				if err != nil {
+					return fmt.Errorf("--server: %w", err)
+				}
+				return attachServer(cmd, mgr, target.host, target.grpcPort, target.httpPort, leafID, target.insecure, caCertPath, trust, logger)
 			}
 
 			// Case 2: attach <leaf-id> (on first configured server)
@@ -53,7 +59,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&server, "server", "", "server hostname or IP")
+	cmd.Flags().StringVar(&server, "server", "", "head to attach: host, host:port, or an http(s):// URL (the scheme and any path are dropped; http:// implies --insecure)")
 	cmd.Flags().IntVar(&grpcPort, "grpc-port", 443, "gRPC port (default 443)")
 	cmd.Flags().IntVar(&httpPort, "http-port", 443, "HTTPS port (default 443)")
 	cmd.Flags().StringVar(&leafID, "leaf", "", "leaf ID on the server")
@@ -187,4 +193,43 @@ func attachLeafByID(mgr *project.Manager, leafID string) error {
 	}
 	fmt.Printf("Pinned leaf %s on head %s — the daemon will request its work by id on next startup (works for unlisted leafs too).\n", leafID, srv.DisplayName())
 	return nil
+}
+
+// attachTarget is the head `attach --server` will connect to, after the typed
+// address and the port flags have been reconciled.
+type attachTarget struct {
+	host     string
+	grpcPort int
+	httpPort int
+	insecure bool
+}
+
+// resolveAttachTarget reconciles the --server value with the port and TLS
+// flags. The value may be a bare host, host:port, or an http(s):// URL
+// (TB-51: "https://host" used to become "https://host:443", refused as
+// "too many colons"). A port carried by the address applies to gRPC and HTTP
+// alike — one address names one port — and an explicit --grpc-port or
+// --http-port overrides the corresponding side; naming a gRPC port both ways
+// with different values is refused rather than silently picking one. An
+// http:// input implies --insecure.
+func resolveAttachTarget(server string, grpcPort, httpPort int, grpcPortGiven, httpPortGiven, insecure bool) (attachTarget, error) {
+	addr, err := config.ParseHeadAddress(server)
+	if err != nil {
+		return attachTarget{}, err
+	}
+	if addr.Port != 0 {
+		if grpcPortGiven && grpcPort != addr.Port {
+			return attachTarget{}, fmt.Errorf("the address names port %d but --grpc-port says %d; give the port once", addr.Port, grpcPort)
+		}
+		grpcPort = addr.Port
+		if !httpPortGiven {
+			httpPort = addr.Port
+		}
+	}
+	return attachTarget{
+		host:     addr.Host,
+		grpcPort: grpcPort,
+		httpPort: httpPort,
+		insecure: insecure || addr.Insecure,
+	}, nil
 }

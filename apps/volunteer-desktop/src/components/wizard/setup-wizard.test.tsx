@@ -102,7 +102,7 @@ async function goToConnect(user: User) {
 }
 
 async function testConnection(user: User, url = "https://science.example.org") {
-  await user.type(screen.getByPlaceholderText("https://compute.example.org"), url);
+  await user.type(screen.getByPlaceholderText("compute.example.org"), url);
   await user.click(screen.getByText("Test Connection"));
   await screen.findByText("Connected");
 }
@@ -296,8 +296,8 @@ describe("SetupWizard", () => {
       expect(screen.getByText("math")).toBeInTheDocument();
       expect(screen.getByText("Climate Model")).toBeInTheDocument();
       expect(screen.queryByText("Paused Leaf")).not.toBeInTheDocument();
-      expect(invoke).toHaveBeenCalledWith("test_server_connection", { url: "https://science.example.org" });
-      expect(invoke).toHaveBeenCalledWith("fetch_head_info", { url: "https://science.example.org" });
+      expect(invoke).toHaveBeenCalledWith("test_server_connection", { url: "science.example.org" });
+      expect(invoke).toHaveBeenCalledWith("fetch_head_info", { url: "science.example.org" });
     });
 
     it("all active leafs are checked by default after test connection", async () => {
@@ -334,7 +334,7 @@ describe("SetupWizard", () => {
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
-        server_url: "https://test.example.org",
+        server_url: "test.example.org",
         enabled_leafs: ["climate"],
       }));
     });
@@ -377,7 +377,7 @@ describe("SetupWizard", () => {
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
 
-      await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://x.example.org");
+      await user.type(screen.getByPlaceholderText("compute.example.org"), "https://x.example.org");
       expect(screen.getByRole("button", { name: "Start Contributing" })).toBeDisabled();
       expect(screen.getByText(/Test the connection/)).toBeInTheDocument();
       expect(screen.queryByText("What may this head run on your machine?")).not.toBeInTheDocument();
@@ -394,7 +394,7 @@ describe("SetupWizard", () => {
       render(<SetupWizard onComplete={vi.fn()} />);
       await goToConnect(user);
 
-      await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://bad.example.com");
+      await user.type(screen.getByPlaceholderText("compute.example.org"), "https://bad.example.com");
       await user.click(screen.getByText("Test Connection"));
 
       await screen.findByText("Connection failed");
@@ -409,7 +409,7 @@ describe("SetupWizard", () => {
       await testConnection(user, "https://first.example.org");
       expect(screen.getByText("What may this head run on your machine?")).toBeInTheDocument();
 
-      const input = screen.getByPlaceholderText("https://compute.example.org");
+      const input = screen.getByPlaceholderText("compute.example.org");
       await user.clear(input);
       await user.type(input, "https://second.example.org");
 
@@ -433,7 +433,7 @@ describe("SetupWizard", () => {
       await screen.findByText(/Init failed: bad config/);
     });
 
-    it("hands the URL to the Rust command unchanged (it adds https:// itself)", async () => {
+    it("hands the bare host to the Rust command (it adds https:// itself)", async () => {
       const user = setup();
       mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
       render(<SetupWizard onComplete={vi.fn()} />);
@@ -441,6 +441,30 @@ describe("SetupWizard", () => {
       await testConnection(user, "compute.example.org");
 
       expect(invoke).toHaveBeenCalledWith("test_server_connection", { url: "compute.example.org" });
+    });
+
+    // TB-51: the old placeholder invited "https://…", the test passed with it,
+    // and the CLI then stored the URL as a gRPC target it could never resolve.
+    // The scheme and path are dropped before the probe, the field shows the
+    // address the head will be stored under, and init receives that address.
+    it("reduces a pasted URL to the head's address, shows it back and stores it", async () => {
+      const user = setup();
+      const onComplete = vi.fn();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
+      render(<SetupWizard onComplete={onComplete} />);
+      await goToConnect(user);
+      await testConnection(user, "https://Science.Example.org/");
+
+      expect(invoke).toHaveBeenCalledWith("test_server_connection", { url: "science.example.org" });
+      expect(invoke).toHaveBeenCalledWith("fetch_head_info", { url: "science.example.org" });
+      expect(screen.getByPlaceholderText("compute.example.org")).toHaveValue("science.example.org");
+
+      await user.click(screen.getByText("Start Contributing"));
+      await waitFor(() => expect(onComplete).toHaveBeenCalled());
+      expect(invoke).toHaveBeenCalledWith(
+        "run_init",
+        expect.objectContaining({ config: expect.objectContaining({ server_url: "science.example.org" }) })
+      );
     });
   });
 
@@ -508,7 +532,7 @@ describe("SetupWizard", () => {
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
-        server_url: "https://science.example.org",
+        server_url: "science.example.org",
         trust: ["container"],
       }));
     });
@@ -537,7 +561,7 @@ describe("SetupWizard", () => {
       await user.click(screen.getByText("Start Contributing"));
 
       await waitFor(() => expect(runInitPayload()).toMatchObject({
-        server_url: "https://science.example.org",
+        server_url: "science.example.org",
         trust: [],
       }));
     });
@@ -878,7 +902,7 @@ describe("SetupWizard", () => {
         schedule_mode: "always",
         idle_threshold_mins: null,
         schedule_window: null,
-        server_url: "https://science.example.org",
+        server_url: "science.example.org",
         trust: ["container"],
         enabled_leafs: null,
       }));

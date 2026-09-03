@@ -246,7 +246,7 @@ describe("ProjectsPage", () => {
 
     await user.click(screen.getByText("+ Add Server"));
     expect(
-      screen.getByPlaceholderText("https://compute.example.org")
+      screen.getByPlaceholderText("compute.example.org")
     ).toBeInTheDocument();
   });
 
@@ -635,7 +635,7 @@ describe("ProjectsPage", () => {
       return undefined;
     });
     await user.click(screen.getByText("+ Add Server"));
-    await user.type(screen.getByPlaceholderText("https://compute.example.org"), "https://new.example.org");
+    await user.type(screen.getByPlaceholderText("compute.example.org"), "https://new.example.org");
     await user.click(screen.getByText("Test Connection"));
     await waitFor(() => expect(screen.getByText("Attach")).toBeInTheDocument());
     await user.click(screen.getByText("Attach"));
@@ -650,7 +650,7 @@ describe("ProjectsPage", () => {
     await attachNewHead(user);
 
     expect(mockClient.attachHead).toHaveBeenCalledWith({
-      server_address: "https://new.example.org",
+      server_address: "new.example.org",
       name: undefined,
       trusted_runtimes: ["CONTAINER"],
     });

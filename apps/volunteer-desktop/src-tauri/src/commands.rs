@@ -41,8 +41,11 @@ pub struct HeadInfo {
     pub leafs: Vec<HeadLeaf>,
 }
 
+/// Base URL for probing a head's HTTP API from whatever the volunteer typed.
+/// A missing scheme means https; a trailing slash is dropped so the probe path
+/// does not become "//api/…" (TB-51).
 fn normalize_url(url: &str) -> String {
-    let trimmed = url.trim();
+    let trimmed = url.trim().trim_end_matches('/');
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else {
@@ -500,7 +503,16 @@ fn system_cpu_count() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{schedule_set_args, system_cpu_count, trust_flag_value, ScheduleWindow};
+    use super::{normalize_url, schedule_set_args, system_cpu_count, trust_flag_value, ScheduleWindow};
+
+    // TB-51: a pasted "https://host/" must probe "https://host/api/…", not
+    // "https://host//api/…"; a bare host gets the https scheme.
+    #[test]
+    fn probe_base_url_drops_trailing_slash_and_defaults_to_https() {
+        assert_eq!(normalize_url("https://h.example/"), "https://h.example");
+        assert_eq!(normalize_url("  h.example  "), "https://h.example");
+        assert_eq!(normalize_url("http://localhost:8080/"), "http://localhost:8080");
+    }
 
     #[test]
     fn cpu_count_comes_from_the_host() {
