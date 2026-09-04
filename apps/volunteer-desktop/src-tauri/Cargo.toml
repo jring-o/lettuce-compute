@@ -1,6 +1,6 @@
 [package]
 name = "lettuce-compute-desktop"
-version = "2.0.0"
+version = "2.0.1"
 description = "Lettuce Compute Desktop App"
 authors = ["Lettuce Contributors"]
 edition = "2021"
