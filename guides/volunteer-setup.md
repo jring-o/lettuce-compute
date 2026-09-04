@@ -34,7 +34,11 @@ work across all of them. `--server` (on `attach` and `init`, and the address
 field in the desktop app) takes the head's host name; a pasted URL such as
 `https://head.example.com/` is accepted too — the scheme and path are dropped,
 and a port in the address (`head.example.com:8443`) is used for both gRPC and
-HTTP. An `http://` address means the head is reached without TLS.
+HTTP. An `http://` address means the head is reached without TLS. A head that
+an older build stored as a URL is repaired the next time the config loads —
+`start` logs one `repaired stored head address` line naming the old and new
+targets and the entry is written back at the next config save — so there is
+nothing to detach or re-add after an update.
 
 ## Logs — attach this when asking for help
 

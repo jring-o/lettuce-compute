@@ -126,6 +126,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 		"data_dir", cfg.DataDir,
 	)
 
+	// A head entry an older build stored as a URL (desktop-v2.0.0, `init
+	// --server https://…` before v0.12.0) was rewritten to a dialable target
+	// when the config loaded (TB-62). Say so once per start, so the log
+	// explains why the address dialled differs from the file's until the
+	// next config write persists the repair.
+	for _, repair := range cfg.ServerAddressRepairs() {
+		logger.Info("repaired stored head address", "repair", repair)
+	}
+
 	// Artifact netguard opt-in (loud, off by default): if the operator listed heads
 	// in LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS, say so at startup — once per
 	// head, plus a loud flag for entries that match no configured head (a typo

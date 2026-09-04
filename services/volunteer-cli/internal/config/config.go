@@ -90,6 +90,12 @@ type Config struct {
 	// file (no yaml tag, unexported), so an unknown key is reported, not applied.
 	deprecatedKeyWarnings []string
 
+	// serverAddressRepairs records, per head entry Load repaired, the stored
+	// gRPC address an older build wrote in a shape gRPC can never dial and the
+	// target it now resolves to (TB-62). Populated by Load, surfaced via
+	// ServerAddressRepairs for the start-up log; never written to the file.
+	serverAddressRepairs []string
+
 	// logLevelOverride and logFileOverride hold the values of the global
 	// --log-level / --log-file flags for the lifetime of one command. They are
 	// unexported and untagged so Save can never flush them to disk: a flag is a
@@ -484,12 +490,93 @@ func Load(path string) (*Config, error) {
 	// (issue #51). Re-scan strictly to collect those keys and surface them as
 	// non-fatal advisories — the config still loads with the recognized keys.
 	cfg.deprecatedKeyWarnings = detectUnknownKeys(data)
-	// Entry-shape migration first (one entry per head, pins merged), then trust:
-	// the merge keeps the head-level entry's fields, so the trust migration seeds
-	// at most one entry per head from a coherent starting point.
-	cfg.migrateServerEntries()
+	// Address repair first, so the entry-shape merge below keys on the address
+	// a head is actually dialled at and a scheme-form duplicate of a clean entry
+	// collapses into it (TB-62); then the merge (one entry per head, pins
+	// merged), then trust: the merge keeps the head-level entry's fields, so
+	// the trust migration seeds at most one entry per head from a coherent
+	// starting point.
+	repaired := cfg.repairServerAddresses()
+	cfg.migrateServerEntries(repaired)
 	cfg.migrateServerRuntimeTrust()
 	return cfg, nil
+}
+
+// repairServerAddresses rewrites every server entry whose stored gRPC address
+// is a shape gRPC's resolver can never dial — an http(s):// URL, or a host
+// carrying a path — into the target ParseHeadAddress derives from it (TB-62).
+// desktop-v2.0.0 and `init --server` before v0.12.0 stored the typed
+// "https://host" verbatim, and PR #197 normalised only the three STORE paths,
+// so such an entry survived every update, failed "name resolver error:
+// produced zero addresses" on every start and showed as a down head until it
+// was detached and re-added. Repairing at load makes the update itself the
+// fix: gRPC and HTTP targets come from the parsed address, an http:// scheme
+// marks the head insecure, and the name is replaced only when it is the
+// scheme-derived junk those builds wrote ("https", or the URL itself); a name
+// the volunteer chose is kept. Trust, pins, weight and TLS files are untouched.
+//
+// Only entries that could never have dialled are touched: a well-formed
+// host:port is left byte-for-byte as stored, because the gRPC address is the
+// key of the per-head host-id store (identity.HostIDStore) and a working
+// entry must keep its head-issued id. A repaired entry never reached its
+// head, so no id exists under the old key.
+//
+// The repair is idempotent and persisted by the next Save (registration with
+// the head, or any settings write). It returns, per entry, whether that entry
+// was repaired, for migrateServerEntries to prefer a clean duplicate's fields.
+func (c *Config) repairServerAddresses() []bool {
+	repaired := make([]bool, len(c.Servers))
+	for i := range c.Servers {
+		s := &c.Servers[i]
+		stored := strings.TrimSpace(s.GRPCAddress)
+		if !needsHeadAddressRepair(stored) {
+			continue
+		}
+		addr, err := ParseHeadAddress(stored)
+		if err != nil {
+			// Not a URL either; leave it for start to report the dial failure.
+			continue
+		}
+		oldName := s.Name
+		s.GRPCAddress = addr.GRPCAddress()
+		s.HTTPAddress = addr.HTTPAddress()
+		if addr.Insecure {
+			s.Insecure = true
+		}
+		if isSchemeDerivedName(s.Name) {
+			s.Name = addr.Host
+		}
+		repaired[i] = true
+		c.serverAddressRepairs = append(c.serverAddressRepairs, fmt.Sprintf(
+			"head %q: the stored address %q was written by an older build as a URL, which could never be dialled; it now reads %s (HTTP %s, name %q) and is saved back at the next config write",
+			oldName, stored, s.GRPCAddress, s.HTTPAddress, s.Name))
+	}
+	return repaired
+}
+
+// needsHeadAddressRepair reports whether a stored gRPC target is a shape the
+// dial can never succeed on: a URL with a scheme ("https://host") or a host
+// with a path ("host/leafs/x"). Everything else — host:port, a bare host, an
+// IPv6 literal — is left exactly as stored (see repairServerAddresses).
+func needsHeadAddressRepair(grpcAddr string) bool {
+	return strings.Contains(grpcAddr, "/")
+}
+
+// isSchemeDerivedName reports whether a head's stored name is the junk the
+// pre-v0.12.0 store paths derived from a URL input — "https" (init took the
+// text before the last colon), the URL itself (the management attach used the
+// raw address as the default name) — or empty. Such a name is replaced by the
+// host; any other name was the volunteer's choice and is kept.
+func isSchemeDerivedName(name string) bool {
+	n := strings.TrimSpace(name)
+	return n == "" || strings.Contains(n, "/") || strings.EqualFold(n, "http") || strings.EqualFold(n, "https")
+}
+
+// ServerAddressRepairs returns one line per server entry Load repaired from a
+// never-dialable stored address (TB-62), naming the old and new targets, for
+// the start-up log. Returns nil when every entry was well-formed.
+func (c *Config) ServerAddressRepairs() []string {
+	return c.serverAddressRepairs
 }
 
 // migrateServerEntries normalizes the servers list to ONE entry per gRPC
@@ -507,36 +594,51 @@ func Load(path string) (*Config, error) {
 //     the pin, which made unlisted leafs permanently unreachable for CLI
 //     volunteers.
 //
+// A third shape joins them with TB-62: an entry repairServerAddresses just
+// rewrote from a never-dialable URL now shares its address with a clean entry
+// the volunteer added later (the "add it again" workaround, without the
+// detach). They merge like the leaf-pin case — the clean entry's connection
+// fields win, because the repaired one never reached the head — with pins
+// unioned and trust merged. repaired says, per entry of c.Servers, which ones
+// were rewritten; nil means none.
+//
 // The migration is idempotent and pinned by the next Save (leaf_id is never
 // written again).
-func (c *Config) migrateServerEntries() {
+func (c *Config) migrateServerEntries(repaired []bool) {
 	if len(c.Servers) == 0 {
 		return
 	}
 	merged := make([]ServerConfig, 0, len(c.Servers))
 	// leafOnly tracks whether a merged entry came from a bare leaf-pin append
 	// (it carried only address/leaf/name), so a later HEAD-LEVEL entry for the
-	// same address can take over the connection fields.
+	// same address can take over the connection fields. wasRepaired tracks
+	// the same for an address-repaired entry (TB-62): a later clean entry for
+	// the address takes over.
 	leafOnly := make([]bool, 0, len(c.Servers))
+	wasRepaired := make([]bool, 0, len(c.Servers))
 	indexByAddr := make(map[string]int, len(c.Servers))
 
-	for _, s := range c.Servers {
+	for idx, s := range c.Servers {
 		wasLeafEntry := s.LeafID != ""
 		if wasLeafEntry {
 			s.PinnedLeafIDs = appendUniqueString(s.PinnedLeafIDs, s.LeafID)
 			s.LeafID = ""
 		}
+		thisRepaired := idx < len(repaired) && repaired[idx]
 		i, seen := indexByAddr[s.GRPCAddress]
 		if !seen {
 			indexByAddr[s.GRPCAddress] = len(merged)
 			merged = append(merged, s)
 			leafOnly = append(leafOnly, wasLeafEntry)
+			wasRepaired = append(wasRepaired, thisRepaired)
 			continue
 		}
-		if leafOnly[i] && !wasLeafEntry {
-			// The kept entry was a bare leaf pin and this one is the real
-			// head-level entry: adopt its connection fields, keep the union of
-			// pins and the merged trust.
+		takeOver := (leafOnly[i] && !wasLeafEntry) || (wasRepaired[i] && !wasLeafEntry && !thisRepaired)
+		if takeOver {
+			// The kept entry was a bare leaf pin, or a repaired URL entry that
+			// never dialled, and this one is the real head-level entry: adopt
+			// its connection fields, keep the union of pins and the merged
+			// trust.
 			pins := merged[i].PinnedLeafIDs
 			trust := merged[i].TrustedRuntimes
 			merged[i] = s
@@ -545,6 +647,7 @@ func (c *Config) migrateServerEntries() {
 				merged[i].PinnedLeafIDs = appendUniqueString(merged[i].PinnedLeafIDs, p)
 			}
 			leafOnly[i] = false
+			wasRepaired[i] = thisRepaired
 			continue
 		}
 		merged[i].TrustedRuntimes = mergeTrustedRuntimes(merged[i].TrustedRuntimes, s.TrustedRuntimes)
