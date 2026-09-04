@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
@@ -66,6 +67,32 @@ func handleStartContainerRuntime(bridge *DaemonBridge) http.HandlerFunc {
 		writeJSON(w, map[string]string{
 			"status":  "running",
 			"message": "Podman machine started",
+		})
+	}
+}
+
+// handleRedetectContainerRuntime asks the daemon to probe for a container
+// engine now instead of at its next periodic check (TB-59). 202: the probe is
+// queued; poll GET /api/v1/container-runtime for the outcome. 409 with a
+// reason when a probe is not applicable.
+func handleRedetectContainerRuntime(bridge *DaemonBridge) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := bridge.RequestContainerRedetect(); err != nil {
+			switch {
+			case errors.Is(err, daemon.ErrContainerRuntimeRegistered):
+				writeError(w, http.StatusConflict, "ALREADY_REGISTERED", err.Error())
+			case errors.Is(err, daemon.ErrContainerNotTrusted):
+				writeError(w, http.StatusConflict, "NOT_TRUSTED", err.Error())
+			default:
+				writeError(w, http.StatusConflict, "NOT_AVAILABLE", err.Error())
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]string{
+			"status":  "checking",
+			"message": "Checking for a container engine now; the runtime status reports the result",
 		})
 	}
 }

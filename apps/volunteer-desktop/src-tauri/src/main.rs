@@ -172,6 +172,7 @@ fn main() {
             commands::setup_container_runtime,
             commands::start_container_runtime,
             commands::stop_container_runtime,
+            commands::redetect_container_runtime,
             commands::check_podman_prerequisites,
             commands::install_podman,
             commands::detect_container_runtime,

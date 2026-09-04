@@ -311,12 +311,15 @@ func TestTB49_FetcherNeverRequestsLeafForUntrustedRuntime(t *testing.T) {
 }
 
 // TestTB49_NoWorkWarnNamesTheTrustGate: when every attached leaf is skipped because
-// the volunteer has not trusted its head for the runtime, the one-time no-work
-// diagnostic must say so (with the opt-in command), not shrug "the head has no
-// matching units" — pre-fix the leaf was requested and refused, and the generic
-// message fired.
+// the volunteer has not trusted its head for the runtime, the diagnostic must say
+// so (with the opt-in command), not shrug "the head has no matching units" —
+// pre-fix the leaf was requested and refused, and the generic message fired.
+// Since TB-60 that diagnostic is the runtime-blocked verdict (its own WARN and
+// notice, raised on the first round), not the "connected but getting no work"
+// streak: a round that asks nothing is not a poll, so the streak never fires here
+// and the head is never asked.
 func TestTB49_NoWorkWarnNamesTheTrustGate(t *testing.T) {
-	mc, _ := tb49CountingHead()
+	mc, requests := tb49CountingHead()
 	servers := []*ServerConnection{{Client: mc, VolunteerID: "vol-1", Name: "server-a", Available: true}}
 	servers[0].Config.TrustedRuntimes = []string{}
 	d := newFetcherTestDaemon(servers)
@@ -340,10 +343,16 @@ func TestTB49_NoWorkWarnNamesTheTrustGate(t *testing.T) {
 	f.Run(ctx)
 
 	s := buf.String()
-	if n := strings.Count(s, "connected but getting no work"); n != 1 {
-		t.Fatalf("no-work WARN count = %d, want exactly 1; log:\n%s", n, s)
+	if reqs := requests(); len(reqs) != 0 {
+		t.Errorf("RequestWorkUnit issued for %v; the untrusted leaf must never be asked for", reqs)
+	}
+	if n := strings.Count(s, "connected but getting no work"); n != 0 {
+		t.Fatalf("no-work streak WARN count = %d, want 0 — nothing was polled (TB-60); log:\n%s", n, s)
+	}
+	if n := strings.Count(s, "no runnable leafs"); n != 1 {
+		t.Fatalf("runtime-blocked WARN count = %d, want exactly 1; log:\n%s", n, s)
 	}
 	if !strings.Contains(s, "has not trusted") || !strings.Contains(s, "heads trust") {
-		t.Errorf("no-work WARN does not name the trust gate and its remedy; log:\n%s", s)
+		t.Errorf("runtime-blocked WARN does not name the trust gate and its remedy; log:\n%s", s)
 	}
 }

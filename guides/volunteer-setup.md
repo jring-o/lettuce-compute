@@ -59,9 +59,9 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `not fetching work: disk-gated …` (`reason=…data dir…`) | Free space on the data-dir volume doesn't cover what an enabled leaf declares it needs (its disk requirement + a 2 GB floor), or is below the floor entirely. The reason names the numbers. | Free space, or `--data-dir` on a roomier volume. With several leafs enabled, only the ones that fit are fetched; this WARN fires when none fit. |
 | `not fetching work: disk-gated …` (`reason=…image store…`) | The container image-store volume (named in the reason) can't hold the fresh image pull an enabled leaf needs, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
 | `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
-| `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
-| `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
-| `connected but getting no work: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
+| `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and no working Docker/Podman answered. The daemon keeps checking for one every minute and starts container work as soon as one answers (it re-registers with the head by itself), so this is also what a Docker Desktop or Podman machine that is still starting looks like. | Start or set up a container runtime (below) — no restart needed — or attach a head with native leafs. |
+| `connected but getting no work after repeated polls …` | The head was asked several times and had nothing for this machine: its queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `no runnable leafs: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse — so this is reported at once, not after polling. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
 | `docker is not available … Is the docker daemon running?` | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
@@ -113,6 +113,15 @@ loginctl enable-linger "$USER"                # keep it alive when logged out
 Install **Podman Desktop** or **Docker Desktop** and make sure the machine/VM is
 started. If you have the Podman CLI, the bundled lettuce binary will create and
 start a Podman machine for you on first `start`.
+
+- **The engine does not have to be up before Lettuce is.** A daemon that finds
+  no engine at start runs WASM-only and checks again every minute; when Docker
+  Desktop finishes launching or a Podman machine is started (by you, by another
+  program, or by the daemon's own machine setup once it can see the `podman`
+  binary), the container runtime is registered and every attached head is told
+  about it without a restart. The desktop app's runtime card shows "Check again
+  now" while this is happening; the log line is `container runtime registered
+  after start`.
 
 - **macOS: Podman does not need to be on the app's PATH.** An app launched from
   Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official

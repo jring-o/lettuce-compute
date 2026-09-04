@@ -385,6 +385,12 @@ pub async fn stop_container_runtime() -> Result<SetupResponse, String> {
     daemon_client()?.stop_container_runtime().await
 }
 
+/// Ask the daemon to probe for a container engine now (TB-59).
+#[tauri::command]
+pub async fn redetect_container_runtime() -> Result<SetupResponse, String> {
+    daemon_client()?.redetect_container_runtime().await
+}
+
 /// Probe this machine for a container engine without the daemon (the setup
 /// wizard runs before one exists). Works on every platform; see
 /// `container_runtime::detect`.

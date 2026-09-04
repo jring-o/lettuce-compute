@@ -3,13 +3,20 @@ package daemon
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // RuntimeRegistry manages multiple runtimes and selects the appropriate one
 // for each work unit based on the work unit's runtime field.
+//
+// It is read from the fetcher, every execution slot, the disk gate and the
+// management API's handlers, and — since TB-59 — written after start-up too,
+// when a container engine that was absent at start is detected and its
+// runtime registered late. Every method therefore takes the lock.
 type RuntimeRegistry struct {
+	mu       sync.RWMutex
 	runtimes map[string]runtime.Runtime
 }
 
@@ -22,6 +29,8 @@ func NewRuntimeRegistry() *RuntimeRegistry {
 
 // Register adds a runtime to the registry, keyed by its Name().
 func (r *RuntimeRegistry) Register(rt runtime.Runtime) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.runtimes[rt.Name()] = rt
 }
 
@@ -37,8 +46,8 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 	if name == "" {
 		return nil, fmt.Errorf("work unit has no runtime specified; refusing to run it")
 	}
-	rt, ok := r.runtimes[name]
-	if !ok {
+	rt := r.GetRuntime(name)
+	if rt == nil {
 		return nil, fmt.Errorf("no available runtime for work unit (requires %s)", wu.Runtime)
 	}
 	if !rt.CanHandle(&wu.ExecutionSpec) {
@@ -49,11 +58,15 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 
 // GetRuntime returns the runtime registered under the given name, or nil if not found.
 func (r *RuntimeRegistry) GetRuntime(name string) runtime.Runtime {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.runtimes[strings.ToLower(name)]
 }
 
 // AvailableRuntimes returns the names of all registered runtimes.
 func (r *RuntimeRegistry) AvailableRuntimes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.runtimes))
 	for name := range r.runtimes {
 		names = append(names, name)

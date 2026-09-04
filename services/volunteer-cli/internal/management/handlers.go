@@ -32,6 +32,7 @@ func registerHandlers(mux *http.ServeMux, bridge *DaemonBridge) {
 	mux.HandleFunc("POST /api/v1/container-runtime/setup", handleSetupContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/container-runtime/start", handleStartContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/container-runtime/stop", handleStopContainerRuntime(bridge))
+	mux.HandleFunc("POST /api/v1/container-runtime/redetect", handleRedetectContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/suspend", handleSuspendTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/resume", handleResumeTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/abort", handleAbortTask(bridge))

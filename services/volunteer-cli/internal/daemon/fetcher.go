@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -48,6 +49,21 @@ type Fetcher struct {
 	// new id (possibly empty). Injected from the daemon; nil disables self-heal (the
 	// refusal then falls through to the normal reconnect backoff).
 	reRegisterFn func(ctx context.Context, head *ServerConnection) (string, error)
+
+	// readvertiseFn re-registers this machine with one head when the runtimes it
+	// can run changed since that head last heard them — a container engine
+	// detected after start (TB-59). Called at the top of each head's turn,
+	// before any request, so the head's dispatch gate admits the newly runnable
+	// leafs instead of refusing them until a restart. nil disables it.
+	readvertiseFn func(ctx context.Context, head *ServerConnection)
+
+	// runtimeBlockedFn re-evaluates whether EVERY attached leaf is
+	// runtime-blocked (needs a runtime this machine lacks or the volunteer has
+	// not trusted its head for — the pre-request skip's own verdict) and keeps
+	// the "runtime_blocked" notice in step with it, returning the verdict
+	// (TB-60). Owned by the daemon so the notice survives fetcher restarts and
+	// a late runtime registration can resolve it. nil = never blocked.
+	runtimeBlockedFn func() bool
 
 	// enabledLeafsFunc is called to get enabled leafs for a server.
 	// Injected from the daemon to reuse its filtering logic.
@@ -258,6 +274,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		notices:                  d.notices,
 		headStatus:               d.headStatus,
 		reRegisterFn:             d.reRegisterHost,
+		readvertiseFn:            d.readvertiseIfPending,
+		runtimeBlockedFn:         d.refreshRuntimeBlocked,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
@@ -282,10 +300,13 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 	}
 }
 
-// noWorkWarnThreshold is how many consecutive empty polls (no work returned)
-// trigger the one-time "connected but getting no work" diagnostic WARN. With
-// exponential backoff this is roughly half a minute of genuine idleness, long
-// enough to skip a momentarily-empty queue but short enough to be useful.
+// noWorkWarnThreshold is how many consecutive empty polls — rounds in which a
+// head was actually asked and answered with no work — trigger the one-time
+// "connected but getting no work" diagnostic WARN. Each such round obeys the
+// head's retry delay, so this is roughly half a minute of genuine idleness,
+// long enough to skip a momentarily-empty queue but short enough to be useful.
+// A round that asked nothing (every leaf skipped before the request) is not a
+// poll and does not count (TB-60).
 const noWorkWarnThreshold = 5
 
 // idleWait is how long the fetcher sleeps when there is nothing to do right now
@@ -372,18 +393,48 @@ func (f *Fetcher) Run(ctx context.Context) {
 			continue
 		}
 
-		if round.pushed == 0 && round.requested == 0 && round.classFull > 0 {
-			// TB-48: nothing was asked for because every leaf left to ask about
-			// belongs to a resource class whose buffer is already at target — the
-			// GPU class on a host with more slots than GPUs. That is the buffer
-			// being full for what this machine can use, not the head having no
-			// work: wait on the loop's poll granularity (no RPC, no retry delay to
-			// obey) and leave the no-work streak untouched.
-			f.logger.Debug("fetcher: every requestable leaf is at its class buffer target, not requesting", "class_full_leafs", round.classFull)
-			if !f.sleep(ctx, idleWait) {
+		if round.pushed == 0 && round.requested == 0 {
+			// Nothing was asked of any head, so this round says nothing about the
+			// heads and must not feed the "no work after repeated polls" streak
+			// (TB-60): with the pre-request skips a runtime-blocked host asked
+			// nothing every round and the notice fired 5 s after start, claiming
+			// polls that never happened.
+			if round.classFull > 0 {
+				// TB-48: every leaf left to ask about belongs to a resource class
+				// whose buffer is already at target — the GPU class on a host with
+				// more slots than GPUs. That is the buffer being full for what this
+				// machine can use, not the head having no work: wait on the loop's
+				// poll granularity (no RPC, no retry delay to obey).
+				f.logger.Debug("fetcher: every requestable leaf is at its class buffer target, not requesting", "class_full_leafs", round.classFull)
+				if !f.sleep(ctx, idleWait) {
+					return
+				}
+				continue
+			}
+			// Every attached leaf runtime-blocked is a static configuration fact
+			// with its own notice, raised at once and kept current by the daemon
+			// (runtime_blocked); poll slowly — nothing changes until a runtime is
+			// registered (TB-59) or the leaf set does. Every other request-less
+			// round (a paused runtime or leaf, a disk or fit gate, an absent GPU,
+			// no head reachable) already has its own notice: stay silent.
+			if f.runtimeBlockedFn != nil && f.runtimeBlockedFn() {
+				f.logger.Debug("fetcher: no attached leaf can run on this machine; not requesting")
+				if !f.sleep(ctx, idleWait) {
+					return
+				}
+				continue
+			}
+			f.logger.Debug("fetcher: nothing requested this round (every leaf skipped for a reason with its own notice, or no head reachable)")
+			if !f.sleep(ctx, f.backoff) {
 				return
 			}
 			continue
+		}
+
+		// A request went out, so at least one leaf passed the runtime gate: keep
+		// the runtime-blocked verdict current (it resolves its notice if live).
+		if f.runtimeBlockedFn != nil {
+			f.runtimeBlockedFn()
 		}
 
 		if round.pushed == 0 {
@@ -405,10 +456,11 @@ func (f *Fetcher) Run(ctx context.Context) {
 	}
 }
 
-// noteEmptyRound counts one fetch round that buffered nothing. When the streak
-// reaches noWorkWarnThreshold it surfaces the "connected but getting no work"
-// diagnostic exactly once, instead of leaving the operator staring at a
-// silent, idle daemon.
+// noteEmptyRound counts one fetch round that asked a head for work and
+// buffered nothing. When the streak reaches noWorkWarnThreshold it surfaces
+// the "connected but getting no work" diagnostic exactly once, instead of
+// leaving the operator staring at a silent, idle daemon. Run only calls it
+// for rounds that issued a request (TB-60).
 func (f *Fetcher) noteEmptyRound() {
 	f.emptyPolls++
 	if f.emptyPolls >= noWorkWarnThreshold && !f.warnedNoWork {
@@ -475,59 +527,43 @@ func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
 	return wait, true
 }
 
-// warnNoWork emits the one-time "connected but getting no work" diagnostic. It
-// compares the leafs the volunteer is attached to against the runtimes it can
-// actually run for each head (leafRuntimeVerdict — the same classification the
-// per-leaf loop skips on, TB-49): if every attached leaf needs a container
-// runtime this box lacks, or a runtime the volunteer has not trusted its head
-// to run, that's the (fixable) reason and it says so; otherwise the queue is
-// most likely just empty, which it reports without crying wolf.
+// warnNoWork emits the one-time "connected but getting no work" diagnostic:
+// the heads were asked, repeatedly, and had nothing for this machine. Since
+// TB-60 it is reached only after rounds that actually issued a request, so
+// the "every leaf is runtime-blocked" cases — a static configuration fact
+// that used to be the first two branches here — cannot be what it is
+// reporting; that verdict has its own notice (runtime_blocked, raised at
+// once by the daemon). A partly blocked host is noted in passing, because a
+// leaf the machine can never run is one the head is never asked for.
 func (f *Fetcher) warnNoWork() {
 	var runtimes []string
 	if f.registry != nil {
 		runtimes = f.registry.AvailableRuntimes()
+		sort.Strings(runtimes)
 	}
 
-	var totalLeafs, containerBlocked, trustBlocked int
+	var totalLeafs, runtimeBlocked int
 	if f.enabledLeafsFunc != nil && f.multiClient != nil {
 		for _, srv := range f.multiClient.Servers() {
 			for _, lf := range f.enabledLeafsFunc(srv.Name) {
 				totalLeafs++
-				rt, missing, untrusted := leafRuntimeVerdict(lf, f.registry, srv.Config)
-				switch {
-				case rt == "container" && missing:
-					containerBlocked++
-				case untrusted:
-					trustBlocked++
+				if _, missing, untrusted := leafRuntimeVerdict(lf, f.registry, srv.Config); missing || untrusted {
+					runtimeBlocked++
 				}
 			}
 		}
 	}
 
-	switch {
-	case totalLeafs > 0 && containerBlocked == totalLeafs:
-		f.logger.Warn("connected but getting no work: every attached leaf needs a container runtime this volunteer doesn't have — install Docker or Podman (see the volunteer setup docs), or attach a head with native leafs",
-			"runtimes", runtimes, "leafs", totalLeafs)
-		f.notices.Notify(NoticeWarn, "no_work",
-			fmt.Sprintf("Connected but getting no work: all %d attached leaf(s) need a container runtime this machine does not have (available: %s). Install Docker or Podman, or attach a head with native leafs.",
-				totalLeafs, strings.Join(runtimes, ", ")),
-			"", "")
-		return
-	case totalLeafs > 0 && containerBlocked+trustBlocked == totalLeafs:
-		f.logger.Warn("connected but getting no work: every attached leaf needs a runtime this volunteer has not trusted its head to run (or does not have) — opt in per head with 'lettuce-volunteer heads trust <head> <runtime>' if you accept running that head's code",
-			"runtimes", runtimes, "leafs", totalLeafs, "trust_blocked_leafs", trustBlocked, "container_blocked_leafs", containerBlocked)
-		f.notices.Notify(NoticeWarn, "no_work",
-			fmt.Sprintf("Connected but getting no work: all %d attached leaf(s) need a runtime you have not trusted their head to run, or this machine does not have (available: %s). Opt in per head with 'lettuce-volunteer heads trust <head> <runtime>' if you accept running that head's code.",
-				totalLeafs, strings.Join(runtimes, ", ")),
-			"", "")
-		return
+	blockedNote := ""
+	if runtimeBlocked > 0 {
+		blockedNote = fmt.Sprintf(" %d of the %d attached leaf(s) need a runtime this machine does not offer their head and are never requested.", runtimeBlocked, totalLeafs)
 	}
 	f.logger.Warn("connected but getting no work after repeated polls — the head has no matching units for this volunteer right now",
-		"runtimes", runtimes, "attached_leafs", totalLeafs,
+		"runtimes", runtimes, "attached_leafs", totalLeafs, "runtime_blocked_leafs", runtimeBlocked,
 		"hint", "normal if the queue is just empty; if it persists, check that your runtimes match the leafs and that disk/scheduling aren't pausing fetches")
 	f.notices.Notify(NoticeWarn, "no_work",
-		fmt.Sprintf("Connected but getting no work after repeated polls: the attached heads have no units matching this machine right now (%d attached leaf(s); runtimes: %s). This is normal when a queue is empty; if it persists, check that the leafs match this machine's runtimes and that disk space or the schedule is not pausing fetches.",
-			totalLeafs, strings.Join(runtimes, ", ")),
+		fmt.Sprintf("Connected but getting no work after repeated polls: the attached heads have no units matching this machine right now (%d attached leaf(s); runtimes: %s). This is normal when a queue is empty; if it persists, check that the leafs match this machine's runtimes and that disk space or the schedule is not pausing fetches.%s",
+			totalLeafs, strings.Join(runtimes, ", "), blockedNote),
 		"", "")
 }
 
@@ -601,6 +637,14 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 		if f.now().Before(head.NextContactAt) {
 			f.logger.Debug("fetcher: head waiting out retry delay", "server", head.Name, "next_contact_at", head.NextContactAt)
 			continue
+		}
+
+		// TB-59: if this machine's runtimes changed since this head last heard
+		// them (a container engine detected after start), re-register before
+		// asking — the head's dispatch gate only admits leafs whose runtime we
+		// advertised, and a refused request would look like an empty head.
+		if f.readvertiseFn != nil {
+			f.readvertiseFn(ctx, head)
 		}
 
 		enabled := f.enabledLeafsFunc(head.Name)

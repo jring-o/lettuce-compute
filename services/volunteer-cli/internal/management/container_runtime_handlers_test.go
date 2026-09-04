@@ -104,7 +104,10 @@ func TestGetContainerRuntime_Podman(t *testing.T) {
 	}
 }
 
-func TestGetContainerRuntime_Docker(t *testing.T) {
+// A configured backend PREFERENCE is not a detected engine: with nothing
+// registered and no machine manager the route says so, instead of the old
+// "docker / running" it assumed from the config string alone (TB-59).
+func TestGetContainerRuntime_ConfigPreferenceAloneIsNotABackend(t *testing.T) {
 	env := setupContainerRuntimeTestEnv(t, "docker", nil)
 	resp := env.doRequest(t, "GET", "/api/v1/container-runtime", "")
 	if resp.StatusCode != http.StatusOK {
@@ -112,8 +115,11 @@ func TestGetContainerRuntime_Docker(t *testing.T) {
 	}
 
 	result := decodeJSON(t, resp)
-	if result["backend"] != "docker" {
-		t.Errorf("expected backend 'docker', got %v", result["backend"])
+	if result["backend"] != "none" {
+		t.Errorf("expected backend 'none' (nothing detected or registered), got %v", result["backend"])
+	}
+	if result["status"] != "not_installed" {
+		t.Errorf("expected status 'not_installed', got %v", result["status"])
 	}
 }
 
