@@ -37,6 +37,10 @@ type fakeWURepo struct {
 	// spot-check copy now lands as a RESERVED copy row via ReserveCopy).
 	markSpotCheckFn func(id types.ID) error
 	reserveCopyFn   func(wuID, vol types.ID, reservedUntil time.Time, deadlineSeconds int) (*workunit.Copy, error)
+	// getByIDFn backs GetByID — the flush's refused-unit state probe (TB-61). Nil =
+	// every unit reads back QUEUED, so a refused copy benches the volunteer (the
+	// per-volunteer-refusal shape every pre-TB-61 flush test exercises).
+	getByIDFn func(id types.ID) (*workunit.WorkUnit, error)
 	// countFn backs the reconcile.
 	countFn func() (map[types.ID]int, error)
 	// releaseFn backs ReleaseStaleHeldCopies (the held-copy reconcile); releaseCalls
@@ -125,6 +129,16 @@ func (f *fakeWURepo) FlushReservations(_ context.Context, recs []workunit.FlushR
 		out[i] = workunit.FlushedCopy{WorkUnitID: r.WorkUnitID, VolunteerID: r.VolunteerID}
 	}
 	return out, nil
+}
+
+func (f *fakeWURepo) GetByID(_ context.Context, id types.ID) (*workunit.WorkUnit, error) {
+	f.mu.Lock()
+	fn := f.getByIDFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(id)
+	}
+	return &workunit.WorkUnit{ID: id, State: workunit.WorkUnitStateQueued}, nil
 }
 
 func (f *fakeWURepo) MarkSpotCheck(_ context.Context, id types.ID) error {

@@ -109,6 +109,25 @@ type ResultStore interface {
 	ListByWorkUnit(ctx context.Context, workUnitID types.ID) ([]*result.Result, error)
 }
 
+// DispatchInvalidator lets the transitioner reach the in-process dispatch cache after it
+// changes a unit's state (TB-61). The cache stages a QUEUED unit as a ready candidate and
+// re-reads nothing about it while it sits staged: a candidate leaves the pool only on an
+// explicit eviction. So every state the transitioner writes must evict — a unit it
+// dead-letters (FAILED), validates or rejects can never land another copy, and one it
+// reopens (back to QUEUED) must re-stage from a fresh snapshot. Before this hook only the
+// abandon path's dead-letter evicted; the fault monitor's and the recovery sweeper's did
+// not, so a dead-lettered unit stayed staged and was re-offered to the one volunteer whose
+// refill-time snapshot still admitted it every void-bench window, forever — refused at the
+// SQL landing each time. Optional: nil (tests / the e2e browser harness) means no cache.
+//
+// Satisfied by *server.DispatchCacheRef (the late-bound handle main.go wires into the
+// HTTP handlers for the same purpose, PB-9).
+type DispatchInvalidator interface {
+	// InvalidateWorkUnit drops the unit's staged candidate and in-memory holds and
+	// requests a re-stage from a fresh DB snapshot.
+	InvalidateWorkUnit(id types.ID)
+}
+
 // Locker serializes decisions per unit. Implementations may be cross-replica (PgxLocker) or a
 // no-op (tests). A Locker must run fn exactly once.
 type Locker interface {
@@ -136,6 +155,9 @@ type Transitioner struct {
 	comparator  Comparator
 	trustPolicy TrustPolicy
 	logger      *slog.Logger
+	// dispatch is the optional dispatch-cache eviction hook (TB-61); nil = no cache.
+	// Boot-time wiring only (SetDispatchInvalidator), before any Evaluate can run.
+	dispatch DispatchInvalidator
 }
 
 // NewTransitioner wires the transitioner. trustPolicy is the head trust-gate configuration
@@ -146,6 +168,35 @@ func NewTransitioner(locker Locker, wus WorkUnitStore, leaves LeafStore, results
 		logger = slog.New(slog.NewTextHandler(discard{}, nil))
 	}
 	return &Transitioner{locker: locker, wus: wus, leaves: leaves, results: results, comparator: comparator, trustPolicy: trustPolicy, logger: logger}
+}
+
+// SetDispatchInvalidator wires the dispatch-cache eviction hook (TB-61). Optional so the
+// existing constructor call sites are unchanged; call it during boot wiring, before the
+// transitioner can be evaluating (the field is not synchronized).
+func (t *Transitioner) SetDispatchInvalidator(inv DispatchInvalidator) {
+	t.dispatch = inv
+}
+
+// invalidateDispatch forwards to the wired invalidator, if any.
+func (t *Transitioner) invalidateDispatch(id types.ID) {
+	if t.dispatch != nil {
+		t.dispatch.InvalidateWorkUnit(id)
+	}
+}
+
+// changesUnitState reports whether an Outcome means Evaluate WROTE a new unit state the
+// dispatch cache may be holding a stale candidate for: the three terminal-ish decisions
+// (VALIDATED / REJECTED / FAILED — no further copy can land) and the reopen demotion back
+// to QUEUED (the unit must re-stage from a fresh snapshot). WAITING and a no-op leave the
+// unit where dispatch already sees it. (A WAIT that parks the unit COMPLETED first has no
+// dispatch headroom by construction — Decide only parks without headroom — so no staged
+// candidate can be handed out for it.)
+func (o Outcome) changesUnitState() bool {
+	switch o {
+	case OutcomeValidated, OutcomeRejected, OutcomeDeadLettered, OutcomeReopened:
+		return true
+	}
+	return false
 }
 
 // Evaluate re-evaluates a unit after a result submit or a copy close and applies the single
@@ -168,6 +219,14 @@ func (t *Transitioner) Evaluate(ctx context.Context, workUnitID types.ID) (Outco
 		outcome = o
 		return e
 	})
+	// TB-61: the decision is committed and the per-unit lock released; evict the unit's
+	// staged dispatch candidate (and any in-memory hold) so this replica stops offering
+	// copies of a unit that can no longer land them — or re-stages a reopened one fresh.
+	// Off the lock on purpose: the hook only touches in-memory cache state and nudges the
+	// refiller, which must read the state this transaction just wrote.
+	if err == nil && outcome.changesUnitState() {
+		t.invalidateDispatch(workUnitID)
+	}
 	return outcome, err
 }
 

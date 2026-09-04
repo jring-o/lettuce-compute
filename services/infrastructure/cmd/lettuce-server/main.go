@@ -377,6 +377,12 @@ func main() {
 	// exists, so the operator-requeue handler holds this ref; StartDispatchCache
 	// binds the live cache into it below.
 	dispatchCacheRef := server.NewDispatchCacheRef()
+	// TB-61: every state this transitioner writes (validate / reject / dead-letter /
+	// reopen) evicts the unit's staged dispatch candidate through the same handle. This
+	// instance serves the fault monitor, the recovery sweeper and content verification;
+	// the gRPC volunteer service's and the browser path's own instances are wired the
+	// same way where they are built (BindDispatchCacheRef, NewRouter).
+	transitioner.SetDispatchInvalidator(dispatchCacheRef)
 
 	deps := &server.Dependencies{
 		Pool:              pool,

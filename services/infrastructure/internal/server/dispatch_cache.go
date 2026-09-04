@@ -3078,21 +3078,87 @@ func (c *dispatchCache) flushBatch(ctx context.Context, acquireAdmission bool) {
 	for _, fc := range landed {
 		landedPairs[[2]types.ID{fc.WorkUnitID, fc.VolunteerID}] = true
 	}
+	var conflicts []workunit.FlushReservation
 	for _, rec := range batch {
-		if landedPairs[[2]types.ID{rec.WorkUnitID, rec.VolunteerID}] {
+		if !landedPairs[[2]types.ID{rec.WorkUnitID, rec.VolunteerID}] {
+			conflicts = append(conflicts, rec)
+		}
+	}
+	if len(conflicts) == 0 {
+		return
+	}
+	// TB-61: a refused copy has two very different causes, and the flush could not tell
+	// them apart. Per-volunteer refusals (post-failure cooldown, a live copy already held,
+	// redundancy met by others) are right to BENCH: the unit is still QUEUED and another
+	// volunteer can land it. But a unit that is no longer QUEUED — dead-lettered FAILED by
+	// the fault monitor or the recovery sweeper, validated, rejected, or deleted — can
+	// never land a copy for ANYONE, and a 60 s bench on it is the wrong tool: the bench
+	// lapsed, the stale candidate re-admitted the same volunteer, the landing refused it
+	// again, forever (one host on infra.scios.tech received nothing but one FAILED unit
+	// for two weeks, ~1,200 refused cycles a day). The state writers now evict through
+	// the transitioner's hook; this probe is the landing-side backstop for any writer
+	// that does not, at one point read per refused unit — conflicts are rare by design
+	// (each one is the WARN tripwire below).
+	notQueued := c.notQueuedStates(dbCtx, conflicts)
+	evicted := make(map[types.ID]bool, len(notQueued))
+	for _, rec := range conflicts {
+		if state, gone := notQueued[rec.WorkUnitID]; gone {
+			if !evicted[rec.WorkUnitID] {
+				evicted[rec.WorkUnitID] = true
+				// Drop the candidate and EVERY holder (each pending copy of it would be
+				// refused the same way) so it is not re-offered to anyone; the refill
+				// nudge re-stages it only if it is QUEUED again (its predicate).
+				c.InvalidateWorkUnit(rec.WorkUnitID)
+			}
+			c.logger.Warn("dispatch cache: hand-out copy did not land: work unit is no longer QUEUED; evicted the staged candidate",
+				"work_unit_id", rec.WorkUnitID, "volunteer_id", rec.VolunteerID, "state", state)
 			continue
 		}
 		c.voidNonLandedCopy(rec.WorkUnitID, rec.VolunteerID)
 		// D-5 / TB-38 (5): a non-landed copy silently revokes a hand-out the volunteer
-		// already received (the unit is no longer QUEUED, redundancy was met, this
-		// volunteer already holds a live copy, or it is in post-failure cooldown).
-		// voidNonLandedCopy also benches the volunteer on the staged candidate so the
-		// same un-reservable unit is not re-offered to it next tick. Warn, not Debug:
-		// a hand-out whose claim never became durable is the TB-35 zombie-window shape,
-		// and its recurrence must be visible on a production head.
+		// already received (redundancy was met, this volunteer already holds a live copy,
+		// or it is in post-failure cooldown). voidNonLandedCopy also benches the volunteer
+		// on the staged candidate so the same un-reservable unit is not re-offered to it
+		// next tick. Warn, not Debug: a hand-out whose claim never became durable is the
+		// TB-35 zombie-window shape, and its recurrence must be visible on a production
+		// head.
 		c.logger.Warn("dispatch cache: hand-out copy did not land (flush conflict); voided and benched volunteer on candidate",
 			"work_unit_id", rec.WorkUnitID, "volunteer_id", rec.VolunteerID)
 	}
+}
+
+// notQueuedStates reads the current state of every distinct unit among the refused
+// flush records and returns those that are no longer QUEUED (state by unit id; a
+// deleted unit reports as "" — gone is gone). One point read per unit, on the flush
+// goroutine's DB budget. A read that fails for any other reason leaves the unit OUT of
+// the map, so the caller falls back to the bench — the pre-TB-61 behavior, which
+// self-corrects at the next refused flush; the failure is logged once per batch.
+func (c *dispatchCache) notQueuedStates(ctx context.Context, conflicts []workunit.FlushReservation) map[types.ID]workunit.WorkUnitState {
+	out := make(map[types.ID]workunit.WorkUnitState)
+	seen := make(map[types.ID]bool, len(conflicts))
+	warned := false
+	for _, rec := range conflicts {
+		if seen[rec.WorkUnitID] {
+			continue
+		}
+		seen[rec.WorkUnitID] = true
+		wu, err := c.deps.wuRepo.GetByID(ctx, rec.WorkUnitID)
+		switch {
+		case err != nil && isNotFound(err):
+			out[rec.WorkUnitID] = ""
+		case err != nil:
+			if !warned {
+				warned = true
+				c.logger.Warn("dispatch cache: could not read the state of a refused unit; benching instead of evicting",
+					"work_unit_id", rec.WorkUnitID, "error", err)
+			}
+		case wu == nil:
+			out[rec.WorkUnitID] = ""
+		case wu.State != workunit.WorkUnitStateQueued:
+			out[rec.WorkUnitID] = wu.State
+		}
+	}
+	return out
 }
 
 // requeueWrites prepends a batch back onto the pending queue (preserving order).

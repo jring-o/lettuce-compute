@@ -494,6 +494,12 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 		registrationPow: RegistrationPowFromHeadConfig(deps.HeadConfig),
 		trustedProxies:  deps.TrustedProxies,
 	}
+	// TB-61: the browser path's transitioner evicts the staged dispatch candidate of
+	// every unit whose state it writes, through the same late-bound handle the operator
+	// handlers use; nil-safe no-op until/unless the dispatch cache is started.
+	if bvDeps.transitioner != nil && deps.DispatchCacheRef != nil {
+		bvDeps.transitioner.SetDispatchInvalidator(deps.DispatchCacheRef)
+	}
 
 	mux.HandleFunc("POST /api/v1/volunteers/register", handleBrowserRegister(bvDeps))
 	// Registration proof-of-work challenge issuance (design §4.1). Unauthenticated
