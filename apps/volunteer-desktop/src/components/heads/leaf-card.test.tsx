@@ -833,4 +833,100 @@ describe("LeafCard", () => {
 
     expect(screen.queryByText("View results on the head's website")).not.toBeInTheDocument();
   });
+
+  // --- TB-66: a memory shortfall names the slider stop that clears it ---
+
+  describe("TB-66: memory shortfall", () => {
+    const grep = () =>
+      makeLeaf({ slug: "grep-f13", name: "GREP f13", execution_spec: { max_memory_mb: 7000 } });
+
+    it("prints both figures in MB and offers to raise the allowance to the next slider stop", async () => {
+      const user = userEvent.setup();
+      const onRaiseMemory = vi.fn().mockResolvedValue(undefined);
+
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={makeMachine({ max_memory_mb: 6912 })}
+          memoryCeilingMb={7373}
+          onRaiseMemory={onRaiseMemory}
+        />
+      );
+
+      const memory = screen.getByTestId("requirement-memory");
+      expect(memory).toHaveAttribute("data-short", "true");
+      expect(memory).toHaveTextContent("7000 MB RAM (you allow 6912 MB)");
+
+      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+      expect(onRaiseMemory).toHaveBeenCalledWith(7168);
+    });
+
+    it("offers the raise while the machine's total is still unknown", () => {
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={makeMachine({ max_memory_mb: 6912 })}
+          onRaiseMemory={vi.fn()}
+        />
+      );
+      expect(screen.getByText("Raise memory allowance to 7.0 GB")).toBeInTheDocument();
+    });
+
+    it("says so instead of offering a stop the Memory slider cannot reach", () => {
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={makeMachine({ max_memory_mb: 6912 })}
+          memoryCeilingMb={6144}
+          onRaiseMemory={vi.fn()}
+        />
+      );
+      expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
+      expect(
+        screen.getByText("Needs more memory than this machine can allow (6.0 GB at most).")
+      ).toBeInTheDocument();
+    });
+
+    it("shows the error when raising the allowance fails", async () => {
+      const user = userEvent.setup();
+      const onRaiseMemory = vi
+        .fn()
+        .mockRejectedValue(new Error("VALIDATION_ERROR: max_memory_mb must be >= 1"));
+
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={makeMachine({ max_memory_mb: 6912 })}
+          memoryCeilingMb={7373}
+          onRaiseMemory={onRaiseMemory}
+        />
+      );
+
+      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+      await waitFor(() => {
+        expect(
+          screen.getByText("VALIDATION_ERROR: max_memory_mb must be >= 1")
+        ).toBeInTheDocument();
+      });
+    });
+
+    it("offers nothing when the machine is not short", () => {
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={makeMachine({ max_memory_mb: 7168 })}
+          memoryCeilingMb={7373}
+          onRaiseMemory={vi.fn()}
+        />
+      );
+      expect(screen.getByTestId("requirement-memory")).toHaveTextContent("6.8 GB RAM");
+      expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Needs more memory/)).not.toBeInTheDocument();
+    });
+  });
 });

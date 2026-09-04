@@ -2,7 +2,7 @@ import { useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Slider } from "@/components/ui/slider";
-import { cn } from "@/lib/utils";
+import { cn, formatBytes } from "@/lib/utils";
 import type { LeafInfo, ContainerRuntimeStatus, MachineCapabilities } from "@/api/client";
 import {
   leafRuntimes,
@@ -23,6 +23,13 @@ interface LeafCardProps {
   onWeightChange: (weight: number) => void;
   /** Raise `resource_limits.max_disk_gb` to the given whole-GB value. */
   onRaiseDisk?: (gb: number) => Promise<void>;
+  /** Raise `resource_limits.max_memory_mb` to the given Memory-slider stop, in MB. */
+  onRaiseMemory?: (mb: number) => Promise<void>;
+  /**
+   * The most the Memory slider can be set to (90 % of this machine's RAM),
+   * in MB; null while unknown. A stop above it is not offered.
+   */
+  memoryCeilingMb?: number | null;
   dashboardUrl?: string;
   volunteerId?: string;
 }
@@ -57,11 +64,15 @@ export function LeafCard({
   onToggle,
   onWeightChange,
   onRaiseDisk,
+  onRaiseMemory,
+  memoryCeilingMb = null,
   dashboardUrl,
   volunteerId,
 }: LeafCardProps) {
   const [raising, setRaising] = useState(false);
   const [raiseError, setRaiseError] = useState<string | null>(null);
+  const [raisingMemory, setRaisingMemory] = useState(false);
+  const [raiseMemoryError, setRaiseMemoryError] = useState<string | null>(null);
 
   const spec = leaf.execution_spec;
   const runtimes = leafRuntimes(leaf);
@@ -75,6 +86,10 @@ export function LeafCard({
   const diskGate = leaf.disk_gate;
   const raiseTo = diskGate?.raise_to_gb ?? 0;
   const researchArea = leaf.research_area.join(", ");
+  // The memory shortfall names the slider stop that clears it (TB-66); the
+  // stop is offered only when the Memory slider can reach it.
+  const memoryRaiseTo = requirements.find((r) => r.key === "memory")?.raiseToMb ?? 0;
+  const memoryRaiseFits = memoryCeilingMb == null || memoryRaiseTo <= memoryCeilingMb;
 
   const handleRaiseDisk = async (gb: number) => {
     if (!onRaiseDisk) return;
@@ -86,6 +101,19 @@ export function LeafCard({
       setRaiseError(err instanceof Error ? err.message : "Could not raise the disk allowance");
     } finally {
       setRaising(false);
+    }
+  };
+
+  const handleRaiseMemory = async (mb: number) => {
+    if (!onRaiseMemory) return;
+    setRaisingMemory(true);
+    setRaiseMemoryError(null);
+    try {
+      await onRaiseMemory(mb);
+    } catch (err) {
+      setRaiseMemoryError(err instanceof Error ? err.message : "Could not raise the memory allowance");
+    } finally {
+      setRaisingMemory(false);
     }
   };
 
@@ -179,6 +207,29 @@ export function LeafCard({
                 </span>
               ))}
             </p>
+          )}
+
+          {memoryRaiseTo > 0 && (
+            <div className="mt-1 space-y-1">
+              {memoryRaiseFits && onRaiseMemory && (
+                <button
+                  onClick={() => handleRaiseMemory(memoryRaiseTo)}
+                  disabled={raisingMemory}
+                  className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+                >
+                  {raisingMemory
+                    ? "Raising..."
+                    : `Raise memory allowance to ${formatBytes(memoryRaiseTo)}`}
+                </button>
+              )}
+              {!memoryRaiseFits && memoryCeilingMb != null && (
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  Needs more memory than this machine can allow ({formatBytes(memoryCeilingMb)} at
+                  most).
+                </p>
+              )}
+              {raiseMemoryError && <p className="text-xs text-destructive">{raiseMemoryError}</p>}
+            </div>
           )}
 
           {diskGate?.blocked && (

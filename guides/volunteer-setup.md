@@ -622,7 +622,9 @@ Within a head you can do the same per leaf, and opt a leaf in or out entirely:
 ```
 
 Add `--server <name>` to any `leafs` command to scope it to one head; omit it to
-apply across all of them.
+apply across all of them. Disabling every leaf of a head is allowed: the head stays
+attached and is simply asked for no work until you enable one again (the desktop
+app's leaf checkboxes work the same way).
 
 > **Capability still wins.** These preferences only re-rank work you can already
 > run — they can't make you eligible for a leaf your machine can't handle (e.g. a

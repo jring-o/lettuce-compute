@@ -1211,4 +1211,36 @@ describe("SettingsPage", () => {
       expect(sliderFor("CPU Cores")).toHaveAttribute("max", "8");
     });
   });
+
+  // --- TB-66: the Memory slider's maximum never clamps a saved allowance ---
+
+  it("the Memory slider steps by 256 MB up to 90 % of RAM, and never clamps an allowance saved above that", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+    const { unmount } = render(<SettingsPage />);
+    let memory = (screen.getAllByRole("slider") as HTMLInputElement[]).find(
+      (el) => el.step === "256"
+    );
+    expect(memory).toBeDefined();
+    expect(memory!.min).toBe("256");
+    expect(memory!.max).toBe("14746");
+    unmount();
+
+    const raised = makeConfig();
+    raised.resource_limits = { ...raised.resource_limits, max_memory_mb: 16000 };
+    mockUseConfig.mockReturnValue({
+      config: raised,
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+    render(<SettingsPage />);
+    memory = (screen.getAllByRole("slider") as HTMLInputElement[]).find((el) => el.step === "256");
+    expect(memory!.max).toBe("16000");
+    expect(memory!.value).toBe("16000");
+  });
 });

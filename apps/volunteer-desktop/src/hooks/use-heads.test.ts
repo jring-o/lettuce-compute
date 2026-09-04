@@ -7,6 +7,7 @@ import {
   useWriteLeafPreferences,
   useWriteHeadTrust,
   useRaiseDiskAllowance,
+  useRaiseMemoryAllowance,
   trustByHeadFromConfig,
   findServerConfig,
   resolveServerName,
@@ -833,5 +834,69 @@ describe("useWriteLeafPreferences", () => {
     });
 
     expect(mockUpdateConfigFn).not.toHaveBeenCalled();
+  });
+});
+
+// TB-66: the leaf card's "Raise memory allowance to …" button.
+describe("useRaiseMemoryAllowance", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetRestartRequiredForTest();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  it("reads the current limits and PUTs the whole object with the new max_memory_mb", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig());
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: false });
+
+    const { result } = renderHook(() => useRaiseMemoryAllowance());
+
+    let resp: ConfigUpdateResponse | null = null;
+    await act(async () => {
+      resp = await result.current.raise(7168);
+    });
+
+    expect(mockConfigFn).toHaveBeenCalledOnce();
+    expect(mockUpdateConfigFn).toHaveBeenCalledWith({
+      resource_limits: {
+        max_cpu_cores: 4,
+        max_memory_mb: 7168,
+        max_disk_gb: 10,
+        max_bandwidth_mbps: 0,
+        max_gpu_vram_pct: 50,
+        max_pids: 0,
+      },
+    });
+    expect(resp).toEqual({ status: "ok", restart_required: false });
+  });
+
+  it("always records a restart: the heads learn the new figure only when the daemon registers again", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig());
+    mockUpdateConfigFn.mockResolvedValue({ status: "ok", restart_required: false });
+
+    const { result } = renderHook(() => ({
+      memory: useRaiseMemoryAllowance(),
+      restart: useRestartRequired(),
+    }));
+    await act(async () => {
+      await result.current.memory.raise(7168);
+    });
+    expect(result.current.restart.restartRequired).toBe(true);
+    expect(result.current.restart.reasons).toEqual([
+      "Your memory allowance is now 7.0 GB. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.",
+    ]);
+  });
+
+  it("resolves to null without writing when there is no client", async () => {
+    mockUseClient.mockReturnValue({ client: null, error: null });
+
+    const { result } = renderHook(() => useRaiseMemoryAllowance());
+    let resp: ConfigUpdateResponse | null = { status: "x" };
+    await act(async () => {
+      resp = await result.current.raise(7168);
+    });
+
+    expect(resp).toBeNull();
+    expect(mockConfigFn).not.toHaveBeenCalled();
   });
 });

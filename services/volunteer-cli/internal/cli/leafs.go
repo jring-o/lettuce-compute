@@ -548,6 +548,12 @@ func runLeafsDisable(cmd *cobra.Command, args []string) error {
 		}
 		modified = true
 		fmt.Printf("Disabled leaf %q on server %q (mode: %s)\n", slug, name, lp.Mode)
+		// An empty SPECIFIC list is the legitimate "none of this head's
+		// leaves" state (TB-65); say so, since the server stays attached
+		// and simply asks for nothing.
+		if lp.Mode == "SPECIFIC" && len(lp.Enabled) == 0 {
+			fmt.Printf("No leaves remain enabled on server %q; it stays attached and is asked for no work until you enable one.\n", name)
+		}
 	}
 
 	if !modified {

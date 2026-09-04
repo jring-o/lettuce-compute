@@ -525,6 +525,8 @@ func TestValidate_LeafPreferences_InvalidMode(t *testing.T) {
 	}
 }
 
+// SPECIFIC with no enabled leaf means "nothing from this head" and is valid
+// (TB-65); the regression tests for that live in tb65_specific_empty_test.go.
 func TestValidate_LeafPreferences_SpecificEmpty(t *testing.T) {
 	cfg := Defaults()
 	cfg.Servers = []ServerConfig{{
@@ -532,8 +534,8 @@ func TestValidate_LeafPreferences_SpecificEmpty(t *testing.T) {
 		Name:            "test",
 		LeafPreferences: LeafPreferences{Mode: "SPECIFIC", Enabled: []string{}},
 	}}
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error for SPECIFIC mode with empty enabled list")
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("SPECIFIC mode with an empty enabled list must validate (it selects nothing), got %v", err)
 	}
 }
 

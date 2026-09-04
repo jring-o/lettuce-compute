@@ -7,6 +7,7 @@ import {
   formatCredit,
   formatAge,
   formatSizeMb,
+  formatSizePairMb,
   formatGb,
   pausedLabel,
   formatDateTime,
@@ -253,6 +254,41 @@ describe("theme helpers", () => {
       expect(listeners).toHaveLength(0);
     } finally {
       Object.defineProperty(window, "matchMedia", { writable: true, value: original });
+    }
+  });
+});
+
+// TB-66: a 7000 MB requirement and a 6912 MB allowance both rounded to
+// "6.8 GB", so the card read "6.8 GB RAM (you allow 6.8 GB)" while the head
+// refused the machine by 88 MB.
+describe("formatSizePairMb", () => {
+  it("prints both figures in MB when either would be rounded", () => {
+    expect(formatSizePairMb(7000, 6912)).toEqual(["7000 MB", "6912 MB"]);
+    expect(formatSizePairMb(7000, 6656)).toEqual(["7000 MB", "6656 MB"]);
+    expect(formatSizePairMb(14340, 14336)).toEqual(["14340 MB", "14336 MB"]);
+    expect(formatSizePairMb(1536, 1024)).toEqual(["1536 MB", "1024 MB"]);
+  });
+
+  it("keeps whole gigabytes short", () => {
+    expect(formatSizePairMb(16384, 8192)).toEqual(["16 GB", "8 GB"]);
+    expect(formatSizePairMb(15360, 10240)).toEqual(["15 GB", "10 GB"]);
+    expect(formatSizePairMb(3072, 2048)).toEqual(["3 GB", "2 GB"]);
+  });
+
+  it("leaves sizes under a gigabyte in MB as before", () => {
+    expect(formatSizePairMb(512, 256)).toEqual(["512 MB", "256 MB"]);
+  });
+
+  it("never prints two different sizes as the same label", () => {
+    for (const [need, have] of [
+      [7000, 6912],
+      [7000, 7168],
+      [8000, 7936],
+      [14340, 14336],
+      [1100, 1050],
+    ] as const) {
+      const [a, b] = formatSizePairMb(need, have);
+      expect(a, `${need} vs ${have}`).not.toBe(b);
     }
   });
 });
