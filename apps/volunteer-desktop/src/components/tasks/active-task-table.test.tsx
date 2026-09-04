@@ -439,4 +439,56 @@ describe("ActiveTaskTable", () => {
     // The context menu dropdown is rendered for the right-clicked task
     expect(await screen.findByRole("menuitem", { name: "Abort" })).toBeInTheDocument();
   });
+  // --- TB-64: a row is one line tall whatever its values ---
+
+  describe("TB-64: cells never wrap, so a row's height does not grow with its values", () => {
+    // The values the tester's screenshot showed wrapping at the Overview's own
+    // maximum width: "CPU Time" in the header, "12m 34s" in the cell, and a leaf
+    // name with a runtime suffix pushed onto a second line.
+    const ONE_TASK = [
+      makeTask({
+        work_unit_id: "cccccccc-1234-5678-abcd-000000000001",
+        leaf_name: "Beyblade Arena (native)",
+        cpu_seconds: 754,
+        estimated_remaining_seconds: 1830,
+        deadline_seconds: 7200,
+        task_status: "running",
+      }),
+    ];
+
+    it("every header is single-line", () => {
+      render(<ActiveTaskTable tasks={ONE_TASK} actions={actions} onRowClick={onRowClick} />);
+
+      for (const label of ["Leaf", "Status", "Progress", "CPU Time", "Remaining", "Deadline", "WU ID"]) {
+        expect(screen.getByText(label).closest("th"), label).toHaveClass("whitespace-nowrap");
+      }
+    });
+
+    it("the Status, CPU Time, Remaining, Deadline and WU ID cells are single-line", () => {
+      render(<ActiveTaskTable tasks={ONE_TASK} actions={actions} onRowClick={onRowClick} />);
+
+      expect(screen.getByText("Running").closest("td"), "status").toHaveClass("whitespace-nowrap");
+      expect(screen.getByText("12m 34s").closest("td"), "cpu time").toHaveClass("whitespace-nowrap");
+      expect(screen.getByText("30m 30s").closest("td"), "remaining").toHaveClass("whitespace-nowrap");
+      expect(screen.getByText("2h 0m").closest("td"), "deadline").toHaveClass("whitespace-nowrap");
+      expect(screen.getByText("cccccccc").closest("td"), "wu id").toHaveClass("whitespace-nowrap");
+    });
+
+    it("the leaf name truncates instead of wrapping and keeps the full name as its tooltip", () => {
+      render(<ActiveTaskTable tasks={ONE_TASK} actions={actions} onRowClick={onRowClick} />);
+
+      const cell = screen.getByText("Beyblade Arena (native)").closest("td");
+      expect(cell).toHaveClass("truncate");
+      expect(cell).toHaveAttribute("title", "Beyblade Arena (native)");
+    });
+
+    it("the progress bar keeps a minimum width beside the width-claiming leaf column", () => {
+      // The leaf cell takes every spare pixel (w-full); without a floor the
+      // bar's flex container shrank to a dot in a headless-Chrome render.
+      render(<ActiveTaskTable tasks={ONE_TASK} actions={actions} onRowClick={onRowClick} />);
+
+      const bar = screen.getByText("50%").parentElement;
+      expect(bar).toHaveClass("min-w-[96px]");
+    });
+  });
 });
