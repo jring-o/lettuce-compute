@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectsPage } from "./projects";
 import { RestartRequiredBanner } from "@/components/restart-required-banner";
 import { resetRestartRequiredForTest, useRestartRequired } from "@/hooks/use-restart-required";
 import { renderHook } from "@testing-library/react";
-import type { HeadInfo, LeafInfo, MachineCapabilities } from "@/api/client";
+import { ApiError, type HeadInfo, type LeafInfo, type MachineCapabilities } from "@/api/client";
 
 const mockRefetch = vi.fn();
 const mockSetHeads = vi.fn();
@@ -14,6 +14,7 @@ const mockSetTrustByHead = vi.fn();
 const mockWriteLeafPrefs = vi.fn().mockResolvedValue(undefined);
 const mockWriteHeadTrust = vi.fn();
 const mockRaiseDisk = vi.fn();
+const mockRaiseMemory = vi.fn();
 const mockWriteHeadWeight = vi.fn();
 const mockWriteLeafWeight = vi.fn();
 const mockClient = {
@@ -38,6 +39,9 @@ vi.mock("@/hooks/use-heads", () => ({
   useRaiseDiskAllowance: () => ({
     raise: mockRaiseDisk,
   }),
+  useRaiseMemoryAllowance: () => ({
+    raise: mockRaiseMemory,
+  }),
   useDebouncedHeadWeight: () => ({
     write: mockWriteHeadWeight,
   }),
@@ -54,6 +58,13 @@ const mockUseContainerRuntime = vi.fn();
 
 vi.mock("@/hooks/use-container-runtime", () => ({
   useContainerRuntime: () => mockUseContainerRuntime(),
+}));
+
+// The page reads the machine's RAM for the Memory slider's ceiling (TB-66).
+const mockUseSystemMetrics = vi.fn();
+
+vi.mock("@/hooks/use-metrics", () => ({
+  useSystemMetrics: () => mockUseSystemMetrics(),
 }));
 
 function makeLeaf(overrides: Partial<LeafInfo> = {}): LeafInfo {
@@ -165,6 +176,11 @@ describe("ProjectsPage", () => {
     mockClient.attachHead.mockResolvedValue(undefined);
     mockWriteHeadTrust.mockResolvedValue({ status: "ok", restart_required: true });
     mockRaiseDisk.mockResolvedValue({ status: "ok", restart_required: false });
+    mockRaiseMemory.mockResolvedValue({ status: "ok", restart_required: false });
+    mockUseSystemMetrics.mockReturnValue({
+      system: { cpu_usage_pct: 0, memory_used_mb: 0, memory_total_mb: 16384 },
+      error: null,
+    });
     mockUseHeads.mockReturnValue(headsState());
     mockUseContainerRuntime.mockReturnValue({
       status: null,
@@ -702,5 +718,105 @@ describe("ProjectsPage", () => {
     await user.click(screen.getByLabelText("Dismiss restart notice"));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(mockInvoke).not.toHaveBeenCalledWith("restart_daemon");
+  });
+
+  // --- TB-65: the last leaf of a head can be unchecked, and a refused save says why ---
+
+  describe("TB-65: unchecking a head's last enabled leaf", () => {
+    it("writes SPECIFIC with an empty list — none of this head's work — not a rejected shape", async () => {
+      const user = userEvent.setup();
+      render(<ProjectsPage />);
+
+      // einstein@home has exactly one leaf, and it is enabled.
+      const gw = screen.getByText("Gravitational Wave Search").closest("div[class*='rounded-md']")!;
+      await user.click(within(gw).getByRole("checkbox"));
+
+      expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(
+        expect.objectContaining({ grpc_address: "einstein.phys.uwm.edu:443" }),
+        { mode: "SPECIFIC", enabled: [] }
+      );
+    });
+
+    it("shows the daemon's own reason when the save is refused, instead of a fixed string", async () => {
+      const user = userEvent.setup();
+      mockWriteLeafPrefs.mockRejectedValueOnce(
+        new ApiError(
+          "VALIDATION_ERROR",
+          "servers[1].leaf_preferences: SPECIFIC mode requires at least one enabled leaf",
+          400
+        )
+      );
+      render(<ProjectsPage />);
+
+      const gw = screen.getByText("Gravitational Wave Search").closest("div[class*='rounded-md']")!;
+      await user.click(within(gw).getByRole("checkbox"));
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(
+            "Failed to save leaf preference: servers[1].leaf_preferences: SPECIFIC mode requires at least one enabled leaf"
+          )
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText("Error: Failed to save leaf preference")).not.toBeInTheDocument();
+    });
+  });
+
+  // --- TB-66: a leaf card can raise the memory allowance to the stop it needs ---
+
+  describe("TB-66: raising the memory allowance from a leaf card", () => {
+    function shortHeads(): HeadInfo[] {
+      return [
+        {
+          ...mockHeads[0],
+          leafs: [
+            makeLeaf({
+              id: "leaf-grep",
+              slug: "grep-f13",
+              name: "GREP f13",
+              execution_spec: { image: "ghcr.io/example/grep:1", max_memory_mb: 7000 },
+            }),
+          ],
+        },
+      ];
+    }
+
+    it("offers the next slider stop, writes it and re-reads the heads", async () => {
+      const user = userEvent.setup();
+      mockUseHeads.mockReturnValue(
+        headsState({ heads: shortHeads(), machine: { ...mockMachine, max_memory_mb: 6912 } })
+      );
+
+      render(<ProjectsPage />);
+
+      expect(screen.getByTestId("requirement-memory")).toHaveTextContent(
+        "7000 MB RAM (you allow 6912 MB)"
+      );
+      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+
+      await waitFor(() => {
+        expect(mockRaiseMemory).toHaveBeenCalledWith(7168);
+      });
+      await waitFor(() => {
+        expect(mockRefetch).toHaveBeenCalled();
+      });
+    });
+
+    it("does not offer a stop above 90 % of this machine's RAM", () => {
+      mockUseSystemMetrics.mockReturnValue({
+        system: { cpu_usage_pct: 0, memory_used_mb: 0, memory_total_mb: 4096 },
+        error: null,
+      });
+      mockUseHeads.mockReturnValue(
+        headsState({ heads: shortHeads(), machine: { ...mockMachine, max_memory_mb: 2048 } })
+      );
+
+      render(<ProjectsPage />);
+
+      expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
+      expect(
+        screen.getByText("Needs more memory than this machine can allow (3.6 GB at most).")
+      ).toBeInTheDocument();
+    });
   });
 });

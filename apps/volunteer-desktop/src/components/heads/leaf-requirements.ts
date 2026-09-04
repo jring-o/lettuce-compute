@@ -1,5 +1,6 @@
 import type { LeafInfo, MachineCapabilities } from "@/api/client";
-import { formatSizeMb } from "@/lib/utils";
+import { formatSizeMb, formatSizePairMb } from "@/lib/utils";
+import { memoryStopAtOrAboveMb } from "@/lib/resource-limits";
 
 /** A runtime a leaf's execution spec can be run under. */
 export type LeafRuntime = "container" | "native" | "wasm";
@@ -31,12 +32,21 @@ export function runtimeTrusted(runtime: LeafRuntime, trustedRuntimes: string[] |
   return trustedRuntimes.some((r) => r.toUpperCase() === runtime.toUpperCase());
 }
 
-/** One item of the "Needs:" line. `shortfall` is set when this machine falls short. */
+/**
+ * One item of the "Needs:" line. `shortfall` is set when this machine falls
+ * short; the label and the shortfall then print their figures in the same
+ * units and never round to the same number (TB-66).
+ */
 export interface RequirementItem {
   /** "disk", "memory", "cores" or "gpu". */
   key: string;
   label: string;
   shortfall?: string;
+  /**
+   * Memory only, with `shortfall`: the first Memory-slider stop that clears
+   * it, in MB — the value to raise `max_memory_mb` to.
+   */
+  raiseToMb?: number;
 }
 
 function specificGpuType(gpuType: string | undefined): string | null {
@@ -71,7 +81,9 @@ export function leafRequirementItems(
   if (minDisk > 0) {
     const item: RequirementItem = { key: "disk", label: `${formatSizeMb(minDisk)} disk` };
     if (machine && machine.max_disk_mb > 0 && minDisk > machine.max_disk_mb) {
-      item.shortfall = `you allow ${formatSizeMb(machine.max_disk_mb)}`;
+      const [need, have] = formatSizePairMb(minDisk, machine.max_disk_mb);
+      item.label = `${need} disk`;
+      item.shortfall = `you allow ${have}`;
     }
     items.push(item);
   }
@@ -80,7 +92,10 @@ export function leafRequirementItems(
   if (memory > 0) {
     const item: RequirementItem = { key: "memory", label: `${formatSizeMb(memory)} RAM` };
     if (machine && machine.max_memory_mb > 0 && memory > machine.max_memory_mb) {
-      item.shortfall = `you allow ${formatSizeMb(machine.max_memory_mb)}`;
+      const [need, have] = formatSizePairMb(memory, machine.max_memory_mb);
+      item.label = `${need} RAM`;
+      item.shortfall = `you allow ${have}`;
+      item.raiseToMb = memoryStopAtOrAboveMb(memory);
     }
     items.push(item);
   }
@@ -101,37 +116,46 @@ export function leafRequirementItems(
     const vram = rr?.min_gpu_vram_mb ?? 0;
     const capability = (rr?.gpu_compute_capability ?? "").trim();
 
-    const parts = [vendor ? `${vendor} GPU` : "a GPU"];
-    if (vram > 0) parts.push(`${formatSizeMb(vram)} VRAM`);
-    if (capability) parts.push(`compute capability ${capability}`);
-    const item: RequirementItem = { key: "gpu", label: parts.join(", ") };
-
+    // The VRAM figure is settled with its shortfall so the two print in the
+    // same units (formatSizePairMb).
+    let vramLabel = vram > 0 ? formatSizeMb(vram) : "";
+    let shortfall: string | undefined;
     if (machine) {
       if (!machine.has_gpu) {
-        item.shortfall = "no GPU detected or enabled";
+        shortfall = "no GPU detected or enabled";
       } else if (
         specGpu &&
         vendor &&
         machine.gpu_vendors.length > 0 &&
         !containsFold(machine.gpu_vendors, vendor)
       ) {
-        item.shortfall = `yours is ${machine.gpu_vendors.join("/")}`;
+        shortfall = `yours is ${machine.gpu_vendors.join("/")}`;
       } else if (
         rrGpu &&
         capability &&
         machine.gpu_compute_capabilities.length > 0 &&
         !containsFold(machine.gpu_compute_capabilities, capability)
       ) {
-        item.shortfall = `yours is ${machine.gpu_compute_capabilities.join("/")}`;
+        shortfall = `yours is ${machine.gpu_compute_capabilities.join("/")}`;
       } else if (vram > 0 && machine.gpu_card_vram_mb > 0 && vram > machine.gpu_card_vram_mb) {
-        item.shortfall = `your ${formatSizeMb(machine.gpu_card_vram_mb)} card is too small whatever percentage you allow`;
+        const [need, card] = formatSizePairMb(vram, machine.gpu_card_vram_mb);
+        vramLabel = need;
+        shortfall = `your ${card} card is too small whatever percentage you allow`;
       } else if (vram > 0 && machine.max_gpu_vram_mb > 0 && vram > machine.max_gpu_vram_mb) {
-        item.shortfall =
+        const [need, have] = formatSizePairMb(vram, machine.max_gpu_vram_mb);
+        vramLabel = need;
+        shortfall =
           machine.gpu_card_vram_mb > 0 && machine.gpu_vram_pct > 0
-            ? `your allowance is ${formatSizeMb(machine.max_gpu_vram_mb)} (${machine.gpu_vram_pct}% of a ${formatSizeMb(machine.gpu_card_vram_mb)} card)`
-            : `your allowance is ${formatSizeMb(machine.max_gpu_vram_mb)}`;
+            ? `your allowance is ${have} (${machine.gpu_vram_pct}% of a ${formatSizeMb(machine.gpu_card_vram_mb)} card)`
+            : `your allowance is ${have}`;
       }
     }
+
+    const parts = [vendor ? `${vendor} GPU` : "a GPU"];
+    if (vram > 0) parts.push(`${vramLabel} VRAM`);
+    if (capability) parts.push(`compute capability ${capability}`);
+    const item: RequirementItem = { key: "gpu", label: parts.join(", ") };
+    if (shortfall) item.shortfall = shortfall;
     items.push(item);
   }
 

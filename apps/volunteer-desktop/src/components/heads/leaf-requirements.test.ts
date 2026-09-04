@@ -91,7 +91,7 @@ describe("leafRequirementItems", () => {
     const items = leafRequirementItems(leaf, makeMachine());
     expect(items).toEqual([
       { key: "disk", label: "15 GB disk", shortfall: "you allow 10 GB" },
-      { key: "memory", label: "16 GB RAM", shortfall: "you allow 8 GB" },
+      { key: "memory", label: "16 GB RAM", shortfall: "you allow 8 GB", raiseToMb: 16384 },
       { key: "cores", label: "8 cores", shortfall: "you allow 4" },
     ]);
   });
@@ -163,5 +163,62 @@ describe("leafRequirementItems", () => {
       resource_requirements: { gpu_compute_capability: "8.6" },
     });
     expect(leafRequirementItems(specOnly, machine)[0].shortfall).toBeUndefined();
+  });
+});
+
+// TB-66: the tester's Mac mini — three GREP leaves declaring 7000 MB, the
+// Memory slider set to the stop that read the same "6.8 GB" as the card
+// (6912 MB), and the head refusing every poll on `7000 <= 6912`.
+describe("TB-66: a shortfall's two figures never round to the same label", () => {
+  it("prints a 7000 MB requirement and a 6912 MB allowance in MB, and names the stop that clears it", () => {
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
+    const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 6912 }));
+    expect(memory).toEqual({
+      key: "memory",
+      label: "7000 MB RAM",
+      shortfall: "you allow 6912 MB",
+      raiseToMb: 7168,
+    });
+  });
+
+  it("keeps whole-gigabyte figures short and still names the stop", () => {
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 16384 } });
+    const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 8192 }));
+    expect(memory).toEqual({
+      key: "memory",
+      label: "16 GB RAM",
+      shortfall: "you allow 8 GB",
+      raiseToMb: 16384,
+    });
+  });
+
+  it("names no stop when the machine is not short", () => {
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
+    const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 7168 }));
+    expect(memory).toEqual({ key: "memory", label: "6.8 GB RAM" });
+  });
+
+  it("applies the same rule to disk and VRAM", () => {
+    const leaf = makeLeaf({
+      execution_spec: { gpu_required: true },
+      resource_requirements: { min_disk_mb: 15000, min_gpu_vram_mb: 2100 },
+    });
+    const [disk, gpu] = leafRequirementItems(
+      leaf,
+      makeMachine({ max_disk_mb: 14336, max_gpu_vram_mb: 2048, gpu_card_vram_mb: 4096, gpu_vram_pct: 50 })
+    );
+    expect(disk).toEqual({ key: "disk", label: "15000 MB disk", shortfall: "you allow 14336 MB" });
+    expect(gpu).toEqual({
+      key: "gpu",
+      label: "a GPU, 2100 MB VRAM",
+      shortfall: "your allowance is 2048 MB (50% of a 4 GB card)",
+    });
+
+    const tooSmallCard = leafRequirementItems(
+      makeLeaf({ execution_spec: { gpu_required: true }, resource_requirements: { min_gpu_vram_mb: 4200 } }),
+      makeMachine({ gpu_card_vram_mb: 4096 })
+    )[0];
+    expect(tooSmallCard.label).toBe("a GPU, 4200 MB VRAM");
+    expect(tooSmallCard.shortfall).toBe("your 4096 MB card is too small whatever percentage you allow");
   });
 });

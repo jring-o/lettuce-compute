@@ -956,9 +956,12 @@ func (c *Config) Validate() error {
 			if !validLeafModes[lp.Mode] {
 				return fmt.Errorf("servers[%d].leaf_preferences.mode must be ALL, SPECIFIC, or BLOCKLIST, got %q", i, lp.Mode)
 			}
-			if lp.Mode == "SPECIFIC" && len(lp.Enabled) == 0 {
-				return fmt.Errorf("servers[%d].leaf_preferences: SPECIFIC mode requires at least one enabled leaf", i)
-			}
+			// SPECIFIC with no enabled leaf is a valid, deliberate state: "stay
+			// attached to this head but take none of its work" — what the desktop
+			// app writes when the last box on a head is unchecked and what `leafs
+			// disable` writes for the last enabled leaf. Every reader of the
+			// per-head preference selects exactly the listed slugs, so an empty
+			// list selects nothing; it is never read as "all" (TB-65).
 		}
 		for slug, w := range lp.Weights {
 			if w <= 0 {

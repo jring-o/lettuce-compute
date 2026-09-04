@@ -4,11 +4,14 @@ import {
   useWriteLeafPreferences,
   useWriteHeadTrust,
   useRaiseDiskAllowance,
+  useRaiseMemoryAllowance,
   useDebouncedHeadWeight,
   useDebouncedLeafWeight,
 } from "@/hooks/use-heads";
 import { useClient } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
+import { useSystemMetrics } from "@/hooks/use-metrics";
+import { memoryAllowanceCeilingMb } from "@/lib/resource-limits";
 import { HeadSection } from "@/components/heads/head-section";
 import { AddServerDialog } from "@/components/heads/add-server-dialog";
 import { markRestartRequired } from "@/hooks/use-restart-required";
@@ -34,10 +37,17 @@ export function ProjectsPage() {
   const { write: writeLeafPrefs } = useWriteLeafPreferences();
   const { write: writeHeadTrust } = useWriteHeadTrust();
   const { raise: raiseDiskAllowance } = useRaiseDiskAllowance();
+  const { raise: raiseMemoryAllowance } = useRaiseMemoryAllowance();
   const { write: writeHeadWeight } = useDebouncedHeadWeight();
   const { write: writeLeafWeight } = useDebouncedLeafWeight();
   const { client } = useClient();
   const { status: containerStatus } = useContainerRuntime();
+  // The Memory slider's ceiling (90 % of this machine's RAM), so a leaf card
+  // offers to raise the allowance only to a stop the slider can reach; null
+  // until the host has been measured.
+  const { system } = useSystemMetrics(30000);
+  const memoryCeilingMb =
+    system && system.memory_total_mb > 0 ? memoryAllowanceCeilingMb(system.memory_total_mb) : null;
   const [toast, setToast] = useState<string | null>(null);
   const [toastType, setToastType] = useState<"error" | "warning">("error");
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -90,11 +100,14 @@ export function ProjectsPage() {
         .filter((l) => (l.slug === leafSlug ? enabled : l.enabled))
         .map((l) => l.slug);
 
+      // No box checked is SPECIFIC with an empty list — "stay attached, take
+      // none of this head's work" — which the daemon accepts and reads as
+      // nothing, never as all (TB-65).
       const prefs = enabledSlugs.length === head.leafs.length
         ? { mode: "ALL" as const }
         : { mode: "SPECIFIC" as const, enabled: enabledSlugs };
 
-      writeLeafPrefs(head, prefs).catch(() => {
+      writeLeafPrefs(head, prefs).catch((err: unknown) => {
         // Roll back on failure
         setHeads((prev) =>
           prev.map((h) =>
@@ -104,7 +117,13 @@ export function ProjectsPage() {
           )
         );
         setToastType("error");
-        setToast("Error: Failed to save leaf preference");
+        // The daemon's own reason (its validation text, a connection error),
+        // not a fixed string that hid it (TB-65).
+        setToast(
+          err instanceof Error
+            ? `Failed to save leaf preference: ${err.message}`
+            : "Failed to save leaf preference"
+        );
       });
     },
     [setHeads, writeLeafPrefs, containerStatus]
@@ -161,6 +180,16 @@ export function ProjectsPage() {
       refetch();
     },
     [raiseDiskAllowance, refetch]
+  );
+
+  // Same for memory: the card's shortfall clears on the re-read (the hook
+  // records the restart the heads need to learn the new figure).
+  const handleRaiseMemory = useCallback(
+    async (mb: number) => {
+      await raiseMemoryAllowance(mb);
+      refetch();
+    },
+    [raiseMemoryAllowance, refetch]
   );
 
   /**
@@ -241,6 +270,8 @@ export function ProjectsPage() {
           onDetach={() => handleDetach(head)}
           onTrustChange={(runtimes) => handleTrustChange(head, runtimes)}
           onRaiseDisk={handleRaiseDisk}
+          onRaiseMemory={handleRaiseMemory}
+          memoryCeilingMb={memoryCeilingMb}
         />
       ))}
 

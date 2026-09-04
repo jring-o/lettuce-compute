@@ -92,6 +92,22 @@ export function formatSizeMb(mb: number): string {
   return Number.isInteger(gb) ? `${gb} GB` : `${gb.toFixed(1)} GB`;
 }
 
+/**
+ * A requirement beside an allowance, as two labels a reader can act on.
+ * `formatSizeMb` rounds to one decimal of a gigabyte, so a leaf declaring
+ * 7000 MB and a machine allowing 6912 MB both printed "6.8 GB": the card
+ * contradicted itself ("6.8 GB RAM (you allow 6.8 GB)") while the head
+ * refused the machine by 88 MB (TB-66). A shortfall is the one place the
+ * numbers are acted on, so whenever either figure would be rounded both are
+ * printed in MB — the unit the daemon and the head compare in; whole
+ * gigabytes keep their short form ("16 GB", "8 GB").
+ */
+export function formatSizePairMb(need: number, have: number): [string, string] {
+  const exact = (mb: number) => mb < 1024 || Number.isInteger(mb / 1024);
+  if (exact(need) && exact(have)) return [formatSizeMb(need), formatSizeMb(have)];
+  return [`${need} MB`, `${have} MB`];
+}
+
 /** Megabytes as a GB figure with one decimal, e.g. `formatGb(1536)` is "1.5 GB". */
 export function formatGb(mb: number): string {
   return `${(mb / 1024).toFixed(1)} GB`;

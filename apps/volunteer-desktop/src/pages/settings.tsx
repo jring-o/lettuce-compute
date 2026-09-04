@@ -14,6 +14,7 @@ import { useConfig } from "@/hooks/use-config";
 import { restartLettuce, useOnDaemonRestart } from "@/hooks/use-restart-required";
 import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
 import { useClient, useApiQuery } from "@/hooks/use-api";
+import { MEMORY_SLIDER_STEP_MB, memorySliderMaxMb } from "@/lib/resource-limits";
 import { ScheduleBuilder } from "@/components/schedule-builder";
 import { ContainerRuntimeStatusCard } from "@/components/container-runtime-status";
 import { Button } from "@/components/ui/button";
@@ -479,9 +480,9 @@ export function SettingsPage() {
         <ResourceSlider
           label="Memory"
           value={config.resource_limits.max_memory_mb}
-          min={256}
-          max={Math.round(totalMemMB * 0.9)}
-          step={256}
+          min={MEMORY_SLIDER_STEP_MB}
+          max={memorySliderMaxMb(totalMemMB, config.resource_limits.max_memory_mb)}
+          step={MEMORY_SLIDER_STEP_MB}
           displayValue={`${formatBytes(config.resource_limits.max_memory_mb)} / ${formatBytes(totalMemMB)}`}
           usagePct={
             system && system.memory_total_mb > 0

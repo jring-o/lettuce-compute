@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import { useClient } from "./use-api";
 import { markRestartRequired, useOnDaemonRestart } from "./use-restart-required";
+import { formatBytes } from "../lib/utils";
 import type {
   ConfigResponse,
   ConfigUpdateResponse,
@@ -219,6 +220,36 @@ export function useRaiseDiskAllowance(): {
           `Your disk allowance is now ${gb} GB. Lettuce applies it the next time it starts.`
         );
       }
+      return resp;
+    },
+    [client]
+  );
+
+  return { raise };
+}
+
+/**
+ * Raise `resource_limits.max_memory_mb` to a Memory-slider stop, the same
+ * way the disk raise works. Unlike the disk gate, the memory ceiling is
+ * advertised to each head when the daemon registers, and a head only offers
+ * work whose declared memory fits the figure it holds — so a restart is
+ * always recorded; until it happens the head keeps refusing the leaf (TB-66).
+ */
+export function useRaiseMemoryAllowance(): {
+  raise: (mb: number) => Promise<ConfigUpdateResponse | null>;
+} {
+  const { client } = useClient();
+
+  const raise = useCallback(
+    async (mb: number) => {
+      if (!client) return null;
+      const config = await client.config();
+      const resp = await client.updateConfig({
+        resource_limits: { ...config.resource_limits, max_memory_mb: mb },
+      });
+      markRestartRequired(
+        `Your memory allowance is now ${formatBytes(mb)}. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.`
+      );
       return resp;
     },
     [client]

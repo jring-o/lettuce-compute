@@ -29,6 +29,10 @@ interface HeadSectionProps {
   onTrustChange: (trustedRuntimes: string[]) => Promise<void>;
   /** Raise `resource_limits.max_disk_gb` to the given whole-GB value. */
   onRaiseDisk?: (gb: number) => Promise<void>;
+  /** Raise `resource_limits.max_memory_mb` to the given Memory-slider stop, in MB. */
+  onRaiseMemory?: (mb: number) => Promise<void>;
+  /** The Memory slider's ceiling in MB (90 % of RAM); null while unknown. */
+  memoryCeilingMb?: number | null;
 }
 
 function TrustMark({ allowed }: { allowed: boolean }) {
@@ -52,6 +56,8 @@ export function HeadSection({
   onDetach,
   onTrustChange,
   onRaiseDisk,
+  onRaiseMemory,
+  memoryCeilingMb = null,
 }: HeadSectionProps) {
   const [expanded, setExpanded] = useState(true);
   const [confirmDetach, setConfirmDetach] = useState(false);
@@ -218,6 +224,8 @@ export function HeadSection({
                 onToggle={(enabled) => onLeafToggle(leaf.slug, enabled)}
                 onWeightChange={(weight) => onLeafWeightChange(leaf.slug, weight)}
                 onRaiseDisk={onRaiseDisk}
+                onRaiseMemory={onRaiseMemory}
+                memoryCeilingMb={memoryCeilingMb}
                 dashboardUrl={head.url || undefined}
                 volunteerId={head.volunteer_id}
               />
