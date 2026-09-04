@@ -2102,7 +2102,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lettuce-compute-desktop"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "dirs 5.0.1",
  "http",
