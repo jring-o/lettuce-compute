@@ -347,9 +347,17 @@ func SetAdmissionPolicy(svc lettucev1.VolunteerServiceServer, cap admission.CapP
 // after which the HTTP router's operator-requeue handler (which holds the same ref,
 // via Dependencies.DispatchCacheRef) can invalidate a requeued unit's in-memory
 // dispatch state. Follows the SetHeadConfig decoupling pattern.
+//
+// The service's own transitioner is wired to the same handle (TB-61): every state it
+// writes from a submit or an abandon — validate, reject, dead-letter, reopen — evicts
+// the unit's staged candidate, so the eviction no longer depends on the calling RPC
+// remembering to do it. Boot-time wiring, before the gRPC server serves.
 func BindDispatchCacheRef(svc lettucev1.VolunteerServiceServer, ref *DispatchCacheRef) {
 	if vs, ok := svc.(*volunteerService); ok {
 		vs.dispatchCacheRef = ref
+		if vs.transitioner != nil && ref != nil {
+			vs.transitioner.SetDispatchInvalidator(ref)
+		}
 	}
 }
 
