@@ -84,6 +84,13 @@ export function ActiveTaskTable({
     setContextMenu({ task, x: e.clientX, y: e.clientY });
   };
 
+  // Column widths: the six value columns and every header are single-line
+  // (whitespace-nowrap) — "CPU Time", "12m 34s" and "Beyblade Arena (native)"
+  // used to wrap at the Overview's own maximum width, so a row grew taller
+  // the moment its CPU time passed a minute (TB-64). The Leaf column takes
+  // whatever width is left (w-full max-w-0) and truncates, with the full name
+  // as the cell's tooltip; the detail panel shows it in full. The Progress
+  // cell's content carries a minimum width so the bar survives that claim.
   return (
     <div className="rounded-lg border overflow-hidden">
       <table className="w-full text-sm">
@@ -93,7 +100,7 @@ export function ActiveTaskTable({
               <th
                 key={col.key}
                 className={cn(
-                  "text-left px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer select-none hover:text-foreground transition-colors",
+                  "text-left px-3 py-2 text-xs font-medium text-muted-foreground whitespace-nowrap cursor-pointer select-none hover:text-foreground transition-colors",
                   col.className
                 )}
                 onClick={() => handleHeaderClick(col.key)}
@@ -113,15 +120,19 @@ export function ActiveTaskTable({
               onClick={() => onRowClick(task)}
               onContextMenu={(e) => handleContextMenu(e, task)}
             >
-              <td className="px-3 py-2 text-sm">{task.leaf_name}</td>
-              <td className="px-3 py-2">
+              <td className="px-3 py-2 text-sm w-full max-w-0 truncate" title={task.leaf_name}>
+                {task.leaf_name}
+              </td>
+              <td className="px-3 py-2 whitespace-nowrap">
                 <span className="flex items-center gap-1.5">
                   <span className={cn("h-2 w-2 rounded-full shrink-0", STATUS_DOT_COLOR[task.task_status] ?? "bg-gray-500")} />
                   <span className="text-xs">{STATUS_TEXT_SHORT[task.task_status] ?? task.task_status}</span>
                 </span>
               </td>
               <td className="px-3 py-2">
-                <div className="flex items-center gap-2">
+                {/* min-w keeps the column at its 120px header width now that the
+                    Leaf column claims the slack; without it the bar shrinks to nothing. */}
+                <div className="flex items-center gap-2 min-w-[96px]">
                   <div className="h-2 flex-1 rounded-full bg-secondary overflow-hidden">
                     <div
                       className="h-full rounded-full bg-primary transition-all duration-300"
@@ -133,14 +144,14 @@ export function ActiveTaskTable({
                   </span>
                 </div>
               </td>
-              <td className="px-3 py-2 text-xs font-mono">{formatDuration(task.cpu_seconds)}</td>
-              <td className="px-3 py-2 text-xs">
+              <td className="px-3 py-2 text-xs font-mono whitespace-nowrap">{formatDuration(task.cpu_seconds)}</td>
+              <td className="px-3 py-2 text-xs whitespace-nowrap">
                 {task.estimated_remaining_seconds != null && task.estimated_remaining_seconds > 0
                   ? formatDuration(task.estimated_remaining_seconds)
                   : "---"}
               </td>
               <td className={cn(
-                "px-3 py-2 text-xs",
+                "px-3 py-2 text-xs whitespace-nowrap",
                 task.deadline_seconds < 0
                   ? "text-red-500"
                   : task.deadline_seconds < 7200
@@ -149,7 +160,7 @@ export function ActiveTaskTable({
               )}>
                 {formatDuration(Math.abs(task.deadline_seconds))}
               </td>
-              <td className="px-3 py-2 text-xs font-mono">{task.work_unit_id.slice(0, 8)}</td>
+              <td className="px-3 py-2 text-xs font-mono whitespace-nowrap">{task.work_unit_id.slice(0, 8)}</td>
               <td className="px-1 py-2" onClick={(e) => e.stopPropagation()}>
                 <TaskContextMenu
                   task={task}
