@@ -130,7 +130,7 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 	// daemon's resource-limiter + process-group hookup so a re-executed leaf binary
 	// runs under the same OS-level limits and child-process containment a normal work
 	// unit would (NewDaemon does this internally; the audit-runner is not a daemon).
-	registry, machineManager := buildRuntimeRegistry(cfg, logger)
+	registry, containerFactory := buildRuntimeRegistry(cfg, logger)
 	logger.Info("runtimes available", "advertised", advertisedRuntimes(registry))
 	pg := wireRuntimeResourceLimits(registry, cfg, logger)
 	if pg != nil {
@@ -138,9 +138,7 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 	}
 	// Same PB-27 ownership rule as the daemon: only undo a machine THIS process
 	// started; one that was already running is left exactly as found.
-	if machineManager != nil {
-		defer stopMachineIfDaemonStarted(machineManager, logger)
-	}
+	defer func() { stopMachineIfDaemonStarted(containerFactory.MachineManager(), logger) }()
 
 	// The audit-runner drives a single head: the first configured one. Entries
 	// are one-per-head (config.Load merges legacy duplicates, PB-16).

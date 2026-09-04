@@ -631,6 +631,13 @@ export interface ContainerRuntimeStatus {
   machine_memory_mb: number;
   machine_disk_gb: number;
   error: string | null;
+  /**
+   * The daemon has no container runtime but keeps probing for an engine
+   * (a head is trusted for container work), so an engine started now is
+   * picked up within a minute without a restart (TB-59). Absent on daemons
+   * older than the route's redetect support.
+   */
+  redetecting?: boolean;
 }
 
 export interface ContainerRuntimeSetupResponse {
@@ -660,6 +667,15 @@ export async function startContainerRuntime(): Promise<ContainerRuntimeSetupResp
 
 export async function stopContainerRuntime(): Promise<ContainerRuntimeSetupResponse> {
   return invoke("stop_container_runtime");
+}
+
+/**
+ * Ask the daemon to probe for a container engine now instead of at its next
+ * periodic check (TB-59). Resolves as soon as the probe is queued; the status
+ * reports the outcome on its next poll.
+ */
+export async function redetectContainerRuntime(): Promise<ContainerRuntimeSetupResponse> {
+  return invoke("redetect_container_runtime");
 }
 
 export interface PodmanPrerequisites {

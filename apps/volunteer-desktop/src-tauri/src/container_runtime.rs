@@ -20,6 +20,9 @@ pub struct ContainerRuntimeStatus {
     pub machine_memory_mb: i64,
     pub machine_disk_gb: i64,
     pub error: Option<String>,
+    /// The daemon keeps probing for an engine (no runtime yet, a head trusted
+    /// for containers); false when absent, as on older daemons.
+    pub redetecting: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +59,12 @@ impl ManagementClient {
 
     pub async fn stop_container_runtime(&self) -> Result<SetupResponse, String> {
         self.post_with_body::<(), SetupResponse>("/api/v1/container-runtime/stop", None)
+            .await
+    }
+
+    /// `POST /api/v1/container-runtime/redetect`: probe for an engine now.
+    pub async fn redetect_container_runtime(&self) -> Result<SetupResponse, String> {
+        self.post_with_body::<(), SetupResponse>("/api/v1/container-runtime/redetect", None)
             .await
     }
 }

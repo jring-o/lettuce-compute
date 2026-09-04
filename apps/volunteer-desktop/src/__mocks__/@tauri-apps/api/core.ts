@@ -42,6 +42,7 @@ export const hostCommandDefaults: Record<string, unknown> = {
     machine_memory_mb: 0,
     machine_disk_gb: 0,
     error: null,
+    redetecting: false,
   },
   setup_container_runtime: { status: "ok", message: "" },
   start_container_runtime: { status: "ok", message: "" },

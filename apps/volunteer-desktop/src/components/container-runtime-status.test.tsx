@@ -18,6 +18,7 @@ const mockStartContainerRuntime = vi.fn();
 const mockStopContainerRuntime = vi.fn();
 
 const mockInstallPodman = vi.fn();
+const mockRedetectContainerRuntime = vi.fn();
 
 vi.mock("@/api/client", () => ({
   setupContainerRuntime: (...args: unknown[]) =>
@@ -28,6 +29,8 @@ vi.mock("@/api/client", () => ({
     mockStopContainerRuntime(...args),
   installPodman: (...args: unknown[]) =>
     mockInstallPodman(...args),
+  redetectContainerRuntime: (...args: unknown[]) =>
+    mockRedetectContainerRuntime(...args),
 }));
 
 function makeStatus(
@@ -289,6 +292,41 @@ describe("ContainerRuntimeStatusCard", () => {
     await waitFor(() => {
       expect(mockRefresh).toHaveBeenCalled();
     });
+  });
+
+  // TB-59: while the daemon keeps probing for an engine, the card says so
+  // and offers an immediate re-check; a daemon that is not probing (no head
+  // trusted for containers, or an older build) gets neither.
+  it("offers an immediate re-check while the daemon is probing for an engine", async () => {
+    const user = userEvent.setup();
+    mockRedetectContainerRuntime.mockResolvedValue({ status: "checking", message: "" });
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ status: "not_installed", backend: "none", redetecting: true }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText(/checks for an engine every minute/)).toBeInTheDocument();
+    await user.click(screen.getByText("Check again now"));
+    expect(mockRedetectContainerRuntime).toHaveBeenCalledOnce();
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
+  });
+
+  it("does not offer a re-check when the daemon is not probing", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ status: "not_installed", backend: "none", redetecting: false }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.queryByText("Check again now")).not.toBeInTheDocument();
+    expect(screen.queryByText(/checks for an engine every minute/)).not.toBeInTheDocument();
   });
 
   // State: Not Installed

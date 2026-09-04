@@ -4,6 +4,7 @@ import {
   setupContainerRuntime,
   startContainerRuntime,
   stopContainerRuntime,
+  redetectContainerRuntime,
   installPodman,
 } from "@/api/client";
 import { Button } from "@/components/ui/button";
@@ -198,9 +199,20 @@ export function ContainerRuntimeStatusCard() {
           </Button>
         )}
         <p className="text-xs text-muted-foreground">
-          Container leafs will be unavailable until a runtime is installed. WASM and native leafs
-          run without one.
+          {status.redetecting
+            ? "Lettuce checks for an engine every minute and starts container work as soon as one answers, no restart needed. WASM and native leafs run without one."
+            : "Container leafs will be unavailable until a runtime is installed. WASM and native leafs run without one."}
         </p>
+        {status.redetecting && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={actionLoading}
+            onClick={() => handleAction(redetectContainerRuntime)}
+          >
+            {actionLoading ? "Checking..." : "Check again now"}
+          </Button>
+        )}
         {actionError && <p className="text-xs text-destructive">{actionError}</p>}
       </div>
     );

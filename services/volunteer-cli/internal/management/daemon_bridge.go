@@ -1904,43 +1904,79 @@ type ContainerRuntimeStatusResponse struct {
 	MachineMemoryMB int     `json:"machine_memory_mb"`
 	MachineDiskGB   int     `json:"machine_disk_gb"`
 	Error           *string `json:"error"`
+	// Redetecting reports that the daemon has no container runtime but keeps
+	// probing for an engine (a head is trusted for container work), so an
+	// engine started now is picked up without a restart (TB-59).
+	Redetecting bool `json:"redetecting"`
 }
 
-// GetContainerRuntimeStatus returns the current container runtime state.
+// GetContainerRuntimeStatus returns the container runtime state AS THE DAEMON
+// HAS IT — the engine the registered runtime is connected to, or the Podman
+// machine's own state when a binary was found but its machine is not up —
+// never the config's backend preference on its own. That preference is empty
+// on an auto-configured host, so the old answer was "none / not_installed"
+// beside a daemon running containers (TB-59).
 func (b *DaemonBridge) GetContainerRuntimeStatus() ContainerRuntimeStatusResponse {
-	cfg := b.daemon.GetConfig()
+	backend, registered := b.daemon.ContainerBackend()
 	mm := b.daemon.GetMachineManager()
 
 	resp := ContainerRuntimeStatusResponse{
-		Backend: cfg.ContainerBackend,
+		Backend:     "none",
+		Status:      "not_installed",
+		Redetecting: b.daemon.ContainerRedetectActive(),
 	}
 
-	if cfg.ContainerBackend == "" {
-		resp.Backend = "none"
-		resp.Status = "not_installed"
+	if mm != nil {
+		// A Podman binary has been found (at start or by a later probe): the
+		// machine's own state is the truth about whether containers can run.
+		resp.Backend = string(runtime.BackendPodman)
+		resp.MachineRequired = mm.NeedsMachine()
+		info := mm.Status()
+		resp.Status = string(info.Status)
+		resp.SocketPath = info.SocketPath
+		resp.MachineName = info.Name
+		resp.MachineCPUs = info.CPUs
+		resp.MachineMemoryMB = info.MemoryMB
+		resp.MachineDiskGB = info.DiskGB
+		if info.Error != "" {
+			resp.Error = &info.Error
+		}
+	}
+
+	if registered {
+		if backend.Backend != "" {
+			resp.Backend = string(backend.Backend)
+		}
+		resp.Version = backend.Version
+		if resp.SocketPath == "" {
+			resp.SocketPath = backend.SocketPath
+		}
+		// With no machine to report on (Docker, or Podman on Linux), a
+		// registered runtime is a running one.
+		if mm == nil || !mm.NeedsMachine() {
+			resp.Status = "running"
+		}
 		return resp
 	}
 
+	// Not registered. A probe that found an engine but could not build the
+	// runtime (socket not up yet, connection refused) says why, unless the
+	// machine state above is the better explanation.
 	if mm == nil {
-		// No machine manager — check the backend string only.
-		resp.Status = "running" // assume running if configured but no manager
-		return resp
+		if lastErr := b.daemon.ContainerDetectError(); lastErr != "" {
+			resp.Status = "error"
+			resp.Error = &lastErr
+		}
 	}
-
-	resp.MachineRequired = mm.NeedsMachine()
-	info := mm.Status()
-	resp.Status = string(info.Status)
-	resp.SocketPath = info.SocketPath
-	resp.MachineName = info.Name
-	resp.MachineCPUs = info.CPUs
-	resp.MachineMemoryMB = info.MemoryMB
-	resp.MachineDiskGB = info.DiskGB
-
-	if info.Error != "" {
-		resp.Error = &info.Error
-	}
-
 	return resp
+}
+
+// RequestContainerRedetect asks the daemon to probe for a container engine
+// now (TB-59). The probe runs on the daemon's own loop — a Podman machine
+// bring-up can take a minute — so this returns at once; the status route
+// reports the outcome.
+func (b *DaemonBridge) RequestContainerRedetect() error {
+	return b.daemon.RequestContainerRedetect()
 }
 
 // SetupContainerRuntime initializes and starts the container runtime.
@@ -1982,7 +2018,14 @@ func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
 		diskGB = 10000
 	}
 
-	return mm.Setup(cpus, memoryMB, diskGB)
+	if err := mm.Setup(cpus, memoryMB, diskGB); err != nil {
+		return err
+	}
+	// The machine is up: have the daemon build and register the runtime now
+	// rather than at its next scheduled probe (TB-59). Not applicable (already
+	// registered, or no head trusted for containers) is fine.
+	_ = b.daemon.RequestContainerRedetect()
+	return nil
 }
 
 // StartContainerRuntime starts the Podman machine (if applicable).
@@ -1998,7 +2041,12 @@ func (b *DaemonBridge) StartContainerRuntime() error {
 	if status.Status == runtime.MachineNotInitialized {
 		return runtime.ErrNotInitialized
 	}
-	return mm.Start()
+	if err := mm.Start(); err != nil {
+		return err
+	}
+	// As in SetupContainerRuntime: register the runtime now, not next minute.
+	_ = b.daemon.RequestContainerRedetect()
+	return nil
 }
 
 // StopContainerRuntime stops the Podman machine (if applicable).

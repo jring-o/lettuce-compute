@@ -114,6 +114,11 @@ func (c *ContainerRuntime) SetBackend(b ContainerBackend) {
 	c.backend = b
 }
 
+// Backend reports which engine this runtime is connected to.
+func (c *ContainerRuntime) Backend() ContainerBackend {
+	return c.backend
+}
+
 // SetMaxCPUCores sets the CPU core limit from volunteer config.
 func (c *ContainerRuntime) SetMaxCPUCores(cores int) {
 	c.maxCPUCores = cores

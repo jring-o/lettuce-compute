@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,7 +69,7 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 		PublicKey:         d.pubKey,
 		DisplayName:       hostname,
 		Hardware:          d.cachedHW,
-		AvailableRuntimes: d.advertisedRuntimes(),
+		AvailableRuntimes: d.advertisedRuntimesFor(head.Config),
 		SchedulingMode:    d.cfg.Scheduling.Mode,
 		HostId:            "", // discard the refused id: empty => the head mints a fresh one
 	})
@@ -90,23 +89,6 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 		}
 	}
 	return resp.HostId, nil
-}
-
-// advertisedRuntimes returns the UPPERCASE runtime enum names this daemon can actually
-// run, derived from the live registry (registry Name()s are lowercase). It mirrors the
-// list start.go advertises at initial registration so a self-heal re-register presents
-// the same capabilities.
-func (d *Daemon) advertisedRuntimes() []string {
-	if d.runtimeRegistry == nil {
-		return nil
-	}
-	names := d.runtimeRegistry.AvailableRuntimes()
-	out := make([]string, 0, len(names))
-	for _, n := range names {
-		out = append(out, strings.ToUpper(n))
-	}
-	sort.Strings(out)
-	return out
 }
 
 // Daemon manages the volunteer compute loop using concurrent execution slots
@@ -143,6 +125,25 @@ type Daemon struct {
 	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
 	// itself — see runtime.PodmanMachineManager.StartedByThisProcess.
 	machineManager *runtime.PodmanMachineManager
+
+	// Late container-engine detection (TB-59, container_detect.go). The
+	// factory outlives every detection attempt (it owns the Podman machine
+	// manager and the PB-27 ownership record); containerRedetectCh wakes the
+	// loop for an on-demand probe; lastRedetectOutcome makes the loop's
+	// logging change-only; readvertisePending names the heads that have not
+	// yet been told this machine's changed runtimes.
+	containerFactory    *ContainerRuntimeFactory
+	containerRedetectMu sync.Mutex
+	containerRedetectCh chan struct{}
+	lastRedetectOutcome string
+	readvertiseMu       sync.Mutex
+	readvertisePending  map[string]bool
+
+	// runtimeBlocked records that every attached leaf is currently
+	// runtime-blocked and the "runtime_blocked" notice is live (TB-60); see
+	// refreshRuntimeBlocked.
+	runtimeBlockedMu sync.Mutex
+	runtimeBlocked   bool
 
 	// Leaf discovery and weighted scheduling.
 	leafCache        *LeafCache
@@ -304,9 +305,13 @@ type DaemonConfig struct {
 	Runtime         runtime.Runtime               // Legacy: wraps in single-entry registry if RuntimeRegistry is nil
 	RuntimeRegistry *RuntimeRegistry              // Preferred: explicit registry with multiple runtimes
 	MachineManager  *runtime.PodmanMachineManager // optional: Podman machine lifecycle
-	Logger          *slog.Logger
-	Limiter         resource.Limiter    // optional, auto-detected if nil
-	Scheduler       *resource.Scheduler // optional, created from config if nil
+	// ContainerFactory is the detector that built (or failed to build) the
+	// container runtime at start; the daemon keeps probing with it while no
+	// container runtime is registered (TB-59). nil disables re-detection.
+	ContainerFactory *ContainerRuntimeFactory
+	Logger           *slog.Logger
+	Limiter          resource.Limiter    // optional, auto-detected if nil
+	Scheduler        *resource.Scheduler // optional, created from config if nil
 }
 
 // NewDaemon creates a new daemon with the provided configuration.
@@ -456,32 +461,35 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	ws.SetHeadWeights(headWeights)
 
 	return &Daemon{
-		cfg:              cfg.Config,
-		pubKey:           cfg.PubKey,
-		privKey:          cfg.PrivKey,
-		hostIDStore:      cfg.HostIDStore,
-		multiClient:      multiClient,
-		runtimeRegistry:  registry,
-		machineManager:   cfg.MachineManager,
-		logger:           cfg.Logger,
-		limiter:          limiter,
-		scheduler:        scheduler,
-		thermalMonitor:   thermalMonitor,
-		thermalPauseCh:   thermalPauseCh,
-		initialBackoff:   1 * time.Second,
-		maxBackoff:       30 * time.Second,
-		cachedHW:         hw,
-		leafCache:        leafCache,
-		weightedSelector: ws,
-		leafFailures:     newLeafFailureTracker(time.Now),
-		userPauseCh:      make(chan bool, 1),
-		processGroup:     pg,
-		benchmarkFPOPS:   benchFPOPS,
-		durations:        durations,
-		arrivalFpopsEst:  make(map[string]float64),
-		notices:          notices,
-		headStatus:       headStatus,
-		clientVersion:    cfg.ClientVersion,
+		cfg:                 cfg.Config,
+		pubKey:              cfg.PubKey,
+		privKey:             cfg.PrivKey,
+		hostIDStore:         cfg.HostIDStore,
+		multiClient:         multiClient,
+		runtimeRegistry:     registry,
+		machineManager:      cfg.MachineManager,
+		containerFactory:    cfg.ContainerFactory,
+		containerRedetectCh: make(chan struct{}, 1),
+		lastRedetectOutcome: "none",
+		logger:              cfg.Logger,
+		limiter:             limiter,
+		scheduler:           scheduler,
+		thermalMonitor:      thermalMonitor,
+		thermalPauseCh:      thermalPauseCh,
+		initialBackoff:      1 * time.Second,
+		maxBackoff:          30 * time.Second,
+		cachedHW:            hw,
+		leafCache:           leafCache,
+		weightedSelector:    ws,
+		leafFailures:        newLeafFailureTracker(time.Now),
+		userPauseCh:         make(chan bool, 1),
+		processGroup:        pg,
+		benchmarkFPOPS:      benchFPOPS,
+		durations:           durations,
+		arrivalFpopsEst:     make(map[string]float64),
+		notices:             notices,
+		headStatus:          headStatus,
+		clientVersion:       cfg.ClientVersion,
 	}
 }
 
@@ -641,6 +649,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// out. This goroutine keeps running across pauses and outlives every fetcher
 	// restart.
 	go d.runBufferMaintenance(ctx)
+
+	// Late container-engine detection (TB-59): while no container runtime is
+	// registered and a head is trusted for one, keep probing for an engine so
+	// one that comes up after the daemon is put to work without a restart.
+	go d.runContainerRedetect(ctx)
 
 	// Coordinator cleanup on exit.
 	defer func() {
@@ -2197,18 +2210,13 @@ func (d *Daemon) logReadiness() {
 	)
 
 	// "Connected, but you will get no work" — the actionable case worth a WARN.
-	if totalLeafs > 0 && eligibleLeafs == 0 {
-		switch {
-		case containerBlocked == totalLeafs && !hasContainer:
-			d.logger.Warn("no runnable leafs: every attached leaf needs a container runtime, but none is available here — install Docker or Podman (see the volunteer setup docs), or attach a head that has native leafs",
-				"runtimes", runtimes, "container_leafs", containerBlocked)
-		case trustBlocked > 0:
-			d.logger.Warn("no runnable leafs: the attached leafs need runtimes this volunteer has not trusted their heads to run — opt in per head with 'lettuce-volunteer heads trust <head> <runtime>' if you accept running that head's code",
-				"runtimes", runtimes, "trust_blocked_leafs", trustBlocked, "total_leafs", totalLeafs)
-		default:
-			d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
-				"runtimes", runtimes, "total_leafs", totalLeafs)
-		}
+	// When every leaf is runtime-blocked the verdict, its WARN and its notice
+	// are owned by refreshRuntimeBlocked (TB-60), which the fetcher keeps
+	// current from here on and which resolves the notice the moment a runtime
+	// registers late (TB-59).
+	if totalLeafs > 0 && eligibleLeafs == 0 && !d.refreshRuntimeBlocked() {
+		d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
+			"runtimes", runtimes, "total_leafs", totalLeafs, "container_blocked_leafs", containerBlocked, "has_container_runtime", hasContainer)
 	}
 }
 
@@ -2969,9 +2977,45 @@ func (d *Daemon) GetWeightedSelector() *WeightedSelector {
 	return d.weightedSelector
 }
 
-// GetMachineManager returns the Podman machine manager, or nil if not configured.
+// GetMachineManager returns the Podman machine manager, or nil if no Podman
+// binary has been found. Since TB-59 the manager can appear after start (the
+// detector creates it the first time a probe finds the binary), so the
+// detector's is preferred over the one handed in at construction.
 func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
+	if mm := d.containerFactory.MachineManager(); mm != nil {
+		return mm
+	}
 	return d.machineManager
+}
+
+// ContainerBackend reports the engine the registered container runtime is
+// connected to, and whether a container runtime is registered at all. The
+// management API reports THIS — what the daemon actually runs on — rather
+// than the config's backend preference, which is empty on an auto-configured
+// host and said "not installed" beside running containers (TB-59).
+func (d *Daemon) ContainerBackend() (runtime.BackendInfo, bool) {
+	if d.runtimeRegistry == nil {
+		return runtime.BackendInfo{}, false
+	}
+	rt := d.runtimeRegistry.GetRuntime("container")
+	if rt == nil {
+		return runtime.BackendInfo{}, false
+	}
+	if b, ok := d.containerFactory.Backend(); ok {
+		return b, true
+	}
+	// A runtime registered without the detector (tests, a hand-built
+	// registry): the runtime itself knows its backend kind at least.
+	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+		return runtime.BackendInfo{Backend: cr.Backend()}, true
+	}
+	return runtime.BackendInfo{}, true
+}
+
+// ContainerDetectError is why the most recent engine probe found an engine but
+// could not build its runtime; empty when it could, or found nothing.
+func (d *Daemon) ContainerDetectError() string {
+	return d.containerFactory.LastError()
 }
 
 // SetSlotManagerForTest injects a SlotManager into the daemon for testing.
