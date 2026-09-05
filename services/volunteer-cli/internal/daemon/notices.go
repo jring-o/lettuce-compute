@@ -178,6 +178,33 @@ func (l *NoticeLog) Resolve(code, head, leaf string) int {
 	return resolved
 }
 
+// ResolveDaemonWide marks resolved every live notice with the given code that
+// names neither a head nor a leaf — the daemon-wide form of a condition that
+// also comes in per-leaf form, which Resolve's wildcard would sweep up too.
+// The disk gate needs the distinction: the data-dir floor recovering ends the
+// machine-wide stall while a leaf whose own gate still refuses stays blocked,
+// and its notice must outlive the floor's (TB-70).
+func (l *NoticeLog) ResolveDaemonWide(code string) int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	resolved := 0
+	for i := range l.entries {
+		e := &l.entries[i]
+		if e.ResolvedAt != nil || e.Code != code || e.Head != "" || e.Leaf != "" {
+			continue
+		}
+		at := now
+		e.ResolvedAt = &at
+		resolved++
+	}
+	return resolved
+}
+
 // Since returns the notices created after the given id — every notice when
 // since is 0 — most recently updated first, plus the highest id ever
 // assigned (0 when nothing has been emitted). A refreshed notice keeps its
