@@ -12,10 +12,12 @@ import (
 
 func lbl(wu string) map[string]string { return map[string]string{WorkUnitIDLabel: wu} }
 
-// The stranded-container reaper removes the volunteer's own inactive work-unit
-// containers (crash/dirty-shutdown leftovers, which pin the leaf image) while
-// sparing running, paused, and still-owned containers.
-func TestReapStrandedContainers_RemovesInactiveOwnLeftovers(t *testing.T) {
+// The stranded-container reaper removes the volunteer's own work-unit
+// containers whose unit it no longer owns, in any state — crash/dirty-shutdown
+// leftovers, which pin the leaf image, and the paused container of a quit whose
+// unit could not be adopted, which holds its memory (TB-74) — while sparing
+// every container of a unit it still owns.
+func TestReapStrandedContainers_RemovesUnownedLeftoversInAnyState(t *testing.T) {
 	var removed []string
 	mock := &MockDockerClient{
 		ContainerListFn: func(_ context.Context, label string) ([]ContainerSummary, error) {
@@ -23,23 +25,24 @@ func TestReapStrandedContainers_RemovesInactiveOwnLeftovers(t *testing.T) {
 				t.Fatalf("listed with label %q, want %q", label, WorkUnitIDLabel)
 			}
 			return []ContainerSummary{
-				{ID: "run1", State: "running", Labels: lbl("wu-running")},      // active — keep
-				{ID: "paused1", State: "paused", Labels: lbl("wu-paused")},     // suspended slot — keep
+				{ID: "run1", State: "running", Labels: lbl("wu-running")},      // no slot supervises it — remove
+				{ID: "paused1", State: "paused", Labels: lbl("wu-paused")},     // frozen by a quit, not adopted — remove
 				{ID: "exited1", State: "exited", Labels: lbl("wu-exited")},     // crash leftover — remove
 				{ID: "created-old", State: "created", Labels: lbl("wu-old")},   // never-started leftover — remove
 				{ID: "created-owned", State: "created", Labels: lbl("wu-own")}, // just-resumed unit — keep (owned)
+				{ID: "paused-owned", State: "paused", Labels: lbl("wu-adopt")}, // adopted by a resumed slot — keep (owned)
 				{ID: "dead1", State: "dead", Labels: lbl("wu-dead")},           // dead leftover — remove
 			}, nil
 		},
 		ContainerRemoveFn: func(_ context.Context, id string) error { removed = append(removed, id); return nil },
 	}
 	cr := reaperTestRuntime(t, mock)
-	cr.ReapStrandedContainers(context.Background(), map[string]bool{"wu-own": true})
+	cr.ReapStrandedContainers(context.Background(), map[string]bool{"wu-own": true, "wu-adopt": true})
 
 	sort.Strings(removed)
-	want := []string{"created-old", "dead1", "exited1"}
+	want := []string{"created-old", "dead1", "exited1", "paused1", "run1"}
 	if fmt.Sprint(removed) != fmt.Sprint(want) {
-		t.Fatalf("removed = %v, want %v (running/paused and the owned 'created' container must be kept)", removed, want)
+		t.Fatalf("removed = %v, want %v (every un-owned container goes, whatever its state; the owned ones stay)", removed, want)
 	}
 }
 

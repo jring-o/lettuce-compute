@@ -350,7 +350,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Warn("run-start StartWork failed; dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "error", swErr)
 			cancelExec()
-			sm.killDroppedOrphan(slot, wu, prep)
+			sm.killDroppedOrphan(slot, wu, prep, rt)
 			execErr = errStartWorkDropped
 			return
 		}
@@ -358,7 +358,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Info("run-start denied (unit reassigned or reservation lapsed); dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "message", swResp.GetMessage())
 			cancelExec()
-			sm.killDroppedOrphan(slot, wu, prep)
+			sm.killDroppedOrphan(slot, wu, prep, rt)
 			execErr = errStartWorkDropped
 			return
 		}
@@ -405,9 +405,22 @@ var stopProcessFunc = StopProcess
 // killDroppedOrphan terminates a resumed orphan whose reservation lapsed at
 // run-start. A normal (non-orphan) drop has no process yet and is a no-op here;
 // only a resumed orphan (OrphanPID > 0) was already unfrozen and would otherwise
-// burn CPU unmonitored after runSlot deletes its work dir.
-func (sm *SlotManager) killDroppedOrphan(slot *ExecutionSlot, wu *runtime.WorkUnit, prep *runtime.PrepareResult) {
-	if prep == nil || prep.OrphanPID <= 0 {
+// burn CPU unmonitored after runSlot deletes its work dir. An adopted container
+// (OrphanContainerID, TB-74) was likewise already unpaused; it is removed, since
+// nothing else would ever supervise it.
+func (sm *SlotManager) killDroppedOrphan(slot *ExecutionSlot, wu *runtime.WorkUnit, prep *runtime.PrepareResult, rt runtime.Runtime) {
+	if prep == nil {
+		return
+	}
+	if prep.OrphanContainerID != "" {
+		if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+			sm.logger.Info("removing adopted container whose reservation lapsed at run-start",
+				"work_unit_id", wu.ID, "slot", slot.ID, "container", prep.OrphanContainerID)
+			cr.RemoveWorkUnitContainers(context.Background(), wu.ID, "")
+		}
+		return
+	}
+	if prep.OrphanPID <= 0 {
 		return
 	}
 	sm.logger.Info("terminating resumed orphan whose reservation lapsed at run-start",
@@ -804,6 +817,9 @@ func (sm *SlotManager) GetActivePersistableTasks() []PersistedTask {
 			}
 			if slot.processHandle != nil {
 				pt.PID = slot.processHandle.PID()
+				if h, ok := slot.processHandle.(*containerProcessHandle); ok {
+					pt.ContainerID = h.ContainerID()
+				}
 			}
 			tasks = append(tasks, pt)
 		}

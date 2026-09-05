@@ -83,6 +83,14 @@ type PrepareResult struct {
 	// instead of calling rt.Execute() to start a new process.
 	OrphanPID int
 
+	// OrphanContainerID, if set, names a container a previous daemon session
+	// left for this unit — paused at quit, or still running after a crash —
+	// that the container runtime's Execute adopts and supervises to completion
+	// instead of creating a new one. The work dir is the preserved one its
+	// binds still point at (TB-74). The daemon sets it only after
+	// ContainerRuntime.ResumeWorkUnitContainer reported the container running.
+	OrphanContainerID string
+
 	// OriginalStartedAt preserves the original (first-ever) start time for resumed
 	// tasks. It is used as a stable reference timestamp, not to derive elapsed time.
 	OriginalStartedAt time.Time
