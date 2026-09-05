@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 #[serde(default)]
 pub struct ContainerRuntimeStatus {
     pub backend: String,
+    /// The engine answering the socket `backend` was reached through:
+    /// "podman" behind a Docker-compatible socket, "docker", or "" (TB-73).
+    pub engine: String,
     pub status: String,
     pub version: String,
     pub socket_path: String,

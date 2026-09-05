@@ -43,8 +43,8 @@ var isDockerAvailableFunc = IsDockerAvailable
 var podmanInstallPathFunc = defaultPodmanInstallPath
 
 // dockerEngineFunc names the engine behind the Docker-compatible socket the
-// Docker probe reached. Overridden in tests.
-var dockerEngineFunc = DockerEngineName
+// Docker probe reached, and its version. Overridden in tests.
+var dockerEngineFunc = DockerEngine
 
 // detectGOOS is the platform the install-location lists are chosen for.
 // Overridden in tests so every platform's list is exercised on any host.
@@ -90,9 +90,10 @@ func DetectContainerBackendPreferred(bundledPodmanPath string, preferred Contain
 }
 
 // dockerBackendInfo describes a backend reached through the Docker probe,
-// labelled by the engine that actually answered.
+// labelled by the engine that actually answered, with that engine's version.
 func dockerBackendInfo() BackendInfo {
-	return BackendInfo{Backend: BackendDocker, Engine: dockerEngineFunc()}
+	engine, version := dockerEngineFunc()
+	return BackendInfo{Backend: BackendDocker, Engine: engine, Version: version}
 }
 
 // detectPodman looks for a Podman binary and resolves its socket path and version.

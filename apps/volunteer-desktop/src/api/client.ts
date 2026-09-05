@@ -152,6 +152,13 @@ export interface HistoryResponse {
     next_cursor: string;
     has_more: boolean;
   };
+  /**
+   * Every distinct leaf name in the whole history file, sorted, whatever
+   * page or filter this response answers. The History page's leaf filter is
+   * built from it, so a leaf whose last unit is older than the newest page
+   * can be selected before a row of it has loaded (TB-71).
+   */
+  leaf_names: string[];
 }
 
 export interface HistoryParams {
@@ -633,6 +640,14 @@ export interface NoticesResponse {
 
 export interface ContainerRuntimeStatus {
   backend: "podman" | "docker" | "none";
+  /**
+   * The engine answering the socket `backend` was reached through: "podman"
+   * when Podman serves the Docker-compatible socket (Podman Desktop's Docker
+   * compatibility, podman-mac-helper), "docker" for Docker itself, "" when
+   * unknown. With `backend` "docker" and `engine` "podman" the machine is
+   * Podman's, managed outside this app (TB-73).
+   */
+  engine: "podman" | "docker" | "";
   status:
     | "running"
     | "stopped"

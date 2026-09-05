@@ -10,6 +10,8 @@ import {
   formatSizePairMb,
   formatGb,
   pausedLabel,
+  pauseIsResumable,
+  pausedExplanation,
   formatDateTime,
   readStoredTheme,
   storeTheme,
@@ -290,5 +292,22 @@ describe("formatSizePairMb", () => {
       const [a, b] = formatSizePairMb(need, have);
       expect(a, `${need} vs ${have}`).not.toBe(b);
     }
+  });
+});
+
+describe("pauseIsResumable / pausedExplanation (TB-72)", () => {
+  it("only a user pause is the daemon's resume to undo", () => {
+    expect(pauseIsResumable("user")).toBe(true);
+    expect(pauseIsResumable("scheduled")).toBe(false);
+    expect(pauseIsResumable("thermal")).toBe(false);
+    expect(pauseIsResumable(null)).toBe(false);
+    expect(pauseIsResumable(undefined)).toBe(false);
+  });
+
+  it("explains each pause with what ends it", () => {
+    expect(pausedExplanation("user")).toBe("Computing is paused. Resume to start contributing.");
+    expect(pausedExplanation("scheduled")).toMatch(/schedule.*Settings/);
+    expect(pausedExplanation("thermal")).toMatch(/cools down/);
+    expect(pausedExplanation(null)).toBe("Computing is paused.");
   });
 });

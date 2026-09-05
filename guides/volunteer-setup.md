@@ -155,9 +155,13 @@ start a Podman machine for you on first `start`.
   (`unix:///path/to.sock`) override the socket on macOS exactly as on Linux.
 - **"Docker-compatible … served by Podman".** When the only thing lettuce finds
   is the Docker socket and Podman is behind it (Podman Desktop's Docker
-  compatibility switch, `podman-mac-helper`), the log and `doctor` say so
-  instead of calling it Docker; rootful/rootless and the compatibility switch
-  only decide whether that socket exists, not whether containers run.
+  compatibility switch, `podman-mac-helper`), the log, `doctor` and the desktop
+  app's runtime card say so instead of calling it Docker; rootful/rootless and
+  the compatibility switch only decide whether that socket exists, not whether
+  containers run. On that path lettuce does not manage the Podman machine
+  (start, stop and resize it from Podman Desktop or `podman machine`); to have
+  it managed, `lettuce-volunteer config set container_backend podman` and
+  restart.
 
 ---
 

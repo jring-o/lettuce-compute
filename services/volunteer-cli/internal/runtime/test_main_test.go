@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 	podmanInstallPathFunc = func() string { return "" }
 	// Likewise never ask a real Docker socket which engine serves it; tests that
 	// care about the label override this explicitly.
-	dockerEngineFunc = func() string { return "" }
+	dockerEngineFunc = func() (string, string) { return "", "" }
 
 	os.Exit(m.Run())
 }

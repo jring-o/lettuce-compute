@@ -82,7 +82,10 @@ export interface HistoryState {
   entries: HistoryEntry[];
   /** Entries received from the daemon for the current date window, before client-side filters. */
   loadedCount: number;
-  /** Every leaf name seen in any page this hook has loaded, sorted. */
+  /**
+   * Every leaf name in the history, sorted: the daemon's whole-file list,
+   * served with every page, plus any name seen on a loaded row.
+   */
   leafNames: string[];
   hasMore: boolean;
   isLoading: boolean;
@@ -113,6 +116,8 @@ export function useHistory(filters: HistoryFilters): HistoryState {
   const generationRef = useRef(0);
   // Leaf names are a property of the history, not of the filter, so they are
   // never reset: selecting a leaf must not shrink the list to that one leaf.
+  // The daemon names every leaf in the file with each page (TB-71); the rows
+  // are read as well so a name is listed the moment a row carrying it shows.
   const seenLeafNamesRef = useRef<Set<string>>(new Set());
   // Every work unit the daemon has returned for the current filter set,
   // before client-side filters: how `refresh` tells new completions from
@@ -156,6 +161,7 @@ export function useHistory(filters: HistoryFilters): HistoryState {
         for (let page = 0; page < MAX_PAGES_PER_LOAD; page++) {
           const resp = await client.history({ ...params, cursor });
           fetched += resp.entries.length;
+          for (const name of resp.leaf_names) seenLeafNamesRef.current.add(name);
           for (const e of resp.entries) {
             seenLeafNamesRef.current.add(e.leaf_name);
             loadedIdsRef.current.add(e.work_unit_id);
@@ -208,6 +214,7 @@ export function useHistory(filters: HistoryFilters): HistoryState {
     try {
       const resp = await client.history(filtersToParams(filtersRef.current));
       if (generation !== generationRef.current) return; // filters changed meanwhile
+      for (const name of resp.leaf_names) seenLeafNamesRef.current.add(name);
       for (const e of resp.entries) seenLeafNamesRef.current.add(e.leaf_name);
       const fresh = resp.entries.filter((e) => !loadedIdsRef.current.has(e.work_unit_id));
 

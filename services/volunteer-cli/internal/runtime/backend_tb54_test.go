@@ -43,7 +43,7 @@ func withMockDockerEngine(t *testing.T, engine string) {
 	t.Helper()
 	orig := dockerEngineFunc
 	t.Cleanup(func() { dockerEngineFunc = orig })
-	dockerEngineFunc = func() string { return engine }
+	dockerEngineFunc = func() (string, string) { return engine, "" }
 }
 
 // TB-54: a Finder-launched app runs with /usr/bin:/bin:/usr/sbin:/sbin, so PATH

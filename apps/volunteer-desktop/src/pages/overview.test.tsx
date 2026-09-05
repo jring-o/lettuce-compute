@@ -4,7 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { OverviewPage } from "./overview";
 import { VIZ_SILENT_TIMEOUT_MS } from "@/components/viz/VizFrame";
 import { makeTask } from "@/components/tasks/test-helpers";
-import type { HeadsResponse, Notice } from "@/api/client";
+import { ApiError, type HeadsResponse, type Notice } from "@/api/client";
+import { emit } from "@tauri-apps/api/event";
 
 // Mock all hooks used by the page
 const mockUseDaemonStatus = vi.fn();
@@ -210,7 +211,7 @@ describe("OverviewPage", () => {
           uptime_seconds: 3600,
           connected_servers: 1,
           active_tasks: [],
-          paused_reason: null,
+          paused_reason: "user",
         },
       },
     });
@@ -245,7 +246,7 @@ describe("OverviewPage", () => {
           uptime_seconds: 3600,
           connected_servers: 1,
           active_tasks: [],
-          paused_reason: null,
+          paused_reason: "user",
         },
       },
     });
@@ -277,7 +278,7 @@ describe("OverviewPage", () => {
           uptime_seconds: 3600,
           connected_servers: 1,
           active_tasks: [],
-          paused_reason: null,
+          paused_reason: "user",
         },
       },
     });
@@ -2479,6 +2480,56 @@ describe("OverviewPage", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+  describe("TB-72: a pause the daemon will not undo offers no Resume", () => {
+    function pausedFor(reason: "user" | "scheduled" | "thermal") {
+      setupDefaultMocks({
+        status: {
+          status: {
+            state: "paused",
+            uptime_seconds: 3600,
+            connected_servers: 1,
+            active_tasks: [],
+            queued_tasks: [],
+            failing_leafs: [],
+            paused_reason: reason,
+          },
+        },
+      });
+    }
+
+    it("shows Change schedule instead of Resume during a schedule pause, and it opens Settings", async () => {
+      const user = userEvent.setup();
+      pausedFor("scheduled");
+      render(<OverviewPage />);
+
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+      expect(screen.queryByText("Pause")).not.toBeInTheDocument();
+      expect(screen.getByText(/Computing is paused by your schedule/)).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Change schedule" }));
+      expect(emit).toHaveBeenCalledWith("navigate:settings");
+      expect(mockClient.resume).not.toHaveBeenCalled();
+    });
+
+    it("offers nothing to click during a thermal pause and says it ends on its own", () => {
+      pausedFor("thermal");
+      render(<OverviewPage />);
+
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+      expect(screen.queryByText("Change schedule")).not.toBeInTheDocument();
+      expect(screen.getByText(/cools down/)).toBeInTheDocument();
+    });
+
+    it("shows the daemon's own reason when a resume is refused", async () => {
+      const user = userEvent.setup();
+      pausedFor("user");
+      mockClient.resume.mockRejectedValueOnce(new ApiError("CONFLICT", "not paused", 409));
+      render(<OverviewPage />);
+
+      await user.click(screen.getByText("Resume"));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Could not resume: not paused");
     });
   });
 });

@@ -124,6 +124,30 @@ export function pausedLabel(reason: string | null | undefined): string {
   return `Paused — ${reason}`;
 }
 
+/**
+ * True when the daemon's resume verb would undo this pause. It undoes a user
+ * pause and nothing else — a schedule or thermal pause answers 409 "not
+ * paused" — so "Resume" is offered for that reason alone (TB-72).
+ */
+export function pauseIsResumable(reason: string | null | undefined): boolean {
+  return reason === "user";
+}
+
+/**
+ * The sentence shown in place of the task list while paused: what paused the
+ * machine and what ends it, since only a user pause has a Resume button.
+ */
+export function pausedExplanation(reason: string | null | undefined): string {
+  if (reason === "user") return "Computing is paused. Resume to start contributing.";
+  if (reason === "scheduled") {
+    return "Computing is paused by your schedule and starts again when the next window opens. Change the schedule in Settings to compute now.";
+  }
+  if (reason === "thermal") {
+    return "Computing is paused while the machine cools down. It starts again on its own.";
+  }
+  return "Computing is paused.";
+}
+
 /** An RFC 3339 timestamp as a short local date and time, e.g. "Mar 4, 14:05". */
 export function formatDateTime(isoString: string): string {
   const d = new Date(isoString);

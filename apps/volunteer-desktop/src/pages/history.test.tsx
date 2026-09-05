@@ -91,6 +91,7 @@ function makeClient(overrides: Record<string, unknown> = {}) {
     history: vi.fn().mockResolvedValue({
       entries: [],
       pagination: { next_cursor: "", has_more: false },
+      leaf_names: [],
     }),
     results: vi.fn().mockResolvedValue({ results: [] }),
     resultData: vi.fn().mockResolvedValue({}),
@@ -536,6 +537,7 @@ describe("HistoryPage", () => {
           },
         ],
         pagination: { next_cursor: "", has_more: false },
+      leaf_names: [],
       }),
     });
     mockUseClient.mockReturnValue({ client, error: null });
@@ -601,6 +603,7 @@ describe("HistoryPage", () => {
           makeMockEntry({ work_unit_id: "wu-rej", validation_status: "rejected" }),
         ],
         pagination: { next_cursor: "", has_more: false },
+      leaf_names: [],
       }),
     });
     mockUseClient.mockReturnValue({ client, error: null });
@@ -643,6 +646,7 @@ describe("HistoryPage", () => {
           },
         ],
         pagination: { next_cursor: "", has_more: false },
+      leaf_names: [],
       }),
     });
     mockUseClient.mockReturnValue({ client, error: null });

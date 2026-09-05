@@ -94,6 +94,30 @@ export function ContainerRuntimeStatusCard() {
     );
   }
 
+  // Running — Podman answering the Docker-compatible socket (Podman Desktop's
+  // Docker compatibility, podman-mac-helper). The probe that found it was the
+  // Docker one, so the card used to call it Docker and advise installing the
+  // Podman that was already running (TB-73). Lettuce does not manage the
+  // machine on this path, so there are no machine figures or buttons here.
+  if (status.status === "running" && status.backend === "docker" && status.engine === "podman") {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <StatusDot color="green" />
+          <span className="text-sm font-medium">
+            Podman{status.version ? ` ${status.version}` : ""}
+          </span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Reached through the Docker-compatible socket, so this app does not manage the Podman
+          machine: start, stop and resize it from Podman Desktop or the podman command. To have
+          Lettuce manage the machine instead, run{" "}
+          <code>lettuce-volunteer config set container_backend podman</code> and restart the app.
+        </p>
+      </div>
+    );
+  }
+
   // Running — Docker
   if (status.status === "running" && status.backend === "docker") {
     return (
