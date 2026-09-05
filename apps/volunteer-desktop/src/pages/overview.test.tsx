@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { OverviewPage } from "./overview";
+import { VIZ_SILENT_TIMEOUT_MS } from "@/components/viz/VizFrame";
 import { makeTask } from "@/components/tasks/test-helpers";
 import type { HeadsResponse, Notice } from "@/api/client";
 
@@ -2376,5 +2377,108 @@ describe("OverviewPage", () => {
     render(<OverviewPage />);
 
     expect(screen.getByText("Start computing to see a simulation")).toBeInTheDocument();
+  });
+
+  // --- TB-69: a bundle with no live view collapses the panel to one line ---
+
+  describe("TB-69: the panel collapses when the shown unit's bundle has no live view", () => {
+    /** Dispatch a message as the frame's page would post it (source = the frame's window). */
+    function postFromFrame(data: unknown) {
+      const iframe = document.querySelector("iframe");
+      expect(iframe?.contentWindow).toBeTruthy();
+      window.dispatchEvent(new MessageEvent("message", { data, source: iframe!.contentWindow }));
+    }
+
+    function twoVizUnits() {
+      return [
+        makeTask({
+          work_unit_id: "wu-tb69-replay-only",
+          leaf_name: "Beyblade Arena",
+          viz_bundle_path: "/w1/.lettuce-viz",
+          work_dir: "/w1",
+        }),
+        makeTask({
+          work_unit_id: "wu-tb69-second-unit",
+          leaf_name: "Other Leaf",
+          viz_bundle_path: "/w2/.lettuce-viz",
+          work_dir: "/w2",
+        }),
+      ];
+    }
+
+    function setupWithVizUnits() {
+      setupDefaultMocks({
+        status: {
+          status: {
+            state: "active",
+            uptime_seconds: 10,
+            connected_servers: 1,
+            active_tasks: twoVizUnits(),
+            paused_reason: null,
+          },
+        },
+      });
+    }
+
+    it("replaces the 320 px frame with a one-line note naming the leaf when the page declares replay only", async () => {
+      setupWithVizUnits();
+      render(<OverviewPage />);
+      await waitFor(() => expect(document.querySelector("iframe")).toBeTruthy());
+
+      await act(async () => {
+        postFromFrame({ type: "vizReady", modes: ["replay"] });
+      });
+
+      const note = screen.getByTestId("viz-unavailable-note");
+      expect(note).toHaveTextContent(
+        "Beyblade Arena has no live view. Finished units can be replayed from History."
+      );
+      expect(note).toHaveStyle({ height: "80px" });
+      expect(document.querySelector("iframe")).toBeNull();
+      // The frame's own in-place note went with the frame; the page shows one line, not two.
+      expect(screen.queryByTestId("viz-unavailable")).toBeNull();
+      expect(screen.queryByText("Computing in progress...")).not.toBeInTheDocument();
+    });
+
+    it("switching to another unit mounts a fresh frame with no note", async () => {
+      setupWithVizUnits();
+      const user = userEvent.setup();
+      render(<OverviewPage />);
+      await waitFor(() => expect(document.querySelector("iframe")).toBeTruthy());
+
+      await act(async () => {
+        postFromFrame({ type: "vizReady", modes: ["replay"] });
+      });
+      expect(screen.getByTestId("viz-unavailable-note")).toBeInTheDocument();
+
+      await user.click(screen.getByText("Other Leaf"));
+      await waitFor(() => expect(document.querySelector("iframe")).toBeTruthy());
+      expect(screen.queryByTestId("viz-unavailable-note")).toBeNull();
+    });
+
+    it("a page that never starts collapses the panel to the could-not-start note", async () => {
+      vi.useFakeTimers();
+      try {
+        setupWithVizUnits();
+        await act(async () => {
+          render(<OverviewPage />);
+          await vi.advanceTimersByTimeAsync(0);
+        });
+        const iframe = document.querySelector("iframe");
+        expect(iframe).toBeTruthy();
+
+        await act(async () => {
+          iframe!.dispatchEvent(new Event("load"));
+          await vi.advanceTimersByTimeAsync(VIZ_SILENT_TIMEOUT_MS);
+        });
+
+        expect(screen.getByTestId("viz-unavailable-note")).toHaveTextContent(
+          "The visualization for Beyblade Arena could not start on this machine."
+        );
+        expect(document.querySelector("iframe")).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });

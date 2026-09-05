@@ -83,6 +83,12 @@ mode and data; the page asks the host for files. Every message is a plain object
    messages. Post it more than once if you like — the host ignores repeats. The helper
    re-posts it every 200 ms, up to five times, until initialised, which covers a page that
    loads before the host's listener is attached.
+
+   The message may carry `modes`, the list of modes the page implements:
+   `{ type: "vizReady", modes: ["replay"] }` for a page that only plays back finished
+   results, `["live"]` for one that only follows a running unit, or both. A `vizReady`
+   without `modes` claims both. See "Declaring the modes you support" below for what the
+   host does with it.
 2. The host answers with `vizInit`:
 
    ```json
@@ -105,6 +111,31 @@ mode and data; the page asks the host for files. Every message is a plain object
 If the host never sees `vizReady` (for instance the page was served from cache and its
 script ran before the host listener existed) the desktop app sends `vizInit` anyway about
 150 ms after the frame's `load` event.
+
+### Declaring the modes you support
+
+Not every bundle draws in both modes — a page that only plays back a finished result has
+nothing to show while the unit runs. Say so in `vizReady`, and the host will not show the
+page in a mode it does not implement:
+
+- **Desktop app, live view (Overview).** A page whose `modes` lacks `"live"` is replaced
+  at once by a one-line note ("*Leaf* has no live view. Finished units can be replayed from
+  History.") and the panel shrinks to that line.
+- **Desktop app, replay (History).** A page whose `modes` lacks `"replay"` shows "This
+  visualization has no replay view." instead.
+- **The head's dashboard** replays only and ignores `modes` today.
+
+Without a declaration the desktop app assumes both modes and watches what the page does: in
+live mode a page that asks for no file (`readFile`, `listFiles` or `watchFile`) within 15 s
+of `vizInit` is treated as having no live view and replaced by the same note. A live page
+that reads lazily — only after a click, say — must declare `modes: ["live"]` (or both) to
+keep its panel.
+
+Independently of `modes`, a page that posts **nothing** within 5 s of its frame's `load`
+event is presumed to have failed before its handshake — typically a script that threw at
+start-up, as a WebGL renderer does on a machine without WebGL — and is replaced by "The
+visualization could not start on this machine." Post `vizReady` as early as your page can,
+before anything that might throw.
 
 ### Live mode: reading the work directory
 
@@ -129,7 +160,9 @@ keep following a file across a pause should re-issue `watchFile` when its data s
 arriving, or poll with `readFile` on its own timer.
 
 In **replay** mode these four requests are ignored (no reply is sent): there is no work
-directory any more. A page that supports both modes should branch on `vizInit.mode`.
+directory any more. A page that supports both modes should branch on `vizInit.mode`; a
+page that supports only one should say so in `vizReady` (see "Declaring the modes you
+support").
 
 ### Replay mode: the result
 
@@ -174,7 +207,7 @@ view.
   import { createVizClient } from "./lettuce-viz.js";
 
   const out = document.getElementById("out");
-  const viz = createVizClient();
+  const viz = createVizClient({ modes: ["live", "replay"] });
   const init = await viz.ready();          // posts vizReady, resolves on vizInit
 
   if (init.mode === "live") {
@@ -197,11 +230,13 @@ Copy `lettuce-viz.js` from this directory next to `index.html`, then
 
 ## The helper: `lettuce-viz.js`
 
-`createVizClient()` returns an object whose methods map one-to-one onto the protocol:
+`createVizClient({ modes })` returns an object whose methods map one-to-one onto the
+protocol. `modes` is optional — `["live"]`, `["replay"]` or both — and is sent with every
+`vizReady`; leave it out to claim both modes.
 
 | Method | Does |
 |---|---|
-| `ready()` | Posts `vizReady` (with retries) and resolves with `{ mode, workDir, leafSlug, params }` from `vizInit`. Resolves immediately if `vizInit` already arrived. |
+| `ready()` | Posts `vizReady` (with retries, carrying `modes` when given) and resolves with `{ mode, workDir, leafSlug, params }` from `vizInit`. Resolves immediately if `vizInit` already arrived. |
 | `readFile(path)` | Resolves with an `ArrayBuffer`; rejects with the host's error message. |
 | `listFiles(pattern?)` | Resolves with an array of relative paths (empty if the host sent none). |
 | `watchFile(path, intervalMs, callback)` | Calls `callback(ArrayBuffer)` on each `fileChanged` for that path. |
@@ -217,8 +252,10 @@ exact file (`apps/volunteer-desktop/src/__tests__/lettuce-viz-sdk.test.ts`).
 - `index.html` is at the archive root (or inside a single top-level folder).
 - Every asset is inside the archive and referenced relatively; nothing is fetched from the
   network.
-- The page handles both `mode: "live"` and `mode: "replay"`, or clearly does nothing in the
-  one it does not support.
+- The page handles both `mode: "live"` and `mode: "replay"`, or declares the one it
+  supports in `vizReady` (`modes`), so the host does not show it in the other.
+- `vizReady` is posted before anything that could throw (a WebGL renderer, say), so a
+  machine that cannot run the page gets the host's note rather than a black frame.
 - Live-mode file paths are relative to the work directory and match what the computation
   actually writes.
 - `binary_checksums.viz` is the SHA-256 of the exact archive you uploaded.

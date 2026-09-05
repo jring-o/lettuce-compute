@@ -22,6 +22,56 @@ interface VizFrameProps {
   paused: boolean;
   mode?: "live" | "replay";
   replayData?: Record<string, unknown>;
+  /**
+   * Called once when the host gives up on the page (see
+   * `VizUnavailableReason`). The frame replaces itself with a one-line note
+   * either way; a parent that wants to collapse the space the frame took —
+   * the Overview's 320 px panel — listens here.
+   */
+  onUnavailable?: (reason: VizUnavailableReason) => void;
+}
+
+/**
+ * Why the host stopped showing the page and put a note in its place (TB-69):
+ * - "unsupported": the page's `vizReady` carried a `modes` list without the
+ *   mode this frame is in — a replay-only bundle shown live, or vice versa.
+ * - "silent": the page posted nothing within `VIZ_SILENT_TIMEOUT_MS` of its
+ *   `load` event. It threw before its handshake (no WebGL, say) or never
+ *   speaks the protocol; either way nothing will be drawn.
+ * - "idle": live mode, no `modes` declared, and no `readFile` / `listFiles` /
+ *   `watchFile` within `VIZ_IDLE_TIMEOUT_MS` of `vizInit` — a page written for
+ *   replay only, shown a mode it ignores.
+ */
+export type VizUnavailableReason = "unsupported" | "silent" | "idle";
+
+/** How long after the frame's `load` event a page may stay quiet before it is presumed dead. */
+export const VIZ_SILENT_TIMEOUT_MS = 5000;
+/** How long after `vizInit` an undeclared live page may go without a file request before it is presumed replay-only. */
+export const VIZ_IDLE_TIMEOUT_MS = 15000;
+
+/**
+ * The one-line note shown in a frame's place. `leafName` (the Overview has
+ * one; the History modal does not) makes the sentence name the leaf.
+ */
+export function describeVizUnavailable(
+  reason: VizUnavailableReason,
+  mode: "live" | "replay",
+  leafName?: string,
+): string {
+  const name = leafName?.trim();
+  if (reason === "silent") {
+    return name
+      ? `The visualization for ${name} could not start on this machine.`
+      : "The visualization could not start on this machine.";
+  }
+  if (mode === "replay") {
+    return name
+      ? `The visualization for ${name} has no replay view.`
+      : "This visualization has no replay view.";
+  }
+  return name
+    ? `${name} has no live view. Finished units can be replayed from History.`
+    : "This leaf has no live view. Finished units can be replayed from History.";
 }
 
 /**
@@ -58,7 +108,15 @@ export function isValidRelPath(path: string): boolean {
  * - "live" (default): sets up file watching for real-time viz during computation
  * - "replay": sends persisted result data for post-completion visualization
  */
-export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "live", replayData }: VizFrameProps) {
+export function VizFrame({
+  vizBundlePath,
+  workDir,
+  leafSlug,
+  paused,
+  mode = "live",
+  replayData,
+  onUnavailable,
+}: VizFrameProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const watchIntervalsRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const watchHashesRef = useRef<Map<string, number>>(new Map());
@@ -66,15 +124,45 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
   const [vizReady, setVizReady] = useState(false);
   const [vizError, setVizError] = useState<string | null>(null);
 
+  // Liveness bookkeeping (TB-69). `spokeRef`: the page posted anything at all;
+  // `requestedRef`: it asked for a file; `declaredModesRef`: the `modes` list
+  // from its `vizReady`, if any. The two timers turn silence into a verdict.
+  const [unavailable, setUnavailable] = useState<VizUnavailableReason | null>(null);
+  const spokeRef = useRef(false);
+  const requestedRef = useRef(false);
+  const declaredModesRef = useRef<string[] | null>(null);
+  const idleArmedRef = useRef(false);
+  const silentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onUnavailableRef = useRef(onUnavailable);
+  onUnavailableRef.current = onUnavailable;
+
   const isReplay = mode === "replay";
 
   const indexUrl = convertFileSrc("index.html", VIZ_PROTOCOL);
+
+  const clearLivenessTimers = useCallback(() => {
+    if (silentTimerRef.current) {
+      clearTimeout(silentTimerRef.current);
+      silentTimerRef.current = null;
+    }
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+  }, []);
 
   // Tell the Rust backend which directory to serve, then load via the custom protocol.
   useEffect(() => {
     setVizReady(false);
     setVizError(null);
+    setUnavailable(null);
     readyRef.current = false;
+    spokeRef.current = false;
+    requestedRef.current = false;
+    declaredModesRef.current = null;
+    idleArmedRef.current = false;
+    clearLivenessTimers();
     let cancelled = false;
     invoke("set_viz_base", { path: vizBundlePath })
       .then(() => {
@@ -86,7 +174,7 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
     return () => {
       cancelled = true;
     };
-  }, [vizBundlePath]);
+  }, [vizBundlePath, clearLivenessTimers]);
 
   /** Post a message to the iframe. */
   const postToIframe = useCallback((msg: unknown) => {
@@ -165,6 +253,13 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
     watchHashesRef.current.clear();
   }, []);
 
+  /** Stop showing the page: drop its watches and timers, put the note in its place. */
+  const giveUp = useCallback((reason: VizUnavailableReason) => {
+    clearLivenessTimers();
+    clearAllWatches();
+    setUnavailable((current) => current ?? reason);
+  }, [clearLivenessTimers, clearAllWatches]);
+
   // Pause/unpause: clear watches when paused (live mode only).
   useEffect(() => {
     if (paused && !isReplay) {
@@ -174,8 +269,16 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
 
   // Cleanup on unmount.
   useEffect(() => {
-    return () => clearAllWatches();
-  }, [clearAllWatches]);
+    return () => {
+      clearAllWatches();
+      clearLivenessTimers();
+    };
+  }, [clearAllWatches, clearLivenessTimers]);
+
+  // Report a verdict to the parent once.
+  useEffect(() => {
+    if (unavailable) onUnavailableRef.current?.(unavailable);
+  }, [unavailable]);
 
   /** Send vizInit (and replayData in replay mode) to the iframe. */
   const sendInit = useCallback(() => {
@@ -195,28 +298,74 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
         postToIframe({ type: "replayData", ...replayData });
       }, 50);
     }
-  }, [workDir, leafSlug, postToIframe, isReplay, replayData]);
+
+    // A live page that declared nothing gets one idle window to ask for a
+    // file; one that never does is a replay-only page ignoring live mode.
+    if (!isReplay && !idleArmedRef.current) {
+      idleArmedRef.current = true;
+      if (!declaredModesRef.current && !requestedRef.current) {
+        idleTimerRef.current = setTimeout(() => {
+          idleTimerRef.current = null;
+          if (!requestedRef.current && !declaredModesRef.current) giveUp("idle");
+        }, VIZ_IDLE_TIMEOUT_MS);
+      }
+    }
+  }, [workDir, leafSlug, postToIframe, isReplay, replayData, giveUp]);
 
   // Register message listener in useLayoutEffect to ensure it's active before
   // the iframe can fire events (fixes the vizReady/vizInit race condition).
   useLayoutEffect(() => {
+    const noteRequest = () => {
+      requestedRef.current = true;
+      if (idleTimerRef.current) {
+        clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+    };
+
     const handler = (event: MessageEvent) => {
       if (event.source !== iframeRef.current?.contentWindow) return;
 
       const msg = event.data;
       if (!msg || typeof msg.type !== "string") return;
 
+      // Any message at all proves the page is running.
+      spokeRef.current = true;
+      if (silentTimerRef.current) {
+        clearTimeout(silentTimerRef.current);
+        silentTimerRef.current = null;
+      }
+
       switch (msg.type) {
-        case "vizReady":
+        case "vizReady": {
+          const modes = Array.isArray(msg.modes)
+            ? (msg.modes as unknown[]).filter((m): m is string => typeof m === "string")
+            : null;
+          if (modes) {
+            declaredModesRef.current = modes;
+            if (!modes.includes(mode)) {
+              giveUp("unsupported");
+              break;
+            }
+            // A page that says it supports this mode is believed: no idle test.
+            if (idleTimerRef.current) {
+              clearTimeout(idleTimerRef.current);
+              idleTimerRef.current = null;
+            }
+          }
           sendInit();
           break;
+        }
         case "readFile":
+          noteRequest();
           if (msg.id && msg.path) handleReadFile(msg.id, msg.path);
           break;
         case "listFiles":
+          noteRequest();
           if (msg.id) handleListFiles(msg.id, msg.pattern);
           break;
         case "watchFile":
+          noteRequest();
           if (msg.path) handleWatchFile(msg.path, msg.interval);
           break;
         case "unwatchFile":
@@ -228,16 +377,24 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
     window.addEventListener("message", handler);
 
     return () => window.removeEventListener("message", handler);
-  }, [sendInit, handleReadFile, handleListFiles, handleWatchFile, handleUnwatchFile]);
+  }, [mode, sendInit, giveUp, handleReadFile, handleListFiles, handleWatchFile, handleUnwatchFile]);
 
-  // Fallback: if iframe loads from cache and vizReady was never received, send vizInit after a short delay.
+  // Fallback: if iframe loads from cache and vizReady was never received, send
+  // vizInit after a short delay. The same moment arms the silence test: a page
+  // that has said nothing by now has VIZ_SILENT_TIMEOUT_MS to say anything.
   const handleIframeLoad = useCallback(() => {
     setTimeout(() => {
       if (!readyRef.current) {
         sendInit();
       }
     }, 150);
-  }, [sendInit]);
+    if (!spokeRef.current && !silentTimerRef.current) {
+      silentTimerRef.current = setTimeout(() => {
+        silentTimerRef.current = null;
+        if (!spokeRef.current) giveUp("silent");
+      }, VIZ_SILENT_TIMEOUT_MS);
+    }
+  }, [sendInit, giveUp]);
 
   if (vizError) {
     // The bundle directory could not be opened — typically because the unit's
@@ -267,6 +424,32 @@ export function VizFrame({ vizBundlePath, workDir, leafSlug, paused, mode = "liv
             : "The visualization files could not be opened."}
         </span>
         <code style={{ fontSize: "0.75rem", wordBreak: "break-all" }}>{vizError}</code>
+      </div>
+    );
+  }
+
+  if (unavailable) {
+    // The page loaded but will not draw in this mode (or at all): the note
+    // stands in for it. Not an alert — nothing is wrong with the unit.
+    return (
+      <div
+        data-testid="viz-unavailable"
+        data-reason={unavailable}
+        role="status"
+        style={{
+          width: "100%",
+          height: "100%",
+          background: "#0a0a0f",
+          color: "#a1a1aa",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: "1.5rem",
+          textAlign: "center",
+          fontSize: "0.875rem",
+        }}
+      >
+        {describeVizUnavailable(unavailable, mode)}
       </div>
     );
   }
