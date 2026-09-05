@@ -322,12 +322,21 @@ export function historyToCsv(entries: HistoryEntry[], leafToHead: Map<string, st
   return HISTORY_CSV_HEADER + "\n" + rows.join("\n");
 }
 
-export function HistoryPage() {
+interface HistoryPageProps {
+  /**
+   * False while another tab is shown. The layout keeps this page mounted so
+   * its filters, loaded rows and scroll position survive the visit (TB-68);
+   * on return it picks up what completed meanwhile.
+   */
+  active?: boolean;
+}
+
+export function HistoryPage({ active = true }: HistoryPageProps) {
   const [filters, setFilters] = useState<HistoryFilters>({
     dateRange: "30d",
     headAccepted: "all",
   });
-  const { entries, loadedCount, leafNames, hasMore, isLoading, loadMore, error } =
+  const { entries, loadedCount, leafNames, hasMore, isLoading, loadMore, refresh, error } =
     useHistory(filters);
   const { credit } = useCredit(30000);
   const { heads } = useHeads();
@@ -339,6 +348,8 @@ export function HistoryPage() {
   // Locally persisted results (a result is kept only for leafs with a visualization bundle)
   const [availableResults, setAvailableResults] = useState<Map<string, ResultEntry>>(new Map());
   const [replayModal, setReplayModal] = useState<ReplayModalState>(CLOSED_REPLAY_MODAL);
+  // Bumped when the page is shown again, so the results list is re-read.
+  const [resultsGeneration, setResultsGeneration] = useState(0);
 
   useEffect(() => {
     if (!client) return;
@@ -357,7 +368,19 @@ export function HistoryPage() {
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, resultsGeneration]);
+
+  // Back from another tab: pick up the units that completed meanwhile
+  // without dropping the pages already loaded or the scroll position.
+  const wasActiveRef = useRef(active);
+  useEffect(() => {
+    const wasActive = wasActiveRef.current;
+    wasActiveRef.current = active;
+    if (active && !wasActive) {
+      refresh();
+      setResultsGeneration((g) => g + 1);
+    }
+  }, [active, refresh]);
 
   const handleViewResult = useCallback(
     async (workUnitId: string) => {
@@ -611,7 +634,18 @@ export function HistoryPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+      <div className="grid gap-4 md:grid-cols-[1fr_280px]">
+        {/* Credit breakdown: first in the DOM, so below the sidebar breakpoint
+            it sits above the timeline — never under the infinite scroll, where
+            every scroll toward it loaded more rows on top of it (TB-68). From
+            `md` (the 900 px default window qualifies) it is the right-hand
+            column beside the list. */}
+        {credit && (credit.by_head?.length || credit.by_leaf.length > 0) && (
+          <div data-testid="credit-breakdown" className="md:order-last">
+            <CreditBreakdown credit={credit} />
+          </div>
+        )}
+
         {/* Timeline */}
         <div className="space-y-1">
           {error && (
@@ -685,21 +719,7 @@ export function HistoryPage() {
             )}
           </div>
         </div>
-
-        {/* Credit breakdown sidebar */}
-        {credit && (credit.by_head?.length || credit.by_leaf.length > 0) && (
-          <div className="hidden lg:block">
-            <CreditBreakdown credit={credit} />
-          </div>
-        )}
       </div>
-
-      {/* Mobile credit breakdown */}
-      {credit && (credit.by_head?.length || credit.by_leaf.length > 0) && (
-        <div className="lg:hidden">
-          <CreditBreakdown credit={credit} />
-        </div>
-      )}
 
       {/* Replay Modal */}
       {replayModal.open && (

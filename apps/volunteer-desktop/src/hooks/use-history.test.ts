@@ -360,3 +360,93 @@ describe("filtersToParams", () => {
     expect(params.to).toBeUndefined();
   });
 });
+
+// TB-68: the History page stays mounted across tab switches; on return it
+// re-reads the newest page without dropping what the reader scrolled to.
+describe("refresh (TB-68)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("puts the newest page's new entries above the loaded pages and keeps the paging cursor", async () => {
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([entry({ work_unit_id: "wu-2" }), entry({ work_unit_id: "wu-1" })], "c1", true)
+    );
+    const { result } = renderHook(() => useHistory(defaultFilters()));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    mockHistory.mockResolvedValueOnce(
+      makeResponse(
+        [
+          entry({ work_unit_id: "wu-3", leaf_name: "Newer" }),
+          entry({ work_unit_id: "wu-2" }),
+          entry({ work_unit_id: "wu-1" }),
+        ],
+        "c1-again",
+        true
+      )
+    );
+    act(() => {
+      result.current.refresh();
+    });
+    await waitFor(() =>
+      expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-3", "wu-2", "wu-1"])
+    );
+    // The newest page is read without a cursor.
+    expect(mockHistory.mock.lastCall?.[0]).not.toHaveProperty("cursor");
+    expect(result.current.loadedCount).toBe(3);
+    expect(result.current.leafNames).toEqual(["Newer", "Test"]);
+    expect(result.current.hasMore).toBe(true);
+    expect(result.current.isLoading).toBe(false);
+
+    // The next page still continues from where the loaded pages ended.
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ work_unit_id: "wu-0" })]));
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.entries).toHaveLength(4));
+    expect(mockHistory).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: "c1" }));
+  });
+
+  it("starts over from the newest page when nothing loaded is on it any more", async () => {
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ work_unit_id: "wu-1" })], "c1", true));
+    const { result } = renderHook(() => useHistory(defaultFilters()));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([entry({ work_unit_id: "wu-9" }), entry({ work_unit_id: "wu-8" })], "c9", true)
+    );
+    act(() => {
+      result.current.refresh();
+    });
+    await waitFor(() =>
+      expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-9", "wu-8"])
+    );
+    expect(result.current.loadedCount).toBe(2);
+
+    mockHistory.mockResolvedValueOnce(makeResponse([entry({ work_unit_id: "wu-7" })]));
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.entries).toHaveLength(3));
+    expect(mockHistory).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: "c9" }));
+  });
+
+  it("applies the client-side filters to what a refresh adds", async () => {
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([entry({ work_unit_id: "wu-1", leaf_name: "A" })])
+    );
+    const { result } = renderHook(() => useHistory(defaultFilters({ leafName: "A" })));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    mockHistory.mockResolvedValueOnce(
+      makeResponse([
+        entry({ work_unit_id: "wu-3", leaf_name: "A" }),
+        entry({ work_unit_id: "wu-2", leaf_name: "B" }),
+        entry({ work_unit_id: "wu-1", leaf_name: "A" }),
+      ])
+    );
+    act(() => {
+      result.current.refresh();
+    });
+    await waitFor(() => expect(result.current.loadedCount).toBe(3));
+    expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-3", "wu-1"]);
+    expect(result.current.leafNames).toEqual(["A", "B"]);
+  });
+});

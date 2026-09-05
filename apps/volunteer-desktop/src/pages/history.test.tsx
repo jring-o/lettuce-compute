@@ -79,6 +79,7 @@ function historyState(overrides: Partial<ReturnType<typeof useHistory>> = {}) {
     hasMore: false,
     isLoading: false,
     loadMore: vi.fn(),
+    refresh: vi.fn(),
     error: null,
     ...overrides,
   };
@@ -1022,5 +1023,72 @@ describe("historyToCsv", () => {
       HISTORY_CSV_HEADER,
       'wu-1,"Say ""hi""","lettuce.science",2026-03-20T12:00:00Z,10,9,1.5,false',
     ]);
+  });
+});
+
+// TB-68: below the sidebar breakpoint the credit breakdown was rendered after
+// the timeline — under an infinite-scroll list, where every scroll toward it
+// loaded more rows on top of it — and every tab switch remounted the page.
+describe("TB-68: the credit breakdown is reachable without loading the whole history", () => {
+  const byHead = {
+    total_credit: 500,
+    today: 50,
+    this_week: 200,
+    this_month: 500,
+    by_leaf: [],
+    by_head: [
+      { head_name: "lettuce.science", volunteer_id: "v1", total_credit: 1234.5, available: true },
+    ],
+    source: "head",
+  } as CreditSummary;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseClient.mockReturnValue({ client: makeClient(), error: null });
+    mockUseCredit.mockReturnValue({ credit: byHead, isLoading: false, error: null });
+    mockUseHeads.mockReturnValue({ heads: [], isLoading: false, error: null, refetch: vi.fn() });
+  });
+
+  it("renders the credit breakdown before the scroll sentinel in DOM order", () => {
+    mockUseHistory.mockReturnValue(
+      historyState({ entries: [makeMockEntry()], hasMore: true })
+    );
+    const { container } = render(<HistoryPage />);
+    const sentinel = container.querySelector("[data-sentinel]");
+    expect(sentinel).toBeTruthy();
+    const precedesSentinel = screen
+      .getAllByText("Credit by Head")
+      .some((h) => h.compareDocumentPosition(sentinel!) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(precedesSentinel).toBe(true);
+  });
+
+  it("renders the credit breakdown once, as the grid's right-hand column from the md breakpoint", () => {
+    mockUseHistory.mockReturnValue(historyState({ entries: [makeMockEntry()] }));
+    const { container } = render(<HistoryPage />);
+    expect(screen.getAllByText("Credit by Head")).toHaveLength(1);
+    const card = screen.getByTestId("credit-breakdown");
+    expect(card).toHaveClass("md:order-last");
+    // The 900 px default window is narrower than `lg` (1024 px) but wider than `md` (768 px).
+    expect(card.parentElement).toHaveClass("grid", "md:grid-cols-[1fr_280px]");
+    expect(container.querySelector(".lg\\:grid-cols-\\[1fr_280px\\]")).toBeNull();
+  });
+
+  it("re-reads the newest page and the stored results when shown again, not on first render", async () => {
+    const refresh = vi.fn();
+    mockUseHistory.mockReturnValue(historyState({ entries: [makeMockEntry()], refresh }));
+    const client = makeClient();
+    mockUseClient.mockReturnValue({ client, error: null });
+
+    const { rerender } = render(<HistoryPage active />);
+    await waitFor(() => expect(client.results).toHaveBeenCalledTimes(1));
+    expect(refresh).not.toHaveBeenCalled();
+
+    rerender(<HistoryPage active={false} />);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(client.results).toHaveBeenCalledTimes(1);
+
+    rerender(<HistoryPage active />);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(client.results).toHaveBeenCalledTimes(2));
   });
 });
