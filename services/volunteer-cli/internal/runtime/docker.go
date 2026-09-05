@@ -50,6 +50,19 @@ type EngineInfo struct {
 	// Snapshotter is true when the engine reports the containerd snapshotter image
 	// store, where StoragePath (DockerRootDir) is not the image-store filesystem.
 	Snapshotter bool
+	// MemTotalMB is the total memory of the machine the engine daemon runs on,
+	// as the engine reports it (Docker's MemTotal; Podman's Docker-compatible
+	// /info reports the same field). On Linux that is the host's RAM. On macOS
+	// and Windows the engine runs inside a virtual machine — a Podman machine,
+	// Docker Desktop's engine VM — and this is THAT machine's memory: the real
+	// ceiling for every container, whatever the host has and whatever the
+	// configuration allows (TB-63). It is read from the engine rather than from
+	// `podman machine inspect`, because on a WSL-backed machine the inspect
+	// figure is the size Podman recorded at init while WSL sizes the VM by its
+	// own rules (half the host's RAM by default): on the operator's box inspect
+	// said 2048 MB while the engine reported 48 GB. 0 when the engine did not
+	// report it.
+	MemTotalMB int64
 }
 
 // DockerClient abstracts the Docker Engine API operations needed by ContainerRuntime.
@@ -204,7 +217,7 @@ func (d *dockerClientWrapper) Info(ctx context.Context) (*EngineInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker info: %w", err)
 	}
-	return buildEngineInfo(info.DockerRootDir, info.DriverStatus), nil
+	return buildEngineInfo(info.DockerRootDir, info.DriverStatus, info.MemTotal), nil
 }
 
 // pathExistsFunc reports whether a filesystem path exists. A package-level seam
@@ -228,8 +241,11 @@ var pathExistsFunc = func(p string) bool {
 // and include whichever exist, so the disk gate checks the filesystem the blobs
 // actually land on. Including only existing paths means a wrong guess degrades
 // to the prior DockerRootDir-only behavior rather than falsely blocking.
-func buildEngineInfo(dockerRootDir string, driverStatus [][2]string) *EngineInfo {
+func buildEngineInfo(dockerRootDir string, driverStatus [][2]string, memTotalBytes int64) *EngineInfo {
 	ei := &EngineInfo{StoragePath: dockerRootDir}
+	if memTotalBytes > 0 {
+		ei.MemTotalMB = memTotalBytes / (1024 * 1024)
+	}
 	seen := make(map[string]bool)
 	add := func(p string) {
 		if p == "" || seen[p] {

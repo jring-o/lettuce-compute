@@ -87,9 +87,13 @@ export function LeafCard({
   const raiseTo = diskGate?.raise_to_gb ?? 0;
   const researchArea = leaf.research_area.join(", ");
   // The memory shortfall names the slider stop that clears it (TB-66); the
-  // stop is offered only when the Memory slider can reach it.
-  const memoryRaiseTo = requirements.find((r) => r.key === "memory")?.raiseToMb ?? 0;
+  // stop is offered only when the Memory slider can reach it. When the
+  // container engine's virtual machine is the bound (TB-63) there is no stop
+  // to offer — the machine has to be enlarged — and the card says so.
+  const memoryItem = requirements.find((r) => r.key === "memory");
+  const memoryRaiseTo = memoryItem?.raiseToMb ?? 0;
   const memoryRaiseFits = memoryCeilingMb == null || memoryRaiseTo <= memoryCeilingMb;
+  const memoryVMLimited = !!memoryItem?.vmLimited;
 
   const handleRaiseDisk = async (gb: number) => {
     if (!onRaiseDisk) return;
@@ -206,6 +210,15 @@ export function LeafCard({
                   </span>
                 </span>
               ))}
+            </p>
+          )}
+
+          {memoryVMLimited && (
+            <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+              Needs more memory than the container engine's virtual machine has. Enlarge the
+              machine's memory (Podman Desktop or Docker Desktop: Settings → Resources; or{" "}
+              <code>podman machine set --memory</code>), then restart Lettuce — raising the memory
+              allowance alone changes nothing.
             </p>
           )}
 

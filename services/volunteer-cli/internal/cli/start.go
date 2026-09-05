@@ -195,6 +195,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// daemon.
 	hardware := client.DetectHardware(cfg)
 
+	// On macOS/Windows the container engine runs inside a VM whose memory is
+	// the real ceiling for container work; when it is smaller than the memory
+	// limit, heads are told the smaller figure so they only send leafs the VM
+	// can hold (TB-63). The daemon logs the WARN and raises the notice once it
+	// runs; this is the one place the advertisement registration sends is built.
+	if containerFactory.ClampAdvertisedMemory(hardware) {
+		budget, engineMB := containerFactory.ContainerMemory()
+		logger.Info("advertising the container memory budget instead of the memory limit: the container engine's VM is smaller",
+			"advertised_max_memory_mb", budget, "engine_vm_memory_mb", engineMB, "max_memory_mb", cfg.ResourceLimits.MaxMemoryMB)
+	}
+
 	// Volunteer-facing notices and per-head version/update state are created
 	// here, before the daemon exists, because registration below is one of the
 	// two places a head can reject this build as too old — and a head that does

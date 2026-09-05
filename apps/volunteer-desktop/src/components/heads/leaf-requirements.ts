@@ -44,9 +44,17 @@ export interface RequirementItem {
   shortfall?: string;
   /**
    * Memory only, with `shortfall`: the first Memory-slider stop that clears
-   * it, in MB — the value to raise `max_memory_mb` to.
+   * it, in MB — the value to raise `max_memory_mb` to. Absent when the
+   * container engine's virtual machine is the bound (`vmLimited`): no slider
+   * stop clears a shortfall the machine's size causes.
    */
   raiseToMb?: number;
+  /**
+   * Memory only, with `shortfall`: the container engine's virtual machine,
+   * not the Settings allowance, is what falls short (TB-63). The remedy is to
+   * enlarge the machine, so the card offers no allowance raise.
+   */
+  vmLimited?: boolean;
 }
 
 function specificGpuType(gpuType: string | undefined): string | null {
@@ -94,8 +102,20 @@ export function leafRequirementItems(
     if (machine && machine.max_memory_mb > 0 && memory > machine.max_memory_mb) {
       const [need, have] = formatSizePairMb(memory, machine.max_memory_mb);
       item.label = `${need} RAM`;
-      item.shortfall = `you allow ${have}`;
-      item.raiseToMb = memoryStopAtOrAboveMb(memory);
+      if (machine.memory_limited_by_vm) {
+        // The budget is what the container engine's virtual machine can
+        // hold, not what Settings allows (TB-63): name the machine and its
+        // size — in the same unit as the pair, so the three figures read
+        // together — and offer no slider stop, since none would clear it.
+        const vm = have.endsWith(" MB")
+          ? `${machine.container_vm_memory_mb} MB`
+          : formatSizeMb(machine.container_vm_memory_mb);
+        item.shortfall = `the container engine's virtual machine allows ${have}; it has ${vm}`;
+        item.vmLimited = true;
+      } else {
+        item.shortfall = `you allow ${have}`;
+        item.raiseToMb = memoryStopAtOrAboveMb(memory);
+      }
     }
     items.push(item);
   }

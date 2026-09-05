@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
@@ -89,13 +90,23 @@ type ContainerRuntimeFactory struct {
 	// lastMachineSetupFailure is when a machine init/start or the wait for its
 	// socket last failed; see machineSetupRetryInterval.
 	lastMachineSetupFailure time.Time
+	// engineMemoryMB is the memory of the VM the engine runs inside, as the
+	// engine reported it at the last successful Build (0 on a host whose
+	// containers share its RAM, or when the engine did not say); budgetMB is
+	// the memory budget that Build gave container work — the configured budget
+	// clipped to the VM (runtime.ContainerMemoryBudgetMB, TB-63). Both are 0
+	// until a runtime has been built.
+	engineMemoryMB int
+	budgetMB       int
 
-	// Seams for tests: engine detection and runtime construction. Production
-	// wiring is DetectContainerBackendPreferred and NewContainerRuntimeForBackend
-	// plus the configuration start-up applies.
-	detect    func(preferred runtime.ContainerBackend) runtime.BackendInfo
-	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)
-	now       func() time.Time
+	// Seams for tests: engine detection, runtime construction and the engine
+	// VM memory probe. Production wiring is DetectContainerBackendPreferred,
+	// NewContainerRuntimeForBackend plus the configuration start-up applies,
+	// and the engine's own /info on a VM platform.
+	detect       func(preferred runtime.ContainerBackend) runtime.BackendInfo
+	construct    func(backend runtime.BackendInfo) (runtime.Runtime, error)
+	engineMemory func(rt runtime.Runtime) int
+	now          func() time.Time
 }
 
 // NewContainerRuntimeFactory returns the production factory for this config.
@@ -105,17 +116,50 @@ func NewContainerRuntimeFactory(cfg *config.Config, logger *slog.Logger) *Contai
 		return runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), preferred)
 	}
 	f.construct = f.constructContainerRuntime
+	f.engineMemory = probeEngineMemoryMB
 	return f
 }
 
 // NewContainerRuntimeFactoryForTest returns a factory whose detection and
 // construction are the given functions, so a test can make an engine "appear"
-// without a container engine on the host. Exported for the management
-// package's tests.
+// without a container engine on the host. The engine is treated as one whose
+// VM memory is unknown (no memory clip); SetEngineMemoryProbeForTest changes
+// that. Exported for the management package's tests.
 func NewContainerRuntimeFactoryForTest(cfg *config.Config, logger *slog.Logger,
 	detect func(preferred runtime.ContainerBackend) runtime.BackendInfo,
 	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)) *ContainerRuntimeFactory {
-	return &ContainerRuntimeFactory{cfg: cfg, logger: logger, now: time.Now, detect: detect, construct: construct}
+	return &ContainerRuntimeFactory{cfg: cfg, logger: logger, now: time.Now, detect: detect, construct: construct,
+		engineMemory: func(runtime.Runtime) int { return 0 }}
+}
+
+// SetEngineMemoryProbeForTest replaces the engine VM memory probe: the given
+// function answers "how much memory does the VM this engine runs inside have"
+// for a runtime the construction seam returned (0 = none / unknown).
+func (f *ContainerRuntimeFactory) SetEngineMemoryProbeForTest(probe func(rt runtime.Runtime) int) {
+	f.engineMemory = probe
+}
+
+// probeEngineMemoryMB is the production engine VM memory probe: on a platform
+// whose engine runs inside a VM (runtime.ContainerEngineRunsInVM) it asks the
+// engine for its total memory — the VM's, since that is where the engine
+// daemon runs — and reports 0 elsewhere, or when the engine does not answer.
+// The engine's own figure is used rather than `podman machine inspect`, whose
+// number is what Podman recorded at init and, on WSL, not what the VM has.
+func probeEngineMemoryMB(rt runtime.Runtime) int {
+	if !runtime.ContainerEngineRunsInVM() {
+		return 0
+	}
+	cr, ok := rt.(*runtime.ContainerRuntime)
+	if !ok || cr == nil || cr.Client() == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, err := cr.Client().Info(ctx)
+	if err != nil || info == nil || info.MemTotalMB <= 0 {
+		return 0
+	}
+	return int(info.MemTotalMB)
 }
 
 // Build probes for a container engine once and, when one answers, returns the
@@ -160,8 +204,68 @@ func (f *ContainerRuntimeFactory) Build(forceMachineSetup bool) (runtime.Runtime
 		f.recordResult(backend, false, err.Error())
 		return nil, backend, err
 	}
+	f.applyContainerMemoryBudget(rt)
 	f.recordResult(backend, true, "")
 	return rt, backend, nil
+}
+
+// applyContainerMemoryBudget gives a freshly built container runtime its
+// memory ceiling: the configured budget, clipped to the engine VM's memory less
+// headroom when the engine runs inside a VM whose size the probe reports
+// (runtime.ContainerMemoryBudgetMB, TB-63). The figures are recorded on the
+// factory so the daemon can advertise the same budget to heads, book admission
+// against it, and name the VM in its diagnostics. Before this the ceiling was
+// the configuration alone, so a Mac with a 2 GiB Podman machine advertised
+// 8192 MB, was sent 7000 MB units, and had each one killed at model load.
+func (f *ContainerRuntimeFactory) applyContainerMemoryBudget(rt runtime.Runtime) {
+	configMB := f.cfg.ResourceLimits.MaxMemoryMB
+	engineMB := f.engineMemory(rt)
+	budget := runtime.ContainerMemoryBudgetMB(configMB, engineMB)
+	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+		cr.SetEngineMemoryMB(engineMB)
+		cr.SetMemoryCeilingMB(budget)
+	}
+	f.mu.Lock()
+	f.engineMemoryMB = engineMB
+	f.budgetMB = budget
+	f.mu.Unlock()
+	if engineMB > 0 {
+		f.logger.Info("container engine runs inside a VM; container work is budgeted against the VM's memory",
+			"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
+			"container_memory_budget_mb", budget, "max_memory_mb", configMB)
+	}
+}
+
+// ContainerMemory reports the memory budget the last built container runtime
+// was given and the memory of the VM its engine runs inside (0 when the
+// engine shares the host's RAM or its VM size is unknown). Both are 0 until a
+// runtime has been built.
+func (f *ContainerRuntimeFactory) ContainerMemory() (budgetMB, engineMemoryMB int) {
+	if f == nil {
+		return 0, 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.budgetMB, f.engineMemoryMB
+}
+
+// ClampAdvertisedMemory lowers the memory budget in a hardware advertisement
+// to the container memory budget when the engine VM clips the configuration
+// (TB-63), so a head's dispatch gate — which compares a leaf's max_memory_mb
+// against this figure on every poll — stops sending this machine units its VM
+// cannot hold. It reports whether the advertisement changed. A nil factory,
+// no built runtime, or a budget at or above the advertised figure leaves the
+// advertisement as it is.
+func (f *ContainerRuntimeFactory) ClampAdvertisedMemory(hw *lettucev1.HardwareCapabilities) bool {
+	if hw == nil {
+		return false
+	}
+	budget, engineMB := f.ContainerMemory()
+	if engineMB <= 0 || budget <= 0 || int32(budget) >= hw.MaxMemoryMb {
+		return false
+	}
+	hw.MaxMemoryMb = int32(budget)
+	return true
 }
 
 // machineManagerFor returns the machine manager, creating it on the first
@@ -210,21 +314,13 @@ func (f *ContainerRuntimeFactory) recordResult(backend runtime.BackendInfo, buil
 // setUpMachine initialises and starts the Podman machine (idempotent — an
 // already-running machine is left as found and NOT owned, PB-27) and waits
 // for its socket. Sized from the resource limits with the same floors
-// start-up has always used.
+// start-up has always used. A machine Lettuce creates gets the configured
+// memory PLUS the VM headroom, so the budget container work is given after the
+// clip (runtime.ContainerMemoryBudgetMB) is the configured figure and not a
+// permanently "clipped" one (TB-63); an existing machine keeps its size.
 func (f *ContainerRuntimeFactory) setUpMachine(mm *runtime.PodmanMachineManager) error {
 	f.logger.Info("setting up Podman machine for container runtime")
-	cpus := f.cfg.ResourceLimits.MaxCPUCores
-	memMB := f.cfg.ResourceLimits.MaxMemoryMB
-	diskGB := f.cfg.ResourceLimits.MaxDiskGB
-	if cpus <= 0 {
-		cpus = 2
-	}
-	if memMB <= 0 {
-		memMB = 4096
-	}
-	if diskGB <= 0 {
-		diskGB = 20
-	}
+	cpus, memMB, diskGB := MachineSizeFor(f.cfg.ResourceLimits)
 	if err := mm.Setup(cpus, memMB, diskGB); err != nil {
 		f.logger.Warn("podman machine setup failed, container runtime may be unavailable", "error", err)
 		return err
@@ -236,9 +332,33 @@ func (f *ContainerRuntimeFactory) setUpMachine(mm *runtime.PodmanMachineManager)
 	return nil
 }
 
+// MachineSizeFor returns the CPUs, memory (MB) and disk (GB) a Podman machine
+// Lettuce creates is sized to for the given resource limits: each limit with
+// the floor start-up has always applied (2 CPUs, 4096 MB, 20 GB), and the
+// memory raised by runtime.ContainerVMHeadroomMB so that, once the VM's own
+// reserve is kept back, container work is budgeted the configured figure
+// rather than a clipped one (TB-63). Shared with the management API's machine
+// setup so the app's "set up" button and start-up size a machine alike.
+func MachineSizeFor(rl config.ResourceLimits) (cpus, memMB, diskGB int) {
+	cpus, memMB, diskGB = rl.MaxCPUCores, rl.MaxMemoryMB, rl.MaxDiskGB
+	if cpus <= 0 {
+		cpus = 2
+	}
+	if memMB <= 0 {
+		memMB = 4096
+	}
+	if diskGB <= 0 {
+		diskGB = 20
+	}
+	memMB += runtime.ContainerVMHeadroomMB
+	return cpus, memMB, diskGB
+}
+
 // constructContainerRuntime is the production construction step: the backend
-// connection plus every knob start-up applies (BG-16 booked memory/disk
-// clamps, BG-13 hardening, the GPU list, Podman's GPU readiness).
+// connection plus every knob start-up applies (BG-16 booked disk clamp, BG-13
+// hardening, the GPU list, Podman's GPU readiness). The memory ceiling is
+// applied by Build (applyContainerMemoryBudget) once the engine's VM size is
+// known, so it is not set here.
 func (f *ContainerRuntimeFactory) constructContainerRuntime(backend runtime.BackendInfo) (runtime.Runtime, error) {
 	cr, err := runtime.NewContainerRuntimeForBackend(f.cfg.DataDir, f.logger, backend)
 	if err != nil {
@@ -246,7 +366,6 @@ func (f *ContainerRuntimeFactory) constructContainerRuntime(backend runtime.Back
 	}
 	cr.SetMaxCPUCores(f.cfg.ResourceLimits.MaxCPUCores)
 	cr.SetMaxGPUVRAMPct(f.cfg.ResourceLimits.MaxGPUVRAMPct)
-	cr.SetMemoryCeilingMB(f.cfg.ResourceLimits.MaxMemoryMB)
 	cr.SetDiskCeilingMB(f.cfg.ResourceLimits.MaxDiskGB * 1024)
 	cr.SetHardeningConfig(f.cfg.ResourceLimits.MaxPids, f.cfg.ContainerCapAdd, f.cfg.ContainerGPURelaxUser)
 	if gpus := runtime.DetectGPUs(); len(gpus) > 0 {
@@ -446,6 +565,10 @@ func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtim
 		"backend", backend.Backend, "engine", backend.Engine, "version", backend.Version,
 		"socket", backend.SocketPath, "runtimes", runtimes)
 
+	// The engine's VM may be smaller than the configured budget (TB-63): lower
+	// the advertised figure BEFORE the heads are re-told, so the re-registration
+	// and every later poll carry the budget the VM can hold.
+	d.applyContainerMemoryBudget()
 	d.markRuntimesChanged()
 	d.refreshRuntimeBlocked()
 }
@@ -492,7 +615,7 @@ func (d *Daemon) readvertiseIfPending(ctx context.Context, head *ServerConnectio
 		return
 	}
 	advertised := d.advertisedRuntimesFor(head.Config)
-	req := client.BuildRegistrationRequest(d.pubKey, head.HostID, d.cachedHW, d.cfg, advertised...)
+	req := client.BuildRegistrationRequest(d.pubKey, head.HostID, d.advertisedHardware(), d.cfg, advertised...)
 	resp, err := rc.RegisterVolunteer(ctx, req)
 	if err != nil {
 		d.logger.Warn("daemon: could not advertise this machine's new runtimes to head; will retry on its next contact",

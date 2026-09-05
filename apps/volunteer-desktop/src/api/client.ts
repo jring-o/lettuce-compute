@@ -416,7 +416,24 @@ export interface MachineCapabilities {
   /** Runtime kinds the daemon registered, lowercase (e.g. ["container","wasm"]). */
   runtimes: string[];
   has_gpu: boolean;
+  /**
+   * The memory budget the daemon advertises to heads: `max_memory_mb` from
+   * Settings, clipped to what the container engine's virtual machine can hold
+   * where there is one (TB-63).
+   */
   max_memory_mb: number;
+  /**
+   * The memory of the virtual machine the container engine runs inside
+   * (macOS/Windows: a Podman machine, Docker Desktop's engine VM); 0 when the
+   * engine shares the host's RAM or no container runtime is registered.
+   */
+  container_vm_memory_mb: number;
+  /**
+   * True when that virtual machine, not the Settings allowance, is what
+   * bounds `max_memory_mb` — raising the allowance then changes nothing; the
+   * machine has to be enlarged (TB-63).
+   */
+  memory_limited_by_vm: boolean;
   /** `max_disk_gb` as advertised to heads, in MB. */
   max_disk_mb: number;
   max_cpu_cores: number;
@@ -922,11 +939,14 @@ type RawHeadInfo = Omit<HeadInfo, "leafs"> & { leafs?: RawLeafInfo[] | null };
 
 type RawMachineCapabilities = Omit<
   MachineCapabilities,
-  "runtimes" | "gpu_vendors" | "gpu_compute_capabilities"
+  "runtimes" | "gpu_vendors" | "gpu_compute_capabilities" | "container_vm_memory_mb" | "memory_limited_by_vm"
 > & {
   runtimes?: string[] | null;
   gpu_vendors?: string[] | null;
   gpu_compute_capabilities?: string[] | null;
+  // Absent from a daemon older than TB-63: no VM figure, not limited.
+  container_vm_memory_mb?: number | null;
+  memory_limited_by_vm?: boolean | null;
 };
 
 interface RawHeadsResponse {
@@ -950,6 +970,8 @@ function normaliseMachine(
     runtimes: list(m.runtimes),
     has_gpu: m.has_gpu ?? false,
     max_memory_mb: m.max_memory_mb ?? 0,
+    container_vm_memory_mb: m.container_vm_memory_mb ?? 0,
+    memory_limited_by_vm: m.memory_limited_by_vm ?? false,
     max_disk_mb: m.max_disk_mb ?? 0,
     max_cpu_cores: m.max_cpu_cores ?? 0,
     max_gpu_vram_mb: m.max_gpu_vram_mb ?? 0,

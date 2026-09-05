@@ -1095,8 +1095,19 @@ type MachineCapabilities struct {
 	// registry, lowercase (e.g. ["container","native","wasm"]).
 	Runtimes []string `json:"runtimes"`
 	HasGPU   bool     `json:"has_gpu"`
-	// MaxMemoryMB is the per-unit memory ceiling the daemon is enforcing.
+	// MaxMemoryMB is the memory budget the daemon advertises to heads and
+	// enforces: the configured limit, clipped to what the container engine's
+	// VM can hold where there is one (TB-63).
 	MaxMemoryMB int `json:"max_memory_mb"`
+	// ContainerVMMemoryMB is the memory of the virtual machine the container
+	// engine runs inside (macOS/Windows: a Podman machine, Docker Desktop's
+	// engine VM), 0 when the engine shares the host's RAM or no container
+	// runtime is registered. MemoryLimitedByVM says that VM, not the
+	// configured limit, is what bounds MaxMemoryMB — so a client can name the
+	// machine as the thing to enlarge rather than offer to raise a limit that
+	// would change nothing (TB-63).
+	ContainerVMMemoryMB int  `json:"container_vm_memory_mb"`
+	MemoryLimitedByVM   bool `json:"memory_limited_by_vm"`
 	// MaxDiskMB and MaxCPUCores are the other two budgets the head matches leafs
 	// against, in the same units it receives them (max_disk_gb is advertised as
 	// MB). Reported here so the client checks a leaf against what this daemon
@@ -1130,9 +1141,11 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 	rl := b.daemon.GetConfig().ResourceLimits
 	vramMB, cardVRAMMB, vramPct, vendors, computeCaps := b.daemon.GPUBudget()
 	return MachineCapabilities{
-		Runtimes:    b.MachineRuntimes(),
-		HasGPU:      b.daemon.HasGPU(),
-		MaxMemoryMB: rl.MaxMemoryMB,
+		Runtimes:            b.MachineRuntimes(),
+		HasGPU:              b.daemon.HasGPU(),
+		MaxMemoryMB:         b.daemon.MemoryBudgetMB(),
+		ContainerVMMemoryMB: b.daemon.ContainerVMMemoryMB(),
+		MemoryLimitedByVM:   b.daemon.MemoryLimitedByVM(),
 		// max_disk_gb is advertised to the head in MB (client/hardware.go), so it
 		// is converted here rather than at the comparison, where a GB-vs-MB slip
 		// would silently pass every leaf.
@@ -1986,26 +1999,18 @@ func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
 		return fmt.Errorf("no container runtime configured")
 	}
 
-	// Use config defaults if not specified, with hard minimums.
-	cfg := b.daemon.GetConfig()
+	// Use the size start-up would give a new machine (the resource limits with
+	// their floors, memory plus the VM headroom — daemon.MachineSizeFor, TB-63)
+	// for anything the request left unspecified.
+	cpusDefault, memDefault, diskDefault := daemon.MachineSizeFor(b.daemon.GetConfig().ResourceLimits)
 	if cpus <= 0 {
-		cpus = cfg.ResourceLimits.MaxCPUCores
+		cpus = cpusDefault
 	}
 	if memoryMB <= 0 {
-		memoryMB = cfg.ResourceLimits.MaxMemoryMB
+		memoryMB = memDefault
 	}
 	if diskGB <= 0 {
-		diskGB = cfg.ResourceLimits.MaxDiskGB
-	}
-	// Hard minimums (same as cli/start.go).
-	if cpus <= 0 {
-		cpus = 2
-	}
-	if memoryMB <= 0 {
-		memoryMB = 4096
-	}
-	if diskGB <= 0 {
-		diskGB = 20
+		diskGB = diskDefault
 	}
 	// Reasonable upper bounds.
 	if cpus > 128 {

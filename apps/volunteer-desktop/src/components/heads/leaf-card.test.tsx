@@ -58,6 +58,8 @@ function makeMachine(overrides: Partial<MachineCapabilities> = {}): MachineCapab
     runtimes: ["container", "wasm"],
     has_gpu: true,
     max_memory_mb: 8192,
+    container_vm_memory_mb: 0,
+    memory_limited_by_vm: false,
     max_disk_mb: 10240,
     max_cpu_cores: 4,
     max_gpu_vram_mb: 2048,
@@ -835,6 +837,51 @@ describe("LeafCard", () => {
   });
 
   // --- TB-66: a memory shortfall names the slider stop that clears it ---
+
+  describe("TB-63: memory bounded by the container engine's virtual machine", () => {
+    const grep = () =>
+      makeLeaf({ slug: "grep-f14", name: "GREP f14", execution_spec: { max_memory_mb: 7000 } });
+    const vmMachine = () =>
+      makeMachine({ max_memory_mb: 1536, container_vm_memory_mb: 2048, memory_limited_by_vm: true });
+
+    it("names the machine in the shortfall and tells the user to enlarge it, with no raise button", () => {
+      const onRaiseMemory = vi.fn();
+      render(
+        <LeafCard
+          leaf={grep()}
+          {...defaultProps}
+          machine={vmMachine()}
+          memoryCeilingMb={14746}
+          onRaiseMemory={onRaiseMemory}
+        />
+      );
+      const memory = screen.getByTestId("requirement-memory");
+      expect(memory).toHaveAttribute("data-short", "true");
+      expect(memory).toHaveTextContent(
+        "7000 MB RAM (the container engine's virtual machine allows 1536 MB; it has 2048 MB)"
+      );
+      expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/than this machine can allow/)).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/Needs more memory than the container engine's virtual machine has/)
+      ).toBeInTheDocument();
+      expect(screen.getByText("podman machine set --memory")).toBeInTheDocument();
+      expect(onRaiseMemory).not.toHaveBeenCalled();
+    });
+
+    it("says nothing about the machine when the leaf fits its budget", () => {
+      render(
+        <LeafCard
+          leaf={makeLeaf({ execution_spec: { max_memory_mb: 1024 } })}
+          {...defaultProps}
+          machine={vmMachine()}
+          onRaiseMemory={vi.fn()}
+        />
+      );
+      expect(screen.getByTestId("requirement-memory")).toHaveAttribute("data-short", "false");
+      expect(screen.queryByText(/virtual machine/)).not.toBeInTheDocument();
+    });
+  });
 
   describe("TB-66: memory shortfall", () => {
     const grep = () =>

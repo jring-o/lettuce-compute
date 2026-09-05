@@ -94,6 +94,16 @@ func NeedsMachineForTest() bool {
 	return needsMachine()
 }
 
+// ContainerEngineRunsInVM reports whether this platform's container engine
+// runs inside a virtual machine whose memory, not the host's, bounds every
+// container: Windows and macOS, where both Podman (its machine) and Docker
+// Desktop (its engine VM) do. On Linux containers share the host's RAM and the
+// configured budget stands as it is. A variable so tests can put a Linux CI
+// runner on the VM path and vice versa (TB-63).
+var ContainerEngineRunsInVM = func() bool {
+	return needsMachine()
+}
+
 // Status checks the current Podman machine state.
 // On Linux: returns Running if Podman binary exists, NotInstalled otherwise.
 // On Windows/macOS: runs `podman machine inspect` and parses the output.

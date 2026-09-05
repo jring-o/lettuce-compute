@@ -20,6 +20,8 @@ function makeMachine(overrides: Partial<MachineCapabilities> = {}): MachineCapab
     runtimes: ["container", "wasm"],
     has_gpu: false,
     max_memory_mb: 4096,
+    container_vm_memory_mb: 0,
+    memory_limited_by_vm: false,
     max_disk_mb: 10240,
     max_cpu_cores: 2,
     max_gpu_vram_mb: 0,

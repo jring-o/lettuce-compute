@@ -36,7 +36,7 @@ func TestCheckContainer_ProbeDerivedVerdict(t *testing.T) {
 	rep := &doctorReport{w: &buf}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
-	if usable := checkContainer(rep, logger); usable {
+	if usable, _ := checkContainer(rep, logger); usable {
 		t.Fatal("checkContainer = usable with no engine detected")
 	}
 	out := buf.String()

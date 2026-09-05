@@ -27,7 +27,7 @@ func TestUsesContainerdSnapshotter(t *testing.T) {
 func TestBuildEngineInfo_GraphDriverSinglePath(t *testing.T) {
 	defer withPathExists(func(string) bool { return true })()
 
-	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"Backing Filesystem", "extfs"}})
+	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"Backing Filesystem", "extfs"}}, 0)
 	if ei.Snapshotter {
 		t.Fatal("graphdriver host must not be flagged as snapshotter")
 	}
@@ -43,7 +43,7 @@ func TestBuildEngineInfo_SnapshotterAddsExistingContainerdRoot(t *testing.T) {
 	// Only the system containerd root exists; the bundled <root>/containerd does not.
 	defer withPathExists(func(p string) bool { return p == "/var/lib/containerd" })()
 
-	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}})
+	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, 0)
 	if !ei.Snapshotter {
 		t.Fatal("snapshotter host must be flagged")
 	}
@@ -59,7 +59,7 @@ func TestBuildEngineInfo_SnapshotterAddsExistingContainerdRoot(t *testing.T) {
 func TestBuildEngineInfo_SnapshotterSkipsMissingCandidates(t *testing.T) {
 	defer withPathExists(func(string) bool { return false })()
 
-	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}})
+	ei := buildEngineInfo("/var/lib/docker", [][2]string{{"driver-type", "io.containerd.snapshotter.v1"}}, 0)
 	if !ei.Snapshotter {
 		t.Fatal("snapshotter host must be flagged even when no candidate root exists")
 	}

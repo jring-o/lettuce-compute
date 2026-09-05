@@ -108,7 +108,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// Container and daemon are checked before disk usage because the usage
 	// verdict depends on both: the running daemon's figure is the enforced one,
 	// and a container host without it can only report a partial number (TB-30).
-	containerUsable := checkContainer(rep, logger)
+	containerUsable, containerVMMemoryMB := checkContainer(rep, logger)
 	checkDaemon(rep, cfg.DataDir)
 	lettuceUsedMB, usedMBKnown := checkDiskUsage(rep, cfg.DataDir, cfg.ResourceLimits.MaxDiskGB, containerUsable)
 
@@ -125,19 +125,25 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 	rep.add(docInfo, "runtimes", fmt.Sprintf("this machine can run: %v (runtime trust is per-head — see `heads list`)", machineRuntimes), "")
 
+	// The memory budget heads are told is the configured limit clipped to what
+	// the container engine's VM can hold, where there is one (TB-63) — the
+	// same arithmetic the daemon applies (runtime.ContainerMemoryBudgetMB).
 	caps := volunteerCaps{
-		maxMemoryMB:     cfg.ResourceLimits.MaxMemoryMB,
-		containerUsable: containerUsable,
-		hasGPU:          volunteerHasGPU(),
-		maxDiskMB:       int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
-		maxCPUCores:     cfg.ResourceLimits.MaxCPUCores,
-		freeDataDirMB:   freeDataDirMB,
-		lettuceUsedMB:   lettuceUsedMB,
-		usedMBKnown:     usedMBKnown,
+		maxMemoryMB:         runtime.ContainerMemoryBudgetMB(cfg.ResourceLimits.MaxMemoryMB, containerVMMemoryMB),
+		configMemoryMB:      cfg.ResourceLimits.MaxMemoryMB,
+		containerVMMemoryMB: containerVMMemoryMB,
+		containerUsable:     containerUsable,
+		hasGPU:              volunteerHasGPU(),
+		maxDiskMB:           int64(cfg.ResourceLimits.MaxDiskGB) * 1024,
+		maxCPUCores:         cfg.ResourceLimits.MaxCPUCores,
+		freeDataDirMB:       freeDataDirMB,
+		lettuceUsedMB:       lettuceUsedMB,
+		usedMBKnown:         usedMBKnown,
 	}
+	caps.memoryLimitedByVM = containerVMMemoryMB > 0 && caps.maxMemoryMB < caps.configMemoryMB
 	caps.maxGPUVRAMMB, caps.gpuCardVRAMMB, caps.gpuVRAMPct, caps.gpuVendors, caps.gpuComputeCapabilities =
 		volunteerGPUBudget()
-	rep.add(docInfo, "memory limit", fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this", caps.maxMemoryMB), "")
+	checkMemoryBudget(rep, caps)
 	// Disk and cores gate dispatch exactly as memory does, and used to be the only
 	// two budgets nothing on this machine reported (TB-15). Printed next to the
 	// memory line so all three are read together.
@@ -428,19 +434,24 @@ var detectContainerBackendDoctor = runtime.DetectContainerBackendPreferred
 // can exist but be permission-denied — so we construct the runtime and Ping it,
 // which also finally distinguishes "no engine" from "engine present, socket
 // broken" in every config state.
-func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
+//
+// The second result is the memory of the VM the engine runs inside, as the
+// engine reports it, on a platform where it runs inside one (macOS/Windows);
+// 0 elsewhere or when the engine did not say. It is the real ceiling for
+// container work and clips the memory budget heads are told (TB-63).
+func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool, vmMemoryMB int) {
 	info := detectContainerBackendDoctor(runtime.BundledPodmanPath(), runtime.ContainerBackend(cfg.ContainerBackend))
 	if info.Backend == runtime.BackendNone {
 		rep.add(docInfo, "container", "no container engine found (Docker or Podman) — container leafs need one; native/wasm leafs still run",
 			"install Docker or Podman if you want to run container leafs")
-		return false
+		return false, 0
 	}
 
 	cr, err := runtime.NewContainerRuntimeForBackend(cfg.DataDir, logger, info)
 	if err != nil {
 		rep.add(docWarn, "container", fmt.Sprintf("%s found but could not be initialized (%v)", info.Backend, err),
 			containerRemedy(info.Backend))
-		return false
+		return false, 0
 	}
 	defer cr.Client().Close()
 
@@ -449,7 +460,7 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 	if err := cr.Client().Ping(ctx); err != nil {
 		rep.add(docWarn, "container", fmt.Sprintf("%s found but its socket is not reachable (%v)", info.Backend, err),
 			containerRemedy(info.Backend))
-		return false
+		return false, 0
 	}
 
 	desc := string(info.Backend)
@@ -468,11 +479,37 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool) {
 	// image-store volume. Surface where it lands and whether it has pull headroom.
 	if einfo, ierr := cr.Client().Info(ctx); ierr == nil && einfo != nil {
 		checkImageStorePaths(rep, einfo)
+		if runtime.ContainerEngineRunsInVM() {
+			vmMemoryMB = int(einfo.MemTotalMB)
+		}
 	} else {
 		rep.add(docInfo, "image store", "could not determine the container image-store path from the engine",
 			"if a big-image pull fails with ENOSPC, check free space where the engine stores images (Docker data-root / Podman graphroot)")
 	}
-	return true
+	return true, vmMemoryMB
+}
+
+// checkMemoryBudget prints the memory budget heads are told. On a host whose
+// container engine runs inside a VM (macOS/Windows) that is the configured
+// limit clipped to the VM's memory less headroom (TB-63): a limit above the
+// VM used to be advertised as it was, so heads sent units the VM killed at
+// model load (exit 137) — the tester's four GREP units in 40 minutes. The
+// line names both figures and the VM, and the remedy names the VM, not the
+// limit, as the thing to enlarge.
+func checkMemoryBudget(rep *doctorReport, caps volunteerCaps) {
+	switch {
+	case caps.memoryLimitedByVM:
+		rep.add(docWarn, "memory limit",
+			fmt.Sprintf("%d MB for container work — your limit is %d MB (resource_limits.max_memory_mb), but the container engine runs inside a virtual machine with %d MB, and %d MB is kept back for the machine itself; heads are told %d MB and only send leafs whose per-unit memory fits under it",
+				caps.maxMemoryMB, caps.configMemoryMB, caps.containerVMMemoryMB, runtime.ContainerVMHeadroomMB, caps.maxMemoryMB),
+			"to run bigger leafs, enlarge the machine's memory (Podman: `podman machine stop`, `podman machine set --memory <MB>`, `podman machine start`; Podman Desktop or Docker Desktop: Settings → Resources), then restart the daemon — raising max_memory_mb alone changes nothing")
+	case caps.containerVMMemoryMB > 0:
+		rep.add(docInfo, "memory limit",
+			fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this; the container engine's virtual machine has %d MB, enough to honor it",
+				caps.maxMemoryMB, caps.containerVMMemoryMB), "")
+	default:
+		rep.add(docInfo, "memory limit", fmt.Sprintf("%d MB (resource_limits.max_memory_mb) — a head only sends leafs whose per-unit memory fits under this", caps.maxMemoryMB), "")
+	}
 }
 
 // checkImageStorePaths reports free space on the filesystem(s) where the
@@ -761,6 +798,9 @@ func checkOneHead(ctx context.Context, rep *doctorReport, logger *slog.Logger, s
 			remedy = "every leaf here needs a container runtime — fix the container check above, or attach a head with native leafs"
 		case res.trustBlocked == res.total:
 			remedy = fmt.Sprintf("every leaf here needs a runtime you have not trusted this head to run — opt in with 'lettuce-volunteer heads trust %s <runtime>' if you accept running its code", name)
+		case res.memoryBlocked > 0 && caps.memoryLimitedByVM:
+			remedy = fmt.Sprintf("container work here is limited to %d MB by the container engine's virtual machine (%d MB) — enlarge the machine's memory to cover the per-leaf requirements below, then restart the daemon to re-advertise; raising max_memory_mb (%d MB) alone changes nothing",
+				caps.maxMemoryMB, caps.containerVMMemoryMB, caps.configMemoryMB)
 		case res.memoryBlocked > 0:
 			remedy = fmt.Sprintf("raise resource_limits.max_memory_mb (currently %d MB) to cover the per-leaf requirements below, then restart the daemon to re-advertise", caps.maxMemoryMB)
 		case res.diskBlocked > 0:
@@ -823,9 +863,18 @@ func allEligibleFetchGated(res eligibilityResult) bool {
 // volunteerCaps is the subset of this volunteer's advertised capabilities that gate
 // leaf eligibility in doctor's per-head report.
 type volunteerCaps struct {
-	maxMemoryMB     int
-	containerUsable bool
-	hasGPU          bool
+	// maxMemoryMB is the memory budget heads are told: the configured limit
+	// (configMemoryMB) clipped to what the container engine's VM can hold
+	// where there is one — containerVMMemoryMB, 0 when the engine shares the
+	// host's RAM or is unknown. memoryLimitedByVM says the VM, not the limit,
+	// is the binding figure, so a blocked leaf's remedy names the machine to
+	// enlarge rather than a setting that would change nothing (TB-63).
+	maxMemoryMB         int
+	configMemoryMB      int
+	containerVMMemoryMB int
+	memoryLimitedByVM   bool
+	containerUsable     bool
+	hasGPU              bool
 	// maxDiskMB and maxCPUCores are the other two budgets the head's dispatch
 	// gate matches leafs against. They are in the units the head receives them
 	// in — max_disk_gb is advertised as MB — so callers convert once when filling
@@ -1106,6 +1155,10 @@ func classifyLeaf(req leafRequirements, caps volunteerCaps, srv config.ServerCon
 	// below (same wording either way — vramRemedy detects the too-small card).
 	case req.needsGPU && req.gpuVRAMMB > 0 && caps.gpuCardVRAMMB > 0 && req.gpuVRAMMB > caps.gpuCardVRAMMB:
 		return leafEligibility{name: req.name, eligible: false, reason: vramBlockedReason(req, caps)}, "vram"
+	case req.memoryMB > caps.maxMemoryMB && caps.memoryLimitedByVM:
+		return leafEligibility{name: req.name, eligible: false, reason:
+			fmt.Sprintf("needs %d MB memory > the %d MB container work can get on this machine (the container engine's virtual machine has %d MB; enlarge it — Podman: `podman machine set --memory` — then restart; raising max_memory_mb alone changes nothing)",
+				req.memoryMB, caps.maxMemoryMB, caps.containerVMMemoryMB)}, "memory"
 	case req.memoryMB > caps.maxMemoryMB:
 		return leafEligibility{name: req.name, eligible: false, reason:
 			fmt.Sprintf("needs %d MB memory > your limit %d MB", req.memoryMB, caps.maxMemoryMB)}, "memory"
