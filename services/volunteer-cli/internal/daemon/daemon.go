@@ -624,15 +624,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is exactly the active slots' + restored buffer's work dirs at this point.
 	d.gcOrphanedWorkDirs()
 
-	// Reclaim container-image disk left by a previous session, in two ordered steps.
-	// MUST run after the resumers (so a just-resumed unit is in the owned set and its
-	// freshly-created container is spared) and off the startup path. First remove this
-	// volunteer's own stranded work-unit containers (crash/dirty-shutdown leftovers) —
-	// they pin the leaf image, so the non-force image reaper cannot reclaim it — THEN
-	// sweep superseded cached images now that they are unpinned. Without this, a stale
-	// image left while the wanted image is already cached lingers indefinitely, since
-	// the per-pull reaper only fires on a fresh pull (confirmed in the field on
-	// v0.8.11/v0.8.12). Best-effort; never blocks startup.
+	// Reclaim container-image disk and memory left by a previous session, in two
+	// ordered steps. MUST run after the resumers (so a just-resumed unit is in the
+	// owned set and its freshly-created — or adopted, TB-74 — container is spared)
+	// and off the startup path. First remove this volunteer's own stranded work-unit
+	// containers in any state (crash/dirty-shutdown leftovers, and the paused
+	// container of a quit whose unit could not be adopted — still holding its
+	// memory) — they pin the leaf image, so the non-force image reaper cannot
+	// reclaim it — THEN sweep superseded cached images now that they are unpinned.
+	// Without this, a stale image left while the wanted image is already cached
+	// lingers indefinitely, since the per-pull reaper only fires on a fresh pull
+	// (confirmed in the field on v0.8.11/v0.8.12). Best-effort; never blocks startup.
 	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
 		owned := d.ownedWorkUnitIDs()
 		go func() {
@@ -3976,6 +3978,20 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			break
 		}
 
+		// A container unit whose previous session recorded its container —
+		// paused at quit, or left running by a crash: unpause and adopt it
+		// instead of running the unit again beside its frozen twin, the
+		// container analogue of the PID resume above (TB-74). A container that
+		// is gone or not resumable falls through to re-execution, whose Execute
+		// removes the leftover before creating a new one.
+		var adoptedBy *runtime.ContainerRuntime
+		if pt.ContainerID != "" {
+			if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil && cr.ResumeWorkUnitContainer(ctx, pt.WorkUnitID, pt.ContainerID) {
+				prep.OrphanContainerID = pt.ContainerID
+				adoptedBy = cr
+			}
+		}
+
 		// Build a synthetic PreFetchItem for StartSlot.
 		item := &PreFetchItem{
 			WU:        wu,
@@ -3990,7 +4006,16 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			d.logger.Warn("failed to resume persisted task",
 				"work_unit_id", pt.WorkUnitID, "error", startErr)
 			d.slotManager.ReturnSlotID(slotID)
+			if adoptedBy != nil {
+				// Unpaused above and now supervised by nothing.
+				adoptedBy.RemoveWorkUnitContainers(ctx, pt.WorkUnitID, "")
+			}
 			continue
+		}
+		if adoptedBy != nil {
+			// The slot pauses and unpauses the adopted container through this
+			// handle from now on, and persists its id again at the next quit.
+			d.slotManager.SetProcessHandle(slotID, NewContainerProcessHandle(adoptedBy.Client(), pt.ContainerID))
 		}
 
 		resumed++
@@ -3999,6 +4024,7 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			"leaf_id", pt.LeafID,
 			"work_dir", pt.WorkDir,
 			"checkpoint_seq", pt.CheckpointSequence,
+			"adopted_container", prep.OrphanContainerID,
 		)
 	}
 

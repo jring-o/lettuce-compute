@@ -38,6 +38,12 @@ type PersistedTask struct {
 	ElapsedAccruedSeconds   int64             `json:"elapsed_accrued_seconds,omitempty"`
 	PausedAccruedSeconds    int64             `json:"paused_accrued_seconds,omitempty"`
 	PID                     int               `json:"pid,omitempty"` // OS PID for resuming suspended orphans
+	// ContainerID is the engine id of a container unit's container, recorded so
+	// the next launch can unpause and adopt it (a container has no PID to
+	// resume by). Empty for native units and before the container exists. A
+	// quit that suspended the unit leaves the container paused; without the id
+	// the relaunch re-ran the unit beside its frozen twin (TB-74).
+	ContainerID             string            `json:"container_id,omitempty"`
 	// ReservedUntilUnix and FetchedAt are used for buffered (not-yet-started) tasks
 	// persisted from the prefetch queue: the reservation window drives the on-resume
 	// lapse check, and the fetch time drives the deadline-expiry check, so a restored

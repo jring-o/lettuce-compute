@@ -548,6 +548,12 @@ func isDiskExhaustionError(err error) bool {
 
 // Execute runs the work unit in a Docker container and returns results.
 func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	// A container a previous session left for this unit, reported running by
+	// ResumeWorkUnitContainer: supervise it instead of starting a second one.
+	if prep.OrphanContainerID != "" {
+		return c.adoptContainer(ctx, wu, prep)
+	}
+
 	c.logger.Info("executing work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "runtime", wu.Runtime)
 
 	inputDir := filepath.Join(prep.WorkDir, "input")
@@ -647,6 +653,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		Labels: map[string]string{
 			WorkUnitIDLabel:   wu.ID,
 			"lettuce.leaf-id": wu.LeafID,
+			DataDirLabel:      c.dataDir,
 		},
 	}
 
@@ -678,6 +685,14 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		}
 	}
 
+	// A container of this unit from a previous session — one the relaunch could
+	// not adopt, or a stop the engine never confirmed — would run beside the new
+	// one on the same work dir, holding its memory (TB-74): make the new
+	// container the unit's only one.
+	if n := c.RemoveWorkUnitContainers(ctx, wu.ID, ""); n > 0 {
+		c.logger.Info("removed leftover containers of this unit before starting a new one", "work_unit_id", wu.ID, "removed", n)
+	}
+
 	// Create container.
 	containerID, err := c.dockerClient.ContainerCreate(ctx, cfg)
 	if err != nil {
@@ -686,18 +701,63 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	}
 
 	// Best-effort removal when done.
-	defer func() {
-		rmErr := c.dockerClient.ContainerRemove(context.Background(), containerID)
-		if rmErr != nil {
-			c.logger.Warn("failed to remove container", "container", containerID, "error", rmErr)
-		}
-	}()
+	defer c.removeContainer(containerID)
 
 	// Start container.
 	if err := c.dockerClient.ContainerStart(ctx, containerID); err != nil {
 		c.logger.Error("container start failed", "work_unit_id", wu.ID, "container", containerID, "image", cfg.Image, "backend", c.backend, "error", err)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
+
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+}
+
+// removeContainer is the best-effort removal every started container of a
+// unit gets when its supervision ends (deferred by Execute and adoptContainer).
+// Skipped only by a quit that suspended the unit, which exits the process
+// without running defers on purpose so the paused container survives.
+func (c *ContainerRuntime) removeContainer(containerID string) {
+	if rmErr := c.dockerClient.ContainerRemove(context.Background(), containerID); rmErr != nil {
+		c.logger.Warn("failed to remove container", "container", containerID, "error", rmErr)
+	}
+}
+
+// adoptContainer supervises a container a previous session left for this unit
+// — paused at quit and unpaused again by ResumeWorkUnitContainer, or still
+// running after a crash — to completion, in place of creating a new one. The
+// work dir was preserved, so the container's binds are still in place. This is
+// the container analogue of the daemon's orphan-PID resume; before it, every
+// resume of a container unit re-ran it from scratch beside the frozen twin
+// (TB-74).
+func (c *ContainerRuntime) adoptContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	containerID := prep.OrphanContainerID
+	c.logger.Info("adopting the unit's container from the previous session",
+		"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "container", shortImageID(containerID))
+
+	// Any other container of this unit is a leftover twin (TB-74).
+	if n := c.RemoveWorkUnitContainers(ctx, wu.ID, containerID); n > 0 {
+		c.logger.Info("removed leftover twins of the adopted container", "work_unit_id", wu.ID, "removed", n)
+	}
+	defer c.removeContainer(containerID)
+
+	// The container already holds its GPU device; the selection here only
+	// serves the metrics collector, and finding none is not a failure.
+	var selectedGPU *GpuDetectionResult
+	var gpuDeviceIdx int
+	if wu.ExecutionSpec.GPURequired {
+		selectedGPU, gpuDeviceIdx = c.selectGPU(wu.ExecutionSpec.GPUType)
+	}
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+}
+
+// runContainer supervises a started container of the unit to completion —
+// the deadline, the /work disk watchdog, GPU metrics, the graceful stop on
+// cancellation, log capture, the output read and the metrics — and is shared
+// by Execute (a container it just created) and adoptContainer (one a previous
+// session left running). selectedGPU may be nil.
+func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult, containerID string, selectedGPU *GpuDetectionResult, gpuDeviceIdx int) (*ExecutionResult, error) {
+	outputDir := filepath.Join(prep.WorkDir, "output")
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
 
 	// Notify caller of container ID for suspend/resume support.
 	if prep.ContainerIDCallback != nil {
