@@ -253,9 +253,10 @@ func TestDaemon_DiskGateNoticeResolvesWhenTheGateClears(t *testing.T) {
 	d := newFetcherTestDaemon([]*ServerConnection{srv})
 	d.notices = NewNoticeLog()
 
-	d.warnDiskGateOnce("free space is below the floor", "Leaf One", "leaf-1", 20)
-	if n := noticeByCode(t, d.notices, "disk_gate_blocked"); n.ResolvedAt != nil || n.Leaf != "leaf-1" {
-		t.Fatalf("disk_gate_blocked notice = %+v, want live and naming leaf-1", n)
+	// A stall no single leaf owns (the data-dir floor) is a daemon-wide notice.
+	d.stallDiskGateDaemonWide("free space is below the floor", 20)
+	if n := noticeByCode(t, d.notices, "disk_gate_blocked"); n.ResolvedAt != nil || n.Leaf != "" || n.Head != "" {
+		t.Fatalf("disk_gate_blocked notice = %+v, want live and daemon-wide", n)
 	}
 
 	d.clearDiskGateWarning()

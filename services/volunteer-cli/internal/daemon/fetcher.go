@@ -750,7 +750,11 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			// TB-24: skip a leaf whose disk gate refuses — free space does not
 			// cover ITS declared need right now — so its units are never
 			// requested only to die mid-pull, while affordable leafs keep
-			// fetching. shouldFetch owns the loud all-leafs-gated WARN.
+			// fetching. This skip is the enforcement only: shouldFetch's sweep
+			// owns the leaf's WARN and disk_gate_blocked notice (raised once
+			// when its gate flips to refusing, ended when it passes again —
+			// TB-70) and the all-leafs-gated WARN, so this line is the Debug
+			// trail of every round the skip actually ran.
 			if f.leafDiskGateFn != nil {
 				if ok, reason := f.leafDiskGateFn(leaf); !ok {
 					f.logger.Debug("fetcher: skipping disk-gated leaf", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)

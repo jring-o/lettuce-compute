@@ -247,6 +247,12 @@ type Daemon struct {
 	// volunteer that's idle on disk space says so instead of only at Debug.
 	diskGateMu     sync.Mutex
 	diskGateWarned bool
+	// diskGatedLeafs is the set of enabled leaf ids whose own disk gate refused
+	// at the last shouldFetch sweep, each carrying one live disk_gate_blocked
+	// notice and one WARN. A gate that blocks SOME leafs while others keep
+	// fetching used to leave no trace above Debug — the machine-wide WARN
+	// above fires only when every leaf is gated (TB-70). Guarded by diskGateMu.
+	diskGatedLeafs map[string]bool
 	// unstattableStores records image-store paths whose free space cannot be
 	// determined from this host (see noteUnstattableImageStore), so the
 	// informational log fires once per path per daemon run. Guarded by diskGateMu.
@@ -1361,6 +1367,14 @@ func (d *Daemon) itemMayDelay(blocked, candidate *PreFetchItem) bool {
 // is each leaf's own declared need, never the whole max_disk_gb allowance; see
 // disk_gate.go). Which specific leafs are fetchable is the fetcher's per-leaf
 // skip, driven by the same leafDiskGate.
+//
+// Every call sweeps the gate of EVERY fetchable leaf — not just until the
+// first one passes — and keeps one notice and one WARN per gated leaf current
+// (noteLeafDiskGated / noteLeafDiskGatePassed). With mixed leafs the machine
+// keeps fetching, so the answer here stays true, and the gated leaf used to be
+// the one surface a volunteer never heard about: a tester lost a night of his
+// biggest leaf's work to a gate that only the per-leaf API verdict mentioned,
+// with nothing above Debug in the log and nothing in the notice ring (TB-70).
 func (d *Daemon) shouldFetch() bool {
 	// Check scheduler.
 	if d.scheduler != nil && !d.scheduler.ShouldRun() {
@@ -1374,28 +1388,31 @@ func (d *Daemon) shouldFetch() bool {
 
 	// The absolute floor: below this nothing runs at all.
 	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, DiskFloorMB); err != nil {
-		d.warnDiskGateOnce(fmt.Sprintf("free space on the data dir (%s) is below the %d MB floor the fetch gate needs to run any work: %v",
-			d.cfg.DataDir, DiskFloorMB, err), "", "", 0)
+		d.stallDiskGateDaemonWide(fmt.Sprintf("free space on the data dir (%s) is below the %d MB floor the fetch gate needs to run any work: %v",
+			d.cfg.DataDir, DiskFloorMB, err), 0)
 		return false
 	}
 
-	leafs := d.allEnabledLeafs()
+	leafs := d.enabledLeafsByHead()
 	if len(leafs) == 0 {
 		// No cached leaf catalog (e.g. a head that doesn't surface GetHeadInfo):
 		// gate the any-leaf request on the unknown-need fallback, since the
-		// leaf's real requirement is unknowable here.
+		// leaf's real requirement is unknowable here. No leaf is enabled, so no
+		// leaf is blocked by its own gate any more either.
+		d.resolveLeafDiskGatesExcept(nil)
 		if ok, reason := d.leafDiskGate(anyLeafInfo); !ok {
-			d.warnDiskGateOnce(reason, "", "", d.leafRaiseToGB(anyLeafInfo))
+			d.stallDiskGateDaemonWide(reason, d.leafRaiseToGB(anyLeafInfo))
 			return false
 		}
 		d.clearDiskGateWarning()
 		return true
 	}
 
-	var gatedLabel, gatedLeafID, gatedReason string
-	var gatedRaiseToGB int
-	sawFetchable := false
-	for _, leaf := range leafs {
+	var gatedLabel, gatedReason string
+	sawFetchable, anyPasses := false, false
+	swept := make(map[string]bool, len(leafs))
+	for _, hl := range leafs {
+		leaf := hl.leaf
 		// A leaf that requires a GPU this machine does not offer is refused by
 		// the head whatever its disk verdict, so it neither justifies fetching
 		// nor supplies the representative disk reason — a disk remedy quoted
@@ -1404,21 +1421,22 @@ func (d *Daemon) shouldFetch() bool {
 			continue
 		}
 		sawFetchable = true
+		swept[leaf.ID] = true
 		ok, reason := d.leafDiskGate(leaf)
 		if ok {
-			d.clearDiskGateWarning()
-			return true
+			anyPasses = true
+			d.noteLeafDiskGatePassed(leaf)
+			continue
 		}
+		d.noteLeafDiskGated(hl.head, leaf, reason)
 		if gatedLabel == "" {
-			gatedLabel = leaf.Slug
-			if gatedLabel == "" {
-				gatedLabel = leaf.ID
-			}
-			gatedLeafID = leaf.ID
+			gatedLabel = leafLabel(leaf)
 			gatedReason = reason
-			gatedRaiseToGB = d.leafRaiseToGB(leaf)
 		}
 	}
+	// A leaf that left the sweep — disabled by the volunteer, retired by its
+	// head, or newly GPU-impossible — is no longer held back by its disk gate.
+	d.resolveLeafDiskGatesExcept(swept)
 	if !sawFetchable {
 		// Every enabled leaf needs a GPU this machine does not offer — a
 		// permanent capability mismatch, not a disk stall. `leafs list` and
@@ -1426,12 +1444,26 @@ func (d *Daemon) shouldFetch() bool {
 		d.logger.Debug("shouldFetch: every enabled leaf requires a GPU this machine does not offer")
 		return false
 	}
-	// Every fetchable leaf is disk-gated; surface one representative reason,
-	// naming its leaf — an unnamed "this leaf" sent a tester hunting through
-	// the catalog for which leaf the numbers belonged to (TB-30).
-	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason),
-		gatedLabel, gatedLeafID, gatedRaiseToGB)
+	if anyPasses {
+		d.clearDiskGateWarning()
+		return true
+	}
+	// Every fetchable leaf is disk-gated. Each carries its own notice from the
+	// sweep above; this is the log's one machine-wide WARN — the volunteer is
+	// idle, not merely narrowed — naming a representative leaf (an unnamed
+	// "this leaf" sent a tester hunting through the catalog for which leaf the
+	// numbers belonged to, TB-30).
+	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason))
 	return false
+}
+
+// leafLabel is the name a log line or notice calls a leaf by: its slug, or
+// its id for a leaf the head gave no slug.
+func leafLabel(leaf CachedLeafInfo) string {
+	if leaf.Slug != "" {
+		return leaf.Slug
+	}
+	return leaf.ID
 }
 
 // leafRequiresGPU reports whether this leaf's units need a GPU: either of the
@@ -1496,14 +1528,33 @@ func leafRuntimeVerdict(leaf CachedLeafInfo, registry *RuntimeRegistry, srv conf
 	return rt, missing, untrusted
 }
 
-// allEnabledLeafs returns the enabled leafs across every attached head.
-func (d *Daemon) allEnabledLeafs() []CachedLeafInfo {
+// headLeaf is an enabled leaf together with the name of the head it is
+// enabled on, for the log lines and notices that name both.
+type headLeaf struct {
+	head string
+	leaf CachedLeafInfo
+}
+
+// enabledLeafsByHead returns the enabled leafs across every attached head,
+// each paired with its head's name.
+func (d *Daemon) enabledLeafsByHead() []headLeaf {
 	if d.multiClient == nil {
 		return nil
 	}
-	var out []CachedLeafInfo
+	var out []headLeaf
 	for _, srv := range d.multiClient.Servers() {
-		out = append(out, d.enabledLeafs(srv.Name)...)
+		for _, leaf := range d.enabledLeafs(srv.Name) {
+			out = append(out, headLeaf{head: srv.Name, leaf: leaf})
+		}
+	}
+	return out
+}
+
+// allEnabledLeafs returns the enabled leafs across every attached head.
+func (d *Daemon) allEnabledLeafs() []CachedLeafInfo {
+	var out []CachedLeafInfo
+	for _, hl := range d.enabledLeafsByHead() {
+		out = append(out, hl.leaf)
 	}
 	return out
 }
@@ -2110,19 +2161,19 @@ func (d *Daemon) trackSlotStarvation() {
 		"", "")
 }
 
-// warnDiskGateOnce surfaces the disk-space stall. The first time the gate
-// blocks all fetching it logs a single actionable WARN carrying the gate's own
-// reason (which names the numbers and the setting involved); subsequent blocked
-// polls stay at Debug so the log isn't spammed. clearDiskGateWarning resets it
-// so a later recovery and re-stall warns again.
+// warnDiskGateOnce surfaces the machine-wide disk-space stall — nothing is
+// being fetched at all. The first time it logs a single actionable WARN
+// carrying the gate's own reason (which names the numbers and the setting
+// involved) and reports true; subsequent blocked polls stay at Debug so the
+// log isn't spammed. clearDiskGateWarning resets it so a later recovery and
+// re-stall warns again.
 //
-// leafLabel and leafID name the representative gated leaf (empty when the
-// stall is the absolute floor or the any-leaf fallback); raiseToGB is the
-// max_disk_gb that would cover that leaf on this machine today (0 = not
-// applicable). Both go into the volunteer-facing notice, which must name the
-// leaf and the allowance that clears it — a refusal that names neither sent a
-// tester on a raise-and-chase (TB-41).
-func (d *Daemon) warnDiskGateOnce(reason, leafLabel, leafID string, raiseToGB int) {
+// The notice for the stall is the caller's. A stall no single leaf owns (the
+// absolute floor, the any-leaf fallback) raises a daemon-wide one through
+// stallDiskGateDaemonWide; when every leaf is gated, each leaf's own notice
+// from the shouldFetch sweep already says so, and a daemon-wide one on top
+// would show the same stall twice.
+func (d *Daemon) warnDiskGateOnce(reason string) bool {
 	d.diskGateMu.Lock()
 	already := d.diskGateWarned
 	d.diskGateWarned = true
@@ -2130,27 +2181,37 @@ func (d *Daemon) warnDiskGateOnce(reason, leafLabel, leafID string, raiseToGB in
 
 	if already {
 		d.logger.Debug("shouldFetch: still disk-gated", "reason", reason)
-		return
+		return false
 	}
 
 	d.logger.Warn("not fetching work: disk-gated — this volunteer stays idle until it clears",
 		"reason", reason,
 		"data_dir_free_mb", client.DiskAvailableMB(d.cfg.DataDir))
+	return true
+}
 
+// stallDiskGateDaemonWide is warnDiskGateOnce for a stall that no single leaf
+// owns, plus its daemon-wide notice (no head, no leaf) the first time.
+// raiseToGB is the max_disk_gb that would cover the attached leafs on this
+// machine today (0 = not applicable); the notice must name the allowance that
+// clears it — a refusal that named no number sent a tester on a
+// raise-and-chase (TB-41).
+func (d *Daemon) stallDiskGateDaemonWide(reason string, raiseToGB int) {
+	if !d.warnDiskGateOnce(reason) {
+		return
+	}
 	msg := "Not fetching work: " + reason + "."
-	if leafLabel != "" && raiseToGB > 0 {
-		msg += fmt.Sprintf(" Leaf %q would be covered by max_disk_gb = %d (currently %d).",
-			leafLabel, raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
-	} else if raiseToGB > 0 {
+	if raiseToGB > 0 {
 		msg += fmt.Sprintf(" The attached leafs would be covered by max_disk_gb = %d (currently %d).",
 			raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
 	}
-	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, "", leafID)
+	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, "", "")
 }
 
-// clearDiskGateWarning re-arms the disk-gate WARN after the gate clears, and
-// resolves the notice the stall raised — for every leaf, since the gate
-// passing means no leaf is blocked any more.
+// clearDiskGateWarning re-arms the machine-wide disk-gate WARN once fetching
+// is possible again, and resolves the daemon-wide notice — that one only: the
+// floor recovering does not unblock a leaf whose own gate still refuses, so
+// its notice stays live until noteLeafDiskGatePassed ends it.
 func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Lock()
 	wasWarned := d.diskGateWarned
@@ -2158,7 +2219,76 @@ func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Unlock()
 	if wasWarned {
 		d.logger.Info("disk space recovered: resuming work fetching")
-		d.notices.Resolve("disk_gate_blocked", "", "")
+		d.notices.ResolveDaemonWide("disk_gate_blocked")
+	}
+}
+
+// noteLeafDiskGated records that this leaf's own disk gate refused in the
+// current shouldFetch sweep. The first refusal since the leaf last passed
+// logs one WARN and raises the leaf's own disk_gate_blocked notice — naming
+// the leaf, the gate's reason and the max_disk_gb that would cover it, the
+// figure the per-leaf API verdict shows (TB-41) — so a gate that blocks some
+// leafs while others keep fetching is as visible as one that blocks them all.
+// Later sweeps that still refuse stay silent; the fetcher's per-leaf skip
+// keeps the Debug trail (TB-70). noteLeafDiskGatePassed ends it.
+func (d *Daemon) noteLeafDiskGated(head string, leaf CachedLeafInfo, reason string) {
+	d.diskGateMu.Lock()
+	already := d.diskGatedLeafs[leaf.ID]
+	if d.diskGatedLeafs == nil {
+		d.diskGatedLeafs = make(map[string]bool)
+	}
+	d.diskGatedLeafs[leaf.ID] = true
+	d.diskGateMu.Unlock()
+	if already {
+		return
+	}
+
+	label := leafLabel(leaf)
+	raiseToGB := d.leafRaiseToGB(leaf)
+	d.logger.Warn("not fetching leaf: disk-gated — its units are skipped until the gate clears",
+		"server", head, "leaf_slug", label, "leaf_id", leaf.ID,
+		"reason", reason, "raise_to_gb", raiseToGB,
+		"data_dir_free_mb", client.DiskAvailableMB(d.cfg.DataDir))
+
+	msg := fmt.Sprintf("Not fetching leaf %q: %s.", label, reason)
+	if raiseToGB > 0 {
+		msg += fmt.Sprintf(" It would be covered by max_disk_gb = %d (currently %d).",
+			raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
+	}
+	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, head, leaf.ID)
+}
+
+// noteLeafDiskGatePassed records that this leaf's own disk gate passed in the
+// current sweep; if it had been refusing, that is logged and its notice ends.
+func (d *Daemon) noteLeafDiskGatePassed(leaf CachedLeafInfo) {
+	d.diskGateMu.Lock()
+	was := d.diskGatedLeafs[leaf.ID]
+	delete(d.diskGatedLeafs, leaf.ID)
+	d.diskGateMu.Unlock()
+	if was {
+		d.logger.Info("disk gate cleared for leaf: resuming its fetching",
+			"leaf_slug", leafLabel(leaf), "leaf_id", leaf.ID)
+		d.notices.Resolve("disk_gate_blocked", "", leaf.ID)
+	}
+}
+
+// resolveLeafDiskGatesExcept ends the stall of every gated leaf the current
+// sweep did not visit — one no longer enabled here, or one the head would now
+// refuse regardless of disk — since its gate no longer keeps anything from
+// fetching. swept may be nil (the sweep visited nothing).
+func (d *Daemon) resolveLeafDiskGatesExcept(swept map[string]bool) {
+	d.diskGateMu.Lock()
+	var gone []string
+	for id := range d.diskGatedLeafs {
+		if !swept[id] {
+			gone = append(gone, id)
+			delete(d.diskGatedLeafs, id)
+		}
+	}
+	d.diskGateMu.Unlock()
+	for _, id := range gone {
+		d.logger.Info("disk-gated leaf is no longer enabled here: ending its stall", "leaf_id", id)
+		d.notices.Resolve("disk_gate_blocked", "", id)
 	}
 }
 
