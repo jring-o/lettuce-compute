@@ -28,8 +28,14 @@ type ContainerRuntime struct {
 	maxCPUCores   int              // from config; 0 means no CPU limit
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
-	memCeilingMB  int // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
+	memCeilingMB  int // the memory budget container work is given (0 = unset); clamps per-unit BookedMemMB
 	diskCeilingMB int // volunteer's configured disk budget in MB (0 = unset); clamps per-unit BookedDiskMB
+	// engineMemMB is the memory of the virtual machine the engine runs inside,
+	// as the engine reported it, when it runs inside one (macOS/Windows); 0 on a
+	// host whose containers share its RAM (Linux) or when the engine did not
+	// say. It is the fact behind a memCeilingMB below the configured budget
+	// (TB-63) and is reported so diagnostics can name it.
+	engineMemMB int
 	maxPids       int // fork-bomb PID cap from config (<=0 = built-in default)
 	capAdd        []string
 	gpuRelaxUser  bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
@@ -134,10 +140,23 @@ func (c *ContainerRuntime) SetMaxGPUVRAMPct(pct int) {
 	c.maxGPUVRAMPct = pct
 }
 
-// SetMemoryCeilingMB sets the volunteer's configured memory budget
-// (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
+// SetMemoryCeilingMB sets the memory budget container work is given: the
+// volunteer's configured budget (config.ResourceLimits.MaxMemoryMB), clipped to
+// the engine VM's memory less headroom where the engine runs inside a VM
+// (ContainerMemoryBudgetMB, TB-63). Per-unit enforcement clamps the declared
 // memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
 func (c *ContainerRuntime) SetMemoryCeilingMB(mb int) { c.memCeilingMB = mb }
+
+// MemoryCeilingMB reports the memory budget container work is given (0 = unset).
+func (c *ContainerRuntime) MemoryCeilingMB() int { return c.memCeilingMB }
+
+// SetEngineMemoryMB records the memory of the VM the engine runs inside, as
+// the engine reported it (EngineInfo.MemTotalMB); 0 when the engine does not
+// run inside a VM or did not report it.
+func (c *ContainerRuntime) SetEngineMemoryMB(mb int) { c.engineMemMB = mb }
+
+// EngineMemoryMB reports the memory of the VM the engine runs inside, or 0.
+func (c *ContainerRuntime) EngineMemoryMB() int { return c.engineMemMB }
 
 // SetDiskCeilingMB sets the volunteer's configured disk budget in MB
 // (config.ResourceLimits.MaxDiskGB * 1024). The /work size watchdog and any

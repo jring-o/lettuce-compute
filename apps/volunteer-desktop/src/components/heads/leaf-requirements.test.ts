@@ -24,6 +24,8 @@ function makeMachine(overrides: Partial<MachineCapabilities> = {}): MachineCapab
     runtimes: ["container", "wasm"],
     has_gpu: true,
     max_memory_mb: 8192,
+    container_vm_memory_mb: 0,
+    memory_limited_by_vm: false,
     max_disk_mb: 10240,
     max_cpu_cores: 4,
     max_gpu_vram_mb: 2048,
@@ -220,5 +222,56 @@ describe("TB-66: a shortfall's two figures never round to the same label", () =>
     )[0];
     expect(tooSmallCard.label).toBe("a GPU, 4200 MB VRAM");
     expect(tooSmallCard.shortfall).toBe("your 4096 MB card is too small whatever percentage you allow");
+  });
+});
+
+describe("TB-63: the container engine's virtual machine bounds memory", () => {
+  // The tester's Mac: 8192 MB allowed in Settings, a 2 GiB Podman machine, so
+  // 1536 MB for container work. The card used to say "you allow 8 GB" beside a
+  // 7000 MB leaf the machine killed at model load, and TB-66's raise button
+  // would have offered a slider stop that changes nothing.
+  const vmMachine = () =>
+    makeMachine({ max_memory_mb: 1536, container_vm_memory_mb: 2048, memory_limited_by_vm: true });
+
+  it("names the machine and its size instead of the allowance, and offers no slider stop", () => {
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
+    const memory = leafRequirementItems(leaf, vmMachine()).find((i) => i.key === "memory");
+    expect(memory).toEqual({
+      key: "memory",
+      label: "7000 MB RAM",
+      shortfall: "the container engine's virtual machine allows 1536 MB; it has 2048 MB",
+      vmLimited: true,
+    });
+    expect(memory?.raiseToMb).toBeUndefined();
+  });
+
+  it("prints all three figures in GB when none would round", () => {
+    const machine = makeMachine({
+      max_memory_mb: 3072,
+      container_vm_memory_mb: 4096,
+      memory_limited_by_vm: true,
+    });
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 8192 } });
+    const memory = leafRequirementItems(leaf, machine).find((i) => i.key === "memory");
+    expect(memory?.label).toBe("8 GB RAM");
+    expect(memory?.shortfall).toBe("the container engine's virtual machine allows 3 GB; it has 4 GB");
+  });
+
+  it("marks nothing when the leaf fits the machine's budget", () => {
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 1024 } });
+    const memory = leafRequirementItems(leaf, vmMachine()).find((i) => i.key === "memory");
+    expect(memory).toEqual({ key: "memory", label: "1 GB RAM" });
+  });
+
+  it("keeps the allowance wording and the slider stop when the machine is not the bound", () => {
+    const machine = makeMachine({ max_memory_mb: 6912, container_vm_memory_mb: 8192 });
+    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
+    const memory = leafRequirementItems(leaf, machine).find((i) => i.key === "memory");
+    expect(memory).toEqual({
+      key: "memory",
+      label: "7000 MB RAM",
+      shortfall: "you allow 6912 MB",
+      raiseToMb: 7168,
+    });
   });
 });

@@ -30,6 +30,11 @@ type Fetcher struct {
 	backoff     time.Duration
 	maxBackoff  time.Duration
 	cachedHW    *lettucev1.HardwareCapabilities
+	// hardwareFn returns the CURRENT advertisement (the daemon's
+	// advertisedHardware), which a late container-engine detection may have
+	// lowered the memory budget of (TB-63); cachedHW is the fallback for tests
+	// that build a Fetcher by hand.
+	hardwareFn func() *lettucev1.HardwareCapabilities
 	pubKey      ed25519.PublicKey
 	// notices receives the fetcher's volunteer-facing escalations (too-old
 	// rejection, runtime breaker trip, no-work diagnostic); headStatus keeps
@@ -270,6 +275,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		backoff:                  d.initialBackoff,
 		maxBackoff:               d.maxBackoff,
 		cachedHW:                 d.cachedHW,
+		hardwareFn:               d.advertisedHardware,
 		pubKey:                   d.pubKey,
 		notices:                  d.notices,
 		headStatus:               d.headStatus,
@@ -842,7 +848,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		LeafIds:          leafIDs,
 		BlockedLeafIds:   blockedIDs,
 		MaxAssignments:   maxAssignments,
-		CurrentAvailable: f.cachedHW,
+		CurrentAvailable: f.currentHardware(),
 		HeldWorkUnitIds:  heldIDs,
 	})
 	if err != nil {
@@ -1184,6 +1190,15 @@ func (f *Fetcher) applyServerRetryDelay(head *ServerConnection, retryAfterSecond
 	head.NextContactAt = f.now().Add(time.Duration(retryAfterSeconds) * time.Second)
 	f.logger.Debug("fetcher: obeying server-directed retry delay",
 		"server", head.Name, "retry_after_s", retryAfterSeconds, "next_contact_at", head.NextContactAt)
+}
+
+// currentHardware returns the hardware advertisement to send with a poll: the
+// daemon's live one when wired, else the copy taken at construction.
+func (f *Fetcher) currentHardware() *lettucev1.HardwareCapabilities {
+	if f.hardwareFn != nil {
+		return f.hardwareFn()
+	}
+	return f.cachedHW
 }
 
 // applyResourceExhaustedBackoff applies a fixed, jittered LOCAL backoff to a head

@@ -305,6 +305,21 @@ describe("ManagementClient", () => {
       expect(result.machine.max_disk_mb).toBe(10240);
     });
 
+    it("defaults the container-VM memory fields a daemon older than TB-63 does not send", async () => {
+      respond({ heads: [head], machine });
+      const result = await client.headsAndMachine();
+      expect(result.machine.container_vm_memory_mb).toBe(0);
+      expect(result.machine.memory_limited_by_vm).toBe(false);
+
+      respond({
+        heads: [head],
+        machine: { ...machine, container_vm_memory_mb: 2048, memory_limited_by_vm: true },
+      });
+      const limited = await client.headsAndMachine();
+      expect(limited.machine.container_vm_memory_mb).toBe(2048);
+      expect(limited.machine.memory_limited_by_vm).toBe(true);
+    });
+
     it("tolerates a missing machine block", async () => {
       respond({ heads: null });
       const result = await client.headsAndMachine();

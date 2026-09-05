@@ -68,7 +68,7 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 	resp, err := rc.RegisterVolunteer(ctx, &lettucev1.RegisterVolunteerRequest{
 		PublicKey:         d.pubKey,
 		DisplayName:       hostname,
-		Hardware:          d.cachedHW,
+		Hardware:          d.advertisedHardware(),
 		AvailableRuntimes: d.advertisedRuntimesFor(head.Config),
 		SchedulingMode:    d.cfg.Scheduling.Mode,
 		HostId:            "", // discard the refused id: empty => the head mints a fresh one
@@ -118,8 +118,14 @@ type Daemon struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 
-	// Cached hardware capabilities (detected once at startup)
+	// Cached hardware capabilities (detected once at startup). This is what
+	// every head is told and what each poll carries (CurrentAvailable). Read
+	// through advertisedHardware and replaced — never mutated in place — under
+	// hwMu, because the fetcher reads it on its own goroutine while a late
+	// container-engine detection may lower the advertised memory budget
+	// (setAdvertisedMemoryMB, TB-63).
 	cachedHW *lettucev1.HardwareCapabilities
+	hwMu     sync.RWMutex
 
 	// Podman machine lifecycle (Windows/macOS). Whether this process started the
 	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
@@ -526,6 +532,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.mu.Unlock()
 	}()
 
+	// A container runtime built before the daemon existed (start-up) may have
+	// had its memory budget clipped to the engine's VM; start-up lowered the
+	// advertisement it registered with, and the volunteer is told here (TB-63).
+	d.refreshContainerMemoryNotice()
+
 	maxSlots := d.cfg.MaxConcurrentTasks
 	if maxSlots <= 0 {
 		maxSlots = 1
@@ -899,6 +910,9 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 
 	if result.Result.ExitCode != 0 {
 		reason := fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode)
+		if note := d.containerKillNote(wu, result.Result.ExitCode); note != "" {
+			reason += " (" + note + ")"
+		}
 		d.logger.Error("slot execution non-zero exit",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
@@ -1236,7 +1250,9 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
 	// enforce — so admission and enforcement share one denominator. A declared 0 is
 	// bounded to the per-task default; a huge declaration is clamped to the budget.
-	maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB
+	// The budget is the configured one clipped to the container engine's VM where
+	// there is one (MemoryBudgetMB, TB-63) — the same figure the heads are told.
+	maxMemoryMB := d.MemoryBudgetMB()
 	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 
 	// 1. Configured memory budget.
@@ -1258,10 +1274,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 
 	// 3. GPU exclusivity: one GPU work unit per physical GPU.
 	if wu.ExecutionSpec.GPURequired {
-		gpuCount := 0
-		if d.cachedHW != nil {
-			gpuCount = len(d.cachedHW.GetGpus())
-		}
+		gpuCount := len(d.advertisedHardware().GetGpus())
 		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
 			return false, fmt.Sprintf("all GPUs busy: %d of %d running GPU work units",
 				d.slotManager.ActiveGPUCount(), gpuCount)
@@ -1298,7 +1311,7 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 	}
 
 	// Configured memory budget: harmless iff both bookings fit it together.
-	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
+	if maxMemoryMB := d.MemoryBudgetMB(); maxMemoryMB > 0 {
 		blockedMemMB := runtime.BookedMemMB(int(blocked.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 		candMemMB := runtime.BookedMemMB(int(candidate.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 		if blockedMemMB+candMemMB > maxMemoryMB {
@@ -1308,10 +1321,7 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 
 	// GPU exclusivity: two GPU units co-run only when two physical GPUs exist.
 	if blocked.ExecutionSpec.GPURequired && candidate.ExecutionSpec.GPURequired {
-		gpuCount := 0
-		if d.cachedHW != nil {
-			gpuCount = len(d.cachedHW.GetGpus())
-		}
+		gpuCount := len(d.advertisedHardware().GetGpus())
 		if gpuCount < 2 {
 			return true
 		}
@@ -1634,10 +1644,7 @@ func (d *Daemon) bufferTargetSeconds() float64 {
 // so the slot count is returned and the GPU class collapses into the whole.
 func (d *Daemon) gpuSlots() int {
 	slots := d.maxSlots()
-	if d.cachedHW == nil {
-		return slots
-	}
-	if n := len(d.cachedHW.GetGpus()); n > 0 && n < slots {
+	if n := len(d.advertisedHardware().GetGpus()); n > 0 && n < slots {
 		return n
 	}
 	return slots
@@ -2417,7 +2424,7 @@ func (d *Daemon) HasGPU() bool {
 	if d.cfg != nil && d.cfg.ResourceLimits.MaxGPUVRAMPct == 0 {
 		return false
 	}
-	return d.cachedHW != nil && len(d.cachedHW.GetGpus()) > 0
+	return len(d.advertisedHardware().GetGpus()) > 0
 }
 
 // GPUBudget reports the GPU capabilities this daemon ADVERTISED to heads, in the
@@ -2437,7 +2444,7 @@ func (d *Daemon) GPUBudget() (vramMB, cardVRAMMB, vramPct int, vendors []string,
 	if !d.HasGPU() {
 		return 0, 0, 0, nil, nil
 	}
-	for _, g := range d.cachedHW.GetGpus() {
+	for _, g := range d.advertisedHardware().GetGpus() {
 		if eff := int(g.GetVramMb()) * int(g.GetMaxVramPct()) / 100; eff > vramMB {
 			vramMB, cardVRAMMB, vramPct = eff, int(g.GetVramMb()), int(g.GetMaxVramPct())
 		}
@@ -2948,6 +2955,11 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 
 	// Reinitialize weights from new config.
 	d.initializeWeights()
+
+	// A raised memory limit does not raise what the container engine's VM can
+	// hold (TB-63): say so again against the new figure, or clear the notice
+	// when the limit now fits.
+	d.refreshContainerMemoryNotice()
 }
 
 // SetBackoff overrides backoff durations (for testing).
@@ -2986,6 +2998,126 @@ func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
 		return mm
 	}
 	return d.machineManager
+}
+
+// advertisedHardware returns the hardware capabilities this machine currently
+// advertises to heads — what registration sends and what every poll carries
+// as CurrentAvailable. May be nil in tests that never advertise.
+func (d *Daemon) advertisedHardware() *lettucev1.HardwareCapabilities {
+	d.hwMu.RLock()
+	defer d.hwMu.RUnlock()
+	return d.cachedHW
+}
+
+// AdvertisedHardware is advertisedHardware for the management package's tests.
+func (d *Daemon) AdvertisedHardware() *lettucev1.HardwareCapabilities {
+	return d.advertisedHardware()
+}
+
+// setAdvertisedMemoryMB replaces the advertised hardware with a copy whose
+// memory budget is mb. A copy, not an in-place write: the fetcher hands the
+// current advertisement to gRPC on its own goroutine, and a field write under
+// it would be a race.
+func (d *Daemon) setAdvertisedMemoryMB(mb int) {
+	d.hwMu.Lock()
+	defer d.hwMu.Unlock()
+	if d.cachedHW == nil {
+		return
+	}
+	hw := proto.Clone(d.cachedHW).(*lettucev1.HardwareCapabilities)
+	hw.MaxMemoryMb = int32(mb)
+	d.cachedHW = hw
+}
+
+// ContainerVMMemoryMB reports the memory of the VM the registered container
+// engine runs inside (0 when there is no container runtime, the engine shares
+// the host's RAM, or its VM size is unknown) — the fact behind a memory budget
+// below the configuration (TB-63).
+func (d *Daemon) ContainerVMMemoryMB() int {
+	if d.runtimeRegistry == nil || d.runtimeRegistry.GetRuntime("container") == nil {
+		return 0
+	}
+	_, engineMB := d.containerFactory.ContainerMemory()
+	return engineMB
+}
+
+// MemoryBudgetMB is the whole-machine memory budget this daemon works to: the
+// configured max_memory_mb, clipped to what the container engine's VM can hold
+// less headroom where the engine runs inside one (runtime.ContainerMemoryBudgetMB,
+// TB-63). It is the figure advertised to heads, booked at admission and given
+// to the container runtime as its ceiling, so all three agree. With no
+// container engine, or one that shares the host's RAM, it is the configuration.
+func (d *Daemon) MemoryBudgetMB() int {
+	cfgMB := 0
+	if d.cfg != nil {
+		cfgMB = d.cfg.ResourceLimits.MaxMemoryMB
+	}
+	return runtime.ContainerMemoryBudgetMB(cfgMB, d.ContainerVMMemoryMB())
+}
+
+// MemoryLimitedByVM reports whether the container engine's VM, not the
+// configuration, is what bounds this machine's memory budget (TB-63).
+func (d *Daemon) MemoryLimitedByVM() bool {
+	if d.cfg == nil {
+		return false
+	}
+	return d.ContainerVMMemoryMB() > 0 && d.MemoryBudgetMB() < d.cfg.ResourceLimits.MaxMemoryMB
+}
+
+// applyContainerMemoryBudget lowers the advertised memory budget to what the
+// container engine's VM can hold, when that is below the configuration, and
+// raises the volunteer-facing notice. Called once a container runtime is
+// registered — at start (start-up clamps the advertisement it registers with
+// before the daemon exists, and Run raises the notice) and on a late detection
+// (registerContainerRuntime, before the heads are re-told).
+func (d *Daemon) applyContainerMemoryBudget() {
+	if d.MemoryLimitedByVM() {
+		d.setAdvertisedMemoryMB(d.MemoryBudgetMB())
+	}
+	d.refreshContainerMemoryNotice()
+}
+
+// refreshContainerMemoryNotice keeps the "container_memory_clipped" notice in
+// step with the facts: raised with one WARN whenever the configured memory
+// limit exceeds what the container engine's VM can hold, naming both figures
+// and the remedy; resolved when the limit fits (the VM was enlarged and the
+// engine re-detected, or the limit was lowered).
+func (d *Daemon) refreshContainerMemoryNotice() {
+	if !d.MemoryLimitedByVM() {
+		d.notices.Resolve("container_memory_clipped", "", "")
+		return
+	}
+	cfgMB := d.cfg.ResourceLimits.MaxMemoryMB
+	budget := d.MemoryBudgetMB()
+	engineMB := d.ContainerVMMemoryMB()
+	d.logger.Warn("container engine's VM is smaller than the memory limit; container work is limited to the VM — heads are told the smaller figure and only send leafs that fit it",
+		"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
+		"container_memory_budget_mb", budget, "max_memory_mb", cfgMB,
+		"remedy", "enlarge the VM's memory (Podman: `podman machine stop`, `podman machine set --memory <MB>`, `podman machine start`; Podman Desktop or Docker Desktop: Settings → Resources) — or lower the memory limit to the budget so the two agree")
+	d.notices.Notify(NoticeWarn, "container_memory_clipped",
+		fmt.Sprintf("Container work on this machine is limited to %d MB: the container engine runs inside a virtual machine with %d MB, and %d MB is kept back for the machine itself. Your memory limit of %d MB is not what heads are told — they see %d MB and only send leafs that fit. To run bigger leafs, enlarge the machine's memory (Podman: `podman machine set --memory`; Podman Desktop or Docker Desktop: Settings → Resources) and restart Lettuce.",
+			budget, engineMB, runtime.ContainerVMHeadroomMB, cfgMB, budget),
+		"", "")
+}
+
+// containerKillNote explains an exit code 137 on a container unit: 137 is a
+// kill, and for a container almost always the out-of-memory kill. When the unit
+// declares more than container work on this machine can be given — the engine's
+// VM is smaller than the declaration — the note says so with both figures, so
+// the abandon reason the head logs and the leaf-failing notice the volunteer
+// sees read "killed for memory: … VM …" instead of a bare exit code (TB-63).
+// Empty for any other exit code or a non-container unit.
+func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, exitCode int) string {
+	if wu == nil || exitCode != 137 || wu.Runtime != "container" {
+		return ""
+	}
+	budget := d.MemoryBudgetMB()
+	declared := int(wu.ExecutionSpec.MaxMemoryMB)
+	booked := runtime.BookedMemMB(declared, budget)
+	if engineMB := d.ContainerVMMemoryMB(); engineMB > 0 && declared > budget {
+		return fmt.Sprintf("killed for memory: the unit declares %d MB but container work on this machine is limited to %d MB by the container engine's VM of %d MB", declared, budget, engineMB)
+	}
+	return fmt.Sprintf("killed, usually out of memory at its %d MB limit", booked)
 }
 
 // ContainerBackend reports the engine the registered container runtime is

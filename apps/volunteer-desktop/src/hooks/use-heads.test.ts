@@ -62,6 +62,8 @@ const mockMachine: MachineCapabilities = {
   runtimes: ["container", "wasm"],
   has_gpu: false,
   max_memory_mb: 2048,
+  container_vm_memory_mb: 0,
+  memory_limited_by_vm: false,
   max_disk_mb: 10240,
   max_cpu_cores: 4,
   max_gpu_vram_mb: 0,

@@ -127,6 +127,26 @@ start a Podman machine for you on first `start`.
   now" while this is happening; the log line is `container runtime registered
   after start`.
 
+- **The machine's memory is the real ceiling for container work.** On Windows
+  and macOS every container runs inside the engine's virtual machine (the Podman
+  machine, or Docker Desktop's engine VM), so a container can only use what that
+  machine has, whatever your Settings allow. Lettuce reads the machine's memory
+  from the engine when it finds it and budgets container work at that figure less
+  512 MB kept back for the machine itself. If that is below your memory limit
+  (`resource_limits.max_memory_mb`), heads are told the smaller figure and only
+  send leafs that fit it — before this a 16 GB Mac with a 2 GB Podman machine
+  advertised 8 GB, was sent 7 GB units, and had each one killed at model load
+  (`non-zero exit code 137`, now reported as `killed for memory` with both
+  figures). The log line is `container engine's VM is smaller than the memory
+  limit`, the desktop app shows a notice, `lettuce-volunteer doctor` prints both
+  figures under "memory limit", and a leaf blocked this way says so in `leafs
+  list` and on the app's leaf card. To run bigger leafs, enlarge the machine's
+  memory — Podman Desktop or Docker Desktop: Settings → Resources; Podman CLI:
+  `podman machine stop`, `podman machine set --memory <MB>`, `podman machine
+  start` — then restart Lettuce. Raising the memory limit alone changes nothing.
+  A machine Lettuce creates for you is sized at your memory limit plus the 512 MB
+  reserve, so it is never the bound.
+
 - **macOS: Podman does not need to be on the app's PATH.** An app launched from
   Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official
   installer and Podman Desktop), `/opt/homebrew/bin` and `/usr/local/bin`
@@ -421,7 +441,8 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   what the earlier ones actually took.
 - **Buffered units start first-fit, not strictly first-fetched.** A free slot
   takes the oldest buffered unit that fits in the memory you've allowed
-  (`resource_limits.max_memory_mb`). If the oldest unit needs more memory than
+  (`resource_limits.max_memory_mb` — or, on Windows/macOS, what the container
+  engine's machine can hold, when that is less). If the oldest unit needs more memory than
   is currently free, smaller units behind it start instead of the slot sitting
   idle — the waiting unit logs a single `waiting for capacity` line, keeps its
   place in line, and only a bounded number of units may jump it before the
