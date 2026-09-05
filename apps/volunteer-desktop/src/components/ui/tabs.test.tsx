@@ -112,3 +112,34 @@ describe("TabsContent outside Tabs context", () => {
     spy.mockRestore();
   });
 });
+
+describe("TabsContent keepMounted (TB-68)", () => {
+  it("keeps an inactive panel in the DOM, hidden, and shows it again when its tab is chosen", async () => {
+    const user = userEvent.setup();
+    render(
+      <Tabs defaultValue="tab1">
+        <TabsList>
+          <TabsTrigger value="tab1">Tab 1</TabsTrigger>
+          <TabsTrigger value="tab2">Tab 2</TabsTrigger>
+        </TabsList>
+        <TabsContent value="tab1">Content 1</TabsContent>
+        <TabsContent value="tab2" keepMounted>
+          Content 2
+        </TabsContent>
+      </Tabs>
+    );
+    expect(screen.getByText("Content 2")).toBeInTheDocument();
+    expect(screen.getByText("Content 2")).not.toBeVisible();
+    // Only the shown panel is exposed as a tab panel.
+    expect(screen.getByRole("tabpanel")).toHaveTextContent("Content 1");
+
+    await user.click(screen.getByText("Tab 2"));
+    expect(screen.getByText("Content 2")).toBeVisible();
+    // A panel without keepMounted is still unmounted while not shown.
+    expect(screen.queryByText("Content 1")).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("Tab 1"));
+    expect(screen.getByText("Content 1")).toBeVisible();
+    expect(screen.getByText("Content 2")).not.toBeVisible();
+  });
+});

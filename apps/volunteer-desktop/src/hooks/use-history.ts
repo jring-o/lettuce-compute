@@ -87,6 +87,15 @@ export interface HistoryState {
   hasMore: boolean;
   isLoading: boolean;
   loadMore: () => void;
+  /**
+   * Re-read the newest page and put what it holds that is not loaded yet
+   * above the list, keeping every page loaded so far and the paging cursor.
+   * If nothing loaded is on that page any more (more than a page of new
+   * completions, or nothing was loaded), the list starts over from it.
+   * Silent: no loading state, so a page that stays mounted between visits
+   * can pick up new completions without dropping what the reader scrolled to.
+   */
+  refresh: () => void;
   error: Error | null;
 }
 
@@ -105,12 +114,17 @@ export function useHistory(filters: HistoryFilters): HistoryState {
   // Leaf names are a property of the history, not of the filter, so they are
   // never reset: selecting a leaf must not shrink the list to that one leaf.
   const seenLeafNamesRef = useRef<Set<string>>(new Set());
+  // Every work unit the daemon has returned for the current filter set,
+  // before client-side filters: how `refresh` tells new completions from
+  // rows it already holds.
+  const loadedIdsRef = useRef<Set<string>>(new Set());
 
   // Reset when filters change
   useEffect(() => {
     filtersRef.current = filters;
     cursorRef.current = undefined;
     generationRef.current += 1;
+    loadedIdsRef.current = new Set();
     setEntries([]);
     setLoadedCount(0);
     setHasMore(false);
@@ -142,7 +156,10 @@ export function useHistory(filters: HistoryFilters): HistoryState {
         for (let page = 0; page < MAX_PAGES_PER_LOAD; page++) {
           const resp = await client.history({ ...params, cursor });
           fetched += resp.entries.length;
-          for (const e of resp.entries) seenLeafNamesRef.current.add(e.leaf_name);
+          for (const e of resp.entries) {
+            seenLeafNamesRef.current.add(e.leaf_name);
+            loadedIdsRef.current.add(e.work_unit_id);
+          }
           matched.push(...applyClientFilters(resp.entries, filtersRef.current));
           more = resp.pagination.has_more;
           cursor = resp.pagination.next_cursor;
@@ -185,5 +202,37 @@ export function useHistory(filters: HistoryFilters): HistoryState {
     }
   }, [hasMore, isLoading, fetchPage]);
 
-  return { entries, loadedCount, leafNames, hasMore, isLoading, loadMore, error };
+  const refresh = useCallback(async () => {
+    if (!client) return;
+    const generation = generationRef.current;
+    try {
+      const resp = await client.history(filtersToParams(filtersRef.current));
+      if (generation !== generationRef.current) return; // filters changed meanwhile
+      for (const e of resp.entries) seenLeafNamesRef.current.add(e.leaf_name);
+      const fresh = resp.entries.filter((e) => !loadedIdsRef.current.has(e.work_unit_id));
+
+      if (fresh.length === resp.entries.length) {
+        // Nothing loaded is on the newest page any more: start over from it.
+        loadedIdsRef.current = new Set(resp.entries.map((e) => e.work_unit_id));
+        setEntries(applyClientFilters(resp.entries, filtersRef.current));
+        setLoadedCount(resp.entries.length);
+        cursorRef.current = resp.pagination.next_cursor;
+        setHasMore(resp.pagination.has_more);
+      } else if (fresh.length > 0) {
+        // The newest page overlaps what is loaded: the entries it holds that
+        // are not loaded yet are newer than everything here — they go on top.
+        for (const e of fresh) loadedIdsRef.current.add(e.work_unit_id);
+        const matched = applyClientFilters(fresh, filtersRef.current);
+        if (matched.length > 0) setEntries((prev) => [...matched, ...prev]);
+        setLoadedCount((prev) => prev + fresh.length);
+      }
+      setLeafNames(Array.from(seenLeafNamesRef.current).sort());
+      setError(null);
+    } catch (err) {
+      if (generation !== generationRef.current) return;
+      setError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }, [client]);
+
+  return { entries, loadedCount, leafNames, hasMore, isLoading, loadMore, refresh, error };
 }

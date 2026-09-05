@@ -102,16 +102,24 @@ interface TabsContentProps {
   value: string;
   children: React.ReactNode;
   className?: string;
+  /**
+   * Keep the panel mounted (hidden) while another tab is active, so its
+   * children's state, effects and DOM survive a visit to another tab. By
+   * default an inactive panel is unmounted.
+   */
+  keepMounted?: boolean;
 }
 
-function TabsContent({ value, children, className }: TabsContentProps) {
+function TabsContent({ value, children, className, keepMounted }: TabsContentProps) {
   const { activeTab } = useTabs();
+  const isActive = activeTab === value;
 
-  if (activeTab !== value) return null;
+  if (!isActive && !keepMounted) return null;
 
   return (
     <div
       role="tabpanel"
+      hidden={!isActive}
       className={cn(
         "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
         className
