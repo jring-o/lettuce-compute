@@ -38,6 +38,7 @@ function makeStatus(
 ): ContainerRuntimeStatus {
   return {
     backend: "podman",
+    engine: "",
     status: "running",
     version: "5.3.1",
     socket_path: "/run/podman/podman.sock",
@@ -610,3 +611,52 @@ describe("ContainerRuntimeStatusCard", () => {
 
 // Need to import act for the pending-action tests
 import { act } from "@testing-library/react";
+
+describe("TB-73: Podman behind the Docker-compatible socket is called Podman", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRefresh.mockResolvedValue(undefined);
+  });
+
+  it("names Podman with its version and does not advise installing it", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ backend: "docker", engine: "podman", version: "5.3.1" }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+    expect(screen.getByText("Podman 5.3.1")).toBeInTheDocument();
+    expect(screen.queryByText(/Docker 5.3.1/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Install Podman/)).not.toBeInTheDocument();
+    expect(screen.getByText(/does not manage the Podman machine/)).toBeInTheDocument();
+    expect(screen.getByText("lettuce-volunteer config set container_backend podman")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Stop Machine/ })).not.toBeInTheDocument();
+  });
+
+  it("names Podman alone when the socket reported no version", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ backend: "docker", engine: "podman", version: "" }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+    expect(screen.getByText("Podman")).toBeInTheDocument();
+  });
+
+  it("still calls Docker Docker", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ backend: "docker", engine: "docker", version: "24.0.7" }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+    expect(screen.getByText("Docker 24.0.7")).toBeInTheDocument();
+    expect(screen.getByText(/Install Podman for a lighter alternative/)).toBeInTheDocument();
+  });
+});

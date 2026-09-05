@@ -62,6 +62,21 @@ fn status_text(status: &Option<StatusResponse>) -> String {
     }
 }
 
+/// The pause menu item for a status: its text and whether clicking it does
+/// anything. The daemon's resume undoes a user pause and nothing else — a
+/// schedule or thermal pause answers 409 "not paused" — so "Resume" is offered
+/// for that reason alone and any other pause names itself, disabled (TB-72).
+fn pause_menu(status: &Option<StatusResponse>) -> (String, bool) {
+    match status {
+        Some(s) if s.state == "paused" => match s.paused_reason.as_deref() {
+            Some("user") => ("Resume".into(), true),
+            Some("scheduled") => ("Paused by your schedule".into(), false),
+            other => (paused_text(other), false),
+        },
+        _ => ("Pause".into(), true),
+    }
+}
+
 fn determine_state(status: &Option<StatusResponse>) -> TrayState {
     match status {
         Some(s) => match s.state.as_str() {
@@ -206,9 +221,16 @@ async fn handle_pause_resume(_app: &AppHandle) {
     match client.status().await {
         Ok(status) => {
             if status.state == "paused" {
-                let _ = client.resume().await;
-            } else {
-                let _ = client.pause().await;
+                // Only a user pause is the daemon's to undo; the menu item is
+                // disabled for any other reason, so this is belt and braces.
+                if status.paused_reason.as_deref() != Some("user") {
+                    return;
+                }
+                if let Err(e) = client.resume().await {
+                    eprintln!("[warn] the daemon refused to resume: {e}");
+                }
+            } else if let Err(e) = client.pause().await {
+                eprintln!("[warn] the daemon refused to pause: {e}");
             }
         }
         Err(_) => {}
@@ -226,6 +248,9 @@ async fn handle_quit(app: &AppHandle) {
 
 pub fn start_status_poll(app: AppHandle, tray: TrayIcon, items: TrayMenuItems) {
     let current_state = Arc::new(Mutex::new(TrayState::Stopped));
+    // The pause item as last applied: it depends on the pause reason, not
+    // only on the tray state, so it is tracked on its own.
+    let mut current_menu: Option<(String, bool)> = None;
 
     tauri::async_runtime::spawn(async move {
         loop {
@@ -236,16 +261,16 @@ pub fn start_status_poll(app: AppHandle, tray: TrayIcon, items: TrayMenuItems) {
             if *state != new_state {
                 let icon = load_tray_icon(&new_state);
                 let _ = tray.set_icon(Some(icon));
-
-                // Update pause/resume menu text
-                let label = if new_state == TrayState::Paused {
-                    "Resume"
-                } else {
-                    "Pause"
-                };
-                let _ = items.pause_item.set_text(label);
-
                 *state = new_state;
+            }
+
+            // Update the pause/resume menu item: its text and whether it does
+            // anything follow the pause reason (TB-72).
+            let menu = pause_menu(&status);
+            if current_menu.as_ref() != Some(&menu) {
+                let _ = items.pause_item.set_text(&menu.0);
+                let _ = items.pause_item.set_enabled(menu.1);
+                current_menu = Some(menu);
             }
 
             // Update status text
@@ -301,6 +326,23 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(status_text(&Some(s)), "Computing: Prime Gap — 1 task active");
+    }
+
+    #[test]
+    fn resume_is_offered_for_a_user_pause_only() {
+        // TB-72: a schedule pause is not the daemon's resume to undo.
+        assert_eq!(pause_menu(&status("paused", Some("user"))), ("Resume".to_string(), true));
+        assert_eq!(
+            pause_menu(&status("paused", Some("scheduled"))),
+            ("Paused by your schedule".to_string(), false)
+        );
+        assert_eq!(
+            pause_menu(&status("paused", Some("thermal"))),
+            ("Paused — thermal".to_string(), false)
+        );
+        assert_eq!(pause_menu(&status("paused", None)), ("Paused".to_string(), false));
+        assert_eq!(pause_menu(&status("active", None)), ("Pause".to_string(), true));
+        assert_eq!(pause_menu(&None), ("Pause".to_string(), true));
     }
 
     #[test]

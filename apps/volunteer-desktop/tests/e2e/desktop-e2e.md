@@ -118,6 +118,7 @@ old PID lingers, note the platform. 4.4 — search the log for `disk gate`.
 | 5.4 | **Launch minimized** (start on boot): turn it on, log out and back in (or reboot). | The app starts with the daemon running and only the tray icon visible; no window opens until you choose Open Dashboard. Turn it off afterwards. |
 | 5.5 | Identity section. | The public key is shown; the regenerate option asks for confirmation and warns that credit is tied to the key. Do not confirm. |
 | 5.6 | Notifications: turn **Work unit completed** on. | A completion notification appears when the next unit finishes (revisit after section 3 if needed). |
+| 5.7 | Container runtime card. | It names the engine that answers: **Podman** with its version when lettuce found a Podman binary (machine figures and Start/Stop Machine below it), **Podman** with its version and a note that the machine is managed outside the app when Podman answers on the Docker-compatible socket (Podman Desktop's Docker compatibility), **Docker** for Docker itself. A Podman host is never labelled Docker or told to install Podman. |
 
 ## 6. History
 
@@ -127,7 +128,7 @@ Precondition: at least one unit completed (section 3).
 |---|---|---|
 | 6.1 | Open History. | The completed unit is listed under today's date with its leaf name, the first characters of its work-unit ID, completion time, head, and CPU time. Its badge reads **Head accepted** (hover: it explains that acceptance is recorded on submission and that validation and credit are decided later on the head). A count of loaded entries and an **End of history** line are shown. |
 | 6.2 | Expand the row. | CPU time, wall clock, time paused, head, "Head accepted: Yes", and the full work-unit ID with a working **Copy** button. |
-| 6.3 | Leaf filter: choose **beyblade-arena**, then **All Leafs**. | Only that leaf's entries are shown, with the count reading "N matching of M loaded"; clearing restores the list. The dropdown keeps listing every leaf seen. |
+| 6.3 | Leaf filter: choose **beyblade-arena**, then **All Leafs**. | Only that leaf's entries are shown, with the count reading "N matching of M loaded"; clearing restores the list. The dropdown lists every leaf in the history from the first page — including one whose last unit is older than the rows loaded so far — and keeps them all while a leaf is selected. |
 | 6.4 | Head accepted filter: choose **Head rejected**. | The list shows "No entries match the current filters" (assuming nothing was rejected); the count still shows how many were loaded. Return to **All submissions**. |
 | 6.5 | Date range: **Last 7 days**, **All time**, **Custom** with a range that excludes today. | Entries appear or disappear accordingly. |
 | 6.6 | Export **CSV**. | A file `lettuce-history.csv` is saved with the header `work_unit_id,leaf_name,head_name,completed_at,duration_seconds,cpu_seconds,credit_earned,head_accepted` and one row per entry (`head_accepted` is `true`/`false`). |
@@ -152,6 +153,8 @@ that directory must exist and hold an `index.html`.
 | 7.5 | Relaunch the app. | The daemon starts, adopts the frozen unit, and the unit resumes from where it was (progress continues from the previous figure; the log reports the unit resumed). |
 | 7.6 | macOS only: with a unit running, quit through the application menu (**Lettuce Compute → Quit**, or ⌘Q), then repeat 7.5. | Exactly the result of 7.4 and 7.5: the daemon has exited, the unit is frozen (`ps` shows its process stopped, not running), and it resumes on relaunch. A daemon still computing after the app is gone is the bug. |
 | 7.7 | Settings → change the log level (a "restart required" change) → **Restart** in the banner. | The restart succeeds on the first try, within a few seconds: no "Daemon (PID …) did not exit after stop --force". `daemon.json` shows a new PID. |
+
+| 7.8 | Settings → Schedule → **Scheduled**, paint a window that is closed right now, save; look at Overview and the tray. Restore **Always** afterwards. | Overview shows **Paused — outside your schedule** with a **Change schedule** button in place of **Resume** (there is no Resume: only a pause you started can be resumed); the task list reads that computing is paused by the schedule; the tray's pause item reads **Paused by your schedule** and is greyed out. |
 
 On failure: 7.4–7.6 — search the log for `preserving work directory` and `resum`; 7.7 — `ps -o pid,stat -p <old PID>` right after a failed restart (a `Z` state means the app did not reap its child).
 

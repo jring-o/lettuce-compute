@@ -25,6 +25,8 @@ import {
   formatGb,
   formatDateTime,
   pausedLabel,
+  pauseIsResumable,
+  pausedExplanation,
 } from "@/lib/utils";
 import {
   getClientVersion,
@@ -387,6 +389,19 @@ export function OverviewPage() {
   const tasks = status?.active_tasks ?? [];
   const queuedTasks = status?.queued_tasks ?? [];
   const isPaused = state === "paused";
+  const pausedReason = status?.paused_reason ?? null;
+  // The daemon's resume undoes a user pause only; offered for a schedule
+  // pause it was refused with 409 "not paused" and the refusal was swallowed,
+  // so the button did nothing (TB-72). Any other pause names its remedy.
+  const canResume = isPaused && pauseIsResumable(pausedReason);
+
+  // A refused pause or resume, with the daemon's own reason, for a few seconds.
+  const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    if (!toast) return;
+    const id = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(id);
+  }, [toast]);
 
   const taskActions: TaskActions = useMemo(() => ({
     onSuspend: (id) => client?.suspendTask(id),
@@ -448,16 +463,30 @@ export function OverviewPage() {
 
   const handlePauseResume = async () => {
     if (!client) return;
-    if (isPaused) {
-      await client.resume();
-    } else {
-      await client.pause();
+    try {
+      if (isPaused) {
+        await client.resume();
+      } else {
+        await client.pause();
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      setToast(`Could not ${isPaused ? "resume" : "pause"}: ${reason}`);
     }
   };
 
   return (
     <div className="p-6 space-y-6 max-w-3xl mx-auto">
       <UpdateRequiredBanner heads={heads} />
+
+      {toast && (
+        <div
+          role="alert"
+          className="fixed top-4 right-4 z-50 rounded-md px-4 py-2 text-sm font-medium shadow-lg bg-destructive text-destructive-foreground"
+        >
+          {toast}
+        </div>
+      )}
 
       {/* Status section */}
       <div className="flex items-center justify-between">
@@ -469,13 +498,19 @@ export function OverviewPage() {
             </span>
           )}
         </div>
-        {state !== "stopped" && (
-          <Button
-            variant={isPaused ? "default" : "outline"}
-            size="sm"
-            onClick={handlePauseResume}
-          >
-            {isPaused ? "Resume" : "Pause"}
+        {state === "active" && (
+          <Button variant="outline" size="sm" onClick={handlePauseResume}>
+            Pause
+          </Button>
+        )}
+        {canResume && (
+          <Button variant="default" size="sm" onClick={handlePauseResume}>
+            Resume
+          </Button>
+        )}
+        {isPaused && !canResume && pausedReason === "scheduled" && (
+          <Button variant="outline" size="sm" onClick={() => emit("navigate:settings")}>
+            Change schedule
           </Button>
         )}
       </div>
@@ -576,9 +611,7 @@ export function OverviewPage() {
             ))
           )
         ) : isPaused ? (
-          <p className="text-sm text-muted-foreground">
-            Computing is paused. Resume to start contributing.
-          </p>
+          <p className="text-sm text-muted-foreground">{pausedExplanation(pausedReason)}</p>
         ) : (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <PulsingDot />

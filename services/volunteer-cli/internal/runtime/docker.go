@@ -635,28 +635,30 @@ func IsDockerAvailable() bool {
 	return err == nil
 }
 
-// DockerEngineName reports which engine serves the Docker-compatible API the
-// default client reaches (the Docker socket, or DOCKER_HOST): "podman" when the
-// server's version components name Podman — its compatibility API reports a
-// "Podman Engine" component — "docker" otherwise, and "" when the API could not
-// be asked. The Docker probe only checks that something answers on the Docker
-// socket; on a Podman Desktop or podman-mac-helper host that something is
-// Podman, and the backend used to be labelled "Docker" regardless (TB-54).
-func DockerEngineName() string {
+// DockerEngine reports which engine serves the Docker-compatible API the
+// default client reaches (the Docker socket, or DOCKER_HOST), and its version:
+// "podman" when the server's version components name Podman — its
+// compatibility API reports a "Podman Engine" component — "docker" otherwise,
+// and "" when the API could not be asked. The Docker probe only checks that
+// something answers on the Docker socket; on a Podman Desktop or
+// podman-mac-helper host that something is Podman, and the backend used to be
+// labelled "Docker" regardless (TB-54). The version is the server's own
+// (Podman's on that host), so the app's runtime card can show it (TB-73).
+func DockerEngine() (engine, version string) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer cli.Close()
 	v, err := cli.ServerVersion(context.Background())
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	names := make([]string, 0, len(v.Components))
 	for _, c := range v.Components {
 		names = append(names, c.Name)
 	}
-	return engineNameFromVersion(v.Platform.Name, names)
+	return engineNameFromVersion(v.Platform.Name, names), v.Version
 }
 
 // engineNameFromVersion classifies a Docker-compatible server from its version

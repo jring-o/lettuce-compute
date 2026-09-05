@@ -43,11 +43,15 @@ function entry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
 function makeResponse(
   entries: HistoryEntry[],
   nextCursor = "",
-  hasMore = false
+  hasMore = false,
+  leafNames?: string[]
 ): HistoryResponse {
   return {
     entries,
     pagination: { next_cursor: nextCursor, has_more: hasMore },
+    // The daemon names every leaf in the file with each page (TB-71); a
+    // fixture that says nothing names the leaves on its own rows.
+    leaf_names: leafNames ?? Array.from(new Set(entries.map((e) => e.leaf_name))).sort(),
   };
 }
 
@@ -448,5 +452,42 @@ describe("refresh (TB-68)", () => {
     await waitFor(() => expect(result.current.loadedCount).toBe(3));
     expect(result.current.entries.map((e) => e.work_unit_id)).toEqual(["wu-3", "wu-1"]);
     expect(result.current.leafNames).toEqual(["A", "B"]);
+  });
+});
+
+describe("TB-71: the leaf filter lists every leaf in the history, not only the loaded pages", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const beybladePage = () =>
+    Array.from({ length: HISTORY_PAGE_SIZE }, (_, i) =>
+      entry({ work_unit_id: `bb-${i}`, leaf_name: "Beyblade Arena" })
+    );
+
+  it("offers a leaf whose rows are all on pages not loaded yet", async () => {
+    // The newest 50 rows are one leaf's; the daemon names both leaves.
+    mockHistory.mockResolvedValueOnce(
+      makeResponse(beybladePage(), "50", true, ["Beyblade Arena", "GREP v1"])
+    );
+
+    const { result } = renderHook(() => useHistory(defaultFilters()));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.loadedCount).toBe(HISTORY_PAGE_SIZE);
+    expect(mockHistory).toHaveBeenCalledTimes(1);
+    expect(result.current.leafNames).toEqual(["Beyblade Arena", "GREP v1"]);
+  });
+
+  it("keeps the whole list when the selected leaf matches no loaded row", async () => {
+    mockHistory.mockResolvedValue(
+      makeResponse(beybladePage(), "", false, ["Beyblade Arena", "GREP v1"])
+    );
+
+    const { result } = renderHook(() => useHistory(defaultFilters({ leafName: "GREP v1" })));
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.entries).toHaveLength(0);
+    expect(result.current.leafNames).toEqual(["Beyblade Arena", "GREP v1"]);
   });
 });

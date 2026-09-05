@@ -737,6 +737,13 @@ func containsIgnoreCase(s, substr string) bool {
 type HistoryResponse struct {
 	Entries    []HistoryEntryInfo `json:"entries"`
 	Pagination PaginationInfo     `json:"pagination"`
+	// LeafNames is every distinct leaf display name in the WHOLE history file,
+	// sorted, regardless of the page, cursor or filters this request asked for.
+	// The desktop app's leaf filter is built from it: built from the pages
+	// loaded so far, a leaf whose last unit was older than the newest page
+	// could not be selected until the reader had scrolled one of its rows into
+	// view (TB-71). The file is read in full for the page anyway.
+	LeafNames []string `json:"leaf_names"`
 }
 
 // HistoryEntryInfo describes a completed work unit.
@@ -768,6 +775,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 
 	cfg := b.daemon.GetConfig()
 	entries := readAllHistory(cfg.DataDir)
+	leafNames := b.historyLeafNames(entries)
 
 	// Apply filters.
 	var filtered []daemon.HistoryEntry
@@ -804,6 +812,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 		return HistoryResponse{
 			Entries:    []HistoryEntryInfo{},
 			Pagination: PaginationInfo{},
+			LeafNames:  leafNames,
 		}
 	}
 
@@ -843,7 +852,26 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 			NextCursor: nextCursor,
 			HasMore:    hasMore,
 		},
+		LeafNames: leafNames,
 	}
+}
+
+// historyLeafNames is the sorted set of display names the given entries would
+// be served under — the same name per entry as historyLeafName, so the filter
+// built from the list matches the rows it is applied to.
+func (b *DaemonBridge) historyLeafNames(entries []daemon.HistoryEntry) []string {
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, e := range entries {
+		name := b.historyLeafName(e)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // readAllHistory reads all history entries (newest first). A file that cannot be
@@ -1907,7 +1935,14 @@ func toStringSlice(arr []any) []string {
 
 // ContainerRuntimeStatusResponse is the response for GET /api/v1/container-runtime.
 type ContainerRuntimeStatusResponse struct {
-	Backend         string  `json:"backend"`
+	Backend string `json:"backend"`
+	// Engine names what actually answers the socket the registered runtime is
+	// connected to: "podman" when Podman serves the Docker-compatible socket
+	// (Podman Desktop's Docker compatibility, podman-mac-helper), "docker" for
+	// Docker itself, "" when the runtime could not be asked. Backend alone
+	// labelled such a host "Docker" in the app's runtime card and advised
+	// installing the Podman that was already running (TB-73).
+	Engine          string  `json:"engine"`
 	Status          string  `json:"status"`
 	Version         string  `json:"version"`
 	SocketPath      string  `json:"socket_path"`
@@ -1960,6 +1995,7 @@ func (b *DaemonBridge) GetContainerRuntimeStatus() ContainerRuntimeStatusRespons
 		if backend.Backend != "" {
 			resp.Backend = string(backend.Backend)
 		}
+		resp.Engine = backend.Engine
 		resp.Version = backend.Version
 		if resp.SocketPath == "" {
 			resp.SocketPath = backend.SocketPath
