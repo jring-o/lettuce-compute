@@ -81,15 +81,18 @@ Precondition: section 2 complete, the daemon active, machine idle.
 | # | Action | Expected |
 |---|---|---|
 | 3.1 | Overview tab, wait up to 5 minutes. | A **beyblade-arena** unit appears in the active tasks with progress climbing, the head name `lbry.science`, runtime **container**. Before it starts, the log shows the container image and the visualization bundle being downloaded. |
-| 3.2 | Look at the visualization panel above the task list. | The unit's live visualization renders inside the panel (not a blank dark box) and updates as the unit runs. |
-| 3.3 | Click the task row. | The detail panel opens with CPU, memory, and progress figures; the panel keeps showing the same unit's visualization. |
-| 3.4 | Click **Pause** at the top of Overview, wait 10 s, click **Resume**. | The task is shown as suspended (with the reason "user") then running again; progress does not reset; the visualization stops updating while paused. |
+| 3.2 | Look at the visualization panel above the task list. | If the leaf's bundle has a live view, it renders inside the panel and updates as the unit runs. The Beyblade bundle deployed on `lbry.science` today is replay-only, so within about 15 s of the unit starting the panel collapses to a single line reading that **beyblade-arena** has no live view and that finished units can be replayed from History. It is never a dark box captioned "Waiting for replay data…" for the rest of the run, and never a black box with no text. |
+| 3.3 | Click the task row. | The detail panel opens with CPU, memory, and progress figures; the panel keeps showing the same unit's visualization (or its one-line note). |
+| 3.4 | Click **Pause** at the top of Overview, wait 10 s, click **Resume**. | The task is shown as suspended (with the reason "user") then running again; progress does not reset; a live visualization, where the bundle has one, stops updating while paused. |
 | 3.5 | Wait for the unit to finish (about 12 minutes). | The task leaves the active list; the tray and Overview return to "waiting for work" or start the next unit; the log shows the result submitted and `accepted=true`. If notifications are on, a completion notification appears. |
 | 3.6 | Credit on Overview. | Credit figures refresh within a minute of completion; they may be decimals (for example `0.5`). |
 
 On failure: a unit that never arrives is almost always a trust or resource-fit problem —
-search the log for `trusted` and for `disk`; a visualization panel that stays dark is a
-bundle problem — search the log for `PrepareVizBundle`.
+search the log for `trusted` and for `disk`; a visualization panel that stays dark with no
+text for more than a few seconds is a bundle problem (the app replaces a page that never
+starts with a note within 5 s) — search the log for `PrepareVizBundle`. A panel reading that
+the visualization "could not start on this machine" means the page threw before its
+handshake; on a Mac, check WebGL at get.webgl.org in Safari and note the machine.
 
 ## 4. Projects page
 
@@ -129,7 +132,7 @@ Precondition: at least one unit completed (section 3).
 | 6.5 | Date range: **Last 7 days**, **All time**, **Custom** with a range that excludes today. | Entries appear or disappear accordingly. |
 | 6.6 | Export **CSV**. | A file `lettuce-history.csv` is saved with the header `work_unit_id,leaf_name,head_name,completed_at,duration_seconds,cpu_seconds,credit_earned,head_accepted` and one row per entry (`head_accepted` is `true`/`false`). |
 | 6.7 | Export **JSON**. | `lettuce-history.json` holds an array with the same entries as the daemon reports them. |
-| 6.8 | Replay (requires the client build described under "Before you start"): expand the beyblade-arena row and click **View Visualization**. | A dialog opens and replays the unit's result in the visualization. Escape or the close button closes it. The result's `viz_bundle_path` in `~/.lettuce/results/index.jsonl` points under `~/.lettuce/results/viz/`. If the dialog instead reports that the visualization files are no longer on this machine, the step fails: either the bundled client is too old (its recorded path was inside the deleted work directory) or the kept copy is missing — note which. |
+| 6.8 | Replay (requires the client build described under "Before you start"): expand the beyblade-arena row and click **View Visualization**. | A dialog opens and replays the unit's result in the visualization. Escape or the close button closes it. The result's `viz_bundle_path` in `~/.lettuce/results/index.jsonl` points under `~/.lettuce/results/viz/`. If the dialog instead reports that the visualization files are no longer on this machine, the step fails: either the bundled client is too old (its recorded path was inside the deleted work directory) or the kept copy is missing — note which. If it reads that the visualization could not start on this machine, the page threw before its handshake (on a Mac, usually no WebGL in the web view — check get.webgl.org in Safari); that is an environment limitation, not a step failure — note the machine. |
 | 6.9 | With more entries than fit the window (choose **All time** if needed), scroll the list. | Only the list scrolls: the tab bar stays at the top of the window and the status bar at the bottom throughout, and the day headers stick just below the tab bar. On macOS no scroll indicator appears in the tab bar's corner. |
 | 6.10 | Credit at the default window size, without scrolling. | The **Credit by Head** card (**Credit by Leaf** when no head reports credit) sits beside the list at its top. In a window narrower than about 790 px it sits above the list instead. It is never below the list. |
 | 6.11 | Choose **All time**, scroll down until more rows have loaded, switch to Overview, then back to History. | The date range, the loaded rows and the scroll position are as you left them. A unit that completed meanwhile appears at the top of the list. |

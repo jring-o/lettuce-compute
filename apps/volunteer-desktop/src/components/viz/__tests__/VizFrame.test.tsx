@@ -415,3 +415,258 @@ describe("isValidRelPath", () => {
     expect(isValidRelPath("frames//0001.bin")).toBe(false);
   });
 });
+
+// ============================================================
+// TB-69: a page that cannot draw in this mode is replaced by a note
+// ============================================================
+
+import { describeVizUnavailable, VIZ_IDLE_TIMEOUT_MS, VIZ_SILENT_TIMEOUT_MS } from "../VizFrame";
+
+/** Dispatch a message as the frame's page would post it (source = the frame's window). */
+function postFromFrame(container: HTMLElement, data: unknown) {
+  const iframe = container.querySelector("iframe");
+  expect(iframe?.contentWindow).toBeTruthy();
+  window.dispatchEvent(new MessageEvent("message", { data, source: iframe!.contentWindow }));
+}
+
+/** Render under fake timers and flush set_viz_base so the iframe is mounted. */
+async function renderWithFakeTimers(props?: Partial<Parameters<typeof VizFrame>[0]>) {
+  let result!: ReturnType<typeof render>;
+  await act(async () => {
+    result = render(
+      <VizFrame vizBundlePath="/work/.lettuce-viz" workDir="/work" leafSlug="t" paused={false} {...props} />
+    );
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  expect(result.container.querySelector("iframe")).toBeTruthy();
+  return result;
+}
+
+describe("TB-69: the host replaces a page that cannot draw in this mode", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockInvoke.mockResolvedValue([]);
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  it("a live page that declares modes: ['replay'] is replaced by the no-live-view note and the parent is told", async () => {
+    const onUnavailable = vi.fn();
+    const result = await renderWithFakeTimers({ onUnavailable });
+    const post = vi.spyOn(result.container.querySelector("iframe")!.contentWindow!, "postMessage");
+
+    await act(async () => {
+      postFromFrame(result.container, { type: "vizReady", modes: ["replay"] });
+    });
+
+    const note = result.getByTestId("viz-unavailable");
+    expect(note).toHaveAttribute("data-reason", "unsupported");
+    expect(note).toHaveTextContent(
+      "This leaf has no live view. Finished units can be replayed from History."
+    );
+    expect(result.container.querySelector("iframe")).toBeNull();
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    expect(onUnavailable).toHaveBeenCalledWith("unsupported");
+    // No point initialising a page for a mode it does not implement.
+    expect(post.mock.calls.some(([m]) => (m as { type?: string })?.type === "vizInit")).toBe(false);
+  });
+
+  it("a replay page that declares modes: ['live'] shows the no-replay-view note", async () => {
+    const result = await renderWithFakeTimers({
+      mode: "replay",
+      replayData: { frames: [] },
+      workDir: undefined,
+    });
+
+    await act(async () => {
+      postFromFrame(result.container, { type: "vizReady", modes: ["live"] });
+    });
+
+    expect(result.getByTestId("viz-unavailable")).toHaveTextContent(
+      "This visualization has no replay view."
+    );
+  });
+
+  it("a page that declares the current mode is initialised and believed without an idle test", async () => {
+    const onUnavailable = vi.fn();
+    const result = await renderWithFakeTimers({ onUnavailable });
+    const post = vi.spyOn(result.container.querySelector("iframe")!.contentWindow!, "postMessage");
+
+    await act(async () => {
+      postFromFrame(result.container, { type: "vizReady", modes: ["live", "replay"] });
+    });
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "vizInit", mode: "live" }), "*");
+
+    // It asks for no file, but it said it can draw live: believed.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(VIZ_IDLE_TIMEOUT_MS + 1000);
+    });
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+    expect(result.container.querySelector("iframe")).toBeTruthy();
+    expect(onUnavailable).not.toHaveBeenCalled();
+  });
+
+  it("a page that says nothing within 5 s of load is presumed dead", async () => {
+    const onUnavailable = vi.fn();
+    const result = await renderWithFakeTimers({ onUnavailable });
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      await vi.advanceTimersByTimeAsync(VIZ_SILENT_TIMEOUT_MS - 1);
+    });
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    const note = result.getByTestId("viz-unavailable");
+    expect(note).toHaveAttribute("data-reason", "silent");
+    expect(note).toHaveTextContent("The visualization could not start on this machine.");
+    expect(result.container.querySelector("iframe")).toBeNull();
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    expect(onUnavailable).toHaveBeenCalledWith("silent");
+  });
+
+  it("the same silence in replay mode shows the same note (the History modal on a machine without WebGL)", async () => {
+    const result = await renderWithFakeTimers({
+      mode: "replay",
+      replayData: { frames: [] },
+      workDir: undefined,
+    });
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      await vi.advanceTimersByTimeAsync(VIZ_SILENT_TIMEOUT_MS);
+    });
+
+    expect(result.getByTestId("viz-unavailable")).toHaveTextContent(
+      "The visualization could not start on this machine."
+    );
+  });
+
+  it("an undeclared live page that answers but never asks for a file is presumed replay-only after 15 s (the deployed Beyblade bundle)", async () => {
+    const onUnavailable = vi.fn();
+    const result = await renderWithFakeTimers({ onUnavailable });
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      postFromFrame(result.container, { type: "vizReady" });
+      await vi.advanceTimersByTimeAsync(VIZ_SILENT_TIMEOUT_MS + 1000);
+    });
+    // It spoke, so it is not "silent"...
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(VIZ_IDLE_TIMEOUT_MS);
+    });
+    // ...but it never touched the work directory.
+    const note = result.getByTestId("viz-unavailable");
+    expect(note).toHaveAttribute("data-reason", "idle");
+    expect(note).toHaveTextContent(
+      "This leaf has no live view. Finished units can be replayed from History."
+    );
+    expect(onUnavailable).toHaveBeenCalledTimes(1);
+    expect(onUnavailable).toHaveBeenCalledWith("idle");
+  });
+
+  it("an undeclared live page that watches a file keeps its frame", async () => {
+    const onUnavailable = vi.fn();
+    const result = await renderWithFakeTimers({ onUnavailable });
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      postFromFrame(result.container, { type: "vizReady" });
+      postFromFrame(result.container, { type: "watchFile", path: "output/progress.txt", interval: 1000 });
+      await vi.advanceTimersByTimeAsync(VIZ_IDLE_TIMEOUT_MS + VIZ_SILENT_TIMEOUT_MS);
+    });
+
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+    expect(result.container.querySelector("iframe")).toBeTruthy();
+    expect(onUnavailable).not.toHaveBeenCalled();
+    expect(mockInvoke.mock.calls.some(([cmd]) => cmd === "viz_read_file")).toBe(true);
+  });
+
+  it("a page that skips vizReady but asks for a file after the fallback init keeps its frame", async () => {
+    const result = await renderWithFakeTimers();
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      // The 150 ms fallback vizInit has gone out by now.
+      await vi.advanceTimersByTimeAsync(1000);
+      postFromFrame(result.container, { type: "readFile", id: "r1", path: "output/state.json" });
+      await vi.advanceTimersByTimeAsync(VIZ_IDLE_TIMEOUT_MS + VIZ_SILENT_TIMEOUT_MS);
+    });
+
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+    expect(result.container.querySelector("iframe")).toBeTruthy();
+  });
+
+  it("a replay page that posts vizReady gets its data and is never presumed idle", async () => {
+    const result = await renderWithFakeTimers({
+      mode: "replay",
+      replayData: { frames: [] },
+      workDir: undefined,
+    });
+    const post = vi.spyOn(result.container.querySelector("iframe")!.contentWindow!, "postMessage");
+
+    await act(async () => {
+      result.container.querySelector("iframe")!.dispatchEvent(new Event("load"));
+      postFromFrame(result.container, { type: "vizReady" });
+      await vi.advanceTimersByTimeAsync(VIZ_IDLE_TIMEOUT_MS + VIZ_SILENT_TIMEOUT_MS);
+    });
+
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "replayData", frames: [] }), "*");
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+    expect(result.container.querySelector("iframe")).toBeTruthy();
+  });
+
+  it("a new bundle path starts the verdict afresh", async () => {
+    const result = await renderWithFakeTimers();
+    await act(async () => {
+      postFromFrame(result.container, { type: "vizReady", modes: ["replay"] });
+    });
+    expect(result.getByTestId("viz-unavailable")).toBeInTheDocument();
+
+    await act(async () => {
+      result.rerender(
+        <VizFrame vizBundlePath="/work2/.lettuce-viz" workDir="/work2" leafSlug="t" paused={false} />
+      );
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.queryByTestId("viz-unavailable")).toBeNull();
+    expect(result.container.querySelector("iframe")).toBeTruthy();
+  });
+});
+
+describe("describeVizUnavailable", () => {
+  it("names the leaf when the caller has one", () => {
+    expect(describeVizUnavailable("unsupported", "live", "Beyblade Arena")).toBe(
+      "Beyblade Arena has no live view. Finished units can be replayed from History."
+    );
+    expect(describeVizUnavailable("idle", "live", "Beyblade Arena")).toBe(
+      "Beyblade Arena has no live view. Finished units can be replayed from History."
+    );
+    expect(describeVizUnavailable("silent", "live", "Beyblade Arena")).toBe(
+      "The visualization for Beyblade Arena could not start on this machine."
+    );
+    expect(describeVizUnavailable("unsupported", "replay", "Beyblade Arena")).toBe(
+      "The visualization for Beyblade Arena has no replay view."
+    );
+  });
+
+  it("falls back to generic wording without a name", () => {
+    expect(describeVizUnavailable("unsupported", "live")).toBe(
+      "This leaf has no live view. Finished units can be replayed from History."
+    );
+    expect(describeVizUnavailable("silent", "replay", "  ")).toBe(
+      "The visualization could not start on this machine."
+    );
+    expect(describeVizUnavailable("unsupported", "replay")).toBe(
+      "This visualization has no replay view."
+    );
+  });
+});

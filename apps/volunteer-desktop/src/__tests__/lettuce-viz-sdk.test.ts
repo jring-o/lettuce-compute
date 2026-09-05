@@ -367,4 +367,36 @@ describe("lettuce-viz SDK", () => {
     const result = await listPromise;
     expect(result).toEqual([]);
   });
+
+  // --- TB-69: a page may declare which modes it implements ---
+
+  it("ready() sends the declared modes with every vizReady, retries included (TB-69)", async () => {
+    const createVizClient = await loadSdk();
+    const client = createVizClient({ modes: ["replay"] });
+
+    client.ready();
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { type: "vizReady", modes: ["replay"] },
+      "*"
+    );
+
+    vi.advanceTimersByTime(200);
+    expect(postMessageSpy).toHaveBeenCalledTimes(2);
+    expect(postMessageSpy).toHaveBeenLastCalledWith(
+      { type: "vizReady", modes: ["replay"] },
+      "*"
+    );
+  });
+
+  it("ready() without modes posts the bare vizReady, so an undeclared page claims both modes (TB-69)", async () => {
+    const createVizClient = await loadSdk();
+    const client = createVizClient();
+
+    client.ready();
+
+    const [msg] = postMessageSpy.mock.calls[0];
+    expect(msg).toEqual({ type: "vizReady" });
+    expect("modes" in msg).toBe(false);
+  });
 });

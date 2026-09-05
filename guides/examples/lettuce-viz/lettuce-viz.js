@@ -7,7 +7,7 @@
  *
  * Usage:
  *   import { createVizClient } from './lettuce-viz.js';
- *   const viz = createVizClient();
+ *   const viz = createVizClient({ modes: ['live', 'replay'] });
  *   const init = await viz.ready();
  *   // init = { mode: 'live' | 'replay', leafSlug, params }
  *
@@ -16,9 +16,16 @@
 
 /**
  * Create a viz client that communicates with the Lettuce host via postMessage.
+ * @param {object} [options]
+ * @param {("live"|"replay")[]} [options.modes] - The modes this page implements.
+ *   Sent with every `vizReady`; a host shows the page only in a declared mode
+ *   and puts a note in its place otherwise. Omit it to claim both modes — the
+ *   desktop app then expects a live page to ask for a file within 15 s of
+ *   `vizInit` (see the README).
  * @returns {object} Viz client API
  */
-export function createVizClient() {
+export function createVizClient(options = {}) {
+  const _modes = Array.isArray(options.modes) ? options.modes.slice() : null;
   let _initResolve = null;
   let _initData = null;
   const _pendingRequests = new Map(); // id -> { resolve, reject }
@@ -124,7 +131,10 @@ export function createVizClient() {
       // Signal readiness to the parent, with retries in case the parent's
       // message listener isn't registered yet (race condition on fast loads).
       function sendVizReady() {
-        window.parent.postMessage({ type: "vizReady" }, "*");
+        window.parent.postMessage(
+          _modes ? { type: "vizReady", modes: _modes } : { type: "vizReady" },
+          "*"
+        );
         _vizReadyRetryCount++;
         if (_vizReadyRetryCount < 5 && !_initialized) {
           _vizReadyRetryTimer = setTimeout(sendVizReady, 200);

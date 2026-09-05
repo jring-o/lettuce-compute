@@ -5,7 +5,7 @@ import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
 import { useCredit } from "@/hooks/use-credit";
 import { useClient, useApiQuery } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
-import { VizFrame } from "@/components/viz/VizFrame";
+import { VizFrame, describeVizUnavailable, type VizUnavailableReason } from "@/components/viz/VizFrame";
 import { ResourceGauge } from "@/components/resource-gauge";
 import { CreditDisplay } from "@/components/credit-display";
 import { NoticesPanel } from "@/components/notices-panel";
@@ -434,6 +434,17 @@ export function OverviewPage() {
   const vizWorkDir = vizTask?.work_dir ?? null;
   const vizBundlePath = vizTask?.viz_bundle_path ?? null;
   const vizLeafSlug = vizTask?.leaf_name ?? "";
+  const vizTaskId = vizTask?.work_unit_id ?? null;
+
+  // The frame's verdict on the shown unit's bundle (TB-69): once it reports
+  // the page has no live view, or never started, the 320 px panel gives way
+  // to a one-line note. Keyed by unit so switching units starts afresh.
+  const [vizUnavailable, setVizUnavailable] = useState<{ workUnitId: string; reason: VizUnavailableReason } | null>(null);
+  const vizUnavailableReason =
+    vizTaskId && vizUnavailable?.workUnitId === vizTaskId ? vizUnavailable.reason : null;
+  const handleVizUnavailable = useCallback((reason: VizUnavailableReason) => {
+    if (vizTaskId) setVizUnavailable({ workUnitId: vizTaskId, reason });
+  }, [vizTaskId]);
 
   const handlePauseResume = async () => {
     if (!client) return;
@@ -471,14 +482,23 @@ export function OverviewPage() {
 
       {/* Visualization panel */}
       <div className="space-y-2">
-        {vizBundlePath && vizWorkDir ? (
+        {vizBundlePath && vizWorkDir && vizUnavailableReason ? (
+          <div
+            data-testid="viz-unavailable-note"
+            className="flex items-center justify-center rounded-lg border bg-muted/20 px-4 text-center text-sm text-muted-foreground"
+            style={{ height: 80 }}
+          >
+            {describeVizUnavailable(vizUnavailableReason, "live", vizLeafSlug)}
+          </div>
+        ) : vizBundlePath && vizWorkDir ? (
           <div className="rounded-lg overflow-hidden border" style={{ height: 320 }}>
             <VizFrame
-              key={vizTask?.work_unit_id}
+              key={vizTaskId ?? undefined}
               vizBundlePath={vizBundlePath}
               workDir={vizWorkDir}
               leafSlug={vizLeafSlug}
               paused={isPaused}
+              onUnavailable={handleVizUnavailable}
             />
           </div>
         ) : tasks.length > 0 ? (
