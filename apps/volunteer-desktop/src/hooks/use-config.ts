@@ -17,20 +17,20 @@ import {
  * - `scheduling`: `resource.NewScheduler` copies mode, idle threshold and the
  *   schedule ranges at construction and is never rebuilt.
  * - `thermal`: copied into the thermal monitor's config at construction.
- * - `resource_limits`: the hardware profile advertised to heads (which decides
- *   what work they offer) is detected once at start, and the native process
- *   limiter holds the original limits struct.
  * - `max_concurrent_tasks`: the slot count is fixed at start (the daemon logs
  *   "restart daemon to apply").
  * - `log_level`: the logger's level is parsed once at start.
  *
- * `work_buffer_hours`, `notifications`, `leafs` and per-head weights and leaf
- * preferences are read live and need no restart.
+ * `resource_limits` is live since the client's TB-79 fix: `ApplyConfig`
+ * rebuilds the hardware profile heads are told (carried on the next poll),
+ * admission books against the new figures at once, and the runtimes read the
+ * new memory ceiling for the next task. Running tasks keep the ceilings they
+ * started with. `work_buffer_hours`, `notifications`, `leafs` and per-head
+ * weights and leaf preferences are read live as well.
  */
 const RESTART_ONLY_KEYS: ReadonlyArray<keyof ConfigUpdate> = [
   "scheduling",
   "thermal",
-  "resource_limits",
   "max_concurrent_tasks",
   "log_level",
 ];

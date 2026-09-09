@@ -193,7 +193,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// machine at least twice — and on Windows each probe could raise its own
 	// UAC prompt. The one result is advertised to every head and handed to the
 	// daemon.
-	hardware := client.DetectHardware(cfg)
+	hardware, detectedGPUs := client.DetectHardwareWithGPUs(cfg)
 
 	// On macOS/Windows the container engine runs inside a VM whose memory is
 	// the real ceiling for container work; when it is smaller than the memory
@@ -365,6 +365,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		ContainerFactory: containerFactory,
 		Logger:           logger,
 		Hardware:         hardware,
+		DetectedGPUs:     detectedGPUs,
 		ClientVersion:    version,
 		Notices:          notices,
 		HeadStatus:       headStatus,

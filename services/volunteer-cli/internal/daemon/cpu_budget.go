@@ -5,10 +5,8 @@ import (
 	"os/exec"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
-	"google.golang.org/protobuf/proto"
 )
 
 // The CPU budget (TB-75): resource_limits.max_cpu_cores is the most CPU
@@ -149,26 +147,23 @@ func (d *Daemon) leafMinCPUCores(leafID string) int {
 	return 0
 }
 
-// wireRuntimeLimits attaches the resource limiter, the process group and the
-// live CPU grant to the registered runtimes. The limiter is enforced against
-// a PER-UNIT set of limits: the memory ceiling is BookedMemMB(declared,
-// configured) — the same clamped number admission books — so native
-// enforcement matches admission instead of always capping at the whole
-// configured budget (BG-16); the CPU is the task's share of the budget at
-// the moment it starts (TB-75), the same grant the task is told through its
-// environment. limits is the configuration the memory ceiling clamps to.
-func (d *Daemon) wireRuntimeLimits(pg ProcessGroup, limiter resource.Limiter, limits *config.ResourceLimits) {
+// wireRuntimeLimits attaches the resource limiter, the process group, the
+// live CPU grant and the live memory ceiling to the registered runtimes. The
+// limiter is enforced against a PER-UNIT set of limits (taskLimits): the
+// memory ceiling is BookedMemMB(declared, budget) — the same clamped number
+// admission books — so native enforcement matches admission instead of
+// always capping at the whole configured budget (BG-16); the CPU is the
+// task's share of the budget at the moment it starts (TB-75), the same grant
+// the task is told through its environment. Both are read when the task
+// starts, so a limit changed while the daemon runs bounds the next task
+// (TB-79); the closure used to hold the start-up configuration's struct.
+func (d *Daemon) wireRuntimeLimits(pg ProcessGroup, limiter resource.Limiter) {
 	if d.runtimeRegistry == nil {
 		return
 	}
-	taskLimits := func(declaredMemMB int, cpu runtime.CPUGrant) *resource.TaskLimits {
-		return &resource.TaskLimits{
-			MaxMemoryMB: runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB),
-			CPU:         cpu,
-		}
-	}
 	for _, rt := range d.runtimeRegistry.runtimes {
 		d.wireRuntimeCPU(rt)
+		d.wireRuntimeMemory(rt)
 		nr, ok := rt.(*runtime.NativeRuntime)
 		if !ok {
 			continue
@@ -177,7 +172,7 @@ func (d *Daemon) wireRuntimeLimits(pg ProcessGroup, limiter resource.Limiter, li
 			if pg != nil {
 				pg.ConfigureCommand(cmd)
 			}
-			return limiter.Apply(cmd, taskLimits(declaredMemMB, cpu))
+			return limiter.Apply(cmd, d.taskLimits(declaredMemMB, cpu))
 		})
 		nr.SetProcessNotifier(func(pid int, declaredMemMB int, cpu runtime.CPUGrant) (func(), error) {
 			if pg != nil {
@@ -185,8 +180,36 @@ func (d *Daemon) wireRuntimeLimits(pg ProcessGroup, limiter resource.Limiter, li
 					d.logger.Warn("failed to add process to group", "pid", pid, "error", err)
 				}
 			}
-			return limiter.Enforce(pid, taskLimits(declaredMemMB, cpu))
+			return limiter.Enforce(pid, d.taskLimits(declaredMemMB, cpu))
 		})
+	}
+}
+
+// taskLimits is the per-unit limit set the native limiter enforces on a
+// task starting now: its declared memory clamped to the live memory budget
+// (the figure admission booked it at), and the CPU grant it was given.
+func (d *Daemon) taskLimits(declaredMemMB int, cpu runtime.CPUGrant) *resource.TaskLimits {
+	return &resource.TaskLimits{
+		MaxMemoryMB: runtime.BookedMemMB(declaredMemMB, d.MemoryBudgetMB()),
+		CPU:         cpu,
+	}
+}
+
+// wireRuntimeMemory gives one runtime the daemon's live memory budget as the
+// ceiling it clamps a unit's declaration to at start (TB-79), the memory twin
+// of wireRuntimeCPU. Also called for a container runtime that appears after
+// start (registerContainerRuntime). The native runtime's ceiling travels
+// through the limiter closure (taskLimits) instead.
+func (d *Daemon) wireRuntimeMemory(rt runtime.Runtime) {
+	switch r := rt.(type) {
+	case *runtime.ContainerRuntime:
+		if r != nil {
+			r.SetMemoryCeilingSource(d.MemoryBudgetMB)
+		}
+	case *runtime.WasmRuntime:
+		if r != nil {
+			r.SetMemoryCeilingSource(d.MemoryBudgetMB)
+		}
 	}
 }
 
@@ -211,17 +234,9 @@ func (d *Daemon) wireRuntimeCPU(rt runtime.Runtime) {
 }
 
 // setAdvertisedCPUCores replaces the advertised hardware with a copy whose
-// CPU budget is cores. A copy, not an in-place write, for the reason
-// setAdvertisedMemoryMB gives.
+// CPU budget is cores (the late-detection clip; see updateAdvertisedHardware).
 func (d *Daemon) setAdvertisedCPUCores(cores int) {
-	d.hwMu.Lock()
-	defer d.hwMu.Unlock()
-	if d.cachedHW == nil {
-		return
-	}
-	hw := proto.Clone(d.cachedHW).(*lettucev1.HardwareCapabilities)
-	hw.MaxCpuCores = int32(cores)
-	d.cachedHW = hw
+	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) { hw.MaxCpuCores = int32(cores) })
 }
 
 // applyContainerCPUBudget lowers the advertised CPU budget to the container

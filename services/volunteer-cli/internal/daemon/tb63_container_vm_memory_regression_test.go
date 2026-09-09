@@ -230,8 +230,8 @@ func TestTB63_AdmissionBooksAgainstTheClippedBudget(t *testing.T) {
 	defer func() { freeSystemMemoryMB = defaultFreeSystemMemoryMB }()
 	d.slotManager = NewSlotManager(2, d.logger)
 
-	one := &runtime.WorkUnit{ID: "wu-1", LeafID: "leaf-grep", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}
-	two := &runtime.WorkUnit{ID: "wu-2", LeafID: "leaf-grep", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}
+	one := headContainerUnit("wu-1", "leaf-grep", "", 1024)
+	two := headContainerUnit("wu-2", "leaf-grep", "", 1024)
 	if !d.mayDelayAdmission(one, two) {
 		t.Error("mayDelayAdmission = false: two 1024 MB units fit the configured 8192 but not the VM's 1536 budget")
 	}
@@ -253,8 +253,9 @@ func TestTB63_Exit137NamesTheVMShortfall(t *testing.T) {
 		t.Fatal("RedetectContainerRuntime = false with the engine up")
 	}
 	mc := &mockClient{}
-	wu := &runtime.WorkUnit{ID: "wu-137", LeafID: "leaf-grep", Runtime: "container",
-		ExecutionSpec: runtime.ExecutionSpec{Image: "ghcr.io/example/grep:1.2", MaxMemoryMB: 7000}}
+	// Built as the head sends it (runtime "CONTAINER"): a fixture spelled the
+	// client's way hid that the note never fired in production (TB-76).
+	wu := headContainerUnit("wu-137", "leaf-grep", "ghcr.io/example/grep:1.2", 7000)
 	for i := 0; i < leafFailurePauseThreshold; i++ {
 		d.handleSlotResult(context.Background(), SlotResult{
 			WU: wu, Conn: handleSlotResultTestConn(mc),
@@ -279,8 +280,7 @@ func TestTB63_Exit137NamesTheVMShortfall(t *testing.T) {
 	// A 137 within the budget is still explained as a kill, at its own limit;
 	// any other exit code is reported as before.
 	mc = &mockClient{}
-	small := &runtime.WorkUnit{ID: "wu-small", LeafID: "leaf-grep", Runtime: "container",
-		ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}
+	small := headContainerUnit("wu-small", "leaf-grep", "", 1024)
 	d.handleSlotResult(context.Background(), SlotResult{WU: small, Conn: handleSlotResultTestConn(mc),
 		Result: &runtime.ExecutionResult{ExitCode: 137}})
 	if got := mc.lastAbandonReq.Reason; !strings.Contains(got, "usually out of memory at its 1024 MB limit") {

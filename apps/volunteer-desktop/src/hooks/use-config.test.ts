@@ -197,7 +197,9 @@ describe("needsRestart and the shared restart store", () => {
     const { needsRestart } = await import("./use-config");
     expect(needsRestart({ scheduling: { mode: "ALWAYS" } })).toBe(true);
     expect(needsRestart({ thermal: { enabled: false } })).toBe(true);
-    expect(needsRestart({ resource_limits: { max_cpu_cores: 2 } })).toBe(true);
+    // Live since the client's TB-79 fix: re-advertised on the next poll.
+    expect(needsRestart({ resource_limits: { max_cpu_cores: 2 } })).toBe(false);
+    expect(needsRestart({ resource_limits: { max_memory_mb: 6912 } })).toBe(false);
     expect(needsRestart({ max_concurrent_tasks: 2 })).toBe(true);
     expect(needsRestart({ log_level: "debug" })).toBe(true);
     expect(needsRestart({ work_buffer_hours: 3 })).toBe(false);

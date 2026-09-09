@@ -73,11 +73,11 @@ func release(d *Daemon, i int) {
 }
 
 func bbUnit(id string) *runtime.WorkUnit {
-	return &runtime.WorkUnit{ID: id, LeafID: "leaf-bb", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{Image: "ghcr.io/example/bb:1"}}
+	return headContainerUnit(id, "leaf-bb", "ghcr.io/example/bb:1", 0)
 }
 
 func grepUnit(id string) *runtime.WorkUnit {
-	return &runtime.WorkUnit{ID: id, LeafID: "leaf-grep", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{Image: "ghcr.io/example/grep:1"}}
+	return headContainerUnit(id, "leaf-grep", "ghcr.io/example/grep:1", 0)
 }
 
 // TestTB75_AdmissionBooksCoresAgainstTheBudget: under max_cpu_cores 2, two
@@ -291,7 +291,7 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	d.leafCache.PopulateForTest("server-a", &CachedHeadInfo{Name: "server-a", Leafs: []CachedLeafInfo{
 		{ID: "leaf-four", ResourceRequirements: &CachedResourceRequirements{MinCPUCores: 4}},
 	}})
-	four := &runtime.WorkUnit{ID: "four-1", LeafID: "leaf-four", Runtime: "container", ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}
+	four := headContainerUnit("four-1", "leaf-four", "", 1024)
 	if ok, reason := d.canAccommodateWU(four); !ok {
 		t.Errorf("a 4-core unit refused against a 4-core budget: %s", reason)
 	}

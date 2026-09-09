@@ -27,6 +27,10 @@ type WasmRuntime struct {
 	logger       *slog.Logger
 	httpClient   *http.Client // injectable for testing
 	memCeilingMB int          // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
+	// memCeiling, when set, is the daemon's live memory budget, read at the
+	// moment a module is instantiated (TB-79); memCeilingMB is the static
+	// figure in force until the daemon wires it.
+	memCeiling func() int
 	// cpuGrant answers "what CPU does a task starting now get" (TB-75). A WASM
 	// module runs single-threaded and is not capped, but it is told its share
 	// like every other task, and it counts as a running task in the split.
@@ -37,6 +41,20 @@ type WasmRuntime struct {
 // (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
 // memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
 func (w *WasmRuntime) SetMemoryCeilingMB(mb int) { w.memCeilingMB = mb }
+
+// SetMemoryCeilingSource wires the daemon's live memory budget as the
+// ceiling, so a limit changed while the daemon runs bounds the next module
+// without a restart (TB-79); see ContainerRuntime.SetMemoryCeilingSource.
+func (w *WasmRuntime) SetMemoryCeilingSource(fn func() int) { w.memCeiling = fn }
+
+// MemoryCeilingMB reports the memory budget WASM work is given (0 = unset):
+// the live source when the daemon wired one, else the static figure.
+func (w *WasmRuntime) MemoryCeilingMB() int {
+	if w.memCeiling != nil {
+		return w.memCeiling()
+	}
+	return w.memCeilingMB
+}
 
 // SetCPUGrantSource wires the daemon's live CPU grant (TB-75); see
 // NativeRuntime.SetCPUGrantSource.
@@ -54,7 +72,7 @@ func NewWasmRuntime(dataDir string, logger *slog.Logger) *WasmRuntime {
 }
 
 // Name returns "wasm".
-func (w *WasmRuntime) Name() string { return "wasm" }
+func (w *WasmRuntime) Name() string { return RuntimeWasm }
 
 // CanHandle returns true if spec.Binaries contains a "wasm" key and no container image is set.
 func (w *WasmRuntime) CanHandle(spec *ExecutionSpec) bool {
@@ -180,7 +198,7 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	// guest's linear memory can never grow past what admission booked. (This bounds
 	// the guest's 32-bit linear memory; wazero's own host-side allocation is a
 	// documented residual — see design §4.1.)
-	bookedMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), w.memCeilingMB)
+	bookedMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), w.MemoryCeilingMB())
 	maxPages := uint32(bookedMB) * 16 // 1 MB = 16 pages (64 KiB each)
 	runtimeConfig = runtimeConfig.WithMemoryLimitPages(maxPages)
 

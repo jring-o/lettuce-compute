@@ -91,7 +91,7 @@ func (n *NativeRuntime) currentCPUGrant() CPUGrant {
 }
 
 // Name returns "native".
-func (n *NativeRuntime) Name() string { return "native" }
+func (n *NativeRuntime) Name() string { return RuntimeNative }
 
 // platformKey returns the current OS/arch key (e.g., "linux_amd64").
 func platformKey() string {
