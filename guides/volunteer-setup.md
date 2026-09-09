@@ -227,7 +227,9 @@ work files.
   (when the daemon is running), so one paste clears the gate — no
   raise-and-check-again loop. Raise it with
   `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
-  daemon, which is when the new figure is re-advertised.
+  daemon, which is when a figure set from the command line is re-advertised. A
+  limit changed in the desktop app reaches the running daemon at once: heads
+  are told the new figures on the next poll, with no restart.
 - **`max_gpu_vram_pct` is the same kind of trap, and sharper, because it is a
   percentage.** A head does not compare a GPU leaf's memory requirement against
   your card's size — it compares it against the *share of the card you allow*,
@@ -238,9 +240,9 @@ work files.
   your machine offers and the card it came from, and suggest the percentage that
   would clear it; where no percentage can (the card really is too small) they say
   that instead. Raise it with
-  `lettuce-volunteer config set resource_limits.max_gpu_vram_pct <n>` and restart.
-  A leaf may also require a particular make of card, which the same commands
-  report.
+  `lettuce-volunteer config set resource_limits.max_gpu_vram_pct <n>` and restart
+  (or change it in the desktop app, which needs no restart). A leaf may also
+  require a particular make of card, which the same commands report.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
 

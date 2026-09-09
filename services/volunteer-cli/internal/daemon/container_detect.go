@@ -609,9 +609,11 @@ func (d *Daemon) RedetectContainerRuntime(ctx context.Context, forceMachineSetup
 // re-registration and the no-runnable-leaf verdict is re-evaluated (TB-60).
 func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtime, backend runtime.BackendInfo) {
 	d.runtimeRegistry.Register(rt)
-	// The runtime was built with the static whole-budget CPU grant; give it
-	// the daemon's live equal split (TB-75).
+	// The runtime was built with the static whole-budget CPU grant and the
+	// start-up memory ceiling; give it the daemon's live equal split (TB-75)
+	// and live memory budget (TB-79).
 	d.wireRuntimeCPU(rt)
+	d.wireRuntimeMemory(rt)
 	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetWantedImages(d.allEnabledImageRefs)
 		if d.IsRunning() && d.slotManager != nil && d.prefetchQueue != nil {

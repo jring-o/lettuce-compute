@@ -58,6 +58,17 @@ type PersistedState struct {
 	Tasks   []PersistedTask `json:"tasks"`
 }
 
+// normalizeRuntimeNames brings every persisted task's runtime name to the
+// canonical form (runtime.NormalizeRuntimeName). A file written by a build
+// before TB-76 carries the head's spelling ("CONTAINER"); the resumed unit's
+// comparisons — the runtime lookup, the exit-137 memory diagnosis — read the
+// canonical one.
+func normalizeRuntimeNames(state *PersistedState) {
+	for i := range state.Tasks {
+		state.Tasks[i].RuntimeName = runtime.NormalizeRuntimeName(state.Tasks[i].RuntimeName)
+	}
+}
+
 func activeTasksPath(dataDir string) string {
 	return filepath.Join(dataDir, "active-tasks.json")
 }
@@ -90,6 +101,7 @@ func LoadActiveState(dataDir string) (*PersistedState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parsing active tasks: %w", err)
 	}
+	normalizeRuntimeNames(&state)
 	return &state, nil
 }
 
@@ -133,6 +145,7 @@ func LoadBufferState(dataDir string) (*PersistedState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parsing buffered tasks: %w", err)
 	}
+	normalizeRuntimeNames(&state)
 	return &state, nil
 }
 

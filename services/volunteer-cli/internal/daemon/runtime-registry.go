@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
@@ -42,7 +41,7 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 	// default let a (malicious or buggy) head omit the field to steer a unit onto the
 	// least-isolated backend; leaf creation already requires a runtime, so only such
 	// a head ever sends "".
-	name := strings.ToLower(wu.Runtime)
+	name := runtime.NormalizeRuntimeName(wu.Runtime)
 	if name == "" {
 		return nil, fmt.Errorf("work unit has no runtime specified; refusing to run it")
 	}
@@ -60,7 +59,7 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 func (r *RuntimeRegistry) GetRuntime(name string) runtime.Runtime {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.runtimes[strings.ToLower(name)]
+	return r.runtimes[runtime.NormalizeRuntimeName(name)]
 }
 
 // AvailableRuntimes returns the names of all registered runtimes.

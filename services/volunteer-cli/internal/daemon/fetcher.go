@@ -145,6 +145,11 @@ type Fetcher struct {
 	// back to the head for immediate re-dispatch instead of being held past its
 	// usefulness and dropped at 90 % of deadline. nil accepts everything.
 	bufferAcceptsFn func(wu *runtime.WorkUnit) (bool, string)
+	// unfitBufferedFn is the buffer-sweep half of a live resource-limit change
+	// (TB-79): it names why a BUFFERED unit can no longer run on this machine
+	// ("" when it still can). sweepBuffer gives such units back un-run. nil
+	// keeps everything.
+	unfitBufferedFn func(wu *runtime.WorkUnit) string
 	// batchSizeFn returns how many assignments to request for a leaf given an
 	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest]. The leaf
 	// is passed so a GPU-required leaf is sized against the GPU class's own
@@ -241,12 +246,37 @@ const runtimeAbandonPauseThreshold = 3
 const reservationDropMargin = 60 * time.Second
 
 // sweepBuffer drops buffered units that have aged out, on two independent
-// grounds. Idempotent and cheap (one mutex, one pass over a short slice), so it
-// is safe to call from both the fetcher loop and the daemon's buffer-maintenance
+// grounds, and gives back units a resource-limit change has made unrunnable.
+// Idempotent and cheap (one mutex, one pass over a short slice), so it is safe
+// to call from both the fetcher loop and the daemon's buffer-maintenance
 // ticker — whichever is still running.
 func (f *Fetcher) sweepBuffer() {
 	// Deadline safety: drop at 90% of the unit's deadline.
 	f.queue.DropExpiring(0.1)
+
+	// A unit whose declaration the live budget no longer covers (the memory
+	// limit was lowered after it was buffered, TB-79) can never start here:
+	// admission would refuse it forever and the starvation cap would hold
+	// backfills behind it. Give it back now, flagged un-run so the head closes
+	// the copy RETURNED (budget-neutral, TB-35) and re-offers it at once.
+	if f.unfitBufferedFn != nil {
+		for _, u := range f.queue.DropUnfit(func(item *PreFetchItem) string {
+			if item == nil || item.WU == nil {
+				return ""
+			}
+			return f.unfitBufferedFn(item.WU)
+		}) {
+			f.logger.Info("fetcher: returning buffered unit this machine can no longer run", "work_unit_id", u.Item.WU.ID, "leaf_id", u.Item.WU.LeafID, "reason", u.Reason)
+			if u.Item.Conn != nil && u.Item.Conn.Client != nil {
+				f.giveBackWorkUnit(context.Background(), u.Item.Conn, u.Item.WU, u.Reason)
+			}
+			if u.Item.Runtime != nil && u.Item.Prep != nil {
+				if err := u.Item.Runtime.Cleanup(u.Item.Prep); err != nil {
+					f.logger.Warn("cleanup failed for returned item", "work_unit_id", u.Item.WU.ID, "error", err)
+				}
+			}
+		}
+	}
 
 	// Drop buffered items whose head-side reservation window has (nearly) lapsed.
 	// With per-task heartbeats removed, the reservation window (reserved_until) is
@@ -294,6 +324,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		starvedBackfillFn:        d.starvedBackfill,
 		leafFitGateFn:            d.leafFitGate,
 		bufferAcceptsFn:          d.bufferAccepts,
+		unfitBufferedFn:          d.unfitBuffered,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		noteArrivalEstFn:         d.noteArrivalEstimate,
@@ -1237,9 +1268,9 @@ func withBackoffJitter(d time.Duration) time.Duration {
 // runtimeKeyForWU normalizes a work unit's runtime hint for the abandon counter,
 // mirroring RuntimeRegistry.SelectRuntime (empty -> "native").
 func runtimeKeyForWU(wu *runtime.WorkUnit) string {
-	name := strings.ToLower(wu.Runtime)
+	name := runtime.NormalizeRuntimeName(wu.Runtime)
 	if name == "" {
-		return "native"
+		return runtime.RuntimeNative
 	}
 	return name
 }

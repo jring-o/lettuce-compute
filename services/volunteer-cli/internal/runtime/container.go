@@ -34,6 +34,12 @@ type ContainerRuntime struct {
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
 	memCeilingMB  int // the memory budget container work is given (0 = unset); clamps per-unit BookedMemMB
+	// memCeiling, when set, answers the same question live: the daemon wires
+	// its memory budget here so a limit changed while the daemon runs reaches
+	// the ceiling at once, the way a changed CPU budget reaches cpuGrant
+	// (TB-79). memCeilingMB is the figure in force until then, and outside the
+	// daemon (the audit runner).
+	memCeiling    func() int
 	diskCeilingMB int // volunteer's configured disk budget in MB (0 = unset); clamps per-unit BookedDiskMB
 	// engineMemMB is the memory of the virtual machine the engine runs inside,
 	// as the engine reported it, when it runs inside one (macOS/Windows); 0 on a
@@ -184,8 +190,20 @@ func (c *ContainerRuntime) SetMaxGPUVRAMPct(pct int) {
 // memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
 func (c *ContainerRuntime) SetMemoryCeilingMB(mb int) { c.memCeilingMB = mb }
 
-// MemoryCeilingMB reports the memory budget container work is given (0 = unset).
-func (c *ContainerRuntime) MemoryCeilingMB() int { return c.memCeilingMB }
+// SetMemoryCeilingSource wires the daemon's live memory budget as the
+// ceiling: asked at the moment a container is created, so a memory limit
+// changed while the daemon runs is enforced on the next unit without a
+// restart, and enforcement never drifts from what admission books (TB-79).
+func (c *ContainerRuntime) SetMemoryCeilingSource(fn func() int) { c.memCeiling = fn }
+
+// MemoryCeilingMB reports the memory budget container work is given (0 =
+// unset): the live source when the daemon wired one, else the static figure.
+func (c *ContainerRuntime) MemoryCeilingMB() int {
+	if c.memCeiling != nil {
+		return c.memCeiling()
+	}
+	return c.memCeilingMB
+}
 
 // SetEngineMemoryMB records the memory of the VM the engine runs inside, as
 // the engine reported it (EngineInfo.MemTotalMB); 0 when the engine does not
@@ -381,7 +399,7 @@ func screenImageRegistry(ctx context.Context, image string) error {
 }
 
 // Name returns "container".
-func (c *ContainerRuntime) Name() string { return "container" }
+func (c *ContainerRuntime) Name() string { return RuntimeContainer }
 
 // Client returns the underlying DockerClient for suspend/resume operations.
 func (c *ContainerRuntime) Client() DockerClient { return c.dockerClient }
@@ -667,7 +685,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// a declared 0 is bounded to the per-task default (never Docker's unlimited-0) and
 	// a huge declaration is clamped to the volunteer's configured budget. The container
 	// can therefore never exceed what admission booked for it.
-	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.memCeilingMB)
+	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.MemoryCeilingMB())
 	memoryBytes := int64(bookedMemMB) * 1024 * 1024
 
 	// The CPU quota is this task's SHARE of the budget, not the whole budget:

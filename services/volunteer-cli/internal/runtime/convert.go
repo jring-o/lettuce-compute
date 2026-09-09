@@ -14,7 +14,7 @@ func WorkUnitFromProto(a *lettucev1.WorkUnitAssignment) *WorkUnit {
 	wu := &WorkUnit{
 		ID:                        a.GetWorkUnitId(),
 		LeafID:                    a.GetLeafId(),
-		Runtime:                   a.GetRuntime(),
+		Runtime:                   NormalizeRuntimeName(a.GetRuntime()),
 		InputData:                 a.GetInputData(),
 		InputDataURL:              a.GetInputDataUrl(),
 		CodeArtifactURL:           a.GetCodeArtifactUrl(),

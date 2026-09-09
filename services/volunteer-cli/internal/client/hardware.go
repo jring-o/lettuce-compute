@@ -59,6 +59,17 @@ func TotalMemoryMB() int64 {
 // offender: amd-smi taking minutes on hosts without a working ROCm driver)
 // cannot block volunteer Register past its RPC deadline.
 func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
+	hw, _ := DetectHardwareWithGPUs(cfg)
+	return hw
+}
+
+// DetectHardwareWithGPUs is DetectHardware returning, beside the
+// advertisement, the raw GPU detection it was built from — the input
+// ApplyGPUConfig turns into the advertised GPU list. The daemon keeps it so a
+// changed GPU share can be re-advertised without probing the vendor tools
+// again (TB-79); it is an empty, non-nil slice when detection ran and found
+// nothing, and nil when detection was skipped.
+func DetectHardwareWithGPUs(cfg *config.Config) (*lettucev1.HardwareCapabilities, []*gpudetect.GpuDetectionResult) {
 	if gpudetect.SkipHardwareDetection() {
 		return &lettucev1.HardwareCapabilities{
 			CpuCores:         int32(runtime.NumCPU()),
@@ -70,13 +81,14 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 			Gpus:             []*lettucev1.GpuInfo{},
 			Os:               runtime.GOOS,
 			CpuArch:          runtime.GOARCH,
-		}
+		}, nil
 	}
 
 	var (
 		cpuModel string
 		memMB    int32
 		diskMB   int64
+		detected []*gpudetect.GpuDetectionResult
 		gpus     []*lettucev1.GpuInfo
 	)
 
@@ -90,7 +102,8 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 	}()
 	go func() {
 		defer wg.Done()
-		gpus = runWithFallback("gpus", func() []*lettucev1.GpuInfo { return detectAndApplyGPUConfig(cfg) }, []*lettucev1.GpuInfo{})
+		detected = runWithFallback("gpus", gpudetect.DetectGPUs, []*gpudetect.GpuDetectionResult{})
+		gpus = ApplyGPUConfig(cfg, detected)
 	}()
 
 	// Wait with an overall ceiling — individual sub-detections each have their
@@ -110,6 +123,9 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 	if gpus == nil {
 		gpus = []*lettucev1.GpuInfo{}
 	}
+	if detected == nil {
+		detected = []*gpudetect.GpuDetectionResult{}
+	}
 
 	return &lettucev1.HardwareCapabilities{
 		CpuCores:         int32(runtime.NumCPU()),
@@ -128,7 +144,7 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 		Os:        runtime.GOOS,
 		CpuArch:   runtime.GOARCH,
 		CpuVendor: detectCPUVendor(cpuModel),
-	}
+	}, detected
 }
 
 // detectCPUVendor returns the CPU vendor token used by the head's HRClass
@@ -180,11 +196,6 @@ func runWithFallback[T any](label string, fn func() T, fallback T) (out T) {
 		}
 	}()
 	return fn()
-}
-
-// detectAndApplyGPUConfig detects GPUs and applies config limits.
-func detectAndApplyGPUConfig(cfg *config.Config) []*lettucev1.GpuInfo {
-	return ApplyGPUConfig(cfg, gpudetect.DetectGPUs())
 }
 
 // ApplyGPUConfig turns detected GPUs into what this volunteer ADVERTISES: the

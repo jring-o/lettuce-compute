@@ -2,8 +2,29 @@ package runtime
 
 import (
 	"context"
+	"strings"
 	"time"
 )
+
+// The runtime kinds, as the daemon keys them: the names the runtimes report
+// (Name()), the registry indexes by, and every comparison of a work unit's
+// Runtime field uses. A head writes the leaf's execution_config.runtime on an
+// assignment verbatim — the enum name, "CONTAINER" — so the field is
+// normalised to these at the boundary (WorkUnitFromProto, the persisted-task
+// load) rather than compared case-by-case; the exit-137 memory diagnosis
+// keyed on the lower-case spelling and never fired in production (TB-76).
+const (
+	RuntimeNative    = "native"
+	RuntimeContainer = "container"
+	RuntimeWasm      = "wasm"
+)
+
+// NormalizeRuntimeName returns the canonical form of a runtime kind name: the
+// head's "CONTAINER", the proto comment's "container" and a stray " Wasm "
+// all become the constant the daemon compares against.
+func NormalizeRuntimeName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
 
 // gracefulShutdownGrace bounds how long a compute process is given to exit after it
 // is asked to terminate on cancellation (a graceful stop or a deadline). It is long
@@ -15,7 +36,7 @@ const gracefulShutdownGrace = 15 * time.Second
 type WorkUnit struct {
 	ID              string            // work unit UUID
 	LeafID          string            // leaf UUID
-	Runtime         string            // "native", "container", etc.
+	Runtime         string            // the runtime kind, canonical lower-case (RuntimeNative, RuntimeContainer, RuntimeWasm)
 	InputData       []byte            // inline data (< 1 MB)
 	InputDataURL    string            // URL for external data
 	CodeArtifactURL string            // URL to download code/binary

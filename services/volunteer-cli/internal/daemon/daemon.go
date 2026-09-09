@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,6 +126,10 @@ type Daemon struct {
 	// (setAdvertisedMemoryMB, TB-63).
 	cachedHW *lettucev1.HardwareCapabilities
 	hwMu     sync.RWMutex
+	// detectedGPUs is the raw GPU detection the advertisement's GPU list is
+	// derived from (DaemonConfig.DetectedGPUs); nil when unknown. Read under
+	// hwMu beside cachedHW.
+	detectedGPUs []*runtime.GpuDetectionResult
 
 	// Podman machine lifecycle (Windows/macOS). Whether this process started the
 	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
@@ -299,6 +304,13 @@ type DaemonConfig struct {
 	// passes the result here; when nil the daemon detects for itself (tests, and
 	// any caller without a prior detection).
 	Hardware *lettucev1.HardwareCapabilities
+	// DetectedGPUs is the raw GPU detection Hardware's advertisement was built
+	// from (client.DetectHardwareWithGPUs). The daemon keeps it so a changed
+	// GPU share (resource_limits.max_gpu_vram_pct, the per-GPU overrides) can
+	// be re-applied to the advertisement without probing the vendor tools
+	// again (TB-79). nil when the caller did not detect; the daemon then
+	// detects for itself, or leaves the advertised GPUs as they are.
+	DetectedGPUs []*runtime.GpuDetectionResult
 	// ClientVersion is this build's version string (the value `--version`
 	// prints), surfaced on GET /api/v1/status as client_version.
 	ClientVersion string
@@ -405,8 +417,9 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// registries, and a second probe per start is exactly what once raised a
 	// second UAC prompt on Windows.
 	hw := cfg.Hardware
+	detectedGPUs := cfg.DetectedGPUs
 	if hw == nil {
-		hw = client.DetectHardware(cfg.Config)
+		hw, detectedGPUs = client.DetectHardwareWithGPUs(cfg.Config)
 	}
 
 	// Run or load CPU benchmark for runtime estimation.
@@ -460,6 +473,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		initialBackoff:      1 * time.Second,
 		maxBackoff:          30 * time.Second,
 		cachedHW:            hw,
+		detectedGPUs:        detectedGPUs,
 		leafCache:           leafCache,
 		weightedSelector:    ws,
 		leafFailures:        newLeafFailureTracker(time.Now),
@@ -473,9 +487,10 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		clientVersion:       cfg.ClientVersion,
 	}
 
-	// Wire the resource limiter, the process group and the live CPU grant
-	// into the registered runtimes (BG-16, TB-75).
-	d.wireRuntimeLimits(pg, limiter, &cfg.Config.ResourceLimits)
+	// Wire the resource limiter, the process group, the live CPU grant and
+	// the live memory ceiling into the registered runtimes (BG-16, TB-75,
+	// TB-79).
+	d.wireRuntimeLimits(pg, limiter)
 	return d
 }
 
@@ -1248,6 +1263,15 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	maxMemoryMB := d.MemoryBudgetMB()
 	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 
+	// 0. The declaration itself. A unit that declares more than the budget is
+	// never started clamped below what its leaf asked for (TB-79): the head
+	// handed it out against a stale advertisement (a limit lowered since, a
+	// VM clip it has not been told yet), and the buffer sweep gives such a
+	// unit back un-run. This guard keeps admission honest in the meantime.
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return false, why
+	}
+
 	// 1. Configured memory budget.
 	if maxMemoryMB > 0 {
 		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(maxMemoryMB)
@@ -2001,6 +2025,13 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 // — on a one-GPU host the global target admitted slots × hours of GPU units, of
 // which one ran and the rest waited for the deadline drop.
 func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
+	// A unit whose declaration the budget cannot cover is returned before
+	// any Prepare cost (TB-79): the head sent it against an advertisement
+	// this poll has already replaced, and it can only ever run here clamped
+	// below what its leaf asked for.
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return false, why
+	}
 	full, reason := d.workBufferHoursFull(), "work buffer full (over the hours target)"
 	if !full && wu.ExecutionSpec.GPURequired && d.gpuBufferHoursFull() {
 		full = true
@@ -2016,6 +2047,31 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", why)
 	}
 	return true, ""
+}
+
+// memoryDeclarationFits reports whether a unit's declared memory fits this
+// machine's live memory budget, with the reason when it does not — both
+// figures, so the head's ledger and the volunteer's log say why the unit was
+// returned (TB-79). A unit declaring nothing is bounded to the per-task
+// default and always fits; with no configured budget everything fits.
+func (d *Daemon) memoryDeclarationFits(wu *runtime.WorkUnit) (bool, string) {
+	if wu == nil {
+		return true, ""
+	}
+	declared, budget := int(wu.ExecutionSpec.MaxMemoryMB), d.MemoryBudgetMB()
+	if declared <= 0 || budget <= 0 || declared <= budget {
+		return true, ""
+	}
+	return false, fmt.Sprintf("unit declares %d MB but this machine's memory budget is %d MB; heads are told the budget and only send leafs that fit it", declared, budget)
+}
+
+// unfitBuffered is the fetcher's buffer-sweep hook (TB-79): the reason a
+// buffered unit can no longer run on this machine, or "".
+func (d *Daemon) unfitBuffered(wu *runtime.WorkUnit) string {
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return why
+	}
+	return ""
 }
 
 // fallbackBufferUnits is the unit-count cap used when an hours estimate is
@@ -3079,21 +3135,41 @@ func (d *Daemon) GetMultiClient() *MultiServerClient {
 
 // ApplyConfig applies new configuration to the running daemon without restart.
 // Changing max_concurrent_tasks requires a restart — slot count is fixed at init.
+//
+// The resource_limits block is live (TB-79): a change reaches, in this one
+// call, the budgets admission books against (they read the configuration),
+// the advertisement every poll carries as CurrentAvailable — the figure a
+// head's dispatch gate compares a leaf's requirements against, so the head
+// agrees with admission from the next poll — and the memory ceilings the
+// runtimes enforce (they read the live budget). Before this the advertisement
+// and the ceilings were the start-up figures until a restart, so a lowered
+// memory limit left the head sending leafs the budget could not hold and
+// the client running them above what admission had booked.
 func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	d.mu.Lock()
-	oldMax := d.cfg.MaxConcurrentTasks
+	oldCfg := d.cfg
 	d.cfg = newCfg
 	d.mu.Unlock()
 
-	if newCfg.MaxConcurrentTasks != oldMax && oldMax > 0 {
+	if oldCfg != nil && newCfg.MaxConcurrentTasks != oldCfg.MaxConcurrentTasks && oldCfg.MaxConcurrentTasks > 0 {
 		d.logger.Warn("max_concurrent_tasks changed — restart daemon to apply",
-			"old", oldMax,
+			"old", oldCfg.MaxConcurrentTasks,
 			"new", newCfg.MaxConcurrentTasks,
 		)
 	}
 
 	// Reinitialize weights from new config.
 	d.initializeWeights()
+
+	if oldCfg == nil || oldCfg.ResourceLimits != newCfg.ResourceLimits || !reflect.DeepEqual(oldCfg.GPUOverrides, newCfg.GPUOverrides) {
+		d.setAdvertisedResourceLimits()
+		hw := d.advertisedHardware()
+		d.logger.Info("resource limits changed: heads are told the new figures from the next poll, admission books against them now, and running tasks keep the ceilings they started with",
+			"max_memory_mb", newCfg.ResourceLimits.MaxMemoryMB, "advertised_max_memory_mb", hw.GetMaxMemoryMb(),
+			"max_cpu_cores", newCfg.ResourceLimits.MaxCPUCores, "advertised_max_cpu_cores", hw.GetMaxCpuCores(),
+			"max_disk_gb", newCfg.ResourceLimits.MaxDiskGB, "max_gpu_vram_pct", newCfg.ResourceLimits.MaxGPUVRAMPct,
+			"advertised_gpus", len(hw.GetGpus()))
+	}
 
 	// A raised memory limit does not raise what the container engine's VM can
 	// hold (TB-63): say so again against the new figure, or clear the notice
@@ -3156,19 +3232,52 @@ func (d *Daemon) AdvertisedHardware() *lettucev1.HardwareCapabilities {
 	return d.advertisedHardware()
 }
 
-// setAdvertisedMemoryMB replaces the advertised hardware with a copy whose
-// memory budget is mb. A copy, not an in-place write: the fetcher hands the
+// updateAdvertisedHardware replaces the advertised hardware with a copy that
+// mutate has changed. A copy, not an in-place write: the fetcher hands the
 // current advertisement to gRPC on its own goroutine, and a field write under
-// it would be a race.
-func (d *Daemon) setAdvertisedMemoryMB(mb int) {
+// it would be a race. mutate runs under hwMu and must not read the
+// advertisement back through advertisedHardware.
+func (d *Daemon) updateAdvertisedHardware(mutate func(hw *lettucev1.HardwareCapabilities)) {
 	d.hwMu.Lock()
 	defer d.hwMu.Unlock()
 	if d.cachedHW == nil {
 		return
 	}
 	hw := proto.Clone(d.cachedHW).(*lettucev1.HardwareCapabilities)
-	hw.MaxMemoryMb = int32(mb)
+	mutate(hw)
 	d.cachedHW = hw
+}
+
+// setAdvertisedMemoryMB replaces the advertised hardware with a copy whose
+// memory budget is mb (the TB-63 late-detection clip).
+func (d *Daemon) setAdvertisedMemoryMB(mb int) {
+	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) { hw.MaxMemoryMb = int32(mb) })
+}
+
+// setAdvertisedResourceLimits rebuilds the resource_limits half of the
+// advertisement from the live configuration (TB-79): the memory and CPU
+// budgets (the configuration clipped to the container engine's VM where
+// there is one — MemoryBudgetMB, CPUBudgetCores), the disk allowance, the
+// bandwidth cap, and the GPU list with the configured share and the per-GPU
+// overrides applied to the detection the start-up advertisement was built
+// from — the same rules registration used (client.ApplyGPUConfig), so a
+// changed share advertises exactly what a restart would. The detected
+// figures (total memory, core count, free disk, the GPU models) are kept.
+// Without a retained detection the GPU list is left as it is.
+func (d *Daemon) setAdvertisedResourceLimits() {
+	memMB, cores := d.MemoryBudgetMB(), d.CPUBudgetCores()
+	d.hwMu.RLock()
+	detected := d.detectedGPUs
+	d.hwMu.RUnlock()
+	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) {
+		hw.MaxMemoryMb = int32(memMB)
+		hw.MaxCpuCores = int32(cores)
+		hw.MaxDiskMb = int64(d.cfg.ResourceLimits.MaxDiskGB) * 1024
+		hw.MaxBandwidthMbps = int32(d.cfg.ResourceLimits.MaxBandwidthMbps)
+		if detected != nil {
+			hw.Gpus = client.ApplyGPUConfig(d.cfg, detected)
+		}
+	})
 }
 
 // ContainerVMMemoryMB reports the memory of the VM the registered container
@@ -3250,7 +3359,7 @@ func (d *Daemon) refreshContainerMemoryNotice() {
 // sees read "killed for memory: … VM …" instead of a bare exit code (TB-63).
 // Empty for any other exit code or a non-container unit.
 func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, exitCode int) string {
-	if wu == nil || exitCode != 137 || wu.Runtime != "container" {
+	if wu == nil || exitCode != 137 || wu.Runtime != runtime.RuntimeContainer {
 		return ""
 	}
 	budget := d.MemoryBudgetMB()

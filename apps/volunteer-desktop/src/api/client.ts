@@ -1034,8 +1034,10 @@ type RawConfigResponse = Omit<ConfigResponse, "servers"> & {
 };
 
 /**
- * The daemon reports `runtime_type` in upper case ("CONTAINER"); the app keys
- * its badges and filters on the lower-case form. Normalise once, at the edge.
+ * Daemons before the client's TB-76 fix report `runtime_type` in upper case
+ * ("CONTAINER", the head's spelling); later ones report the canonical
+ * lower-case form. The app keys its badges and filters on the lower-case
+ * form. Normalise once, at the edge, whichever build answers.
  */
 function normalizeTask<T extends { runtime_type: string }>(task: T): T {
   return { ...task, runtime_type: String(task.runtime_type ?? "").toLowerCase() };

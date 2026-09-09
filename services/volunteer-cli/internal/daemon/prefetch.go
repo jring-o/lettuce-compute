@@ -313,6 +313,38 @@ func (q *PreFetchQueue) DropLapsedReservations(margin time.Duration, now time.Ti
 	}
 }
 
+// DropUnfit removes every buffered item for which unfit returns a non-empty
+// reason and returns them, in queue order, paired with their reasons; the
+// caller gives them back to their heads and cleans up their work dirs. It is
+// the buffer's side of a live resource-limit change (TB-79): a unit that was
+// admissible when it arrived but declares more than the budget allows now
+// can never start here, and leaving it in place would hold its reservation
+// until the head reclaimed it — a billed copy — while the starvation cap held
+// backfills behind it. unfit is called under the queue lock and must not
+// call back into the queue.
+func (q *PreFetchQueue) DropUnfit(unfit func(*PreFetchItem) string) []UnfitItem {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var kept []*PreFetchItem
+	var dropped []UnfitItem
+	for _, item := range q.items {
+		if reason := unfit(item); reason != "" {
+			dropped = append(dropped, UnfitItem{Item: item, Reason: reason})
+			continue
+		}
+		kept = append(kept, item)
+	}
+	q.items = kept
+	return dropped
+}
+
+// UnfitItem is a buffered unit DropUnfit removed, with the reason it can no
+// longer run on this machine.
+type UnfitItem struct {
+	Item   *PreFetchItem
+	Reason string
+}
+
 // Clear removes all items and returns them so the caller can clean up.
 func (q *PreFetchQueue) Clear() []*PreFetchItem {
 	q.mu.Lock()
