@@ -30,6 +30,17 @@ import (
 // verb, and a machine start or setup that succeeds through it). When an
 // engine answers, the runtime is built exactly as at start, registered, and
 // every head is re-registered with the new capability on its next contact.
+//
+// The same machinery covers the other direction (TB-80): an engine that was
+// up and stops answering — a Podman machine whose API socket died behind a
+// VM that still reports "running", Docker Desktop quit, a rootless socket
+// file nothing listens on. The runtime that reports the outage is taken out
+// of service (NoteContainerEngineUnreachable), every buffered container unit
+// is returned to its head un-run, the heads are re-told the machine's
+// runtimes, and the loop below — which never exits while the daemon runs —
+// probes again until the engine answers, then registers a fresh runtime and
+// resolves the notice. A probe is a ping, never a fetched unit, and a runtime
+// is registered only after its engine has answered one.
 
 // containerRedetectInterval is how often a daemon without a container runtime
 // probes for an engine again. A minute is short enough that a login-time
@@ -111,7 +122,14 @@ type ContainerRuntimeFactory struct {
 	detect    func(preferred runtime.ContainerBackend) runtime.BackendInfo
 	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)
 	engineVM  func(rt runtime.Runtime) (memMB, cpus int)
-	now       func() time.Time
+	// ping asks the engine behind a freshly constructed runtime to answer
+	// before the runtime is put into service (TB-80): detection on Linux is
+	// a socket FILE check, and a socket nobody listens on used to register
+	// CONTAINER, advertise it, and fail every Prepare. Production pings the
+	// engine's API; the test factory accepts any runtime unless a test
+	// installs its own (SetEnginePingForTest).
+	ping func(rt runtime.Runtime) error
+	now  func() time.Time
 }
 
 // NewContainerRuntimeFactory returns the production factory for this config.
@@ -122,6 +140,7 @@ func NewContainerRuntimeFactory(cfg *config.Config, logger *slog.Logger) *Contai
 	}
 	f.construct = f.constructContainerRuntime
 	f.engineVM = probeEngineVM
+	f.ping = pingContainerRuntime
 	return f
 }
 
@@ -135,7 +154,37 @@ func NewContainerRuntimeFactoryForTest(cfg *config.Config, logger *slog.Logger,
 	detect func(preferred runtime.ContainerBackend) runtime.BackendInfo,
 	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)) *ContainerRuntimeFactory {
 	return &ContainerRuntimeFactory{cfg: cfg, logger: logger, now: time.Now, detect: detect, construct: construct,
-		engineVM: func(runtime.Runtime) (int, int) { return 0, 0 }}
+		engineVM: func(runtime.Runtime) (int, int) { return 0, 0 },
+		ping:     func(runtime.Runtime) error { return nil }}
+}
+
+// SetEnginePingForTest replaces the registration ping: the given function
+// answers "does the engine behind this runtime answer" for a runtime the
+// construction seam returned (nil = yes).
+func (f *ContainerRuntimeFactory) SetEnginePingForTest(ping func(rt runtime.Runtime) error) {
+	f.ping = ping
+}
+
+// enginePingTimeout bounds the registration ping. The engine is local; an
+// answer that takes longer than this is not one.
+const enginePingTimeout = 5 * time.Second
+
+// pingContainerRuntime is the production registration ping: the engine's
+// API must answer before its runtime is registered. A runtime that is not a
+// container runtime (nothing to ping) passes. The failure is reported as an
+// EngineUnreachableError so the detector's log and the status route name
+// the socket the volunteer has to look at.
+func pingContainerRuntime(rt runtime.Runtime) error {
+	cr, ok := rt.(*runtime.ContainerRuntime)
+	if !ok || cr == nil || cr.Client() == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), enginePingTimeout)
+	defer cancel()
+	if err := cr.Client().Ping(ctx); err != nil {
+		return &runtime.EngineUnreachableError{Backend: cr.Backend(), Socket: cr.EngineSocket(), Err: err}
+	}
+	return nil
 }
 
 // SetEngineMemoryProbeForTest replaces the engine VM memory probe: the given
@@ -185,9 +234,10 @@ func probeEngineVM(rt runtime.Runtime) (memMB, cpus int) {
 
 // Build probes for a container engine once and, when one answers, returns the
 // container runtime built for it and the engine it was built against. A nil
-// runtime with a nil error means no engine answered; a nil runtime with an
-// error means an engine was found but the runtime could not be built (the
-// error says why — usually a socket that is not up yet). When a Podman binary
+// runtime with a nil error means no engine was found; a nil runtime with an
+// error means an engine was found but the runtime could not be built or its
+// socket did not answer the registration ping (the error says why — usually
+// a socket that is not up yet, or one nothing listens on). When a Podman binary
 // is found on a platform that needs a machine, the machine is initialised and
 // started as at start-up, unless that step failed within
 // machineSetupRetryInterval and forceMachineSetup is false.
@@ -225,9 +275,26 @@ func (f *ContainerRuntimeFactory) Build(forceMachineSetup bool) (runtime.Runtime
 		f.recordResult(backend, false, err.Error())
 		return nil, backend, err
 	}
+	// An engine that was found but does not answer is not registered: a
+	// socket file with no service behind it advertised CONTAINER to every
+	// head and failed each unit at the ping (TB-80). The probe keeps running;
+	// the runtime is built again when the socket answers.
+	if err := f.ping(rt); err != nil {
+		closeRuntimeClient(rt)
+		f.recordResult(backend, false, err.Error())
+		return nil, backend, err
+	}
 	f.applyContainerBudgets(rt)
 	f.recordResult(backend, true, "")
 	return rt, backend, nil
+}
+
+// closeRuntimeClient releases the engine connection of a runtime that will
+// not be registered.
+func closeRuntimeClient(rt runtime.Runtime) {
+	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil && cr.Client() != nil {
+		_ = cr.Client().Close()
+	}
 }
 
 // applyContainerBudgets gives a freshly built container runtime its memory
@@ -505,18 +572,56 @@ func (d *Daemon) ContainerRedetectActive() bool {
 }
 
 // runContainerRedetect is the re-detection loop, started by Run and tied to
-// the run context. It exits for good once a container runtime is registered:
-// a runtime that later stops answering is the runtime breaker's business
-// (runtimeAbandonCooldown), not this loop's.
+// the run context. While no container runtime is registered (and a head is
+// trusted for one) it probes every containerRedetectInterval and on request;
+// while one is registered it sleeps until woken. It used to exit for good
+// once a runtime was registered, leaving an engine that later stopped
+// answering to the runtime breaker — which re-probed by fetching a real unit
+// and abandoning it, billed, every ten minutes (TB-80). Now an outage
+// (NoteContainerEngineUnreachable) unregisters the runtime and wakes the loop,
+// which probes with a ping until the engine answers and registers a fresh
+// runtime.
 func (d *Daemon) runContainerRedetect(ctx context.Context) {
-	if !d.containerRedetectActive() {
+	if d.containerFactory == nil || d.runtimeRegistry == nil {
 		return
 	}
-	d.logger.Info("no container runtime at start; re-checking for a container engine periodically — start Docker or the Podman machine and container work begins without a restart",
-		"interval", containerRedetectInterval)
+	if d.containerRedetectActive() {
+		d.logger.Info("no container runtime at start; re-checking for a container engine periodically — start Docker or the Podman machine and container work begins without a restart",
+			"interval", containerRedetectInterval)
+	}
 	timer := time.NewTimer(containerRedetectInterval)
 	defer timer.Stop()
+	stopTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
 	for {
+		if !d.containerRedetectActive() {
+			// A runtime is registered (or no head trusts one): nothing to
+			// probe. Sleep until an outage or a request wakes the loop.
+			stopTimer()
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.containerRedetectCh:
+			}
+			if !d.containerRedetectActive() {
+				continue
+			}
+			// Woken with nothing registered — an outage took the runtime out
+			// of service: probe at once, then on the cadence. Not forced: a
+			// Podman machine bring-up that failed within its retry interval
+			// is not re-driven for an outage the way it is for a person's
+			// explicit request; the cheap ping still runs every minute.
+			if d.RedetectContainerRuntime(ctx, false) {
+				continue
+			}
+			timer.Reset(containerRedetectInterval)
+		}
 		force := false
 		select {
 		case <-ctx.Done():
@@ -527,15 +632,10 @@ func (d *Daemon) runContainerRedetect(ctx context.Context) {
 			// succeeded): probe now and let a machine bring-up run even inside
 			// its retry interval — the person asking has usually just fixed it.
 			force = true
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			stopTimer()
 		}
 		if d.RedetectContainerRuntime(ctx, force) {
-			return
+			continue
 		}
 		timer.Reset(containerRedetectInterval)
 	}
@@ -632,9 +732,20 @@ func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtim
 
 	runtimes := d.runtimeRegistry.AvailableRuntimes()
 	sort.Strings(runtimes)
-	d.logger.Info("container runtime registered after start: this machine can now run container work",
-		"backend", backend.Backend, "engine", backend.Engine, "version", backend.Version,
-		"socket", backend.SocketPath, "runtimes", runtimes)
+	if outage := d.endContainerOutage(); outage != nil {
+		// The engine that stopped answering is back (TB-80): the notice the
+		// outage raised is resolved, and the heads hear CONTAINER again on
+		// their next contact (markRuntimesChanged below).
+		d.logger.Info("container engine answering again; container work resumes",
+			"backend", backend.Backend, "engine", backend.Engine, "version", backend.Version,
+			"socket", backend.SocketPath, "runtimes", runtimes,
+			"unreachable_for", time.Since(outage.since).Round(time.Second).String())
+		d.notices.Resolve("container_engine_unreachable", "", "")
+	} else {
+		d.logger.Info("container runtime registered after start: this machine can now run container work",
+			"backend", backend.Backend, "engine", backend.Engine, "version", backend.Version,
+			"socket", backend.SocketPath, "runtimes", runtimes)
+	}
 
 	// The engine's VM may be smaller than the configured budgets (TB-63,
 	// TB-75): lower the advertised figures BEFORE the heads are re-told, so
@@ -742,6 +853,144 @@ func (d *Daemon) advertisedRuntimesFor(srv config.ServerConfig) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// --- an engine that was up and stopped answering (TB-80) ---
+
+// containerOutage records a container engine that stopped answering under a
+// running daemon: when, which engine, and the transport error it reported.
+// It lives from NoteContainerEngineUnreachable until the next successful
+// registration.
+type containerOutage struct {
+	since   time.Time
+	backend runtime.BackendInfo
+	err     string
+}
+
+// NoteContainerEngineUnreachable takes a container runtime whose engine has
+// stopped answering out of service. rt is the runtime that reported the
+// outage (the fetcher's Prepare, or a slot's Execute); it is unregistered only
+// if it is still the registered one, so a stale report from a unit that was
+// running when the engine died cannot remove a runtime a later probe built
+// for the recovered engine. On the first report of an outage it records the
+// outage, raises ONE container_engine_unreachable notice naming the socket
+// and the remedy, flags every head for re-registration without CONTAINER,
+// re-evaluates the no-runnable-leaf verdict, returns every buffered container
+// unit to its head un-run (budget-neutral, TB-35) so none reaches a slot only
+// to fail at create, and wakes the re-detection loop, which probes with a
+// ping until the engine answers. It reports whether it took a runtime out of
+// service. Safe to call from any goroutine.
+func (d *Daemon) NoteContainerEngineUnreachable(rt runtime.Runtime, err error) bool {
+	if d.runtimeRegistry == nil || rt == nil {
+		return false
+	}
+	if !d.runtimeRegistry.Unregister(rt) {
+		return false
+	}
+	// Name the engine: the detector's record of what it built, else what the
+	// error itself says (the runtime stamps its backend and socket on it),
+	// else what the runtime knows.
+	backend, _ := d.containerFactory.Backend()
+	var eu *runtime.EngineUnreachableError
+	if backend.Backend == "" && errors.As(err, &eu) {
+		backend = runtime.BackendInfo{Backend: eu.Backend, SocketPath: eu.Socket}
+	}
+	if backend.Backend == "" {
+		if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+			backend = runtime.BackendInfo{Backend: cr.Backend(), SocketPath: cr.EngineSocket()}
+		}
+	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	d.containerOutageMu.Lock()
+	d.containerOutage = &containerOutage{since: time.Now(), backend: backend, err: errText}
+	d.containerOutageMu.Unlock()
+
+	where := string(backend.Backend)
+	if backend.SocketPath != "" {
+		where += " at " + backend.SocketPath
+	}
+	if where == "" {
+		where = "the container engine"
+	}
+	d.logger.Warn("container engine stopped answering: container work is paused, buffered container units are returned to their heads, and the engine is re-checked every minute until it answers",
+		"backend", backend.Backend, "engine", backend.Engine, "socket", backend.SocketPath,
+		"error", errText, "interval", containerRedetectInterval,
+		"remedy", containerOutageRemedy(backend))
+	d.notices.Notify(NoticeWarn, "container_engine_unreachable",
+		fmt.Sprintf("The container engine (%s) is not answering: %s. Container work is paused and buffered container units have been returned to their heads un-run; Lettuce re-checks the engine every minute and resumes container work by itself when it answers. %s",
+			where, errText, containerOutageRemedy(backend)),
+		"", "")
+
+	d.markRuntimesChanged()
+	d.refreshRuntimeBlocked()
+
+	// Every buffered container unit would reach a slot only to fail at
+	// create, run-started and billed; give them back now while they are
+	// un-run. The sweep is the fetcher's own (unfitBuffered names the
+	// reason), safe from any goroutine.
+	d.mu.Lock()
+	f := d.fetcher
+	d.mu.Unlock()
+	if f != nil {
+		f.sweepBuffer()
+	}
+
+	select {
+	case d.containerRedetectCh <- struct{}{}:
+	default: // a probe is already queued
+	}
+	return true
+}
+
+// containerOutageRemedy is the volunteer-facing hint for an engine that
+// stopped answering, by engine kind.
+func containerOutageRemedy(backend runtime.BackendInfo) string {
+	switch backend.Backend {
+	case runtime.BackendPodman:
+		return "Check that the Podman machine is running ('podman machine ls', 'podman machine start') or that the Podman socket is enabled; a machine that reports running while its socket is dead is fixed by 'podman machine stop' and then 'podman machine start'."
+	case runtime.BackendDocker:
+		if backend.Engine == "podman" {
+			return "Check that Podman Desktop's machine is running and its Docker compatibility is on."
+		}
+		return "Check that Docker (Docker Desktop, or the docker service) is running."
+	default:
+		return "Check that the container engine is running."
+	}
+}
+
+// endContainerOutage clears the outage record and returns it (nil when none
+// was recorded): the engine has answered a probe and its runtime is
+// registered again.
+func (d *Daemon) endContainerOutage() *containerOutage {
+	d.containerOutageMu.Lock()
+	defer d.containerOutageMu.Unlock()
+	out := d.containerOutage
+	d.containerOutage = nil
+	return out
+}
+
+// ContainerOutage reports whether a container engine that was in service has
+// stopped answering and is being re-probed, with the engine and the error
+// it last reported. For the management API's status route, so the app's
+// runtime card can say "unreachable, re-checking" rather than "running"
+// (the machine's own claim) or "not installed".
+func (d *Daemon) ContainerOutage() (backend runtime.BackendInfo, errText string, since time.Time, down bool) {
+	d.containerOutageMu.Lock()
+	defer d.containerOutageMu.Unlock()
+	if d.containerOutage == nil {
+		return runtime.BackendInfo{}, "", time.Time{}, false
+	}
+	return d.containerOutage.backend, d.containerOutage.err, d.containerOutage.since, true
+}
+
+// containerEngineDown reports whether a container-engine outage is in
+// progress (recorded and not yet ended by a successful registration).
+func (d *Daemon) containerEngineDown() bool {
+	_, _, _, down := d.ContainerOutage()
+	return down
 }
 
 // --- the no-runnable-leaf verdict (TB-60) ---

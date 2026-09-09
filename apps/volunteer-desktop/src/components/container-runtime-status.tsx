@@ -172,6 +172,46 @@ export function ContainerRuntimeStatusCard() {
     );
   }
 
+  // Unreachable: an engine that was in service stopped answering (TB-80).
+  // The machine may still claim to be running — a Podman machine can report
+  // running with a dead API socket — so this is shown ahead of that claim.
+  // The daemon has already paused container work, returned buffered
+  // container units to their heads, and re-checks every minute; the button
+  // only brings the next check forward.
+  if (status.status === "unreachable") {
+    const engineName =
+      status.backend === "podman" || status.engine === "podman" ? "Podman" : status.backend === "docker" ? "Docker" : "Container engine";
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <StatusDot color="red" />
+          <span className="text-sm font-medium">{engineName} not answering</span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {engineName} was running but its API{status.socket_path ? ` at ${status.socket_path}` : ""} has
+          stopped answering. Container work is paused and buffered container units were returned
+          to their heads; WASM and native leafs keep running. Lettuce checks the engine every
+          minute and resumes container work by itself when it answers.
+        </p>
+        {status.error && <p className="text-xs text-destructive break-words">{status.error}</p>}
+        <p className="text-xs text-muted-foreground">
+          {(status.backend === "podman" || status.engine === "podman")
+            ? "Check that the Podman machine is running (podman machine ls). A machine that says running while its socket is dead is fixed by podman machine stop, then podman machine start."
+            : "Check that Docker (Docker Desktop, or the docker service) is running."}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={actionLoading}
+          onClick={() => handleAction(redetectContainerRuntime)}
+        >
+          {actionLoading ? "Checking..." : "Check again now"}
+        </Button>
+        {actionError && <p className="text-xs text-destructive">{actionError}</p>}
+      </div>
+    );
+  }
+
   // Not Initialized (Podman installed, machine not init)
   if (status.status === "not_initialized") {
     return (

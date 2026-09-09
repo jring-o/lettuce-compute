@@ -341,8 +341,14 @@ func TestContainerRuntime_PrepareDockerUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when Docker is unavailable")
 	}
-	if !strings.Contains(err.Error(), "docker is not available") {
-		t.Errorf("error = %q, want to contain 'docker is not available'", err)
+	// An engine that does not answer the ping is reported as an outage of
+	// the runtime, not as this unit's failure (TB-80): the daemon returns the
+	// unit un-run and takes the runtime out of service on this error type.
+	if !IsEngineUnreachable(err) {
+		t.Errorf("error = %q, want an EngineUnreachableError", err)
+	}
+	if !strings.Contains(err.Error(), "container engine unreachable") {
+		t.Errorf("error = %q, want to contain 'container engine unreachable'", err)
 	}
 }
 

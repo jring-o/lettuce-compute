@@ -738,8 +738,11 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > them — recorded as `RETURNED`) do **not** count toward that ceiling or the error cap:
 > a full buffer says nothing about the unit, so give-backs can never dead-letter a
 > healthy unit. A returned unit is simply not re-offered to the same machine for about
-> ten minutes. A copy a volunteer abandons **without ever starting it** (its container
-> engine is unreachable, it has no runtime for the leaf, the artifact fails to prepare)
+> ten minutes. A volunteer whose container engine stops answering also hands its un-run
+> copies back as `RETURNED` (and stops asking for container work until the engine
+> answers again), so an engine outage costs the unit nothing. A copy a volunteer
+> abandons **without ever starting it** (it has no runtime for the leaf, the artifact
+> fails to prepare, an old client build with a dead engine)
 > counts **once per volunteer** however often that volunteer repeats it, so one broken
 > machine can never spend a unit's budget by itself — only distinct volunteers failing
 > the same unit do. Once a unit's budget **is** spent, dispatch stops serving it

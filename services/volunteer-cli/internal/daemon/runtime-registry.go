@@ -33,6 +33,27 @@ func (r *RuntimeRegistry) Register(rt runtime.Runtime) {
 	r.runtimes[rt.Name()] = rt
 }
 
+// Unregister removes rt from the registry, but only if rt is the very
+// instance registered under its name. It reports whether it removed anything.
+// The identity check is what makes the container-outage path safe (TB-80): a
+// unit that was running on an engine when it died may report its failure
+// after a probe has already built and registered a fresh runtime for the
+// recovered engine, and that stale report must not take the new runtime out
+// of service.
+func (r *RuntimeRegistry) Unregister(rt runtime.Runtime) bool {
+	if rt == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name := rt.Name()
+	if r.runtimes[name] != rt {
+		return false
+	}
+	delete(r.runtimes, name)
+	return true
+}
+
 // SelectRuntime picks the runtime for a work unit based on wu.Runtime.
 // Returns an error if no matching runtime is registered or it can't handle the spec.
 func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, error) {
