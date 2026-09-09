@@ -38,14 +38,16 @@ type Copy struct {
 
 // ClosedCopy reports what CloseCopyByVolunteer actually wrote: the outcome the
 // single write point honored (it downgrades a RETURNED request to ABANDONED when the
-// copy had started, TB-35) and whether the copy had started. Together these are
-// exactly the facts the SQL cooldown gate benches on (cooldownGuardSQL: RETURNED, or
-// ABANDONED with started_at set — never a graceful un-started ABANDONED, #59), so
-// the close's caller can mirror the gate in memory without re-reading the row
-// (TB-40).
+// copy had started, TB-35) — the one fact the SQL cooldown gate benches on
+// (cooldownGuardSQL: a RETURNED give-back for its short re-offer throttle, any
+// EXPIRED or ABANDONED copy for ~one deadline, TB-81), so the close's caller can
+// mirror the gate in memory without re-reading the row (TB-40) — and the machine
+// the copy was charged to (host_id; nil = the account reported no host), so an
+// ABANDONED close can be recorded against that machine's reliability the way the
+// deadline sweep records a timeout (TB-81).
 type ClosedCopy struct {
 	Outcome string
-	Started bool
+	HostID  *types.ID
 }
 
 // CopyState is the lifecycle phase of a copy.

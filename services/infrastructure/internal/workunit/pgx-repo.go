@@ -567,21 +567,25 @@ const ReturnedReofferCooldownSeconds = 600
 // scope; wuAlias is the work_units alias carrying deadline_seconds. The cg_* internal
 // aliases collide with none of the dispatch queries' aliases.
 //
-// A copy benches only if the volunteer actually STARTED it: a graceful return of
-// un-started buffered work (ABANDONED, started_at NULL) is not a reliability signal
-// and does not bench (#59). A RETURNED give-back (TB-35) refuses on its own, much
-// shorter window (ReturnedReofferCooldownSeconds — a re-offer throttle, not a
-// reliability bench). The clause is keyed on volunteer_id, NOT the trust
-// subject, BY DESIGN: the cooldown is a per-account reliability signal — one device
-// timing out does not bench its siblings bound to the same DID.
+// Every EXPIRED or ABANDONED copy benches, started or not (TB-81). The client
+// distinguishes a graceful return of un-started buffered work by flagging it a
+// give-back, which closes RETURNED — so an un-started ABANDONED is, by the client's
+// own account, a failure to even start the unit (no runtime, an unreachable
+// container engine, a prepare error). The #59 exemption for un-started ABANDONED
+// rows predates that flag and let one machine with a dead engine re-take the same
+// unit every ten minutes while its abandons spent the unit's copy budget. A
+// RETURNED give-back (TB-35) refuses on its own, much shorter window
+// (ReturnedReofferCooldownSeconds — a re-offer throttle, not a reliability bench).
+// The clause is keyed on volunteer_id, NOT the trust subject, BY DESIGN: the
+// cooldown is a per-account reliability signal — one device timing out does not
+// bench its siblings bound to the same DID.
 func cooldownGuardSQL(unitExpr, volExpr, wuAlias string) string {
 	return `NOT EXISTS (
 		SELECT 1 FROM work_unit_assignment_history cg_h
 		WHERE cg_h.work_unit_id = ` + unitExpr + ` AND cg_h.volunteer_id = ` + volExpr + `
 		  AND (
 		    (
-		      (cg_h.outcome = 'EXPIRED'
-		       OR (cg_h.outcome = 'ABANDONED' AND cg_h.started_at IS NOT NULL))
+		      cg_h.outcome IN ('EXPIRED', 'ABANDONED')
 		      AND cg_h.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
 		    )
 		    OR (
@@ -610,7 +614,7 @@ func cooldownGuardSQL(unitExpr, volExpr, wuAlias string) string {
 // just membership) lets the dispatch cache seed TIMED bench entries that mirror the
 // SQL cooldown window instead of out-living it while the candidate sits staged
 // (PB-9's stale-set defect). Two entry kinds, matching cooldownGuardSQL's two arms:
-// plain bench entries (EXPIRED / started-then-ABANDONED, ~one deadline window) and
+// plain bench entries (EXPIRED / ABANDONED, ~one deadline window) and
 // '|R'-suffixed RETURNED give-back entries (TB-35, the short
 // ReturnedReofferCooldownSeconds re-offer throttle). A volunteer with both kinds
 // yields two entries; the cache keeps whichever bench holds longest (benchSet).
@@ -621,8 +625,7 @@ func benchedSnapshotSQL(wuAlias string) string {
 		SELECT cb.volunteer_id::text || '|' || floor(extract(epoch FROM MAX(cb.outcome_at)))::bigint::text
 		 FROM work_unit_assignment_history cb
 		 WHERE cb.work_unit_id = ` + wuAlias + `.id AND cb.volunteer_id IS NOT NULL
-		   AND (cb.outcome = 'EXPIRED'
-		        OR (cb.outcome = 'ABANDONED' AND cb.started_at IS NOT NULL))
+		   AND cb.outcome IN ('EXPIRED', 'ABANDONED')
 		   AND cb.outcome_at IS NOT NULL
 		   AND cb.outcome_at > NOW() - GREATEST(` + wuAlias + `.deadline_seconds, 1) * INTERVAL '1 second'
 		 GROUP BY cb.volunteer_id
@@ -923,7 +926,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- reservation arithmetic above neutralize them). With every account OK this is inert.
 		  AND req.effective_standing <> 'BENCHED'
 		  -- Prefer-distinct on requeue (property 6): a volunteer whose recent copy of
-		  -- this unit TIMED OUT or was abandoned mid-run is benched (cooldownGuardSQL,
+		  -- this unit TIMED OUT or was abandoned is benched (cooldownGuardSQL,
 		  -- incl. the PB-9 pool-exhausted fallback) so a fresh volunteer gets first
 		  -- refusal without a small pool ever stranding the work. Keyed on volunteer_id
 		  -- ($9), NOT the trust subject, BY DESIGN — see cooldownGuardSQL.
@@ -2242,8 +2245,10 @@ func (r *PgxWorkUnitRepository) CloseCopy(ctx context.Context, copyID types.ID, 
 // single write point: a caller asking for RETURNED gets it only when the copy really
 // never started (started_at IS NULL); a STARTED copy closes ABANDONED instead, so a
 // client's give-back flag can never whitewash work it actually began and dropped.
-// The RETURNING clause reports the honored outcome and the copy's started-ness back
-// to the caller (TB-40) — the facts the cooldown gate benches on, from the same write.
+// The RETURNING clause reports the honored outcome back to the caller (TB-40) — the
+// fact the cooldown gate benches on, from the same write — and the machine the copy
+// was charged to (host_id), so an ABANDONED close can be recorded against that
+// machine's reliability (TB-81).
 func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUnitID, volunteerID types.ID, outcome string, resultID *types.ID, reason string) (ClosedCopy, error) {
 	var closed ClosedCopy
 	err := r.db.QueryRow(ctx, `
@@ -2253,9 +2258,9 @@ func (r *PgxWorkUnitRepository) CloseCopyByVolunteer(ctx context.Context, workUn
 		    outcome_at = NOW(), result_id = COALESCE($4, result_id),
 		    outcome_reason = $5
 		WHERE work_unit_id = $1 AND volunteer_id = $2 AND outcome IS NULL
-		RETURNING outcome, started_at IS NOT NULL`,
+		RETURNING outcome, host_id`,
 		workUnitID, volunteerID, outcome, resultID, boundedOutcomeReason(reason),
-	).Scan(&closed.Outcome, &closed.Started)
+	).Scan(&closed.Outcome, &closed.HostID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ClosedCopy{}, apierror.Conflict(

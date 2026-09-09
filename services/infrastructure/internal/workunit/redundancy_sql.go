@@ -81,33 +81,63 @@ func effMaxErrorSQL(wu, l string) string {
 // a give-back carries no information about the unit, so it is not an error signal — the same
 // reasoning that keeps SUPERSEDED out.
 //
+// An ABANDONED row whose copy never started (started_at NULL — the volunteer could not even
+// begin the unit: no runtime, an unreachable container engine, a prepare error) counts ONCE
+// PER VOLUNTEER, not once per row (TB-81, unstartedAbandonersSQL): a machine that fails to
+// start the same unit ten times has told the unit one thing, not ten. Before this, one
+// volunteer with a dead container engine re-took a unit every ten minutes and spent its whole
+// budget alone, dead-lettering 22 healthy units in 30 hours. A STARTED abandon still counts
+// per row — the volunteer ran the unit and it failed, which is evidence about the unit.
+//
 // unitID is the work-unit id column/placeholder expression in scope ("wu.id", "$1", ...). The
 // internal aliases are ec_-prefixed so an embedding never collides with a host query's aliases,
 // following countableLiveCopiesSQL's prefix idiom.
 func errorCopiesSQL(unitID string) string {
 	return `(
 		(SELECT COUNT(*) FROM work_unit_assignment_history ec_h
-		 WHERE ec_h.work_unit_id = ` + unitID + ` AND ec_h.outcome IN ('EXPIRED', 'ABANDONED'))
+		 WHERE ec_h.work_unit_id = ` + unitID + `
+		   AND (ec_h.outcome = 'EXPIRED'
+		        OR (ec_h.outcome = 'ABANDONED' AND ec_h.started_at IS NOT NULL)))
+		+ ` + unstartedAbandonersSQL(unitID, "ec_u") + `
 		+ (SELECT COUNT(*) FROM results ec_r
 		   WHERE ec_r.work_unit_id = ` + unitID + ` AND ec_r.validation_status = 'DISAGREED')
 	)`
 }
 
+// unstartedAbandonersSQL: the number of DISTINCT volunteers with an un-started ABANDONED copy
+// of the unit — the TB-81 rule that one account's repeated failures to start a unit are ONE
+// error against it, shared by budgetCopiesSQL and errorCopiesSQL so the two tallies apply the
+// same rule. alias is the internal alias for the embedding (distinct per host fragment).
+func unstartedAbandonersSQL(unitID, alias string) string {
+	return `(SELECT COUNT(DISTINCT ` + alias + `.volunteer_id) FROM work_unit_assignment_history ` + alias + `
+		 WHERE ` + alias + `.work_unit_id = ` + unitID + `
+		   AND ` + alias + `.outcome = 'ABANDONED' AND ` + alias + `.started_at IS NULL)`
+}
+
 // budgetCopiesSQL: the copies that COUNT toward the dead-letter total ceiling
-// (max_total_copies) — every history row EXCEPT the RETURNED give-backs (TB-35). A copy a
+// (max_total_copies) — every history row EXCEPT the RETURNED give-backs (TB-35), with one
+// volunteer's un-started ABANDONED rows counted ONCE (TB-81, unstartedAbandonersSQL). A copy a
 // volunteer returned un-run because its work buffer could not use it says nothing about the
 // unit, so it must not spend the unit's budget: before this exclusion, a batch tail bouncing
 // between full buffers drove healthy units to FAILED with zero compute ever attempted (the
-// dead units' claims split 153 un-run give-backs / 9 real attempts on the live heads).
-// LIVE rows (outcome IS NULL) still count, exactly as the old raw COUNT(*) counted them —
-// IS DISTINCT FROM keeps them (NULL is distinct from 'RETURNED').
+// dead units' claims split 153 un-run give-backs / 9 real attempts on the live heads). And a
+// volunteer that cannot START the unit says one thing about it however often it repeats: the
+// per-row count let a single machine with a dead container engine exhaust a unit's budget by
+// itself (eight abandons, ten minutes apart) and dead-letter a unit already holding a good
+// result from another volunteer. LIVE rows (outcome IS NULL) still count, exactly as the old
+// raw COUNT(*) counted them — IS DISTINCT FROM keeps them (NULL is distinct from 'RETURNED').
 //
 // Written ONCE here and embedded by CountTotalCopies, DeadLetterIfExhausted's total-ceiling
 // disjunct, RefundCopyBudget's rebase, and capsNotExhaustedSQL, so the budget count has a
-// single definition (the errorCopiesSQL discipline). bc_-prefixed internal alias.
+// single definition (the errorCopiesSQL discipline). bc_-prefixed internal aliases.
 func budgetCopiesSQL(unitID string) string {
-	return `(SELECT COUNT(*) FROM work_unit_assignment_history bc_h
-		 WHERE bc_h.work_unit_id = ` + unitID + ` AND bc_h.outcome IS DISTINCT FROM 'RETURNED')`
+	return `(
+		(SELECT COUNT(*) FROM work_unit_assignment_history bc_h
+		 WHERE bc_h.work_unit_id = ` + unitID + `
+		   AND bc_h.outcome IS DISTINCT FROM 'RETURNED'
+		   AND NOT (bc_h.outcome = 'ABANDONED' AND bc_h.started_at IS NULL))
+		+ ` + unstartedAbandonersSQL(unitID, "bc_u") + `
+	)`
 }
 
 // capsNotExhaustedSQL: the dispatch-side twin of transition.capsExhausted (decide.go),

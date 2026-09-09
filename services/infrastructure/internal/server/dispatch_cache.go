@@ -144,7 +144,7 @@ type candidate struct {
 	// that lingers staged across the submitter's submit still excludes it.
 	contributors map[string]struct{}
 	// benched maps volunteers whose recent copy of this unit timed out / was abandoned
-	// mid-run (a refill-time snapshot, plus flush-conflict entries from
+	// (a refill-time snapshot, plus flush-conflict entries from
 	// voidNonLandedCopy) to their bench window. They are given last refusal so a fresh
 	// volunteer gets first crack on a requeue; the DB reservation is the authoritative
 	// cooldown gate, this is the hand-out optimization. Entries are TIMED (PB-9): the
@@ -718,6 +718,20 @@ func (r *DispatchCacheRef) InvalidateWorkUnit(id types.ID) {
 	r.mu.Unlock()
 	if c != nil {
 		c.InvalidateWorkUnit(id)
+	}
+}
+
+// copyClosed forwards a copy close the fault monitor performed to the bound cache
+// (TB-82): the reaper's EXPIRED / ABANDONED close must reach onCopyClosed exactly as
+// AbandonWorkUnit's does, or the closed copy's in-memory hold outlives it. A no-op
+// until the cache exists. Never a RETURNED close — the sweep writes only benching
+// outcomes.
+func (r *DispatchCacheRef) copyClosed(unitID, volunteerID types.ID) {
+	r.mu.Lock()
+	c := r.cache
+	r.mu.Unlock()
+	if c != nil {
+		c.onCopyClosed(unitID, volunteerID, false)
 	}
 }
 
@@ -1728,38 +1742,39 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 	}
 }
 
-// onCopyClosed drops one volunteer's in-memory hold after AbandonWorkUnit closed its
-// copy row and, when that close feeds the SQL cooldown, benches the volunteer on the
-// still-staged candidate with the window the fresh row now enforces (TB-40). The
-// candidate's bench map is a refill-time snapshot, taken BEFORE this close existed,
-// and it refreshes only on re-stage — which never happens while the candidate sits
-// staged. So a bare release left eligibleLocked blind to the SQL cooldown the close
-// just started: the closer's next poll (30–60 s later, squarely inside the window)
-// was re-handed the same unit, the async reservation flush was refused, and the
-// client — never told — buffered a phantom that died at run-start (~14 % of fleet
-// slot starts on 2026-08-02). voidNonLandedCopy stays the backstop for refusals this
-// replica did NOT perform (it learns of those only from the flush conflict, so it can
-// only throttle blind); this path knows the honored outcome and its time, so it
-// mirrors the SQL gate exactly — bench-or-not per cooldownGuardSQL's arms, the
-// per-outcome window, and the pool-exhausted fallback intact so a small pool still
-// cannot strand.
+// onCopyClosed drops one volunteer's in-memory hold after its copy row was closed —
+// by AbandonWorkUnit, or by the fault monitor's deadline sweep (TB-82) — and benches
+// the volunteer on the still-staged candidate with the window the fresh row now
+// enforces (TB-40). The candidate's bench map is a refill-time snapshot, taken BEFORE
+// this close existed, and it refreshes only on re-stage — which never happens while
+// the candidate sits staged. So a bare release left eligibleLocked blind to the SQL
+// cooldown the close just started: the closer's next poll (30–60 s later, squarely
+// inside the window) was re-handed the same unit, the async reservation flush was
+// refused, and the client — never told — buffered a phantom that died at run-start
+// (~14 % of fleet slot starts on 2026-08-02). And a close the cache was never told
+// about at all (the reaper's, before TB-82) left the hold in place for the life of
+// the process: the unit stayed excluded from refill and its staged candidate
+// counted a holder that no longer existed, so two units sat offered to nobody for
+// 30 days until a restart. voidNonLandedCopy stays the backstop for refusals this
+// replica did NOT perform (it learns of those only from the flush conflict, so it
+// can only throttle blind); this path knows the honored outcome and its time, so it
+// mirrors the SQL gate exactly — the per-outcome window, and the pool-exhausted
+// fallback intact so a small pool still cannot strand.
 //
-// `returned` and `started` are what the close actually WROTE (workunit.ClosedCopy —
-// the repo downgrades a mis-flagged give-back of a started copy to ABANDONED), so
-// this stays in lockstep with the row the SQL gate will read.
-func (c *dispatchCache) onCopyClosed(unitID, volunteerID types.ID, returned, started bool) {
+// Every close benches (TB-81): a RETURNED give-back for its short re-offer throttle
+// (that IS the give-back's only teeth, TB-35), any other outcome — EXPIRED, or
+// ABANDONED whether or not the copy had started — for ~one deadline. The #59
+// exemption that let an un-started ABANDONED bench nothing predates the give-back
+// flag: the client now marks its graceful returns, so an un-started ABANDONED is a
+// failure to start the unit, exactly what the SQL gate benches on.
+//
+// `returned` is what the close actually WROTE (workunit.ClosedCopy — the repo
+// downgrades a mis-flagged give-back of a started copy to ABANDONED), so this stays
+// in lockstep with the row the SQL gate will read.
+func (c *dispatchCache) onCopyClosed(unitID, volunteerID types.ID, returned bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.releaseInMemLocked(unitID, volunteerID)
-	// A graceful return of un-started buffered work (ABANDONED, started_at NULL) is
-	// not a reliability signal and does not feed the SQL cooldown (#59) — so it must
-	// not bench here either, or a one-volunteer pool is refused in memory forever
-	// what the SQL landing would grant at once (the graceful-buffer-return e2e
-	// property). RETURNED benches its short re-offer throttle even though un-started:
-	// that IS the give-back's only teeth (TB-35).
-	if !returned && !started {
-		return
-	}
 	for i := range c.ready {
 		if c.ready[i].unit.ID != unitID {
 			continue
@@ -3455,6 +3470,7 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 	// reflected in the authoritative inflight counts recomputed below.
 	c.reconcileHeldCopies(ctx)
 	c.pruneStarveLog()
+	c.releaseLapsedHolds()
 
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)
 	defer cancel()
@@ -3525,6 +3541,43 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 				delete(c.lastHandOut, vol)
 			}
 		}
+	}
+}
+
+// lapsedHoldGrace is how long past its own lease an in-memory hold may linger before
+// releaseLapsedHolds drops it: comfortably longer than the fault monitor's scan
+// interval, so the reaper's close — which releases the hold directly (TB-82) — gets
+// there first on the replica that runs the sweep, and this only catches what no
+// close-time path told this replica about.
+const lapsedHoldGrace = 5 * time.Minute
+
+// releaseLapsedHolds drops every in-memory hold whose lease lapsed more than
+// lapsedHoldGrace ago — the reconcile-time backstop behind TB-82. A hold's lease is
+// the copy row's reserved_until: once it passes, the copy is either run-started (the
+// hold already converted, onRunStart) or reaped by the fault monitor's lapsed-
+// reservation sweep (closed ABANDONED, so the SQL gate refuses this holder anyway).
+// Either way the hold is a fossil, and a fossil hold kept its unit excluded from
+// refill and its staged candidate counting a holder that no longer existed — the
+// shape that left two units offered to nobody for 30 days. The close-time paths
+// (AbandonWorkUnit, the reaper) release holds as they close; this catches a close
+// this replica never heard of (another replica's sweep, or a future writer that
+// forgets to say so) within one reconcile tick of the grace instead of never.
+func (c *dispatchCache) releaseLapsedHolds() {
+	cutoff := c.now().Add(-lapsedHoldGrace)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	released := 0
+	for unitID, holders := range c.reservedInMem {
+		for acct, hc := range holders {
+			if hc.reservedUntil.Before(cutoff) {
+				c.releaseInMemLocked(unitID, acct)
+				released++
+			}
+		}
+	}
+	if released > 0 {
+		c.logger.Warn("dispatch cache: released in-memory holds whose lease lapsed unannounced",
+			"released", released, "grace", lapsedHoldGrace)
 	}
 }
 

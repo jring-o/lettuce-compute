@@ -738,10 +738,16 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 > them — recorded as `RETURNED`) do **not** count toward that ceiling or the error cap:
 > a full buffer says nothing about the unit, so give-backs can never dead-letter a
 > healthy unit. A returned unit is simply not re-offered to the same machine for about
-> ten minutes. Once a unit's budget **is** spent, dispatch stops serving it entirely
-> while it awaits the dead-letter sweep. A volunteer whose copy timed out is briefly
-> benched so a fresh volunteer gets first refusal, then becomes eligible again if the
-> pool is otherwise exhausted (so work never strands).
+> ten minutes. A copy a volunteer abandons **without ever starting it** (its container
+> engine is unreachable, it has no runtime for the leaf, the artifact fails to prepare)
+> counts **once per volunteer** however often that volunteer repeats it, so one broken
+> machine can never spend a unit's budget by itself — only distinct volunteers failing
+> the same unit do. Once a unit's budget **is** spent, dispatch stops serving it
+> entirely while it awaits the dead-letter sweep. A volunteer whose copy timed out or
+> was abandoned — started or not — is benched from that unit for about one deadline so
+> a fresh volunteer gets first refusal, then becomes eligible again if the pool is
+> otherwise exhausted (so work never strands); each such copy also lowers the
+> machine's measured reliability, which shrinks the work buffer the head lets it hold.
 >
 > A parked unit is **recoverable**: `POST
 > /api/v1/leafs/{leaf_id}/work-units/{work_unit_id}/revive` (owner API key) re-judges
