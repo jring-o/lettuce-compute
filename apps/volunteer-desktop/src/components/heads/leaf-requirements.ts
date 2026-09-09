@@ -124,7 +124,14 @@ export function leafRequirementItems(
   if (cores > 0) {
     const item: RequirementItem = { key: "cores", label: `${cores} ${cores === 1 ? "core" : "cores"}` };
     if (machine && machine.max_cpu_cores > 0 && cores > machine.max_cpu_cores) {
-      item.shortfall = `you allow ${machine.max_cpu_cores}`;
+      if (machine.cpu_limited_by_vm) {
+        // The budget is the container engine's virtual machine CPU count,
+        // not what Settings allows (TB-75): name the machine, as for memory.
+        item.shortfall = `the container engine's virtual machine allows ${machine.max_cpu_cores}; it has ${machine.container_vm_cpus} CPUs`;
+        item.vmLimited = true;
+      } else {
+        item.shortfall = `you allow ${machine.max_cpu_cores}`;
+      }
     }
     items.push(item);
   }

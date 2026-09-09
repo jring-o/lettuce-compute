@@ -1508,6 +1508,7 @@ type e2eMockProcessHandle struct {
 func (m *e2eMockProcessHandle) Suspend() error { m.suspended = true; return nil }
 func (m *e2eMockProcessHandle) Resume() error  { m.suspended = false; return nil }
 func (m *e2eMockProcessHandle) PID() int       { return m.pid }
+func (m *e2eMockProcessHandle) SetCPUShare(float64) error { return nil }
 
 // setupTestEnvWithActiveTask creates a test environment with a daemon that has
 // an active task in a SlotManager, suitable for testing per-task endpoints.

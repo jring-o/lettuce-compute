@@ -68,6 +68,17 @@ function Section({
 }
 
 // Resource limit slider with usage bar
+/**
+ * The sentence under the CPU slider: the allowance is a whole-machine total
+ * that every running task shares equally (TB-75) — it used to be applied per
+ * task, so "2 cores" with two tasks used four.
+ */
+export function cpuShareCaption(cores: number): string {
+  const half = Number((cores / 2).toFixed(2));
+  const each = cores === 1 ? "half a core" : `${half} each`;
+  return `All running tasks share these ${cores} ${cores === 1 ? "core" : "cores"} equally: one task alone gets all ${cores}, two tasks get ${each}. Each task is told its share (LETTUCE_CPU_LIMIT).`;
+}
+
 function ResourceSlider({
   label,
   value,
@@ -463,7 +474,7 @@ export function SettingsPage() {
       {/* Section 1: Resource Limits */}
       <Section title="Resource Limits">
         <ResourceSlider
-          label="CPU Cores"
+          label="CPU Cores — shared by all running tasks"
           value={config.resource_limits.max_cpu_cores}
           min={1}
           max={coresSliderMax}
@@ -476,6 +487,11 @@ export function SettingsPage() {
             })
           }
         />
+        <p className="text-xs text-muted-foreground">
+          {machine?.cpu_limited_by_vm
+            ? `Work on this machine is limited to ${machine.max_cpu_cores} cores: the container engine's virtual machine has ${machine.container_vm_cpus} CPUs, so heads are told ${machine.max_cpu_cores}. Give the machine more CPUs to use more.`
+            : cpuShareCaption(config.resource_limits.max_cpu_cores)}
+        </p>
 
         <ResourceSlider
           label="Memory"

@@ -63,6 +63,12 @@ type EngineInfo struct {
 	// said 2048 MB while the engine reported 48 GB. 0 when the engine did not
 	// report it.
 	MemTotalMB int64
+	// NCPU is the number of CPUs the machine the engine daemon runs on has, as
+	// the engine reports it — on macOS and Windows the VM's vCPU count, the
+	// real ceiling for every container's CPU use whatever the host has and
+	// whatever the configuration allows (TB-75, the CPU twin of MemTotalMB).
+	// 0 when the engine did not report it.
+	NCPU int
 }
 
 // DockerClient abstracts the Docker Engine API operations needed by ContainerRuntime.
@@ -101,6 +107,12 @@ type DockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string) error
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
+	// ContainerUpdateCPU replaces a running (or paused) container's CPU quota
+	// in place — the engine's update call, which rewrites the container's
+	// cgroup without restarting it. quota/period are the CFS pair (CFSQuota);
+	// 0/0 removes the cap. Used to give a container its new share of the CPU
+	// budget when another task starts or finishes (TB-75).
+	ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error
 	Close() error
 }
 
@@ -217,7 +229,7 @@ func (d *dockerClientWrapper) Info(ctx context.Context) (*EngineInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker info: %w", err)
 	}
-	return buildEngineInfo(info.DockerRootDir, info.DriverStatus, info.MemTotal), nil
+	return buildEngineInfo(info.DockerRootDir, info.DriverStatus, info.MemTotal, info.NCPU), nil
 }
 
 // pathExistsFunc reports whether a filesystem path exists. A package-level seam
@@ -241,10 +253,13 @@ var pathExistsFunc = func(p string) bool {
 // and include whichever exist, so the disk gate checks the filesystem the blobs
 // actually land on. Including only existing paths means a wrong guess degrades
 // to the prior DockerRootDir-only behavior rather than falsely blocking.
-func buildEngineInfo(dockerRootDir string, driverStatus [][2]string, memTotalBytes int64) *EngineInfo {
+func buildEngineInfo(dockerRootDir string, driverStatus [][2]string, memTotalBytes int64, ncpu int) *EngineInfo {
 	ei := &EngineInfo{StoragePath: dockerRootDir}
 	if memTotalBytes > 0 {
 		ei.MemTotalMB = memTotalBytes / (1024 * 1024)
+	}
+	if ncpu > 0 {
+		ei.NCPU = ncpu
 	}
 	seen := make(map[string]bool)
 	add := func(p string) {
@@ -618,6 +633,19 @@ func (d *dockerClientWrapper) ContainerPause(ctx context.Context, containerID st
 
 func (d *dockerClientWrapper) ContainerUnpause(ctx context.Context, containerID string) error {
 	return d.cli.ContainerUnpause(ctx, containerID)
+}
+
+func (d *dockerClientWrapper) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
+	resp, err := d.cli.ContainerUpdate(ctx, containerID, container.UpdateConfig{
+		Resources: container.Resources{CPUQuota: quota, CPUPeriod: period},
+	})
+	if err != nil {
+		return fmt.Errorf("container update (cpu quota %d/%d): %w", quota, period, err)
+	}
+	for _, w := range resp.Warnings {
+		d.logger.Warn("container engine warned on CPU quota update", "container", containerID, "warning", w)
+	}
+	return nil
 }
 
 func (d *dockerClientWrapper) Close() error {

@@ -148,6 +148,19 @@ start a Podman machine for you on first `start`.
   A machine Lettuce creates for you is sized at your memory limit plus the 512 MB
   reserve, so it is never the bound.
 
+- **The machine's CPUs bound your CPU limit the same way.** Container work can
+  use no more CPUs than the virtual machine has, so if your CPU limit
+  (`resource_limits.max_cpu_cores`) is above the machine's CPU count, Lettuce
+  works to the machine's count instead: heads are told the smaller figure, the
+  running tasks share it, and you are told once — the log line is `container
+  engine's VM has fewer CPUs than the CPU limit`, the desktop app shows a
+  notice and says so under the CPU slider, and `lettuce-volunteer doctor`
+  prints both figures under "cpu limit". To use more cores, give the machine
+  more CPUs (Podman Desktop or Docker Desktop: Settings → Resources; Podman
+  CLI: `podman machine stop`, `podman machine set --cpus <n>`, `podman machine
+  start`) and restart Lettuce. A machine Lettuce creates for you is sized at
+  your CPU limit, so it is never the bound.
+
 - **macOS: Podman does not need to be on the app's PATH.** An app launched from
   Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official
   installer and Podman Desktop), `/opt/homebrew/bin` and `/usr/local/bin`
@@ -497,6 +510,38 @@ Two things make this volunteer-friendly:
 
 > **Replaces `work_buffer_size`.** Earlier releases sized the buffer as a unit
 > count via `work_buffer_size`. That key is gone; use `work_buffer_hours`.
+
+### CPU cores — one budget, shared by the running tasks
+
+`resource_limits.max_cpu_cores` (the **CPU Cores** slider in the desktop app) is
+the most CPU Lettuce will use on your machine, in total — the same kind of number
+as the memory and disk limits beside it. The tasks that are running share it
+equally: a task running alone is given the whole budget; when a second starts,
+each is given half; when one finishes, the survivor is given the whole again.
+The share is enforced on every task (a container's CPU quota, a cgroup or Job
+Object cap for native work) and adjusted live as tasks start and finish, so
+`max_cpu_cores: 2` means two cores whether `max_concurrent_tasks` is 1 or 4.
+Fractions are fine — three cores over two tasks is 1.5 each.
+
+Two consequences worth knowing:
+
+- **At most `max_cpu_cores` tasks run at once**, whatever `max_concurrent_tasks`
+  allows: each unit books its leaf's minimum core requirement (at least one) and
+  admission keeps the sum within the budget, so no task is ever given less than
+  its leaf declared it needs. A leaf that needs two cores runs alone under a
+  two-core budget; two one-core leafs run side by side.
+- **Each task is told its share.** Every task is started with
+  `LETTUCE_CPU_LIMIT=<cores>` (the exact share, possibly fractional) and the
+  standard thread-pool knobs (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `MKL_NUM_THREADS`, `NUMEXPR_MAX_THREADS`) set to the same figure rounded to
+  whole threads, so a well-written leaf sizes its workers to what it was given
+  rather than to every CPU it can see. A running task cannot be told when its
+  share changes; only the cap moves.
+
+> **In earlier releases (through v0.12.1)** the figure was applied per task:
+> every task got the whole number as its own cap and nothing counted the total,
+> so "2 cores" with two tasks used four. If you lowered the slider to work
+> around that, you can put it back.
 
 ### Thermal protection
 

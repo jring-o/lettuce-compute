@@ -43,6 +43,42 @@ The flow you'll follow:
 
 ---
 
+## Sizing your worker pool (recommended)
+
+A volunteer's CPU allowance is a budget for the whole machine that every running
+task shares equally, and the volunteer client caps each task at its share (a
+container CPU quota, a cgroup or Job Object cap for native work). Inside a
+container `os.cpu_count()` / `runtime.NumCPU()` / `nproc` still report every CPU
+of the machine, so a program that sizes its thread pool from them oversubscribes
+its cap and stalls on throttling instead of computing.
+
+Size the pool from what the task was actually given instead. The client sets, for
+every runtime:
+
+- **`LETTUCE_CPU_LIMIT`** — the task's share in cores, possibly fractional (`2`,
+  `1.5`, `0.5`). Round it to whole threads, never below one.
+- **`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `NUMEXPR_MAX_THREADS`** — the same figure as a whole thread count, which
+  OpenMP, NumPy/SciPy (OpenBLAS/MKL) and numexpr read on their own; a library
+  that honours them needs no code change.
+
+```python
+import math, os
+workers = max(1, round(float(os.environ.get("LETTUCE_CPU_LIMIT", "1"))))
+```
+
+```go
+limit, _ := strconv.ParseFloat(os.Getenv("LETTUCE_CPU_LIMIT"), 64)
+workers := max(1, int(math.Round(limit)))
+```
+
+On Linux the same figure can be read from the cgroup (`/sys/fs/cgroup/cpu.max`:
+quota ÷ period). The share is fixed for the life of the process — the cap moves
+when other tasks on the machine start or finish, but a running process is not
+told — so read it once at start-up and do not re-derive it from the CPU count.
+
+---
+
 ## Reporting progress (recommended)
 
 Have your entrypoint report progress so contributors can see how far along a work

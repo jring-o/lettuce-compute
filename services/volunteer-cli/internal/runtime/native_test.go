@@ -1006,7 +1006,7 @@ func TestCommandModifier(t *testing.T) {
 
 	// Set a modifier that adds an env var.
 	modifierCalled := false
-	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int) error {
+	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int, _ CPUGrant) error {
 		modifierCalled = true
 		return nil
 	})
@@ -1047,7 +1047,7 @@ func TestCommandModifierError(t *testing.T) {
 	nr := NewNativeRuntime(dataDir, newTestLogger())
 	nr.httpClient = ts.Client()
 
-	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int) error {
+	nr.SetCommandModifier(func(cmd *exec.Cmd, _ int, _ CPUGrant) error {
 		return fmt.Errorf("resource limit exceeded")
 	})
 
@@ -1338,7 +1338,7 @@ func TestProcessNotifier(t *testing.T) {
 	// Set a notifier that records the PID and returns a cleanup.
 	var notifiedPID int
 	cleanupCalled := false
-	nr.SetProcessNotifier(func(pid int, _ int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, _ int, _ CPUGrant) (func(), error) {
 		notifiedPID = pid
 		return func() { cleanupCalled = true }, nil
 	})
@@ -1385,7 +1385,7 @@ func TestProcessNotifierError(t *testing.T) {
 	nr.httpClient = ts.Client()
 
 	// Set a notifier that returns an error.
-	nr.SetProcessNotifier(func(pid int, _ int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, _ int, _ CPUGrant) (func(), error) {
 		return nil, fmt.Errorf("cgroup creation failed")
 	})
 

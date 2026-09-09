@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // readRlimit returns a live process's current limit for one resource. It reads
@@ -60,7 +60,7 @@ func TestEnforceFallbackSetsDataLimitNotAddressSpace(t *testing.T) {
 	asBefore := readRlimit(t, pid, syscall.RLIMIT_AS)
 
 	const declaredMB = 128
-	limits := &config.ResourceLimits{MaxCPUCores: 1, MaxMemoryMB: declaredMB}
+	limits := &TaskLimits{MaxMemoryMB: declaredMB, CPU: runtime.CPUGrant{ShareCores: 1, BudgetCores: 1}}
 	cleanup, err := l.Enforce(pid, limits)
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
@@ -100,7 +100,7 @@ func TestEnforceFallbackLeavesMemoryUnlimitedWhenUndeclared(t *testing.T) {
 
 	before := readRlimit(t, pid, syscall.RLIMIT_DATA)
 
-	cleanup, err := l.Enforce(pid, &config.ResourceLimits{MaxCPUCores: 1, MaxMemoryMB: 0})
+	cleanup, err := l.Enforce(pid, &TaskLimits{CPU: runtime.CPUGrant{ShareCores: 1, BudgetCores: 1}})
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
 	}

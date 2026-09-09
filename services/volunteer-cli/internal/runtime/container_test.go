@@ -38,9 +38,26 @@ type MockDockerClient struct {
 	ContainerListFn        func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 	ContainerPauseFn       func(ctx context.Context, containerID string) error
 	ContainerUnpauseFn     func(ctx context.Context, containerID string) error
+	ContainerUpdateCPUFn   func(ctx context.Context, containerID string, quota, period int64) error
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
+	// CPUUpdates records every ContainerUpdateCPU call (TB-75).
+	CPUUpdates []CPUUpdateCall
+}
+
+// CPUUpdateCall is one recorded ContainerUpdateCPU call.
+type CPUUpdateCall struct {
+	ContainerID   string
+	Quota, Period int64
+}
+
+func (m *MockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
+	m.CPUUpdates = append(m.CPUUpdates, CPUUpdateCall{ContainerID: containerID, Quota: quota, Period: period})
+	if m.ContainerUpdateCPUFn != nil {
+		return m.ContainerUpdateCPUFn(ctx, containerID, quota, period)
+	}
+	return nil
 }
 
 func (m *MockDockerClient) Ping(ctx context.Context) error {
@@ -667,7 +684,7 @@ func TestContainerRuntime_ExecuteMemoryLimit(t *testing.T) {
 func TestContainerRuntime_ExecuteCPULimit(t *testing.T) {
 	mock := &MockDockerClient{}
 	cr, _ := newTestContainerRuntime(t, mock)
-	cr.SetMaxCPUCores(2)
+	cr.SetCPUBudget(2)
 
 	wu := &WorkUnit{
 		ID:            "505885bb-386c-478a-8204-36832e02431a", // was cpu-1

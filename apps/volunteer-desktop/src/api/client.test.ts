@@ -320,6 +320,22 @@ describe("ManagementClient", () => {
       expect(limited.machine.memory_limited_by_vm).toBe(true);
     });
 
+    it("defaults the container-VM CPU fields a daemon older than TB-75 does not send", async () => {
+      respond({ heads: [head], machine });
+      const result = await client.headsAndMachine();
+      expect(result.machine.container_vm_cpus).toBe(0);
+      expect(result.machine.cpu_limited_by_vm).toBe(false);
+
+      respond({
+        heads: [head],
+        machine: { ...machine, max_cpu_cores: 4, container_vm_cpus: 4, cpu_limited_by_vm: true },
+      });
+      const limited = await client.headsAndMachine();
+      expect(limited.machine.max_cpu_cores).toBe(4);
+      expect(limited.machine.container_vm_cpus).toBe(4);
+      expect(limited.machine.cpu_limited_by_vm).toBe(true);
+    });
+
     it("tolerates a missing machine block", async () => {
       respond({ heads: null });
       const result = await client.headsAndMachine();

@@ -944,19 +944,21 @@ type testLimiter struct {
 	enforceCalls int
 }
 
-func (tl *testLimiter) Apply(_ *exec.Cmd, _ *config.ResourceLimits) error {
+func (tl *testLimiter) Apply(_ *exec.Cmd, _ *resource.TaskLimits) error {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
 	tl.applyCalls++
 	return nil
 }
 
-func (tl *testLimiter) Enforce(_ int, _ *config.ResourceLimits) (func(), error) {
+func (tl *testLimiter) Enforce(_ int, _ *resource.TaskLimits) (func(), error) {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
 	tl.enforceCalls++
 	return func() {}, nil
 }
+
+func (tl *testLimiter) SetCPU(_ int, _ runtime.CPUGrant) error { return nil }
 
 func (tl *testLimiter) CheckDiskSpace(_ string, _ int) error {
 	tl.mu.Lock()

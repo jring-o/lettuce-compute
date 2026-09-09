@@ -50,12 +50,12 @@ func TestTB63_ContainerMemoryBudgetMB(t *testing.T) {
 func TestTB63_BuildEngineInfoCarriesTheEngineMemory(t *testing.T) {
 	defer withPathExists(func(string) bool { return false })()
 
-	ei := buildEngineInfo("/var/lib/containers/storage", nil, 2048*1024*1024)
+	ei := buildEngineInfo("/var/lib/containers/storage", nil, 2048*1024*1024, 0)
 	if ei.MemTotalMB != 2048 {
 		t.Errorf("MemTotalMB = %d, want 2048 for a 2 GiB engine VM", ei.MemTotalMB)
 	}
 	for _, bytes := range []int64{0, -1} {
-		if ei := buildEngineInfo("/var/lib/docker", nil, bytes); ei.MemTotalMB != 0 {
+		if ei := buildEngineInfo("/var/lib/docker", nil, bytes, 0); ei.MemTotalMB != 0 {
 			t.Errorf("MemTotalMB = %d for a reported %d bytes, want 0 (unknown)", ei.MemTotalMB, bytes)
 		}
 	}

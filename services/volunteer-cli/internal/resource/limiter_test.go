@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // startLimiterTestChild spawns a short-lived child process for the Enforce tests
@@ -91,9 +91,9 @@ func TestCheckDiskSpace_ZeroRequirement(t *testing.T) {
 
 func TestEnforce_ReturnsCleanup(t *testing.T) {
 	l := NewLimiter(slog.Default())
-	limits := &config.ResourceLimits{
-		MaxCPUCores: 1,
+	limits := &TaskLimits{
 		MaxMemoryMB: 256,
+		CPU:         runtime.CPUGrant{ShareCores: 1, BudgetCores: 1},
 	}
 	// Enforce against a disposable child, never the test process itself (see
 	// startLimiterTestChild). It should return a non-nil cleanup without error
@@ -112,9 +112,9 @@ func TestEnforce_ReturnsCleanup(t *testing.T) {
 
 func TestEnforce_ChildProcess(t *testing.T) {
 	l := NewLimiter(slog.Default())
-	limits := &config.ResourceLimits{
-		MaxCPUCores: 1,
+	limits := &TaskLimits{
 		MaxMemoryMB: 256,
+		CPU:         runtime.CPUGrant{ShareCores: 1, BudgetCores: 1},
 	}
 	// A live, non-self PID exercises the real enforce path (prlimit64 +
 	// sched_setaffinity on Linux) without capping the test binary's own
@@ -132,10 +132,7 @@ func TestEnforce_ChildProcess(t *testing.T) {
 
 func TestEnforce_ZeroLimits(t *testing.T) {
 	l := NewLimiter(slog.Default())
-	limits := &config.ResourceLimits{
-		MaxCPUCores: 0,
-		MaxMemoryMB: 0,
-	}
+	limits := &TaskLimits{}
 	pid := os.Getpid()
 	cleanup, err := l.Enforce(pid, limits)
 	if err != nil {
@@ -150,9 +147,9 @@ func TestEnforce_ZeroLimits(t *testing.T) {
 
 func TestApply_NoError(t *testing.T) {
 	l := NewLimiter(slog.Default())
-	limits := &config.ResourceLimits{
-		MaxCPUCores: 2,
+	limits := &TaskLimits{
 		MaxMemoryMB: 512,
+		CPU:         runtime.CPUGrant{ShareCores: 2, BudgetCores: 2},
 	}
 	cmd := exec.Command("echo", "test")
 	if err := l.Apply(cmd, limits); err != nil {

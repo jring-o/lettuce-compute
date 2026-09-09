@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // LinuxLimiter enforces resource limits using cgroups v2 (preferred) or
@@ -56,7 +56,7 @@ func detectCgroupsV2() bool {
 }
 
 // Apply configures the exec.Cmd before process start.
-func (l *LinuxLimiter) Apply(cmd *exec.Cmd, limits *config.ResourceLimits) error {
+func (l *LinuxLimiter) Apply(cmd *exec.Cmd, limits *TaskLimits) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -66,16 +66,51 @@ func (l *LinuxLimiter) Apply(cmd *exec.Cmd, limits *config.ResourceLimits) error
 }
 
 // Enforce applies post-start resource limits (cgroups or prlimit+affinity).
-func (l *LinuxLimiter) Enforce(pid int, limits *config.ResourceLimits) (func(), error) {
+func (l *LinuxLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
 	if l.useCgroups {
 		return l.enforceCgroups(pid, limits)
 	}
 	return l.enforceFallback(pid, limits)
 }
 
+// SetCPU gives a running task its new share of the CPU budget (TB-75): on
+// the cgroup path its cpu.max is rewritten to the share's quota; on the
+// affinity fallback, which cannot express a fraction, the process is pinned
+// to the budget's CPU set again (a changed budget moves the set; an unchanged
+// one is a no-op).
+func (l *LinuxLimiter) SetCPU(pid int, cpu runtime.CPUGrant) error {
+	if l.useCgroups {
+		return writeCPUMax(cgroupPathFor(pid), cpu.ShareCores)
+	}
+	if cpu.BudgetCores > 0 {
+		l.applyCPUAffinity(pid, cpu.BudgetCores)
+	}
+	return nil
+}
+
+// cgroupPathFor is the per-process cgroup v2 scope the cgroup path creates.
+func cgroupPathFor(pid int) string {
+	return fmt.Sprintf("/sys/fs/cgroup/lettuce-%d", pid)
+}
+
+// writeCPUMax sets a cgroup's CPU bandwidth to shareCores: cpu.max =
+// "{quota} {period}" with quota = share × period, so 1.5 cores is
+// "150000 100000". A share of 0 lifts the cap ("max 100000").
+func writeCPUMax(cgroupPath string, shareCores float64) error {
+	quota, period := runtime.CFSQuota(shareCores)
+	cpuMax := fmt.Sprintf("max %d", runtime.CFSPeriodMicros)
+	if quota > 0 {
+		cpuMax = fmt.Sprintf("%d %d", quota, period)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(cpuMax), 0o644); err != nil {
+		return fmt.Errorf("set cpu.max: %w", err)
+	}
+	return nil
+}
+
 // enforceCgroups creates a cgroup v2 scope for the process with memory and CPU limits.
-func (l *LinuxLimiter) enforceCgroups(pid int, limits *config.ResourceLimits) (func(), error) {
-	cgroupPath := fmt.Sprintf("/sys/fs/cgroup/lettuce-%d", pid)
+func (l *LinuxLimiter) enforceCgroups(pid int, limits *TaskLimits) (func(), error) {
+	cgroupPath := cgroupPathFor(pid)
 
 	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
 		return nil, fmt.Errorf("create cgroup: %w", err)
@@ -96,18 +131,16 @@ func (l *LinuxLimiter) enforceCgroups(pid int, limits *config.ResourceLimits) (f
 		l.logger.Debug("cgroup memory limit set", "bytes", memBytes)
 	}
 
-	// Set CPU limit: cpu.max = "{quota} {period}".
-	// quota = cores * period; period = 100000 µs (100ms).
-	if limits.MaxCPUCores > 0 {
-		period := 100000
-		quota := limits.MaxCPUCores * period
-		cpuMax := fmt.Sprintf("%d %d", quota, period)
-		cpuPath := filepath.Join(cgroupPath, "cpu.max")
-		if err := os.WriteFile(cpuPath, []byte(cpuMax), 0o644); err != nil {
+	// Set the CPU limit to this task's SHARE of the budget — not, as before,
+	// the whole budget for every process, which let N tasks use N times the
+	// limit (TB-75). Fractional shares are exact here (CFS quota).
+	if limits.CPU.ShareCores > 0 {
+		if err := writeCPUMax(cgroupPath, limits.CPU.ShareCores); err != nil {
 			cleanup()
-			return nil, fmt.Errorf("set cpu.max: %w", err)
+			return nil, err
 		}
-		l.logger.Debug("cgroup CPU limit set", "quota", quota, "period", period, "cores", limits.MaxCPUCores)
+		quota, period := runtime.CFSQuota(limits.CPU.ShareCores)
+		l.logger.Debug("cgroup CPU limit set", "quota", quota, "period", period, "cores", runtime.FormatCores(limits.CPU.ShareCores), "budget_cores", limits.CPU.BudgetCores)
 	}
 
 	// Assign the process to the cgroup.
@@ -128,7 +161,7 @@ type rlimit64 struct {
 }
 
 // enforceFallback uses prlimit64 for memory and sched_setaffinity for CPU.
-func (l *LinuxLimiter) enforceFallback(pid int, limits *config.ResourceLimits) (func(), error) {
+func (l *LinuxLimiter) enforceFallback(pid int, limits *TaskLimits) (func(), error) {
 	// Memory ceiling via prlimit64.
 	//
 	// This used RLIMIT_AS and was lethal (TB-11). RLIMIT_AS caps a process's
@@ -167,8 +200,8 @@ func (l *LinuxLimiter) enforceFallback(pid int, limits *config.ResourceLimits) (
 		}
 	}
 
-	// Confine the process to MaxCPUCores of the CPUs it is actually PERMITTED to
-	// use — not to CPUs 0..N-1.
+	// Confine the process to the BUDGET's worth of the CPUs it is actually
+	// PERMITTED to use — not to CPUs 0..N-1.
 	//
 	// This used to build the mask from the bare count, setting bits 0..N-1
 	// unconditionally (TB-16). A process confined by a cpuset — a systemd slice
@@ -183,16 +216,21 @@ func (l *LinuxLimiter) enforceFallback(pid int, limits *config.ResourceLimits) (
 	//
 	// The quieter half was worse: a PARTIAL overlap SUCCEEDS at the wrong size,
 	// because the kernel intersects the requested mask with the permitted set.
-	// Permitted {2..7} with MaxCPUCores 4 pinned the process to {2,3} — half the
-	// requested allowance — and nothing was logged at any level.
+	// Permitted {2..7} with a 4-core budget pinned the process to {2,3} — half
+	// the requested allowance — and nothing was logged at any level.
+	//
+	// An affinity mask cannot express a task's fractional SHARE of the budget
+	// (TB-75), so every task is pinned to the same budget-sized set: the sum
+	// of what they can use is then bounded by the budget, which is the promise
+	// — the tasks share those CPUs by the kernel's ordinary scheduling.
 	//
 	// Note this is the fallback path only: containers get a CFS quota
 	// (runtime/container.go) and cgroup-capable hosts get cpu.max above, both of
 	// which cap CPU *time* and are immune to this. Affinity is the sole lever
 	// left when cgroup delegation is unavailable, which is the common case on an
 	// unprivileged desktop.
-	if limits.MaxCPUCores > 0 {
-		l.applyCPUAffinity(pid, limits.MaxCPUCores)
+	if limits.CPU.BudgetCores > 0 {
+		l.applyCPUAffinity(pid, limits.CPU.BudgetCores)
 	}
 
 	return func() {}, nil

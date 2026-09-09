@@ -217,24 +217,29 @@ func wireRuntimeResourceLimits(registry *daemon.RuntimeRegistry, cfg *config.Con
 	if !ok {
 		return pg
 	}
-	perUnitLimits := func(declaredMemMB int) *config.ResourceLimits {
-		l := *limits
-		l.MaxMemoryMB = runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB)
-		return &l
+	// The runner executes one job at a time, so each task is granted the whole
+	// CPU budget (TB-75); the daemon's equal split among concurrent tasks does
+	// not apply here.
+	nr.SetCPUBudget(limits.MaxCPUCores)
+	perUnitLimits := func(declaredMemMB int, cpu runtime.CPUGrant) *resource.TaskLimits {
+		return &resource.TaskLimits{
+			MaxMemoryMB: runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB),
+			CPU:         cpu,
+		}
 	}
-	nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int) error {
+	nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int, cpu runtime.CPUGrant) error {
 		if pg != nil {
 			pg.ConfigureCommand(cmd)
 		}
-		return limiter.Apply(cmd, perUnitLimits(declaredMemMB))
+		return limiter.Apply(cmd, perUnitLimits(declaredMemMB, cpu))
 	})
-	nr.SetProcessNotifier(func(pid int, declaredMemMB int) (func(), error) {
+	nr.SetProcessNotifier(func(pid int, declaredMemMB int, cpu runtime.CPUGrant) (func(), error) {
 		if pg != nil {
 			if err := pg.Add(pid); err != nil {
 				logger.Warn("failed to add process to group", "pid", pid, "error", err)
 			}
 		}
-		return limiter.Enforce(pid, perUnitLimits(declaredMemMB))
+		return limiter.Enforce(pid, perUnitLimits(declaredMemMB, cpu))
 	})
 	return pg
 }

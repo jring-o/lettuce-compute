@@ -94,19 +94,24 @@ type ContainerRuntimeFactory struct {
 	// engine reported it at the last successful Build (0 on a host whose
 	// containers share its RAM, or when the engine did not say); budgetMB is
 	// the memory budget that Build gave container work — the configured budget
-	// clipped to the VM (runtime.ContainerMemoryBudgetMB, TB-63). Both are 0
-	// until a runtime has been built.
+	// clipped to the VM (runtime.ContainerMemoryBudgetMB, TB-63). engineCPUs
+	// and cpuBudget are the CPU twins (the VM's vCPU count and the configured
+	// max_cpu_cores clipped to it, runtime.ContainerCPUBudget, TB-75). All
+	// are 0 until a runtime has been built.
 	engineMemoryMB int
 	budgetMB       int
+	engineCPUs     int
+	cpuBudget      int
 
 	// Seams for tests: engine detection, runtime construction and the engine
-	// VM memory probe. Production wiring is DetectContainerBackendPreferred,
-	// NewContainerRuntimeForBackend plus the configuration start-up applies,
-	// and the engine's own /info on a VM platform.
-	detect       func(preferred runtime.ContainerBackend) runtime.BackendInfo
-	construct    func(backend runtime.BackendInfo) (runtime.Runtime, error)
-	engineMemory func(rt runtime.Runtime) int
-	now          func() time.Time
+	// VM probe (its memory and vCPU count). Production wiring is
+	// DetectContainerBackendPreferred, NewContainerRuntimeForBackend plus the
+	// configuration start-up applies, and the engine's own /info on a VM
+	// platform.
+	detect    func(preferred runtime.ContainerBackend) runtime.BackendInfo
+	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)
+	engineVM  func(rt runtime.Runtime) (memMB, cpus int)
+	now       func() time.Time
 }
 
 // NewContainerRuntimeFactory returns the production factory for this config.
@@ -116,50 +121,66 @@ func NewContainerRuntimeFactory(cfg *config.Config, logger *slog.Logger) *Contai
 		return runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), preferred)
 	}
 	f.construct = f.constructContainerRuntime
-	f.engineMemory = probeEngineMemoryMB
+	f.engineVM = probeEngineVM
 	return f
 }
 
 // NewContainerRuntimeFactoryForTest returns a factory whose detection and
 // construction are the given functions, so a test can make an engine "appear"
 // without a container engine on the host. The engine is treated as one whose
-// VM memory is unknown (no memory clip); SetEngineMemoryProbeForTest changes
-// that. Exported for the management package's tests.
+// VM size is unknown (no memory or CPU clip); SetEngineMemoryProbeForTest and
+// SetEngineVMProbeForTest change that. Exported for the management package's
+// tests.
 func NewContainerRuntimeFactoryForTest(cfg *config.Config, logger *slog.Logger,
 	detect func(preferred runtime.ContainerBackend) runtime.BackendInfo,
 	construct func(backend runtime.BackendInfo) (runtime.Runtime, error)) *ContainerRuntimeFactory {
 	return &ContainerRuntimeFactory{cfg: cfg, logger: logger, now: time.Now, detect: detect, construct: construct,
-		engineMemory: func(runtime.Runtime) int { return 0 }}
+		engineVM: func(runtime.Runtime) (int, int) { return 0, 0 }}
 }
 
 // SetEngineMemoryProbeForTest replaces the engine VM memory probe: the given
 // function answers "how much memory does the VM this engine runs inside have"
-// for a runtime the construction seam returned (0 = none / unknown).
+// for a runtime the construction seam returned (0 = none / unknown). The VM's
+// CPU count stays unknown.
 func (f *ContainerRuntimeFactory) SetEngineMemoryProbeForTest(probe func(rt runtime.Runtime) int) {
-	f.engineMemory = probe
+	f.engineVM = func(rt runtime.Runtime) (int, int) { return probe(rt), 0 }
 }
 
-// probeEngineMemoryMB is the production engine VM memory probe: on a platform
-// whose engine runs inside a VM (runtime.ContainerEngineRunsInVM) it asks the
-// engine for its total memory — the VM's, since that is where the engine
+// SetEngineVMProbeForTest replaces the engine VM probe: the given function
+// answers "how much memory and how many CPUs does the VM this engine runs
+// inside have" (0 = none / unknown for either).
+func (f *ContainerRuntimeFactory) SetEngineVMProbeForTest(probe func(rt runtime.Runtime) (memMB, cpus int)) {
+	f.engineVM = probe
+}
+
+// probeEngineVM is the production engine VM probe: on a platform whose engine
+// runs inside a VM (runtime.ContainerEngineRunsInVM) it asks the engine for
+// its total memory and CPU count — the VM's, since that is where the engine
 // daemon runs — and reports 0 elsewhere, or when the engine does not answer.
-// The engine's own figure is used rather than `podman machine inspect`, whose
-// number is what Podman recorded at init and, on WSL, not what the VM has.
-func probeEngineMemoryMB(rt runtime.Runtime) int {
+// The engine's own figures are used rather than `podman machine inspect`,
+// whose numbers are what Podman recorded at init and, on WSL, not what the
+// VM has.
+func probeEngineVM(rt runtime.Runtime) (memMB, cpus int) {
 	if !runtime.ContainerEngineRunsInVM() {
-		return 0
+		return 0, 0
 	}
 	cr, ok := rt.(*runtime.ContainerRuntime)
 	if !ok || cr == nil || cr.Client() == nil {
-		return 0
+		return 0, 0
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	info, err := cr.Client().Info(ctx)
-	if err != nil || info == nil || info.MemTotalMB <= 0 {
-		return 0
+	if err != nil || info == nil {
+		return 0, 0
 	}
-	return int(info.MemTotalMB)
+	if info.MemTotalMB > 0 {
+		memMB = int(info.MemTotalMB)
+	}
+	if info.NCPU > 0 {
+		cpus = info.NCPU
+	}
+	return memMB, cpus
 }
 
 // Build probes for a container engine once and, when one answers, returns the
@@ -204,35 +225,49 @@ func (f *ContainerRuntimeFactory) Build(forceMachineSetup bool) (runtime.Runtime
 		f.recordResult(backend, false, err.Error())
 		return nil, backend, err
 	}
-	f.applyContainerMemoryBudget(rt)
+	f.applyContainerBudgets(rt)
 	f.recordResult(backend, true, "")
 	return rt, backend, nil
 }
 
-// applyContainerMemoryBudget gives a freshly built container runtime its
-// memory ceiling: the configured budget, clipped to the engine VM's memory less
-// headroom when the engine runs inside a VM whose size the probe reports
-// (runtime.ContainerMemoryBudgetMB, TB-63). The figures are recorded on the
-// factory so the daemon can advertise the same budget to heads, book admission
-// against it, and name the VM in its diagnostics. Before this the ceiling was
-// the configuration alone, so a Mac with a 2 GiB Podman machine advertised
-// 8192 MB, was sent 7000 MB units, and had each one killed at model load.
-func (f *ContainerRuntimeFactory) applyContainerMemoryBudget(rt runtime.Runtime) {
+// applyContainerBudgets gives a freshly built container runtime its memory
+// ceiling and records the engine VM's size: the memory budget is the
+// configured one, clipped to the VM's memory less headroom when the engine
+// runs inside a VM whose size the probe reports (runtime.ContainerMemoryBudgetMB,
+// TB-63); the CPU budget is max_cpu_cores clipped to the VM's vCPUs
+// (runtime.ContainerCPUBudget, TB-75). The figures are recorded on the factory
+// so the daemon can advertise the same budgets to heads, book admission
+// against them, and name the VM in its diagnostics. Before this the ceilings
+// were the configuration alone, so a Mac with a 2 GiB Podman machine
+// advertised 8192 MB, was sent 7000 MB units, and had each one killed at model
+// load. The runtime's CPU grant — what each container is given — is the
+// static whole budget until the daemon wires its live equal split
+// (wireRuntimeCPU).
+func (f *ContainerRuntimeFactory) applyContainerBudgets(rt runtime.Runtime) {
 	configMB := f.cfg.ResourceLimits.MaxMemoryMB
-	engineMB := f.engineMemory(rt)
+	configCores := f.cfg.ResourceLimits.MaxCPUCores
+	engineMB, engineCPUs := f.engineVM(rt)
 	budget := runtime.ContainerMemoryBudgetMB(configMB, engineMB)
+	cpuBudget := runtime.ContainerCPUBudget(configCores, engineCPUs)
 	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetEngineMemoryMB(engineMB)
 		cr.SetMemoryCeilingMB(budget)
+		cr.SetCPUBudget(cpuBudget)
 	}
 	f.mu.Lock()
 	f.engineMemoryMB = engineMB
 	f.budgetMB = budget
+	f.engineCPUs = engineCPUs
+	f.cpuBudget = cpuBudget
 	f.mu.Unlock()
 	if engineMB > 0 {
 		f.logger.Info("container engine runs inside a VM; container work is budgeted against the VM's memory",
 			"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
 			"container_memory_budget_mb", budget, "max_memory_mb", configMB)
+	}
+	if engineCPUs > 0 {
+		f.logger.Info("container engine runs inside a VM; the CPU budget is bounded by the VM's CPUs",
+			"engine_vm_cpus", engineCPUs, "cpu_budget_cores", cpuBudget, "max_cpu_cores", configCores)
 	}
 }
 
@@ -247,6 +282,19 @@ func (f *ContainerRuntimeFactory) ContainerMemory() (budgetMB, engineMemoryMB in
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.budgetMB, f.engineMemoryMB
+}
+
+// ContainerCPUs reports the CPU budget the last built container runtime was
+// given (max_cpu_cores clipped to the VM) and the vCPU count of the VM its
+// engine runs inside (0 when the engine shares the host's CPUs or the count
+// is unknown). Both are 0 until a runtime has been built (TB-75).
+func (f *ContainerRuntimeFactory) ContainerCPUs() (budgetCores, engineCPUs int) {
+	if f == nil {
+		return 0, 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cpuBudget, f.engineCPUs
 }
 
 // ClampAdvertisedMemory lowers the memory budget in a hardware advertisement
@@ -265,6 +313,24 @@ func (f *ContainerRuntimeFactory) ClampAdvertisedMemory(hw *lettucev1.HardwareCa
 		return false
 	}
 	hw.MaxMemoryMb = int32(budget)
+	return true
+}
+
+// ClampAdvertisedCPU is ClampAdvertisedMemory's CPU twin (TB-75): it lowers
+// the CPU budget in a hardware advertisement to the container CPU budget when
+// the engine VM's vCPU count clips the configuration, so a head's dispatch
+// gate — which compares a leaf's min_cpu_cores against this figure — stops
+// sending this machine units its VM cannot run at their declared size. It
+// reports whether the advertisement changed.
+func (f *ContainerRuntimeFactory) ClampAdvertisedCPU(hw *lettucev1.HardwareCapabilities) bool {
+	if hw == nil {
+		return false
+	}
+	budget, engineCPUs := f.ContainerCPUs()
+	if engineCPUs <= 0 || budget <= 0 || int32(budget) >= hw.MaxCpuCores {
+		return false
+	}
+	hw.MaxCpuCores = int32(budget)
 	return true
 }
 
@@ -364,7 +430,7 @@ func (f *ContainerRuntimeFactory) constructContainerRuntime(backend runtime.Back
 	if err != nil {
 		return nil, err
 	}
-	cr.SetMaxCPUCores(f.cfg.ResourceLimits.MaxCPUCores)
+	cr.SetCPUBudget(f.cfg.ResourceLimits.MaxCPUCores)
 	cr.SetMaxGPUVRAMPct(f.cfg.ResourceLimits.MaxGPUVRAMPct)
 	cr.SetDiskCeilingMB(f.cfg.ResourceLimits.MaxDiskGB * 1024)
 	cr.SetHardeningConfig(f.cfg.ResourceLimits.MaxPids, f.cfg.ContainerCapAdd, f.cfg.ContainerGPURelaxUser)
@@ -543,6 +609,9 @@ func (d *Daemon) RedetectContainerRuntime(ctx context.Context, forceMachineSetup
 // re-registration and the no-runnable-leaf verdict is re-evaluated (TB-60).
 func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtime, backend runtime.BackendInfo) {
 	d.runtimeRegistry.Register(rt)
+	// The runtime was built with the static whole-budget CPU grant; give it
+	// the daemon's live equal split (TB-75).
+	d.wireRuntimeCPU(rt)
 	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetWantedImages(d.allEnabledImageRefs)
 		if d.IsRunning() && d.slotManager != nil && d.prefetchQueue != nil {
@@ -565,10 +634,11 @@ func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtim
 		"backend", backend.Backend, "engine", backend.Engine, "version", backend.Version,
 		"socket", backend.SocketPath, "runtimes", runtimes)
 
-	// The engine's VM may be smaller than the configured budget (TB-63): lower
-	// the advertised figure BEFORE the heads are re-told, so the re-registration
-	// and every later poll carry the budget the VM can hold.
+	// The engine's VM may be smaller than the configured budgets (TB-63,
+	// TB-75): lower the advertised figures BEFORE the heads are re-told, so
+	// the re-registration and every later poll carry what the VM can hold.
 	d.applyContainerMemoryBudget()
+	d.applyContainerCPUBudget()
 	d.markRuntimesChanged()
 	d.refreshRuntimeBlocked()
 }

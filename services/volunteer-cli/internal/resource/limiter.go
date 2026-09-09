@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"os/exec"
 
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // ErrDiskSpaceUnknown marks a CheckDiskSpace failure where free space COULD NOT
@@ -17,14 +17,35 @@ import (
 // errors.Is and decide per gate whether unknown means block or proceed.
 var ErrDiskSpaceUnknown = errors.New("free disk space could not be determined")
 
+// TaskLimits is what the limiter enforces on ONE task — per-unit figures, not
+// the volunteer's whole-machine configuration. Admission books the same
+// numbers: MaxMemoryMB is the unit's BookedMemMB (BG-16), and CPU is the
+// task's share of the CPU budget at the moment it starts (TB-75), which the
+// daemon adjusts through SetCPU as other tasks start and finish.
+type TaskLimits struct {
+	// MaxMemoryMB is the memory ceiling for this task; 0 = none.
+	MaxMemoryMB int
+	// CPU is the task's CPU grant: its share of the budget (the quota
+	// enforced where the platform can express a fraction) and the budget
+	// itself (the CPU set the affinity fallback confines every task to).
+	CPU runtime.CPUGrant
+}
+
 // Limiter enforces resource limits on a subprocess.
 type Limiter interface {
 	// Apply sets resource limits on the exec.Cmd before it is started.
-	Apply(cmd *exec.Cmd, limits *config.ResourceLimits) error
+	Apply(cmd *exec.Cmd, limits *TaskLimits) error
 
 	// Enforce is called after the process starts. It sets up any post-start
 	// enforcement (e.g., cgroups, job object assignment).
-	Enforce(pid int, limits *config.ResourceLimits) (cleanup func(), err error)
+	Enforce(pid int, limits *TaskLimits) (cleanup func(), err error)
+
+	// SetCPU gives an already-enforced process a new CPU grant — the share
+	// the daemon recomputes when another task starts or finishes (TB-75).
+	// It rewrites the cap in place (cgroup cpu.max, the Job Object's rate)
+	// and is a no-op where the platform enforces no CPU cap. The pid must be
+	// one Enforce was called for and whose cleanup has not yet run.
+	SetCPU(pid int, cpu runtime.CPUGrant) error
 
 	// CheckDiskSpace verifies enough disk space is available before execution.
 	// A stat failure (the path cannot be examined from this host) is reported

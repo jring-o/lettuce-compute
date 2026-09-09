@@ -57,6 +57,8 @@ const noGpuMachine: HeadsResponse["machine"] = {
   max_memory_mb: 4096,
   container_vm_memory_mb: 0,
   memory_limited_by_vm: false,
+  container_vm_cpus: 0,
+  cpu_limited_by_vm: false,
   max_disk_mb: 10240,
   max_cpu_cores: 4,
   max_gpu_vram_mb: 0,

@@ -105,6 +105,8 @@ const noGpuMachine = {
   max_memory_mb: 2048,
   container_vm_memory_mb: 0,
   memory_limited_by_vm: false,
+  container_vm_cpus: 0,
+  cpu_limited_by_vm: false,
   max_disk_mb: 10240,
   max_cpu_cores: 4,
   max_gpu_vram_mb: 0,
@@ -160,7 +162,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Resource Limits")).toBeInTheDocument();
   });
 
-  it("renders CPU cores slider", () => {
+  it("renders CPU cores slider as a total shared by all running tasks (TB-75)", () => {
     mockUseConfig.mockReturnValue({
       config: makeConfig(),
       isLoading: false,
@@ -169,7 +171,31 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText("CPU Cores")).toBeInTheDocument();
+    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
+    expect(screen.queryByText("CPU Cores")).not.toBeInTheDocument();
+    // The caption spells out the split for the configured 4 cores.
+    expect(
+      screen.getByText(/All running tasks share these 4 cores equally: one task alone gets all 4, two tasks get 2 each/)
+    ).toBeInTheDocument();
+  });
+
+  it("names the container engine's virtual machine when it bounds the CPU budget (TB-75)", async () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ resource_limits: { ...makeConfig().resource_limits, max_cpu_cores: 6 } }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+    mockHeads({
+      heads: [],
+      machine: { ...noGpuMachine, max_cpu_cores: 4, container_vm_cpus: 4, cpu_limited_by_vm: true },
+    });
+
+    render(<SettingsPage />);
+    expect(
+      await screen.findByText(/limited to 4 cores: the container engine's virtual machine has 4 CPUs, so heads are told 4/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/All running tasks share these/)).not.toBeInTheDocument();
   });
 
   it("renders Memory slider", () => {
@@ -934,16 +960,16 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    // Resource Limits is open by default and contains "CPU Cores"
-    expect(screen.getByText("CPU Cores")).toBeInTheDocument();
+    // Resource Limits is open by default and contains "CPU Cores — shared by all running tasks"
+    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
 
     // Click to collapse
     await user.click(screen.getByText("Resource Limits"));
-    expect(screen.queryByText("CPU Cores")).not.toBeInTheDocument();
+    expect(screen.queryByText("CPU Cores — shared by all running tasks")).not.toBeInTheDocument();
 
     // Click again to expand
     await user.click(screen.getByText("Resource Limits"));
-    expect(screen.getByText("CPU Cores")).toBeInTheDocument();
+    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
   });
 
   it("calls updateConfig with correct notifications partial when credit milestones toggle is clicked", async () => {
@@ -1166,7 +1192,7 @@ describe("SettingsPage", () => {
       await waitFor(() => {
         expect(screen.getByText("4 / 256 cores")).toBeInTheDocument();
       });
-      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "256");
+      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "256");
       expect(sliderFor("Concurrent Tasks")).toHaveAttribute("max", "256");
     });
 
@@ -1188,8 +1214,8 @@ describe("SettingsPage", () => {
       await waitFor(() => {
         expect(screen.getByText("128 / 8 cores")).toBeInTheDocument();
       });
-      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "128");
-      expect(sliderFor("CPU Cores")).toHaveValue("128");
+      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "128");
+      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveValue("128");
     });
 
     it("falls back to the web view's figure only when the host cannot report a count", async () => {
@@ -1210,7 +1236,7 @@ describe("SettingsPage", () => {
         ).toBe(true);
       });
       expect(screen.getByText("4 / 8 cores")).toBeInTheDocument();
-      expect(sliderFor("CPU Cores")).toHaveAttribute("max", "8");
+      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "8");
     });
   });
 

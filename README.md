@@ -126,9 +126,12 @@ has that unit refused and handed straight back. Declining everything is durable;
 will not quietly re-grant it.
 
 Your machine also holds the line on resources. You set CPU cores, memory, disk, GPU VRAM share, and
-concurrent tasks. The client reserves exactly what it will enforce, using cgroups where available,
-container limits, or WASM memory pages. It stops fetching before your disk runs low, and pauses
-everything if your CPU gets too hot.
+concurrent tasks. Each limit is a budget for the whole machine: the CPU cores you allow are shared
+equally by every task that is running (a task alone gets them all; two tasks get half each, adjusted
+as tasks start and finish), and each task is told its share so it can size its worker pool. The
+client reserves exactly what it will enforce, using cgroups where available, container limits, or
+WASM memory pages. It stops fetching before your disk runs low, and pauses everything if your CPU
+gets too hot.
 
 ### Commands
 
