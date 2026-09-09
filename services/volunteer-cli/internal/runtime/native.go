@@ -23,12 +23,14 @@ import (
 // is the work unit's declared memory (MaxMemoryMB, 0 = unspecified); the modifier
 // clamps it to the volunteer's configured ceiling via BookedMemMB and enforces THAT
 // per-unit value, so the number enforced matches the number admission booked (BG-16).
-type CommandModifier func(cmd *exec.Cmd, declaredMemMB int) error
+// cpu is the CPU the task is granted — its share of the volunteer's budget (TB-75),
+// the same grant the task is told through its environment.
+type CommandModifier func(cmd *exec.Cmd, declaredMemMB int, cpu CPUGrant) error
 
-// ProcessNotifier is called by NativeRuntime after cmd.Start() with the child PID and
-// the work unit's declared memory (see CommandModifier). It returns a cleanup
-// function that is called after the process exits.
-type ProcessNotifier func(pid int, declaredMemMB int) (cleanup func(), err error)
+// ProcessNotifier is called by NativeRuntime after cmd.Start() with the child PID,
+// the work unit's declared memory and its CPU grant (see CommandModifier). It
+// returns a cleanup function that is called after the process exits.
+type ProcessNotifier func(pid int, declaredMemMB int, cpu CPUGrant) (cleanup func(), err error)
 
 // NativeRuntime executes pre-compiled binaries for the volunteer's platform.
 type NativeRuntime struct {
@@ -37,6 +39,9 @@ type NativeRuntime struct {
 	cmdModifier     CommandModifier
 	processNotifier ProcessNotifier
 	httpClient      *http.Client // injectable for testing
+	// cpuGrant answers "what CPU does a task starting now get" (TB-75); see
+	// ContainerRuntime.cpuGrant. Nil means no CPU limit.
+	cpuGrant func() CPUGrant
 }
 
 // NewNativeRuntime creates a NativeRuntime with the given data directory. Its HTTP
@@ -60,6 +65,29 @@ func (n *NativeRuntime) SetCommandModifier(fn CommandModifier) {
 // Used by S28 for post-start enforcement (cgroups, job objects).
 func (n *NativeRuntime) SetProcessNotifier(fn ProcessNotifier) {
 	n.processNotifier = fn
+}
+
+// SetCPUBudget gives the runtime a fixed CPU budget every process it starts
+// is granted the whole of — the grant until the daemon wires the live one
+// (SetCPUGrantSource), and the right one outside the daemon.
+func (n *NativeRuntime) SetCPUBudget(cores int) {
+	n.cpuGrant = staticCPUGrant(cores)
+}
+
+// SetCPUGrantSource wires the daemon's live CPU grant (TB-75): asked, at the
+// moment a process is started, what share of the budget a task starting now
+// is given. The grant reaches the limiter through the command modifier and
+// the process notifier, and the task through its environment.
+func (n *NativeRuntime) SetCPUGrantSource(fn func() CPUGrant) {
+	n.cpuGrant = fn
+}
+
+// currentCPUGrant is the grant a task starting now receives.
+func (n *NativeRuntime) currentCPUGrant() CPUGrant {
+	if n.cpuGrant == nil {
+		return CPUGrant{}
+	}
+	return n.cpuGrant()
 }
 
 // Name returns "native".
@@ -228,6 +256,12 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	if _, err := os.Stat(paramsPath); err == nil {
 		env = append(env, "LETTUCE_PARAMS_FILE="+paramsPath)
 	}
+	// The CPU this task is given — its share of the volunteer's budget, read
+	// once so the limiter's cap and the figure the task is told agree (TB-75).
+	// LETTUCE_CPU_LIMIT and the thread-pool knobs let the leaf size its
+	// workers to the share rather than to os.cpu_count().
+	cpu := n.currentCPUGrant()
+	env = append(env, cpu.Env()...)
 	cmd.Env = env
 
 	// Per-unit declared memory (0 = unspecified) threaded to the resource limiter so
@@ -237,7 +271,7 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 
 	// Apply command modifier (resource limiter hook).
 	if n.cmdModifier != nil {
-		if err := n.cmdModifier(cmd, declaredMemMB); err != nil {
+		if err := n.cmdModifier(cmd, declaredMemMB, cpu); err != nil {
 			return nil, fmt.Errorf("command modifier: %w", err)
 		}
 	}
@@ -267,7 +301,7 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	// Apply post-start resource limits (cgroups, job objects).
 	var enforcementCleanup func()
 	if n.processNotifier != nil {
-		cleanup, notifyErr := n.processNotifier(cmd.Process.Pid, declaredMemMB)
+		cleanup, notifyErr := n.processNotifier(cmd.Process.Pid, declaredMemMB, cpu)
 		if notifyErr != nil {
 			cmd.Process.Kill()
 			logFile.Close()

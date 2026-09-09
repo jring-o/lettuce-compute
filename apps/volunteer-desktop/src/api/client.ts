@@ -443,7 +443,24 @@ export interface MachineCapabilities {
   memory_limited_by_vm: boolean;
   /** `max_disk_gb` as advertised to heads, in MB. */
   max_disk_mb: number;
+  /**
+   * The whole-machine CPU budget every running task shares equally — the
+   * Settings allowance, clipped to the container engine's virtual machine
+   * CPU count where there is one (TB-75). It is what heads are told.
+   */
   max_cpu_cores: number;
+  /**
+   * The CPU count of the virtual machine the container engine runs inside;
+   * 0 when the engine shares the host's CPUs or no container runtime is
+   * registered.
+   */
+  container_vm_cpus: number;
+  /**
+   * True when that virtual machine, not the Settings allowance, is what
+   * bounds `max_cpu_cores` — raising the allowance then changes nothing; the
+   * machine needs more CPUs (TB-75).
+   */
+  cpu_limited_by_vm: boolean;
   /** ALLOWED VRAM: card size × `max_gpu_vram_pct` / 100 — the figure dispatch compares against. */
   max_gpu_vram_mb: number;
   gpu_card_vram_mb: number;
@@ -954,7 +971,13 @@ type RawHeadInfo = Omit<HeadInfo, "leafs"> & { leafs?: RawLeafInfo[] | null };
 
 type RawMachineCapabilities = Omit<
   MachineCapabilities,
-  "runtimes" | "gpu_vendors" | "gpu_compute_capabilities" | "container_vm_memory_mb" | "memory_limited_by_vm"
+  | "runtimes"
+  | "gpu_vendors"
+  | "gpu_compute_capabilities"
+  | "container_vm_memory_mb"
+  | "memory_limited_by_vm"
+  | "container_vm_cpus"
+  | "cpu_limited_by_vm"
 > & {
   runtimes?: string[] | null;
   gpu_vendors?: string[] | null;
@@ -962,6 +985,9 @@ type RawMachineCapabilities = Omit<
   // Absent from a daemon older than TB-63: no VM figure, not limited.
   container_vm_memory_mb?: number | null;
   memory_limited_by_vm?: boolean | null;
+  // Absent from a daemon older than TB-75: likewise for the VM's CPUs.
+  container_vm_cpus?: number | null;
+  cpu_limited_by_vm?: boolean | null;
 };
 
 interface RawHeadsResponse {
@@ -989,6 +1015,8 @@ function normaliseMachine(
     memory_limited_by_vm: m.memory_limited_by_vm ?? false,
     max_disk_mb: m.max_disk_mb ?? 0,
     max_cpu_cores: m.max_cpu_cores ?? 0,
+    container_vm_cpus: m.container_vm_cpus ?? 0,
+    cpu_limited_by_vm: m.cpu_limited_by_vm ?? false,
     max_gpu_vram_mb: m.max_gpu_vram_mb ?? 0,
     gpu_card_vram_mb: m.gpu_card_vram_mb ?? 0,
     gpu_vram_pct: m.gpu_vram_pct ?? 0,

@@ -30,10 +30,11 @@ func (discard) Write(p []byte) (int, error) { return len(p), nil }
 // test can distinguish the full-allowance check from the workspace check.
 type thresholdLimiter struct{ availMB int }
 
-func (l *thresholdLimiter) Apply(_ *exec.Cmd, _ *config.ResourceLimits) error { return nil }
-func (l *thresholdLimiter) Enforce(_ int, _ *config.ResourceLimits) (func(), error) {
+func (l *thresholdLimiter) Apply(_ *exec.Cmd, _ *resource.TaskLimits) error { return nil }
+func (l *thresholdLimiter) Enforce(_ int, _ *resource.TaskLimits) (func(), error) {
 	return func() {}, nil
 }
+func (l *thresholdLimiter) SetCPU(_ int, _ runtime.CPUGrant) error { return nil }
 func (l *thresholdLimiter) CheckDiskSpace(_ string, requiredMB int) error {
 	if requiredMB > l.availMB {
 		return fmt.Errorf("insufficient: need %d, have %d", requiredMB, l.availMB)
@@ -72,10 +73,11 @@ func (f *fakeDocker) Info(_ context.Context) (*runtime.EngineInfo, error) {
 // map is treated as effectively unlimited.
 type pathLimiter struct{ availMB map[string]int }
 
-func (l *pathLimiter) Apply(_ *exec.Cmd, _ *config.ResourceLimits) error { return nil }
-func (l *pathLimiter) Enforce(_ int, _ *config.ResourceLimits) (func(), error) {
+func (l *pathLimiter) Apply(_ *exec.Cmd, _ *resource.TaskLimits) error { return nil }
+func (l *pathLimiter) Enforce(_ int, _ *resource.TaskLimits) (func(), error) {
 	return func() {}, nil
 }
+func (l *pathLimiter) SetCPU(_ int, _ runtime.CPUGrant) error { return nil }
 func (l *pathLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	avail, ok := l.availMB[path]
 	if !ok {

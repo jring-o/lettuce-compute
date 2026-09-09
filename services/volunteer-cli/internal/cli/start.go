@@ -205,6 +205,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		logger.Info("advertising the container memory budget instead of the memory limit: the container engine's VM is smaller",
 			"advertised_max_memory_mb", budget, "engine_vm_memory_mb", engineMB, "max_memory_mb", cfg.ResourceLimits.MaxMemoryMB)
 	}
+	// The VM's vCPU count bounds the CPU budget the same way (TB-75).
+	if containerFactory.ClampAdvertisedCPU(hardware) {
+		budget, engineCPUs := containerFactory.ContainerCPUs()
+		logger.Info("advertising the VM's CPU count instead of the CPU limit: the container engine's VM has fewer CPUs",
+			"advertised_max_cpu_cores", budget, "engine_vm_cpus", engineCPUs, "max_cpu_cores", cfg.ResourceLimits.MaxCPUCores)
+	}
 
 	// Volunteer-facing notices and per-head version/update state are created
 	// here, before the daemon exists, because registration below is one of the

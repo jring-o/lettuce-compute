@@ -25,7 +25,12 @@ type ContainerRuntime struct {
 	logger        *slog.Logger
 	dockerClient  DockerClient
 	backend       ContainerBackend // which container backend (podman, docker)
-	maxCPUCores   int              // from config; 0 means no CPU limit
+	// cpuGrant answers "what CPU does a task starting now get": its equal
+	// share of the volunteer's CPU budget and the budget itself (TB-75). The
+	// daemon wires the live source (the budget divided among the running
+	// tasks); until then, and outside the daemon, it is the whole budget.
+	// Nil means no CPU limit.
+	cpuGrant      func() CPUGrant
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
 	memCeilingMB  int // the memory budget container work is given (0 = unset); clamps per-unit BookedMemMB
@@ -125,9 +130,41 @@ func (c *ContainerRuntime) Backend() ContainerBackend {
 	return c.backend
 }
 
-// SetMaxCPUCores sets the CPU core limit from volunteer config.
-func (c *ContainerRuntime) SetMaxCPUCores(cores int) {
-	c.maxCPUCores = cores
+// SetCPUBudget gives the runtime a fixed CPU budget: every container it
+// starts is granted the whole of it. This is the grant in force until the
+// daemon wires the live one (SetCPUGrantSource), and the right one where no
+// daemon shares the budget among concurrent tasks (the audit runner).
+func (c *ContainerRuntime) SetCPUBudget(cores int) {
+	c.cpuGrant = staticCPUGrant(cores)
+}
+
+// SetCPUGrantSource wires the daemon's live CPU grant: the source is asked,
+// at the moment a container is created, what share of the budget a task
+// starting now is given (TB-75). Later changes to a running container's share
+// arrive through SetContainerCPU.
+func (c *ContainerRuntime) SetCPUGrantSource(fn func() CPUGrant) {
+	c.cpuGrant = fn
+}
+
+// currentCPUGrant is the grant a task starting now receives.
+func (c *ContainerRuntime) currentCPUGrant() CPUGrant {
+	if c.cpuGrant == nil {
+		return CPUGrant{}
+	}
+	return c.cpuGrant()
+}
+
+// SetContainerCPU gives a running container a new CPU share: its quota is
+// rewritten in place through the engine's update call, so the sum of the
+// running containers' quotas follows the budget as tasks start and finish
+// (TB-75). A share of 0 removes the cap.
+func (c *ContainerRuntime) SetContainerCPU(ctx context.Context, containerID string, shareCores float64) error {
+	quota, period := CFSQuota(shareCores)
+	if err := c.dockerClient.ContainerUpdateCPU(ctx, containerID, quota, period); err != nil {
+		return err
+	}
+	c.logger.Debug("container CPU share updated", "container", shortImageID(containerID), "cores", FormatCores(shareCores), "quota", quota, "period", period)
+	return nil
 }
 
 // SetGPUs sets the detected GPUs available for container execution.
@@ -572,8 +609,13 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		return nil, err
 	}
 
+	// The CPU this task is given: its share of the volunteer's budget, read
+	// once here so the quota enforced and the figure the task is told agree
+	// (TB-75).
+	cpu := c.currentCPUGrant()
+
 	// Build environment variables.
-	env := make([]string, 0, len(wu.EnvVars)+8)
+	env := make([]string, 0, len(wu.EnvVars)+13)
 	for k, v := range wu.EnvVars {
 		env = append(env, k+"="+v)
 	}
@@ -586,6 +628,10 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		"LETTUCE_CHECKPOINT_DIR=/work/checkpoint",
 		"LETTUCE_CHECKPOINT_FILE=/work/checkpoint/checkpoint.dat",
 	)
+	// Tell the task its CPU share (LETTUCE_CPU_LIMIT and the thread-pool
+	// knobs), so it sizes its workers to what it was given rather than to the
+	// CPUs it can see — inside a container that is every CPU of the machine.
+	env = append(env, cpu.Env()...)
 
 	// GPU passthrough.
 	var selectedGPU *GpuDetectionResult
@@ -624,11 +670,11 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.memCeilingMB)
 	memoryBytes := int64(bookedMemMB) * 1024 * 1024
 
-	var cpuQuota, cpuPeriod int64
-	if c.maxCPUCores > 0 {
-		cpuPeriod = 100000
-		cpuQuota = int64(c.maxCPUCores) * cpuPeriod
-	}
+	// The CPU quota is this task's SHARE of the budget, not the whole budget:
+	// every container used to be given max_cpu_cores of its own, so N running
+	// containers could use N times the limit (TB-75). The share is adjusted
+	// live as other tasks start and finish (SetContainerCPU).
+	cpuQuota, cpuPeriod := CFSQuota(cpu.ShareCores)
 
 	// Network mode.
 	networkMode := "none"

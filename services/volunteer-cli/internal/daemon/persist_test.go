@@ -238,7 +238,7 @@ func TestContainerProcessHandle_PIDReturnsZero(t *testing.T) {
 }
 
 func TestNativeProcessHandle_PIDReturnsStoredPID(t *testing.T) {
-	handle := NewNativeProcessHandle(42)
+	handle := NewNativeProcessHandle(42, nil)
 	if handle.PID() != 42 {
 		t.Errorf("nativeProcessHandle.PID() = %d, want 42", handle.PID())
 	}
@@ -613,6 +613,10 @@ type mockProcessHandle struct {
 	resumeErr    error
 	suspendCalls int
 	resumeCalls  int
+	// cpuShares records every SetCPUShare call (TB-75); cpuErr is returned
+	// from each.
+	cpuShares []float64
+	cpuErr    error
 }
 
 func (m *mockProcessHandle) Suspend() error {
@@ -627,6 +631,11 @@ func (m *mockProcessHandle) Resume() error {
 
 func (m *mockProcessHandle) PID() int {
 	return m.pid
+}
+
+func (m *mockProcessHandle) SetCPUShare(shareCores float64) error {
+	m.cpuShares = append(m.cpuShares, shareCores)
+	return m.cpuErr
 }
 
 // --- SuspendAll and ResumeAll with PID ---

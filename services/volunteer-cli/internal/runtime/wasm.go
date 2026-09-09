@@ -27,12 +27,20 @@ type WasmRuntime struct {
 	logger       *slog.Logger
 	httpClient   *http.Client // injectable for testing
 	memCeilingMB int          // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
+	// cpuGrant answers "what CPU does a task starting now get" (TB-75). A WASM
+	// module runs single-threaded and is not capped, but it is told its share
+	// like every other task, and it counts as a running task in the split.
+	cpuGrant func() CPUGrant
 }
 
 // SetMemoryCeilingMB sets the volunteer's configured memory budget
 // (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
 // memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
 func (w *WasmRuntime) SetMemoryCeilingMB(mb int) { w.memCeilingMB = mb }
+
+// SetCPUGrantSource wires the daemon's live CPU grant (TB-75); see
+// NativeRuntime.SetCPUGrantSource.
+func (w *WasmRuntime) SetCPUGrantSource(fn func() CPUGrant) { w.cpuGrant = fn }
 
 // NewWasmRuntime creates a WasmRuntime with the given data directory. Its HTTP
 // client is the shared netguard-guarded one so module/input/viz downloads cannot be
@@ -208,6 +216,14 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	paramsPath := filepath.Join(prep.WorkDir, "params.json")
 	if _, err := os.Stat(paramsPath); err == nil {
 		envVars["LETTUCE_PARAMS_FILE"] = "/work/params.json"
+	}
+	// Tell the module its CPU share (TB-75), as every runtime does.
+	if w.cpuGrant != nil {
+		for _, kv := range w.cpuGrant().Env() {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				envVars[k] = v
+			}
+		}
 	}
 
 	// Configure module with WASI.

@@ -26,6 +26,8 @@ function makeMachine(overrides: Partial<MachineCapabilities> = {}): MachineCapab
     max_memory_mb: 8192,
     container_vm_memory_mb: 0,
     memory_limited_by_vm: false,
+    container_vm_cpus: 0,
+    cpu_limited_by_vm: false,
     max_disk_mb: 10240,
     max_cpu_cores: 4,
     max_gpu_vram_mb: 2048,
@@ -96,6 +98,20 @@ describe("leafRequirementItems", () => {
       { key: "memory", label: "16 GB RAM", shortfall: "you allow 8 GB", raiseToMb: 16384 },
       { key: "cores", label: "8 cores", shortfall: "you allow 4" },
     ]);
+  });
+
+  it("names the container engine's virtual machine when it bounds the CPU budget (TB-75)", () => {
+    const leaf = makeLeaf({ resource_requirements: { min_cpu_cores: 6 } });
+    const machine = makeMachine({ max_cpu_cores: 4, container_vm_cpus: 4, cpu_limited_by_vm: true });
+    const cores = leafRequirementItems(leaf, machine).find((i) => i.key === "cores");
+    expect(cores).toEqual({
+      key: "cores",
+      label: "6 cores",
+      shortfall: "the container engine's virtual machine allows 4; it has 4 CPUs",
+      vmLimited: true,
+    });
+    const fits = makeLeaf({ resource_requirements: { min_cpu_cores: 4 } });
+    expect(leafRequirementItems(fits, machine).find((i) => i.key === "cores")?.shortfall).toBeUndefined();
   });
 
   it("treats a budget the daemon reports as 0 as unknown, not as a shortfall", () => {

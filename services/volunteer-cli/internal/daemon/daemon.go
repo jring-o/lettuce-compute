@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -355,36 +354,6 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cfg.Logger.Warn("failed to create process group, child processes may outlive daemon", "error", pgErr)
 	}
 
-	// Wire resource limiter and process group hooks into any NativeRuntime. The
-	// limiter is enforced against a PER-UNIT copy of the configured limits whose
-	// memory ceiling is BookedMemMB(declared, configured) — the same clamped number
-	// admission books — so native enforcement matches admission instead of always
-	// capping at the whole configured budget (BG-16).
-	limits := &cfg.Config.ResourceLimits
-	perUnitLimits := func(declaredMemMB int) *config.ResourceLimits {
-		l := *limits
-		l.MaxMemoryMB = runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB)
-		return &l
-	}
-	for _, rt := range registry.runtimes {
-		if nr, ok := rt.(*runtime.NativeRuntime); ok {
-			nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int) error {
-				if pg != nil {
-					pg.ConfigureCommand(cmd)
-				}
-				return limiter.Apply(cmd, perUnitLimits(declaredMemMB))
-			})
-			nr.SetProcessNotifier(func(pid int, declaredMemMB int) (func(), error) {
-				if pg != nil {
-					if err := pg.Add(pid); err != nil {
-						cfg.Logger.Warn("failed to add process to group", "pid", pid, "error", err)
-					}
-				}
-				return limiter.Enforce(pid, perUnitLimits(declaredMemMB))
-			})
-		}
-	}
-
 	// Create thermal monitor.
 	thermalPauseCh := make(chan bool, 1)
 	thermalCfg := runtime.ThermalConfig{
@@ -472,7 +441,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	ws.SetHeadWeights(headWeights)
 
-	return &Daemon{
+	d := &Daemon{
 		cfg:                 cfg.Config,
 		pubKey:              cfg.PubKey,
 		privKey:             cfg.PrivKey,
@@ -503,6 +472,11 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		headStatus:          headStatus,
 		clientVersion:       cfg.ClientVersion,
 	}
+
+	// Wire the resource limiter, the process group and the live CPU grant
+	// into the registered runtimes (BG-16, TB-75).
+	d.wireRuntimeLimits(pg, limiter, &cfg.Config.ResourceLimits)
+	return d
 }
 
 // Notices returns the daemon's volunteer-facing notice ring.
@@ -541,7 +515,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A container runtime built before the daemon existed (start-up) may have
 	// had its memory budget clipped to the engine's VM; start-up lowered the
 	// advertisement it registered with, and the volunteer is told here (TB-63).
+	// The CPU budget likewise (TB-75).
 	d.refreshContainerMemoryNotice()
+	d.refreshContainerCPUNotice()
 
 	maxSlots := d.cfg.MaxConcurrentTasks
 	if maxSlots <= 0 {
@@ -597,6 +573,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// maxDepth is only a safety ceiling on descriptor count, so it is set well
 	// above the hours target to avoid being the binding constraint.
 	d.slotManager = NewSlotManager(maxSlots, d.logger)
+	d.slotManager.SetCPUShareSource(d.currentCPUShare)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 
 	// Start resource monitor goroutine.
@@ -875,6 +852,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wu := result.WU
 	conn := result.Conn
+
+	// The slot is already inactive: the survivors share the CPU budget among
+	// fewer tasks from now on (TB-75).
+	d.rebalanceCPUShares()
 
 	if result.Err != nil {
 		if errors.Is(result.Err, context.Canceled) {
@@ -1220,6 +1201,10 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 			}
 		} else {
 			d.persistActiveTasks()
+			// One more task shares the CPU budget: shrink the others' shares
+			// to the new equal split (TB-75). The newcomer reads the same
+			// split when its runtime starts it.
+			d.rebalanceCPUShares()
 		}
 		// End the handoff only now: on success the active slot carries the unit
 		// (set before StartSlot returned), on failure it was abandoned to the
@@ -1298,6 +1283,21 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 		}
 	}
 
+	// 5. Configured CPU budget (TB-75): the cores booked by the running tasks
+	// plus this unit's must stay within max_cpu_cores (clipped to the engine
+	// VM's CPUs). Each unit books its leaf's minimum core requirement, floor
+	// 1, so the equal share the running tasks are given never drops below
+	// what a leaf declared it needs — and at most budget tasks run at once,
+	// whatever max_concurrent_tasks allows.
+	if budget := d.CPUBudgetCores(); budget > 0 {
+		wuCores := d.bookedCPUCores(wu)
+		activeCores := d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+		if activeCores+wuCores > budget {
+			return false, fmt.Sprintf("configured CPU budget: %d core(s) booked by running tasks + %d for this unit exceeds max_cpu_cores %d",
+				activeCores, wuCores, budget)
+		}
+	}
+
 	return true, ""
 }
 
@@ -1343,6 +1343,13 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 		blockedDiskMB := runtime.BookedDiskMB(int(blocked.ExecutionSpec.MaxDiskMB), maxDiskMB)
 		candDiskMB := runtime.BookedDiskMB(int(candidate.ExecutionSpec.MaxDiskMB), maxDiskMB)
 		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, blockedDiskMB+candDiskMB+DiskFloorMB); err != nil {
+			return true
+		}
+	}
+
+	// Configured CPU budget (TB-75): harmless iff both bookings fit it together.
+	if budget := d.CPUBudgetCores(); budget > 0 {
+		if d.bookedCPUCores(blocked)+d.bookedCPUCores(candidate) > budget {
 			return true
 		}
 	}
@@ -3090,8 +3097,11 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 
 	// A raised memory limit does not raise what the container engine's VM can
 	// hold (TB-63): say so again against the new figure, or clear the notice
-	// when the limit now fits.
+	// when the limit now fits. The CPU limit likewise (TB-75) — and a changed
+	// CPU budget is re-split among the tasks already running at once.
 	d.refreshContainerMemoryNotice()
+	d.refreshContainerCPUNotice()
+	d.rebalanceCPUShares()
 }
 
 // SetBackoff overrides backoff durations (for testing).
@@ -3824,8 +3834,11 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 				break
 			}
 
-			// Resume the frozen process.
-			handle := NewNativeProcessHandle(pt.PID)
+			// Resume the frozen process. Its CPU cap was set by the previous
+			// session's limiter and cannot be rewritten by this one (the cgroup
+			// or Job Object bookkeeping died with that process), so the handle
+			// carries no CPU adjuster: it keeps the share it was given.
+			handle := NewNativeProcessHandle(pt.PID, nil)
 			if err := handle.Resume(); err != nil {
 				d.logger.Warn("failed to resume orphan process, will re-execute",
 					"pid", pt.PID, "error", err)

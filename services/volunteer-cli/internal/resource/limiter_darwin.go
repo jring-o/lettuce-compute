@@ -8,7 +8,7 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/lettuce-compute/volunteer-cli/internal/config"
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // DarwinLimiter enforces resource limits using setpriority (best-effort).
@@ -28,7 +28,7 @@ func NewDarwinLimiter(logger *slog.Logger) *DarwinLimiter {
 }
 
 // Apply configures the exec.Cmd before process start.
-func (d *DarwinLimiter) Apply(cmd *exec.Cmd, limits *config.ResourceLimits) error {
+func (d *DarwinLimiter) Apply(cmd *exec.Cmd, limits *TaskLimits) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
@@ -37,7 +37,7 @@ func (d *DarwinLimiter) Apply(cmd *exec.Cmd, limits *config.ResourceLimits) erro
 }
 
 // Enforce lowers process priority as best-effort CPU management on macOS.
-func (d *DarwinLimiter) Enforce(pid int, limits *config.ResourceLimits) (func(), error) {
+func (d *DarwinLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
 	// Lower priority: nice value 10 (range -20 to 19, higher = lower priority).
 	if err := syscall.Setpriority(syscall.PRIO_PROCESS, pid, 10); err != nil {
 		d.logger.Warn("setpriority failed (best-effort)", "error", err, "pid", pid)
@@ -46,6 +46,12 @@ func (d *DarwinLimiter) Enforce(pid int, limits *config.ResourceLimits) (func(),
 	}
 
 	return func() {}, nil
+}
+
+// SetCPU is a no-op: macOS has no per-process CPU cap to rewrite. The task's
+// share still reaches it through LETTUCE_CPU_LIMIT at start (TB-75).
+func (d *DarwinLimiter) SetCPU(pid int, cpu runtime.CPUGrant) error {
+	return nil
 }
 
 // CheckDiskSpace checks available disk space on the filesystem containing path.

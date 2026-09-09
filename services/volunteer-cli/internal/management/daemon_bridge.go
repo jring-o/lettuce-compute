@@ -1140,9 +1140,15 @@ type MachineCapabilities struct {
 	// against, in the same units it receives them (max_disk_gb is advertised as
 	// MB). Reported here so the client checks a leaf against what this daemon
 	// actually advertised, not against a config file that may have moved on
-	// since (TB-15).
-	MaxDiskMB   int64 `json:"max_disk_mb"`
-	MaxCPUCores int   `json:"max_cpu_cores"`
+	// since (TB-15). MaxCPUCores is the whole-machine CPU budget every running
+	// task shares — the configured limit, clipped to the container engine
+	// VM's vCPUs where there is one (TB-75); ContainerVMCPUs and
+	// CPULimitedByVM are that VM's count and whether it is the bound, as
+	// ContainerVMMemoryMB / MemoryLimitedByVM are for memory.
+	MaxDiskMB       int64 `json:"max_disk_mb"`
+	MaxCPUCores     int   `json:"max_cpu_cores"`
+	ContainerVMCPUs int   `json:"container_vm_cpus"`
+	CPULimitedByVM  bool  `json:"cpu_limited_by_vm"`
 	// The GPU side of the same idea (TB-21). MaxGPUVRAMMB is the ALLOWED VRAM —
 	// card capacity * max_gpu_vram_pct / 100, the figure dispatch compares a leaf
 	// against — not the size of the card. GPUVendors are uppercase ("NVIDIA").
@@ -1178,7 +1184,9 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 		// is converted here rather than at the comparison, where a GB-vs-MB slip
 		// would silently pass every leaf.
 		MaxDiskMB:              int64(rl.MaxDiskGB) * 1024,
-		MaxCPUCores:            rl.MaxCPUCores,
+		MaxCPUCores:            b.daemon.CPUBudgetCores(),
+		ContainerVMCPUs:        b.daemon.ContainerVMCPUs(),
+		CPULimitedByVM:         b.daemon.CPULimitedByVM(),
 		MaxGPUVRAMMB:           vramMB,
 		GPUCardVRAMMB:          cardVRAMMB,
 		GPUVRAMPct:             vramPct,
