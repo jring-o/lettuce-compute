@@ -103,6 +103,15 @@ type FaultMonitor struct {
 	// Held as the narrow unitEvaluator interface (see above) so the re-evaluate calls are
 	// unit-testable; *transition.Transitioner satisfies it.
 	transitioner unitEvaluator
+	// dispatch is the late-bound handle to this replica's dispatch cache (TB-82). Every
+	// copy the timeout sweep closes is reported through it, exactly as AbandonWorkUnit
+	// reports its close: the cache drops the closed copy's in-memory hold and benches
+	// the holder on the still-staged candidate. Without it the reaper's close was
+	// invisible to the cache — the transitioner's eviction hook fires only on a unit
+	// STATE change, and a closed copy usually leaves the unit QUEUED — so the fossil
+	// hold kept the unit excluded from refill and its candidate fully "held", offered to
+	// nobody until the process restarted. May be nil (tests / no cache) -> no report.
+	dispatch     *DispatchCacheRef
 	logger       *slog.Logger
 	scanInterval time.Duration
 	batchSize    int
@@ -228,6 +237,15 @@ func NewFaultMonitor(
 	return m
 }
 
+// WithDispatchCache wires the dispatch-cache handle the timeout sweep reports its copy
+// closes to (TB-82). The ref is late-bound, so it may be passed before the cache exists;
+// left unset the sweep reports nothing (tests, or a deployment without the cache).
+// Chainable, same pattern as the other optional wiring.
+func (m *FaultMonitor) WithDispatchCache(ref *DispatchCacheRef) *FaultMonitor {
+	m.dispatch = ref
+	return m
+}
+
 // WithStandingPopulation wires the OPTIONAL account-standing read that backs the
 // auto-benched/probation operator WARN (warnStandingPopulation). Left unset the sweep
 // is a no-op; the orchestrator calls this only when the standing-backpressure machine
@@ -326,6 +344,14 @@ func (m *FaultMonitor) ScanOnce(ctx context.Context) error {
 		m.logger.Warn("work unit copy timed out",
 			"copy_id", cp.ID, "work_unit_id", cp.WorkUnitID, "volunteer_id", cp.VolunteerID,
 			"outcome", outcome, "deadline_seconds", cp.DeadlineSeconds)
+
+		// Tell the dispatch cache (TB-82), the way AbandonWorkUnit does after its close:
+		// the closed copy's in-memory hold is dropped and the holder benched on the
+		// still-staged candidate for the window the new row enforces. Before this the
+		// hold outlived the copy for the life of the process.
+		if m.dispatch != nil {
+			m.dispatch.copyClosed(cp.WorkUnitID, cp.VolunteerID)
+		}
 
 		// TODO #54: a timed-out (EXPIRED) or abandoned (ABANDONED) copy is wasted work — a
 		// bad reliability signal for the machine that held it (host_id, folding onto the

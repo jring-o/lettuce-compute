@@ -116,10 +116,11 @@ const (
 // CooldownState is the requester's most-recent CLOSED copy of the target unit — the
 // history row that drives the post-failure cooldown. A copy benches the requester
 // (gives it last refusal for ~one deadline so a fresh volunteer gets first crack)
-// only when it is a genuine reliability signal: a copy that TIMED OUT (EXPIRED), or
-// one the volunteer actually run-STARTED and then abandoned. A graceful return of
-// un-started buffered work does not bench, nor does a failure older than the
-// cooldown window.
+// on every EXPIRED or ABANDONED copy — a timeout, a copy it run-started and then
+// abandoned, or a copy it could not even start (TB-81: the client marks a graceful
+// return of un-started buffered work as a RETURNED give-back, so an un-started
+// ABANDONED is a failure to start the unit). A failure older than the cooldown
+// window does not bench.
 type CooldownState int
 
 const (
@@ -130,8 +131,9 @@ const (
 	// CooldownStartedAbandon: a copy the requester run-started (started_at set) then
 	// abandoned, within the window. Benches (a reliability signal).
 	CooldownStartedAbandon
-	// CooldownUnstartedAbandon: a graceful return of never-started buffered work
-	// (ABANDONED, started_at NULL). Does NOT bench.
+	// CooldownUnstartedAbandon: a copy the requester abandoned without ever starting it
+	// (ABANDONED, started_at NULL — no runtime, an unreachable container engine, a
+	// prepare error), within the window. Benches (TB-81); before TB-81 it did not (#59).
 	CooldownUnstartedAbandon
 	// CooldownExpiredStale: a timeout whose outcome_at is OLDER than the cooldown
 	// window (roughly one deadline). Does NOT bench — the cooldown has elapsed.
@@ -175,7 +177,7 @@ func (s Scenario) CooldownOutcomeAgoSeconds() int {
 // benched set. Whether an entry actually REFUSES additionally depends on its window
 // and the pool-exhausted fallback (PB-9) — see CooldownExpiredExhausted.
 func (c CooldownState) benches() bool {
-	return c == CooldownExpiredRecent || c == CooldownStartedAbandon || c == CooldownExpiredExhausted
+	return c == CooldownExpiredRecent || c == CooldownStartedAbandon || c == CooldownUnstartedAbandon || c == CooldownExpiredExhausted
 }
 
 // Gate identifies one of the four predicate implementations under parity test.
@@ -649,9 +651,9 @@ func Scenarios() []Scenario {
 			s.Cooldown = CooldownStartedAbandon
 			s.Eligible = false
 		}),
-		with("cooldown_unstarted_abandon_not_benched", DimCooldown, func(s *Scenario) {
-			s.Cooldown = CooldownUnstartedAbandon // graceful never-started return (#59)
-			s.Eligible = true
+		with("cooldown_unstarted_abandon_benched", DimCooldown, func(s *Scenario) {
+			s.Cooldown = CooldownUnstartedAbandon // could not start the unit (TB-81)
+			s.Eligible = false
 		}),
 		with("cooldown_expired_stale_window_elapsed", DimCooldown, func(s *Scenario) {
 			s.Cooldown = CooldownExpiredStale // failure older than the cooldown window

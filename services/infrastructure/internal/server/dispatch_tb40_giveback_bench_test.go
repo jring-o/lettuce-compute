@@ -10,10 +10,11 @@ package server
 // host).
 //
 // The close-time bench must mirror the SQL cooldown gate (cooldownGuardSQL) EXACTLY:
-// RETURNED benches the short re-offer throttle, a STARTED abandon benches ~one
-// deadline, and a graceful un-started ABANDONED return benches NOTHING (#59) — the
-// first cut of this fix benched every abandon and stranded the one-volunteer pool
-// the graceful-buffer-return e2e test pins.
+// RETURNED benches the short re-offer throttle and any ABANDONED benches ~one
+// deadline. (Until TB-81 an un-started ABANDONED benched nothing, the #59 exemption
+// for graceful buffer returns; those returns are RETURNED give-backs now, and an
+// un-started ABANDONED is a failure to start the unit — see
+// dispatch_tb81_tb82_test.go.)
 //
 // Red evidence (2026-08-03, pre-fix tree, tests in place): both bench tests failed
 // with "hand-out inside the ... cooldown = 1 results, want 0" — the handler released
@@ -110,7 +111,7 @@ func tb40Service(t *testing.T, deadlineSeconds int, closed workunit.ClosedCopy) 
 // offer (fallbackAt == until).
 func TestAbandonGiveback_BenchesVolunteerOnStagedCandidate(t *testing.T) {
 	svc, c, ctx, volID, unitID, advance := tb40Service(t, 18000,
-		workunit.ClosedCopy{Outcome: "RETURNED", Started: false})
+		workunit.ClosedCopy{Outcome: "RETURNED"})
 
 	if res, _ := c.HandOut(volID, capableOpts(volID, 0), 1); len(res) != 1 {
 		t.Fatalf("initial hand-out = %d results, want 1", len(res))
@@ -150,7 +151,7 @@ func TestAbandonGiveback_BenchesVolunteerOnStagedCandidate(t *testing.T) {
 // applies to every benching close the cache performs.
 func TestAbandonMidRun_BenchesVolunteerOnStagedCandidate(t *testing.T) {
 	svc, c, ctx, volID, unitID, _ := tb40Service(t, 18000,
-		workunit.ClosedCopy{Outcome: "ABANDONED", Started: true})
+		workunit.ClosedCopy{Outcome: "ABANDONED"})
 
 	if res, _ := c.HandOut(volID, capableOpts(volID, 0), 1); len(res) != 1 {
 		t.Fatalf("initial hand-out = %d results, want 1", len(res))
@@ -166,34 +167,5 @@ func TestAbandonMidRun_BenchesVolunteerOnStagedCandidate(t *testing.T) {
 
 	if res, _ := c.HandOut(volID, capableOpts(volID, 0), 1); len(res) != 0 {
 		t.Fatalf("hand-out inside the abandon cooldown = %d results, want 0: a started-copy ABANDONED close must bench the volunteer on the still-staged candidate (TB-40)", len(res))
-	}
-}
-
-// TestAbandonGracefulUnstarted_DoesNotBench pins the #59 parity boundary the fix
-// must NOT cross: a graceful return of un-started buffered work (plain abandon,
-// started_at NULL — e.g. "volunteer shutdown") is not a reliability signal and does
-// not feed the SQL cooldown, so the close-time bench must record NOTHING — otherwise
-// a one-volunteer pool is refused in memory what the SQL landing would grant at
-// once. This is a guard against over-benching (the first cut of the TB-40 fix failed
-// exactly this property in TestDispatchCache_GracefulBufferReturn_ReReservable),
-// not a differential regression test: it passes on the pre-fix tree too.
-func TestAbandonGracefulUnstarted_DoesNotBench(t *testing.T) {
-	svc, c, ctx, volID, unitID, _ := tb40Service(t, 18000,
-		workunit.ClosedCopy{Outcome: "ABANDONED", Started: false})
-
-	if res, _ := c.HandOut(volID, capableOpts(volID, 0), 1); len(res) != 1 {
-		t.Fatalf("initial hand-out = %d results, want 1", len(res))
-	}
-
-	if _, err := svc.AbandonWorkUnit(ctx, &lettucev1.AbandonWorkUnitRequest{
-		WorkUnitId:  unitID.String(),
-		VolunteerId: volID.String(),
-		Reason:      "volunteer shutdown",
-	}); err != nil {
-		t.Fatalf("AbandonWorkUnit(graceful): %v", err)
-	}
-
-	if res, _ := c.HandOut(volID, capableOpts(volID, 0), 1); len(res) != 1 {
-		t.Fatal("volunteer refused after a graceful un-started return: the close-time bench must mirror the SQL gate's #59 arm (no bench for ABANDONED with started_at NULL), or a one-volunteer pool strands on every buffer return")
 	}
 }

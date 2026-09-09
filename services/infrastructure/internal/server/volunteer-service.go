@@ -2474,13 +2474,27 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 	// left the cache re-offering the unit to this same volunteer on its next poll — a
 	// hand-out whose reservation flush the SQL landing was guaranteed to refuse, buffered
 	// client-side as a phantom that died at run-start. The bench mirrors what the write
-	// actually recorded (`closed`, not the requested outcome), so a graceful un-started
-	// ABANDONED return still benches nothing (#59) and a downgraded give-back benches
+	// actually recorded (`closed`, not the requested outcome): a RETURNED give-back
+	// benches its short re-offer throttle, any ABANDONED — a downgraded give-back of a
+	// started copy, or an un-started copy the client could not begin (TB-81) — benches
 	// the full deadline window. The unit stays QUEUED and staged for fresh distinct
 	// volunteers.
+	returned := closed.Outcome == string(assignment.OutcomeReturned)
 	if s.dispatchCache != nil {
-		s.dispatchCache.onCopyClosed(workUnitID, volunteerID,
-			closed.Outcome == string(assignment.OutcomeReturned), closed.Started)
+		s.dispatchCache.onCopyClosed(workUnitID, volunteerID, returned)
+	}
+
+	// An ABANDONED close is wasted work — or a unit the machine could not even start —
+	// and a bad reliability signal for the machine that held the copy (TB-81), the same
+	// signal the fault monitor records when a copy times out. Charged to the copy's
+	// host (folding onto the account when none was reported), best-effort: pure
+	// dispatch shaping, never correctness-bearing. A RETURNED give-back is not charged —
+	// returning un-run buffered work promptly is cooperative (TB-35).
+	if !returned && s.reliabilityRepo != nil {
+		if rerr := s.reliabilityRepo.RecordOutcome(ctx, meterID(volunteerID, closed.HostID), false); rerr != nil {
+			s.logger.Warn("abandon: failed to record host reliability",
+				"work_unit_id", req.WorkUnitId, "volunteer_id", req.VolunteerId, "error", rerr)
+		}
 	}
 
 	// Delegate the post-close decision to the single transitioner (TODO #50): requeue (stay
