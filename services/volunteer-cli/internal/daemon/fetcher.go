@@ -35,7 +35,7 @@ type Fetcher struct {
 	// lowered the memory budget of (TB-63); cachedHW is the fallback for tests
 	// that build a Fetcher by hand.
 	hardwareFn func() *lettucev1.HardwareCapabilities
-	pubKey      ed25519.PublicKey
+	pubKey     ed25519.PublicKey
 	// notices receives the fetcher's volunteer-facing escalations (too-old
 	// rejection, runtime breaker trip, no-work diagnostic); headStatus keeps
 	// each head's update-required flag current. Both are nil-safe.
@@ -61,6 +61,12 @@ type Fetcher struct {
 	// before any request, so the head's dispatch gate admits the newly runnable
 	// leafs instead of refusing them until a restart. nil disables it.
 	readvertiseFn func(ctx context.Context, head *ServerConnection)
+
+	// engineUnreachableFn takes a container runtime whose engine stopped
+	// answering out of service (Daemon.NoteContainerEngineUnreachable, TB-80).
+	// Called once per outage from bufferBatch, on the fetcher's goroutine.
+	// nil in tests that never exercise it.
+	engineUnreachableFn func(rt runtime.Runtime, err error) bool
 
 	// runtimeBlockedFn re-evaluates whether EVERY attached leaf is
 	// runtime-blocked (needs a runtime this machine lacks or the volunteer has
@@ -312,6 +318,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		reRegisterFn:             d.reRegisterHost,
 		readvertiseFn:            d.readvertiseIfPending,
 		runtimeBlockedFn:         d.refreshRuntimeBlocked,
+		engineUnreachableFn:      d.NoteContainerEngineUnreachable,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
@@ -1040,6 +1047,11 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			held[id] = struct{}{}
 		}
 	}
+	// engineDown names a runtime whose engine stopped answering during THIS
+	// batch (TB-80): the rest of the batch is returned un-run without another
+	// Prepare, and without the runtime lookup that would now fail — the
+	// outage took the runtime out of the registry — and bill the abandon.
+	engineDown := make(map[string]bool)
 	for _, asg := range assignments {
 		wu := runtime.WorkUnitFromProto(asg)
 		// Stamp the dispatching head (display name) on the unit: the artifact
@@ -1088,6 +1100,12 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			}
 		}
 
+		if engineDown[runtimeKeyForWU(wu)] {
+			f.logger.Info("fetcher: returning batch unit un-run; its container engine stopped answering earlier in this batch", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug)
+			f.giveBackWorkUnit(ctx, head, wu, "container engine unreachable")
+			continue
+		}
+
 		rt, selErr := f.registry.SelectRuntime(wu)
 		if selErr != nil {
 			f.logger.Warn("fetcher: no runtime for work unit", "work_unit_id", wu.ID, "runtime", wu.Runtime, "error", selErr)
@@ -1119,6 +1137,24 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		// needs a keep-alive to look alive. Prepare directly.
 		prep, prepErr := rt.Prepare(ctx, wu)
 		if prepErr != nil {
+			if runtime.IsEngineUnreachable(prepErr) {
+				// The container engine did not answer the ping: an OUTAGE of the
+				// runtime, not a failure of this unit or this leaf. The unit was
+				// never started here, so it goes back un-run — budget-neutral,
+				// no bench (TB-35) — and the runtime is taken out of service at
+				// once and re-probed with a ping until the engine answers (TB-80).
+				// Before this every unit of every batch was a billed abandon and
+				// three of them raised "prepare failed 3 times".
+				name := strings.ToLower(rt.Name())
+				f.logger.Warn("fetcher: container engine unreachable at prepare; returning the batch un-run and pausing container work until the engine answers",
+					"work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", name, "error", prepErr)
+				f.giveBackWorkUnit(ctx, head, wu, prepErr.Error())
+				engineDown[name] = true
+				if f.engineUnreachableFn != nil {
+					f.engineUnreachableFn(rt, prepErr)
+				}
+				continue
+			}
 			f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
 			// ESCALATION (#15 fix 4): capability category B — Prepare failed for
 			// this runtime (image pull / binary download / setup).

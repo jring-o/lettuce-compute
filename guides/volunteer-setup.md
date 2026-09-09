@@ -69,7 +69,9 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `no runnable leafs: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse — so this is reported at once, not after polling. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
-| `docker is not available … Is the docker daemon running?` | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
+| `container engine stopped answering …` (`container_engine_unreachable` in the app's **Needs attention** list; the runtime card reads "not answering") | The Docker or Podman engine Lettuce was using has stopped answering on its socket — Docker Desktop quit, the Podman machine was stopped, or (macOS) the machine still says "running" but its API socket is dead. Lettuce paused container work at once, returned every buffered container unit to its head **un-run** (nothing is billed to you or the unit), told the heads it has no container runtime for now, and re-checks the engine every minute. WASM and native leafs keep running. | Start the engine again (`podman machine start`, or Docker Desktop). A Podman machine that reports running with a dead socket is fixed by `podman machine stop` then `podman machine start`. Container work resumes by itself within a minute of the engine answering — no restart; the log line is `container engine answering again`. |
+| `container engine found but its runtime could not be built … container engine unreachable` at start | Detection found an engine (a Podman binary, or a socket file) but nothing answered on the socket — a rootless Podman socket that isn't started, a socket file left by a service that is not running. Lettuce does **not** advertise CONTAINER on a socket that does not answer; it re-checks every minute. | `systemctl --user enable --now podman.socket` (see below), or start the engine. |
+| `docker is not available … Is the docker daemon running?` (older builds) | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
 | `permission denied … /run/user/1000/podman/podman.sock` | Socket owned by a different user, or you ran under `sudo`. | Run lettuce as your **normal user**, not sudo; the socket owner must match. |
 
 ---
@@ -127,6 +129,20 @@ start a Podman machine for you on first `start`.
   about it without a restart. The desktop app's runtime card shows "Check again
   now" while this is happening; the log line is `container runtime registered
   after start`.
+
+- **The engine can also go away and come back.** If the engine stops answering
+  while Lettuce is running (Docker Desktop quit, the machine stopped, or a
+  Podman machine that still says "running" with a dead API socket — a known
+  macOS state, fixed by `podman machine stop` then `start`), Lettuce pauses
+  container work at once, returns every buffered container unit to its head
+  un-run so nothing is billed, tells the heads it has no container runtime for
+  now, and re-checks the engine every minute. The runtime card reads "not
+  answering" with the engine's error and offers "Check again now"; the
+  **Needs attention** list carries `container_engine_unreachable` until the
+  engine answers, when container work resumes by itself. A unit that was
+  already running inside a container when the engine died is lost and reported
+  to its head with the engine named as the reason; it does not count against
+  the leaf.
 
 - **The machine's memory is the real ceiling for container work.** On Windows
   and macOS every container runs inside the engine's virtual machine (the Podman

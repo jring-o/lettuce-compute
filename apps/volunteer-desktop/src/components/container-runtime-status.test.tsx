@@ -295,6 +295,65 @@ describe("ContainerRuntimeStatusCard", () => {
     });
   });
 
+  // TB-80: an engine that was in service and stopped answering is shown as
+  // "not answering" — ahead of the Podman machine's own "running" claim —
+  // with the daemon's transport error, what the daemon has already done
+  // (paused container work, returned buffered units, re-checking every
+  // minute), the remedy, and a "Check again now" that queues a probe.
+  it("renders an unreachable engine with the error, the remedy and an immediate re-check", async () => {
+    const user = userEvent.setup();
+    mockRedetectContainerRuntime.mockResolvedValue({ status: "ok", message: "queued" });
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "unreachable",
+        backend: "podman",
+        machine_required: true,
+        socket_path: "/var/folders/82/T/podman/podman-machine-default-api.sock",
+        error: "container engine unreachable (podman at /var/folders/82/T/podman/podman-machine-default-api.sock): docker ping: Cannot connect to the Docker daemon",
+        redetecting: true,
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Podman not answering")).toBeInTheDocument();
+    expect(screen.getByText(/Container work is paused and buffered container units were returned/)).toBeInTheDocument();
+    expect(screen.getByText(/checks the engine every minute/)).toBeInTheDocument();
+    expect(screen.getByText(/Cannot connect to the Docker daemon/)).toBeInTheDocument();
+    expect(screen.getByText(/podman machine stop, then podman machine start/)).toBeInTheDocument();
+    expect(screen.queryByText("Stop Machine")).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("Check again now"));
+    expect(mockRedetectContainerRuntime).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+  });
+
+  it("names Docker when the unreachable engine is Docker", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "unreachable",
+        backend: "docker",
+        engine: "docker",
+        socket_path: "unix:///var/run/docker.sock",
+        error: "container engine unreachable (docker at unix:///var/run/docker.sock): docker ping: Cannot connect to the Docker daemon",
+        redetecting: true,
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Docker not answering")).toBeInTheDocument();
+    expect(screen.getByText(/Check that Docker \(Docker Desktop, or the docker service\) is running/)).toBeInTheDocument();
+  });
+
   // TB-59: while the daemon keeps probing for an engine, the card says so
   // and offers an immediate re-check; a daemon that is not probing (no head
   // trusted for containers, or an older build) gets neither.

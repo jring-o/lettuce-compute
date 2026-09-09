@@ -148,6 +148,12 @@ type Daemon struct {
 	lastRedetectOutcome string
 	readvertiseMu       sync.Mutex
 	readvertisePending  map[string]bool
+	// containerOutage records a container engine that was in service and
+	// stopped answering (TB-80); nil while none is. Set by
+	// NoteContainerEngineUnreachable, cleared when a probe registers a
+	// runtime again. Read by the management API and the buffer sweep.
+	containerOutageMu sync.Mutex
+	containerOutage   *containerOutage
 
 	// runtimeBlocked records that every attached leaf is currently
 	// runtime-blocked and the "runtime_blocked" notice is live (TB-60); see
@@ -894,6 +900,24 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 				"work_unit_id", wu.ID,
 				"slot", result.SlotID,
 			)
+			return
+		}
+		if runtime.IsEngineUnreachable(result.Err) {
+			// The container engine stopped answering under this unit (a create
+			// or start that the socket refused, a wait the engine dropped). That
+			// is a RUNTIME outage, not this leaf failing on this machine: the
+			// unit is abandoned with the engine named as the reason — it was
+			// run-started, so the head bills the copy as any started abandon —
+			// but the leaf breaker does not count it, and the runtime is taken
+			// out of service and re-probed until the engine answers (TB-80).
+			// Before this the notice read "leaf keeps failing on this machine".
+			d.logger.Warn("slot execution failed because the container engine stopped answering; the unit is returned and container work is paused until the engine answers again",
+				"work_unit_id", wu.ID,
+				"slot", result.SlotID,
+				"error", result.Err,
+			)
+			d.abandonUnit(wu, conn, result.Err.Error())
+			d.NoteContainerEngineUnreachable(result.Runtime, result.Err)
 			return
 		}
 		d.logger.Error("slot execution failed",
@@ -2070,6 +2094,12 @@ func (d *Daemon) memoryDeclarationFits(wu *runtime.WorkUnit) (bool, string) {
 func (d *Daemon) unfitBuffered(wu *runtime.WorkUnit) string {
 	if ok, why := d.memoryDeclarationFits(wu); !ok {
 		return why
+	}
+	// A container unit buffered before its engine stopped answering would
+	// reach a slot only to be run-started and fail at create, billed; while
+	// the outage lasts it is returned un-run instead (TB-80).
+	if wu != nil && runtimeKeyForWU(wu) == runtime.RuntimeContainer && d.containerEngineDown() {
+		return "container engine unreachable"
 	}
 	return ""
 }

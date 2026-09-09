@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,16 +16,22 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // ContainerRuntime executes work units inside Docker containers.
 type ContainerRuntime struct {
-	dataDir       string
-	logger        *slog.Logger
-	dockerClient  DockerClient
-	backend       ContainerBackend // which container backend (podman, docker)
+	dataDir      string
+	logger       *slog.Logger
+	dockerClient DockerClient
+	backend      ContainerBackend // which container backend (podman, docker)
+	// engineSocket is where the engine's API was reached (a Unix socket path,
+	// a Windows named pipe, or the Docker host string), kept so an outage can
+	// be reported with the one fact the volunteer can act on (TB-80). Empty
+	// for a runtime built without a detector.
+	engineSocket string
 	// cpuGrant answers "what CPU does a task starting now get": its equal
 	// share of the volunteer's CPU budget and the budget itself (TB-75). The
 	// daemon wires the live source (the budget divided among the running
@@ -46,11 +53,11 @@ type ContainerRuntime struct {
 	// host whose containers share its RAM (Linux) or when the engine did not
 	// say. It is the fact behind a memCeilingMB below the configured budget
 	// (TB-63) and is reported so diagnostics can name it.
-	engineMemMB int
-	maxPids       int // fork-bomb PID cap from config (<=0 = built-in default)
-	capAdd        []string
-	gpuRelaxUser  bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
-	httpClient    *http.Client // for viz bundle downloads
+	engineMemMB  int
+	maxPids      int // fork-bomb PID cap from config (<=0 = built-in default)
+	capAdd       []string
+	gpuRelaxUser bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
+	httpClient   *http.Client // for viz bundle downloads
 
 	// wantedImages, when set, returns every image ref the volunteer currently
 	// wants cached (all enabled leaves across all heads). The stale-image reaper
@@ -117,13 +124,28 @@ func NewContainerRuntimeForBackend(dataDir string, logger *slog.Logger, backend 
 		return nil, fmt.Errorf("no container runtime available")
 	}
 
+	socket := backend.SocketPath
+	if socket == "" && backend.Backend == BackendDocker {
+		socket = dockerHostForDisplay()
+	}
 	return &ContainerRuntime{
 		dataDir:      dataDir,
 		logger:       logger,
 		dockerClient: dc,
 		backend:      backend.Backend,
+		engineSocket: socket,
 		httpClient:   NewGuardedHTTPClient(),
 	}, nil
+}
+
+// dockerHostForDisplay names the Docker socket the default client connects
+// to — the DOCKER_HOST override when set, else the platform default — for
+// the outage message; the connection itself is the SDK's own FromEnv.
+func dockerHostForDisplay() string {
+	if h := strings.TrimSpace(os.Getenv("DOCKER_HOST")); h != "" {
+		return h
+	}
+	return client.DefaultDockerHost
 }
 
 // SetBackend sets the container backend (for testing).
@@ -404,6 +426,11 @@ func (c *ContainerRuntime) Name() string { return RuntimeContainer }
 // Client returns the underlying DockerClient for suspend/resume operations.
 func (c *ContainerRuntime) Client() DockerClient { return c.dockerClient }
 
+// EngineSocket reports where this runtime reaches its engine's API (a Unix
+// socket path, a Windows named pipe, or the Docker host string), for outage
+// reporting; empty for a runtime built without a detector.
+func (c *ContainerRuntime) EngineSocket() string { return c.engineSocket }
+
 // CanHandle returns true if the spec has an OCI image reference.
 func (c *ContainerRuntime) CanHandle(spec *ExecutionSpec) bool {
 	return spec != nil && spec.Image != ""
@@ -421,9 +448,15 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 		return nil, err
 	}
 
-	// Verify Docker daemon is accessible.
+	// Verify the engine is accessible. A ping that fails is an engine OUTAGE,
+	// not this unit's failure: it is reported as such so the daemon returns the
+	// unit un-run and takes the runtime out of service instead of billing the
+	// abandon and counting it toward the prepare breaker (TB-80).
 	if err := c.dockerClient.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("docker is not available: %w", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("docker is not available: %w", err)
+		}
+		return nil, c.engineUnreachable(err)
 	}
 
 	// Create work directory structure. The checkpoint dir is bind-mounted rw into the
@@ -507,12 +540,18 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 	if strings.Contains(image, "@sha256:") {
 		if !exists {
 			if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+				if isEngineConnectionError(err) {
+					return nil, c.engineUnreachable(err)
+				}
 				return nil, interpretPullError(c.backend, image, err)
 			}
 			pulled = true
 		}
 	} else {
 		if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+			if isEngineConnectionError(err) {
+				return nil, c.engineUnreachable(err)
+			}
 			if !exists {
 				return nil, interpretPullError(c.backend, image, err)
 			}
@@ -760,6 +799,12 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// Create container.
 	containerID, err := c.dockerClient.ContainerCreate(ctx, cfg)
 	if err != nil {
+		if isEngineConnectionError(err) {
+			// The engine is gone, not the unit: reported as an outage so the
+			// daemon pauses container work instead of blaming the leaf (TB-80).
+			c.logger.Warn("container create failed: the engine did not answer", "work_unit_id", wu.ID, "image", cfg.Image, "backend", c.backend, "socket", c.engineSocket, "error", err)
+			return nil, c.engineUnreachable(fmt.Errorf("create container: %w", err))
+		}
 		c.logger.Error("container create failed", "work_unit_id", wu.ID, "image", cfg.Image, "backend", c.backend, "error", err)
 		return nil, fmt.Errorf("create container: %w", err)
 	}
@@ -770,7 +815,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// Start container.
 	if err := c.dockerClient.ContainerStart(ctx, containerID); err != nil {
 		c.logger.Error("container start failed", "work_unit_id", wu.ID, "container", containerID, "image", cfg.Image, "backend", c.backend, "error", err)
-		return nil, fmt.Errorf("start container: %w", err)
+		return nil, c.classifyEngineError(fmt.Errorf("start container: %w", err))
 	}
 
 	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
@@ -915,7 +960,9 @@ func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep 
 			}
 			return nil, fmt.Errorf("execution deadline exceeded: %w", waitCtx.Err())
 		}
-		return nil, fmt.Errorf("container wait: %w", err)
+		// An engine that died under a running container drops the wait: an
+		// outage, not the unit's exit (TB-80).
+		return nil, c.classifyEngineError(fmt.Errorf("container wait: %w", err))
 	}
 
 	// Capture logs to execution.log (capped at 10 MB).

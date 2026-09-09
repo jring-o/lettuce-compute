@@ -1950,7 +1950,12 @@ type ContainerRuntimeStatusResponse struct {
 	// Docker itself, "" when the runtime could not be asked. Backend alone
 	// labelled such a host "Docker" in the app's runtime card and advised
 	// installing the Podman that was already running (TB-73).
-	Engine          string  `json:"engine"`
+	Engine string `json:"engine"`
+	// Status is one of running, stopped, not_initialized, not_installed,
+	// starting, error, or unreachable — the last when an engine that was in
+	// service stopped answering and the daemon is re-probing it (TB-80); the
+	// machine's own "running" claim is overridden then, since a Podman
+	// machine can report running with a dead API socket.
 	Status          string  `json:"status"`
 	Version         string  `json:"version"`
 	SocketPath      string  `json:"socket_path"`
@@ -2012,6 +2017,26 @@ func (b *DaemonBridge) GetContainerRuntimeStatus() ContainerRuntimeStatusRespons
 		// registered runtime is a running one.
 		if mm == nil || !mm.NeedsMachine() {
 			resp.Status = "running"
+		}
+		return resp
+	}
+
+	// An engine that was in service and stopped answering (TB-80): the
+	// runtime is out of service and re-probed every minute. This overrides
+	// the machine's own state above — a Podman machine can report running
+	// while its API socket is dead, which is exactly the outage.
+	if outBackend, outErr, _, down := b.daemon.ContainerOutage(); down {
+		if outBackend.Backend != "" {
+			resp.Backend = string(outBackend.Backend)
+		}
+		resp.Engine = outBackend.Engine
+		resp.Version = outBackend.Version
+		if outBackend.SocketPath != "" {
+			resp.SocketPath = outBackend.SocketPath
+		}
+		resp.Status = "unreachable"
+		if outErr != "" {
+			resp.Error = &outErr
 		}
 		return resp
 	}

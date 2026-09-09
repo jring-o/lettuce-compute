@@ -665,13 +665,22 @@ export interface ContainerRuntimeStatus {
    * Podman's, managed outside this app (TB-73).
    */
   engine: "podman" | "docker" | "";
+  /**
+   * "unreachable": an engine that was in service stopped answering (a Podman
+   * machine whose API socket died behind a VM that still says running, Docker
+   * Desktop quit). Container work is paused, buffered container units were
+   * returned to their heads, and the daemon re-checks the engine every minute
+   * and resumes by itself when it answers (TB-80). `error` carries the
+   * transport error.
+   */
   status:
     | "running"
     | "stopped"
     | "not_initialized"
     | "not_installed"
     | "starting"
-    | "error";
+    | "error"
+    | "unreachable";
   version: string;
   socket_path: string;
   machine_required: boolean;

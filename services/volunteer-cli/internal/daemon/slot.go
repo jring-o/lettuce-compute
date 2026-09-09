@@ -97,10 +97,15 @@ func (s *ExecutionSlot) sessionPaused() time.Duration {
 
 // SlotResult is the outcome of a slot's execution.
 type SlotResult struct {
-	SlotID         int
-	WU             *runtime.WorkUnit
-	Result         *runtime.ExecutionResult
-	Conn           *ServerConnection
+	SlotID int
+	WU     *runtime.WorkUnit
+	Result *runtime.ExecutionResult
+	Conn   *ServerConnection
+	// Runtime is the runtime the slot executed the unit on. An execution error
+	// that says the container engine stopped answering names it, so the
+	// daemon takes THAT runtime out of service and not one a later probe has
+	// since registered for the recovered engine (TB-80).
+	Runtime        runtime.Runtime
 	Err            error
 	TotalPausedDur time.Duration // accumulated pause time for CPU time calculation
 	VizBundlePath  string        // from PrepareResult; non-empty if leaf has viz bundle
@@ -288,6 +293,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			WU:             wu,
 			Result:         execResult,
 			Conn:           conn,
+			Runtime:        rt,
 			Err:            execErr,
 			TotalPausedDur: pausedDur,
 			VizBundlePath:  prep.VizBundlePath,
