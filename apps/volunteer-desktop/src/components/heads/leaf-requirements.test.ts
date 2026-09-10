@@ -83,7 +83,7 @@ describe("leafRequirementItems", () => {
       resource_requirements: { min_disk_mb: 15360, min_cpu_cores: 1, min_gpu_vram_mb: 1024, gpu_type: "NVIDIA" },
     });
     const items = leafRequirementItems(leaf, makeMachine({ max_disk_mb: 20480 }));
-    expect(items.map((i) => i.label)).toEqual(["15 GB disk", "7 GB RAM", "1 core", "NVIDIA GPU, 1 GB VRAM"]);
+    expect(items.map((i) => i.label)).toEqual(["15 GiB disk", "7 GiB RAM", "1 core", "NVIDIA GPU, 1 GiB VRAM"]);
     expect(items.every((i) => i.shortfall === undefined)).toBe(true);
   });
 
@@ -94,8 +94,8 @@ describe("leafRequirementItems", () => {
     });
     const items = leafRequirementItems(leaf, makeMachine());
     expect(items).toEqual([
-      { key: "disk", label: "15 GB disk", shortfall: "you allow 10 GB" },
-      { key: "memory", label: "16 GB RAM", shortfall: "you allow 8 GB", raiseToMb: 16384 },
+      { key: "disk", label: "15 GiB disk", shortfall: "you allow 10 GiB" },
+      { key: "memory", label: "16 GiB RAM", shortfall: "you allow 8 GiB", raiseToMb: 16384 },
       { key: "cores", label: "8 cores", shortfall: "you allow 4" },
     ]);
   });
@@ -131,8 +131,8 @@ describe("leafRequirementItems", () => {
       resource_requirements: { min_gpu_vram_mb: 3072 },
     });
     const [gpu] = leafRequirementItems(leaf, makeMachine());
-    expect(gpu.label).toBe("a GPU, 3 GB VRAM");
-    expect(gpu.shortfall).toBe("your allowance is 2 GB (50% of a 4 GB card)");
+    expect(gpu.label).toBe("a GPU, 3 GiB VRAM");
+    expect(gpu.shortfall).toBe("your allowance is 2 GiB (50% of a 4 GiB card)");
   });
 
   it("says when the card itself is too small", () => {
@@ -141,7 +141,7 @@ describe("leafRequirementItems", () => {
       resource_requirements: { min_gpu_vram_mb: 8192 },
     });
     const [gpu] = leafRequirementItems(leaf, makeMachine());
-    expect(gpu.shortfall).toBe("your 4 GB card is too small whatever percentage you allow");
+    expect(gpu.shortfall).toBe("your 4 GiB card is too small whatever percentage you allow");
   });
 
   it("reports a missing GPU before anything else", () => {
@@ -188,13 +188,13 @@ describe("leafRequirementItems", () => {
 // Memory slider set to the stop that read the same "6.8 GB" as the card
 // (6912 MB), and the head refusing every poll on `7000 <= 6912`.
 describe("TB-66: a shortfall's two figures never round to the same label", () => {
-  it("prints a 7000 MB requirement and a 6912 MB allowance in MB, and names the stop that clears it", () => {
+  it("prints a 7000 MiB requirement and a 6912 MiB allowance in MiB, and names the stop that clears it", () => {
     const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
     const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 6912 }));
     expect(memory).toEqual({
       key: "memory",
-      label: "7000 MB RAM",
-      shortfall: "you allow 6912 MB",
+      label: "7000 MiB RAM",
+      shortfall: "you allow 6912 MiB",
       raiseToMb: 7168,
     });
   });
@@ -204,8 +204,8 @@ describe("TB-66: a shortfall's two figures never round to the same label", () =>
     const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 8192 }));
     expect(memory).toEqual({
       key: "memory",
-      label: "16 GB RAM",
-      shortfall: "you allow 8 GB",
+      label: "16 GiB RAM",
+      shortfall: "you allow 8 GiB",
       raiseToMb: 16384,
     });
   });
@@ -213,7 +213,7 @@ describe("TB-66: a shortfall's two figures never round to the same label", () =>
   it("names no stop when the machine is not short", () => {
     const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
     const [memory] = leafRequirementItems(leaf, makeMachine({ max_memory_mb: 7168 }));
-    expect(memory).toEqual({ key: "memory", label: "6.8 GB RAM" });
+    expect(memory).toEqual({ key: "memory", label: "6.8 GiB RAM" });
   });
 
   it("applies the same rule to disk and VRAM", () => {
@@ -225,19 +225,19 @@ describe("TB-66: a shortfall's two figures never round to the same label", () =>
       leaf,
       makeMachine({ max_disk_mb: 14336, max_gpu_vram_mb: 2048, gpu_card_vram_mb: 4096, gpu_vram_pct: 50 })
     );
-    expect(disk).toEqual({ key: "disk", label: "15000 MB disk", shortfall: "you allow 14336 MB" });
+    expect(disk).toEqual({ key: "disk", label: "15000 MiB disk", shortfall: "you allow 14336 MiB" });
     expect(gpu).toEqual({
       key: "gpu",
-      label: "a GPU, 2100 MB VRAM",
-      shortfall: "your allowance is 2048 MB (50% of a 4 GB card)",
+      label: "a GPU, 2100 MiB VRAM",
+      shortfall: "your allowance is 2048 MiB (50% of a 4 GiB card)",
     });
 
     const tooSmallCard = leafRequirementItems(
       makeLeaf({ execution_spec: { gpu_required: true }, resource_requirements: { min_gpu_vram_mb: 4200 } }),
       makeMachine({ gpu_card_vram_mb: 4096 })
     )[0];
-    expect(tooSmallCard.label).toBe("a GPU, 4200 MB VRAM");
-    expect(tooSmallCard.shortfall).toBe("your 4096 MB card is too small whatever percentage you allow");
+    expect(tooSmallCard.label).toBe("a GPU, 4200 MiB VRAM");
+    expect(tooSmallCard.shortfall).toBe("your 4096 MiB card is too small whatever percentage you allow");
   });
 });
 
@@ -254,14 +254,14 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
     const memory = leafRequirementItems(leaf, vmMachine()).find((i) => i.key === "memory");
     expect(memory).toEqual({
       key: "memory",
-      label: "7000 MB RAM",
-      shortfall: "the container engine's virtual machine allows 1536 MB; it has 2048 MB",
+      label: "7000 MiB RAM",
+      shortfall: "the container engine's virtual machine allows 1536 MiB; it has 2048 MiB",
       vmLimited: true,
     });
     expect(memory?.raiseToMb).toBeUndefined();
   });
 
-  it("prints all three figures in GB when none would round", () => {
+  it("prints all three figures in GiB when none would round", () => {
     const machine = makeMachine({
       max_memory_mb: 3072,
       container_vm_memory_mb: 4096,
@@ -269,14 +269,14 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
     });
     const leaf = makeLeaf({ execution_spec: { max_memory_mb: 8192 } });
     const memory = leafRequirementItems(leaf, machine).find((i) => i.key === "memory");
-    expect(memory?.label).toBe("8 GB RAM");
-    expect(memory?.shortfall).toBe("the container engine's virtual machine allows 3 GB; it has 4 GB");
+    expect(memory?.label).toBe("8 GiB RAM");
+    expect(memory?.shortfall).toBe("the container engine's virtual machine allows 3 GiB; it has 4 GiB");
   });
 
   it("marks nothing when the leaf fits the machine's budget", () => {
     const leaf = makeLeaf({ execution_spec: { max_memory_mb: 1024 } });
     const memory = leafRequirementItems(leaf, vmMachine()).find((i) => i.key === "memory");
-    expect(memory).toEqual({ key: "memory", label: "1 GB RAM" });
+    expect(memory).toEqual({ key: "memory", label: "1 GiB RAM" });
   });
 
   it("keeps the allowance wording and the slider stop when the machine is not the bound", () => {
@@ -285,8 +285,8 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
     const memory = leafRequirementItems(leaf, machine).find((i) => i.key === "memory");
     expect(memory).toEqual({
       key: "memory",
-      label: "7000 MB RAM",
-      shortfall: "you allow 6912 MB",
+      label: "7000 MiB RAM",
+      shortfall: "you allow 6912 MiB",
       raiseToMb: 7168,
     });
   });

@@ -139,8 +139,36 @@ describe("ContainerRuntimeStatusCard", () => {
 
     expect(screen.getByText("Machine: lettuce-vm")).toBeInTheDocument();
     expect(
-      screen.getByText("Resources: 4 CPUs, 4 GB RAM, 50 GB disk")
+      screen.getByText("Resources: 4 CPUs, 4096 MiB RAM, 50 GiB disk")
     ).toBeInTheDocument();
+  });
+
+  // TB-78: the machine's RAM is the container memory ceiling (TB-63), and a
+  // tester sizing it from Podman Desktop's decimal slider needs the exact MiB
+  // the engine reports, not "9 GB" — a rounded GiB that is neither figure.
+  it("prints the machine's RAM exactly in MiB rather than a rounded GB (TB-78)", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        backend: "podman",
+        status: "running",
+        version: "5.3.1",
+        machine_required: true,
+        machine_name: "podman-machine-default",
+        machine_cpus: 4,
+        machine_memory_mb: 9000,
+        machine_disk_gb: 50,
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(
+      screen.getByText("Resources: 4 CPUs, 9000 MiB RAM, 50 GiB disk")
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/\d GB\b/)).not.toBeInTheDocument();
   });
 
   it("shows default machine name when machine_name is empty", () => {

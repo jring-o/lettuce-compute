@@ -484,7 +484,7 @@ describe("LeafCard", () => {
     );
 
     const line = screen.getByText(/^Needs:/);
-    expect(line).toHaveTextContent("Needs: 5 GB disk · 7 GB RAM · 1 core · NVIDIA GPU, 1 GB VRAM");
+    expect(line).toHaveTextContent("Needs: 5 GiB disk · 7 GiB RAM · 1 core · NVIDIA GPU, 1 GiB VRAM");
     expect(screen.getByTestId("requirement-disk")).toHaveAttribute("data-short", "false");
     expect(screen.getByTestId("requirement-gpu")).toHaveAttribute("data-short", "false");
   });
@@ -503,12 +503,12 @@ describe("LeafCard", () => {
 
     const disk = screen.getByTestId("requirement-disk");
     expect(disk).toHaveAttribute("data-short", "true");
-    expect(disk).toHaveTextContent("15 GB disk (you allow 10 GB)");
+    expect(disk).toHaveTextContent("15 GiB disk (you allow 10 GiB)");
     expect(screen.getByTestId("requirement-memory")).toHaveAttribute("data-short", "false");
     const gpu = screen.getByTestId("requirement-gpu");
     expect(gpu).toHaveAttribute("data-short", "true");
     expect(gpu).toHaveTextContent(
-      "NVIDIA GPU, 3 GB VRAM (your allowance is 2 GB (50% of a 4 GB card))"
+      "NVIDIA GPU, 3 GiB VRAM (your allowance is 2 GiB (50% of a 4 GiB card))"
     );
   });
 
@@ -541,7 +541,7 @@ describe("LeafCard", () => {
       screen.getByText("Will not fetch: needs 15 GB of free allowance; 4 GB left of your 10 GB")
     ).toBeInTheDocument();
 
-    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
+    await user.click(screen.getByText("Raise disk allowance to 21 GiB"));
     expect(onRaiseDisk).toHaveBeenCalledWith(21);
   });
 
@@ -570,7 +570,7 @@ describe("LeafCard", () => {
       />
     );
 
-    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
+    await user.click(screen.getByText("Raise disk allowance to 21 GiB"));
     await waitFor(() => {
       expect(screen.getByText("VALIDATION_ERROR: max_disk_gb too large")).toBeInTheDocument();
     });
@@ -860,7 +860,7 @@ describe("LeafCard", () => {
       const memory = screen.getByTestId("requirement-memory");
       expect(memory).toHaveAttribute("data-short", "true");
       expect(memory).toHaveTextContent(
-        "7000 MB RAM (the container engine's virtual machine allows 1536 MB; it has 2048 MB)"
+        "7000 MiB RAM (the container engine's virtual machine allows 1536 MiB; it has 2048 MiB)"
       );
       expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
       expect(screen.queryByText(/than this machine can allow/)).not.toBeInTheDocument();
@@ -889,7 +889,7 @@ describe("LeafCard", () => {
     const grep = () =>
       makeLeaf({ slug: "grep-f13", name: "GREP f13", execution_spec: { max_memory_mb: 7000 } });
 
-    it("prints both figures in MB and offers to raise the allowance to the next slider stop", async () => {
+    it("prints both figures in MiB and offers to raise the allowance to the next slider stop", async () => {
       const user = userEvent.setup();
       const onRaiseMemory = vi.fn().mockResolvedValue(undefined);
 
@@ -905,9 +905,9 @@ describe("LeafCard", () => {
 
       const memory = screen.getByTestId("requirement-memory");
       expect(memory).toHaveAttribute("data-short", "true");
-      expect(memory).toHaveTextContent("7000 MB RAM (you allow 6912 MB)");
+      expect(memory).toHaveTextContent("7000 MiB RAM (you allow 6912 MiB)");
 
-      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+      await user.click(screen.getByText("Raise memory allowance to 7168 MiB"));
       expect(onRaiseMemory).toHaveBeenCalledWith(7168);
     });
 
@@ -920,7 +920,7 @@ describe("LeafCard", () => {
           onRaiseMemory={vi.fn()}
         />
       );
-      expect(screen.getByText("Raise memory allowance to 7.0 GB")).toBeInTheDocument();
+      expect(screen.getByText("Raise memory allowance to 7168 MiB")).toBeInTheDocument();
     });
 
     it("says so instead of offering a stop the Memory slider cannot reach", () => {
@@ -935,7 +935,7 @@ describe("LeafCard", () => {
       );
       expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
       expect(
-        screen.getByText("Needs more memory than this machine can allow (6.0 GB at most).")
+        screen.getByText("Needs more memory than this machine can allow (6144 MiB at most).")
       ).toBeInTheDocument();
     });
 
@@ -955,7 +955,7 @@ describe("LeafCard", () => {
         />
       );
 
-      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+      await user.click(screen.getByText("Raise memory allowance to 7168 MiB"));
       await waitFor(() => {
         expect(
           screen.getByText("VALIDATION_ERROR: max_memory_mb must be >= 1")
@@ -973,7 +973,7 @@ describe("LeafCard", () => {
           onRaiseMemory={vi.fn()}
         />
       );
-      expect(screen.getByTestId("requirement-memory")).toHaveTextContent("6.8 GB RAM");
+      expect(screen.getByTestId("requirement-memory")).toHaveTextContent("6.8 GiB RAM");
       expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
       expect(screen.queryByText(/Needs more memory/)).not.toBeInTheDocument();
     });

@@ -8,7 +8,7 @@ import {
   installPodman,
 } from "@/api/client";
 import { Button } from "@/components/ui/button";
-import { cn, detectPlatform } from "@/lib/utils";
+import { cn, detectPlatform, formatExactMb } from "@/lib/utils";
 
 const platform = detectPlatform();
 
@@ -75,7 +75,7 @@ export function ContainerRuntimeStatusCard() {
           <div className="text-xs text-muted-foreground space-y-0.5">
             <p>Machine: {status.machine_name || "default"}</p>
             <p>
-              Resources: {status.machine_cpus} CPUs, {Math.round(status.machine_memory_mb / 1024)} GB RAM, {status.machine_disk_gb} GB disk
+              Resources: {status.machine_cpus} CPUs, {formatExactMb(status.machine_memory_mb)} RAM, {status.machine_disk_gb} GiB disk
             </p>
           </div>
         )}

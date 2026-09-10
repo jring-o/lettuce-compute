@@ -9,6 +9,7 @@ import {
   formatSizeMb,
   formatSizePairMb,
   formatGb,
+  formatExactMb,
   pausedLabel,
   pauseIsResumable,
   pausedExplanation,
@@ -42,26 +43,58 @@ describe("cn", () => {
 });
 
 describe("formatBytes", () => {
-  it("returns MB for values under 1024", () => {
-    expect(formatBytes(512)).toBe("512 MB");
+  it("returns MiB for values under 1024", () => {
+    expect(formatBytes(512)).toBe("512 MiB");
   });
 
-  it("returns MB for zero", () => {
-    expect(formatBytes(0)).toBe("0 MB");
+  it("returns MiB for zero", () => {
+    expect(formatBytes(0)).toBe("0 MiB");
   });
 
-  it("converts to GB at 1024 MB", () => {
-    expect(formatBytes(1024)).toBe("1.0 GB");
+  it("converts to GiB at 1024 MiB", () => {
+    expect(formatBytes(1024)).toBe("1.0 GiB");
   });
 
-  it("converts to GB with one decimal for values above 1024", () => {
-    expect(formatBytes(2048)).toBe("2.0 GB");
-    expect(formatBytes(1536)).toBe("1.5 GB");
+  it("converts to GiB with one decimal for values above 1024", () => {
+    expect(formatBytes(2048)).toBe("2.0 GiB");
+    expect(formatBytes(1536)).toBe("1.5 GiB");
   });
 
-  it("handles fractional GB correctly", () => {
-    // 1500 MB = 1.46... GB -> "1.5 GB"
-    expect(formatBytes(1500)).toBe("1.5 GB");
+  it("handles fractional GiB correctly", () => {
+    // 1500 MiB = 1.46... GiB -> "1.5 GiB"
+    expect(formatBytes(1500)).toBe("1.5 GiB");
+  });
+});
+
+// TB-78: every size the app prints is a MiB value — the daemon, `doctor` and
+// the heads work in MiB — but the labels said "MB" and "GB", so the Memory
+// slider's 6912 stop read "6.8 GB" (it is 6.75 GiB; neither 6800 decimal MB
+// nor the 6912 the head compares), consecutive 256-MiB stops read 6.5 / 6.8 /
+// 7.0, and a tester reconciling Podman Desktop (decimal GB), the kernel (MiB)
+// and Lettuce could not tell which unit he was reading.
+describe("binary sizes carry binary prefixes (TB-78)", () => {
+  it("never labels a MiB value GB or MB", () => {
+    for (const mb of [0, 512, 1024, 1500, 6912, 7000, 7168, 16384]) {
+      for (const label of [formatBytes(mb), formatSizeMb(mb), formatGb(mb), formatExactMb(mb)]) {
+        expect(label, `${mb}`).not.toMatch(/\b[GM]B\b/);
+        expect(label, `${mb}`).toMatch(/ [GM]iB$/);
+      }
+    }
+    for (const label of formatSizePairMb(7000, 6912)) {
+      expect(label).not.toMatch(/\b[GM]B\b/);
+    }
+  });
+
+  it("rounds 6912 MiB to 6.8 GiB, not 6.8 GB", () => {
+    expect(formatBytes(6912)).toBe("6.8 GiB");
+    expect(formatSizeMb(6912)).toBe("6.8 GiB");
+  });
+
+  it("prints a slider stop exactly, so neighbouring stops never read alike", () => {
+    const stops = [6656, 6912, 7168].map(formatExactMb);
+    expect(stops).toEqual(["6656 MiB", "6912 MiB", "7168 MiB"]);
+    expect(new Set(stops).size).toBe(3);
+    expect(formatExactMb(16384)).toBe("16384 MiB");
   });
 });
 
@@ -155,17 +188,17 @@ describe("formatAge", () => {
 
 describe("formatSizeMb", () => {
   it("renders whole gigabytes without a decimal", () => {
-    expect(formatSizeMb(15360)).toBe("15 GB");
-    expect(formatSizeMb(1024)).toBe("1 GB");
+    expect(formatSizeMb(15360)).toBe("15 GiB");
+    expect(formatSizeMb(1024)).toBe("1 GiB");
   });
 
   it("renders fractional gigabytes with one decimal", () => {
-    expect(formatSizeMb(1536)).toBe("1.5 GB");
-    expect(formatSizeMb(7000)).toBe("6.8 GB");
+    expect(formatSizeMb(1536)).toBe("1.5 GiB");
+    expect(formatSizeMb(7000)).toBe("6.8 GiB");
   });
 
-  it("renders under a gigabyte in MB", () => {
-    expect(formatSizeMb(512)).toBe("512 MB");
+  it("renders under a gigabyte in MiB", () => {
+    expect(formatSizeMb(512)).toBe("512 MiB");
   });
 });
 
@@ -179,10 +212,10 @@ describe("formatCredit with decimals", () => {
 });
 
 describe("formatGb", () => {
-  it("renders megabytes as gigabytes with one decimal", () => {
-    expect(formatGb(1024)).toBe("1.0 GB");
-    expect(formatGb(5734)).toBe("5.6 GB");
-    expect(formatGb(0)).toBe("0.0 GB");
+  it("renders MiB as GiB with one decimal", () => {
+    expect(formatGb(1024)).toBe("1.0 GiB");
+    expect(formatGb(5734)).toBe("5.6 GiB");
+    expect(formatGb(0)).toBe("0.0 GiB");
   });
 });
 
@@ -268,21 +301,21 @@ describe("theme helpers", () => {
 // "6.8 GB", so the card read "6.8 GB RAM (you allow 6.8 GB)" while the head
 // refused the machine by 88 MB.
 describe("formatSizePairMb", () => {
-  it("prints both figures in MB when either would be rounded", () => {
-    expect(formatSizePairMb(7000, 6912)).toEqual(["7000 MB", "6912 MB"]);
-    expect(formatSizePairMb(7000, 6656)).toEqual(["7000 MB", "6656 MB"]);
-    expect(formatSizePairMb(14340, 14336)).toEqual(["14340 MB", "14336 MB"]);
-    expect(formatSizePairMb(1536, 1024)).toEqual(["1536 MB", "1024 MB"]);
+  it("prints both figures in MiB when either would be rounded", () => {
+    expect(formatSizePairMb(7000, 6912)).toEqual(["7000 MiB", "6912 MiB"]);
+    expect(formatSizePairMb(7000, 6656)).toEqual(["7000 MiB", "6656 MiB"]);
+    expect(formatSizePairMb(14340, 14336)).toEqual(["14340 MiB", "14336 MiB"]);
+    expect(formatSizePairMb(1536, 1024)).toEqual(["1536 MiB", "1024 MiB"]);
   });
 
   it("keeps whole gigabytes short", () => {
-    expect(formatSizePairMb(16384, 8192)).toEqual(["16 GB", "8 GB"]);
-    expect(formatSizePairMb(15360, 10240)).toEqual(["15 GB", "10 GB"]);
-    expect(formatSizePairMb(3072, 2048)).toEqual(["3 GB", "2 GB"]);
+    expect(formatSizePairMb(16384, 8192)).toEqual(["16 GiB", "8 GiB"]);
+    expect(formatSizePairMb(15360, 10240)).toEqual(["15 GiB", "10 GiB"]);
+    expect(formatSizePairMb(3072, 2048)).toEqual(["3 GiB", "2 GiB"]);
   });
 
-  it("leaves sizes under a gigabyte in MB as before", () => {
-    expect(formatSizePairMb(512, 256)).toEqual(["512 MB", "256 MB"]);
+  it("leaves sizes under a gigabyte in MiB as before", () => {
+    expect(formatSizePairMb(512, 256)).toEqual(["512 MiB", "256 MiB"]);
   });
 
   it("never prints two different sizes as the same label", () => {

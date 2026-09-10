@@ -225,7 +225,7 @@ function ResourcesStep({
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
             <span>Memory</span>
-            <span className="font-medium">{state.memoryMb} MB</span>
+            <span className="font-medium">{state.memoryMb} MiB</span>
           </div>
           <Slider
             min={256}
@@ -255,7 +255,7 @@ function ResourcesStep({
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
             <span>Disk Storage</span>
-            <span className="font-medium">{state.diskGb} GB</span>
+            <span className="font-medium">{state.diskGb} GiB</span>
           </div>
           <Slider
             min={1}

@@ -522,7 +522,7 @@ describe("useRaiseDiskAllowance", () => {
       await result.current.disk.raise(25);
     });
     expect(result.current.restart.reasons).toEqual([
-      "Your disk allowance is now 25 GB. Lettuce applies it the next time it starts.",
+      "Your disk allowance is now 25 GiB. Lettuce applies it the next time it starts.",
     ]);
   });
 
@@ -887,7 +887,7 @@ describe("useRaiseMemoryAllowance", () => {
     });
     expect(result.current.restart.restartRequired).toBe(true);
     expect(result.current.restart.reasons).toEqual([
-      "Your memory allowance is now 7.0 GB. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.",
+      "Your memory allowance is now 7168 MiB. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.",
     ]);
   });
 
