@@ -330,7 +330,7 @@ describe("OverviewPage", () => {
     // CPU comes from useSystemMetrics (45%), not the daemon's zeros.
     expect(screen.getByText("45%")).toBeInTheDocument();
     expect(
-      screen.getByText("Lettuce is using 2.0 GB of your 10.0 GB allowance")
+      screen.getByText("Lettuce is using 2.0 GiB of your 10.0 GiB allowance")
     ).toBeInTheDocument();
   });
 
@@ -378,7 +378,7 @@ describe("OverviewPage", () => {
     });
     render(<OverviewPage />);
     expect(
-      screen.getByText("GPU: NVIDIA, 8.0 GB card, 5.6 GB allowed for Lettuce")
+      screen.getByText("GPU: NVIDIA, 8.0 GiB card, 5.6 GiB allowed for Lettuce")
     ).toBeInTheDocument();
   });
 

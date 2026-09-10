@@ -24,6 +24,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import {
   cn,
   formatBytes,
+  formatExactMb,
   formatGb,
   readStoredTheme,
   storeTheme,
@@ -524,7 +525,7 @@ export function SettingsPage() {
           min={MEMORY_SLIDER_STEP_MB}
           max={memorySliderMaxMb(totalMemMB, config.resource_limits.max_memory_mb)}
           step={MEMORY_SLIDER_STEP_MB}
-          displayValue={`${formatBytes(config.resource_limits.max_memory_mb)} / ${formatBytes(totalMemMB)}`}
+          displayValue={`${formatExactMb(config.resource_limits.max_memory_mb)} / ${formatBytes(totalMemMB)}`}
           usagePct={
             system && system.memory_total_mb > 0
               ? (system.memory_used_mb / system.memory_total_mb) * 100
@@ -572,7 +573,7 @@ export function SettingsPage() {
           min={1}
           max={100}
           step={1}
-          displayValue={`${config.resource_limits.max_disk_gb} GB`}
+          displayValue={`${config.resource_limits.max_disk_gb} GiB`}
           usagePct={
             metrics && metrics.disk_usage_known && metrics.disk_allowance_mb > 0
               ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
@@ -586,7 +587,7 @@ export function SettingsPage() {
         />
         <p className="text-xs text-muted-foreground">
           A cap on what Lettuce may use for work files and cached container images, not
-          space it reserves. A leaf is fetched only when its declared need plus 2 GB of
+          space it reserves. A leaf is fetched only when its declared need plus 2 GiB of
           headroom fits inside this allowance.
           {metrics?.disk_usage_known &&
             ` Lettuce is using ${formatGb(metrics.disk_used_mb)} right now.`}

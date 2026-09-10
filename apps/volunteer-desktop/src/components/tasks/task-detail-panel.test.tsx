@@ -207,8 +207,8 @@ describe("TaskDetailPanel", () => {
     mockTaskDetails.mockResolvedValue(makeDetail({ memory_rss_mb: 512, virtual_memory_mb: 1024 }));
     renderPanel();
     await waitForDetail();
-    expect(screen.getByText("512 MB")).toBeInTheDocument();
-    expect(screen.getByText("1024 MB")).toBeInTheDocument();
+    expect(screen.getByText("512 MiB")).toBeInTheDocument();
+    expect(screen.getByText("1024 MiB")).toBeInTheDocument();
   });
 
   it("renders CPU usage percentage", async () => {

@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState, useEffect } from "react";
 import { useClient } from "./use-api";
 import { markRestartRequired, useOnDaemonRestart } from "./use-restart-required";
-import { formatBytes } from "../lib/utils";
+import { formatExactMb } from "../lib/utils";
 import type {
   ConfigResponse,
   ConfigUpdateResponse,
@@ -217,7 +217,7 @@ export function useRaiseDiskAllowance(): {
       });
       if (resp?.restart_required === true) {
         markRestartRequired(
-          `Your disk allowance is now ${gb} GB. Lettuce applies it the next time it starts.`
+          `Your disk allowance is now ${gb} GiB. Lettuce applies it the next time it starts.`
         );
       }
       return resp;
@@ -248,7 +248,7 @@ export function useRaiseMemoryAllowance(): {
         resource_limits: { ...config.resource_limits, max_memory_mb: mb },
       });
       markRestartRequired(
-        `Your memory allowance is now ${formatBytes(mb)}. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.`
+        `Your memory allowance is now ${formatExactMb(mb)}. Lettuce tells its servers the new figure the next time it starts; until then they keep offering only work that fit the old one.`
       );
       return resp;
     },

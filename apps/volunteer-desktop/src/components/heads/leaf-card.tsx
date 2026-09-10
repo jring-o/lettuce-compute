@@ -2,7 +2,7 @@ import { useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Slider } from "@/components/ui/slider";
-import { cn, formatBytes } from "@/lib/utils";
+import { cn, formatExactMb } from "@/lib/utils";
 import type { LeafInfo, ContainerRuntimeStatus, MachineCapabilities } from "@/api/client";
 import {
   leafRuntimes,
@@ -232,12 +232,12 @@ export function LeafCard({
                 >
                   {raisingMemory
                     ? "Raising..."
-                    : `Raise memory allowance to ${formatBytes(memoryRaiseTo)}`}
+                    : `Raise memory allowance to ${formatExactMb(memoryRaiseTo)}`}
                 </button>
               )}
               {!memoryRaiseFits && memoryCeilingMb != null && (
                 <p className="text-xs text-amber-700 dark:text-amber-400">
-                  Needs more memory than this machine can allow ({formatBytes(memoryCeilingMb)} at
+                  Needs more memory than this machine can allow ({formatExactMb(memoryCeilingMb)} at
                   most).
                 </p>
               )}
@@ -256,7 +256,7 @@ export function LeafCard({
                   disabled={raising}
                   className="text-xs text-blue-600 hover:underline disabled:opacity-50"
                 >
-                  {raising ? "Raising..." : `Raise disk allowance to ${raiseTo} GB`}
+                  {raising ? "Raising..." : `Raise disk allowance to ${raiseTo} GiB`}
                 </button>
               )}
               {raiseError && <p className="text-xs text-destructive">{raiseError}</p>}

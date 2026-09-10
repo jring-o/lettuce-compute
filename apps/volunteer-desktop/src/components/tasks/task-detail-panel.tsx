@@ -87,11 +87,11 @@ function buildCopyText(d: TaskDetail): string {
     `Progress Rate: ${d.progress_rate_pct_per_hour != null ? `${d.progress_rate_pct_per_hour.toFixed(1)}% / hour` : "---"}`,
     "",
     "--- Resources ---",
-    `Memory (RSS): ${d.memory_rss_mb != null ? `${d.memory_rss_mb} MB` : "---"}`,
-    `Virtual Memory: ${d.virtual_memory_mb != null ? `${d.virtual_memory_mb} MB` : "---"}`,
+    `Memory (RSS): ${d.memory_rss_mb != null ? `${d.memory_rss_mb} MiB` : "---"}`,
+    `Virtual Memory: ${d.virtual_memory_mb != null ? `${d.virtual_memory_mb} MiB` : "---"}`,
     `CPU Usage: ${d.cpu_usage_pct != null ? `${d.cpu_usage_pct}%` : "---"}`,
-    `Disk Read: ${d.disk_read_mb != null ? `${d.disk_read_mb} MB` : "---"}`,
-    `Disk Written: ${d.disk_written_mb != null ? `${d.disk_written_mb} MB` : "---"}`,
+    `Disk Read: ${d.disk_read_mb != null ? `${d.disk_read_mb} MiB` : "---"}`,
+    `Disk Written: ${d.disk_written_mb != null ? `${d.disk_written_mb} MiB` : "---"}`,
     "",
     "--- Task Info ---",
     `Head: ${d.head_name}`,
@@ -224,11 +224,11 @@ export function TaskDetailPanel({
                 </CollapsibleSection>
 
                 <CollapsibleSection title="Resources">
-                  <KV label="Memory (RSS)" value={detail.memory_rss_mb != null ? `${detail.memory_rss_mb} MB` : "---"} />
-                  <KV label="Virtual Memory" value={detail.virtual_memory_mb != null ? `${detail.virtual_memory_mb} MB` : "---"} />
+                  <KV label="Memory (RSS)" value={detail.memory_rss_mb != null ? `${detail.memory_rss_mb} MiB` : "---"} />
+                  <KV label="Virtual Memory" value={detail.virtual_memory_mb != null ? `${detail.virtual_memory_mb} MiB` : "---"} />
                   <KV label="CPU Usage" value={detail.cpu_usage_pct != null ? `${detail.cpu_usage_pct}%` : "---"} />
-                  <KV label="Disk Read" value={detail.disk_read_mb != null ? `${detail.disk_read_mb} MB` : "---"} />
-                  <KV label="Disk Written" value={detail.disk_written_mb != null ? `${detail.disk_written_mb} MB` : "---"} />
+                  <KV label="Disk Read" value={detail.disk_read_mb != null ? `${detail.disk_read_mb} MiB` : "---"} />
+                  <KV label="Disk Written" value={detail.disk_written_mb != null ? `${detail.disk_written_mb} MiB` : "---"} />
                 </CollapsibleSection>
 
                 <CollapsibleSection title="Task Info">

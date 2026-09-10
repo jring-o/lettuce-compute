@@ -252,7 +252,7 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
     await waitFor(() => {
       expect(
-        screen.getByText(/your card 8\.0 GB × 50% = 4\.0 GB allowed/)
+        screen.getByText(/your card 8.0 GiB × 50% = 4.0 GiB allowed/)
       ).toBeInTheDocument();
     });
     expect(screen.queryByText("No GPU detected")).not.toBeInTheDocument();
@@ -267,10 +267,29 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText("2.0 GB / 16.0 GB")).toBeInTheDocument();
+    expect(screen.getByText("2048 MiB / 16.0 GiB")).toBeInTheDocument();
   });
 
-  it("explains the disk allowance and the 2 GB headroom rule", () => {
+  // TB-78: the stops are 256 MiB apart, and rounded to one decimal of a GiB
+  // labelled "GB" they read 6.5 / 6.8 / 7.0 — the tester's "0.2 steps". The
+  // label prints the stop exactly, in the unit the daemon advertises to heads.
+  it("prints the Memory slider's stop exactly in MiB, so neighbouring stops never read alike (TB-78)", () => {
+    const labels: string[] = [];
+    for (const mb of [6656, 6912, 7168]) {
+      const config = makeConfig();
+      config.resource_limits = { ...config.resource_limits, max_memory_mb: mb };
+      mockUseConfig.mockReturnValue({ config, isLoading: false, updateConfig: vi.fn(), toast: null });
+      const { unmount } = render(<SettingsPage />);
+      const label = screen.getByText(/ \/ 16\.0 GiB$/).textContent ?? "";
+      labels.push(label);
+      expect(label).toBe(`${mb} MiB / 16.0 GiB`);
+      expect(label).not.toMatch(/\bGB\b/);
+      unmount();
+    }
+    expect(new Set(labels).size).toBe(3);
+  });
+
+  it("explains the disk allowance and the 2 GiB headroom rule", () => {
     mockUseMetrics.mockReturnValue({
       metrics: {
         cpu_usage_pct: 0,
@@ -295,9 +314,9 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     expect(
-      screen.getByText(/A leaf is fetched only when its declared need plus 2 GB of headroom fits/)
+      screen.getByText(/A leaf is fetched only when its declared need plus 2 GiB of headroom fits/)
     ).toBeInTheDocument();
-    expect(screen.getByText(/Lettuce is using 3\.0 GB right now/)).toBeInTheDocument();
+    expect(screen.getByText(/Lettuce is using 3.0 GiB right now/)).toBeInTheDocument();
   });
 
   it("shows the daemon's work buffer in hours (0–12, step 0.5) and saves work_buffer_hours", () => {

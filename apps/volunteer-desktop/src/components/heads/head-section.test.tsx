@@ -502,7 +502,7 @@ describe("HeadSection", () => {
 
     render(<HeadSection head={head} {...defaultProps} onRaiseDisk={onRaiseDisk} />);
 
-    await user.click(screen.getByText("Raise disk allowance to 30 GB"));
+    await user.click(screen.getByText("Raise disk allowance to 30 GiB"));
     expect(onRaiseDisk).toHaveBeenCalledWith(30);
   });
 });

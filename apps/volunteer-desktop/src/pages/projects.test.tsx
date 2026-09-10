@@ -635,7 +635,7 @@ describe("ProjectsPage", () => {
     render(<ProjectsPage />);
 
     expect(screen.getByText("Will not fetch: needs 15 GB; 4 GB left of your 10 GB")).toBeInTheDocument();
-    await user.click(screen.getByText("Raise disk allowance to 21 GB"));
+    await user.click(screen.getByText("Raise disk allowance to 21 GiB"));
 
     await waitFor(() => {
       expect(mockRaiseDisk).toHaveBeenCalledWith(21);
@@ -794,9 +794,9 @@ describe("ProjectsPage", () => {
       render(<ProjectsPage />);
 
       expect(screen.getByTestId("requirement-memory")).toHaveTextContent(
-        "7000 MB RAM (you allow 6912 MB)"
+        "7000 MiB RAM (you allow 6912 MiB)"
       );
-      await user.click(screen.getByText("Raise memory allowance to 7.0 GB"));
+      await user.click(screen.getByText("Raise memory allowance to 7168 MiB"));
 
       await waitFor(() => {
         expect(mockRaiseMemory).toHaveBeenCalledWith(7168);
@@ -819,7 +819,7 @@ describe("ProjectsPage", () => {
 
       expect(screen.queryByText(/Raise memory allowance/)).not.toBeInTheDocument();
       expect(
-        screen.getByText("Needs more memory than this machine can allow (3.6 GB at most).")
+        screen.getByText("Needs more memory than this machine can allow (3686 MiB at most).")
       ).toBeInTheDocument();
     });
   });

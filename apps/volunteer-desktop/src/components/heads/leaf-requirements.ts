@@ -107,8 +107,8 @@ export function leafRequirementItems(
         // hold, not what Settings allows (TB-63): name the machine and its
         // size — in the same unit as the pair, so the three figures read
         // together — and offer no slider stop, since none would clear it.
-        const vm = have.endsWith(" MB")
-          ? `${machine.container_vm_memory_mb} MB`
+        const vm = have.endsWith(" MiB")
+          ? `${machine.container_vm_memory_mb} MiB`
           : formatSizeMb(machine.container_vm_memory_mb);
         item.shortfall = `the container engine's virtual machine allows ${have}; it has ${vm}`;
         item.vmLimited = true;

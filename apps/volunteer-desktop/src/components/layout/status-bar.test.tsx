@@ -45,7 +45,7 @@ describe("StatusBar", () => {
     mockUseDaemonStatus.mockReturnValue(status({}));
     render(<StatusBar />);
     expect(screen.getByText("CPU 33%")).toBeInTheDocument();
-    expect(screen.getByText("MEM 2.0 GB")).toBeInTheDocument();
+    expect(screen.getByText("MEM 2.0 GiB")).toBeInTheDocument();
     expect(screen.getByText("Active — waiting for tasks")).toBeInTheDocument();
   });
 

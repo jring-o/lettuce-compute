@@ -666,7 +666,7 @@ export function OverviewPage() {
                     ? (metrics.disk_used_mb / metrics.disk_allowance_mb) * 100
                     : 0
                 }
-                displayValue={`${(metrics.disk_used_mb / 1024).toFixed(1)} / ${(metrics.disk_allowance_mb / 1024).toFixed(1)} GB`}
+                displayValue={`${(metrics.disk_used_mb / 1024).toFixed(1)} / ${(metrics.disk_allowance_mb / 1024).toFixed(1)} GiB`}
               />
             )}
           </div>

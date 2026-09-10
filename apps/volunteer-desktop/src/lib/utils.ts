@@ -5,11 +5,30 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/**
+ * A memory or disk figure in MiB — the unit the daemon, `doctor` and the heads
+ * all work in — with its binary prefix: under a gibibyte in MiB ("512 MiB"),
+ * otherwise GiB to one decimal ("6.8 GiB"). Rounded, so it suits a gauge or a
+ * total; a figure someone acts on (a slider stop, an allowance, a machine
+ * size) goes through `formatExactMb` instead (TB-78).
+ */
 export function formatBytes(mb: number): string {
   if (mb >= 1024) {
-    return `${(mb / 1024).toFixed(1)} GB`;
+    return `${(mb / 1024).toFixed(1)} GiB`;
   }
-  return `${mb} MB`;
+  return `${mb} MiB`;
+}
+
+/**
+ * The exact MiB figure, never rounded: "6912 MiB". The Memory slider's stops
+ * are 256 MiB apart, so 6656 / 6912 / 7168 rounded to one decimal of a GiB
+ * read 6.5 / 6.8 / 7.0 — the "0.2 steps" a tester saw — and the label's "GB"
+ * was a GiB: neither the decimal GB Podman Desktop shows beside it nor the
+ * 6912 the daemon advertises to heads (TB-78). Every figure the daemon or a
+ * head compares is printed this way.
+ */
+export function formatExactMb(mb: number): string {
+  return `${mb} MiB`;
 }
 
 export function formatDuration(seconds: number): string {
@@ -82,14 +101,15 @@ export function formatAge(isoString: string, now: number = Date.now()): string {
 }
 
 /**
- * A size given in MB, rendered in the unit a person would use: whole
- * gigabytes without a decimal ("15 GB"), fractional ones with one ("1.5 GB"),
- * and anything under a gigabyte in MB ("512 MB").
+ * A size given in MiB, rendered in the unit a person would use: whole
+ * gibibytes without a decimal ("15 GiB"), fractional ones with one
+ * ("1.5 GiB"), and anything under a gibibyte in MiB ("512 MiB"). Binary
+ * prefixes, because the value is binary (TB-78).
  */
 export function formatSizeMb(mb: number): string {
-  if (mb < 1024) return `${mb} MB`;
+  if (mb < 1024) return `${mb} MiB`;
   const gb = mb / 1024;
-  return Number.isInteger(gb) ? `${gb} GB` : `${gb.toFixed(1)} GB`;
+  return Number.isInteger(gb) ? `${gb} GiB` : `${gb.toFixed(1)} GiB`;
 }
 
 /**
@@ -99,18 +119,18 @@ export function formatSizeMb(mb: number): string {
  * contradicted itself ("6.8 GB RAM (you allow 6.8 GB)") while the head
  * refused the machine by 88 MB (TB-66). A shortfall is the one place the
  * numbers are acted on, so whenever either figure would be rounded both are
- * printed in MB — the unit the daemon and the head compare in; whole
- * gigabytes keep their short form ("16 GB", "8 GB").
+ * printed in MiB — the unit the daemon and the head compare in; whole
+ * gibibytes keep their short form ("16 GiB", "8 GiB").
  */
 export function formatSizePairMb(need: number, have: number): [string, string] {
   const exact = (mb: number) => mb < 1024 || Number.isInteger(mb / 1024);
   if (exact(need) && exact(have)) return [formatSizeMb(need), formatSizeMb(have)];
-  return [`${need} MB`, `${have} MB`];
+  return [`${need} MiB`, `${have} MiB`];
 }
 
-/** Megabytes as a GB figure with one decimal, e.g. `formatGb(1536)` is "1.5 GB". */
+/** MiB as a GiB figure with one decimal, e.g. `formatGb(1536)` is "1.5 GiB". */
 export function formatGb(mb: number): string {
-  return `${(mb / 1024).toFixed(1)} GB`;
+  return `${(mb / 1024).toFixed(1)} GiB`;
 }
 
 /**
