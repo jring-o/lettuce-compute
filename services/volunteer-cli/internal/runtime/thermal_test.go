@@ -15,17 +15,28 @@ import (
 // withMockCPUTemp overrides CPUTempReader for the duration of the test.
 func withMockCPUTemp(t *testing.T, tempC int) {
 	t.Helper()
-	orig := CPUTempReader
-	t.Cleanup(func() { CPUTempReader = orig })
-	CPUTempReader = func() int { return tempC }
+	withMockCPUTempFunc(t, func() int { return tempC })
 }
 
-// withMockCPUTempFunc overrides CPUTempReader with a custom function.
+// withMockCPUTempFunc overrides CPUTempReader with a custom function. A
+// mocked reader is a readable source, so the capability the monitor detects
+// at Start (TB-77) is stubbed readable too — otherwise the host running the
+// tests (a CI container without sensors, a Windows box) would decide whether
+// the "cannot read the CPU" notice appears in front of the throttle notices.
 func withMockCPUTempFunc(t *testing.T, fn func() int) {
 	t.Helper()
 	orig := CPUTempReader
 	t.Cleanup(func() { CPUTempReader = orig })
 	CPUTempReader = fn
+	withMockThermalCapability(t, ThermalCapability{CPUSource: "test", CPUReadable: true, Detail: "test reader"})
+}
+
+// withMockThermalCapability overrides what the monitor detects at Start.
+func withMockThermalCapability(t *testing.T, cap ThermalCapability) {
+	t.Helper()
+	orig := ThermalCapabilityReader
+	t.Cleanup(func() { ThermalCapabilityReader = orig })
+	ThermalCapabilityReader = func() ThermalCapability { return cap }
 }
 
 func defaultThermalConfig() ThermalConfig {

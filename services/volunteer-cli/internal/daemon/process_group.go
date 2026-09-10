@@ -26,4 +26,11 @@ type ProcessGroup interface {
 	// survive when the daemon exits. Used for "suspend and quit" — frozen
 	// orphan processes stay alive for the next daemon launch to resume.
 	ReleaseChildren()
+
+	// CPUSeconds is the cumulative CPU time of the processes in the group,
+	// keyed by group (a process group id on Unix, the one Job Object on
+	// Windows), so the yield monitor can subtract Lettuce's native tasks
+	// from the machine's load (TB-83). A group whose processes have all
+	// exited is absent; the caller keeps what it had used.
+	CPUSeconds() (map[string]float64, error)
 }

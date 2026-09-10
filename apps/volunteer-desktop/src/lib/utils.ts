@@ -121,6 +121,7 @@ export function formatGb(mb: number): string {
 export function pausedLabel(reason: string | null | undefined): string {
   if (!reason) return "Paused";
   if (reason === "scheduled") return "Paused — outside your schedule";
+  if (reason === "busy") return "Paused — your computer is busy";
   return `Paused — ${reason}`;
 }
 
@@ -144,6 +145,9 @@ export function pausedExplanation(reason: string | null | undefined): string {
   }
   if (reason === "thermal") {
     return "Computing is paused while the machine cools down. It starts again on its own.";
+  }
+  if (reason === "busy") {
+    return "Computing is paused because other programs are using the CPU. It starts again on its own when they need less. Adjust the thresholds in Settings.";
   }
   return "Computing is paused.";
 }

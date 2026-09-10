@@ -194,6 +194,10 @@ describe("pausedLabel", () => {
     expect(pausedLabel("thermal")).toBe("Paused — thermal");
     expect(pausedLabel("user")).toBe("Paused — user");
   });
+
+  it("words a yield pause as the computer being busy (TB-83)", () => {
+    expect(pausedLabel("busy")).toBe("Paused — your computer is busy");
+  });
 });
 
 describe("formatDateTime", () => {
@@ -308,6 +312,8 @@ describe("pauseIsResumable / pausedExplanation (TB-72)", () => {
     expect(pausedExplanation("user")).toBe("Computing is paused. Resume to start contributing.");
     expect(pausedExplanation("scheduled")).toMatch(/schedule.*Settings/);
     expect(pausedExplanation("thermal")).toMatch(/cools down/);
+    expect(pausedExplanation("busy")).toMatch(/other programs are using the CPU/);
+    expect(pauseIsResumable("busy")).toBe(false);
     expect(pausedExplanation(null)).toBe("Computing is paused.");
   });
 });

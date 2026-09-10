@@ -19,3 +19,13 @@ func readCPUTemperature() int {
 // raise UAC prompts, so no temperature is read at all. GPU monitoring via
 // nvidia-smi/rocm-smi is unaffected.
 func readSensors() []Sensor { return nil }
+
+// detectThermalCapability on Windows is always "none", and unfixable by the
+// volunteer: the decision above not to ask WMI is this client's, so there is
+// no remedy to offer (TB-77). Reported as information, not a warning.
+func detectThermalCapability() ThermalCapability {
+	return ThermalCapability{
+		CPUSource: "none",
+		Detail:    "Windows only lets programs running as administrator read the CPU temperature, and asking can raise a permissions prompt, so Lettuce does not try",
+	}
+}

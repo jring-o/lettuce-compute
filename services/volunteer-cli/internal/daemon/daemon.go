@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,6 +115,13 @@ type Daemon struct {
 	thermalMonitor *runtime.ThermalMonitor
 	thermalPauseCh chan bool
 
+	// Yielding to other programs (TB-83): a second automatic pause source
+	// beside the thermal monitor, wired the same way. ownMeter keeps the
+	// daemon's own cumulative CPU time monotonic for its sampler.
+	yieldMonitor *runtime.YieldMonitor
+	yieldPauseCh chan bool
+	ownMeter     ownCPUMeter
+
 	// Backoff configuration (overridable for tests)
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
@@ -181,11 +189,22 @@ type Daemon struct {
 	mu       sync.Mutex
 	stopping bool
 	running  bool
-	paused   bool
+	// paused is true while ANY automatic source holds a pause; the three
+	// flags say which. Each source is remembered on its own — the resource
+	// monitor (schedule window, low disk), the thermal monitor, the yield
+	// monitor — so one source resuming cannot unfreeze work another still
+	// holds. Both are maintained only by setAutoPause.
+	paused         bool
+	resourcePaused bool
+	thermalPaused  bool
+	busyPaused     bool
+	// pauseReason is the automatic source PauseReason reports while paused,
+	// derived by setAutoPause: "thermal", "busy" or "scheduled", ranked in
+	// that order when several hold at once.
+	pauseReason string
 
-	// User-initiated pause (separate from resource/thermal auto-pause).
+	// User-initiated pause (separate from the automatic sources above).
 	userPaused  bool
-	pauseReason string // "user", "thermal", "scheduled", ""
 	userPauseCh chan bool
 
 	// Daemon start time for uptime calculation.
@@ -385,6 +404,18 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	thermalMonitor := runtime.NewThermalMonitor(thermalCfg, thermalPauseCh, cfg.Logger)
 
+	// Create the yield monitor (TB-83): the same pause verb, for other
+	// programs' CPU use instead of heat. Its sampler needs the daemon (the
+	// daemon's own CPU use is what it subtracts), so that is wired below.
+	yieldPauseCh := make(chan bool, 1)
+	yieldMonitor := runtime.NewYieldMonitor(runtime.YieldConfig{
+		Enabled:             cfg.Config.Yield.Enabled,
+		CPUPausePct:         cfg.Config.Yield.CPUPausePct,
+		CPUResumePct:        cfg.Config.Yield.CPUResumePct,
+		WindowSeconds:       cfg.Config.Yield.WindowSeconds,
+		PollIntervalSeconds: cfg.Config.Yield.PollIntervalSeconds,
+	}, yieldPauseCh, cfg.Logger)
+
 	// Notices and per-head state: adopt start-up's instances when given (they
 	// may already hold a registration-time rejection), else start empty.
 	notices := cfg.Notices
@@ -398,6 +429,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// The thermal monitor emits its own throttle notices (it alone knows the
 	// temperatures and the cause); it only needs somewhere to put them.
 	thermalMonitor.SetNoticeSink(notices)
+	yieldMonitor.SetNoticeSink(notices)
 
 	// Build multi-server client. Support both new Servers field and legacy
 	// Client/VolunteerID for backward compatibility with existing tests.
@@ -476,6 +508,8 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		scheduler:           scheduler,
 		thermalMonitor:      thermalMonitor,
 		thermalPauseCh:      thermalPauseCh,
+		yieldMonitor:        yieldMonitor,
+		yieldPauseCh:        yieldPauseCh,
 		initialBackoff:      1 * time.Second,
 		maxBackoff:          30 * time.Second,
 		cachedHW:            hw,
@@ -497,6 +531,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// the live memory ceiling into the registered runtimes (BG-16, TB-75,
 	// TB-79).
 	d.wireRuntimeLimits(pg, limiter)
+	yieldMonitor.SetSampler(runtime.NewCPULoadSampler(runtime.NewMachineCPUSampler(), d.ownCPUSeconds, goruntime.NumCPU(), nil))
 	return d
 }
 
@@ -608,6 +643,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.thermalMonitor != nil {
 		d.thermalMonitor.Start(monitorCtx)
 		defer d.thermalMonitor.Stop()
+	}
+
+	// Start the yield monitor (TB-83); a no-op unless yield.enabled.
+	if d.yieldMonitor != nil {
+		d.yieldMonitor.Start(monitorCtx)
+		defer d.yieldMonitor.Stop()
 	}
 
 	// Resume any tasks preserved from the previous daemon session: first the running
@@ -772,7 +813,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Suspend all running processes (freeze in place).
 			d.slotManager.SuspendAll()
 			d.logger.Info("suspended all active processes",
-				"reason", d.pauseReason,
+				"reason", d.PauseReason(),
 				"active_slots", d.slotManager.ActiveCount(),
 			)
 
@@ -846,19 +887,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// New item in queue — try to fill slots.
 			d.fillSlots(ctx)
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -2770,23 +2803,11 @@ func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
 	for {
 		select {
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-				d.logger.Info("daemon paused by resource monitor")
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-				d.logger.Info("daemon paused due to thermal throttle")
-			} else {
-				d.logger.Info("daemon resumed from thermal throttle")
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -2817,25 +2838,11 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 		case <-ctx.Done():
 			return false
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-			}
-			d.mu.Unlock()
-			if !shouldPause {
-				d.logger.Info("daemon resumed by resource monitor")
-			}
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-			}
-			d.mu.Unlock()
-			if !shouldPause {
-				d.logger.Info("daemon resumed from thermal throttle")
-			}
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -2845,6 +2852,73 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 			}
 		}
 	}
+}
+
+// Automatic pause sources. A user pause is separate (userPaused): it is the
+// one `resume` undoes.
+const (
+	pauseSourceResource = "scheduled" // the resource monitor: schedule window, low disk
+	pauseSourceThermal  = "thermal"   // the thermal monitor
+	pauseSourceBusy     = "busy"      // the yield monitor: other programs need the CPU (TB-83)
+)
+
+// setAutoPause records one automatic source's pause (on) or resume (off)
+// and re-derives the daemon's paused state and reported reason from ALL the
+// sources. Before the yield monitor joined, one flag was overwritten by
+// whichever monitor signalled last, so a source resuming could unfreeze work
+// another still held paused; each source now keeps its own flag. The reason
+// ranks the sources — thermal over busy over the schedule — so the most
+// serious explanation is the one shown when several hold at once.
+func (d *Daemon) setAutoPause(source string, on bool) {
+	d.mu.Lock()
+	switch source {
+	case pauseSourceResource:
+		d.resourcePaused = on
+	case pauseSourceThermal:
+		d.thermalPaused = on
+	case pauseSourceBusy:
+		d.busyPaused = on
+	}
+	d.paused = d.resourcePaused || d.thermalPaused || d.busyPaused
+	d.pauseReason = d.autoPauseReasonLocked()
+	stillPaused := d.paused
+	stillBy := d.pauseReason
+	d.mu.Unlock()
+
+	var msg string
+	switch {
+	case source == pauseSourceResource && on:
+		msg = "daemon paused by resource monitor"
+	case source == pauseSourceResource:
+		msg = "daemon resumed by resource monitor"
+	case source == pauseSourceThermal && on:
+		msg = "daemon paused due to thermal throttle"
+	case source == pauseSourceThermal:
+		msg = "daemon resumed from thermal throttle"
+	case on:
+		msg = "daemon paused: other programs need the CPU (yield)"
+	default:
+		msg = "daemon resumed: other programs' CPU use fell (yield)"
+	}
+	if !on && stillPaused {
+		d.logger.Info(msg, "still_paused_by", stillBy)
+		return
+	}
+	d.logger.Info(msg)
+}
+
+// autoPauseReasonLocked ranks the automatic sources currently holding a
+// pause. Caller holds d.mu.
+func (d *Daemon) autoPauseReasonLocked() string {
+	switch {
+	case d.thermalPaused:
+		return pauseSourceThermal
+	case d.busyPaused:
+		return pauseSourceBusy
+	case d.resourcePaused:
+		return pauseSourceResource
+	}
+	return ""
 }
 
 // waitForScheduleActive blocks until the scheduler says the daemon may run, and
@@ -2978,7 +3052,6 @@ func (d *Daemon) Pause() error {
 		return fmt.Errorf("already paused")
 	}
 	d.userPaused = true
-	d.pauseReason = "user"
 	d.mu.Unlock()
 	// Signal the daemon loop (non-blocking).
 	select {
@@ -3020,7 +3093,9 @@ func (d *Daemon) IsPaused() bool {
 
 // PauseReason returns the reason the daemon is paused, or empty string if not
 // paused. A user pause outranks everything (it is the state `resume` undoes);
-// then the signal-driven reason; then the live schedule verdict (TB-44).
+// then the signal-driven reason — "thermal" over "busy" over "scheduled" when
+// several sources hold at once (setAutoPause); then the live schedule verdict
+// (TB-44).
 func (d *Daemon) PauseReason() string {
 	d.mu.Lock()
 	if d.userPaused {
@@ -3037,6 +3112,38 @@ func (d *Daemon) PauseReason() string {
 		return "scheduled"
 	}
 	return ""
+}
+
+// PauseDetail is one sentence of detail behind PauseReason, or "" when the
+// reason needs none. For "busy" it is the measured share of the CPU other
+// programs are using and both thresholds, so `status` and the app can say
+// what the volunteer's setting saw (TB-83).
+func (d *Daemon) PauseDetail() string {
+	if d.PauseReason() != pauseSourceBusy || d.yieldMonitor == nil {
+		return ""
+	}
+	return runtime.DescribeYieldPause(d.yieldMonitor.Snapshot())
+}
+
+// YieldSnapshot reports the yield monitor's state (TB-83); the zero value
+// when the daemon has none.
+func (d *Daemon) YieldSnapshot() runtime.YieldSnapshot {
+	if d.yieldMonitor == nil {
+		return runtime.YieldSnapshot{}
+	}
+	return d.yieldMonitor.Snapshot()
+}
+
+// ThermalCapability reports where this machine's CPU temperature comes from
+// (TB-77): as the thermal monitor detected when it started, or detected now
+// if the monitors have not started yet.
+func (d *Daemon) ThermalCapability() runtime.ThermalCapability {
+	if d.thermalMonitor != nil {
+		if cap := d.thermalMonitor.Capability(); cap.CPUSource != "" {
+			return cap
+		}
+	}
+	return runtime.ThermalCapabilityReader()
 }
 
 // scheduleClosed reports whether the scheduler currently forbids running —

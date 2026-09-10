@@ -87,6 +87,10 @@ type StatusResponse struct {
 	ActiveTasks      []ActiveTaskInfo `json:"active_tasks"`
 	QueuedTasks      []QueuedTaskInfo `json:"queued_tasks"`
 	PausedReason     *string          `json:"paused_reason"`
+	// PausedDetail is one sentence behind PausedReason when the reason has
+	// one — for "busy", the share of the CPU other programs are using and
+	// the two thresholds (TB-83). Absent otherwise.
+	PausedDetail string `json:"paused_detail,omitempty"`
 	// ClientVersion is this volunteer build's version string (what
 	// `lettuce-volunteer --version` prints), so a client can compare it with
 	// each head's head_version on GET /api/v1/heads.
@@ -159,6 +163,10 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused
 		case "scheduled":
 			status = "suspended_scheduled"
 			r := "Outside scheduled computing hours"
+			return status, &r
+		case "busy":
+			status = "suspended_busy"
+			r := "Other programs are using the CPU"
 			return status, &r
 		case "user":
 			status = "suspended_user"
@@ -277,6 +285,7 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 	if pauseReason != "" {
 		pausedReasonPtr = &pauseReason
 	}
+	pausedDetail := b.daemon.PauseDetail()
 
 	var queuedTasks []QueuedTaskInfo
 	for _, qt := range b.daemon.GetQueuedTasks() {
@@ -298,6 +307,7 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 		ConnectedServers: connectedServers,
 		ActiveTasks:      activeTasks,
 		QueuedTasks:      queuedTasks,
+		PausedDetail:     pausedDetail,
 		PausedReason:     pausedReasonPtr,
 		FailingLeafs:     b.failingLeafs(),
 		ClientVersion:    b.daemon.ClientVersion(),
@@ -889,6 +899,7 @@ type ConfigResponse struct {
 	Scheduling     config.Scheduling         `json:"scheduling"`
 	Leafs          config.LeafFilter         `json:"leafs"`
 	Thermal        config.ThermalConfig      `json:"thermal"`
+	Yield          config.YieldConfig        `json:"yield"`
 	Notifications  config.NotificationConfig `json:"notifications"`
 	Servers        []config.ServerConfig     `json:"servers"`
 	LogLevel       string                    `json:"log_level"`
@@ -915,6 +926,7 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 		Scheduling:      cfg.Scheduling,
 		Leafs:           cfg.Leafs,
 		Thermal:         cfg.Thermal,
+		Yield:           cfg.Yield,
 		Notifications:   cfg.Notifications,
 		Servers:         cfg.Servers,
 		LogLevel:        cfg.LogLevel,
@@ -962,6 +974,11 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigRespon
 	if v, ok := partial["thermal"]; ok {
 		if th, ok := v.(map[string]any); ok {
 			applyThermal(&newCfg.Thermal, th)
+		}
+	}
+	if v, ok := partial["yield"]; ok {
+		if y, ok := v.(map[string]any); ok {
+			applyYield(&newCfg.Yield, y)
 		}
 	}
 	if v, ok := partial["notifications"]; ok {
@@ -1160,6 +1177,21 @@ type MachineCapabilities struct {
 	GPUVRAMPct             int      `json:"gpu_vram_pct"`
 	GPUVendors             []string `json:"gpu_vendors"`
 	GPUComputeCapabilities []string `json:"gpu_compute_capabilities"`
+	// Where the thermal monitor's CPU temperature comes from (TB-77):
+	// CPUTempSource is "sysfs", "osx-cpu-temp" or "none"; CPUTempReadable
+	// false means the CPU thresholds have no effect on this machine, and
+	// CPUTempDetail says why in a sentence. CPUTempRemedy is what the
+	// volunteer can do about it, or "" when nothing.
+	CPUTempSource   string `json:"cpu_temp_source"`
+	CPUTempReadable bool   `json:"cpu_temp_readable"`
+	CPUTempDetail   string `json:"cpu_temp_detail"`
+	CPUTempRemedy   string `json:"cpu_temp_remedy,omitempty"`
+	// Whether the yield monitor can measure other programs' CPU use here
+	// (TB-83). Reported as true while the monitor is off (nothing has tried);
+	// false only once sampling has actually failed, with YieldUnavailable
+	// saying why.
+	YieldMeasurable  bool   `json:"yield_measurable"`
+	YieldUnavailable string `json:"yield_unavailable,omitempty"`
 }
 
 // MachineRuntimes returns the runtime kinds this daemon has registered and can
@@ -1174,6 +1206,8 @@ func (b *DaemonBridge) MachineRuntimes() []string {
 func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 	rl := b.daemon.GetConfig().ResourceLimits
 	vramMB, cardVRAMMB, vramPct, vendors, computeCaps := b.daemon.GPUBudget()
+	thermal := b.daemon.ThermalCapability()
+	yield := b.daemon.YieldSnapshot()
 	return MachineCapabilities{
 		Runtimes:            b.MachineRuntimes(),
 		HasGPU:              b.daemon.HasGPU(),
@@ -1192,6 +1226,12 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 		GPUVRAMPct:             vramPct,
 		GPUVendors:             vendors,
 		GPUComputeCapabilities: computeCaps,
+		CPUTempSource:          thermal.CPUSource,
+		CPUTempReadable:        thermal.CPUReadable,
+		CPUTempDetail:          thermal.Detail,
+		CPUTempRemedy:          thermal.Remedy,
+		YieldMeasurable:        !yield.Enabled || yield.Measurable,
+		YieldUnavailable:       yield.Unavailable,
 	}
 }
 
@@ -1758,6 +1798,26 @@ func applyThermal(t *config.ThermalConfig, m map[string]any) {
 	}
 	if v, ok := m["poll_interval_seconds"]; ok {
 		t.PollIntervalSeconds = toInt(v)
+	}
+}
+
+func applyYield(y *config.YieldConfig, m map[string]any) {
+	if v, ok := m["enabled"]; ok {
+		if b, ok := v.(bool); ok {
+			y.Enabled = b
+		}
+	}
+	if v, ok := m["cpu_pause_pct"]; ok {
+		y.CPUPausePct = toInt(v)
+	}
+	if v, ok := m["cpu_resume_pct"]; ok {
+		y.CPUResumePct = toInt(v)
+	}
+	if v, ok := m["window_seconds"]; ok {
+		y.WindowSeconds = toInt(v)
+	}
+	if v, ok := m["poll_interval_seconds"]; ok {
+		y.PollIntervalSeconds = toInt(v)
 	}
 }
 

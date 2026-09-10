@@ -28,10 +28,11 @@ export type DaemonState = "active" | "paused" | "stopped";
 
 /**
  * Why the daemon is paused: "user" (pause button or CLI), "thermal" (CPU or
- * GPU over the configured temperature), "scheduled" (outside the configured
- * computing hours).
+ * GPU over the configured temperature), "busy" (other programs are using
+ * more of the CPU than the yield setting allows), "scheduled" (outside the
+ * configured computing hours).
  */
-export type PausedReason = "user" | "thermal" | "scheduled";
+export type PausedReason = "user" | "thermal" | "busy" | "scheduled";
 
 /**
  * "suspended" (without a suffix) is a task frozen while the daemon is paused
@@ -42,6 +43,7 @@ export type TaskStatus =
   | "suspended"
   | "suspended_user"
   | "suspended_thermal"
+  | "suspended_busy"
   | "suspended_scheduled";
 
 export type RuntimeType = "native" | "container" | "wasm";
@@ -99,6 +101,12 @@ export interface StatusResponse {
   active_tasks: ActiveTaskInfo[];
   queued_tasks: QueuedTaskInfo[];
   paused_reason: PausedReason | null;
+  /**
+   * One sentence behind `paused_reason` when it has one: for "busy", the
+   * share of the CPU other programs are using and the two thresholds.
+   * Absent on older daemons and for reasons that need none.
+   */
+  paused_detail?: string;
   /** Newest failure first. Empty when nothing has failed. */
   failing_leafs: FailingLeaf[];
   /** Version of the running daemon (being added by the CLI; absent on older builds). */
@@ -242,6 +250,21 @@ export interface ThermalConfig {
   max_throttle_minutes: number;
 }
 
+/**
+ * Yielding to other programs: pause ALL work while programs other than
+ * Lettuce use more than `cpu_pause_pct` of the CPU (averaged over
+ * `window_seconds`), resume once they use less than `cpu_resume_pct`.
+ * Percentages are of all cores; Lettuce's own tasks never count. Off by
+ * default.
+ */
+export interface YieldConfig {
+  enabled: boolean;
+  cpu_pause_pct: number;
+  cpu_resume_pct: number;
+  window_seconds: number;
+  poll_interval_seconds: number;
+}
+
 export interface NotificationConfig {
   credit_milestones: boolean;
   credit_milestone_threshold: number;
@@ -289,6 +312,8 @@ export interface ConfigResponse {
   scheduling: Scheduling;
   leafs: LeafFilter;
   thermal: ThermalConfig;
+  /** Absent from a daemon older than the yield setting. */
+  yield?: YieldConfig;
   notifications: NotificationConfig;
   servers: ServerConfig[];
   log_level: string;
@@ -317,6 +342,7 @@ export interface ConfigUpdate {
   resource_limits?: Partial<ResourceLimits>;
   scheduling?: Partial<Scheduling>;
   thermal?: Partial<ThermalConfig>;
+  yield?: Partial<YieldConfig>;
   notifications?: Partial<NotificationConfig>;
   leafs?: Partial<LeafFilter>;
   log_level?: string;
@@ -468,6 +494,24 @@ export interface MachineCapabilities {
   /** Uppercase, e.g. "NVIDIA". */
   gpu_vendors: string[];
   gpu_compute_capabilities: string[];
+  /**
+   * Where the thermal CPU thresholds get their reading: "sysfs" (Linux),
+   * "osx-cpu-temp" (a macOS helper tool) or "none". When
+   * `cpu_temp_readable` is false the CPU thresholds have no effect on this
+   * machine — `cpu_temp_detail` says why and `cpu_temp_remedy` what the
+   * volunteer can do, if anything (TB-77).
+   */
+  cpu_temp_source: string;
+  cpu_temp_readable: boolean;
+  cpu_temp_detail: string;
+  cpu_temp_remedy: string;
+  /**
+   * Whether the yield setting can measure other programs' CPU use here.
+   * True while the setting is off (nothing has tried); false only once
+   * sampling has failed, with `yield_unavailable` saying why.
+   */
+  yield_measurable: boolean;
+  yield_unavailable: string;
 }
 
 export interface HeadsResponse {
@@ -997,6 +1041,14 @@ type RawMachineCapabilities = Omit<
   // Absent from a daemon older than TB-75: likewise for the VM's CPUs.
   container_vm_cpus?: number | null;
   cpu_limited_by_vm?: boolean | null;
+  // Absent from a daemon older than TB-77 / TB-83: assume the thresholds
+  // work and the load can be measured, as before.
+  cpu_temp_source?: string | null;
+  cpu_temp_readable?: boolean | null;
+  cpu_temp_detail?: string | null;
+  cpu_temp_remedy?: string | null;
+  yield_measurable?: boolean | null;
+  yield_unavailable?: string | null;
 };
 
 interface RawHeadsResponse {
@@ -1026,6 +1078,12 @@ function normaliseMachine(
     max_cpu_cores: m.max_cpu_cores ?? 0,
     container_vm_cpus: m.container_vm_cpus ?? 0,
     cpu_limited_by_vm: m.cpu_limited_by_vm ?? false,
+    cpu_temp_source: m.cpu_temp_source ?? "",
+    cpu_temp_readable: m.cpu_temp_readable ?? true,
+    cpu_temp_detail: m.cpu_temp_detail ?? "",
+    cpu_temp_remedy: m.cpu_temp_remedy ?? "",
+    yield_measurable: m.yield_measurable ?? true,
+    yield_unavailable: m.yield_unavailable ?? "",
     max_gpu_vram_mb: m.max_gpu_vram_mb ?? 0,
     gpu_card_vram_mb: m.gpu_card_vram_mb ?? 0,
     gpu_vram_pct: m.gpu_vram_pct ?? 0,

@@ -32,12 +32,14 @@ fn load_tray_icon(state: &TrayState) -> Image<'static> {
 }
 
 /// Human wording for the daemon's `paused_reason`. "scheduled" means outside
-/// the configured computing hours; other reasons are shown as sent so an
-/// unfamiliar value is still visible.
+/// the configured computing hours; "busy" means other programs are using
+/// more of the CPU than the yield setting allows (TB-83); other reasons are
+/// shown as sent so an unfamiliar value is still visible.
 fn paused_text(reason: Option<&str>) -> String {
     match reason {
         None | Some("") => "Paused".into(),
         Some("scheduled") => "Paused — outside your schedule".into(),
+        Some("busy") => "Paused — your computer is busy".into(),
         Some(other) => format!("Paused — {other}"),
     }
 }
@@ -312,6 +314,10 @@ mod tests {
             "Paused — outside your schedule"
         );
         assert_eq!(status_text(&status("paused", Some("thermal"))), "Paused — thermal");
+        assert_eq!(
+            status_text(&status("paused", Some("busy"))),
+            "Paused — your computer is busy"
+        );
         assert_eq!(status_text(&status("paused", None)), "Paused");
         assert_eq!(status_text(&status("paused", Some(""))), "Paused");
     }
@@ -339,6 +345,10 @@ mod tests {
         assert_eq!(
             pause_menu(&status("paused", Some("thermal"))),
             ("Paused — thermal".to_string(), false)
+        );
+        assert_eq!(
+            pause_menu(&status("paused", Some("busy"))),
+            ("Paused — your computer is busy".to_string(), false)
         );
         assert_eq!(pause_menu(&status("paused", None)), ("Paused".to_string(), false));
         assert_eq!(pause_menu(&status("active", None)), ("Pause".to_string(), true));

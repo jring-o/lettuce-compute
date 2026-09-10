@@ -64,6 +64,10 @@ type Config struct {
 
 	Thermal ThermalConfig `yaml:"thermal"`
 
+	// Yield pauses work while OTHER programs need the CPU (TB-83). Off by
+	// default: nothing changes for a volunteer who has not turned it on.
+	Yield YieldConfig `yaml:"yield"`
+
 	Notifications NotificationConfig `yaml:"notifications"`
 
 	Servers []ServerConfig `yaml:"servers,omitempty"`
@@ -121,6 +125,27 @@ type ThermalConfig struct {
 	// a negative value waits indefinitely, which is the pre-TB-17 behavior and is
 	// a livelock whenever the heat is not this client's to clear.
 	MaxThrottleMinutes int `yaml:"max_throttle_minutes" json:"max_throttle_minutes"` // default 30
+}
+
+// YieldConfig controls yielding to the rest of the machine: pausing all work
+// while programs OTHER than Lettuce are using more than a share of the CPU,
+// and resuming once they are using less (TB-83). The share is measured as the
+// whole machine's CPU use minus Lettuce's own — the daemon, every native task
+// tree and every running container — averaged over WindowSeconds, so a brief
+// spike neither pauses nor resumes anything. Percentages are of ALL cores:
+// on an 8-core machine, one fully busy core is 12.5 %.
+type YieldConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"` // default false
+	// CPUPausePct: pause when other programs' CPU use, averaged over the
+	// window, reaches this percentage of the machine.
+	CPUPausePct int `yaml:"cpu_pause_pct" json:"cpu_pause_pct"` // default 25
+	// CPUResumePct: resume once the same average falls to this (must be
+	// below CPUPausePct — the gap is hysteresis so work does not flap).
+	CPUResumePct int `yaml:"cpu_resume_pct" json:"cpu_resume_pct"` // default 15
+	// WindowSeconds is the moving-average window both thresholds are judged
+	// on; PollIntervalSeconds is how often the load is sampled within it.
+	WindowSeconds       int `yaml:"window_seconds" json:"window_seconds"`               // default 30
+	PollIntervalSeconds int `yaml:"poll_interval_seconds" json:"poll_interval_seconds"` // default 5
 }
 
 // NotificationConfig controls notification preferences.
@@ -391,6 +416,13 @@ func Defaults() *Config {
 			GPUResumeThresholdC: 70,
 			PollIntervalSeconds: 10,
 			MaxThrottleMinutes:  30,
+		},
+		Yield: YieldConfig{
+			Enabled:             false,
+			CPUPausePct:         25,
+			CPUResumePct:        15,
+			WindowSeconds:       30,
+			PollIntervalSeconds: 5,
 		},
 		MaxConcurrentTasks: 1,
 		WorkBufferHours:    2.0,
@@ -848,6 +880,7 @@ func (c *Config) marshalCommented() ([]byte, error) {
 		applyKeyComments(root, topLevelConfigComments)
 		applyKeyComments(childMappingNode(root, "resource_limits"), resourceLimitsComments)
 		applyKeyComments(childMappingNode(root, "thermal"), thermalComments)
+		applyKeyComments(childMappingNode(root, "yield"), yieldComments)
 		applyKeyComments(childMappingNode(root, "scheduling"), schedulingComments)
 	}
 	return yaml.Marshal(&doc)
@@ -891,6 +924,7 @@ var topLevelConfigComments = map[string]string{
 	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
 	"scheduling":           "When the volunteer runs.",
 	"thermal":              "Hardware overheating protection. Temperatures in degrees C, NOT workload limits: ALL work freezes above the pause threshold and resumes below the resume threshold.",
+	"yield":                "Yield to other programs. When enabled, ALL work pauses while programs other than Lettuce use more than cpu_pause_pct of the CPU (averaged over window_seconds) and resumes once they use less than cpu_resume_pct. Lettuce's own tasks never count.",
 }
 
 var resourceLimitsComments = map[string]string{
@@ -910,6 +944,14 @@ var thermalComments = map[string]string{
 	"gpu_pause_threshold":   "degrees C - freeze ALL work when the GPU reaches this.",
 	"gpu_resume_threshold":  "degrees C - resume once the GPU cools below this (must be < gpu_pause_threshold).",
 	"poll_interval_seconds": "How often temperatures are sampled, in seconds.",
+}
+
+var yieldComments = map[string]string{
+	"enabled":               "Master switch. Off by default: Lettuce does not watch other programs' CPU use until you turn this on.",
+	"cpu_pause_pct":         "percent of ALL cores - pause when other programs' CPU use, averaged over the window, reaches this.",
+	"cpu_resume_pct":        "percent of ALL cores - resume once it falls to this (must be < cpu_pause_pct).",
+	"window_seconds":        "Seconds the average is taken over. A short spike within the window neither pauses nor resumes work.",
+	"poll_interval_seconds": "How often the load is sampled within the window, in seconds.",
 }
 
 var schedulingComments = map[string]string{
@@ -1026,6 +1068,31 @@ func (c *Config) Validate() error {
 		}
 		if c.Thermal.PollIntervalSeconds < 1 || c.Thermal.PollIntervalSeconds > 300 {
 			return fmt.Errorf("thermal.poll_interval_seconds must be 1-300, got %d", c.Thermal.PollIntervalSeconds)
+		}
+	}
+
+	// Yield config validation (TB-83). Only checked when enabled, as thermal
+	// is, so a config that never turned it on cannot be refused by it.
+	if c.Yield.Enabled {
+		if c.Yield.CPUPausePct < 1 || c.Yield.CPUPausePct > 100 {
+			return fmt.Errorf("yield.cpu_pause_pct must be 1-100, got %d", c.Yield.CPUPausePct)
+		}
+		if c.Yield.CPUResumePct < 0 || c.Yield.CPUResumePct > 99 {
+			return fmt.Errorf("yield.cpu_resume_pct must be 0-99, got %d", c.Yield.CPUResumePct)
+		}
+		if c.Yield.CPUPausePct <= c.Yield.CPUResumePct {
+			return fmt.Errorf("yield.cpu_pause_pct (%d) must be > cpu_resume_pct (%d)",
+				c.Yield.CPUPausePct, c.Yield.CPUResumePct)
+		}
+		if c.Yield.WindowSeconds < 5 || c.Yield.WindowSeconds > 600 {
+			return fmt.Errorf("yield.window_seconds must be 5-600, got %d", c.Yield.WindowSeconds)
+		}
+		if c.Yield.PollIntervalSeconds < 1 || c.Yield.PollIntervalSeconds > 60 {
+			return fmt.Errorf("yield.poll_interval_seconds must be 1-60, got %d", c.Yield.PollIntervalSeconds)
+		}
+		if c.Yield.PollIntervalSeconds > c.Yield.WindowSeconds {
+			return fmt.Errorf("yield.poll_interval_seconds (%d) must not exceed window_seconds (%d)",
+				c.Yield.PollIntervalSeconds, c.Yield.WindowSeconds)
 		}
 	}
 
@@ -1199,6 +1266,36 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
 		c.Thermal.MaxThrottleMinutes = v
+	case "yield.enabled":
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid boolean for %s: %w", dotPath, err)
+		}
+		c.Yield.Enabled = v
+	case "yield.cpu_pause_pct":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Yield.CPUPausePct = v
+	case "yield.cpu_resume_pct":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Yield.CPUResumePct = v
+	case "yield.window_seconds":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Yield.WindowSeconds = v
+	case "yield.poll_interval_seconds":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.Yield.PollIntervalSeconds = v
 	default:
 		return fmt.Errorf("unknown config path: %s", dotPath)
 	}
@@ -1270,6 +1367,16 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return strconv.Itoa(c.Thermal.PollIntervalSeconds), nil
 	case "thermal.max_throttle_minutes":
 		return strconv.Itoa(c.Thermal.MaxThrottleMinutes), nil
+	case "yield.enabled":
+		return strconv.FormatBool(c.Yield.Enabled), nil
+	case "yield.cpu_pause_pct":
+		return strconv.Itoa(c.Yield.CPUPausePct), nil
+	case "yield.cpu_resume_pct":
+		return strconv.Itoa(c.Yield.CPUResumePct), nil
+	case "yield.window_seconds":
+		return strconv.Itoa(c.Yield.WindowSeconds), nil
+	case "yield.poll_interval_seconds":
+		return strconv.Itoa(c.Yield.PollIntervalSeconds), nil
 	default:
 		return "", fmt.Errorf("unknown config path: %s", dotPath)
 	}
