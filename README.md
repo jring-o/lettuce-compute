@@ -130,8 +130,10 @@ concurrent tasks. Each limit is a budget for the whole machine: the CPU cores yo
 equally by every task that is running (a task alone gets them all; two tasks get half each, adjusted
 as tasks start and finish), and each task is told its share so it can size its worker pool. The
 client reserves exactly what it will enforce, using cgroups where available, container limits, or
-WASM memory pages. It stops fetching before your disk runs low, and pauses everything if your CPU
-gets too hot.
+WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU gets
+too hot (where the machine lets a program read its CPU temperature: Linux, or a Mac with the
+`osx-cpu-temp` helper — the client tells you when it cannot), and, if you turn the setting on,
+pauses everything while other programs need the CPU.
 
 ### Commands
 

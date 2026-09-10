@@ -113,6 +113,12 @@ type DockerClient interface {
 	// 0/0 removes the cap. Used to give a container its new share of the CPU
 	// budget when another task starts or finishes (TB-75).
 	ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error
+	// ContainerCPUNanos is the CPU time a container has used so far, in
+	// nanoseconds, from one stats sample. Read every few seconds while the
+	// yield monitor runs, so Lettuce's own containers are never mistaken for
+	// other programs' load (TB-83). On macOS and Windows this is time on the
+	// engine VM's CPUs, which the caller converts against the host's.
+	ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error)
 	Close() error
 }
 
@@ -633,6 +639,26 @@ func (d *dockerClientWrapper) ContainerPause(ctx context.Context, containerID st
 
 func (d *dockerClientWrapper) ContainerUnpause(ctx context.Context, containerID string) error {
 	return d.cli.ContainerUnpause(ctx, containerID)
+}
+
+// IsContainerNotFound reports whether err is the engine saying the container
+// no longer exists — a task that finished and was removed between one look
+// and the next, not a failure.
+func IsContainerNotFound(err error) bool {
+	return err != nil && client.IsErrNotFound(err)
+}
+
+func (d *dockerClientWrapper) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
+	resp, err := d.cli.ContainerStatsOneShot(ctx, containerID)
+	if err != nil {
+		return 0, fmt.Errorf("container stats: %w", err)
+	}
+	defer resp.Body.Close()
+	var stats container.StatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return 0, fmt.Errorf("decode container stats: %w", err)
+	}
+	return stats.CPUStats.CPUUsage.TotalUsage, nil
 }
 
 func (d *dockerClientWrapper) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {

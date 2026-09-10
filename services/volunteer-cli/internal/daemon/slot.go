@@ -723,6 +723,27 @@ func (sm *SlotManager) ApplyCPUShare(shareCores float64) {
 	}
 }
 
+// OwnProcesses lists the containers of the active container tasks, with the
+// engine client that can read their stats, and counts the active native
+// tasks — what the yield monitor subtracts from the machine's load as
+// Lettuce's own (TB-83). WASM tasks run inside the daemon process and need
+// no entry.
+func (sm *SlotManager) OwnProcesses() (containers []OwnContainer, nativeTasks int) {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.processHandle != nil {
+			switch h := slot.processHandle.(type) {
+			case *containerProcessHandle:
+				containers = append(containers, OwnContainer{Client: h.client, ContainerID: h.containerID})
+			case *nativeProcessHandle:
+				nativeTasks++
+			}
+		}
+		slot.mu.Unlock()
+	}
+	return containers, nativeTasks
+}
+
 // ActiveGPUCount returns the number of active slots running GPU work units.
 // Used by admission to keep at most one GPU work unit per physical GPU so
 // concurrent units never oversubscribe VRAM.

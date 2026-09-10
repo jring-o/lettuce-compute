@@ -84,6 +84,13 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
       poll_interval_seconds: 10,
       max_throttle_minutes: 30,
     },
+    yield: {
+      enabled: false,
+      cpu_pause_pct: 25,
+      cpu_resume_pct: 15,
+      window_seconds: 30,
+      poll_interval_seconds: 5,
+    },
     notifications: {
       credit_milestones: true,
       credit_milestone_threshold: 100,
@@ -359,6 +366,127 @@ describe("SettingsPage", () => {
     expect(updateConfig).toHaveBeenCalledWith({
       thermal: expect.objectContaining({ max_throttle_minutes: 45, cpu_pause_threshold: 85 }),
     });
+  });
+
+  it("says when the CPU temperature cannot be read and disables the CPU thresholds (TB-77)", async () => {
+    const user = userEvent.setup();
+    mockHeads({
+      heads: [],
+      machine: {
+        ...noGpuMachine,
+        cpu_temp_source: "none",
+        cpu_temp_readable: false,
+        cpu_temp_detail: "osx-cpu-temp is not installed",
+        cpu_temp_remedy: "install it with `brew install osx-cpu-temp` and restart Lettuce",
+      },
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+
+    const caption = await screen.findByTestId("thermal-cpu-unreadable");
+    expect(caption).toHaveTextContent(/CPU temperature cannot be read/);
+    expect(caption).toHaveTextContent(/osx-cpu-temp is not installed/);
+    expect(caption).toHaveTextContent(/have no effect here/);
+    expect(caption).toHaveTextContent(/brew install osx-cpu-temp/);
+    expect(screen.getByLabelText("CPU pause above")).toBeDisabled();
+    expect(screen.getByLabelText("CPU resume below")).toBeDisabled();
+    // GPU thresholds are unaffected.
+    expect(screen.getByLabelText("GPU pause above")).not.toBeDisabled();
+  });
+
+  it("shows no thermal caption for a daemon that does not report the CPU source", async () => {
+    const user = userEvent.setup();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+    expect(screen.queryByTestId("thermal-cpu-unreadable")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("CPU pause above")).not.toBeDisabled();
+  });
+
+  it("renders the yield section and writes the yield block (TB-83)", async () => {
+    const user = userEvent.setup();
+    const updateConfig = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("When other programs need the CPU"));
+
+    expect(screen.getByText("Pause when your computer is busy")).toBeInTheDocument();
+    expect(screen.getByLabelText("Pause above")).toHaveValue(25);
+    expect(screen.getByLabelText("Resume below")).toHaveValue(15);
+    expect(screen.getByLabelText("Averaged over")).toHaveValue(30);
+    // Off by default: the thresholds are disabled until the toggle is on.
+    expect(screen.getByLabelText("Pause above")).toBeDisabled();
+
+    await user.click(screen.getByRole("switch", { name: "Pause when your computer is busy" }));
+    expect(updateConfig).toHaveBeenCalledWith({
+      yield: expect.objectContaining({ enabled: true, cpu_pause_pct: 25, cpu_resume_pct: 15 }),
+    });
+  });
+
+  it("writes a threshold for the yield block of a daemon that sent none", async () => {
+    const user = userEvent.setup();
+    const updateConfig = vi.fn();
+    const config = makeConfig({ yield: { enabled: true, cpu_pause_pct: 40, cpu_resume_pct: 20, window_seconds: 30, poll_interval_seconds: 5 } });
+    mockUseConfig.mockReturnValue({
+      config,
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("When other programs need the CPU"));
+    const field = screen.getByLabelText("Resume below");
+    await user.clear(field);
+    await user.type(field, "10");
+    expect(updateConfig).not.toHaveBeenCalled();
+    await user.tab();
+    expect(updateConfig).toHaveBeenCalledWith({
+      yield: expect.objectContaining({ enabled: true, cpu_pause_pct: 40, cpu_resume_pct: 10 }),
+    });
+  });
+
+  it("greys the yield section when the load cannot be measured here", async () => {
+    const user = userEvent.setup();
+    mockHeads({
+      heads: [],
+      machine: { ...noGpuMachine, yield_measurable: false, yield_unavailable: "no counters" },
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("When other programs need the CPU"));
+    const caption = await screen.findByTestId("yield-unmeasurable");
+    expect(caption).toHaveTextContent(/cannot measure other programs' CPU use/);
+    expect(caption).toHaveTextContent(/no counters/);
+    // The thresholds are greyed; the switch stays live so a volunteer who
+    // turned the setting on can still turn it off here.
+    expect(screen.getByLabelText("Pause above")).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "Pause when your computer is busy" })).not.toBeDisabled();
   });
 
   it("toggles thermal monitoring", async () => {

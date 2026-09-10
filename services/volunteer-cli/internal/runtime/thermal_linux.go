@@ -213,3 +213,34 @@ func readCPUTemperature() int {
 	}
 	return maxTemp
 }
+
+// detectThermalCapability reports which CPU sensors this machine exposes, or
+// that it exposes none we can identify (TB-77) — the case on a container, a VM
+// without a passthrough sensor, or a machine whose CPU temperature driver is
+// not loaded.
+func detectThermalCapability() ThermalCapability {
+	var zones, kinds []string
+	seenKind := make(map[string]bool)
+	for _, s := range readSensors() {
+		if s.Class != SensorCPU {
+			continue
+		}
+		zones = append(zones, s.Zone)
+		if !seenKind[s.Kind] {
+			seenKind[s.Kind] = true
+			kinds = append(kinds, s.Kind)
+		}
+	}
+	if len(zones) == 0 {
+		return ThermalCapability{
+			CPUSource: "none",
+			Detail:    "no CPU temperature sensor found under /sys/class/thermal or /sys/class/hwmon (looked for " + strings.Join(cpuZoneTypes, ", ") + ")",
+			Remedy:    "load your CPU's temperature driver (coretemp for Intel, k10temp for AMD) so the kernel exposes the sensor, then restart Lettuce",
+		}
+	}
+	return ThermalCapability{
+		CPUSource:   "sysfs",
+		CPUReadable: true,
+		Detail:      "reading " + strings.Join(zones, ", ") + " (" + strings.Join(kinds, ", ") + ")",
+	}
+}

@@ -39,6 +39,7 @@ type MockDockerClient struct {
 	ContainerPauseFn       func(ctx context.Context, containerID string) error
 	ContainerUnpauseFn     func(ctx context.Context, containerID string) error
 	ContainerUpdateCPUFn   func(ctx context.Context, containerID string, quota, period int64) error
+	ContainerCPUNanosFn    func(ctx context.Context, containerID string) (uint64, error)
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
@@ -50,6 +51,13 @@ type MockDockerClient struct {
 type CPUUpdateCall struct {
 	ContainerID   string
 	Quota, Period int64
+}
+
+func (m *MockDockerClient) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
+	if m.ContainerCPUNanosFn != nil {
+		return m.ContainerCPUNanosFn(ctx, containerID)
+	}
+	return 0, nil
 }
 
 func (m *MockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {

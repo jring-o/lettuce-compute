@@ -583,6 +583,22 @@ thermal:
   max_throttle_minutes: 30     # resume and re-check after this long frozen (negative = wait indefinitely)
 ```
 
+> **Which machines can read the CPU temperature.** Linux exposes it through the
+> kernel (`/sys/class/thermal`, `hwmon`) and the CPU thresholds work as described.
+> **macOS gives programs no CPU temperature without a helper:** install
+> [`osx-cpu-temp`](https://github.com/lavoiesl/osx-cpu-temp) with `brew install
+> osx-cpu-temp` (Intel Macs; Apple silicon Macs report nothing through it) and
+> restart Lettuce — the client looks on `PATH` and in the Homebrew prefixes, so a
+> Dock-launched app finds it too. **Windows only lets administrators read it**, and
+> asking can raise a permissions prompt, so the client does not try. Where the CPU
+> temperature cannot be read the CPU thresholds have **no effect**: the client says
+> so at start (`thermal protection cannot read this machine's CPU temperature` in
+> the log, a notice in the app, a `thermal` row in `lettuce-volunteer doctor`, and a
+> caption in the app's Thermal settings), the GPU thresholds still apply where
+> `nvidia-smi`/`rocm-smi` reports a temperature, and the hardware's own thermal
+> protection is unaffected. If you want the machine to back off under load rather
+> than heat, use *yield to other programs* below.
+
 > **Which sensors these apply to.** The CPU thresholds are compared against CPU
 > sensors only, and the GPU thresholds against GPU sensors only. Machines expose
 > plenty of other temperatures — the SSD, the WiFi chip, the chipset — and those
@@ -619,6 +635,57 @@ thermal:
 > run a longer CPU-heavy leaf, and **restart the daemon** (config is read at
 > startup, not hot-reloaded). Watch the log for `thermal throttle activated` /
 > `thermal throttle released`.
+
+### Yield to other programs — pause when your computer is busy
+
+Lettuce pauses for a schedule, for heat and for you; it can also pause when
+**other programs need the CPU** — the workstation you are typing on, a render, or
+another volunteer client sharing the machine. The setting is **off by default**
+and lives under the `yield:` block of `~/.lettuce/config.yaml` (the app's
+Settings page has it as "When other programs need the CPU"):
+
+```bash
+lettuce-volunteer config set yield.enabled true
+lettuce-volunteer stop && lettuce-volunteer start   # read at startup
+```
+
+```yaml
+yield:
+  enabled: false          # master switch - off by default
+  cpu_pause_pct: 25       # pause when OTHER programs use this much of the CPU
+  cpu_resume_pct: 15      # resume once they use less than this (must be < cpu_pause_pct)
+  window_seconds: 30      # the average both thresholds are judged on
+  poll_interval_seconds: 5
+```
+
+When it is on, the client samples the whole machine's CPU use every few seconds,
+subtracts its own — the daemon, every native task's process tree, every running
+container — and averages what is left over the window. When that "foreign" share
+reaches `cpu_pause_pct`, **all** work freezes exactly as a thermal pause does (the
+running units are suspended in place, fetching stops); when it falls to
+`cpu_resume_pct`, everything resumes. `status` reads `Paused: busy — other programs
+are using 62% of the CPU (pause above 25%, resume below 15%)`, the app's status
+pill and tray say "Paused — your computer is busy", and the log has
+`yield pause: other programs are using the CPU`.
+
+> **Percentages are of all cores.** On an 8-core machine one fully busy core is
+> 12.5%, so the default 25% means "about two cores' worth of other work". Your own
+> Lettuce tasks never count, however many cores they use.
+
+> **Low-priority programs count.** A niced or "below normal" background job that
+> is using the CPU is still using the CPU; the client does not ignore it.
+
+> **A container engine on macOS or Windows runs inside a virtual machine.** The
+> VM shows up on the host as one process. Your own containers' CPU is measured
+> inside it and subtracted; the VM's own overhead is not, so it counts as "other
+> programs" — usually a few percent.
+
+> **If the client cannot measure the load it will not pause.** Lettuce's own share
+> must be known before the rest can be blamed on other programs; if a container's
+> statistics cannot be read, or a native task cannot be attributed, the client logs
+> `yield monitor cannot measure other programs' CPU use` once, raises a notice, and
+> pauses nothing until it can. `lettuce-volunteer doctor` has a `yield` row saying
+> whether the setting is on and whether the load can be measured here.
 
 ### Scheduling — run only at certain times
 

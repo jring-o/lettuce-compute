@@ -30,6 +30,7 @@ type statusAPIResponse struct {
 	ActiveTasks   []statusActiveTask  `json:"active_tasks"`
 	QueuedTasks   []statusQueuedTask  `json:"queued_tasks"`
 	PausedReason  *string             `json:"paused_reason"`
+	PausedDetail  string              `json:"paused_detail,omitempty"`
 	FailingLeafs  []statusFailingLeaf `json:"failing_leafs"`
 }
 
@@ -167,7 +168,11 @@ func printActiveTasks(dataDir string) {
 	}
 
 	if sr.PausedReason != nil && *sr.PausedReason != "" {
-		fmt.Printf("Paused: %s\n", *sr.PausedReason)
+		if sr.PausedDetail != "" {
+			fmt.Printf("Paused: %s — %s\n", *sr.PausedReason, sr.PausedDetail)
+		} else {
+			fmt.Printf("Paused: %s\n", *sr.PausedReason)
+		}
 	}
 
 	if len(sr.ActiveTasks) == 0 {

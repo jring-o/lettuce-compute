@@ -35,10 +35,20 @@ import {
   getSystemCpuCount,
   type ScheduleRange,
   type ThermalConfig,
+  type YieldConfig,
   type ManagementClient,
 } from "@/api/client";
 
 // Collapsible section
+/** The daemon's defaults for the yield block, for a daemon that predates it. */
+const YIELD_DEFAULTS: YieldConfig = {
+  enabled: false,
+  cpu_pause_pct: 25,
+  cpu_resume_pct: 15,
+  window_seconds: 30,
+  poll_interval_seconds: 5,
+};
+
 function Section({
   title,
   defaultOpen = true,
@@ -406,6 +416,14 @@ export function SettingsPage() {
     [config, updateConfig]
   );
 
+  const updateYield = useCallback(
+    (patch: Partial<YieldConfig>) => {
+      if (!config) return;
+      updateConfig({ yield: { ...(config.yield ?? YIELD_DEFAULTS), ...patch } });
+    },
+    [config, updateConfig]
+  );
+
   // Apply the theme to the document and remember it for the next launch.
   useEffect(() => {
     storeTheme(theme);
@@ -438,6 +456,13 @@ export function SettingsPage() {
   const gpuCardMb = machine?.gpu_card_vram_mb ?? 0;
   const gpuAllowedMb = Math.round((gpuCardMb * gpuPct) / 100);
   const thermal = config.thermal;
+  // A daemon older than the yield setting sends no block: show the defaults
+  // (off) and write the whole block on the first change.
+  const yieldCfg: YieldConfig = config.yield ?? YIELD_DEFAULTS;
+  // Whether the thermal CPU thresholds can see this machine's CPU at all
+  // (TB-77). An older daemon does not say; assume they can, as before.
+  const cpuTempReadable = machine?.cpu_temp_readable ?? true;
+  const yieldMeasurable = machine?.yield_measurable ?? true;
   const dataDir = hostDataDir ?? config.data_dir;
 
   const handleSignChallenge = async () => {
@@ -673,6 +698,15 @@ export function SettingsPage() {
             onChange={(v) => updateThermal({ enabled: v })}
           />
         </div>
+        {!cpuTempReadable && (
+          <p className="text-xs text-muted-foreground" data-testid="thermal-cpu-unreadable">
+            This machine's CPU temperature cannot be read
+            {machine?.cpu_temp_detail ? ` (${machine.cpu_temp_detail})` : ""}, so the CPU
+            thresholds below have no effect here. GPU thresholds still apply where a GPU tool
+            reports a temperature, and the hardware's own thermal protection is unaffected.
+            {machine?.cpu_temp_remedy ? ` To enable them, ${machine.cpu_temp_remedy}.` : ""}
+          </p>
+        )}
         <div className="space-y-2">
           <NumberField
             label="CPU pause above"
@@ -680,7 +714,7 @@ export function SettingsPage() {
             min={40}
             max={110}
             suffix="°C"
-            disabled={!thermal.enabled}
+            disabled={!thermal.enabled || !cpuTempReadable}
             onCommit={(v) => updateThermal({ cpu_pause_threshold: v })}
           />
           <NumberField
@@ -689,7 +723,7 @@ export function SettingsPage() {
             min={30}
             max={110}
             suffix="°C"
-            disabled={!thermal.enabled}
+            disabled={!thermal.enabled || !cpuTempReadable}
             onCommit={(v) => updateThermal({ cpu_resume_threshold: v })}
           />
           <NumberField
@@ -734,6 +768,66 @@ export function SettingsPage() {
           sensors again — a guard against a sensor that never reports cool. Work is never
           released while the sensor still reads above the resume temperature. 0 uses the
           default (30 minutes); -1 waits as long as it takes.
+        </p>
+      </Section>
+
+      {/* Section 3b: Yield to other programs (TB-83) */}
+      <Section title="When other programs need the CPU" defaultOpen={false}>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">Pause when your computer is busy</p>
+            <p className="text-xs text-muted-foreground">
+              Pause all work while programs other than Lettuce use more than the pause share of
+              the CPU; continue once they use less than the resume share. Lettuce's own tasks
+              never count.
+            </p>
+          </div>
+          <Toggle
+            label="Pause when your computer is busy"
+            checked={yieldCfg.enabled}
+            onChange={(v) => updateYield({ enabled: v })}
+          />
+        </div>
+        {!yieldMeasurable && (
+          <p className="text-xs text-muted-foreground" data-testid="yield-unmeasurable">
+            Lettuce cannot measure other programs' CPU use on this machine
+            {machine?.yield_unavailable ? ` (${machine.yield_unavailable})` : ""}, so this
+            setting has no effect here.
+          </p>
+        )}
+        <div className="space-y-2">
+          <NumberField
+            label="Pause above"
+            value={yieldCfg.cpu_pause_pct}
+            min={1}
+            max={100}
+            suffix="% CPU"
+            disabled={!yieldCfg.enabled || !yieldMeasurable}
+            onCommit={(v) => updateYield({ cpu_pause_pct: v })}
+          />
+          <NumberField
+            label="Resume below"
+            value={yieldCfg.cpu_resume_pct}
+            min={0}
+            max={99}
+            suffix="% CPU"
+            disabled={!yieldCfg.enabled || !yieldMeasurable}
+            onCommit={(v) => updateYield({ cpu_resume_pct: v })}
+          />
+          <NumberField
+            label="Averaged over"
+            value={yieldCfg.window_seconds}
+            min={5}
+            max={600}
+            suffix="s"
+            disabled={!yieldCfg.enabled || !yieldMeasurable}
+            onCommit={(v) => updateYield({ window_seconds: v })}
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Percentages are of all cores: on an 8-core machine, one fully busy core is 12.5%. The
+          share is averaged over the window, so a brief spike neither pauses nor resumes work.
+          The resume share must be below the pause share.
         </p>
       </Section>
 

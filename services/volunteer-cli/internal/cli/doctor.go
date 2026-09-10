@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -154,6 +155,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		caps.maxDiskMB, cfg.ResourceLimits.MaxDiskGB), "")
 	checkCPUBudget(rep, caps)
 	checkCPUEnforcement(rep, caps.maxCPUCores)
+	// The two automatic pauses that protect the machine's owner: whether the
+	// thermal thresholds can see the CPU at all (TB-77), and whether Lettuce
+	// yields to other programs (TB-83).
+	checkThermal(rep, cfg.Thermal, runtime.ThermalCapabilityReader())
+	checkYield(rep, cfg.Yield, probeYieldMeasurable())
 
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
@@ -170,6 +176,57 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(out, "Summary: all checks passed.")
 	}
 	return nil
+}
+
+// checkThermal says what the thermal CPU thresholds are actually reading
+// (TB-77). The monitor treats an unreadable CPU as "never hot", so a machine
+// without a CPU temperature source had "pause above 85 °C" configured, shown
+// in Settings, and doing nothing — a tester watched an Intel MacBook's die at
+// 100 °C under it. Fixable gaps (install the macOS helper, load a Linux
+// driver) are warnings; an unfixable one (Windows) is a line of information.
+func checkThermal(rep *doctorReport, th config.ThermalConfig, cap runtime.ThermalCapability) {
+	if !th.Enabled {
+		rep.add(docInfo, "thermal", "off (thermal.enabled false) — work is never paused for temperature; hardware protection is unaffected", "")
+		return
+	}
+	if cap.CPUReadable {
+		rep.add(docOK, "thermal", fmt.Sprintf("CPU temperature from %s: %s — ALL work pauses at %d°C and resumes below %d°C (GPU: %d/%d°C where a GPU tool reports one)",
+			cap.CPUSource, cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC, th.GPUPauseThresholdC, th.GPUResumeThresholdC), "")
+		return
+	}
+	detail := fmt.Sprintf("on, but this machine's CPU temperature cannot be read: %s. The CPU thresholds (%d/%d°C) have no effect here; GPU thresholds apply only where a GPU tool reports a temperature; the hardware's own thermal protection is unaffected",
+		cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC)
+	if cap.Fixable() {
+		rep.add(docWarn, "thermal", detail, cap.Remedy)
+		return
+	}
+	rep.add(docInfo, "thermal", detail, "")
+}
+
+// probeYieldMeasurable takes one machine CPU sample the way the yield monitor
+// would, to say whether other programs' CPU use can be measured here. The
+// first sample of a counter-based reader only takes a baseline, which is a
+// success; anything else that errors is not.
+func probeYieldMeasurable() error {
+	_, err := runtime.NewMachineCPUSampler().Sample()
+	if err != nil && !errors.Is(err, runtime.ErrNoBaseline) {
+		return err
+	}
+	return nil
+}
+
+// checkYield says whether Lettuce pauses for other programs' CPU use, and
+// whether it can measure that here (TB-83).
+func checkYield(rep *doctorReport, y config.YieldConfig, probeErr error) {
+	if !y.Enabled {
+		rep.add(docInfo, "yield", "off (yield.enabled false) — Lettuce does not pause when other programs need the CPU; `lettuce-volunteer config set yield.enabled true` to pause above 25% foreign CPU use", "")
+		return
+	}
+	if probeErr != nil {
+		rep.add(docWarn, "yield", fmt.Sprintf("on (pause above %d%%, resume below %d%%), but other programs' CPU use cannot be measured on this machine: %v — work will not be paused for other programs", y.CPUPausePct, y.CPUResumePct, probeErr), "")
+		return
+	}
+	rep.add(docOK, "yield", fmt.Sprintf("on — ALL work pauses when other programs use more than %d%% of the CPU (averaged over %d s) and resumes below %d%%; Lettuce's own tasks never count", y.CPUPausePct, y.WindowSeconds, y.CPUResumePct), "")
 }
 
 // checkAccountInfo surfaces the identity and runtime context an operator would

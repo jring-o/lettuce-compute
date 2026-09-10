@@ -12,9 +12,24 @@ import (
 )
 
 const (
-	jobObjectExtendedLimitInformation = 9
-	jobObjectLimitKillOnJobClose      = 0x2000
+	jobObjectBasicAccountingInformation = 1
+	jobObjectExtendedLimitInformation   = 9
+	jobObjectLimitKillOnJobClose        = 0x2000
 )
+
+// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION matches the Windows API struct
+// layout: the CPU time of every process ever in the job, in 100 ns units,
+// terminated processes included.
+type jobObjectBasicAccountingInfo struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
 
 // JOBOBJECT_BASIC_LIMIT_INFORMATION matches the Windows API struct layout.
 type jobObjectBasicLimitInformation struct {
@@ -118,6 +133,23 @@ func (g *jobObjectGroup) Terminate() {
 	} else {
 		g.logger.Info("terminated all processes in job object")
 	}
+}
+
+// CPUSeconds is the Job Object's own accounting: kernel + user time of every
+// process ever assigned to it, terminated ones included (TB-83). Always one
+// entry, "job"; the daemon itself is not in the job.
+func (g *jobObjectGroup) CPUSeconds() (map[string]float64, error) {
+	var info jobObjectBasicAccountingInfo
+	if err := windows.QueryInformationJobObject(
+		g.handle,
+		jobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	); err != nil {
+		return nil, fmt.Errorf("QueryInformationJobObject: %w", err)
+	}
+	return map[string]float64{"job": float64(info.TotalUserTime+info.TotalKernelTime) / 1e7}, nil
 }
 
 func (g *jobObjectGroup) ReleaseChildren() {

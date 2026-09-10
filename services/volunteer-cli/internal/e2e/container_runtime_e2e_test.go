@@ -141,6 +141,10 @@ func (m *mockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID s
 	return nil
 }
 
+func (m *mockDockerClient) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
+	return 0, nil
+}
+
 func (m *mockDockerClient) Close() error { return nil }
 
 // --- Helpers ---

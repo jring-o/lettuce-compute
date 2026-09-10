@@ -124,11 +124,26 @@ type ThermalMonitor struct {
 	pollOverride  time.Duration    // for testing; 0 = use config
 	nowFn         func() time.Time // for testing; nil = time.Now
 	notices       NoticeSink       // optional; nil discards notices
+	// capability is where the CPU temperature comes from on this machine,
+	// detected once at Start (TB-77). Read through Capability.
+	capability ThermalCapability
 
 	mu      sync.Mutex
 	stopCh  chan struct{}
 	stopped bool
 }
+
+// thermalCPUUnreadableCode is the notice raised once at start when thermal
+// protection is on but this machine's CPU temperature cannot be read, so the
+// CPU pause threshold the volunteer set has no effect (TB-77).
+const thermalCPUUnreadableCode = "thermal_cpu_unreadable"
+
+// Notice levels as the daemon's notice ring spells them (daemon.NoticeInfo,
+// NoticeWarn); duplicated here because this package cannot import daemon.
+const (
+	NoticeLevelInfo = "info"
+	NoticeLevelWarn = "warn"
+)
 
 // NoticeSink receives volunteer-facing notices — the throttle activated /
 // released escalations that the monitor otherwise only logs — and the
@@ -170,6 +185,68 @@ func (t *ThermalMonitor) SetClockForTest(fn func() time.Time) {
 	t.nowFn = fn
 }
 
+// Capability reports where this machine's CPU temperature comes from, as
+// detected at Start (TB-77). Before Start it is the zero value.
+func (t *ThermalMonitor) Capability() ThermalCapability {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.capability
+}
+
+// announceCPUSource says, once at start, what the CPU threshold check is
+// actually reading (TB-77). Nothing used to distinguish "the CPU is cool"
+// from "I cannot read the CPU": a reading of 0 can never pause work, and no
+// log line, notice, `doctor` row or Settings caption said so, so a tester's
+// Intel MacBook sat at 100 °C under "pause above 85 °C" with the sliders in
+// front of him. The log line is unconditional; the notice is raised only when
+// the CPU cannot be read — as a warning when the volunteer can fix it
+// (install the macOS helper, load a Linux driver) and as information when
+// nothing they do will change it (Windows), so a box labelled "needs
+// attention" never holds what no one can act on.
+func (t *ThermalMonitor) announceCPUSource() (enabled bool) {
+	cap := ThermalCapabilityReader()
+	t.mu.Lock()
+	t.capability = cap
+	t.mu.Unlock()
+
+	if !t.config.Enabled {
+		t.logger.Info("thermal protection off (thermal.enabled false)", "cpu_source", cap.CPUSource)
+		return false
+	}
+	if cap.CPUReadable {
+		t.logger.Info("thermal protection active",
+			"cpu_source", cap.CPUSource,
+			"detail", cap.Detail,
+			"cpu_pause_above", t.config.CPUPauseThresholdC,
+			"cpu_resume_below", t.config.CPUResumeThresholdC,
+			"gpu_pause_above", t.config.GPUPauseThresholdC,
+			"gpu_resume_below", t.config.GPUResumeThresholdC,
+		)
+		return true
+	}
+
+	t.logger.Warn("thermal protection cannot read this machine's CPU temperature; the CPU pause threshold has no effect (GPU thresholds and hardware protection are unaffected)",
+		"cpu_source", cap.CPUSource,
+		"detail", cap.Detail,
+		"remedy", cap.Remedy,
+		"cpu_pause_above", t.config.CPUPauseThresholdC,
+	)
+	if t.notices == nil {
+		return true
+	}
+	level := NoticeLevelInfo
+	if cap.Fixable() {
+		level = NoticeLevelWarn
+	}
+	msg := fmt.Sprintf("Thermal protection cannot read this machine's CPU temperature (%s), so the CPU pause threshold of %d°C has no effect. GPU thresholds still apply where a GPU tool reports a temperature, and the hardware's own thermal protection is unaffected.",
+		cap.Detail, t.config.CPUPauseThresholdC)
+	if cap.Fixable() {
+		msg += " To enable it, " + cap.Remedy + "."
+	}
+	t.notices.Notify(level, thermalCPUUnreadableCode, msg, "", "")
+	return true
+}
+
 // NewThermalMonitor creates a new thermal monitor.
 func NewThermalMonitor(cfg ThermalConfig, pauseCh chan<- bool, logger *slog.Logger) *ThermalMonitor {
 	return &ThermalMonitor{
@@ -192,9 +269,12 @@ func (t *ThermalMonitor) SetPollIntervalForTest(d time.Duration) {
 	t.pollOverride = d
 }
 
-// Start begins temperature monitoring in a goroutine.
+// Start begins temperature monitoring in a goroutine. The CPU temperature
+// source is detected and reported first (TB-77), whether or not protection
+// is on, so `doctor`, the management API and the app can say what this
+// machine can read either way.
 func (t *ThermalMonitor) Start(ctx context.Context) {
-	if !t.config.Enabled {
+	if !t.announceCPUSource() {
 		return
 	}
 

@@ -5,9 +5,12 @@ package daemon
 import (
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 const terminateGracePeriod = 5 * time.Second
@@ -92,6 +95,36 @@ func (g *pgidGroup) clearPgids() {
 	g.mu.Lock()
 	g.pgids = make(map[int]struct{})
 	g.mu.Unlock()
+}
+
+// CPUSeconds sums each tracked group's process tree from the process table
+// (TB-83). A group the table no longer has any process for has exited and is
+// dropped from tracking, so a later process that happens to reuse its id is
+// not mistaken for it.
+func (g *pgidGroup) CPUSeconds() (map[string]float64, error) {
+	g.mu.Lock()
+	pgids := make([]int, 0, len(g.pgids))
+	for pgid := range g.pgids {
+		pgids = append(pgids, pgid)
+	}
+	g.mu.Unlock()
+
+	found, err := runtime.ProcessGroupsCPUSeconds(pgids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]float64, len(found))
+	g.mu.Lock()
+	for _, pgid := range pgids {
+		secs, alive := found[pgid]
+		if !alive {
+			delete(g.pgids, pgid)
+			continue
+		}
+		out[strconv.Itoa(pgid)] = secs
+	}
+	g.mu.Unlock()
+	return out, nil
 }
 
 func (g *pgidGroup) ReleaseChildren() {
