@@ -145,9 +145,32 @@ Ask, in plain terms, what they want to compute. Three cases:
 3. **They just want to try** → offer an example (`monte-carlo-pi` native, or `nbody-gravity`
    container) and use it.
 
-### B — Native or container? (you decide, tell them why)
-- Compiles to a static binary easily (Go, Rust, C/C++) → **NATIVE** (simplest).
-- Python / R / Julia, or heavy library/system deps → **CONTAINER** (no cross-compilation).
+### B — Which runtime? (you decide, tell them why)
+
+There are three, and the choice decides **how many volunteers can ever run this leaf**. Each
+volunteer grants trust per head and per runtime, so the runtime is a reach decision before it
+is a technical one. Say this to the user in plain language rather than just picking.
+
+- **WASM** — reaches the most volunteers, because it is sandboxed and is the one runtime every
+  volunteer allows by default with no action from them. Also the only runtime browser
+  volunteers can run at all. Choose it when the code compiles to WebAssembly (Go, Rust, C/C++
+  via WASI), needs no network, and fits in ~4 GB of memory.
+- **CONTAINER** — Python / R / Julia, or heavy library and system deps, with no
+  cross-compilation. Each volunteer must opt this head in with
+  `lettuce-volunteer heads trust <head> container`, so reach is narrower than WASM.
+- **NATIVE** — a compiled binary running directly on the volunteer's machine with no sandbox.
+  **Off by default for every volunteer**, and each one must explicitly grant
+  `lettuce-volunteer heads trust <head> native`. Reaches the fewest volunteers. Choose it only
+  when WASM cannot work and a container is impractical.
+
+Constraints that decide it for you: **network access requires CONTAINER** (WASI has no network
+APIs, and the head rejects `network_access` on a WASM leaf), and **a GPU leaf must be CONTAINER
+or WASM** — the head rejects `gpu_required` on NATIVE, because native binaries get no device
+passthrough.
+
+If NATIVE is genuinely the right answer, tell the user the consequence in one sentence: their
+volunteers will fetch nothing from this leaf until each of them runs the `heads trust` command,
+and until then it will look like the leaf is broken.
 
 ### C — Make it honor the contract (the important part)
 The program must:
@@ -155,6 +178,14 @@ The program must:
   `$LETTUCE_OUTPUT_FILE` (JSON), exit 0.
 - **CONTAINER:** read `$LETTUCE_PARAMETERS_FILE` (`/work/input/parameters.json`), write
   `$LETTUCE_OUTPUT_DIR/output.json`, exit 0.
+- **WASM:** same variable names as native, at fixed paths inside the sandbox's virtual
+  filesystem — `$LETTUCE_PARAMS_FILE` is `/work/params.json` and `$LETTUCE_OUTPUT_FILE` is
+  `/work/output.dat`. Compile with WASI support and read and write those paths normally.
+
+**`guides/first-leaf.md` documents the native and container paths only; there is no WASM
+walkthrough yet.** For a WASM leaf, take the contract above and the hosting step from the
+native path (it is the same `binaries/` directory and the same checksum step), and tell the
+user plainly that you are following the contract from source rather than a written guide.
 
 **Always add progress reporting (both runtimes — do this every time, not as an
 afterthought).** Whenever you write or wrap an entrypoint, make it periodically write a
@@ -219,13 +250,52 @@ leaving their actual computation intact. Mirror the patterns in `guides/examples
   rejected at configure time).
 
 - **CONTAINER:** `podman login <domain> -u lettuce` (registry password from head setup),
-  then `podman push <domain>/<image>:latest`.
+  then push under an **immutable tag** — a version like `:v1`, or a digest. **Do not use
+  `:latest` or a bare image name.** Publishing an artifact version rejects both, because a
+  re-pushed floating tag is never re-pulled by volunteers that already cached it, so some
+  machines would silently keep computing the old code. Use `podman push <domain>/<image>:v1`
+  and bump the tag on every rebuild.
+
+- **WASM:** `scp` the `.wasm` module into the server's `~/lettuce-compute/binaries/`, exactly
+  like a native binary, and take its SHA-256 the same way. **Compute the checksum even though
+  the head does not demand one for WASM:** the volunteer client refuses to execute a module it
+  cannot verify, so a WASM leaf that passes configure with no `binary_checksums["wasm"]` fails
+  on every command-line volunteer that fetches it.
 
 ### F — Create, configure, activate the leaf
 Run these on the server over SSH (key stays put). Use first-leaf.md Steps 4–6 (native) or
 Path 2 Steps 4–5 (container). Help the user choose: a **name**, a one-line **description**, a
-**research_area** slug (`mathematics`, `physics`, …), and the validation mode — **EXACT** for
-deterministic code, **NUMERIC_TOLERANCE** for stochastic.
+**research_area** slug (`mathematics`, `physics`, …), a **visibility**, and the validation
+mode.
+
+**Visibility** decides who can be handed this leaf's work. `PUBLIC` is listed in the head's
+catalog and dispatched to every attached volunteer. `UNLISTED` and `PRIVATE` are handed out
+**only** to volunteers who name the leaf explicitly with
+`lettuce-volunteer attach --leaf <leaf-id>`. Default to `PUBLIC` unless the user wants a
+private test run; if they pick a hidden one, tell them they must give the leaf id to anyone
+who is meant to compute it, or nothing will ever be dispatched. `PUBLIC` also requires at
+least one `research_area`.
+
+**Validation mode and redundancy go together.** `redundancy_factor` (or the explicit
+`target_copies`) is how many volunteers independently compute each unit, and `min_quorum` is
+how many must agree before the unit validates.
+
+- **EXACT** — byte-identical outputs. Right for genuinely deterministic code. If the output
+  carries anything that varies run to run, such as a wall-clock timing, list those paths in
+  `validation_config.ignore_fields` or honest volunteers will be recorded as disagreeing.
+- **NUMERIC_TOLERANCE** — selected numeric fields within `numeric_tolerance`. Right for
+  floating-point and stochastic work.
+
+**On a redundant NUMERIC_TOLERANCE leaf the head refuses the configure call unless you scope
+the comparison.** Set `compare_fields` (the paths that must agree), or `ignore_fields` (the
+paths to skip), or assert `compare_all_fields: true` if every field really is deterministic.
+This is not optional and there is deliberately no silent default: comparing every field
+included nondeterministic runtime metadata, and honest results were being rejected over a
+one-millisecond difference in a timing field. Pick the fields that carry the science.
+
+Two more constraints the validator enforces, so get them right the first time:
+`agreement_threshold` must be **greater than 0.5** on any leaf dispatching two or more copies,
+and `min_quorum` must be less than or equal to `target_copies`.
 
 For NATIVE, put each binary's URL under `execution_config.binaries` **and** its SHA-256 under
 `execution_config.binary_checksums` (same platform key, e.g. `linux_amd64`); a missing or
@@ -270,6 +340,15 @@ Translate the user's "I'd like to run these values" into a `parameter_space`. **
 (a handful of units) and confirm the pipeline works before scaling. For `PARAMETER_SWEEP`
 it's a **Cartesian product** — compute and state the total count, and get the user's OK
 before generating anything large.
+
+**Settle `data_config.generation_mode` before you generate anything, because it is immutable
+afterwards.** `eager` means you call the generate endpoint and the head produces the whole
+space; `lazy` means the head tops the queue up itself as it drains, which suits a long or
+open-ended run. Once any work unit exists the head returns `409 GENERATION_MODE_IMMUTABLE` on
+a change, and on a `lazy` leaf the manual generate endpoint returns `409
+LAZY_GENERATION_MANAGED` because calling it by hand would re-emit trials the head already
+generated and burn real volunteer compute on duplicates.
+
 **Check:** work units are `QUEUED`.
 
 ### H — Verify and (optionally) compute

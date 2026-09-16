@@ -178,7 +178,7 @@ table:
 
 | Computation type | `redundancy_factor` | `comparison_mode` | Notes |
 |---|---|---|---|
-| Deterministic CPU code (e.g. WASM, fixed-seed Go) | 1 | `EXACT` | Head spot-checks ~5% automatically |
+| Deterministic CPU code (e.g. WASM, fixed-seed Go) | 1 | `EXACT` | Cheapest. One volunteer per unit |
 | Stochastic CPU (Monte Carlo, MCMC) | 1 | `NUMERIC_TOLERANCE` | Tolerance ~0.01 of the typical signal |
 | GPU computation | 2 | `NUMERIC_TOLERANCE` | GPU math is never bit-identical across hardware |
 | High-stakes results | 2–3 | `EXACT` (if deterministic) or `NUMERIC_TOLERANCE` | Two/three volunteers must agree |
@@ -186,30 +186,63 @@ table:
 **Default for a first leaf:** `redundancy_factor: 1` (no double-running)
 with `comparison_mode` picked from determinism.
 
-**Caveat (open question on this head as of 2026-05):** Results with
-`redundancy_factor: 1` may park at `validation_status: PENDING`
-indefinitely instead of auto-validating. See
-`lettuce-compute/TODO.md` #12. If you want results to definitely flip
-to `VALIDATED`, use `redundancy_factor: 2` until that's resolved.
+**Record the comparison scope in the spec, not just the mode.** On any leaf
+that dispatches two or more copies, a `NUMERIC_TOLERANCE` config is **refused
+at configure time** unless it names `compare_fields` (the paths that must
+agree), or `ignore_fields` (the paths to skip), or asserts
+`compare_all_fields: true`. This is the same science-vs-provenance split you
+made in section 4, so write it down here: the science fields go in
+`compare_fields`, and anything nondeterministic — a `compute_time_ms`, a host
+label — goes in `ignore_fields` or is left out of the compare set. Comparing
+everything is what caused honest volunteers to be recorded as disagreeing over
+a one-millisecond timing difference.
+
+**Two constraints the validator enforces**, so design within them rather than
+discovering them at configure time: `agreement_threshold` must be **greater
+than 0.5** on any leaf dispatching two or more copies, and `min_quorum` (how
+many must agree) must be **≤** `target_copies` (how many are dispatched).
+
+**Spot-checking is opt-in, not automatic.** `spot_check_enabled` defaults to
+off; turning it on is only legal on a leaf dispatching a single copy, and it
+then requires the same comparison scoping as a redundant leaf.
 
 ### 6. Runtime (NATIVE / CONTAINER / WASM)
 
+**Runtime is a reach decision before it is a technical one.** Every volunteer
+grants trust per head and per runtime. WASM is always allowed, because it is
+sandboxed, so a WASM leaf can be computed by every attached volunteer and by
+browser volunteers with nothing installed. CONTAINER and NATIVE each require
+the volunteer to opt this head in
+(`lettuce-volunteer heads trust <head> container|native`), and NATIVE is off by
+default for everyone. Ranked by how many machines can run the work: **WASM,
+then CONTAINER, then NATIVE.** Pick the highest one the code can live with, and
+say in the spec what the choice costs in reach.
+
 | Code shape | Pick |
 |---|---|
-| Pure Go/Rust/C, no system deps | NATIVE (or WASM, if browser reach matters) |
+| Compiles to WebAssembly (Go, Rust, C/C++ via WASI), no network, under 4 GB | WASM |
 | Python / R / Julia / heavy library deps | CONTAINER |
-| Needs NVIDIA/AMD GPU | CONTAINER (with `gpu_required: true`) |
-| Needs >4 GB memory and not WASM | NATIVE or CONTAINER |
-| You want browser volunteers to be able to run it | WASM |
-| You don't know | CONTAINER (broadest fit; fewest sharp edges) |
+| Needs NVIDIA/AMD GPU | CONTAINER (with `gpu_required: true`), or WASM via WebGPU |
+| Needs network access | CONTAINER |
+| Needs >4 GB memory | CONTAINER or NATIVE |
+| Pure Go/Rust/C that will not compile to WASM | NATIVE |
+| You don't know | WASM if it can compile to it, otherwise CONTAINER |
 
 **Constraints:**
 - NATIVE requires per-platform builds and a per-platform SHA-256 in
-  `binary_checksums`. The head rejects NATIVE configs without it.
+  `binary_checksums`. The head rejects NATIVE configs without it. NATIVE also
+  cannot use a GPU — the head rejects `gpu_required` on it, because native
+  binaries get no device passthrough.
+- WASM should carry a checksum too. The head does not demand one, but the
+  volunteer client refuses to execute a module it cannot verify, so a WASM leaf
+  configured without `binary_checksums["wasm"]` fails on every command-line
+  volunteer that fetches it.
 - CONTAINER images can be huge — the GREP image is ~91 GB on disk and
   requires ≥120 GB free on the volunteer. Note this if your image is
-  going to be big.
-- WASM has a hard 4 GB memory ceiling and no network.
+  going to be big. Push under an immutable tag; publishing an artifact version
+  rejects a bare name or `:latest`.
+- WASM has a hard 4 GB memory ceiling and no network. The head rejects
+  `network_access` on a WASM leaf, since WASI has no network APIs.
 
 **Progress reporting (design it in now).** Every leaf should emit progress so
 `lettuce-volunteer status` shows live progress and an ETA instead of a flat
