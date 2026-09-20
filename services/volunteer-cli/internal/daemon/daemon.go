@@ -1676,10 +1676,13 @@ func (d *Daemon) noteUnstattableImageStore(path string) {
 const workBufferQueueDepth = 256
 
 // fallbackBufferUnitsPerSlot bounds the buffer when no per-unit time estimate is
-// available (benchmark unknown, or leafs report rsc_fpops_est=0). Without a time
-// estimate the hours-based target can't be computed, so we fall back to a small
-// unit-count buffer (this many descriptors per slot) so the volunteer still
-// pre-fetches a little without unboundedly hoarding reservations.
+// available: the leaf has not completed here yet, the head carries no leaf-level
+// estimate, and the units bring no FP-ops figure (or there is no benchmark to
+// apply one to). Without a time estimate the hours-based target can't be
+// computed, so we fall back to a small unit-count buffer (this many descriptors
+// per slot) so the volunteer still pre-fetches a little without unboundedly
+// hoarding reservations. It binds only until the leaf's first completion here
+// (TB-84): from then on the learned median books every unit.
 const fallbackBufferUnitsPerSlot = 2
 
 // maxSlots returns the configured concurrent-task count (>= 1).
@@ -1691,34 +1694,60 @@ func (d *Daemon) maxSlots() int {
 	return n
 }
 
-// estSecondsForUnit estimates wall-clock seconds for a unit from its FP-ops
-// estimate: at the leaf's learned seconds per FP-op once the leaf has completed
-// on this machine (TB-58), else against this host's CPU benchmark. Returns 0
-// when no estimate is possible — no FP-ops figure, or no benchmark before the
-// leaf's first completion here.
+// estSecondsForUnit estimates wall-clock seconds for one unit of a leaf — the
+// figure every held unit is booked at (bufferedSeconds, the GPU class, the
+// refill trigger, the status API's remaining time) — from the best evidence
+// there is, in this order:
+//
+//  1. the unit's FP-ops estimate × the leaf's learned seconds per FP-op, once
+//     the leaf has completed here with FP-ops figures (TB-58): the only source
+//     that scales each unit by its own size;
+//  2. the median seconds of the leaf's completions on this machine (TB-58's
+//     UnitSeconds): the figure that carries a leaf whose units publish no
+//     FP-ops estimate at all, which every leaf on the fleet heads is (TB-84);
+//  3. the unit's FP-ops estimate against this host's CPU benchmark;
+//  4. the leaf-level, benchmark-independent estimate the head carries on
+//     CachedLeafInfo (#29) — last of the real sources because TB-34 found it
+//     can sit far below the units' real size, so a per-unit FP-ops figure
+//     outranks it;
+//  5. 0: nothing is known, and the buffer is bounded by the unit count.
+//
+// Before TB-84 this returned 0 for any unit without an FP-ops figure before
+// consulting anything, so on the fleet — where no leaf publishes one — the
+// hours target never bound: every host held the unit-count fallback (two per
+// slot) whatever work_buffer_hours said, while the ask, sized by
+// leafEstSeconds (which did read the medians), was hours-sized, and the
+// surplus went back to the head every round.
 func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
-	if rscFpopsEst <= 0 {
-		return 0
-	}
 	if d.durations != nil {
-		if rate, ok := d.durations.SecondsPerFpop(leafID); ok {
-			return rscFpopsEst * rate
+		if rscFpopsEst > 0 {
+			if rate, ok := d.durations.SecondsPerFpop(leafID); ok {
+				return rscFpopsEst * rate
+			}
+		}
+		if sec, ok := d.durations.UnitSeconds(leafID); ok {
+			return sec
 		}
 	}
-	if d.benchmarkFPOPS <= 0 {
-		return 0
+	if rscFpopsEst > 0 && d.benchmarkFPOPS > 0 {
+		return rscFpopsEst / d.benchmarkFPOPS
 	}
-	return rscFpopsEst / d.benchmarkFPOPS
+	if d.leafCache != nil {
+		if leaf, ok := d.leafCache.LeafByID(leafID); ok && leaf.EstimatedDurationSeconds > 0 {
+			return leaf.EstimatedDurationSeconds
+		}
+	}
+	return 0
 }
 
 // leafEstSeconds estimates wall-clock seconds for one unit of a leaf to size the
-// FIRST batch request to it (#29), BEFORE any of that leaf's units have been
-// buffered (so estSecondsForUnit, which needs a per-unit rsc_fpops_est, can't
-// help yet). Once the leaf has completed on this machine it is the median of
-// those completions (TB-58); until then it is the leaf-level, benchmark-
-// INDEPENDENT estimate the head carries on CachedLeafInfo. Neither divides by
-// the local benchmark, so it stays non-zero on un-benchmarked hosts — the exact
-// case the old FP-ops-only seam tripped to 0, leaving the flat ceiling to bind.
+// batch request to it (#29). Once the leaf has completed on this machine it is
+// the median of those completions (TB-58); until then it is the leaf-level,
+// benchmark-INDEPENDENT estimate the head carries on CachedLeafInfo. Neither
+// divides by the local benchmark, so it stays non-zero on un-benchmarked hosts —
+// the exact case the old FP-ops-only seam tripped to 0, leaving the flat ceiling
+// to bind. Since TB-84 the per-unit estimate (estSecondsForUnit) reads the same
+// sources, so the ask and the booking agree on a unit's size.
 // Returns 0 only when the head supplied no estimate and nothing has been learned.
 func (d *Daemon) leafEstSeconds(leaf CachedLeafInfo) float64 {
 	sec := leaf.EstimatedDurationSeconds
@@ -1845,15 +1874,32 @@ func (d *Daemon) fallbackGPUBufferUnits() int {
 // nothing about runnability; bufferAccepts and the fetcher's pre-request skip
 // apply it, and the TB-32 idle-slot escape still governs acceptance over it.
 func (d *Daemon) gpuBufferHoursFull() bool {
+	full, _ := d.gpuBufferFullVerdict()
+	return full
+}
+
+// gpuBufferFullVerdict is gpuBufferHoursFull with the give-back wording for
+// the bound that held (see workBufferFullVerdict); "" when not full.
+func (d *Daemon) gpuBufferFullVerdict() (bool, string) {
+	held, cap := d.bufferedGPUUnitCount(), d.fallbackGPUBufferUnits()
 	target := d.gpuBufferTargetSeconds()
 	if target <= 0 {
-		return d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits()
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("GPU work buffer full (work_buffer_hours is 0: %d of %d GPU units held for %d GPU slot(s))", held, cap, d.gpuSlots())
 	}
 	sec := d.bufferedGPUSeconds()
-	if sec <= 0 && d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits() {
-		return true
+	if sec <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("GPU work buffer full (unit-count fallback: %d of %d GPU units held for %d GPU slot(s), no duration estimate yet)", held, cap, d.gpuSlots())
 	}
-	return sec >= target
+	if sec < target {
+		return false, ""
+	}
+	return true, fmt.Sprintf("GPU work buffer full (over the hours target for %d GPU slot(s))", d.gpuSlots())
 }
 
 // leafClassBufferFull reports whether the resource class this leaf's units
@@ -1962,8 +2008,8 @@ func (d *Daemon) workBufferFull() bool {
 // (buffering disabled, or held units with no estimates) it reopens at the
 // unit-count cap itself — count mode keeps its pre-hysteresis cadence, because a
 // halved count threshold would idle the slot between the last spare unit
-// starting and the next fetch round, and count-mode asks are already bounded by
-// the batch-feedback cap rather than by an estimate.
+// starting and the next fetch round, and count-mode asks are bounded by the
+// count's headroom (requestBatchSize, TB-84) rather than by an estimate.
 func (d *Daemon) bufferBelowLowWater() bool {
 	target := d.bufferTargetSeconds()
 	if target <= 0 || d.bufferedSeconds() <= 0 {
@@ -1979,17 +2025,40 @@ func (d *Daemon) bufferBelowLowWater() bool {
 // otherwise it falls back to a small per-slot unit count so the buffer can't
 // grow without bound when estimates are missing.
 func (d *Daemon) workBufferHoursFull() bool {
+	full, _ := d.workBufferFullVerdict()
+	return full
+}
+
+// workBufferFullVerdict is workBufferHoursFull with the reason: whether the
+// buffer is full and, when it is, the wording bufferAccepts sends to the head
+// as the give-back reason ("" otherwise). The wording names the bound that
+// actually held — the hours target, the unit-count fallback, or buffering
+// switched off — because a head ledger reading "over the hours target" for a
+// buffer whose hours target was never consulted sent the reading of every
+// give-back on the fleet the wrong way (TB-84).
+func (d *Daemon) workBufferFullVerdict() (bool, string) {
+	held, cap := d.bufferedUnitCount(), d.fallbackBufferUnits()
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
 		// Hours target unusable (buffering disabled) — fall back to a unit count.
-		return d.bufferedUnitCount() >= d.fallbackBufferUnits()
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("work buffer full (work_buffer_hours is 0: %d of %d units held)", held, cap)
 	}
 	// If we have buffered units but can't estimate ANY of their durations, the
 	// hours math is meaningless; bound by the unit-count fallback instead.
-	if d.bufferedSeconds() <= 0 && d.bufferedUnitCount() >= d.fallbackBufferUnits() {
-		return true
+	sec := d.bufferedSeconds()
+	if sec <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("work buffer full (unit-count fallback: %d of %d units held, no duration estimate yet)", held, cap)
 	}
-	return d.bufferedSeconds() >= target
+	if sec < target {
+		return false, ""
+	}
+	return true, "work buffer full (over the hours target)"
 }
 
 // idleSlotStarved reports whether an execution slot is idle while the picker
@@ -2089,10 +2158,9 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	if ok, why := d.memoryDeclarationFits(wu); !ok {
 		return false, why
 	}
-	full, reason := d.workBufferHoursFull(), "work buffer full (over the hours target)"
-	if !full && wu.ExecutionSpec.GPURequired && d.gpuBufferHoursFull() {
-		full = true
-		reason = fmt.Sprintf("GPU work buffer full (over the hours target for %d GPU slot(s))", d.gpuSlots())
+	full, reason := d.workBufferFullVerdict()
+	if !full && wu.ExecutionSpec.GPURequired {
+		full, reason = d.gpuBufferFullVerdict()
 	}
 	if !full {
 		return true, ""
@@ -2189,12 +2257,17 @@ func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64
 		per = d.avgBufferedSecondsPerUnit()
 	}
 	if per <= 0 {
-		// No estimate at all: request a full batch to refill the deficit quickly —
-		// except for the GPU class, whose unit-count fallback bounds the ask.
+		// No estimate at all — for this leaf or anything held — so the arriving
+		// units will book no time either and the unit-count fallback is what
+		// will bound acceptance: ask for the headroom under it, never a full
+		// batch. The full-batch ask here was the first round of every leaf on
+		// the fleet (TB-84: 5–64 asked, two kept, the rest returned within
+		// seconds, and the batch-feedback cap then pinned the next ask at
+		// kept + 1). The GPU class was already bounded this way (TB-48).
 		if gpu {
 			return clampBatch(int32(d.fallbackGPUBufferUnits() - d.bufferedGPUUnitCount()))
 		}
-		return maxBatchPerRequest
+		return clampBatch(int32(d.fallbackBufferUnits() - d.bufferedUnitCount()))
 	}
 	return clampBatch(int32(deficit / per))
 }

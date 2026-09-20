@@ -111,8 +111,10 @@ on their answers.
 
 ### 1 — [user] Get a server
 If they don't have one, walk them through it click-by-click (default to **DigitalOcean**
-unless they prefer another provider; head-setup.md Step 1 lists alternatives): Ubuntu 22.04,
-2 GB RAM, **add their SSH key during creation**. Ask them to paste the server's **public IP**.
+unless they prefer another provider; head-setup.md Step 1 lists alternatives): **Ubuntu 24.04
+LTS** (DigitalOcean no longer offers 22.04 in its creation flow; any 22.04+ works if they
+already have a server), **2 GB RAM or larger**, **add their SSH key during creation**. Ask them
+to paste the server's **public IP**.
 **Check:** you can reach it — `ssh root@<IP> 'echo ok; lsb_release -d'` returns `ok` and an
 Ubuntu version. If SSH fails, help them add your public key, or drop to *Degraded mode*.
 
@@ -150,10 +152,30 @@ the username." Then call **`AskUserQuestion`** with options like *Yes — saved*
 yet, wait while I save it* / *Help me pick a password manager*. Do not continue until
 they confirm.
 
-You already know the domain. Generate everything else (`POSTGRES_PASSWORD`,
-`NEXTAUTH_SECRET`, `LETTUCE_ADMIN_API_KEY`, `DASHBOARD_API_KEY`) with `openssl rand -base64 32`
-**on the server**, and the registry password + its hash (head-setup.md Step 6). Write `.env`
-directly on the server and `chmod 600` it.
+You already know the domain. Generate everything else **on the server** and write `.env`
+directly there, then `chmod 600` it (head-setup.md Step 6):
+
+- `POSTGRES_PASSWORD`, `NEXTAUTH_SECRET`, `LETTUCE_ADMIN_API_KEY`, `DASHBOARD_API_KEY` —
+  `openssl rand -base64 32`.
+- `REDIS_PASSWORD` — **required; the compose file refuses to start without it.** Use
+  `openssl rand -hex 32`, not base64: the value rides inside a connection URL, so other
+  characters would need percent-encoding.
+- The registry password and its bcrypt hash.
+
+**The head refuses to boot on a bad secret, by design.** It rejects any value that is a known
+placeholder (stems `change-me`, `changeme`, `generate-with`, `replace-with`, `placeholder`,
+`not-for-production`) or shorter than its floor: **32 characters** for the generated machine
+secrets (`LETTUCE_ADMIN_API_KEY`, `DASHBOARD_API_KEY`, `REDIS_PASSWORD`, `NEXTAUTH_SECRET`) and
+**12** for the human passwords. The error names the offending variable. The generators above
+clear both floors; the admin password the user chooses must clear 12 characters, so check it
+before they commit to it.
+
+**`REGISTRY_PASS_HASH` needs every `$` escaped as `$$`.** A bcrypt hash always contains `$`,
+and Docker Compose interpolates it inside `.env`, silently eating part of the hash. The only
+immediate symptom is a variable-not-set warning; the stack boots fine and registry
+authentication then fails much later, which is very hard to trace back. If the line is already
+written unescaped, repair it with
+`sed -i '/^REGISTRY_PASS_HASH=/ s/\$/$$/g' .env` (head-setup.md Step 6).
 
 Show the user the **registry password once** with the same kind of storage instructions:
 "Save this in your password manager. Label it **Lettuce registry — <domain>**, username
@@ -173,12 +195,11 @@ hassle.)
   code can never execute as script on the main app origin.
 - `LETTUCE_TRUSTED_PROXIES` — **leave unset in `.env`**. `compose.production.yaml`
   already defaults it to the Docker/RFC1918 bridge ranges so per-client rate
-  limiting works behind Caddy. As of v0.2.0 this governs per-client limiting on
-  **both** the HTTP and the gRPC (volunteer) port, so the default matters more —
-  but it's still correct out of the box. Only override it if the user has a
-  non-standard proxy network.
-- **Dispatch tuning (`LETTUCE_HEAD_*`) — leave unset for a fresh head.** v0.2.0
-  added server-directed dispatch knobs (work batching, retry delays, the buffer
+  limiting works behind Caddy. It governs per-client limiting on **both** the HTTP
+  and the gRPC (volunteer) port, and the shipped default is correct out of the box.
+  Only override it if the user has a non-standard proxy network.
+- **Dispatch tuning (`LETTUCE_HEAD_*`) — leave unset for a fresh head.** The head
+  exposes server-directed dispatch knobs (work batching, retry delays, the buffer
   lease). `compose.production.yaml` forwards them all from `.env`, but the
   built-in defaults are fine to launch with. The one to revisit **later**, once
   the head carries real volunteer load, is
@@ -192,7 +213,8 @@ hassle.)
 
 **Check:** `.env` contains no `change-me`/`generate-with`/`replace-with` placeholders, and its
 permissions are `600`. `grep -E '^(PLATFORM_URL|LETTUCE_CORS_ORIGINS|VIZ_ORIGIN)=' .env`
-shows all three set to the user's real domain.
+shows all three set to the user's real domain. `grep -c '^REDIS_PASSWORD=.\{32,\}' .env`
+returns `1`. `grep '^REGISTRY_PASS_HASH=' .env` shows a hash whose every `$` is doubled.
 
 ### 6 — [you] Set the domain in the Caddyfile
 Run the `sed` from head-setup.md Step 7 to replace `your-domain.com` with their domain.
@@ -201,10 +223,23 @@ Run the `sed` from head-setup.md Step 7 to replace `your-domain.com` with their 
 ### 7 — [you] Generate the signing key (MUST be before compose up)
 head-setup.md Step 8. The infrastructure container **fails to start** with a fatal error
 if `keys/signing.key` is missing — it no longer silently auto-generates in production.
-Run `openssl genpkey -algorithm ed25519 -out keys/signing.key` in the repo root on the
-server (so the file ends up at `./keys/signing.key`, which `compose.production.yaml`
-mounts read-only at `/keys/signing.key`).
-**Check:** `ls -l keys/signing.key` shows the file exists and is non-empty.
+
+**The key's ownership and mode are enforced at boot too, so all three commands are
+required.** The head container runs as uid 10001 (non-root) and refuses to start if the key
+is group- or other-readable, or owned by any other uid. Run these in the repo root on the
+server, so the file lands at `./keys/signing.key`, which `compose.production.yaml` mounts
+read-only at `/keys/signing.key`:
+
+```bash
+openssl genpkey -algorithm ed25519 -out keys/signing.key
+sudo chown 10001:10001 keys/signing.key
+chmod 600 keys/signing.key
+```
+
+**Check:** `ls -ln keys/signing.key` shows a non-empty file with mode `-rw-------` and owner
+`10001` and group `10001`. Do not settle for "the file exists" — a wrong owner or mode passes
+that weaker check and then fails the boot in Step 8 with `signing key file ... insecure
+permissions` or `... not owned by`.
 
 Now **back it up off-server, safely**. The user must own a copy: if the server dies and
 the key is gone, the head's signing identity is lost and no prior attestation can ever
@@ -227,8 +262,21 @@ be verified against this head again.
    - macOS/Linux: `rm /tmp/<head-name>-signing.key`
 
 ### 8 — [you] Start the stack
-head-setup.md Step 9. **If the server has ≤ 1 GB RAM, build images one at a time** to avoid
-the build being killed. **Check:** `docker compose -f compose.production.yaml ps` shows
+head-setup.md Step 9. **Build memory is the usual failure here, and it fails silently.**
+`docker compose build` builds the infrastructure and dashboard images *in parallel*, and
+together they exhaust 2 GB; cloud images ship with no swap, so the symptom is a build that
+stalls for tens of minutes printing nothing. On a 2 GB server add a swapfile first:
+
+```bash
+fallocate -l 3G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+free -h   # confirm the Swap line shows 3.0Gi
+```
+
+On a 1 GB server, or if the user would rather not add swap, build the images one at a time
+instead (`build infrastructure`, then `build dashboard`, then `up -d`).
+
+**Check:** `docker compose -f compose.production.yaml ps` shows
 postgres, infrastructure, dashboard, registry, caddy, **redis** all up. (`redis` is the
 shared cross-replica replay + rate-limit store; it ships in `compose.production.yaml` and
 comes up even for a single replica — it is only *required* once you run more than one.)
@@ -236,20 +284,27 @@ comes up even for a single replica — it is only *required* once you run more t
 ### 9 — [you] Verify
 head-setup.md Step 10:
 - `curl https://your-domain.com/api/v1/health` → `"status":"healthy"`, `"database":"connected"`.
-- Startup logs show the schema migrations applied (`migrations applied successfully`,
-  through `00003_dispatch_claims` — the v0.3.0 dispatch-claim columns that make
-  horizontal scale-out safe, after `00002_work_unit_reservations`) and a
-  `trusted proxies configured` line. No panics or restart loop.
+- Startup logs show `migrations applied successfully` and a `trusted proxies configured`
+  line. No panics or restart loop. Do not check for a particular migration number; the
+  chain grows every release, and a fresh head applies all of them on first boot.
+- Startup logs show `attestation signing key loaded`. If instead you see `insecure
+  permissions` or `not owned by`, Step 7's chown/chmod did not take — fix and restart.
 - Bootstrap log shows `admin user created via bootstrap` and `dashboard API key created via bootstrap`.
 - Ask the user to open `https://your-domain.com/sign-in`, log in with their email + password,
   and **share a screenshot** of the dashboard so you both confirm it works.
 
-**Note (v0.3.0 — BREAKING):** this head removed per-task heartbeats — liveness is
-now deadline-based and run-start is the `StartWork` RPC. The head and ALL volunteers
-must be on **v0.3.0+** and update together: deploy the head first, then update every
-volunteer. An older (pre-v0.3.0) volunteer cannot talk to this head (it still calls
-the removed Heartbeat RPC) and is rejected — that's expected, not a deploy fault.
-Point contributors at the **v0.3.0** release binaries.
+**Which build contributors should run:** point them at the **latest** release binaries, or
+`lettuce-volunteer update` if they already have the client. Each release note states whether
+the head and volunteers have to update together. A client too old for this head is refused
+work and logs an instruction to run `lettuce-volunteer update` — that is the intended
+steering, not a deploy fault.
+
+**Tell the operator this now if their head will host native leafs.** Since v0.10.0 the client
+runs a leaf's native binary only for heads the volunteer has explicitly trusted, with
+`lettuce-volunteer heads trust <head> native`. WASM is always allowed because it is sandboxed;
+containers are a per-head opt-in as well. A volunteer who has not granted native trust simply
+never advertises that runtime, so the head hands them nothing and it looks from both sides like
+the head is broken. WASM leafs reach the most volunteers with no action from anyone.
 
 **Scaling out (only if they ask — a single replica is the default and fine):** the
 head is stateless, so you can run **N replicas** behind Caddy against the one shared
@@ -266,8 +321,14 @@ automatically; no `Caddyfile` edit. Full procedure: `guides/head-setup.md` →
 
 ### 10 — Done → offer the leaf
 Tell them their head is live and where: `https://your-domain.com` (dashboard), admin console
-at `/dashboard/leafs`. Then: "Want me to help you create your first computation now? I'll
-walk you through it." → hand off to the **`create-lettuce-leaf`** skill.
+at `/dashboard/leafs`. Then offer the next step, and pick the right one by asking whether they
+already have code that runs:
+
+- **They have working code** → "Want me to help you get that running on your head now?" →
+  hand off to the **`create-lettuce-leaf`** skill.
+- **They have a research question but no code yet** → "Want to work out what the computation
+  should actually be first?" → hand off to the **`design-lettuce-leaf`** skill, which produces
+  the spec that `create-lettuce-leaf` then builds from.
 
 ## Secret handling
 
