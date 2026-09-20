@@ -415,13 +415,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// programs' CPU use instead of heat. Its sampler needs the daemon (the
 	// daemon's own CPU use is what it subtracts), so that is wired below.
 	yieldPauseCh := make(chan bool, 1)
-	yieldMonitor := runtime.NewYieldMonitor(runtime.YieldConfig{
-		Enabled:             cfg.Config.Yield.Enabled,
-		CPUPausePct:         cfg.Config.Yield.CPUPausePct,
-		CPUResumePct:        cfg.Config.Yield.CPUResumePct,
-		WindowSeconds:       cfg.Config.Yield.WindowSeconds,
-		PollIntervalSeconds: cfg.Config.Yield.PollIntervalSeconds,
-	}, yieldPauseCh, cfg.Logger)
+	yieldMonitor := runtime.NewYieldMonitor(yieldMonitorConfig(cfg.Config.Yield), yieldPauseCh, cfg.Logger)
 
 	// Notices and per-head state: adopt start-up's instances when given (they
 	// may already hold a registration-time rejection), else start empty.
@@ -3395,6 +3389,26 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	d.refreshContainerMemoryNotice()
 	d.refreshContainerCPUNotice()
 	d.rebalanceCPUShares()
+
+	// The yield block is live (TB-90): the monitor judges its next sample
+	// against the new thresholds, turning the setting off releases a pause it
+	// holds, and turning it on starts sampling — no restart, unlike the
+	// thermal block, which the monitor still copies at construction.
+	if d.yieldMonitor != nil && (oldCfg == nil || oldCfg.Yield != newCfg.Yield) {
+		d.yieldMonitor.SetConfig(yieldMonitorConfig(newCfg.Yield))
+	}
+}
+
+// yieldMonitorConfig maps the config file's yield block onto the monitor's
+// settings; construction and a live change (TB-90) share it.
+func yieldMonitorConfig(c config.YieldConfig) runtime.YieldConfig {
+	return runtime.YieldConfig{
+		Enabled:             c.Enabled,
+		CPUPausePct:         c.CPUPausePct,
+		CPUResumePct:        c.CPUResumePct,
+		WindowSeconds:       c.WindowSeconds,
+		PollIntervalSeconds: c.PollIntervalSeconds,
+	}
 }
 
 // SetBackoff overrides backoff durations (for testing).

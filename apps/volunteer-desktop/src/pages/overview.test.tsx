@@ -2522,7 +2522,7 @@ describe("OverviewPage", () => {
       expect(mockClient.resume).not.toHaveBeenCalled();
     });
 
-    it("offers nothing to click during a thermal pause and says it ends on its own", () => {
+    it("offers no Resume during a thermal pause and says it ends on its own", () => {
       pausedFor("thermal");
       render(<OverviewPage />);
 
@@ -2539,6 +2539,74 @@ describe("OverviewPage", () => {
 
       await user.click(screen.getByText("Resume"));
       expect(await screen.findByRole("alert")).toHaveTextContent("Could not resume: not paused");
+    });
+  });
+
+  describe("TB-89: a user pause is offered during an automatic pause", () => {
+    function pausedFor(reason: "user" | "scheduled" | "thermal" | "busy") {
+      setupDefaultMocks({
+        status: {
+          status: {
+            state: "paused",
+            uptime_seconds: 3600,
+            connected_servers: 1,
+            active_tasks: [],
+            queued_tasks: [],
+            failing_leafs: [],
+            paused_reason: reason,
+          },
+        },
+      });
+    }
+
+    it("offers Keep paused during a thermal pause and sends a pause, not a resume", async () => {
+      const user = userEvent.setup();
+      pausedFor("thermal");
+      render(<OverviewPage />);
+
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+      expect(screen.queryByText("Pause")).not.toBeInTheDocument();
+      expect(screen.getByText(/cools down/)).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Keep paused" }));
+      expect(mockClient.pause).toHaveBeenCalledOnce();
+      expect(mockClient.resume).not.toHaveBeenCalled();
+    });
+
+    it("offers Keep paused during a busy pause", () => {
+      pausedFor("busy");
+      render(<OverviewPage />);
+
+      expect(screen.getByRole("button", { name: "Keep paused" })).toBeInTheDocument();
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+    });
+
+    it("offers Keep paused beside Change schedule during a schedule pause", () => {
+      pausedFor("scheduled");
+      render(<OverviewPage />);
+
+      expect(screen.getByRole("button", { name: "Keep paused" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Change schedule" })).toBeInTheDocument();
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+    });
+
+    it("offers Resume and no Keep paused during a user pause", () => {
+      pausedFor("user");
+      render(<OverviewPage />);
+
+      expect(screen.getByText("Resume")).toBeInTheDocument();
+      expect(screen.queryByText("Keep paused")).not.toBeInTheDocument();
+      expect(screen.queryByText("Pause")).not.toBeInTheDocument();
+    });
+
+    it("shows the daemon's own reason when the pause is refused", async () => {
+      const user = userEvent.setup();
+      pausedFor("thermal");
+      mockClient.pause.mockRejectedValueOnce(new ApiError("CONFLICT", "already paused", 409));
+      render(<OverviewPage />);
+
+      await user.click(screen.getByRole("button", { name: "Keep paused" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Could not pause: already paused");
     });
   });
 });

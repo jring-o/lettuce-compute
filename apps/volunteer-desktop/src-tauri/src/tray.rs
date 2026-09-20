@@ -67,13 +67,14 @@ fn status_text(status: &Option<StatusResponse>) -> String {
 /// The pause menu item for a status: its text and whether clicking it does
 /// anything. The daemon's resume undoes a user pause and nothing else — a
 /// schedule or thermal pause answers 409 "not paused" — so "Resume" is offered
-/// for that reason alone and any other pause names itself, disabled (TB-72).
+/// for that reason alone (TB-72). A user pause, on the other hand, is accepted
+/// during any automatic pause and holds after it lifts, so every other pause
+/// offers "Keep paused" (TB-89); the status item above it names the pause.
 fn pause_menu(status: &Option<StatusResponse>) -> (String, bool) {
     match status {
         Some(s) if s.state == "paused" => match s.paused_reason.as_deref() {
             Some("user") => ("Resume".into(), true),
-            Some("scheduled") => ("Paused by your schedule".into(), false),
-            other => (paused_text(other), false),
+            _ => ("Keep paused".into(), true),
         },
         _ => ("Pause".into(), true),
     }
@@ -222,12 +223,10 @@ async fn handle_pause_resume(_app: &AppHandle) {
 
     match client.status().await {
         Ok(status) => {
-            if status.state == "paused" {
-                // Only a user pause is the daemon's to undo; the menu item is
-                // disabled for any other reason, so this is belt and braces.
-                if status.paused_reason.as_deref() != Some("user") {
-                    return;
-                }
+            // Only a user pause is the daemon's to undo (TB-72). Any other
+            // state — active, or paused by a monitor — takes a user pause,
+            // which holds after the automatic pause lifts (TB-89).
+            if status.state == "paused" && status.paused_reason.as_deref() == Some("user") {
                 if let Err(e) = client.resume().await {
                     eprintln!("[warn] the daemon refused to resume: {e}");
                 }
@@ -338,21 +337,23 @@ mod tests {
     fn resume_is_offered_for_a_user_pause_only() {
         // TB-72: a schedule pause is not the daemon's resume to undo.
         assert_eq!(pause_menu(&status("paused", Some("user"))), ("Resume".to_string(), true));
-        assert_eq!(
-            pause_menu(&status("paused", Some("scheduled"))),
-            ("Paused by your schedule".to_string(), false)
-        );
-        assert_eq!(
-            pause_menu(&status("paused", Some("thermal"))),
-            ("Paused — thermal".to_string(), false)
-        );
-        assert_eq!(
-            pause_menu(&status("paused", Some("busy"))),
-            ("Paused — your computer is busy".to_string(), false)
-        );
-        assert_eq!(pause_menu(&status("paused", None)), ("Paused".to_string(), false));
+        assert_ne!(pause_menu(&status("paused", Some("scheduled"))).0, "Resume");
+        assert_ne!(pause_menu(&status("paused", Some("thermal"))).0, "Resume");
         assert_eq!(pause_menu(&status("active", None)), ("Pause".to_string(), true));
         assert_eq!(pause_menu(&None), ("Pause".to_string(), true));
+    }
+
+    #[test]
+    fn keep_paused_is_offered_during_an_automatic_pause() {
+        // TB-89: a user pause laid over a thermal, busy or schedule pause
+        // holds after it lifts, so the item is enabled and says so.
+        for reason in [Some("thermal"), Some("busy"), Some("scheduled"), None] {
+            assert_eq!(
+                pause_menu(&status("paused", reason)),
+                ("Keep paused".to_string(), true),
+                "paused_reason {reason:?}"
+            );
+        }
     }
 
     #[test]

@@ -673,8 +673,14 @@ Settings page has it as "When other programs need the CPU"):
 
 ```bash
 lettuce-volunteer config set yield.enabled true
-lettuce-volunteer stop && lettuce-volunteer start   # read at startup
+lettuce-volunteer stop && lettuce-volunteer start   # config set edits the file; the daemon reads it at start
 ```
+
+Saved from the app's Settings page, a change to this block is in force at once — the
+running client judges its next sample against the new thresholds, starts watching
+when you turn the setting on and releases a pause it is holding when you turn it
+off — so no restart and no banner. `config set` only edits the file, which the
+daemon reads when it next starts.
 
 ```yaml
 yield:
@@ -694,6 +700,13 @@ running units are suspended in place, fetching stops); when it falls to
 are using 62% of the CPU (pause above 25%, resume below 15%)`, the app's status
 pill and tray say "Paused — your computer is busy", and the log has
 `yield pause: other programs are using the CPU`.
+
+> **To stay paused after an automatic pause lifts,** press **Keep paused** — the app's
+> Overview and tray offer it during a busy, thermal or schedule pause — or run
+> `lettuce-volunteer pause`. That is an ordinary user pause laid over the automatic
+> one: the pause is then reported as yours (`user`), the machine stays paused when
+> the load drops (or the machine cools, or the schedule window opens), and
+> **Resume** ends it.
 
 > **Percentages are of all cores.** On an 8-core machine one fully busy core is
 > 12.5%, so the default 25% means "about two cores' worth of other work". Your own

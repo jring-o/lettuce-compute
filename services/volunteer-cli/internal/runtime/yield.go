@@ -80,7 +80,6 @@ type YieldSnapshot struct {
 // YieldMonitor watches other programs' CPU use and signals pause/resume to
 // the daemon via a channel, with hysteresis between the two thresholds.
 type YieldMonitor struct {
-	config       YieldConfig
 	logger       *slog.Logger
 	pauseCh      chan<- bool
 	sampler      CPULoadSampler
@@ -88,7 +87,12 @@ type YieldMonitor struct {
 	nowFn        func() time.Time // for testing; nil = time.Now
 	notices      NoticeSink       // optional; nil discards notices
 
+	// reconfigured wakes the sampling loop after SetConfig (TB-90). One
+	// pending wake is enough: the loop re-reads the whole configuration.
+	reconfigured chan struct{}
+
 	mu      sync.Mutex
+	config  YieldConfig // the live settings; SetConfig replaces them (TB-90)
 	stopCh  chan struct{}
 	stopped bool
 	snap    YieldSnapshot
@@ -99,10 +103,11 @@ type YieldMonitor struct {
 // pauses.
 func NewYieldMonitor(cfg YieldConfig, pauseCh chan<- bool, logger *slog.Logger) *YieldMonitor {
 	return &YieldMonitor{
-		config:  cfg,
-		logger:  logger,
-		pauseCh: pauseCh,
-		stopCh:  make(chan struct{}),
+		config:       cfg,
+		logger:       logger,
+		pauseCh:      pauseCh,
+		reconfigured: make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
 		snap: YieldSnapshot{
 			Enabled:   cfg.Enabled,
 			PausePct:  cfg.CPUPausePct,
@@ -124,6 +129,55 @@ func (y *YieldMonitor) SetPollIntervalForTest(d time.Duration) { y.pollOverride 
 // SetClockForTest overrides the monitor's clock (for testing only).
 func (y *YieldMonitor) SetClockForTest(fn func() time.Time) { y.nowFn = fn }
 
+// SetConfig replaces the monitor's settings while it runs (TB-90). The
+// daemon calls it from ApplyConfig, so a change saved in the app is in force
+// at once rather than at the next restart: new thresholds judge the next
+// sample; a new window or poll interval restarts the average; turning the
+// setting off releases any pause the monitor holds and stops sampling;
+// turning it on starts sampling. Safe to call before Start as well.
+func (y *YieldMonitor) SetConfig(cfg YieldConfig) {
+	y.mu.Lock()
+	y.config = cfg
+	y.snap.Enabled = cfg.Enabled
+	y.snap.PausePct = cfg.CPUPausePct
+	y.snap.ResumePct = cfg.CPUResumePct
+	y.mu.Unlock()
+	select {
+	case y.reconfigured <- struct{}{}:
+	default:
+	}
+}
+
+// currentConfig is the live configuration.
+func (y *YieldMonitor) currentConfig() YieldConfig {
+	y.mu.Lock()
+	defer y.mu.Unlock()
+	return y.config
+}
+
+// cadence is a configuration's sampling interval, the window it averages
+// over and the number of samples in that window, honouring the test
+// override on the interval.
+func (y *YieldMonitor) cadence(cfg YieldConfig) (interval, window time.Duration, samples int) {
+	interval = time.Duration(cfg.PollIntervalSeconds) * time.Second
+	if y.pollOverride > 0 {
+		interval = y.pollOverride
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	window = time.Duration(cfg.WindowSeconds) * time.Second
+	if y.pollOverride > 0 && cfg.PollIntervalSeconds > 0 {
+		// Keep the window-to-poll ratio under a test override.
+		window = interval * time.Duration(cfg.WindowSeconds) / time.Duration(cfg.PollIntervalSeconds)
+	}
+	samples = int(window / interval)
+	if samples < 1 {
+		samples = 1
+	}
+	return interval, window, samples
+}
+
 // Snapshot reports the monitor's current state.
 func (y *YieldMonitor) Snapshot() YieldSnapshot {
 	y.mu.Lock()
@@ -137,40 +191,32 @@ func (y *YieldMonitor) update(fn func(s *YieldSnapshot)) {
 	y.mu.Unlock()
 }
 
-// Start begins load monitoring in a goroutine. Disabled monitors do nothing.
+// Start begins the sampling loop in a goroutine. The loop runs whether or
+// not the setting is on, so that SetConfig can turn it on later (TB-90);
+// while off it samples nothing.
 func (y *YieldMonitor) Start(ctx context.Context) {
-	if !y.config.Enabled {
-		return
+	if cfg := y.currentConfig(); cfg.Enabled {
+		y.announce(cfg)
 	}
-	interval := time.Duration(y.config.PollIntervalSeconds) * time.Second
-	if y.pollOverride > 0 {
-		interval = y.pollOverride
-	}
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	window := time.Duration(y.config.WindowSeconds) * time.Second
-	if y.pollOverride > 0 && y.config.PollIntervalSeconds > 0 {
-		// Keep the window-to-poll ratio under a test override.
-		window = interval * time.Duration(y.config.WindowSeconds) / time.Duration(y.config.PollIntervalSeconds)
-	}
-	samples := int(window / interval)
-	if samples < 1 {
-		samples = 1
-	}
+	go y.run(ctx)
+}
 
+// announce logs that the monitor is watching — or records, once, that it
+// cannot measure what it is meant to judge. Called when the monitor starts
+// enabled and again whenever the setting is turned on.
+func (y *YieldMonitor) announce(cfg YieldConfig) {
 	if y.sampler == nil {
 		y.markUnavailable(errors.New("no load sampler on this platform"))
-	} else {
-		y.logger.Info("yield monitor started: pausing when other programs use the CPU",
-			"pause_above_pct", y.config.CPUPausePct,
-			"resume_below_pct", y.config.CPUResumePct,
-			"window", window.String(),
-			"poll_interval", interval.String(),
-		)
-		y.update(func(s *YieldSnapshot) { s.Measurable = true })
+		return
 	}
-	go y.run(ctx, interval, samples)
+	interval, window, _ := y.cadence(cfg)
+	y.logger.Info("yield monitor started: pausing when other programs use the CPU",
+		"pause_above_pct", cfg.CPUPausePct,
+		"resume_below_pct", cfg.CPUResumePct,
+		"window", window.String(),
+		"poll_interval", interval.String(),
+	)
+	y.update(func(s *YieldSnapshot) { s.Measurable = true })
 }
 
 // markUnavailable records, once, that the load cannot be measured; the
@@ -193,7 +239,9 @@ func (y *YieldMonitor) markUnavailable(err error) {
 	}
 }
 
-func (y *YieldMonitor) run(ctx context.Context, interval time.Duration, windowSize int) {
+func (y *YieldMonitor) run(ctx context.Context) {
+	cfg := y.currentConfig()
+	interval, windowDur, windowSize := y.cadence(cfg)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -212,8 +260,58 @@ func (y *YieldMonitor) run(ctx context.Context, interval time.Duration, windowSi
 			return
 		case <-y.stopCh:
 			return
+		case <-y.reconfigured:
+			next := y.currentConfig()
+			if next == cfg {
+				continue
+			}
+			prev := cfg
+			cfg = next
+			if nextInterval, nextDur, nextSize := y.cadence(cfg); nextInterval != interval || nextSize != windowSize {
+				interval, windowDur, windowSize = nextInterval, nextDur, nextSize
+				ticker.Reset(interval)
+				// A new cadence restarts the average: samples taken at the
+				// old one would weigh the new window unevenly.
+				window = make([]float64, 0, windowSize)
+				y.update(func(s *YieldSnapshot) { s.HaveWindow = false; s.ForeignPct = 0 })
+			}
+			switch {
+			case cfg.Enabled && !prev.Enabled:
+				unavailable = y.sampler == nil
+				failures = 0
+				y.announce(cfg)
+			case !cfg.Enabled && prev.Enabled:
+				if paused {
+					paused = false
+					pausedFor := y.now().Sub(pausedSince).Round(time.Second).String()
+					y.logger.Info("yield pause released: yielding to other programs was turned off; computing resumed",
+						"paused_for", pausedFor)
+					y.setPaused(false, time.Time{})
+					y.resolveBusyNotice()
+					y.notify(NoticeLevelInfo, fmt.Sprintf("Computing resumed after %s: yielding to other programs was turned off.", pausedFor))
+					y.signal(ctx, false)
+				}
+				window = window[:0]
+				y.update(func(s *YieldSnapshot) {
+					s.Measurable = false
+					s.Unavailable = ""
+					s.HaveWindow = false
+					s.ForeignPct = 0
+				})
+				if unavailable && y.notices != nil {
+					y.notices.Resolve(yieldUnavailableCode, "", "")
+				}
+				y.logger.Info("yield monitor stopped: yielding to other programs was turned off")
+			case cfg.Enabled:
+				y.logger.Info("yield settings changed: the next sample is judged against the new thresholds",
+					"pause_above_pct", cfg.CPUPausePct,
+					"resume_below_pct", cfg.CPUResumePct,
+					"window", windowDur.String(),
+					"poll_interval", interval.String(),
+				)
+			}
 		case <-ticker.C:
-			if y.sampler == nil {
+			if !cfg.Enabled || y.sampler == nil {
 				continue
 			}
 			sample, err := y.sampler.Sample()
@@ -263,7 +361,7 @@ func (y *YieldMonitor) run(ctx context.Context, interval time.Duration, windowSi
 			y.update(func(s *YieldSnapshot) { s.ForeignPct = avg; s.HaveWindow = true })
 
 			if !paused {
-				if avg >= float64(y.config.CPUPausePct) {
+				if avg >= float64(cfg.CPUPausePct) {
 					paused = true
 					pausedSince = y.now()
 					lastLog = pausedSince
@@ -271,18 +369,18 @@ func (y *YieldMonitor) run(ctx context.Context, interval time.Duration, windowSi
 						"foreign_cpu_pct", round1(avg),
 						"machine_cpu_pct", round1(sample.MachinePct),
 						"own_cpu_pct", round1(sample.OwnPct),
-						"pause_above_pct", y.config.CPUPausePct,
-						"resume_below_pct", y.config.CPUResumePct,
+						"pause_above_pct", cfg.CPUPausePct,
+						"resume_below_pct", cfg.CPUResumePct,
 					)
 					y.setPaused(true, pausedSince)
 					y.notify(NoticeLevelInfo, fmt.Sprintf("Computing paused: other programs are using %.0f%% of the CPU (pause above %d%%, resume below %d%%). Work resumes on its own when they need less.",
-						avg, y.config.CPUPausePct, y.config.CPUResumePct))
+						avg, cfg.CPUPausePct, cfg.CPUResumePct))
 					y.signal(ctx, true)
 				}
 				continue
 			}
 
-			if avg <= float64(y.config.CPUResumePct) {
+			if avg <= float64(cfg.CPUResumePct) {
 				paused = false
 				pausedFor := y.now().Sub(pausedSince).Round(time.Second).String()
 				y.logger.Info("yield pause released: other programs' CPU use fell; computing resumed",
@@ -300,7 +398,7 @@ func (y *YieldMonitor) run(ctx context.Context, interval time.Duration, windowSi
 				lastLog = y.now()
 				y.logger.Info("still paused for other programs' CPU use",
 					"foreign_cpu_pct", round1(avg),
-					"resume_below_pct", y.config.CPUResumePct,
+					"resume_below_pct", cfg.CPUResumePct,
 					"paused_for", y.now().Sub(pausedSince).Round(time.Second).String(),
 				)
 			}
