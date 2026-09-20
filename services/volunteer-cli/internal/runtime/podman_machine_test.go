@@ -884,7 +884,8 @@ func TestStop_NonBlocking(t *testing.T) {
 
 	<-stopStarted
 
-	// Status should return MachineStarting (stopping flag set) without blocking.
+	// Status should return MachineStopping (stopping flag set) without
+	// blocking — stopping, not starting, since TB-87.
 	done := make(chan MachineInfo, 1)
 	go func() {
 		done <- m.Status()
@@ -892,8 +893,8 @@ func TestStop_NonBlocking(t *testing.T) {
 
 	select {
 	case info := <-done:
-		if info.Status != MachineStarting {
-			t.Errorf("expected MachineStarting during Stop, got %s", info.Status)
+		if info.Status != MachineStopping {
+			t.Errorf("expected MachineStopping during Stop, got %s", info.Status)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Status() blocked while Stop() was running")

@@ -2012,10 +2012,13 @@ type ContainerRuntimeStatusResponse struct {
 	// installing the Podman that was already running (TB-73).
 	Engine string `json:"engine"`
 	// Status is one of running, stopped, not_initialized, not_installed,
-	// starting, error, or unreachable — the last when an engine that was in
-	// service stopped answering and the daemon is re-probing it (TB-80); the
-	// machine's own "running" claim is overridden then, since a Podman
-	// machine can report running with a dead API socket.
+	// starting, stopping, error, or unreachable — the last when an engine
+	// that was in service stopped answering and the daemon is re-probing it
+	// (TB-80); the machine's own "running" claim is overridden then, since a
+	// Podman machine can report running with a dead API socket. starting and
+	// stopping cover an asynchronous start, stop or setup accepted through
+	// this API (TB-87); a failed one leaves the machine's own state with the
+	// failure in Error.
 	Status          string  `json:"status"`
 	Version         string  `json:"version"`
 	SocketPath      string  `json:"socket_path"`
@@ -2025,6 +2028,15 @@ type ContainerRuntimeStatusResponse struct {
 	MachineMemoryMB int     `json:"machine_memory_mb"`
 	MachineDiskGB   int     `json:"machine_disk_gb"`
 	Error           *string `json:"error"`
+	// MachineHeldStopped reports that the Podman machine was running under
+	// this daemon and was then stopped by the volunteer — MachineStopSource
+	// says from where: "app" (the stop verb) or "outside" (`podman machine
+	// stop`, Podman Desktop) — so the daemon leaves it stopped: container work
+	// waits until the volunteer starts it again (TB-88). Status is then the
+	// machine's own state (stopped, or stopping while the stop runs), not
+	// unreachable.
+	MachineHeldStopped bool   `json:"machine_held_stopped"`
+	MachineStopSource  string `json:"machine_stop_source"`
 	// Redetecting reports that the daemon has no container runtime but keeps
 	// probing for an engine (a head is trusted for container work), so an
 	// engine started now is picked up without a restart (TB-59).
@@ -2081,6 +2093,23 @@ func (b *DaemonBridge) GetContainerRuntimeStatus() ContainerRuntimeStatusRespons
 		return resp
 	}
 
+	// A machine the volunteer stopped and the daemon leaves stopped (TB-88):
+	// the machine's own state stands, with the hold named, instead of the
+	// outage the stop caused. Once somebody starts the machine again by hand
+	// its state reads running: the next probe registers the runtime, so the
+	// hold is not reported over a running machine — the probe is brought
+	// forward instead, and the machine is reported as it is rather than as
+	// the outage it is about to end.
+	if held, source := b.daemon.PodmanMachineHeldStopped(); held && mm != nil {
+		if resp.Status == string(runtime.MachineRunning) {
+			b.daemon.WakeContainerRedetect()
+			return resp
+		}
+		resp.MachineHeldStopped = true
+		resp.MachineStopSource = source
+		return resp
+	}
+
 	// An engine that was in service and stopped answering (TB-80): the
 	// runtime is out of service and re-probed every minute. This overrides
 	// the machine's own state above — a Podman machine can report running
@@ -2121,11 +2150,18 @@ func (b *DaemonBridge) RequestContainerRedetect() error {
 	return b.daemon.RequestContainerRedetect()
 }
 
-// SetupContainerRuntime initializes and starts the container runtime.
-func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
+// SetupContainerRuntime initializes and starts the Podman machine. The work
+// runs on its own goroutine and this returns as soon as it is accepted (TB-87:
+// `podman machine init` downloads an image and `start` can take minutes, and
+// the app's client gave up on the request after 15 s); accepted reports
+// whether a setup is now under way — false with a nil error when the machine
+// is already running, in which case the runtime is registered if it is not
+// yet. The status route reports the outcome (starting, then running, or the
+// machine's state with the failure in its error).
+func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) (accepted bool, err error) {
 	mm := b.daemon.GetMachineManager()
 	if mm == nil {
-		return fmt.Errorf("no container runtime configured")
+		return false, fmt.Errorf("no container runtime configured")
 	}
 
 	// Use the size start-up would give a new machine (the resource limits with
@@ -2152,48 +2188,96 @@ func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
 		diskGB = 10000
 	}
 
-	if err := mm.Setup(cpus, memoryMB, diskGB); err != nil {
-		return err
+	switch mm.Status().Status {
+	case runtime.MachineRunning:
+		// Idempotent: nothing to set up. Register the runtime if a probe has
+		// not yet (not applicable — already registered, no head trusted for
+		// containers — is fine).
+		_ = b.daemon.RequestContainerRedetect()
+		return false, nil
+	case runtime.MachineNotInstalled:
+		return false, runtime.ErrNotInstalled
+	case runtime.MachineStarting:
+		return true, nil
+	case runtime.MachineStopping:
+		return false, runtime.ErrMachineBusy
 	}
-	// The machine is up: have the daemon build and register the runtime now
-	// rather than at its next scheduled probe (TB-59). Not applicable (already
-	// registered, or no head trusted for containers) is fine.
-	_ = b.daemon.RequestContainerRedetect()
-	return nil
+	// The volunteer is asking for the machine: a hold from an earlier stop is
+	// released so the daemon connects as soon as the socket answers (TB-88).
+	b.daemon.ReleasePodmanMachineHold()
+	return true, mm.SetupAsync(cpus, memoryMB, diskGB, func(err error) {
+		if err == nil {
+			// The machine is up: have the daemon build and register the
+			// runtime now rather than at its next scheduled probe (TB-59).
+			_ = b.daemon.RequestContainerRedetect()
+		}
+	})
 }
 
-// StartContainerRuntime starts the Podman machine (if applicable).
+// StartContainerRuntime starts the Podman machine. Returns as soon as the
+// start is under way (TB-87); nil means starting — newly, or already in
+// progress — and the status route reports the outcome. ErrAlreadyRunning,
+// ErrNotInitialized, or ErrMachineBusy while a stop is still running.
 func (b *DaemonBridge) StartContainerRuntime() error {
 	mm := b.daemon.GetMachineManager()
 	if mm == nil {
 		return fmt.Errorf("no container runtime configured")
 	}
-	status := mm.Status()
-	if status.Status == runtime.MachineRunning {
+	switch mm.Status().Status {
+	case runtime.MachineRunning:
 		return runtime.ErrAlreadyRunning
-	}
-	if status.Status == runtime.MachineNotInitialized {
+	case runtime.MachineNotInitialized:
 		return runtime.ErrNotInitialized
+	case runtime.MachineStarting:
+		return nil
+	case runtime.MachineStopping:
+		return runtime.ErrMachineBusy
 	}
-	if err := mm.Start(); err != nil {
-		return err
-	}
-	// As in SetupContainerRuntime: register the runtime now, not next minute.
-	_ = b.daemon.RequestContainerRedetect()
-	return nil
+	// As in SetupContainerRuntime: the volunteer is asking, so a hold from an
+	// earlier stop is released before the start (TB-88).
+	b.daemon.ReleasePodmanMachineHold()
+	return mm.StartAsync(func(err error) {
+		if err == nil {
+			// Register the runtime now, not next minute.
+			_ = b.daemon.RequestContainerRedetect()
+		}
+	})
 }
 
-// StopContainerRuntime stops the Podman machine (if applicable).
+// StopContainerRuntime stops the Podman machine. Returns as soon as the stop
+// is under way (TB-87); nil means stopping. The volunteer's decision is
+// recorded before the stop begins (TB-88): the container runtime leaves
+// service now — buffered container units go back to their heads un-run — and
+// the re-detection loop will not start the machine again; a stop that fails
+// hands the machine back to the loop. ErrNotRunning, or ErrMachineBusy while
+// a start is still running.
 func (b *DaemonBridge) StopContainerRuntime() error {
 	mm := b.daemon.GetMachineManager()
 	if mm == nil {
 		return fmt.Errorf("no container runtime configured")
 	}
-	status := mm.Status()
-	if status.Status != runtime.MachineRunning {
+	switch mm.Status().Status {
+	case runtime.MachineRunning:
+	case runtime.MachineStopping:
+		return nil
+	case runtime.MachineStarting:
+		return runtime.ErrMachineBusy
+	default:
 		return runtime.ErrNotRunning
 	}
-	return mm.Stop()
+	b.daemon.NotePodmanMachineStopped(daemon.MachineStopFromApp)
+	err := mm.StopAsync(func(err error) {
+		if err != nil {
+			// The machine is still up: let the loop reconnect to it.
+			b.daemon.ReleasePodmanMachineHold()
+			_ = b.daemon.RequestContainerRedetect()
+		}
+	})
+	if err != nil {
+		b.daemon.ReleasePodmanMachineHold()
+		_ = b.daemon.RequestContainerRedetect()
+	}
+	return err
 }
 
 // RegenerateKeypair generates a new Ed25519 keypair, saves it, and returns the new public key.

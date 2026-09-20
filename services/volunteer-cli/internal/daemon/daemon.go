@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -153,7 +154,13 @@ type Daemon struct {
 	containerFactory    *ContainerRuntimeFactory
 	containerRedetectMu sync.Mutex
 	containerRedetectCh chan struct{}
-	lastRedetectOutcome string
+	// containerRedetectForce is set by RequestContainerRedetect (a person's
+	// request) before the wake, and read by the loop with the wake: a forced
+	// probe runs the Podman machine bring-up even inside its retry interval
+	// and releases a machine the volunteer had stopped (TB-88); a wake
+	// without it (an outage, a machine stop) only probes.
+	containerRedetectForce atomic.Bool
+	lastRedetectOutcome    string
 	readvertiseMu       sync.Mutex
 	readvertisePending  map[string]bool
 	// containerOutage records a container engine that was in service and
@@ -3609,6 +3616,24 @@ func (d *Daemon) ContainerBackend() (runtime.BackendInfo, bool) {
 // could not build its runtime; empty when it could, or found nothing.
 func (d *Daemon) ContainerDetectError() string {
 	return d.containerFactory.LastError()
+}
+
+// TakeContainerRedetectForceForTest reads and clears the loop's force flag,
+// as the loop does on a wake, for tests that drive RedetectContainerRuntime
+// by hand.
+func (d *Daemon) TakeContainerRedetectForceForTest() bool {
+	return d.containerRedetectForce.Swap(false)
+}
+
+// ContainerRedetectWakePendingForTest reports whether a wake is queued for
+// the loop, consuming it.
+func (d *Daemon) ContainerRedetectWakePendingForTest() bool {
+	select {
+	case <-d.containerRedetectCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetSlotManagerForTest injects a SlotManager into the daemon for testing.

@@ -700,9 +700,15 @@ export function OverviewPage() {
               ? "Containers: Ready"
               : containerStatus.status === "not_installed"
                 ? "Containers: Not installed"
-                : "Containers: Unavailable"}
+                : containerStatus.status === "starting"
+                  ? "Containers: Starting…"
+                  : containerStatus.status === "stopping"
+                    ? "Containers: Stopping…"
+                    : "Containers: Unavailable"}
           </span>
-          {containerStatus.status !== "running" && (
+          {containerStatus.status !== "running" &&
+            containerStatus.status !== "starting" &&
+            containerStatus.status !== "stopping" && (
             <button
               onClick={() => emit("navigate:settings")}
               className="text-xs text-primary hover:underline"

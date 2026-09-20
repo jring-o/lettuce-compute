@@ -1017,6 +1017,38 @@ describe("OverviewPage", () => {
     expect(screen.getByText("Start")).toBeInTheDocument();
   });
 
+  it("shows a machine start or stop in progress without a Start link (TB-87)", () => {
+    for (const [status, label] of [
+      ["starting", "Containers: Starting…"],
+      ["stopping", "Containers: Stopping…"],
+    ] as const) {
+      mockUseContainerRuntime.mockReturnValue({
+        status: {
+          backend: "podman",
+          engine: "",
+          status,
+          version: "5.8.6",
+          socket_path: "/tmp/podman-machine-default-api.sock",
+          machine_required: true,
+          machine_name: "podman-machine-default",
+          machine_cpus: 2,
+          machine_memory_mb: 1366,
+          machine_disk_gb: 100,
+          error: null,
+        },
+        loading: false,
+        error: null,
+        refresh: vi.fn(),
+      });
+
+      setupDefaultMocks();
+      const { unmount } = render(<OverviewPage />);
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.queryByText("Start")).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
   it("does not render container status section when status is null", () => {
     mockUseContainerRuntime.mockReturnValue({
       status: null,
@@ -1057,33 +1089,8 @@ describe("OverviewPage", () => {
     expect(screen.queryByText("Start")).not.toBeInTheDocument();
   });
 
-  // --- Coverage gap: container runtime "starting" status ---
-
-  it("renders container runtime starting status as Unavailable with Start link", () => {
-    mockUseContainerRuntime.mockReturnValue({
-      status: {
-        backend: "podman",
-        status: "starting",
-        version: "5.3.1",
-        socket_path: "",
-        machine_required: true,
-        machine_name: "default",
-        machine_cpus: 4,
-        machine_memory_mb: 4096,
-        machine_disk_gb: 50,
-        error: null,
-      },
-      loading: false,
-      error: null,
-      refresh: vi.fn(),
-    });
-
-    setupDefaultMocks();
-    render(<OverviewPage />);
-
-    expect(screen.getByText("Containers: Unavailable")).toBeInTheDocument();
-    expect(screen.getByText("Start")).toBeInTheDocument();
-  });
+  // A machine start or stop in progress is shown as such, without a Start
+  // link (TB-87): see "shows a machine start or stop in progress" above.
 
   // --- Coverage gap: container runtime "error" status ---
 

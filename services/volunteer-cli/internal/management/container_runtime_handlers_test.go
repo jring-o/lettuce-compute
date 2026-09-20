@@ -150,28 +150,8 @@ func TestStopContainerRuntime_NoManager(t *testing.T) {
 	}
 }
 
-func TestStartContainerRuntime_Failure(t *testing.T) {
-	if !runtime.NeedsMachineForTest() {
-		t.Skip("start failure path only exercises on Windows/macOS where machine start shells out")
-	}
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	mm := runtime.NewPodmanMachineManager("/usr/bin/podman", logger)
-
-	// Mock machine start to fail with a generic error (not "not initialized" or "already running").
-	runtime.CommandExecutor = func(name string, args ...string) ([]byte, error) {
-		if len(args) >= 2 && args[0] == "machine" && args[1] == "start" {
-			return []byte("hypervisor error\n"), fmt.Errorf("exit status 1")
-		}
-		return nil, fmt.Errorf("command failed")
-	}
-
-	env := setupContainerRuntimeTestEnv(t, "podman", mm)
-	resp := env.doRequest(t, "POST", "/api/v1/container-runtime/start", "")
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("expected 500 when start fails, got %d", resp.StatusCode)
-	}
-}
+// A start that fails does so after the 202 (TB-87): the failure is reported
+// by the status route, see TestTB87_FailedStartSurfacesInTheStatusRoute.
 
 func TestSetupContainerRuntime_InvalidJSON(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -251,10 +231,11 @@ func TestGetContainerRuntime_WithMachineInfo(t *testing.T) {
 	}
 }
 
+// The machine verbs answer 202 as soon as the operation is accepted (TB-87);
+// the three happy-path tests below check the accept and, through the status
+// route, the outcome.
 func TestSetupContainerRuntime_Success(t *testing.T) {
-	if !runtime.NeedsMachineForTest() {
-		t.Skip("setup happy path only runs on Windows/macOS where machine lifecycle is exercised")
-	}
+	t.Cleanup(runtime.SetNeedsMachineForTest(true))
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	mm := runtime.NewPodmanMachineManager("/usr/bin/podman", logger)
@@ -275,21 +256,19 @@ func TestSetupContainerRuntime_Success(t *testing.T) {
 
 	env := setupContainerRuntimeTestEnv(t, "podman", mm)
 	resp := env.doRequest(t, "POST", "/api/v1/container-runtime/setup", `{"cpus":4,"memory_mb":8192,"disk_gb":20}`)
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		result := decodeJSON(t, resp)
-		t.Fatalf("expected 200, got %d: %v", resp.StatusCode, result)
+		t.Fatalf("expected 202, got %d: %v", resp.StatusCode, result)
 	}
 
 	result := decodeJSON(t, resp)
-	if result["status"] != "running" {
-		t.Errorf("expected status 'running', got %v", result["status"])
+	if result["status"] != "starting" {
+		t.Errorf("expected status 'starting', got %v", result["status"])
 	}
 }
 
 func TestStartContainerRuntime_Success(t *testing.T) {
-	if !runtime.NeedsMachineForTest() {
-		t.Skip("start happy path only runs on Windows/macOS where machine lifecycle is exercised")
-	}
+	t.Cleanup(runtime.SetNeedsMachineForTest(true))
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	mm := runtime.NewPodmanMachineManager("/usr/bin/podman", logger)
@@ -312,21 +291,19 @@ func TestStartContainerRuntime_Success(t *testing.T) {
 
 	env := setupContainerRuntimeTestEnv(t, "podman", mm)
 	resp := env.doRequest(t, "POST", "/api/v1/container-runtime/start", "")
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		result := decodeJSON(t, resp)
-		t.Fatalf("expected 200, got %d: %v", resp.StatusCode, result)
+		t.Fatalf("expected 202, got %d: %v", resp.StatusCode, result)
 	}
 
 	result := decodeJSON(t, resp)
-	if result["status"] != "running" {
-		t.Errorf("expected status 'running', got %v", result["status"])
+	if result["status"] != "starting" {
+		t.Errorf("expected status 'starting', got %v", result["status"])
 	}
 }
 
 func TestStopContainerRuntime_Success(t *testing.T) {
-	if !runtime.NeedsMachineForTest() {
-		t.Skip("stop happy path only runs on Windows/macOS where machine lifecycle is exercised")
-	}
+	t.Cleanup(runtime.SetNeedsMachineForTest(true))
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	mm := runtime.NewPodmanMachineManager("/usr/bin/podman", logger)
@@ -352,14 +329,14 @@ func TestStopContainerRuntime_Success(t *testing.T) {
 
 	env := setupContainerRuntimeTestEnv(t, "podman", mm)
 	resp := env.doRequest(t, "POST", "/api/v1/container-runtime/stop", "")
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusAccepted {
 		result := decodeJSON(t, resp)
-		t.Fatalf("expected 200, got %d: %v", resp.StatusCode, result)
+		t.Fatalf("expected 202, got %d: %v", resp.StatusCode, result)
 	}
 
 	result := decodeJSON(t, resp)
-	if result["status"] != "stopped" {
-		t.Errorf("expected status 'stopped', got %v", result["status"])
+	if result["status"] != "stopping" {
+		t.Errorf("expected status 'stopping', got %v", result["status"])
 	}
 }
 

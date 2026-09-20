@@ -287,11 +287,7 @@ describe("ContainerRuntimeStatusCard", () => {
     render(<ContainerRuntimeStatusCard />);
 
     expect(screen.getByText("Starting...")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Container runtime is starting up. This may take a moment."
-      )
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Starting the Podman machine/)).toBeInTheDocument();
   });
 
   // State: Not Initialized
@@ -745,5 +741,199 @@ describe("TB-73: Podman behind the Docker-compatible socket is called Podman", (
     render(<ContainerRuntimeStatusCard />);
     expect(screen.getByText("Docker 24.0.7")).toBeInTheDocument();
     expect(screen.getByText(/Install Podman for a lighter alternative/)).toBeInTheDocument();
+  });
+});
+
+// TB-87 / TB-88: the machine verbs answer as soon as the daemon has accepted
+// them, so the card shows the operation in progress from the status route and
+// the outcome — including a failure — when it arrives; and a machine the
+// volunteer stopped is left stopped by the daemon, which the card says.
+describe("TB-87 / TB-88: asynchronous machine verbs and a machine left stopped", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRefresh.mockResolvedValue(undefined);
+  });
+
+  it("says the machine stopped from this app is left stopped, with Start Machine", async () => {
+    const user = userEvent.setup();
+    mockStartContainerRuntime.mockResolvedValue({ status: "starting", message: "accepted" });
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "stopped",
+        machine_required: true,
+        machine_held_stopped: true,
+        machine_stop_source: "app",
+        redetecting: true,
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Machine stopped")).toBeInTheDocument();
+    expect(screen.getByText(/You stopped the machine from this app/)).toBeInTheDocument();
+    expect(screen.getByText(/Lettuce will not start it by itself/)).toBeInTheDocument();
+    expect(
+      screen.queryByText("Container leafs unavailable until machine is started.")
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("Start Machine"));
+    expect(mockStartContainerRuntime).toHaveBeenCalledOnce();
+    await waitFor(() => {
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+  });
+
+  it("names a stop from outside Lettuce", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "stopped",
+        machine_required: true,
+        machine_held_stopped: true,
+        machine_stop_source: "outside",
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText(/stopped outside Lettuce \(podman machine stop/)).toBeInTheDocument();
+    expect(screen.getByText(/Lettuce will not start it by itself/)).toBeInTheDocument();
+  });
+
+  it("shows a start that failed after it was accepted, on the stopped card", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "stopped",
+        machine_required: true,
+        error: "podman machine start failed: hypervisor error: exit status 1",
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Machine stopped")).toBeInTheDocument();
+    expect(screen.getByText(/podman machine start failed: hypervisor error/)).toBeInTheDocument();
+    expect(screen.getByText("Start Machine")).toBeInTheDocument();
+  });
+
+  it("shows a stop that failed after it was accepted, on the running card", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "running",
+        machine_required: true,
+        machine_name: "podman-machine-default",
+        machine_cpus: 2,
+        machine_memory_mb: 1366,
+        machine_disk_gb: 100,
+        error: "podman machine stop failed: graceful stop failed: exit status 125",
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText(/podman machine stop failed/)).toBeInTheDocument();
+    expect(screen.getByText("Stop Machine")).toBeInTheDocument();
+  });
+
+  it("renders the stopping state as stopping, not starting", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ status: "stopping", machine_required: true }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Stopping...")).toBeInTheDocument();
+    expect(screen.getByText(/Stopping the Podman machine/)).toBeInTheDocument();
+    expect(screen.queryByText("Starting...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Start Machine")).not.toBeInTheDocument();
+    expect(screen.queryByText("Stop Machine")).not.toBeInTheDocument();
+  });
+
+  it("tells the volunteer a start can take a minute or two", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({ status: "starting", machine_required: true }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText("Starting...")).toBeInTheDocument();
+    expect(screen.getByText(/This can take a minute or two/)).toBeInTheDocument();
+  });
+
+  it("polls the status every two seconds while a start or stop is in progress", () => {
+    vi.useFakeTimers();
+    try {
+      mockUseContainerRuntime.mockReturnValue({
+        status: makeStatus({ status: "starting", machine_required: true }),
+        loading: false,
+        error: null,
+        refresh: mockRefresh,
+      });
+      render(<ContainerRuntimeStatusCard />);
+      expect(mockRefresh).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(2100);
+      expect(mockRefresh).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(2000);
+      expect(mockRefresh).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not poll on its own while the machine is settled", () => {
+    vi.useFakeTimers();
+    try {
+      mockUseContainerRuntime.mockReturnValue({
+        status: makeStatus({ status: "stopped", machine_required: true }),
+        loading: false,
+        error: null,
+        refresh: mockRefresh,
+      });
+      render(<ContainerRuntimeStatusCard />);
+      vi.advanceTimersByTime(10_000);
+      expect(mockRefresh).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // TB-86: the daemon now parses Podman 5's MiB/GiB figures, so a machine
+  // sized `--memory 1366` reads 1,366 MiB and 100 GiB here, not 0 / 0.
+  it("prints the machine's real size from a Podman 5 inspect (TB-86)", () => {
+    mockUseContainerRuntime.mockReturnValue({
+      status: makeStatus({
+        status: "running",
+        version: "5.8.6",
+        machine_required: true,
+        machine_name: "podman-machine-default",
+        machine_cpus: 2,
+        machine_memory_mb: 1366,
+        machine_disk_gb: 100,
+      }),
+      loading: false,
+      error: null,
+      refresh: mockRefresh,
+    });
+
+    render(<ContainerRuntimeStatusCard />);
+
+    expect(screen.getByText(/Resources: 2 CPUs, 1366 MiB RAM, 100 GiB disk/)).toBeInTheDocument();
   });
 });

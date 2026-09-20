@@ -716,6 +716,11 @@ export interface ContainerRuntimeStatus {
    * returned to their heads, and the daemon re-checks the engine every minute
    * and resumes by itself when it answers (TB-80). `error` carries the
    * transport error.
+   *
+   * "starting" / "stopping": a start, stop or setup accepted through the API
+   * is running (TB-87: the verbs answer at once and this route reports the
+   * outcome). A failed one leaves the machine's own state — "stopped" after a
+   * failed start — with the failure in `error`.
    */
   status:
     | "running"
@@ -723,6 +728,7 @@ export interface ContainerRuntimeStatus {
     | "not_initialized"
     | "not_installed"
     | "starting"
+    | "stopping"
     | "error"
     | "unreachable";
   version: string;
@@ -740,6 +746,16 @@ export interface ContainerRuntimeStatus {
    * older than the route's redetect support.
    */
   redetecting?: boolean;
+  /**
+   * The Podman machine was running under this daemon and was then stopped by
+   * the volunteer — `machine_stop_source` says from where: "app" (this app's
+   * Stop Machine button) or "outside" (`podman machine stop`, Podman Desktop)
+   * — so the daemon leaves it stopped: container work waits until the machine
+   * is started again, here or by hand (TB-88). `status` is then the machine's
+   * own state (stopped, or stopping while the stop runs).
+   */
+  machine_held_stopped?: boolean;
+  machine_stop_source?: "app" | "outside" | "";
 }
 
 export interface ContainerRuntimeSetupResponse {
@@ -763,10 +779,21 @@ export async function setupContainerRuntime(
   });
 }
 
+/**
+ * Start the Podman machine. Resolves as soon as the daemon has accepted the
+ * start (TB-87): `podman machine start` takes a minute or more on an Intel
+ * Mac. The runtime status reports "starting", then "running" or the machine's
+ * state with the failure in `error`.
+ */
 export async function startContainerRuntime(): Promise<ContainerRuntimeSetupResponse> {
   return invoke("start_container_runtime");
 }
 
+/**
+ * Stop the Podman machine. Resolves as soon as the stop is accepted; the
+ * runtime status reports "stopping", then "stopped". The daemon leaves a
+ * machine stopped this way stopped until it is started again (TB-88).
+ */
 export async function stopContainerRuntime(): Promise<ContainerRuntimeSetupResponse> {
   return invoke("stop_container_runtime");
 }
