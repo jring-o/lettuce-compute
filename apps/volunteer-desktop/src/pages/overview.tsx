@@ -394,6 +394,12 @@ export function OverviewPage() {
   // pause it was refused with 409 "not paused" and the refusal was swallowed,
   // so the button did nothing (TB-72). Any other pause names its remedy.
   const canResume = isPaused && pauseIsResumable(pausedReason);
+  // A user pause can be laid over an automatic one: the daemon accepts it
+  // during a thermal, busy or schedule pause and keeps the machine paused
+  // after that pause lifts. Pause was keyed to "active", so a volunteer who
+  // wanted to stay paused had to watch for the release (TB-89). It is
+  // offered whenever no user pause is in force, worded for the state.
+  const canPause = state === "active" || (isPaused && !canResume);
 
   // A refused pause or resume, with the daemon's own reason, for a few seconds.
   const [toast, setToast] = useState<string | null>(null);
@@ -461,17 +467,19 @@ export function OverviewPage() {
     if (vizTaskId) setVizUnavailable({ workUnitId: vizTaskId, reason });
   }, [vizTaskId]);
 
-  const handlePauseResume = async () => {
+  // The verb is the button's, not the state's: Keep paused during an
+  // automatic pause must send a pause, not a resume (TB-89).
+  const handlePauseResume = async (verb: "pause" | "resume") => {
     if (!client) return;
     try {
-      if (isPaused) {
+      if (verb === "resume") {
         await client.resume();
       } else {
         await client.pause();
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      setToast(`Could not ${isPaused ? "resume" : "pause"}: ${reason}`);
+      setToast(`Could not ${verb}: ${reason}`);
     }
   };
 
@@ -498,21 +506,28 @@ export function OverviewPage() {
             </span>
           )}
         </div>
-        {state === "active" && (
-          <Button variant="outline" size="sm" onClick={handlePauseResume}>
-            Pause
-          </Button>
-        )}
-        {canResume && (
-          <Button variant="default" size="sm" onClick={handlePauseResume}>
-            Resume
-          </Button>
-        )}
-        {isPaused && !canResume && pausedReason === "scheduled" && (
-          <Button variant="outline" size="sm" onClick={() => emit("navigate:settings")}>
-            Change schedule
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {canPause && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handlePauseResume("pause")}
+              title={isPaused ? "Stay paused after this pause lifts, until you press Resume." : undefined}
+            >
+              {isPaused ? "Keep paused" : "Pause"}
+            </Button>
+          )}
+          {canResume && (
+            <Button variant="default" size="sm" onClick={() => handlePauseResume("resume")}>
+              Resume
+            </Button>
+          )}
+          {isPaused && !canResume && pausedReason === "scheduled" && (
+            <Button variant="outline" size="sm" onClick={() => emit("navigate:settings")}>
+              Change schedule
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Visualization panel */}

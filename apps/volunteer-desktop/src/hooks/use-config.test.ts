@@ -204,6 +204,8 @@ describe("needsRestart and the shared restart store", () => {
     expect(needsRestart({ log_level: "debug" })).toBe(true);
     expect(needsRestart({ work_buffer_hours: 3 })).toBe(false);
     expect(needsRestart({ notifications: { errors: false } })).toBe(false);
+    // TB-90: the daemon applies the yield block live, so no banner.
+    expect(needsRestart({ yield: { enabled: true, cpu_pause_pct: 10 } })).toBe(false);
     expect(needsRestart({ leafs: { mode: "ALL" } })).toBe(false);
     expect(needsRestart({ servers: [] })).toBe(false);
   });

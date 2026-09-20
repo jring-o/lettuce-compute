@@ -26,7 +26,10 @@ import {
  * admission books against the new figures at once, and the runtimes read the
  * new memory ceiling for the next task. Running tasks keep the ceilings they
  * started with. `work_buffer_hours`, `notifications`, `leafs` and per-head
- * weights and leaf preferences are read live as well.
+ * weights and leaf preferences are read live as well. `yield` is live since
+ * TB-90: `ApplyConfig` hands the block to the running monitor, which judges
+ * its next sample against the new thresholds, starts sampling when the
+ * setting is turned on and releases a pause it holds when it is turned off.
  */
 const RESTART_ONLY_KEYS: ReadonlyArray<keyof ConfigUpdate> = [
   "scheduling",
