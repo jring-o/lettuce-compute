@@ -89,9 +89,11 @@ func TestRequestBatchSize(t *testing.T) {
 	if got := d.requestBatchSize(CachedLeafInfo{}, 1); got != maxBatchPerRequest {
 		t.Errorf("requestBatchSize(1) = %d, want %d (cap)", got, maxBatchPerRequest)
 	}
-	// No estimate and an empty buffer => full batch to refill quickly.
-	if got := d.requestBatchSize(CachedLeafInfo{}, 0); got != maxBatchPerRequest {
-		t.Errorf("requestBatchSize(0) on empty buffer = %d, want %d", got, maxBatchPerRequest)
+	// No estimate and an empty buffer => the unit-count fallback's headroom
+	// (2 per slot), not a full batch: the count is what will bound acceptance,
+	// and anything past it came straight back (TB-84).
+	if got := d.requestBatchSize(CachedLeafInfo{}, 0); got != int32(d.fallbackBufferUnits()) {
+		t.Errorf("requestBatchSize(0) on empty buffer = %d, want %d (count headroom)", got, d.fallbackBufferUnits())
 	}
 	// A per-unit estimate larger than the whole deficit yields a single unit.
 	if got := d.requestBatchSize(CachedLeafInfo{}, 100000); got != 1 {

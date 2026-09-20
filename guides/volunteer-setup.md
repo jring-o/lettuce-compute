@@ -462,11 +462,16 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   records them as unused give-backs (not failures) and simply avoids re-offering
   the same unit to the same machine for a few minutes.
 - **It learns how long each leaf's units really take on your machine.** Until a
-  leaf has completed a unit here, its units are booked at a rough figure derived
-  from a short single-core CPU benchmark run at first start — a poor yardstick
-  for GPU work or a container using many cores, so those first bookings can be
-  hours too high. From the first completion on, each leaf's units are booked at
-  the middle value of the last five completions on this machine (kept in
+  leaf has completed a unit here, its units are booked at the per-leaf figure
+  the head publishes, if it publishes one, or else at a rough figure derived
+  from the unit's own size estimate against a short single-core CPU benchmark
+  run at first start — a poor yardstick for GPU work or a container using many
+  cores, so those first bookings can be hours too high. A leaf that publishes
+  neither figure (none of the current heads' leafs do) is held at **two units
+  per task slot** until its first completion here, and a unit handed back for
+  that reason says so in the log ("unit-count fallback"), not "over the hours
+  target". From the first completion on, each leaf's units are booked at the
+  middle value of the last five completions on this machine (kept in
   `durations.json` in the data directory, so a restart remembers it). That
   figure decides how many units fill `work_buffer_hours`, how many are asked for
   at once, and the starting point of the **remaining-time** figure shown for a

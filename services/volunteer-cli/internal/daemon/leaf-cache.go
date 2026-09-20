@@ -225,6 +225,23 @@ func (lc *LeafCache) AllLeafs() map[string][]CachedLeafInfo {
 	return result
 }
 
+// LeafByID returns the cached leaf with the given ID from whichever attached
+// head serves it. Leaf IDs are UUIDs minted per head, so the first match is
+// the leaf. Used per held unit by the per-unit duration estimate (TB-84), so
+// it scans under the read lock rather than copying the map.
+func (lc *LeafCache) LeafByID(id string) (CachedLeafInfo, bool) {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	for _, info := range lc.heads {
+		for _, l := range info.Leafs {
+			if l.ID == id {
+				return l, true
+			}
+		}
+	}
+	return CachedLeafInfo{}, false
+}
+
 // PopulateForTest directly sets cached head info for a server.
 // Intended for use by tests in other packages that need to inject cache state.
 func (lc *LeafCache) PopulateForTest(serverName string, info *CachedHeadInfo) {

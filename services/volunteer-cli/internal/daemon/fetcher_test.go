@@ -826,8 +826,12 @@ func TestFetcher_RequestsMaxAssignments(t *testing.T) {
 	servers := nativeLeafServer(mc)
 
 	d := newFetcherTestDaemon(servers)
-	// No benchmark and no buffered work → no per-unit estimate → batch sizer
-	// requests a full batch to refill the empty buffer quickly.
+	// A short-unit leaf (30 s learned here) against an empty hours buffer: the
+	// deficit math wants far more than the ceiling, so the ask is the ceiling.
+	// (With NO estimate at all the ask is the unit-count fallback's headroom
+	// instead, TB-84 — see TestTB84_NoEstimateAskIsBoundedByTheCountHeadroom.)
+	d.durations = LoadDurationTracker(t.TempDir())
+	d.durations.Record("leaf-1", 0, 30)
 	queue := NewPreFetchQueue(16, d.logger)
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
@@ -838,7 +842,7 @@ func TestFetcher_RequestsMaxAssignments(t *testing.T) {
 	fetcher.Run(ctx)
 
 	if gotMax != maxBatchPerRequest {
-		t.Errorf("MaxAssignments requested = %d, want %d (full batch when buffer empty and no estimate)", gotMax, maxBatchPerRequest)
+		t.Errorf("MaxAssignments requested = %d, want %d (full batch when the buffer is empty and units are short)", gotMax, maxBatchPerRequest)
 	}
 }
 
