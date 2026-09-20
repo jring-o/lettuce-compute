@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import {
   setupContainerRuntime,
@@ -11,6 +11,15 @@ import { Button } from "@/components/ui/button";
 import { cn, detectPlatform, formatExactMb } from "@/lib/utils";
 
 const platform = detectPlatform();
+
+/**
+ * How often the card re-reads the runtime status while a start, stop or
+ * setup is in progress. The machine verbs answer as soon as the daemon has
+ * accepted the operation (TB-87), so the outcome — running, stopped, or a
+ * failure — arrives through the status, and a minute-long start should not
+ * wait on the hook's 10 s poll to show it.
+ */
+const TRANSITION_POLL_MS = 2000;
 
 function StatusDot({ color }: { color: "green" | "yellow" | "gray" | "red" }) {
   const colors = {
@@ -39,6 +48,13 @@ export function ContainerRuntimeStatusCard() {
       setActionLoading(false);
     }
   };
+
+  const inTransition = status?.status === "starting" || status?.status === "stopping";
+  useEffect(() => {
+    if (!inTransition) return;
+    const interval = setInterval(refresh, TRANSITION_POLL_MS);
+    return () => clearInterval(interval);
+  }, [inTransition, refresh]);
 
   if (loading && !status) {
     return (
@@ -89,6 +105,11 @@ export function ContainerRuntimeStatusCard() {
             {actionLoading ? "Stopping..." : "Stop Machine"}
           </Button>
         )}
+        {/* A stop that failed after it was accepted has no request to fail;
+            the daemon reports it here (TB-87). */}
+        {status.machine_required && status.error && (
+          <p className="text-xs text-destructive break-words">{status.error}</p>
+        )}
         {actionError && <p className="text-xs text-destructive">{actionError}</p>}
       </div>
     );
@@ -133,7 +154,11 @@ export function ContainerRuntimeStatusCard() {
     );
   }
 
-  // Stopped (Podman machine)
+  // Stopped (Podman machine). A machine the volunteer stopped — here, or
+  // with podman machine stop — is left stopped by the daemon (TB-88); the
+  // card says so, since the older behaviour was to start it again within a
+  // minute. A start that failed after it was accepted is reported through
+  // status.error (TB-87).
   if (status.status === "stopped") {
     return (
       <div className="space-y-3">
@@ -141,9 +166,21 @@ export function ContainerRuntimeStatusCard() {
           <StatusDot color="yellow" />
           <span className="text-sm font-medium">Machine stopped</span>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Container leafs unavailable until machine is started.
-        </p>
+        {status.machine_held_stopped ? (
+          <p className="text-xs text-muted-foreground">
+            {status.machine_stop_source === "app"
+              ? "You stopped the machine from this app."
+              : "The machine was stopped outside Lettuce (podman machine stop, or Podman Desktop)."}{" "}
+            Lettuce will not start it by itself: container work waits until you press Start
+            Machine, run podman machine start, or restart Lettuce. WASM and native leafs keep
+            running.
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            Container leafs unavailable until machine is started.
+          </p>
+        )}
+        {status.error && <p className="text-xs text-destructive break-words">{status.error}</p>}
         <Button
           variant="outline"
           size="sm"
@@ -157,7 +194,8 @@ export function ContainerRuntimeStatusCard() {
     );
   }
 
-  // Starting
+  // Starting: the daemon accepted a start or setup and is running it; the
+  // card polls until the status settles (TB-87).
   if (status.status === "starting") {
     return (
       <div className="space-y-3">
@@ -166,7 +204,24 @@ export function ContainerRuntimeStatusCard() {
           <span className="text-sm font-medium">Starting...</span>
         </div>
         <p className="text-xs text-muted-foreground">
-          Container runtime is starting up. This may take a moment.
+          Starting the Podman machine. This can take a minute or two, longer on an Intel Mac; the
+          card updates by itself when it is up.
+        </p>
+      </div>
+    );
+  }
+
+  // Stopping: a stop is running; the machine reads stopped when it is done.
+  if (status.status === "stopping") {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center gap-2">
+          <StatusDot color="yellow" />
+          <span className="text-sm font-medium">Stopping...</span>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Stopping the Podman machine. Container work is paused; Lettuce will not start the
+          machine again by itself.
         </p>
       </div>
     );

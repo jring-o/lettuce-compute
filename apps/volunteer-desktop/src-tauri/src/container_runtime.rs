@@ -55,11 +55,15 @@ impl ManagementClient {
             .await
     }
 
+    /// `POST /api/v1/container-runtime/start`: 202 as soon as the daemon has
+    /// accepted the start (TB-87); the status route reports the outcome.
     pub async fn start_container_runtime(&self) -> Result<SetupResponse, String> {
         self.post_with_body::<(), SetupResponse>("/api/v1/container-runtime/start", None)
             .await
     }
 
+    /// `POST /api/v1/container-runtime/stop`: 202 as soon as the stop is
+    /// accepted. The daemon leaves the machine stopped afterwards (TB-88).
     pub async fn stop_container_runtime(&self) -> Result<SetupResponse, String> {
         self.post_with_body::<(), SetupResponse>("/api/v1/container-runtime/stop", None)
             .await

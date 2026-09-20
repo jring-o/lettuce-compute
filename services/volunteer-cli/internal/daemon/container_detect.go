@@ -41,6 +41,17 @@ import (
 // probes again until the engine answers, then registers a fresh runtime and
 // resolves the notice. A probe is a ping, never a fetched unit, and a runtime
 // is registered only after its engine has answered one.
+//
+// One outage is the volunteer's own doing (TB-88): the app's "Stop Machine"
+// button, or `podman machine stop` in a terminal. The loop used to treat the
+// machine that went away exactly like one that had never been started — its
+// next probe, a second after the stop, ran the bring-up and the machine was
+// back within the minute. Now a Podman machine that was running under this
+// daemon and is found stopped is left stopped: the factory holds the machine
+// (machineHeld), the loop only checks each minute whether somebody has
+// started it again, and the hold is released by a person's explicit request
+// (the app's Start / Setup / "Check again now", which force the bring-up) or
+// a daemon restart. The bring-up at daemon start is unchanged.
 
 // containerRedetectInterval is how often a daemon without a container runtime
 // probes for an engine again. A minute is short enough that a login-time
@@ -70,7 +81,31 @@ var (
 	ErrContainerRuntimeRegistered = errors.New("a container runtime is already registered")
 	ErrContainerNotTrusted        = errors.New("no attached head is trusted to run container work on this machine")
 	ErrContainerDetectUnavailable = errors.New("this daemon has no container-engine detector")
+	// ErrPodmanMachineHeldStopped is Build's answer while the volunteer's
+	// stopped machine is left stopped (TB-88): no runtime, and not an outage
+	// to warn about.
+	ErrPodmanMachineHeldStopped = errors.New("the Podman machine was stopped by the volunteer and is left stopped")
 )
+
+// Where a Podman machine stop came from, for the hold's record and the
+// management API (ContainerRuntimeStatusResponse.MachineStopSource).
+const (
+	// MachineStopFromApp: the app's Stop Machine button (the management API's
+	// stop verb).
+	MachineStopFromApp = "app"
+	// MachineStopOutside: the machine that was running under this daemon was
+	// found stopped by the probe after an outage — `podman machine stop` in a
+	// terminal, Podman Desktop, another program.
+	MachineStopOutside = "outside"
+)
+
+// describeMachineStop is the plain-language form of a stop source.
+func describeMachineStop(source string) string {
+	if source == MachineStopFromApp {
+		return "from the app"
+	}
+	return "outside Lettuce (podman machine stop, Podman Desktop, or another program)"
+}
 
 // ContainerRuntimeFactory detects a container engine and builds the container
 // runtime for it — the backend connection, the resource ceilings and
@@ -101,6 +136,14 @@ type ContainerRuntimeFactory struct {
 	// lastMachineSetupFailure is when a machine init/start or the wait for its
 	// socket last failed; see machineSetupRetryInterval.
 	lastMachineSetupFailure time.Time
+	// machineHeld records that the Podman machine was running under this
+	// daemon and was then stopped by the volunteer — machineStopSource says
+	// from where — so Build leaves it stopped instead of starting it again
+	// (TB-88). Released by a forced Build (a person's request), by a
+	// successful registration (somebody started the machine by hand), or by
+	// ReleaseMachineHold.
+	machineHeld       bool
+	machineStopSource string
 	// engineMemoryMB is the memory of the VM the engine runs inside, as the
 	// engine reported it at the last successful Build (0 on a host whose
 	// containers share its RAM, or when the engine did not say); budgetMB is
@@ -256,11 +299,40 @@ func (f *ContainerRuntimeFactory) Build(forceMachineSetup bool) (runtime.Runtime
 	if backend.Backend == runtime.BackendPodman {
 		mm := f.machineManagerFor(backend.BinaryPath)
 		if mm.NeedsMachine() {
-			if forceMachineSetup || f.machineSetupDue() {
+			switch {
+			case forceMachineSetup:
+				// Start-up, or a person's explicit request (the redetect verb;
+				// a start or setup through the API): a held machine is
+				// released and the bring-up runs even inside its retry interval.
+				f.ReleaseMachineHold()
 				f.recordMachineSetup(f.setUpMachine(mm))
 				// Re-detect backend after machine setup to get updated socket path.
 				backend = f.detect(preferred)
-			} else {
+			case f.machineHeldStopped():
+				// The volunteer stopped the machine (TB-88): leave it stopped.
+				// Only look (a fresh inspect, once a minute) whether somebody
+				// has started it again — then connect below, and the
+				// registration releases the hold.
+				mm.InvalidateStatus()
+				if st := mm.Status(); st.Status != runtime.MachineRunning {
+					_, source := f.MachineHeldStopped()
+					err := fmt.Errorf("%w (stopped %s)", ErrPodmanMachineHeldStopped, describeMachineStop(source))
+					f.recordResult(backend, false, err.Error())
+					return nil, backend, err
+				}
+			case f.machineSetupDue():
+				if f.stoppedSinceBuilt(mm) {
+					// A machine this daemon had a runtime on is now stopped and
+					// nothing here stopped it: the volunteer did, by hand. Hold
+					// it rather than undo their stop (TB-88).
+					f.HoldMachineStopped(MachineStopOutside)
+					err := fmt.Errorf("%w (stopped %s)", ErrPodmanMachineHeldStopped, describeMachineStop(MachineStopOutside))
+					f.recordResult(backend, false, err.Error())
+					return nil, backend, err
+				}
+				f.recordMachineSetup(f.setUpMachine(mm))
+				backend = f.detect(preferred)
+			default:
 				f.logger.Debug("podman machine setup failed recently; probing the socket only until the retry interval passes",
 					"retry_interval", machineSetupRetryInterval)
 			}
@@ -431,9 +503,70 @@ func (f *ContainerRuntimeFactory) recordMachineSetup(err error) {
 	}
 }
 
+// stoppedSinceBuilt reports whether a Podman machine this factory once built
+// a runtime on — so it was running under this daemon — now reads stopped. A
+// fresh `podman machine inspect`, not the manager's cache: the cache may hold
+// the state from before the stop. A machine that reports running with a dead
+// socket (the applehv stale-socket family) is not stopped, and the bring-up
+// still runs for it as before.
+func (f *ContainerRuntimeFactory) stoppedSinceBuilt(mm *runtime.PodmanMachineManager) bool {
+	f.mu.Lock()
+	wasUp := f.built && f.backend.Backend == runtime.BackendPodman
+	f.mu.Unlock()
+	if !wasUp {
+		return false
+	}
+	mm.InvalidateStatus()
+	return mm.Status().Status == runtime.MachineStopped
+}
+
+// HoldMachineStopped records that the volunteer stopped the Podman machine
+// (source: MachineStopFromApp or MachineStopOutside), so Build leaves it
+// stopped until a person asks for it again (TB-88).
+func (f *ContainerRuntimeFactory) HoldMachineStopped(source string) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.machineHeld = true
+	f.machineStopSource = source
+}
+
+// ReleaseMachineHold lets Build bring the machine up again: the volunteer
+// asked for it (the app's Start or Setup, a redetect request) or the machine
+// came back by their hand.
+func (f *ContainerRuntimeFactory) ReleaseMachineHold() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.machineHeld = false
+	f.machineStopSource = ""
+}
+
+// MachineHeldStopped reports whether the Podman machine is held stopped and
+// where the stop came from.
+func (f *ContainerRuntimeFactory) MachineHeldStopped() (held bool, source string) {
+	if f == nil {
+		return false, ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.machineHeld, f.machineStopSource
+}
+
+func (f *ContainerRuntimeFactory) machineHeldStopped() bool {
+	held, _ := f.MachineHeldStopped()
+	return held
+}
+
 // recordResult notes a Build's outcome: the engine a runtime was built
 // against (only on success — a later "nothing found" must not erase it), and
-// the reason construction failed, if it did.
+// the reason construction failed, if it did. A successful build releases a
+// machine hold: the engine answers, so whoever stopped the machine has
+// started it again.
 func (f *ContainerRuntimeFactory) recordResult(backend runtime.BackendInfo, built bool, errStr string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -441,6 +574,8 @@ func (f *ContainerRuntimeFactory) recordResult(backend runtime.BackendInfo, buil
 	if built {
 		f.backend = backend
 		f.built = true
+		f.machineHeld = false
+		f.machineStopSource = ""
 	}
 }
 
@@ -613,11 +748,13 @@ func (d *Daemon) runContainerRedetect(ctx context.Context) {
 				continue
 			}
 			// Woken with nothing registered — an outage took the runtime out
-			// of service: probe at once, then on the cadence. Not forced: a
-			// Podman machine bring-up that failed within its retry interval
-			// is not re-driven for an outage the way it is for a person's
-			// explicit request; the cheap ping still runs every minute.
-			if d.RedetectContainerRuntime(ctx, false) {
+			// of service, or the volunteer stopped the machine: probe at once,
+			// then on the cadence. Forced only for a person's explicit request
+			// (containerRedetectForce): a Podman machine bring-up that failed
+			// within its retry interval is not re-driven for an outage, and a
+			// machine the volunteer stopped is not started (TB-88); the cheap
+			// ping still runs every minute.
+			if d.RedetectContainerRuntime(ctx, d.containerRedetectForce.Swap(false)) {
 				continue
 			}
 			timer.Reset(containerRedetectInterval)
@@ -628,10 +765,12 @@ func (d *Daemon) runContainerRedetect(ctx context.Context) {
 			return
 		case <-timer.C:
 		case <-d.containerRedetectCh:
-			// An explicit request (the API verb, a machine start that just
-			// succeeded): probe now and let a machine bring-up run even inside
-			// its retry interval — the person asking has usually just fixed it.
-			force = true
+			// A wake. An explicit request (the API verb, a machine start that
+			// just succeeded) sets containerRedetectForce: probe now and let a
+			// machine bring-up run even inside its retry interval — the person
+			// asking has usually just fixed it. A wake without the flag (an
+			// outage, a machine stop) probes without the bring-up.
+			force = d.containerRedetectForce.Swap(false)
 			stopTimer()
 		}
 		if d.RedetectContainerRuntime(ctx, force) {
@@ -643,7 +782,9 @@ func (d *Daemon) runContainerRedetect(ctx context.Context) {
 
 // RequestContainerRedetect asks the loop to probe for an engine now instead of
 // at its next tick. It returns an error when a probe is not applicable, so the
-// caller can say why rather than wait for nothing.
+// caller can say why rather than wait for nothing. The probe is forced: a
+// person is asking, so a machine bring-up runs even inside its retry interval
+// and a machine the volunteer had stopped is started again (TB-88).
 func (d *Daemon) RequestContainerRedetect() error {
 	switch {
 	case d.containerFactory == nil:
@@ -653,11 +794,31 @@ func (d *Daemon) RequestContainerRedetect() error {
 	case !d.containerRedetectActive():
 		return ErrContainerNotTrusted
 	}
+	d.containerRedetectForce.Store(true)
+	d.wakeContainerRedetect()
+	return nil
+}
+
+// wakeContainerRedetect wakes the loop for a probe without forcing the
+// machine bring-up (an outage, a machine stop).
+func (d *Daemon) wakeContainerRedetect() {
 	select {
 	case d.containerRedetectCh <- struct{}{}:
 	default: // a probe is already queued
 	}
-	return nil
+}
+
+// WakeContainerRedetect brings the loop's next probe forward without forcing
+// the machine bring-up. The management API's status route uses it when a
+// held machine reads running again — the volunteer started it by hand — so
+// the runtime is registered within a second instead of at the next tick,
+// and the card does not read "not answering" for up to a minute over a
+// machine that is up (TB-88).
+func (d *Daemon) WakeContainerRedetect() {
+	if d.containerFactory == nil || d.runtimeRegistry == nil {
+		return
+	}
+	d.wakeContainerRedetect()
 }
 
 // RedetectContainerRuntime runs one detection attempt now and registers the
@@ -680,14 +841,18 @@ func (d *Daemon) RedetectContainerRuntime(ctx context.Context, forceMachineSetup
 		// is not told so every minute; the first "still nothing" after the
 		// start-up WARN is silent.
 		outcome := "none"
+		held := errors.Is(err, ErrPodmanMachineHeldStopped)
 		if err != nil {
 			outcome = "error: " + err.Error()
 		}
 		if outcome != d.lastRedetectOutcome {
-			if err != nil {
+			switch {
+			case held:
+				d.noteMachineHeldStopped()
+			case err != nil:
 				d.logger.Warn("container engine found but its runtime could not be built; will keep re-checking",
 					"backend", backend.Backend, "socket", backend.SocketPath, "error", err)
-			} else {
+			default:
 				d.logger.Info("no container engine answered; will keep re-checking", "interval", containerRedetectInterval)
 			}
 		} else {
@@ -732,6 +897,10 @@ func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtim
 
 	runtimes := d.runtimeRegistry.AvailableRuntimes()
 	sort.Strings(runtimes)
+	// A machine the volunteer had stopped is up again (by their hand, or by
+	// their request through the app): the hold is released by the build, and
+	// its notice is resolved here (TB-88).
+	d.notices.Resolve("container_machine_stopped", "", "")
 	if outage := d.endContainerOutage(); outage != nil {
 		// The engine that stopped answering is back (TB-80): the notice the
 		// outage raised is resolved, and the heads hear CONTAINER again on
@@ -904,10 +1073,6 @@ func (d *Daemon) NoteContainerEngineUnreachable(rt runtime.Runtime, err error) b
 	if err != nil {
 		errText = err.Error()
 	}
-	d.containerOutageMu.Lock()
-	d.containerOutage = &containerOutage{since: time.Now(), backend: backend, err: errText}
-	d.containerOutageMu.Unlock()
-
 	where := string(backend.Backend)
 	if backend.SocketPath != "" {
 		where += " at " + backend.SocketPath
@@ -923,6 +1088,21 @@ func (d *Daemon) NoteContainerEngineUnreachable(rt runtime.Runtime, err error) b
 		fmt.Sprintf("The container engine (%s) is not answering: %s. Container work is paused and buffered container units have been returned to their heads un-run; Lettuce re-checks the engine every minute and resumes container work by itself when it answers. %s",
 			where, errText, containerOutageRemedy(backend)),
 		"", "")
+	d.retireContainerRuntime(backend, errText)
+	return true
+}
+
+// retireContainerRuntime is the part of taking a container runtime out of
+// service that an engine outage (NoteContainerEngineUnreachable) and a machine
+// the volunteer stopped (NotePodmanMachineStopped) share, once the runtime has
+// left the registry: record the outage (the buffer sweep and the status route
+// read it), flag every head for re-registration without CONTAINER,
+// re-evaluate the no-runnable-leaf verdict, return every buffered container
+// unit to its head un-run, and wake the re-detection loop.
+func (d *Daemon) retireContainerRuntime(backend runtime.BackendInfo, errText string) {
+	d.containerOutageMu.Lock()
+	d.containerOutage = &containerOutage{since: time.Now(), backend: backend, err: errText}
+	d.containerOutageMu.Unlock()
 
 	d.markRuntimesChanged()
 	d.refreshRuntimeBlocked()
@@ -938,11 +1118,73 @@ func (d *Daemon) NoteContainerEngineUnreachable(rt runtime.Runtime, err error) b
 		f.sweepBuffer()
 	}
 
-	select {
-	case d.containerRedetectCh <- struct{}{}:
-	default: // a probe is already queued
+	d.wakeContainerRedetect()
+}
+
+// --- a Podman machine the volunteer stopped (TB-88) ---
+
+// NotePodmanMachineStopped records that the volunteer is stopping the Podman
+// machine through the app (the management API's stop verb, before the stop
+// begins): the machine is held stopped so the re-detection loop will not
+// start it again, and the container runtime leaves service at once — every
+// buffered container unit goes back to its head un-run and the heads are
+// re-told this machine's runtimes — rather than at the first unit to fail
+// against the dead engine. The loop, woken, notes the hold: one Info line and
+// the container_machine_stopped notice, in place of the outage WARN.
+func (d *Daemon) NotePodmanMachineStopped(source string) {
+	if d.containerFactory == nil {
+		return
 	}
-	return true
+	d.containerFactory.HoldMachineStopped(source)
+	if d.runtimeRegistry == nil {
+		return
+	}
+	rt := d.runtimeRegistry.GetRuntime("container")
+	if rt == nil || !d.runtimeRegistry.Unregister(rt) {
+		// Nothing in service (the machine was stopped during an outage, or
+		// before its runtime came up): the loop's next probe notes the hold.
+		return
+	}
+	backend, _ := d.containerFactory.Backend()
+	d.logger.Info("podman machine is being stopped from the app: container work is paused and buffered container units are returned to their heads; Lettuce will not start the machine by itself",
+		"backend", backend.Backend, "socket", backend.SocketPath)
+	d.retireContainerRuntime(backend, "the Podman machine was stopped "+describeMachineStop(source))
+}
+
+// ReleasePodmanMachineHold lets the loop bring the machine up again: the
+// volunteer asked for it (the app's Start or Setup button).
+func (d *Daemon) ReleasePodmanMachineHold() {
+	d.containerFactory.ReleaseMachineHold()
+}
+
+// PodmanMachineHeldStopped reports whether the Podman machine is left stopped
+// on the volunteer's decision, and where the stop came from
+// (MachineStopFromApp, MachineStopOutside). For the management API's status
+// route, so the app's runtime card can say "stopped by you; Lettuce will not
+// start it" instead of "unreachable, re-checking".
+func (d *Daemon) PodmanMachineHeldStopped() (held bool, source string) {
+	return d.containerFactory.MachineHeldStopped()
+}
+
+// noteMachineHeldStopped is the loop's one-time report of a hold (the outcome
+// changed): an Info line — the volunteer's own decision, not a fault — and
+// the container_machine_stopped notice, which supersedes the outage notice
+// the stop may have raised first. A stop from outside the app is a WARN-level
+// notice: nothing on the app's own screens confirmed it.
+func (d *Daemon) noteMachineHeldStopped() {
+	_, source := d.containerFactory.MachineHeldStopped()
+	d.logger.Info("podman machine is stopped by the volunteer; Lettuce will not start it by itself — container work waits until it is started again",
+		"stopped", describeMachineStop(source), "start_it", "the app's Start Machine button, 'podman machine start', or a Lettuce restart",
+		"check_interval", containerRedetectInterval)
+	d.notices.Resolve("container_engine_unreachable", "", "")
+	level := NoticeInfo
+	if source == MachineStopOutside {
+		level = NoticeWarn
+	}
+	d.notices.Notify(level, "container_machine_stopped",
+		fmt.Sprintf("The Podman machine was stopped %s. Lettuce will not start it by itself: container work waits until you start the machine again (Settings, runtime card, Start Machine; or 'podman machine start'), and Lettuce picks it up within a minute. Buffered container units were returned to their heads un-run; WASM and native work continues.",
+			describeMachineStop(source)),
+		"", "")
 }
 
 // containerOutageRemedy is the volunteer-facing hint for an engine that

@@ -61,8 +61,11 @@ pub struct MgmtError {
     /// The daemon's own error code (`VALIDATION_ERROR`, `NOT_FOUND`, `CONFLICT`,
     /// `INTERNAL_ERROR`, ...), `UNKNOWN` when a non-2xx response carried no
     /// parseable `{error:{code,message}}` envelope, `INVALID_RESPONSE` when a
-    /// 2xx body was not JSON, or `DAEMON_UNREACHABLE` when no request reached the
-    /// daemon at all (no daemon.json, connection refused, timeout).
+    /// 2xx body was not JSON, `DAEMON_UNREACHABLE` when no request reached the
+    /// daemon at all (no daemon.json, connection refused), or
+    /// `REQUEST_TIMED_OUT` when the daemon took the request but did not answer
+    /// within the timeout — it may still be working on it, so this is not
+    /// reported as an unreachable daemon (TB-87).
     pub code: String,
     pub message: String,
     /// HTTP status of the daemon's response; 0 when there was no response.
@@ -74,6 +77,17 @@ impl MgmtError {
         Self {
             code: "DAEMON_UNREACHABLE".into(),
             message: message.into(),
+            status: 0,
+        }
+    }
+
+    pub fn timed_out(timeout: Duration) -> Self {
+        Self {
+            code: "REQUEST_TIMED_OUT".into(),
+            message: format!(
+                "the daemon did not answer within {} s; it may still be working on the request",
+                timeout.as_secs()
+            ),
             status: 0,
         }
     }
@@ -155,6 +169,17 @@ fn parse_error(status: u16, body: &[u8]) -> MgmtError {
     MgmtError::with_status("UNKNOWN", message, status)
 }
 
+/// Classify a request that produced no response: a timeout is the daemon not
+/// answering in time (it took the request; a slow verb may still complete),
+/// everything else is the daemon not being reached at all.
+fn transport_error(e: reqwest::Error, timeout: Duration) -> MgmtError {
+    if e.is_timeout() {
+        MgmtError::timed_out(timeout)
+    } else {
+        MgmtError::unreachable(format!("management API request failed: {e}"))
+    }
+}
+
 fn shared_http() -> &'static reqwest::Client {
     static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
     HTTP.get_or_init(reqwest::Client::new)
@@ -212,10 +237,7 @@ impl ManagementClient {
             req = req.json(b);
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| MgmtError::unreachable(format!("management API request failed: {e}")))?;
+        let resp = req.send().await.map_err(|e| transport_error(e, timeout))?;
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| {
             MgmtError::with_status(
@@ -359,5 +381,48 @@ mod tests {
     fn credit_gets_longer_timeout() {
         assert_eq!(timeout_for("/api/v1/credit"), CREDIT_TIMEOUT);
         assert_eq!(timeout_for("/api/v1/status"), DEFAULT_TIMEOUT);
+    }
+
+    /// A daemon that accepts the connection and never answers is a timed-out
+    /// request, not an unreachable daemon (TB-87): the machine verbs are
+    /// asynchronous now, but any slow verb must never be labelled
+    /// DAEMON_UNREACHABLE while the daemon is in fact working on it.
+    #[tokio::test]
+    async fn a_silent_daemon_is_a_timeout_not_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept connections and hold them open without answering.
+        let held: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> = Default::default();
+        let held_in = held.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                held_in.lock().unwrap().push(stream);
+            }
+        });
+        let client = ManagementClient::new(port, "token".into());
+        let err = client
+            .request_value(
+                reqwest::Method::POST,
+                "/api/v1/container-runtime/start",
+                None,
+                Duration::from_millis(300),
+            )
+            .await
+            .expect_err("a request nobody answers must fail");
+        assert_eq!(err.code, "REQUEST_TIMED_OUT", "{err}");
+        assert!(err.message.contains("may still be working"), "{err}");
+
+        // Nothing listening at all is still unreachable: a port that was
+        // bound a moment ago and released, so the connection is refused.
+        drop(held);
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let dead = ManagementClient::new(closed_port, "token".into());
+        let err = dead
+            .request_value(reqwest::Method::GET, "/api/v1/status", None, Duration::from_secs(5))
+            .await
+            .expect_err("a closed port must fail");
+        assert_eq!(err.code, "DAEMON_UNREACHABLE", "{err}");
     }
 }

@@ -17,6 +17,9 @@ var (
 	ErrNotRunning     = errors.New("not running")
 	ErrNotInitialized = errors.New("not initialized")
 	ErrNotInstalled   = errors.New("not installed")
+	// ErrMachineBusy: a start, stop or setup is already in progress and the
+	// requested operation would only queue behind it (TB-87).
+	ErrMachineBusy = errors.New("a machine operation is already in progress")
 )
 
 // MachineStatus represents the state of the Podman machine.
@@ -28,7 +31,11 @@ const (
 	MachineNotInitialized MachineStatus = "not_initialized"
 	MachineNotInstalled   MachineStatus = "not_installed"
 	MachineStarting       MachineStatus = "starting"
-	MachineError          MachineStatus = "error"
+	// MachineStopping: a stop is in progress. Reported apart from starting so
+	// the app's runtime card does not read "Starting..." while the machine is
+	// on its way down (TB-87).
+	MachineStopping MachineStatus = "stopping"
+	MachineError    MachineStatus = "error"
 )
 
 // MachineInfo holds the current state of the Podman machine.
@@ -39,7 +46,11 @@ type MachineInfo struct {
 	MemoryMB   int
 	DiskGB     int
 	SocketPath string
-	Error      string // last error, empty if no error
+	// Error is the machine's own error (an inspect that failed) or, when the
+	// machine itself is fine, why the last start, stop or setup this manager
+	// ran failed — so a failure of an asynchronous operation (TB-87) reaches
+	// the caller that polls Status. Empty when there is nothing to report.
+	Error string
 }
 
 // PodmanMachineManager manages the Podman machine lifecycle on Windows/macOS.
@@ -52,6 +63,18 @@ type PodmanMachineManager struct {
 	starting     bool
 	initializing bool
 	stopping     bool
+	// pendingOp names an asynchronous operation (StartAsync, StopAsync,
+	// SetupAsync) that has been accepted but whose goroutine has not yet taken
+	// opMu — or is still running — so Status reports it as in progress from
+	// the moment the caller was told "accepted", not from the moment the
+	// command starts (TB-87). "start", "stop" or "setup"; empty otherwise.
+	pendingOp string
+	// lastOpErr is why the most recent init, start or stop failed, kept until
+	// the next one succeeds. Status reports it as MachineInfo.Error when the
+	// machine itself has no error to report, so a caller that only polls
+	// Status (the app's runtime card after an asynchronous verb) learns of the
+	// failure.
+	lastOpErr string
 
 	// startedByThisProcess records whether THIS process actually issued the
 	// successful `podman machine start` that brought the machine up (set on
@@ -84,14 +107,24 @@ func (m *PodmanMachineManager) NeedsMachine() bool {
 	return needsMachine()
 }
 
-// needsMachine is the platform check, extracted for testability.
-func needsMachine() bool {
+// needsMachine is the platform check. A variable so a test on a Linux CI
+// runner can put the manager on the machine path (SetNeedsMachineForTest) and
+// drive `podman machine` through the mocked CommandExecutor.
+var needsMachine = func() bool {
 	return goruntime.GOOS == "windows" || goruntime.GOOS == "darwin"
 }
 
 // NeedsMachineForTest exposes needsMachine for use in tests in other packages.
 func NeedsMachineForTest() bool {
 	return needsMachine()
+}
+
+// SetNeedsMachineForTest overrides the platform check for tests in any
+// package and returns the function that restores it.
+func SetNeedsMachineForTest(v bool) (restore func()) {
+	orig := needsMachine
+	needsMachine = func() bool { return v }
+	return func() { needsMachine = orig }
 }
 
 // ContainerEngineRunsInVM reports whether this platform's container engine
@@ -108,17 +141,31 @@ var ContainerEngineRunsInVM = func() bool {
 // On Linux: returns Running if Podman binary exists, NotInstalled otherwise.
 // On Windows/macOS: runs `podman machine inspect` and parses the output.
 func (m *PodmanMachineManager) Status() MachineInfo {
+	return m.status(true)
+}
+
+// status is Status with a choice about the asynchronous accept marker:
+// callers outside the manager see an accepted operation as in progress
+// (withPending); the operation itself (Setup, deciding what the machine
+// needs) must see the machine's real state, not its own marker.
+func (m *PodmanMachineManager) status(withPending bool) MachineInfo {
 	m.mu.Lock()
 
-	// Return transitional status if any operation is in progress.
-	if m.starting || m.initializing || m.stopping {
+	// Return transitional status if any operation is in progress — accepted
+	// (pendingOp) or running. A stop reports as stopping; everything else
+	// (init, start, setup) as starting.
+	if m.stopping || (withPending && m.pendingOp == "stop") {
+		m.mu.Unlock()
+		return MachineInfo{Status: MachineStopping}
+	}
+	if m.starting || m.initializing || (withPending && m.pendingOp != "") {
 		m.mu.Unlock()
 		return MachineInfo{Status: MachineStarting}
 	}
 
 	// Check cache.
 	if m.cachedInfo != nil && time.Since(m.cachedAt) < m.cacheTTL {
-		info := *m.cachedInfo
+		info := m.withLastOpError(*m.cachedInfo)
 		m.mu.Unlock()
 		return info
 	}
@@ -126,7 +173,7 @@ func (m *PodmanMachineManager) Status() MachineInfo {
 	// Prevent stampede: if another goroutine is fetching, return stale cache or starting.
 	if m.fetching {
 		if m.cachedInfo != nil {
-			info := *m.cachedInfo
+			info := m.withLastOpError(*m.cachedInfo)
 			m.mu.Unlock()
 			return info
 		}
@@ -159,9 +206,29 @@ func (m *PodmanMachineManager) Status() MachineInfo {
 	m.mu.Lock()
 	m.cachedInfo = &info
 	m.cachedAt = time.Now()
+	info = m.withLastOpError(info)
 	m.mu.Unlock()
 
 	return info
+}
+
+// withLastOpError fills in the last failed operation's error when the machine
+// itself reported none. Called with mu held.
+func (m *PodmanMachineManager) withLastOpError(info MachineInfo) MachineInfo {
+	if info.Error == "" && m.lastOpErr != "" {
+		info.Error = m.lastOpErr
+	}
+	return info
+}
+
+// InvalidateStatus drops the cached machine state so the next Status runs a
+// fresh `podman machine inspect`. The daemon's re-detection uses it before
+// deciding whether a machine that was running under it has been stopped
+// (TB-88): the cache may still hold the state from before the stop.
+func (m *PodmanMachineManager) InvalidateStatus() {
+	m.mu.Lock()
+	m.cachedInfo = nil
+	m.mu.Unlock()
 }
 
 // linuxStatus checks Podman availability on Linux (no VM required).
@@ -182,9 +249,13 @@ type podmanMachineInspectResult struct {
 	Name      string `json:"Name"`
 	State     string `json:"State"`
 	Resources struct {
-		CPUs     int `json:"CPUs"`
-		Memory   int `json:"Memory"`   // bytes
-		DiskSize int `json:"DiskSize"` // bytes
+		CPUs int `json:"CPUs"`
+		// Memory and DiskSize are printed in MiB and GiB by Podman 5 (the
+		// machine package types them strongunits.MiB / GiB) and in bytes by
+		// Podman 4, which this parser was first written against; see
+		// inspectMemoryMB / inspectDiskGB (TB-86).
+		Memory   int `json:"Memory"`
+		DiskSize int `json:"DiskSize"`
 	} `json:"Resources"`
 	ConnectionInfo struct {
 		PodmanSocket *struct {
@@ -229,8 +300,8 @@ func (m *PodmanMachineManager) machineStatus() MachineInfo {
 	info := MachineInfo{
 		Name:     r.Name,
 		CPUs:     r.Resources.CPUs,
-		MemoryMB: r.Resources.Memory / (1024 * 1024),
-		DiskGB:   r.Resources.DiskSize / (1024 * 1024 * 1024),
+		MemoryMB: inspectMemoryMB(r.Resources.Memory),
+		DiskGB:   inspectDiskGB(r.Resources.DiskSize),
 	}
 
 	// Resolve socket path.
@@ -250,6 +321,32 @@ func (m *PodmanMachineManager) machineStatus() MachineInfo {
 	}
 
 	return info
+}
+
+// inspectUnitsBytesAbove is the value above which an inspect figure is read
+// as bytes rather than MiB/GiB: no machine has a million MiB of memory or a
+// million GiB of disk, and a byte count below one MiB is not a machine size
+// either. Podman 5 prints `"Memory": 6144, "DiskSize": 100` (MiB, GiB);
+// Podman 4 printed the same machine as 6442450944 and 107374182400 (bytes).
+// Dividing the Podman 5 figures as bytes gave every current Podman a card
+// reading "0 MiB RAM, 0 GiB disk" (TB-86).
+const inspectUnitsBytesAbove = 1 << 20
+
+// inspectMemoryMB converts `podman machine inspect`'s Resources.Memory to
+// MiB: bytes when the figure is too large to be a MiB count, else MiB as is.
+func inspectMemoryMB(v int) int {
+	if v > inspectUnitsBytesAbove {
+		return v / (1024 * 1024)
+	}
+	return v
+}
+
+// inspectDiskGB converts Resources.DiskSize to GiB the same way.
+func inspectDiskGB(v int) int {
+	if v > inspectUnitsBytesAbove {
+		return v / (1024 * 1024 * 1024)
+	}
+	return v
 }
 
 // Init initializes a new Podman machine with the given resources.
@@ -286,11 +383,24 @@ func (m *PodmanMachineManager) initLocked(cpus, memoryMB, diskGB int) error {
 
 	out, err := CommandExecutor(m.podmanBinary, args...)
 	if err != nil {
-		return fmt.Errorf("podman machine init failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return m.recordOp(fmt.Errorf("podman machine init failed: %s: %w", strings.TrimSpace(string(out)), err))
 	}
 
 	m.logger.Info("podman machine initialized")
-	return nil
+	return m.recordOp(nil)
+}
+
+// recordOp notes an operation's outcome for Status (lastOpErr) and returns
+// the error unchanged.
+func (m *PodmanMachineManager) recordOp(err error) error {
+	m.mu.Lock()
+	if err != nil {
+		m.lastOpErr = err.Error()
+	} else {
+		m.lastOpErr = ""
+	}
+	m.mu.Unlock()
+	return err
 }
 
 // Start starts the Podman machine.
@@ -320,7 +430,7 @@ func (m *PodmanMachineManager) startLocked() error {
 
 	out, err := CommandExecutor(m.podmanBinary, "machine", "start")
 	if err != nil {
-		return fmt.Errorf("podman machine start failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return m.recordOp(fmt.Errorf("podman machine start failed: %s: %w", strings.TrimSpace(string(out)), err))
 	}
 
 	m.mu.Lock()
@@ -328,7 +438,7 @@ func (m *PodmanMachineManager) startLocked() error {
 	m.mu.Unlock()
 
 	m.logger.Info("podman machine started")
-	return nil
+	return m.recordOp(nil)
 }
 
 // Stop stops the Podman machine.
@@ -358,7 +468,7 @@ func (m *PodmanMachineManager) stopLocked() error {
 
 	out, err := CommandExecutor(m.podmanBinary, "machine", "stop")
 	if err != nil {
-		return fmt.Errorf("podman machine stop failed: %s: %w", strings.TrimSpace(string(out)), err)
+		return m.recordOp(fmt.Errorf("podman machine stop failed: %s: %w", strings.TrimSpace(string(out)), err))
 	}
 
 	// The machine is down; this process no longer owns a start it should undo.
@@ -367,6 +477,62 @@ func (m *PodmanMachineManager) stopLocked() error {
 	m.mu.Unlock()
 
 	m.logger.Info("podman machine stopped")
+	return m.recordOp(nil)
+}
+
+// --- asynchronous verbs (TB-87) ---
+//
+// `podman machine start` and `stop` take 30-120 s on an ordinary Intel Mac
+// and can hang outright (podman #25121, #29074). The management API used to
+// run them to completion inside one request, and the app's 15 s client gave
+// up with "daemon unreachable" while the machine was in fact starting. Each
+// verb now returns as soon as the operation is accepted; Status reports
+// starting / stopping meanwhile and, on failure, carries the error until the
+// next operation succeeds. A caller learns the outcome by polling Status (the
+// app's runtime card) or through the done callback (the daemon bridge, which
+// registers the runtime after a successful start).
+
+// StartAsync runs Start on its own goroutine. ErrMachineBusy when another
+// asynchronous operation is still in flight. done, if not nil, is called with
+// Start's result when it finishes.
+func (m *PodmanMachineManager) StartAsync(done func(error)) error {
+	return m.runAsync("start", done, m.Start)
+}
+
+// StopAsync is StartAsync for Stop.
+func (m *PodmanMachineManager) StopAsync(done func(error)) error {
+	return m.runAsync("stop", done, m.Stop)
+}
+
+// SetupAsync is StartAsync for Setup.
+func (m *PodmanMachineManager) SetupAsync(cpus, memoryMB, diskGB int, done func(error)) error {
+	return m.runAsync("setup", done, func() error { return m.Setup(cpus, memoryMB, diskGB) })
+}
+
+func (m *PodmanMachineManager) runAsync(op string, done func(error), run func() error) error {
+	m.mu.Lock()
+	if m.pendingOp != "" {
+		m.mu.Unlock()
+		return ErrMachineBusy
+	}
+	m.pendingOp = op
+	m.cachedInfo = nil
+	m.mu.Unlock()
+	go func() {
+		err := run()
+		// Setup's own refusals (not installed, an inspect error) do not pass
+		// through recordOp; record them here so Status carries them too.
+		m.recordOp(err)
+		if err != nil {
+			m.logger.Warn("podman machine operation failed", "operation", op, "error", err)
+		}
+		m.mu.Lock()
+		m.pendingOp = ""
+		m.mu.Unlock()
+		if done != nil {
+			done(err)
+		}
+	}()
 	return nil
 }
 
@@ -387,7 +553,7 @@ func (m *PodmanMachineManager) Setup(cpus, memoryMB, diskGB int) error {
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 
-	status := m.Status()
+	status := m.status(false)
 
 	switch status.Status {
 	case MachineRunning:
@@ -404,8 +570,8 @@ func (m *PodmanMachineManager) Setup(cpus, memoryMB, diskGB int) error {
 		return m.startLocked()
 	case MachineStopped:
 		return m.startLocked()
-	case MachineStarting:
-		m.logger.Info("podman machine is already starting")
+	case MachineStarting, MachineStopping:
+		m.logger.Info("podman machine has an operation in progress; not starting it again", "status", status.Status)
 		return nil
 	default:
 		return m.startLocked()

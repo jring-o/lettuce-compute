@@ -70,6 +70,7 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
 | `container engine stopped answering …` (`container_engine_unreachable` in the app's **Needs attention** list; the runtime card reads "not answering") | The Docker or Podman engine Lettuce was using has stopped answering on its socket — Docker Desktop quit, the Podman machine was stopped, or (macOS) the machine still says "running" but its API socket is dead. Lettuce paused container work at once, returned every buffered container unit to its head **un-run** (nothing is billed to you or the unit), told the heads it has no container runtime for now, and re-checks the engine every minute. WASM and native leafs keep running. | Start the engine again (`podman machine start`, or Docker Desktop). A Podman machine that reports running with a dead socket is fixed by `podman machine stop` then `podman machine start`. Container work resumes by itself within a minute of the engine answering — no restart; the log line is `container engine answering again`. |
+| `podman machine is stopped by the volunteer; Lettuce will not start it by itself …` (`container_machine_stopped` in **Needs attention**; the runtime card reads "Machine stopped" and says where the stop came from) | You stopped the Podman machine — with the app's **Stop Machine** button or `podman machine stop` — and Lettuce is leaving it stopped: container work waits, buffered container units were returned to their heads un-run, WASM and native leafs keep running. | Start the machine when you want container work back: **Start Machine** in the app, `podman machine start`, or restart Lettuce. Lettuce connects within a minute; the log line is `container engine answering again`. |
 | `container engine found but its runtime could not be built … container engine unreachable` at start | Detection found an engine (a Podman binary, or a socket file) but nothing answered on the socket — a rootless Podman socket that isn't started, a socket file left by a service that is not running. Lettuce does **not** advertise CONTAINER on a socket that does not answer; it re-checks every minute. | `systemctl --user enable --now podman.socket` (see below), or start the engine. |
 | `docker is not available … Is the docker daemon running?` (older builds) | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
 | `permission denied … /run/user/1000/podman/podman.sock` | Socket owned by a different user, or you ran under `sudo`. | Run lettuce as your **normal user**, not sudo; the socket owner must match. |
@@ -143,6 +144,27 @@ start a Podman machine for you on first `start`.
   already running inside a container when the engine died is lost and reported
   to its head with the engine named as the reason; it does not count against
   the leaf.
+
+- **A machine you stop stays stopped.** Stopping the Podman machine — with the
+  app's **Stop Machine** button, or `podman machine stop` in a terminal — is
+  your decision: Lettuce takes container work out of service at once (buffered
+  container units go back to their heads un-run; WASM and native leafs keep
+  running) and does not start the machine again by itself. The runtime card
+  reads "Machine stopped" and says whether the stop came from the app or from
+  outside it; **Needs attention** carries `container_machine_stopped`. Start it
+  again when you want container work back — **Start Machine** in the app,
+  `podman machine start`, or a Lettuce restart — and Lettuce connects within a
+  minute. The daemon still starts the machine for you when it starts up, as
+  before. (Earlier builds started a stopped machine again within a minute,
+  whoever had stopped it.)
+
+- **Start Machine, Stop Machine and Setup return at once.** `podman machine
+  start` can take a minute or two (longer on an Intel Mac), so the app hands
+  the work to the daemon and the runtime card reads "Starting..." or
+  "Stopping..." until the machine settles; a start or stop that fails is
+  reported on the card afterwards. (Earlier builds waited on the command inside
+  one request and showed `DAEMON_UNREACHABLE` after 15 s while the machine was
+  in fact starting.)
 
 - **The machine's memory is the real ceiling for container work.** On Windows
   and macOS every container runs inside the engine's virtual machine (the Podman
