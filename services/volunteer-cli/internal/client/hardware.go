@@ -71,7 +71,7 @@ func DetectHardware(cfg *config.Config) *lettucev1.HardwareCapabilities {
 // nothing, and nil when detection was skipped.
 func DetectHardwareWithGPUs(cfg *config.Config) (*lettucev1.HardwareCapabilities, []*gpudetect.GpuDetectionResult) {
 	if gpudetect.SkipHardwareDetection() {
-		return &lettucev1.HardwareCapabilities{
+		hw := &lettucev1.HardwareCapabilities{
 			CpuCores:         int32(runtime.NumCPU()),
 			CpuModel:         "unknown",
 			MaxCpuCores:      int32(cfg.ResourceLimits.MaxCPUCores),
@@ -81,7 +81,9 @@ func DetectHardwareWithGPUs(cfg *config.Config) (*lettucev1.HardwareCapabilities
 			Gpus:             []*lettucev1.GpuInfo{},
 			Os:               runtime.GOOS,
 			CpuArch:          runtime.GOARCH,
-		}, nil
+		}
+		SetHostBudgets(hw, cfg.ResourceLimits)
+		return hw, nil
 	}
 
 	var (
@@ -127,7 +129,7 @@ func DetectHardwareWithGPUs(cfg *config.Config) (*lettucev1.HardwareCapabilities
 		detected = []*gpudetect.GpuDetectionResult{}
 	}
 
-	return &lettucev1.HardwareCapabilities{
+	hw := &lettucev1.HardwareCapabilities{
 		CpuCores:         int32(runtime.NumCPU()),
 		CpuModel:         cpuModel,
 		MaxCpuCores:      int32(cfg.ResourceLimits.MaxCPUCores),
@@ -144,7 +146,33 @@ func DetectHardwareWithGPUs(cfg *config.Config) (*lettucev1.HardwareCapabilities
 		Os:        runtime.GOOS,
 		CpuArch:   runtime.GOARCH,
 		CpuVendor: detectCPUVendor(cpuModel),
-	}, detected
+	}
+	SetHostBudgets(hw, cfg.ResourceLimits)
+	return hw, detected
+}
+
+// SetHostBudgets fills an advertisement's host budgets (TB-85) from the
+// configured limits: host_max_memory_mb and host_max_cpu_cores are the
+// budgets of work that runs directly on this machine — native and WASM units —
+// which, unlike container work, is not bounded by a container engine's VM. A
+// head compares a native or WASM leaf with them, and a container leaf with
+// max_memory_mb / max_cpu_cores, which the daemon clips to that VM. Each is
+// capped at the machine's detected total where the total is known: a head
+// refuses a registration claiming more than the machine has, and a limit set
+// above the machine buys nothing.
+func SetHostBudgets(hw *lettucev1.HardwareCapabilities, rl config.ResourceLimits) {
+	if hw == nil {
+		return
+	}
+	mem, cores := int32(rl.MaxMemoryMB), int32(rl.MaxCPUCores)
+	if hw.MemoryTotalMb > 0 && mem > hw.MemoryTotalMb {
+		mem = hw.MemoryTotalMb
+	}
+	if hw.CpuCores > 0 && cores > hw.CpuCores {
+		cores = hw.CpuCores
+	}
+	hw.HostMaxMemoryMb = mem
+	hw.HostMaxCpuCores = cores
 }
 
 // detectCPUVendor returns the CPU vendor token used by the head's HRClass

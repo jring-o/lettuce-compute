@@ -90,3 +90,45 @@ func TestTB75_GrantEnvTellsTheTaskItsShare(t *testing.T) {
 		t.Errorf("String() = %q", got)
 	}
 }
+
+// TestTB85_SplitGivesContainerTasksTheVMAndHostTasksTheRest: container tasks
+// share at most the container engine VM's CPUs, every task at most an equal
+// share of the limit, and what the container tasks cannot use goes to the
+// tasks that run on the machine itself. With no VM clip it is the equal split.
+// The shares never sum above either budget.
+func TestTB85_SplitGivesContainerTasksTheVMAndHostTasksTheRest(t *testing.T) {
+	cases := []struct {
+		host, container, hostTasks, containerTasks int
+		want                                       CPUShares
+	}{
+		{4, 2, 1, 2, CPUShares{Host: 2, Container: 1}},       // two containers on a 2-vCPU VM, one native on the other two
+		{4, 1, 1, 1, CPUShares{Host: 3, Container: 1}},       // the VM's one CPU; the native task takes the rest
+		{4, 4, 1, 1, CPUShares{Host: 2, Container: 2}},       // no clip: the equal split
+		{4, 2, 0, 1, CPUShares{Host: 4, Container: 2}},       // a container alone gets the VM, not the limit
+		{2, 2, 2, 0, CPUShares{Host: 1, Container: 1}},       // natives alone split the limit
+		{3, 2, 2, 1, CPUShares{Host: 1, Container: 1}},       // equal share 1 is under the VM's 2
+		{4, 3, 1, 2, CPUShares{Host: 1.33, Container: 1.33}}, // equal 1.33 each, rounded down
+		{0, 0, 1, 1, CPUShares{}},                            // no limit configured
+	}
+	for _, c := range cases {
+		got := SplitCPUBudget(c.host, c.container, c.hostTasks, c.containerTasks)
+		if got != c.want {
+			t.Errorf("SplitCPUBudget(%d, %d, %d, %d) = %+v, want %+v", c.host, c.container, c.hostTasks, c.containerTasks, got, c.want)
+		}
+	}
+	for host := 1; host <= 8; host++ {
+		for vm := 1; vm <= host; vm++ {
+			for nh := 0; nh <= 4; nh++ {
+				for nc := 0; nc <= 4; nc++ {
+					s := SplitCPUBudget(host, vm, nh, nc)
+					if sum := s.Host*float64(nh) + s.Container*float64(nc); sum > float64(host)+1e-9 {
+						t.Errorf("SplitCPUBudget(%d, %d, %d, %d) = %+v sums to %v, above the limit", host, vm, nh, nc, s, sum)
+					}
+					if sum := s.Container * float64(nc); sum > float64(vm)+1e-9 {
+						t.Errorf("SplitCPUBudget(%d, %d, %d, %d) = %+v gives containers %v, above the VM", host, vm, nh, nc, s, sum)
+					}
+				}
+			}
+		}
+	}
+}

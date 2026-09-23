@@ -102,6 +102,13 @@ type HardwareCapabilities struct {
 	OS               string    `json:"os,omitempty"`         // GOOS: linux, darwin, windows
 	CPUArch          string    `json:"cpu_arch,omitempty"`   // GOARCH: amd64, arm64
 	CPUVendor        string    `json:"cpu_vendor,omitempty"` // GenuineIntel, AuthenticAMD, Apple, ...
+	// Per-runtime budgets (TB-85): the volunteer's own limits, which bound work
+	// that runs directly on the machine (NATIVE and WASM). MaxMemoryMB and
+	// MaxCPUCores are clipped to the container engine's VM where there is one,
+	// so they bound CONTAINER work — and every runtime's, when these are 0 (a
+	// client predating them). See BudgetsFor.
+	HostMaxMemoryMB int `json:"host_max_memory_mb,omitempty"`
+	HostMaxCPUCores int `json:"host_max_cpu_cores,omitempty"`
 }
 
 // HRClass returns the volunteer's Homogeneous-Redundancy hardware class — a coarse
@@ -188,6 +195,8 @@ func HardwareCapabilitiesFromProto(pb *lettucev1.HardwareCapabilities) HardwareC
 		OS:               pb.Os,
 		CPUArch:          pb.CpuArch,
 		CPUVendor:        pb.CpuVendor,
+		HostMaxMemoryMB:  int(pb.HostMaxMemoryMb),
+		HostMaxCPUCores:  int(pb.HostMaxCpuCores),
 	}
 
 	for _, g := range pb.Gpus {
@@ -218,6 +227,8 @@ func HardwareCapabilitiesToProto(hw HardwareCapabilities) *lettucev1.HardwareCap
 		Os:               hw.OS,
 		CpuArch:          hw.CPUArch,
 		CpuVendor:        hw.CPUVendor,
+		HostMaxMemoryMb:  int32(hw.HostMaxMemoryMB),
+		HostMaxCpuCores:  int32(hw.HostMaxCPUCores),
 	}
 
 	for _, g := range hw.GPUs {

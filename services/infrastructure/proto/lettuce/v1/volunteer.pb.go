@@ -1269,11 +1269,22 @@ type HardwareCapabilities struct {
 	// Hardware-class inputs for Homogeneous Redundancy (HR): the head derives an HR
 	// class string from these so all redundant copies of a work unit run on the same
 	// class of machine and their floating-point results are bit-comparable.
-	Os            string `protobuf:"bytes,11,opt,name=os,proto3" json:"os,omitempty"`                                // GOOS: linux, darwin, windows
-	CpuArch       string `protobuf:"bytes,12,opt,name=cpu_arch,json=cpuArch,proto3" json:"cpu_arch,omitempty"`       // GOARCH: amd64, arm64
-	CpuVendor     string `protobuf:"bytes,13,opt,name=cpu_vendor,json=cpuVendor,proto3" json:"cpu_vendor,omitempty"` // GenuineIntel, AuthenticAMD, Apple, ... ("" if unknown)
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Os        string `protobuf:"bytes,11,opt,name=os,proto3" json:"os,omitempty"`                                // GOOS: linux, darwin, windows
+	CpuArch   string `protobuf:"bytes,12,opt,name=cpu_arch,json=cpuArch,proto3" json:"cpu_arch,omitempty"`       // GOARCH: amd64, arm64
+	CpuVendor string `protobuf:"bytes,13,opt,name=cpu_vendor,json=cpuVendor,proto3" json:"cpu_vendor,omitempty"` // GenuineIntel, AuthenticAMD, Apple, ... ("" if unknown)
+	// Per-runtime budgets (TB-85). On macOS and Windows the container engine runs
+	// inside a virtual machine, and container work can only be given what that VM
+	// holds; max_memory_mb and max_cpu_cores are then clipped to it, so every
+	// runtime's work fits them. Work that runs directly on the machine (NATIVE and
+	// WASM units) is not inside the VM and is bounded only by the volunteer's own
+	// limits, which these two fields carry. The dispatch gate compares a NATIVE or
+	// WASM leaf with them and a CONTAINER leaf with max_memory_mb / max_cpu_cores.
+	// 0 = not reported (a client predating them): the single figures apply to
+	// every runtime, as before.
+	HostMaxMemoryMb int32 `protobuf:"varint,14,opt,name=host_max_memory_mb,json=hostMaxMemoryMb,proto3" json:"host_max_memory_mb,omitempty"`
+	HostMaxCpuCores int32 `protobuf:"varint,15,opt,name=host_max_cpu_cores,json=hostMaxCpuCores,proto3" json:"host_max_cpu_cores,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *HardwareCapabilities) Reset() {
@@ -1395,6 +1406,20 @@ func (x *HardwareCapabilities) GetCpuVendor() string {
 		return x.CpuVendor
 	}
 	return ""
+}
+
+func (x *HardwareCapabilities) GetHostMaxMemoryMb() int32 {
+	if x != nil {
+		return x.HostMaxMemoryMb
+	}
+	return 0
+}
+
+func (x *HardwareCapabilities) GetHostMaxCpuCores() int32 {
+	if x != nil {
+		return x.HostMaxCpuCores
+	}
+	return 0
 }
 
 type GpuInfo struct {
@@ -2967,7 +2992,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x13checkpoint_sequence\x18\x03 \x01(\x05R\x12checkpointSequence\x125\n" +
 	"\x17created_by_volunteer_id\x18\x04 \x01(\tR\x14createdByVolunteerId\x12\x1d\n" +
 	"\n" +
-	"created_at\x18\x05 \x01(\tR\tcreatedAt\"\xe0\x03\n" +
+	"created_at\x18\x05 \x01(\tR\tcreatedAt\"\xba\x04\n" +
 	"\x14HardwareCapabilities\x12\x1b\n" +
 	"\tcpu_cores\x18\x01 \x01(\x05R\bcpuCores\x12\x1b\n" +
 	"\tcpu_model\x18\x02 \x01(\tR\bcpuModel\x12\"\n" +
@@ -2983,7 +3008,9 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x02os\x18\v \x01(\tR\x02os\x12\x19\n" +
 	"\bcpu_arch\x18\f \x01(\tR\acpuArch\x12\x1d\n" +
 	"\n" +
-	"cpu_vendor\x18\r \x01(\tR\tcpuVendor\"\xa1\x01\n" +
+	"cpu_vendor\x18\r \x01(\tR\tcpuVendor\x12+\n" +
+	"\x12host_max_memory_mb\x18\x0e \x01(\x05R\x0fhostMaxMemoryMb\x12+\n" +
+	"\x12host_max_cpu_cores\x18\x0f \x01(\x05R\x0fhostMaxCpuCores\"\xa1\x01\n" +
 	"\aGpuInfo\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x16\n" +
 	"\x06vendor\x18\x02 \x01(\tR\x06vendor\x12\x17\n" +

@@ -804,12 +804,24 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- catalog (GetHeadInfo lists PUBLIC ACTIVE only): a leaf hidden from discovery
 		  -- must not dispatch through discovery-driven requests.
 		  AND (l.visibility = 'PUBLIC' OR wu.leaf_id = ANY($1))
-		  AND COALESCE((l.resource_requirements->>'min_cpu_cores')::int, 0) <= $3
+		  -- Cores and memory are matched against the budget of the leaf's runtime
+		  -- (AssignmentOptions.BudgetsFor, TB-85): a NATIVE or WASM leaf (no runtime
+		  -- counts as NATIVE, the in-memory default) against the requester's host
+		  -- budgets ($19 cores, $20 memory) when it reported them, anything else — and
+		  -- every leaf for a requester that did not — against $3 / $4, which the
+		  -- client clips to its container engine's VM.
+		  AND COALESCE((l.resource_requirements->>'min_cpu_cores')::int, 0) <=
+		      CASE WHEN $19::int > 0
+		            AND COALESCE(NULLIF(l.execution_config->>'runtime', ''), 'NATIVE') IN ('NATIVE', 'WASM')
+		           THEN $19::int ELSE $3::int END
 		  -- Memory matches on the container limit (execution_config.max_memory_mb),
-		  -- the single source of truth: the volunteer's budget ($4) must cover the
-		  -- cap, identical to the client's canAccommodateWU admission check. Matching
-		  -- on a separate min_memory_mb let the two drift (matched-but-can't-run).
-		  AND COALESCE((l.execution_config->>'max_memory_mb')::int, 0) <= $4
+		  -- the single source of truth: the volunteer's budget must cover the cap,
+		  -- identical to the client's canAccommodateWU admission check. Matching on a
+		  -- separate min_memory_mb let the two drift (matched-but-can't-run).
+		  AND COALESCE((l.execution_config->>'max_memory_mb')::int, 0) <=
+		      CASE WHEN $20::int > 0
+		            AND COALESCE(NULLIF(l.execution_config->>'runtime', ''), 'NATIVE') IN ('NATIVE', 'WASM')
+		           THEN $20::int ELSE $4::int END
 		  AND COALESCE((l.resource_requirements->>'min_disk_mb')::bigint, 0) <= $5
 		  -- GPU presence: a leaf needs a GPU if EITHER gpu_required flag is set
 		  -- (execution_config.gpu_required is the natural author-set flag;
@@ -989,6 +1001,9 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		r.trustDispatch.GateEnabled,
 		r.trustDispatch.DefaultMinCorroborators,
 		r.trustDispatch.DefaultFloor,
+		// $19-$20: the requester's host budgets for NATIVE/WASM leaves (TB-85).
+		opts.HostMaxCPUCores,
+		opts.HostMaxMemoryMB,
 	)
 
 	wu, err := scanWorkUnit(row)

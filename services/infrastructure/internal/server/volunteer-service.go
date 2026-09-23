@@ -763,6 +763,14 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 	if req.Hardware.MaxMemoryMb <= 0 || req.Hardware.MaxMemoryMb > req.Hardware.MemoryTotalMb {
 		return nil, status.Errorf(codes.InvalidArgument, "hardware.max_memory_mb must be > 0 and <= memory_total_mb")
 	}
+	// The host budgets (TB-85) are optional — 0 means not reported — and bounded by
+	// the machine the same way the single figures are.
+	if req.Hardware.HostMaxCpuCores < 0 || req.Hardware.HostMaxCpuCores > req.Hardware.CpuCores {
+		return nil, status.Errorf(codes.InvalidArgument, "hardware.host_max_cpu_cores must be >= 0 and <= cpu_cores")
+	}
+	if req.Hardware.HostMaxMemoryMb < 0 || req.Hardware.HostMaxMemoryMb > req.Hardware.MemoryTotalMb {
+		return nil, status.Errorf(codes.InvalidArgument, "hardware.host_max_memory_mb must be >= 0 and <= memory_total_mb")
+	}
 
 	// Validate available_runtimes: at least one, all valid.
 	if len(req.AvailableRuntimes) == 0 {
@@ -1215,6 +1223,8 @@ func (s *volunteerService) RequestWorkUnit(ctx context.Context, req *lettucev1.R
 		BlockedLeafIDs:          blockedIDs,
 		MaxCPUCores:             hw.MaxCPUCores,
 		MaxMemoryMB:             hw.MaxMemoryMB,
+		HostMaxCPUCores:         hw.HostMaxCPUCores,
+		HostMaxMemoryMB:         hw.HostMaxMemoryMB,
 		MaxDiskMB:               hw.MaxDiskMB,
 		HasGPU:                  hasGPU,
 		MaxGPUVRAMMB:            maxGPUVRAM,

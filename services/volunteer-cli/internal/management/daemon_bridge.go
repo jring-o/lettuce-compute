@@ -1140,10 +1140,15 @@ type MachineCapabilities struct {
 	// registry, lowercase (e.g. ["container","native","wasm"]).
 	Runtimes []string `json:"runtimes"`
 	HasGPU   bool     `json:"has_gpu"`
-	// MaxMemoryMB is the memory budget the daemon advertises to heads and
-	// enforces: the configured limit, clipped to what the container engine's
-	// VM can hold where there is one (TB-63).
-	MaxMemoryMB int `json:"max_memory_mb"`
+	// MaxMemoryMB is the memory budget of container work, advertised to heads
+	// as max_memory_mb: the configured limit, clipped to what the container
+	// engine's VM can hold where there is one (TB-63). HostMaxMemoryMB is the
+	// budget of native and WASM work, which runs on the machine itself and is
+	// bounded by the configured limit alone (TB-85); heads are told it as
+	// host_max_memory_mb. A client judging whether a leaf fits compares it
+	// with the budget of the leaf's runtime.
+	MaxMemoryMB     int `json:"max_memory_mb"`
+	HostMaxMemoryMB int `json:"host_max_memory_mb"`
 	// ContainerVMMemoryMB is the memory of the virtual machine the container
 	// engine runs inside (macOS/Windows: a Podman machine, Docker Desktop's
 	// engine VM), 0 when the engine shares the host's RAM or no container
@@ -1157,13 +1162,16 @@ type MachineCapabilities struct {
 	// against, in the same units it receives them (max_disk_gb is advertised as
 	// MB). Reported here so the client checks a leaf against what this daemon
 	// actually advertised, not against a config file that may have moved on
-	// since (TB-15). MaxCPUCores is the whole-machine CPU budget every running
-	// task shares — the configured limit, clipped to the container engine
-	// VM's vCPUs where there is one (TB-75); ContainerVMCPUs and
-	// CPULimitedByVM are that VM's count and whether it is the bound, as
-	// ContainerVMMemoryMB / MemoryLimitedByVM are for memory.
+	// since (TB-15). MaxCPUCores is the CPU budget of container work — the
+	// configured limit, clipped to the container engine VM's vCPUs where there
+	// is one (TB-75) — and HostMaxCPUCores the whole-machine budget every
+	// running task shares and native and WASM work is measured against, the
+	// configured limit (TB-85); ContainerVMCPUs and CPULimitedByVM are that
+	// VM's count and whether it is the bound, as ContainerVMMemoryMB /
+	// MemoryLimitedByVM are for memory.
 	MaxDiskMB       int64 `json:"max_disk_mb"`
 	MaxCPUCores     int   `json:"max_cpu_cores"`
+	HostMaxCPUCores int   `json:"host_max_cpu_cores"`
 	ContainerVMCPUs int   `json:"container_vm_cpus"`
 	CPULimitedByVM  bool  `json:"cpu_limited_by_vm"`
 	// The GPU side of the same idea (TB-21). MaxGPUVRAMMB is the ALLOWED VRAM —
@@ -1211,14 +1219,16 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 	return MachineCapabilities{
 		Runtimes:            b.MachineRuntimes(),
 		HasGPU:              b.daemon.HasGPU(),
-		MaxMemoryMB:         b.daemon.MemoryBudgetMB(),
+		MaxMemoryMB:         b.daemon.ContainerMemoryBudgetMB(),
+		HostMaxMemoryMB:     b.daemon.HostMemoryBudgetMB(),
 		ContainerVMMemoryMB: b.daemon.ContainerVMMemoryMB(),
 		MemoryLimitedByVM:   b.daemon.MemoryLimitedByVM(),
 		// max_disk_gb is advertised to the head in MB (client/hardware.go), so it
 		// is converted here rather than at the comparison, where a GB-vs-MB slip
 		// would silently pass every leaf.
 		MaxDiskMB:              int64(rl.MaxDiskGB) * 1024,
-		MaxCPUCores:            b.daemon.CPUBudgetCores(),
+		MaxCPUCores:            b.daemon.ContainerCPUBudgetCores(),
+		HostMaxCPUCores:        b.daemon.HostCPUBudgetCores(),
 		ContainerVMCPUs:        b.daemon.ContainerVMCPUs(),
 		CPULimitedByVM:         b.daemon.CPULimitedByVM(),
 		MaxGPUVRAMMB:           vramMB,

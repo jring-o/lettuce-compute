@@ -450,11 +450,20 @@ export interface MachineCapabilities {
   runtimes: string[];
   has_gpu: boolean;
   /**
-   * The memory budget the daemon advertises to heads: `max_memory_mb` from
-   * Settings, clipped to what the container engine's virtual machine can hold
-   * where there is one (TB-63).
+   * The memory budget of container work, advertised to heads as
+   * `max_memory_mb`: the Settings allowance, clipped to what the container
+   * engine's virtual machine can hold where there is one (TB-63). A container
+   * leaf is compared with this figure.
    */
   max_memory_mb: number;
+  /**
+   * The memory budget of native and WebAssembly work: the Settings allowance.
+   * That work runs on the machine itself, not inside the container engine's
+   * virtual machine, so the machine does not bound it (TB-85). A native or
+   * WebAssembly leaf is compared with this figure; heads are told it beside
+   * `max_memory_mb`.
+   */
+  host_max_memory_mb: number;
   /**
    * The memory of the virtual machine the container engine runs inside
    * (macOS/Windows: a Podman machine, Docker Desktop's engine VM); 0 when the
@@ -470,11 +479,16 @@ export interface MachineCapabilities {
   /** `max_disk_gb` as advertised to heads, in MB. */
   max_disk_mb: number;
   /**
-   * The whole-machine CPU budget every running task shares equally — the
-   * Settings allowance, clipped to the container engine's virtual machine
-   * CPU count where there is one (TB-75). It is what heads are told.
+   * The CPU budget of container work, advertised to heads as `max_cpu_cores`:
+   * the Settings allowance, clipped to the container engine's virtual
+   * machine CPU count where there is one (TB-75).
    */
   max_cpu_cores: number;
+  /**
+   * The whole-machine CPU budget every running task shares equally, and the
+   * budget of native and WebAssembly work: the Settings allowance (TB-85).
+   */
+  host_max_cpu_cores: number;
   /**
    * The CPU count of the virtual machine the container engine runs inside;
    * 0 when the engine shares the host's CPUs or no container runtime is
@@ -1058,6 +1072,8 @@ type RawMachineCapabilities = Omit<
   | "memory_limited_by_vm"
   | "container_vm_cpus"
   | "cpu_limited_by_vm"
+  | "host_max_memory_mb"
+  | "host_max_cpu_cores"
 > & {
   runtimes?: string[] | null;
   gpu_vendors?: string[] | null;
@@ -1068,6 +1084,10 @@ type RawMachineCapabilities = Omit<
   // Absent from a daemon older than TB-75: likewise for the VM's CPUs.
   container_vm_cpus?: number | null;
   cpu_limited_by_vm?: boolean | null;
+  // Absent from a daemon older than TB-85: its single figures bounded every
+  // runtime's work.
+  host_max_memory_mb?: number | null;
+  host_max_cpu_cores?: number | null;
   // Absent from a daemon older than TB-77 / TB-83: assume the thresholds
   // work and the load can be measured, as before.
   cpu_temp_source?: string | null;
@@ -1099,10 +1119,12 @@ function normaliseMachine(
     runtimes: list(m.runtimes),
     has_gpu: m.has_gpu ?? false,
     max_memory_mb: m.max_memory_mb ?? 0,
+    host_max_memory_mb: m.host_max_memory_mb ?? m.max_memory_mb ?? 0,
     container_vm_memory_mb: m.container_vm_memory_mb ?? 0,
     memory_limited_by_vm: m.memory_limited_by_vm ?? false,
     max_disk_mb: m.max_disk_mb ?? 0,
     max_cpu_cores: m.max_cpu_cores ?? 0,
+    host_max_cpu_cores: m.host_max_cpu_cores ?? m.max_cpu_cores ?? 0,
     container_vm_cpus: m.container_vm_cpus ?? 0,
     cpu_limited_by_vm: m.cpu_limited_by_vm ?? false,
     cpu_temp_source: m.cpu_temp_source ?? "",

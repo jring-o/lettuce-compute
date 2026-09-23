@@ -101,7 +101,10 @@ describe("leafRequirementItems", () => {
   });
 
   it("names the container engine's virtual machine when it bounds the CPU budget (TB-75)", () => {
-    const leaf = makeLeaf({ resource_requirements: { min_cpu_cores: 6 } });
+    const leaf = makeLeaf({
+      execution_spec: { image: "ghcr.io/example/grep:1" },
+      resource_requirements: { min_cpu_cores: 6 },
+    });
     const machine = makeMachine({ max_cpu_cores: 4, container_vm_cpus: 4, cpu_limited_by_vm: true });
     const cores = leafRequirementItems(leaf, machine).find((i) => i.key === "cores");
     expect(cores).toEqual({
@@ -110,7 +113,10 @@ describe("leafRequirementItems", () => {
       shortfall: "the container engine's virtual machine allows 4; it has 4 CPUs",
       vmLimited: true,
     });
-    const fits = makeLeaf({ resource_requirements: { min_cpu_cores: 4 } });
+    const fits = makeLeaf({
+      execution_spec: { image: "ghcr.io/example/grep:1" },
+      resource_requirements: { min_cpu_cores: 4 },
+    });
     expect(leafRequirementItems(fits, machine).find((i) => i.key === "cores")?.shortfall).toBeUndefined();
   });
 
@@ -250,7 +256,7 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
     makeMachine({ max_memory_mb: 1536, container_vm_memory_mb: 2048, memory_limited_by_vm: true });
 
   it("names the machine and its size instead of the allowance, and offers no slider stop", () => {
-    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 7000 } });
+    const leaf = makeLeaf({ execution_spec: { image: "ghcr.io/example/grep:1.2", max_memory_mb: 7000 } });
     const memory = leafRequirementItems(leaf, vmMachine()).find((i) => i.key === "memory");
     expect(memory).toEqual({
       key: "memory",
@@ -267,7 +273,7 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
       container_vm_memory_mb: 4096,
       memory_limited_by_vm: true,
     });
-    const leaf = makeLeaf({ execution_spec: { max_memory_mb: 8192 } });
+    const leaf = makeLeaf({ execution_spec: { image: "ghcr.io/example/grep:1.2", max_memory_mb: 8192 } });
     const memory = leafRequirementItems(leaf, machine).find((i) => i.key === "memory");
     expect(memory?.label).toBe("8 GiB RAM");
     expect(memory?.shortfall).toBe("the container engine's virtual machine allows 3 GiB; it has 4 GiB");
@@ -289,5 +295,57 @@ describe("TB-63: the container engine's virtual machine bounds memory", () => {
       shortfall: "you allow 6912 MiB",
       raiseToMb: 7168,
     });
+  });
+});
+
+describe("TB-85: native and WebAssembly work is not bounded by the container engine's virtual machine", () => {
+  // The tester's Mac mini: 1024 MB and 4 cores allowed in Settings, a Podman
+  // machine that gives container work 768 MB and 2 CPUs. A native leaf runs on
+  // the machine itself; the card used to hold it to the machine's figures.
+  const mini = () =>
+    makeMachine({
+      max_memory_mb: 768,
+      host_max_memory_mb: 1024,
+      container_vm_memory_mb: 1280,
+      memory_limited_by_vm: true,
+      max_cpu_cores: 2,
+      host_max_cpu_cores: 4,
+      container_vm_cpus: 2,
+      cpu_limited_by_vm: true,
+    });
+
+  it("marks nothing short for a native leaf that fits the allowance but not the virtual machine", () => {
+    const leaf = makeLeaf({
+      execution_spec: { binaries: { "darwin-arm64": "https://example.org/bb" }, max_memory_mb: 900 },
+      resource_requirements: { min_cpu_cores: 3 },
+    });
+    const items = leafRequirementItems(leaf, mini());
+    expect(items.map((i) => i.key)).toEqual(["memory", "cores"]);
+    expect(items.every((i) => i.shortfall === undefined)).toBe(true);
+  });
+
+  it("still names the virtual machine for a container leaf of the same size", () => {
+    const leaf = makeLeaf({
+      execution_spec: { image: "ghcr.io/example/bb:1", max_memory_mb: 900 },
+      resource_requirements: { min_cpu_cores: 3 },
+    });
+    const items = leafRequirementItems(leaf, mini());
+    expect(items.find((i) => i.key === "memory")).toMatchObject({ vmLimited: true });
+    expect(items.find((i) => i.key === "cores")).toMatchObject({ vmLimited: true });
+  });
+
+  it("offers the allowance raise for a native leaf above the allowance", () => {
+    const leaf = makeLeaf({
+      execution_spec: { binaries: { "darwin-arm64": "https://example.org/bb" }, max_memory_mb: 2048 },
+      resource_requirements: { min_cpu_cores: 6 },
+    });
+    const items = leafRequirementItems(leaf, mini());
+    expect(items.find((i) => i.key === "memory")).toEqual({
+      key: "memory",
+      label: "2 GiB RAM",
+      shortfall: "you allow 1 GiB",
+      raiseToMb: 2048,
+    });
+    expect(items.find((i) => i.key === "cores")).toEqual({ key: "cores", label: "6 cores", shortfall: "you allow 4" });
   });
 });

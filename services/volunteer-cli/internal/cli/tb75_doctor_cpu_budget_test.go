@@ -23,18 +23,20 @@ func tb75VMCaps() volunteerCaps {
 }
 
 // TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM: the line says the
-// figure is shared by all running tasks; when the VM bounds it, it is a WARN
-// naming both figures and the machine to enlarge; a VM that honors the limit
-// says so; no VM prints the plain line.
+// figure is shared by all running tasks; when the VM bounds container work,
+// it names both figures — the limit native and WebAssembly work keeps (TB-85)
+// and the VM's count for container work — and the machine to enlarge, as
+// information (TB-92); a VM that honors the limit says so; no VM prints the
+// plain line.
 func TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM(t *testing.T) {
 	var buf bytes.Buffer
 	rep := &doctorReport{w: &buf}
 	checkCPUBudget(rep, tb75VMCaps())
 	out := buf.String()
-	if rep.warns != 1 {
-		t.Errorf("VM-bounded budget: warns=%d, want 1\n%s", rep.warns, out)
+	if rep.warns != 0 {
+		t.Errorf("VM-bounded budget: warns=%d, want 0 (the clip is information)\n%s", rep.warns, out)
 	}
-	for _, want := range []string{"4 cores", "your limit is 6", "4 CPUs", "share it equally", "podman machine set --cpus", "raising max_cpu_cores alone changes nothing"} {
+	for _, want := range []string{"6 cores", "native and WebAssembly work", "container work is limited to 4", "shared equally", "podman machine set --cpus"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cpu limit line lacks %q:\n%s", want, out)
 		}
@@ -66,7 +68,7 @@ func TestTB75_ClassifyLeafNamesTheVMForCores(t *testing.T) {
 	if le.eligible || blocked != "cores" {
 		t.Fatalf("6-core leaf: eligible=%v blocked=%q, want blocked on cores", le.eligible, blocked)
 	}
-	for _, want := range []string{"6 CPU cores", "4 this machine can give", "4 CPUs", "podman machine set --cpus"} {
+	for _, want := range []string{"6 CPU cores", "4 container work can get", "4 CPUs", "podman machine set --cpus"} {
 		if !strings.Contains(le.reason, want) {
 			t.Errorf("reason lacks %q: %s", want, le.reason)
 		}

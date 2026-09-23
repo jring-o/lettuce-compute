@@ -1233,6 +1233,8 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 			attrs = append(attrs,
 				"max_cpu_cores", opts.MaxCPUCores,
 				"max_memory_mb", opts.MaxMemoryMB,
+				"host_max_cpu_cores", opts.HostMaxCPUCores,
+				"host_max_memory_mb", opts.HostMaxMemoryMB,
 				"max_disk_mb", opts.MaxDiskMB,
 				"has_gpu", opts.HasGPU,
 				"max_gpu_vram_mb", opts.MaxGPUVRAMMB,
@@ -3603,14 +3605,22 @@ func (c *dispatchCache) pruneStarveLog() {
 func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) bool {
 	rr := lf.ResourceRequirements
 	ec := lf.ExecutionConfig
+	runtime := ec.Runtime
+	if runtime == "" {
+		runtime = leaf.RuntimeNative
+	}
 
+	// Cores and memory are matched against the budgets of the leaf's runtime: a
+	// NATIVE or WASM leaf against the machine's own limits, a CONTAINER leaf
+	// against the figures clipped to the container engine's VM (TB-85).
+	maxCPUCores, maxMemoryMB := opts.BudgetsFor(runtime)
 	// CPU cores: leaf min must fit the volunteer's budget.
-	if rr.MinCPUCores > opts.MaxCPUCores {
+	if rr.MinCPUCores > maxCPUCores {
 		return false
 	}
 	// Memory: the container limit (execution_config.max_memory_mb), the single
 	// source of truth, must fit the volunteer's budget.
-	if ec.MaxMemoryMB > opts.MaxMemoryMB {
+	if ec.MaxMemoryMB > maxMemoryMB {
 		return false
 	}
 	// Disk.
@@ -3636,10 +3646,6 @@ func leafMatchesCapabilities(lf *leaf.Leaf, opts workunit.AssignmentOptions) boo
 		}
 	}
 	// Runtime: leaf runtime must be one the volunteer can run.
-	runtime := ec.Runtime
-	if runtime == "" {
-		runtime = leaf.RuntimeNative
-	}
 	if !containsString(opts.AvailableRuntimes, runtime) {
 		return false
 	}

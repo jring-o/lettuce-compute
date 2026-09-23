@@ -91,9 +91,12 @@ const ContainerVMHeadroomMB = 512
 // clipped here. The result is floored at MinTaskMemMB so a VM smaller than
 // the headroom still yields a budget a head can validate.
 //
-// This is the number to ADVERTISE to heads, to book admission against, and to
-// hand the container runtime as its ceiling (BookedMemMB): one figure for all
-// three, so a head only sends this machine units the VM can hold (TB-63).
+// This is container work's budget: ADVERTISED to heads as max_memory_mb, the
+// bound container bookings are summed against at admission, and the container
+// runtime's ceiling (BookedMemMB) — one figure for all three, so a head only
+// sends this machine container units the VM can hold (TB-63). Native and WASM
+// work runs on the machine itself and is bounded by the configuration alone
+// (TB-85).
 func ContainerMemoryBudgetMB(configMB, engineMemMB int) int {
 	if engineMemMB <= 0 {
 		return configMB

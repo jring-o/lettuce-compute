@@ -60,12 +60,20 @@ type leafsAPIMachine struct {
 	Runtimes    []string `json:"runtimes"`
 	HasGPU      bool     `json:"has_gpu"`
 	MaxMemoryMB int      `json:"max_memory_mb"`
+	// HostMaxMemoryMB / HostMaxCPUCores are the budgets of native and WASM
+	// work (TB-85); MaxMemoryMB / MaxCPUCores container work's. See
+	// management.MachineCapabilities.
+	HostMaxMemoryMB int `json:"host_max_memory_mb"`
 	// The container engine's VM memory and whether it, not the configured
 	// limit, bounds MaxMemoryMB (TB-63); see management.MachineCapabilities.
 	ContainerVMMemoryMB int   `json:"container_vm_memory_mb"`
 	MemoryLimitedByVM   bool  `json:"memory_limited_by_vm"`
 	MaxDiskMB           int64 `json:"max_disk_mb"`
 	MaxCPUCores         int   `json:"max_cpu_cores"`
+	HostMaxCPUCores     int   `json:"host_max_cpu_cores"`
+	// The CPU twins of ContainerVMMemoryMB / MemoryLimitedByVM (TB-75).
+	ContainerVMCPUs int  `json:"container_vm_cpus"`
+	CPULimitedByVM  bool `json:"cpu_limited_by_vm"`
 	// The GPU budgets (TB-21). MaxGPUVRAMMB is the allowed share, not the card.
 	MaxGPUVRAMMB           int      `json:"max_gpu_vram_mb"`
 	GPUCardVRAMMB          int      `json:"gpu_card_vram_mb"`
@@ -177,12 +185,16 @@ func runLeafsList(cmd *cobra.Command, args []string) error {
 func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.ServerConfig) {
 	caps := volunteerCaps{
 		maxMemoryMB:            resp.Machine.MaxMemoryMB,
+		hostMaxMemoryMB:        resp.Machine.HostMaxMemoryMB,
 		containerVMMemoryMB:    resp.Machine.ContainerVMMemoryMB,
 		memoryLimitedByVM:      resp.Machine.MemoryLimitedByVM,
 		containerUsable:        containsFold(resp.Machine.Runtimes, "container"),
 		hasGPU:                 resp.Machine.HasGPU,
 		maxDiskMB:              resp.Machine.MaxDiskMB,
 		maxCPUCores:            resp.Machine.MaxCPUCores,
+		hostMaxCPUCores:        resp.Machine.HostMaxCPUCores,
+		containerVMCPUs:        resp.Machine.ContainerVMCPUs,
+		cpuLimitedByVM:         resp.Machine.CPULimitedByVM,
 		maxGPUVRAMMB:           resp.Machine.MaxGPUVRAMMB,
 		gpuCardVRAMMB:          resp.Machine.GPUCardVRAMMB,
 		gpuVRAMPct:             resp.Machine.GPUVRAMPct,

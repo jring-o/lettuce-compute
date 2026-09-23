@@ -35,7 +35,7 @@ func tb75Daemon(t *testing.T) *Daemon {
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	d.cfg.MaxConcurrentTasks = 3
 	d.slotManager = NewSlotManager(3, d.logger)
-	d.slotManager.SetCPUShareSource(d.currentCPUShare)
+	d.slotManager.SetCPUShareSource(d.currentCPUShares)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	t.Cleanup(func() { freeSystemMemoryMB = orig })
@@ -157,14 +157,14 @@ func TestTB75_RunningTasksShareTheBudgetLive(t *testing.T) {
 
 	h0 := &mockProcessHandle{pid: 1}
 	occupy(d, 0, bbUnit("bb-1"), h0)
-	if got := d.cpuGrant(); got.ShareCores != 2 || got.BudgetCores != 2 {
+	if got := d.cpuGrantFor(true); got.ShareCores != 2 || got.BudgetCores != 2 {
 		t.Fatalf("grant with one task running = %+v, want 2 of 2", got)
 	}
 	d.rebalanceCPUShares()
 
 	h1 := &mockProcessHandle{pid: 2}
 	occupy(d, 1, bbUnit("bb-2"), h1)
-	if got := d.cpuGrant().ShareCores; got != 1 {
+	if got := d.cpuGrantFor(true).ShareCores; got != 1 {
 		t.Fatalf("grant with two tasks running = %v, want 1 (half of 2)", got)
 	}
 	d.rebalanceCPUShares()
@@ -191,7 +191,7 @@ func TestTB75_RunningTasksShareTheBudgetLive(t *testing.T) {
 	}
 
 	// The environment a task starting now would be told: the same share.
-	if got := d.cpuGrant().Env()[0]; got != "LETTUCE_CPU_LIMIT=1" {
+	if got := d.cpuGrantFor(true).Env()[0]; got != "LETTUCE_CPU_LIMIT=1" {
 		t.Errorf("grant env = %q, want LETTUCE_CPU_LIMIT=1", got)
 	}
 
@@ -224,15 +224,22 @@ func TestTB75_FractionalSharesAreExact(t *testing.T) {
 }
 
 // TestTB75_EngineVMClipsTheCPUBudget: a 4-vCPU Podman machine bounds a
-// 6-core limit. The budget, the advertisement and every booking become 4,
-// the volunteer is told once with both figures and the remedy, and lowering
-// the limit to the VM's count resolves the notice. The machine's memory is
-// large enough not to clip, so this is the CPU clip alone. Pre-fix the VM's
-// CPU count was read for the Settings card and used for nothing.
+// 6-core limit for container work. Container work's budget, the advertised
+// max_cpu_cores and every container booking become 4 (native work keeps the
+// 6 — TB-85); with a container leaf enabled that needs 6 cores the volunteer
+// is told once with both figures and the remedy (TB-92), and lowering the
+// limit to the VM's count resolves the notice. The machine's memory is large
+// enough not to clip, so this is the CPU clip alone. Pre-fix the VM's CPU
+// count was read for the Settings card and used for nothing.
 func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	d, _, buf := tb63Daemon(t)
 	d.cfg.ResourceLimits.MaxCPUCores = 6
 	d.cachedHW.MaxCpuCores = 6
+	d.leafCache.PopulateForTest("server-a", &CachedHeadInfo{Name: "server-a", Leafs: []CachedLeafInfo{
+		{ID: "leaf-grep", Slug: "grep-f14", Name: "GREP f14", State: "ACTIVE",
+			ExecutionSpec:        &CachedExecutionSpec{Image: "ghcr.io/example/grep:1.2", MaxMemoryMB: 7000},
+			ResourceRequirements: &CachedResourceRequirements{MinCPUCores: 6}},
+	}})
 	f := tb63Factory(t, d, 0)
 	f.SetEngineVMProbeForTest(func(runtime.Runtime) (int, int) { return 8192 + runtime.ContainerVMHeadroomMB, 4 })
 	d.containerFactory = f
@@ -244,8 +251,8 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	if got := d.ContainerVMCPUs(); got != 4 {
 		t.Errorf("ContainerVMCPUs = %d, want 4", got)
 	}
-	if got := d.CPUBudgetCores(); got != 4 {
-		t.Errorf("CPUBudgetCores = %d, want 4 (the VM's), not the 6 configured", got)
+	if got := d.ContainerCPUBudgetCores(); got != 4 {
+		t.Errorf("ContainerCPUBudgetCores = %d, want 4 (the VM's), not the 6 configured", got)
 	}
 	if !d.CPULimitedByVM() {
 		t.Error("CPULimitedByVM = false; the VM is below the configuration")
@@ -259,7 +266,7 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	if got := d.AdvertisedHardware().MaxMemoryMb; got != 8192 {
 		t.Errorf("MaxMemoryMb = %d after the CPU clip, want 8192 (the VM's memory honors it)", got)
 	}
-	if got := d.cpuGrant(); got.BudgetCores != 4 || got.ShareCores != 4 {
+	if got := d.cpuGrantFor(true); got.BudgetCores != 4 || got.ShareCores != 4 {
 		t.Errorf("grant after the clip = %+v, want 4 of 4", got)
 	}
 	if budget, cpus := f.ContainerCPUs(); budget != 4 || cpus != 4 {
@@ -270,20 +277,21 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	if n != 1 || notice.Count != 1 {
 		t.Fatalf("container_cpu_clipped notices = %d (count %d), want exactly one", n, notice.Count)
 	}
-	for _, want := range []string{"4 CPU cores", "4 CPUs", "6 cores", "podman machine set --cpus"} {
+	for _, want := range []string{"4 CPU cores", "4 CPUs", "6 cores", "GREP f14 needs 6 cores", "podman machine set --cpus"} {
 		if !strings.Contains(notice.Message, want) {
 			t.Errorf("notice lacks %q: %s", want, notice.Message)
 		}
 	}
-	if c := strings.Count(buf.String(), "fewer CPUs than the CPU limit"); c != 1 {
+	if c := strings.Count(buf.String(), "fewer CPUs than an enabled container leaf needs"); c != 1 {
 		t.Errorf("clip WARN logged %d time(s), want exactly 1; log:\n%s", c, buf.String())
 	}
 	if n, _ := countNoticesByCode(d.notices, "container_memory_clipped"); n != 0 {
 		t.Errorf("container_memory_clipped raised %d time(s) though the VM's memory honors the limit", n)
 	}
 
-	// Admission books against the clipped budget: a leaf declaring 4 cores
-	// runs alone; a fifth core does not exist.
+	// Container admission books against the clipped budget: a container leaf
+	// declaring 4 cores runs alone among containers — a fifth VM core does not
+	// exist — while a native unit still has the limit's other two (TB-85).
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	defer func() { freeSystemMemoryMB = defaultFreeSystemMemoryMB }()
 	d.limiter = &testLimiter{} // the disk guard is not under test
@@ -296,8 +304,11 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 		t.Errorf("a 4-core unit refused against a 4-core budget: %s", reason)
 	}
 	occupy(d, 0, four, nil)
-	if ok, _ := d.canAccommodateWU(&runtime.WorkUnit{ID: "one", LeafID: "leaf-grep", ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}); ok {
-		t.Error("a unit was admitted beside a 4-core unit under the VM's 4-core budget")
+	if ok, _ := d.canAccommodateWU(headContainerUnit("one", "leaf-grep", "", 1024)); ok {
+		t.Error("a container unit was admitted beside a 4-core container unit under the VM's 4-core budget")
+	}
+	if ok, why := d.canAccommodateWU(&runtime.WorkUnit{ID: "native", LeafID: "leaf-grep", ExecutionSpec: runtime.ExecutionSpec{MaxMemoryMB: 1024}}); !ok {
+		t.Errorf("a one-core native unit was refused beside a 4-core container unit under a 6-core limit: %s", why)
 	}
 
 	// Lowering the limit to the VM's count resolves the notice.
@@ -326,8 +337,8 @@ func TestTB75_VMWithEnoughCPUsKeepsTheConfiguration(t *testing.T) {
 		if !d.RedetectContainerRuntime(context.Background(), false) {
 			t.Fatal("RedetectContainerRuntime = false with the engine up")
 		}
-		if d.CPUBudgetCores() != 2 || d.CPULimitedByVM() || d.AdvertisedHardware().MaxCpuCores != 2 {
-			t.Errorf("vm cpus %d: budget %d, limited %v, advertised %d; want 2 / false / 2", vmCPUs, d.CPUBudgetCores(), d.CPULimitedByVM(), d.AdvertisedHardware().MaxCpuCores)
+		if d.ContainerCPUBudgetCores() != 2 || d.CPULimitedByVM() || d.AdvertisedHardware().MaxCpuCores != 2 {
+			t.Errorf("vm cpus %d: budget %d, limited %v, advertised %d; want 2 / false / 2", vmCPUs, d.ContainerCPUBudgetCores(), d.CPULimitedByVM(), d.AdvertisedHardware().MaxCpuCores)
 		}
 		if got := d.ContainerVMCPUs(); got != vmCPUs {
 			t.Errorf("ContainerVMCPUs = %d, want %d", got, vmCPUs)

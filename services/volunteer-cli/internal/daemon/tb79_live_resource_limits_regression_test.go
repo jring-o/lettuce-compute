@@ -70,8 +70,8 @@ func TestTB79_LoweredMemoryLimitReachesHeadsAndCeilingsAtOnce(t *testing.T) {
 	lowered.ResourceLimits.MaxMemoryMB = 6912
 	d.ApplyConfig(&lowered)
 
-	if got := d.MemoryBudgetMB(); got != 6912 {
-		t.Errorf("MemoryBudgetMB = %d, want 6912", got)
+	if got := d.ContainerMemoryBudgetMB(); got != 6912 {
+		t.Errorf("ContainerMemoryBudgetMB = %d, want 6912", got)
 	}
 	if got := d.AdvertisedHardware().MaxMemoryMb; got != 6912 {
 		t.Errorf("advertised MaxMemoryMb after lowering = %d, want 6912 (the head's gate must see the new budget on the next poll)", got)
@@ -154,8 +154,8 @@ func TestTB79_WholeResourceLimitsBlockIsLive(t *testing.T) {
 	if len(hw.Gpus) != 1 || hw.Gpus[0].MaxVramPct != 25 || hw.Gpus[0].VramMb != 12288 || hw.Gpus[0].Model != "RTX 3060" {
 		t.Errorf("advertised GPUs = %v, want the detected card at 25%%", hw.Gpus)
 	}
-	if got := d.CPUBudgetCores(); got != 2 {
-		t.Errorf("CPUBudgetCores = %d, want 2", got)
+	if got := d.ContainerCPUBudgetCores(); got != 2 {
+		t.Errorf("ContainerCPUBudgetCores = %d, want 2", got)
 	}
 
 	off := *d.cfg

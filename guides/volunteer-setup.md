@@ -166,38 +166,46 @@ start a Podman machine for you on first `start`.
   one request and showed `DAEMON_UNREACHABLE` after 15 s while the machine was
   in fact starting.)
 
-- **The machine's memory is the real ceiling for container work.** On Windows
-  and macOS every container runs inside the engine's virtual machine (the Podman
-  machine, or Docker Desktop's engine VM), so a container can only use what that
-  machine has, whatever your Settings allow. Lettuce reads the machine's memory
-  from the engine when it finds it and budgets container work at that figure less
-  512 MB kept back for the machine itself. If that is below your memory limit
-  (`resource_limits.max_memory_mb`), heads are told the smaller figure and only
-  send leafs that fit it — before this a 16 GB Mac with a 2 GB Podman machine
-  advertised 8 GB, was sent 7 GB units, and had each one killed at model load
-  (`non-zero exit code 137`, now reported as `killed for memory` with both
-  figures). The log line is `container engine's VM is smaller than the memory
-  limit`, the desktop app shows a notice, `lettuce-volunteer doctor` prints both
-  figures under "memory limit", and a leaf blocked this way says so in `leafs
-  list` and on the app's leaf card. To run bigger leafs, enlarge the machine's
-  memory — Podman Desktop or Docker Desktop: Settings → Resources; Podman CLI:
-  `podman machine stop`, `podman machine set --memory <MB>`, `podman machine
-  start` — then restart Lettuce. Raising the memory limit alone changes nothing.
-  A machine Lettuce creates for you is sized at your memory limit plus the 512 MB
-  reserve, so it is never the bound.
+- **The machine's memory is the real ceiling for container work — and only
+  for container work.** On Windows and macOS every container runs inside the
+  engine's virtual machine (the Podman machine, or Docker Desktop's engine VM),
+  so a container can only use what that machine has, whatever your Settings
+  allow. Lettuce reads the machine's memory from the engine when it finds it and
+  budgets container work at that figure less 512 MB kept back for the machine
+  itself. Native and WebAssembly work does not run inside the machine, so it
+  keeps your whole memory limit (`resource_limits.max_memory_mb`); all running
+  work together still stays within that limit. Heads are told both figures and
+  only send a container leaf that fits the machine's — before this a 16 GB Mac
+  with a 2 GB Podman machine advertised 8 GB, was sent 7 GB units, and had each
+  one killed at model load (`non-zero exit code 137`, now reported as `killed
+  for memory` with both figures). So a Mac with a 1,024 MB limit and a Podman
+  machine that holds 768 MB runs a 768 MB container unit and a 128 MB native unit
+  side by side. `lettuce-volunteer doctor` prints both figures under "memory
+  limit". Only when the machine keeps a container leaf you have enabled from
+  running — it needs more than the machine holds but no more than your limit —
+  does the log say `container engine's VM is smaller than an enabled container
+  leaf needs` and the desktop app show a notice naming the leaf; the leaf also
+  says so in `leafs list` and on the app's leaf card. To run it, enlarge the
+  machine's memory — Podman Desktop or Docker Desktop: Settings → Resources;
+  Podman CLI: `podman machine stop`, `podman machine set --memory <MB>`, `podman
+  machine start` — then restart Lettuce. Raising the memory limit alone changes
+  nothing. A machine Lettuce creates for you is sized at your memory limit plus
+  the 512 MB reserve, so it is never the bound.
 
-- **The machine's CPUs bound your CPU limit the same way.** Container work can
+- **The machine's CPUs bound container work the same way.** Container work can
   use no more CPUs than the virtual machine has, so if your CPU limit
-  (`resource_limits.max_cpu_cores`) is above the machine's CPU count, Lettuce
-  works to the machine's count instead: heads are told the smaller figure, the
-  running tasks share it, and you are told once — the log line is `container
-  engine's VM has fewer CPUs than the CPU limit`, the desktop app shows a
-  notice and says so under the CPU slider, and `lettuce-volunteer doctor`
-  prints both figures under "cpu limit". To use more cores, give the machine
-  more CPUs (Podman Desktop or Docker Desktop: Settings → Resources; Podman
-  CLI: `podman machine stop`, `podman machine set --cpus <n>`, `podman machine
-  start`) and restart Lettuce. A machine Lettuce creates for you is sized at
-  your CPU limit, so it is never the bound.
+  (`resource_limits.max_cpu_cores`) is above the machine's CPU count, container
+  tasks together work to the machine's count, while native and WebAssembly
+  tasks share the rest of your limit. Heads are told both figures, the desktop
+  app says so under the CPU slider, and `lettuce-volunteer doctor` prints both
+  under "cpu limit". Only when the machine keeps an enabled container leaf from
+  running (it needs more cores than the machine has, but no more than your
+  limit) does the log say `container engine's VM has fewer CPUs than an enabled
+  container leaf needs` and the desktop app show a notice naming it. To run it,
+  give the machine more CPUs (Podman Desktop or Docker Desktop: Settings →
+  Resources; Podman CLI: `podman machine stop`, `podman machine set --cpus
+  <n>`, `podman machine start`) and restart Lettuce. A machine Lettuce creates
+  for you is sized at your CPU limit, so it is never the bound.
 
 - **macOS: Podman does not need to be on the app's PATH.** An app launched from
   Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official
@@ -504,8 +512,9 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   what the earlier ones actually took.
 - **Buffered units start first-fit, not strictly first-fetched.** A free slot
   takes the oldest buffered unit that fits in the memory you've allowed
-  (`resource_limits.max_memory_mb` — or, on Windows/macOS, what the container
-  engine's machine can hold, when that is less). If the oldest unit needs more memory than
+  (`resource_limits.max_memory_mb`, and for a container unit on Windows/macOS
+  also in what the container engine's machine can hold beside the other
+  containers). If the oldest unit needs more memory than
   is currently free, smaller units behind it start instead of the slot sitting
   idle — the waiting unit logs a single `waiting for capacity` line, keeps its
   place in line, and only a bounded number of units may jump it before the
@@ -574,7 +583,10 @@ Two consequences worth knowing:
   allows: each unit books its leaf's minimum core requirement (at least one) and
   admission keeps the sum within the budget, so no task is ever given less than
   its leaf declared it needs. A leaf that needs two cores runs alone under a
-  two-core budget; two one-core leafs run side by side.
+  two-core budget; two one-core leafs run side by side. On Windows and macOS
+  the container tasks together also stay within the container engine's machine
+  (see above): with four cores allowed and a two-CPU machine, two container
+  tasks get one core each and a native task beside them gets the other two.
 - **Each task is told its share.** Every task is started with
   `LETTUCE_CPU_LIMIT=<cores>` (the exact share, possibly fractional) and the
   standard thread-pool knobs (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,

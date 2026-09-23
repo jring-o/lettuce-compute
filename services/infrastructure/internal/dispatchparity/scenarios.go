@@ -308,6 +308,11 @@ type Scenario struct {
 	RequesterMaxCPUCores int
 	LeafMaxMemoryMB      int // leaf execution_config.max_memory_mb (the container limit)
 	RequesterMaxMemoryMB int
+	// RequesterHostMaxCPUCores / RequesterHostMaxMemoryMB are the requester's
+	// budgets for NATIVE and WASM leaves (TB-85); 0 = not reported, so the
+	// single figures above apply to every runtime.
+	RequesterHostMaxCPUCores int
+	RequesterHostMaxMemoryMB int
 	// LeafGPURequired maps to the leaf's execution_config.gpu_required flag (the
 	// author-set flag; resource_requirements.gpu_required is left false, exercising
 	// the "either flag gates presence" rule).
@@ -774,6 +779,62 @@ func Scenarios() []Scenario {
 		with("capability_cpu_over_budget_excluded", DimCapability, func(s *Scenario) {
 			s.LeafMinCPUCores = 8
 			s.RequesterMaxCPUCores = 4
+			s.Eligible = false
+		}),
+		// Per-runtime budgets (TB-85): a Mac whose container engine VM holds 768 MB
+		// and 2 CPUs under a 1,024 MB / 4-core limit. A NATIVE or WASM leaf runs on
+		// the machine itself and is matched against the host budgets; a CONTAINER
+		// leaf against the VM-clipped single figures; a requester reporting no host
+		// budgets is matched on the single figures for every runtime, as before.
+		with("capability_native_memory_over_vm_within_host_admitted", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "NATIVE"
+			s.LeafMaxMemoryMB = 900
+			s.RequesterMaxMemoryMB = 768
+			s.RequesterHostMaxMemoryMB = 1024
+			s.Eligible = true
+		}),
+		with("capability_wasm_memory_over_vm_within_host_admitted", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "WASM"
+			s.RequesterRuntimes = []string{"NATIVE", "WASM"}
+			s.LeafMaxMemoryMB = 900
+			s.RequesterMaxMemoryMB = 768
+			s.RequesterHostMaxMemoryMB = 1024
+			s.Eligible = true
+		}),
+		with("capability_container_memory_over_vm_excluded", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "CONTAINER"
+			s.RequesterRuntimes = []string{"NATIVE", "CONTAINER"}
+			s.LeafMaxMemoryMB = 900
+			s.RequesterMaxMemoryMB = 768
+			s.RequesterHostMaxMemoryMB = 1024 // the host budget never admits a container leaf
+			s.Eligible = false
+		}),
+		with("capability_native_memory_over_host_excluded", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "NATIVE"
+			s.LeafMaxMemoryMB = 2048
+			s.RequesterMaxMemoryMB = 768
+			s.RequesterHostMaxMemoryMB = 1024
+			s.Eligible = false
+		}),
+		with("capability_native_memory_host_unreported_uses_single_figure", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "NATIVE"
+			s.LeafMaxMemoryMB = 900
+			s.RequesterMaxMemoryMB = 768 // a client predating the host budgets
+			s.Eligible = false
+		}),
+		with("capability_native_cpu_over_vm_within_host_admitted", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "NATIVE"
+			s.LeafMinCPUCores = 3
+			s.RequesterMaxCPUCores = 2
+			s.RequesterHostMaxCPUCores = 4
+			s.Eligible = true
+		}),
+		with("capability_container_cpu_over_vm_excluded", DimCapability, func(s *Scenario) {
+			s.LeafRuntime = "CONTAINER"
+			s.RequesterRuntimes = []string{"NATIVE", "CONTAINER"}
+			s.LeafMinCPUCores = 3
+			s.RequesterMaxCPUCores = 2
+			s.RequesterHostMaxCPUCores = 4
 			s.Eligible = false
 		}),
 		with("capability_gpu_required_but_absent_excluded", DimCapability, func(s *Scenario) {
