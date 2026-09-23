@@ -11,6 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,6 +45,11 @@ type Server struct {
 	token      string
 	dataDir    string
 	logger     *slog.Logger
+
+	// reads tallies the routine reads the request log summarises instead of
+	// logging one by one (TB-91); now is its clock seam (nil = time.Now).
+	reads readTally
+	now   func() time.Time
 }
 
 // NewServer creates a new management server.
@@ -161,11 +169,34 @@ func (s *Server) removeDaemonJSON() {
 	os.Remove(s.daemonJSONPath())
 }
 
+// readSummaryInterval is how often the request log summarises the routine
+// reads it no longer logs one by one (TB-91).
+const readSummaryInterval = time.Minute
+
+// loggingMiddleware logs each management API request at Debug — except the
+// routine ones. The desktop app polls /status, /metrics, /heads and /notices
+// about twice a second, which was 130,479 of one tester's 500,000 debug lines
+// (TB-91), so a successful GET is counted instead and the counts are logged
+// once a minute. Every write, and every request that failed, is still logged
+// on its own.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rw, r)
+		if r.Method == http.MethodGet && rw.statusCode < http.StatusBadRequest {
+			if !s.logger.Enabled(r.Context(), slog.LevelDebug) {
+				return
+			}
+			if n, span, paths, due := s.reads.add(r.URL.Path, s.clock()); due {
+				s.logger.Debug("management API reads",
+					"requests", n,
+					"over", span.Round(time.Second).String(),
+					"paths", paths,
+				)
+			}
+			return
+		}
 		s.logger.Debug("management API request",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -173,6 +204,55 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// readTally counts routine reads per path over one summary window.
+type readTally struct {
+	mu     sync.Mutex
+	since  time.Time
+	counts map[string]int
+}
+
+// add counts one read of path at now. Once the window has run for
+// readSummaryInterval it returns the window's total, its length and its
+// per-path counts (busiest first, "path=count" separated by spaces), with
+// due set, and starts a new window.
+func (t *readTally) add(path string, now time.Time) (total int, span time.Duration, paths string, due bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.counts == nil {
+		t.counts = make(map[string]int)
+		t.since = now
+	}
+	t.counts[path]++
+	span = now.Sub(t.since)
+	if span < readSummaryInterval {
+		return 0, 0, "", false
+	}
+	keys := make([]string, 0, len(t.counts))
+	for k, n := range t.counts {
+		keys = append(keys, k)
+		total += n
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if t.counts[keys[i]] != t.counts[keys[j]] {
+			return t.counts[keys[i]] > t.counts[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s=%d", k, t.counts[k])
+	}
+	t.counts = nil
+	return total, span, strings.Join(parts, " "), true
 }
 
 type responseWriter struct {

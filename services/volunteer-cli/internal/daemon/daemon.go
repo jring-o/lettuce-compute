@@ -111,6 +111,16 @@ type Daemon struct {
 	// Resource management
 	limiter   resource.Limiter
 	scheduler *resource.Scheduler
+	// scheduleClosedLogged records that shouldFetch has already said the
+	// schedule forbids running, so a closed window is logged when it closes
+	// and when it reopens rather than on each of the fetcher's 1-second
+	// re-checks (TB-91).
+	scheduleClosedLogged atomic.Bool
+
+	// slotFillLog remembers what the slot filler last said at Debug, so its
+	// 1-second tick narrates changes rather than repeating itself (TB-91).
+	// Touched only by the Run goroutine.
+	slotFillLog slotFillLog
 
 	// Thermal monitoring
 	thermalMonitor *runtime.ThermalMonitor
@@ -859,8 +869,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.persistActiveTasks()
 		}
 
-		// Fill available slots from the pre-fetch queue.
-		d.logger.Debug("daemon: filling slots", "active_slots", d.slotManager.ActiveCount(), "queue_len", d.prefetchQueue.Len())
+		// Fill available slots from the pre-fetch queue. The tick runs every
+		// second; say so only when the figures moved (TB-91).
+		active, queued := d.slotManager.ActiveCount(), d.prefetchQueue.Len()
+		if d.slotFillLog.tickChanged(fmt.Sprint(active, " ", queued)) {
+			d.logger.Debug("daemon: filling slots", "active_slots", active, "queue_len", queued)
+		}
 		d.fillSlots(ctx)
 
 		// Surface a slot that stays idle with only inadmissible work buffered
@@ -1224,7 +1238,10 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 	for {
 		slotID := d.slotManager.AvailableSlotID()
 		if slotID < 0 {
-			d.logger.Debug("fillSlots: no available slots", "active", d.slotManager.ActiveCount())
+			active := d.slotManager.ActiveCount()
+			if d.slotFillLog.outcomeChanged(fmt.Sprint("full ", active)) {
+				d.logger.Debug("fillSlots: no available slots", "active", active)
+			}
 			return // no available slots
 		}
 
@@ -1234,24 +1251,33 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 				// Once per unit at Info, then Debug: this check runs on a
 				// 1-second tick, and per-check Info was ~30k identical
 				// lines/day on a machine waiting for capacity (TB-23).
+				// The Debug follow-up is logged only when the kind of
+				// reason changes, for the same tick (TB-91).
+				kind := refusalKind(reason)
 				if it.BlockedSince.IsZero() {
 					it.BlockedSince = time.Now()
 					d.logger.Info("buffered work unit waiting for capacity",
 						"work_unit_id", it.WU.ID, "leaf_id", it.WU.LeafID, "reason", reason)
-				} else {
+				} else if kind != it.BlockedReason {
 					d.logger.Debug("buffered work unit still waiting for capacity",
 						"work_unit_id", it.WU.ID, "reason", reason)
 				}
+				it.BlockedReason = kind
 			}
 			return ok
 		}, d.itemMayDelay)
 		if item == nil {
 			// Queue empty, nothing currently fits, or backfill is held for a
 			// starved unit — return the slot and wait for capacity to change.
-			d.logger.Debug("fillSlots: no runnable buffered unit", "queue_len", d.prefetchQueue.Len())
+			queued := d.prefetchQueue.Len()
+			if d.slotFillLog.outcomeChanged(fmt.Sprint("none_runnable ", queued)) {
+				d.logger.Debug("fillSlots: no runnable buffered unit", "queue_len", queued)
+			}
 			d.slotManager.ReturnSlotID(slotID)
 			return
 		}
+		// A unit is starting: the next dead end is news again.
+		d.slotFillLog.outcome = ""
 
 		startAttrs := []any{
 			"work_unit_id", item.WU.ID,
@@ -1284,6 +1310,36 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 		// head — either way the accounting never saw it uncounted (TB-33).
 		d.prefetchQueue.FinishStart(item.WU.ID)
 	}
+}
+
+// slotFillLog is the slot filler's Debug memory (TB-91). The main loop runs
+// the filler on a 1-second tick whether or not anything changed, and it used
+// to narrate every one: 153,718 "filling slots" / "no available slots" lines
+// in 21 hours on a machine whose slots were simply busy. Each narrating line
+// is now logged only when what it would say differs from what it said last.
+type slotFillLog struct {
+	tick    string // the "filling slots" figures last logged
+	outcome string // the dead end fillSlots last logged; "" after a start
+}
+
+func (l *slotFillLog) tickChanged(s string) bool    { return changedFrom(&l.tick, s) }
+func (l *slotFillLog) outcomeChanged(s string) bool { return changedFrom(&l.outcome, s) }
+
+// changedFrom reports whether s differs from *last, recording it if so.
+func changedFrom(last *string, s string) bool {
+	if *last == s {
+		return false
+	}
+	*last = s
+	return true
+}
+
+// refusalKind is an admission refusal's kind — its text before the first
+// colon ("configured memory budget", "free system RAM", …) — so a live figure
+// inside the reason, such as free RAM moving every second, is not news.
+func refusalKind(reason string) string {
+	kind, _, _ := strings.Cut(reason, ":")
+	return kind
 }
 
 // canAccommodateWU checks whether there are enough resources to run the WU
@@ -1469,8 +1525,13 @@ func (d *Daemon) itemMayDelay(blocked, candidate *PreFetchItem) bool {
 func (d *Daemon) shouldFetch() bool {
 	// Check scheduler.
 	if d.scheduler != nil && !d.scheduler.ShouldRun() {
-		d.logger.Debug("shouldFetch: scheduler says don't run")
+		if d.scheduleClosedLogged.CompareAndSwap(false, true) {
+			d.logger.Debug("shouldFetch: scheduler says don't run")
+		}
 		return false
+	}
+	if d.scheduleClosedLogged.CompareAndSwap(true, false) {
+		d.logger.Debug("shouldFetch: scheduler allows running again")
 	}
 
 	if d.limiter == nil {
