@@ -208,6 +208,35 @@ type Fetcher struct {
 	// now is the clock seam (defaults to time.Now). Tests advance it to exercise
 	// the pause cooldown without real sleeps.
 	now func() time.Time
+
+	// waiting names the idle wait the loop is sitting in ("" when it is not),
+	// and waitingSince when it entered it. The loop re-checks every wait about
+	// once a second but logs only the transition into it and out of it, so a
+	// two-hour schedule window is two Debug lines, not 7,200 (TB-91). Owned by
+	// the single Run goroutine — no lock needed.
+	waiting      string
+	waitingSince time.Time
+}
+
+// enterWait logs msg the first time the loop settles into the wait named
+// reason and stays silent on every re-check after that (TB-91). Moving from
+// one wait straight into another closes the first one.
+func (f *Fetcher) enterWait(reason, msg string, args ...any) {
+	if f.waiting == reason {
+		return
+	}
+	f.leaveWait()
+	f.waiting, f.waitingSince = reason, f.now()
+	f.logger.Debug(msg, args...)
+}
+
+// leaveWait logs how long the loop sat in its current wait, if it was in one.
+func (f *Fetcher) leaveWait() {
+	if f.waiting == "" {
+		return
+	}
+	f.logger.Debug("fetcher: wait over", "reason", f.waiting, "waited", f.now().Sub(f.waitingSince).Round(time.Second).String())
+	f.waiting = ""
 }
 
 // Cadence defaults.
@@ -391,7 +420,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 
 		// Check if fetching is allowed (disk space, scheduler, etc.).
 		if f.shouldFetchFunc != nil && !f.shouldFetchFunc() {
-			f.logger.Debug("fetcher: shouldFetch returned false, waiting 1s")
+			f.enterWait("fetch_gate", "fetcher: shouldFetch returned false, not requesting")
 			if !f.sleep(ctx, 1*time.Second) {
 				return
 			}
@@ -403,7 +432,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// the longer idleWait) so the fetcher refills promptly the moment a running
 		// slot completes and frees buffer capacity, without polling the head.
 		if f.workBufferFullFn != nil && f.workBufferFullFn() {
-			f.logger.Debug("fetcher: work buffer full, not requesting", "queue_len", f.queue.Len())
+			f.enterWait("buffer_full", "fetcher: work buffer full, not requesting", "queue_len", f.queue.Len())
 			recheck := f.backoff
 			if recheck <= 0 {
 				recheck = time.Millisecond
@@ -418,12 +447,13 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// out its retry delay, sleep until the earliest NextContactAt (or a poll
 		// tick), issuing no requests in the meantime.
 		if wait, ok := f.waitUntilHeadEligible(); ok {
-			f.logger.Debug("fetcher: all heads waiting out retry delay", "wait", wait)
+			f.enterWait("head_retry_delay", "fetcher: all heads waiting out retry delay", "wait", wait)
 			if !f.sleep(ctx, wait) {
 				return
 			}
 			continue
 		}
+		f.leaveWait()
 
 		f.logger.Debug("fetcher: attempting fetchOne", "queue_len", f.queue.Len())
 

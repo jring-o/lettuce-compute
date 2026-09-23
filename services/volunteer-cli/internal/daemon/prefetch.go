@@ -23,6 +23,10 @@ type PreFetchItem struct {
 	// (zero = never refused); it keys the once-per-unit capacity-wait log and
 	// the wait duration reported when the unit finally starts (TB-23).
 	BlockedSince time.Time
+	// BlockedReason is the kind of admission refusal (refusalKind) last seen
+	// for this unit, so the 1-second slot tick logs a new kind of reason, not
+	// the same one again (TB-91).
+	BlockedReason string
 	// TimesSkipped counts units started past this one while it waited for
 	// capacity — PopFit's starvation guard (TB-22).
 	TimesSkipped int
