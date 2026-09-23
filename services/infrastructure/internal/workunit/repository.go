@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/lettuce-compute/infrastructure/internal/leaf"
 	"github.com/lettuce-compute/infrastructure/internal/types"
 )
 
@@ -51,6 +52,35 @@ type AssignmentOptions struct {
 	// would be killed at the timeout. 0 = no benchmark reported -> the check is skipped
 	// for this requester (cannot estimate, so never refuse work on a guess).
 	BenchmarkFPOPS float64
+	// HostMaxCPUCores / HostMaxMemoryMB are the requester's budgets for work that
+	// runs directly on its machine — NATIVE and WASM leaves (TB-85). MaxCPUCores and
+	// MaxMemoryMB are then the budgets for CONTAINER leaves: on macOS and Windows the
+	// container engine runs inside a virtual machine, and the client clips those two
+	// figures to what that VM holds, which says nothing about what the machine itself
+	// can give a native or WASM unit. 0 = not reported (a client predating them): the
+	// single figures apply to every runtime. BudgetsFor picks the pair for a leaf;
+	// FindNextAssignable carries the same choice in SQL.
+	HostMaxCPUCores int
+	HostMaxMemoryMB int
+}
+
+// BudgetsFor returns the CPU-core and memory budgets a leaf of the given runtime
+// (execution_config.runtime; "" is NATIVE, the in-memory predicate's default) is
+// matched against: the host budgets for NATIVE and WASM when the requester reported
+// them, else MaxCPUCores / MaxMemoryMB (TB-85). Each dimension falls back on its own,
+// so a requester reporting only one host figure is still matched sensibly.
+func (o AssignmentOptions) BudgetsFor(runtime string) (cpuCores, memoryMB int) {
+	cpuCores, memoryMB = o.MaxCPUCores, o.MaxMemoryMB
+	if runtime != "" && runtime != leaf.RuntimeNative && runtime != leaf.RuntimeWasm {
+		return cpuCores, memoryMB
+	}
+	if o.HostMaxCPUCores > 0 {
+		cpuCores = o.HostMaxCPUCores
+	}
+	if o.HostMaxMemoryMB > 0 {
+		memoryMB = o.HostMaxMemoryMB
+	}
+	return cpuCores, memoryMB
 }
 
 // FeasibleByDeadline reports whether a host with benchmark FP-ops/sec can be

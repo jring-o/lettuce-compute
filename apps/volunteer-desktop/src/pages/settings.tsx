@@ -515,7 +515,7 @@ export function SettingsPage() {
         />
         <p className="text-xs text-muted-foreground">
           {machine?.cpu_limited_by_vm
-            ? `Work on this machine is limited to ${machine.max_cpu_cores} cores: the container engine's virtual machine has ${machine.container_vm_cpus} CPUs, so heads are told ${machine.max_cpu_cores}. Give the machine more CPUs to use more.`
+            ? `Container work on this machine is limited to ${machine.max_cpu_cores} cores: the container engine's virtual machine has ${machine.container_vm_cpus} CPUs. Native and WebAssembly work can use all ${config.resource_limits.max_cpu_cores}. Give the machine more CPUs to run bigger container leafs.`
             : cpuShareCaption(config.resource_limits.max_cpu_cores)}
         </p>
 

@@ -320,6 +320,20 @@ describe("ManagementClient", () => {
       expect(limited.machine.memory_limited_by_vm).toBe(true);
     });
 
+    it("falls back to the container figures for the host budgets a daemon older than TB-85 does not send", async () => {
+      respond({ heads: [head], machine });
+      const result = await client.headsAndMachine();
+      expect(result.machine.host_max_memory_mb).toBe(result.machine.max_memory_mb);
+      expect(result.machine.host_max_cpu_cores).toBe(result.machine.max_cpu_cores);
+
+      respond({ heads: [head], machine: { ...machine, max_memory_mb: 768, host_max_memory_mb: 1024, max_cpu_cores: 2, host_max_cpu_cores: 4 } });
+      const split = await client.headsAndMachine();
+      expect(split.machine.max_memory_mb).toBe(768);
+      expect(split.machine.host_max_memory_mb).toBe(1024);
+      expect(split.machine.max_cpu_cores).toBe(2);
+      expect(split.machine.host_max_cpu_cores).toBe(4);
+    });
+
     it("defaults the container-VM CPU fields a daemon older than TB-75 does not send", async () => {
       respond({ heads: [head], machine });
       const result = await client.headsAndMachine();

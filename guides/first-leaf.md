@@ -680,6 +680,10 @@ resource needs. Check these in order:
    your NATIVE leaf. `lettuce-volunteer doctor` on the volunteer shows what it will run.
 4. **Resource fit.** A volunteer only receives units whose declared memory/disk fit
    under its configured limits — an oversized `max_memory_mb` silently matches nobody.
+   On macOS and Windows a `CONTAINER` leaf must also fit the volunteer's container
+   engine virtual machine (its memory less 512 MB, and its CPUs), which is often smaller
+   than the volunteer's limit; a `NATIVE` or `WASM` leaf is matched against the limit
+   alone.
 
 ---
 

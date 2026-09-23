@@ -379,6 +379,8 @@ func parityOpts(s dispatchparity.Scenario, seed seededParity) AssignmentOptions 
 		LeafIDs:                 []types.ID{seed.leafID},
 		MaxCPUCores:             s.RequesterMaxCPUCores,
 		MaxMemoryMB:             s.RequesterMaxMemoryMB,
+		HostMaxCPUCores:         s.RequesterHostMaxCPUCores,
+		HostMaxMemoryMB:         s.RequesterHostMaxMemoryMB,
 		MaxDiskMB:               1 << 40,
 		HasGPU:                  s.RequesterHasGPU,
 		AvailableRuntimes:       s.RequesterRuntimes,

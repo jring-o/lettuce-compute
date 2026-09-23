@@ -101,8 +101,8 @@ func TestTB63_EngineVMClipsBudgetCeilingAndAdvertisement(t *testing.T) {
 	if cr.MemoryCeilingMB() != 1536 {
 		t.Errorf("runtime memory ceiling = %d MB, want 1536 (the VM's 2048 less %d headroom), not the 8192 configured", cr.MemoryCeilingMB(), runtime.ContainerVMHeadroomMB)
 	}
-	if got := d.MemoryBudgetMB(); got != 1536 {
-		t.Errorf("MemoryBudgetMB = %d, want 1536", got)
+	if got := d.ContainerMemoryBudgetMB(); got != 1536 {
+		t.Errorf("ContainerMemoryBudgetMB = %d, want 1536", got)
 	}
 	if got := d.ContainerVMMemoryMB(); got != 2048 {
 		t.Errorf("ContainerVMMemoryMB = %d, want 2048", got)
@@ -133,7 +133,7 @@ func TestTB63_EngineVMClipsBudgetCeilingAndAdvertisement(t *testing.T) {
 	if notice.ResolvedAt != nil {
 		t.Errorf("notice resolved while the VM still clips: %+v", notice)
 	}
-	if c := strings.Count(buf.String(), "container engine's VM is smaller than the memory limit"); c != 1 {
+	if c := strings.Count(buf.String(), "container engine's VM is smaller than an enabled container leaf needs"); c != 1 {
 		t.Errorf("clip WARN logged %d time(s), want exactly 1; log:\n%s", c, buf.String())
 	}
 
@@ -181,8 +181,8 @@ func TestTB63_EngineSharingHostRAMDoesNotClip(t *testing.T) {
 	if cr.MemoryCeilingMB() != 8192 {
 		t.Errorf("ceiling = %d, want the configured 8192", cr.MemoryCeilingMB())
 	}
-	if d.MemoryBudgetMB() != 8192 || d.ContainerVMMemoryMB() != 0 || d.MemoryLimitedByVM() {
-		t.Errorf("budget %d, vm %d, limited %v; want 8192 / 0 / false", d.MemoryBudgetMB(), d.ContainerVMMemoryMB(), d.MemoryLimitedByVM())
+	if d.ContainerMemoryBudgetMB() != 8192 || d.ContainerVMMemoryMB() != 0 || d.MemoryLimitedByVM() {
+		t.Errorf("budget %d, vm %d, limited %v; want 8192 / 0 / false", d.ContainerMemoryBudgetMB(), d.ContainerVMMemoryMB(), d.MemoryLimitedByVM())
 	}
 	if got := d.AdvertisedHardware().MaxMemoryMb; got != 8192 {
 		t.Errorf("advertised MaxMemoryMb = %d, want 8192 unchanged", got)
@@ -206,8 +206,8 @@ func TestTB63_VMLargeEnoughKeepsTheConfiguration(t *testing.T) {
 	if !d.RedetectContainerRuntime(context.Background(), false) {
 		t.Fatal("RedetectContainerRuntime = false with the engine up")
 	}
-	if d.MemoryBudgetMB() != 8192 || d.MemoryLimitedByVM() {
-		t.Errorf("budget %d, limited %v; want 8192 / false", d.MemoryBudgetMB(), d.MemoryLimitedByVM())
+	if d.ContainerMemoryBudgetMB() != 8192 || d.MemoryLimitedByVM() {
+		t.Errorf("budget %d, limited %v; want 8192 / false", d.ContainerMemoryBudgetMB(), d.MemoryLimitedByVM())
 	}
 	if got := d.ContainerVMMemoryMB(); got != 8192+runtime.ContainerVMHeadroomMB {
 		t.Errorf("ContainerVMMemoryMB = %d, want the VM's figure reported even when it does not clip", got)

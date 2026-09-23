@@ -81,19 +81,21 @@ func TestTB63_EvaluateLeafEligibilityCountsTheVMBlock(t *testing.T) {
 	}
 }
 
-// TestTB63_CheckMemoryBudgetWarnsWhenTheVMClips: the "memory limit" line is a
-// warning naming the budget, the limit, the VM and the headroom, with the
-// resize remedy; with a VM that honors the limit it is informational and says
-// so; with no VM it is the old line.
-func TestTB63_CheckMemoryBudgetWarnsWhenTheVMClips(t *testing.T) {
+// TestTB63_CheckMemoryBudgetNamesTheVMWhenItClips: the "memory limit" line
+// names container work's budget, the limit native and WebAssembly work keeps
+// (TB-85), the VM and the headroom, with the resize remedy — as information:
+// a leaf the VM holds back is reported as blocked per head, and the clip
+// alone is no fault (TB-92). With a VM that honors the limit it says so; with
+// no VM it is the old line.
+func TestTB63_CheckMemoryBudgetNamesTheVMWhenItClips(t *testing.T) {
 	var buf bytes.Buffer
 	rep := &doctorReport{w: &buf}
 	checkMemoryBudget(rep, tb63VMCaps())
 	out := buf.String()
-	if rep.warns != 1 {
-		t.Errorf("warns = %d, want 1:\n%s", rep.warns, out)
+	if rep.warns != 0 {
+		t.Errorf("warns = %d, want 0 (the clip is information):\n%s", rep.warns, out)
 	}
-	for _, want := range []string{"1536 MB", "8192 MB", "2048 MB", "512 MB", "podman machine set --memory", "raising max_memory_mb alone changes nothing"} {
+	for _, want := range []string{"1536 MB", "8192 MB", "2048 MB", "512 MB", "podman machine set --memory", "native and WebAssembly work"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("memory limit line lacks %q:\n%s", want, out)
 		}

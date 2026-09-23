@@ -44,10 +44,12 @@ type CPUGrant struct {
 	// ShareCores is this task's share of the budget: budget / running tasks,
 	// rounded down to a hundredth of a core.
 	ShareCores float64
-	// BudgetCores is the whole-machine budget the share is part of. The Linux
-	// affinity fallback, which cannot express a fractional share, confines
-	// every task to this many CPUs instead — the same set for all of them, so
-	// the total still cannot exceed the budget.
+	// BudgetCores is the budget the share is part of: the whole-machine
+	// budget for a task that runs directly on the machine, the container
+	// budget for a container task (TB-85). The Linux affinity fallback, which
+	// cannot express a fractional share, confines every task to this many
+	// CPUs instead — the same set for all of them, so the total still cannot
+	// exceed the budget.
 	BudgetCores int
 }
 
@@ -63,6 +65,61 @@ func CPUShareCores(budgetCores, running int) float64 {
 		running = 1
 	}
 	return math.Floor(float64(budgetCores)/float64(running)*cpuShareGranularity) / cpuShareGranularity
+}
+
+// CPUShares is what each running task is given when the machine has two CPU
+// budgets (TB-85): the host budget, max_cpu_cores, which every task draws on,
+// and the container budget — the host budget clipped to the vCPUs of the
+// container engine's virtual machine (ContainerCPUBudget) — which bounds the
+// container tasks alone, since they all run inside that VM. Native and WASM
+// tasks run directly on the machine and are bounded by the host budget only.
+type CPUShares struct {
+	// Host is the share of a task that runs directly on the machine.
+	Host float64
+	// Container is the share of a container task.
+	Container float64
+}
+
+// SplitCPUBudget divides the CPU budgets among the running tasks: every task
+// is given an equal share of hostBudget, except that the container tasks
+// together never get more than containerBudget; what that leaves of the host
+// budget is split equally among the host tasks. With no VM clip (containerBudget
+// at or above an equal share) it is CPUShareCores' equal split for every task.
+// A task alone gets its whole budget; zero or negative counts are zero. Shares
+// are rounded down to a hundredth of a core, so they never sum to more than
+// either budget. A hostBudget of 0 (no limit) leaves the host share 0 (none
+// enforced) and bounds container tasks by the container budget only.
+func SplitCPUBudget(hostBudget, containerBudget, hostTasks, containerTasks int) CPUShares {
+	if hostTasks < 0 {
+		hostTasks = 0
+	}
+	if containerTasks < 0 {
+		containerTasks = 0
+	}
+	if hostBudget <= 0 {
+		return CPUShares{Container: CPUShareCores(containerBudget, containerTasks)}
+	}
+	running := hostTasks + containerTasks
+	if running < 1 {
+		running = 1
+	}
+	equal := float64(hostBudget) / float64(running)
+	container := equal
+	if containerBudget > 0 && containerTasks > 0 {
+		if vm := float64(containerBudget) / float64(containerTasks); vm < container {
+			container = vm
+		}
+	}
+	host := equal
+	if hostTasks > 0 {
+		host = (float64(hostBudget) - container*float64(containerTasks)) / float64(hostTasks)
+	}
+	return CPUShares{Host: floorShare(host), Container: floorShare(container)}
+}
+
+// floorShare rounds a share down to cpuShareGranularity.
+func floorShare(cores float64) float64 {
+	return math.Floor(cores*cpuShareGranularity) / cpuShareGranularity
 }
 
 // CFSQuota converts a share into the quota/period pair the container engine
@@ -81,8 +138,8 @@ func CFSQuota(shareCores float64) (quota, period int64) {
 	return quota, CFSPeriodMicros
 }
 
-// ContainerCPUBudget returns the CPU budget this machine can actually work to:
-// the configured whole-machine budget (configCores,
+// ContainerCPUBudget returns the CPU budget container work can actually get on
+// this machine: the configured whole-machine budget (configCores,
 // resource_limits.max_cpu_cores), clipped to the number of CPUs the container
 // engine's virtual machine has when the engine runs inside one and reported
 // the count (engineCPUs, the engine's NCPU). On macOS and Windows every
@@ -92,8 +149,10 @@ func CFSQuota(shareCores float64) (quota, period int64) {
 // its size is unknown" and leaves the configuration as it is; a Linux host,
 // where containers share the host's CPUs, is never clipped here.
 //
-// This is the number to advertise to heads, to book admission against and to
-// share among running tasks: one figure for all three.
+// This is container work's budget: advertised to heads as max_cpu_cores, the
+// bound container bookings are summed against, and what container tasks
+// share (SplitCPUBudget). Native and WASM work runs on the machine itself and
+// is bounded by the configuration alone (TB-85).
 func ContainerCPUBudget(configCores, engineCPUs int) int {
 	if engineCPUs <= 0 || configCores <= 0 {
 		return configCores

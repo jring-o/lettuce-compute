@@ -68,6 +68,10 @@ type Fetcher struct {
 	// nil in tests that never exercise it.
 	engineUnreachableFn func(rt runtime.Runtime, err error) bool
 
+	// leafsRefreshedFn is told after a round refreshed at least one head's leaf
+	// catalog, so what depends on the enabled leafs — the VM-clip notices
+	// (TB-92) — is re-evaluated against the new one. Injected from the daemon.
+	leafsRefreshedFn func()
 	// runtimeBlockedFn re-evaluates whether EVERY attached leaf is
 	// runtime-blocked (needs a runtime this machine lacks or the volunteer has
 	// not trusted its head for — the pre-request skip's own verdict) and keeps
@@ -347,6 +351,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		reRegisterFn:             d.reRegisterHost,
 		readvertiseFn:            d.readvertiseIfPending,
 		runtimeBlockedFn:         d.refreshRuntimeBlocked,
+		leafsRefreshedFn:         d.refreshContainerVMNotices,
 		engineUnreachableFn:      d.NoteContainerEngineUnreachable,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
@@ -673,13 +678,19 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 	f.expirePausedRuntimes()
 
 	// Refresh leaf cache for servers that need it.
+	refreshed := false
 	for _, srv := range f.multiClient.Servers() {
 		if f.leafCache.NeedsRefresh(srv.Name) {
 			f.logger.Debug("fetcher: refreshing leaf cache", "server", srv.Name)
 			if err := f.leafCache.Refresh(ctx, srv.Name, srv.Client); err != nil {
 				f.logger.Warn("fetcher: leaf cache refresh failed", "server", srv.Name, "error", err)
+			} else {
+				refreshed = true
 			}
 		}
+	}
+	if refreshed && f.leafsRefreshedFn != nil {
+		f.leafsRefreshedFn()
 	}
 
 	available := f.availableServers()
@@ -1339,6 +1350,13 @@ func runtimeKeyForWU(wu *runtime.WorkUnit) string {
 		return runtime.RuntimeNative
 	}
 	return name
+}
+
+// isContainerUnit reports whether a unit runs in the container runtime —
+// inside the container engine's VM on macOS and Windows, so bounded by the
+// container budgets rather than the host ones (TB-85). A nil unit is not.
+func isContainerUnit(wu *runtime.WorkUnit) bool {
+	return wu != nil && runtimeKeyForWU(wu) == runtime.RuntimeContainer
 }
 
 // requiredRuntimeForLeaf derives the runtime a leaf needs, mirroring the

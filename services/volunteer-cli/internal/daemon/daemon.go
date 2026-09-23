@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	goruntime "runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -317,6 +318,8 @@ type Daemon struct {
 	// client can show what the log would otherwise say only to a reader of
 	// the log. Shared with the thermal monitor and the fetcher.
 	notices *NoticeLog
+	// vmNotices de-duplicates the VM-clip notices' re-evaluation (TB-92).
+	vmNotices vmNoticeState
 
 	// Per-head version and update-required state (see head_status.go),
 	// keyed by gRPC address. Seeded at start-up from registration, then kept
@@ -579,13 +582,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.mu.Unlock()
 	}()
 
-	// A container runtime built before the daemon existed (start-up) may have
-	// had its memory budget clipped to the engine's VM; start-up lowered the
-	// advertisement it registered with, and the volunteer is told here (TB-63).
-	// The CPU budget likewise (TB-75).
-	d.refreshContainerMemoryNotice()
-	d.refreshContainerCPUNotice()
-
 	maxSlots := d.cfg.MaxConcurrentTasks
 	if maxSlots <= 0 {
 		maxSlots = 1
@@ -612,6 +608,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Initialize leaf cache from all servers.
 	d.leafCache.RefreshAll(ctx, d.multiClient.Servers())
 	d.initializeWeights()
+
+	// A container runtime built before the daemon existed (start-up) may have
+	// had its memory budget clipped to the engine's VM; start-up lowered the
+	// advertisement it registered with, and the volunteer is told here (TB-63).
+	// The CPU budget likewise (TB-75). After the catalog is loaded: the
+	// notices name the enabled leafs the clip holds back, and say nothing when
+	// it holds none back (TB-92).
+	d.refreshContainerVMNotices()
 
 	// Give the container runtime the keep-set for its stale-image reaper: every
 	// image an enabled leaf wants cached, so a re-pushed mutable tag's superseded
@@ -640,7 +644,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// maxDepth is only a safety ceiling on descriptor count, so it is set well
 	// above the hours target to avoid being the binding constraint.
 	d.slotManager = NewSlotManager(maxSlots, d.logger)
-	d.slotManager.SetCPUShareSource(d.currentCPUShare)
+	d.slotManager.SetCPUShareSource(d.currentCPUShares)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 
 	// Start resource monitor goroutine.
@@ -1347,8 +1351,10 @@ func refusalKind(reason string) string {
 // what the machine can actually fit):
 //
 //  1. Configured budget — the sum of declared per-WU memory across active slots
-//     plus this WU must stay within the volunteer's max_memory_mb. Uses declared
-//     maxes, so it is robust to container memory ramping up over time.
+//     plus this WU must stay within the volunteer's max_memory_mb, and a
+//     container unit's, with the other container units', within what the
+//     container engine's VM can hold (TB-85). Uses declared maxes, so it is
+//     robust to container memory ramping up over time.
 //  2. Real free system RAM — the machine must currently have enough available
 //     memory for this WU (plus a small headroom), regardless of the configured
 //     budget. Skipped on platforms where free memory can't be read.
@@ -1371,11 +1377,11 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 
 	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
 	// enforce — so admission and enforcement share one denominator. A declared 0 is
-	// bounded to the per-task default; a huge declaration is clamped to the budget.
-	// The budget is the configured one clipped to the container engine's VM where
-	// there is one (MemoryBudgetMB, TB-63) — the same figure the heads are told.
-	maxMemoryMB := d.MemoryBudgetMB()
-	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
+	// bounded to the per-task default; a huge declaration is clamped to the budget
+	// of the unit's runtime (bookedMemMB, TB-85): for a container unit the
+	// configured one clipped to the container engine's VM where there is one
+	// (TB-63), for a native or WASM unit the configured one.
+	wuMemoryMB := d.bookedMemMB(wu)
 
 	// 0. The declaration itself. A unit that declares more than the budget is
 	// never started clamped below what its leaf asked for (TB-79): the head
@@ -1386,12 +1392,27 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 		return false, why
 	}
 
-	// 1. Configured memory budget.
-	if maxMemoryMB > 0 {
-		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(maxMemoryMB)
-		if activeMemoryMB+wuMemoryMB > maxMemoryMB {
+	// 1. Configured memory budget: everything running, whatever its runtime,
+	// within max_memory_mb.
+	hostMemoryMB := d.HostMemoryBudgetMB()
+	if hostMemoryMB > 0 {
+		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(d.bookedMemMB)
+		if activeMemoryMB+wuMemoryMB > hostMemoryMB {
 			return false, fmt.Sprintf("configured memory budget: %d MB active + %d MB unit exceeds max_memory_mb %d",
-				activeMemoryMB, wuMemoryMB, maxMemoryMB)
+				activeMemoryMB, wuMemoryMB, hostMemoryMB)
+		}
+	}
+	// 1b. Container memory budget (TB-85): the container units all run inside
+	// the container engine's VM, so together they stay within what it can hold.
+	// A native or WASM unit runs on the machine itself and is not booked here —
+	// it used to be, against the VM's figure, so a 128 MB native unit could not
+	// start beside a 768 MB container on a 1,024 MB limit.
+	if vmMemoryMB := d.ContainerMemoryBudgetMB(); isContainerUnit(wu) && vmMemoryMB > 0 &&
+		(hostMemoryMB <= 0 || vmMemoryMB < hostMemoryMB) {
+		activeContainerMB := d.slotManager.TotalActiveMemoryMB(d.bookedContainerMemMB)
+		if activeContainerMB+wuMemoryMB > vmMemoryMB {
+			return false, fmt.Sprintf("container memory budget: %d MB of container work active + %d MB unit exceeds the %d MB the container engine's VM can hold",
+				activeContainerMB, wuMemoryMB, vmMemoryMB)
 		}
 	}
 
@@ -1422,17 +1443,27 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	}
 
 	// 5. Configured CPU budget (TB-75): the cores booked by the running tasks
-	// plus this unit's must stay within max_cpu_cores (clipped to the engine
-	// VM's CPUs). Each unit books its leaf's minimum core requirement, floor
-	// 1, so the equal share the running tasks are given never drops below
-	// what a leaf declared it needs — and at most budget tasks run at once,
-	// whatever max_concurrent_tasks allows.
-	if budget := d.CPUBudgetCores(); budget > 0 {
-		wuCores := d.bookedCPUCores(wu)
+	// plus this unit's must stay within max_cpu_cores, and a container unit's,
+	// with the other container tasks', within the container engine VM's CPUs
+	// (TB-85). Each unit books its leaf's minimum core requirement, floor 1,
+	// so the equal share the running tasks are given never drops below what a
+	// leaf declared it needs — and at most budget tasks run at once, whatever
+	// max_concurrent_tasks allows.
+	wuCores := d.bookedCPUCores(wu)
+	hostCores := d.HostCPUBudgetCores()
+	if hostCores > 0 {
 		activeCores := d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
-		if activeCores+wuCores > budget {
+		if activeCores+wuCores > hostCores {
 			return false, fmt.Sprintf("configured CPU budget: %d core(s) booked by running tasks + %d for this unit exceeds max_cpu_cores %d",
-				activeCores, wuCores, budget)
+				activeCores, wuCores, hostCores)
+		}
+	}
+	if vmCores := d.ContainerCPUBudgetCores(); isContainerUnit(wu) && vmCores > 0 &&
+		(hostCores <= 0 || vmCores < hostCores) {
+		activeContainerCores := d.slotManager.TotalActiveCPUCores(d.bookedContainerCPUCores)
+		if activeContainerCores+wuCores > vmCores {
+			return false, fmt.Sprintf("container CPU budget: %d core(s) booked by running container tasks + %d for this unit exceeds the %d CPUs of the container engine's VM",
+				activeContainerCores, wuCores, vmCores)
 		}
 	}
 
@@ -1456,13 +1487,16 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 		return true
 	}
 
-	// Configured memory budget: harmless iff both bookings fit it together.
-	if maxMemoryMB := d.MemoryBudgetMB(); maxMemoryMB > 0 {
-		blockedMemMB := runtime.BookedMemMB(int(blocked.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
-		candMemMB := runtime.BookedMemMB(int(candidate.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
-		if blockedMemMB+candMemMB > maxMemoryMB {
-			return true
-		}
+	// Configured memory budgets: harmless iff both bookings fit them together —
+	// max_memory_mb always, and the container engine VM's budget when both are
+	// container units (TB-85).
+	bothContainer := isContainerUnit(blocked) && isContainerUnit(candidate)
+	blockedMemMB, candMemMB := d.bookedMemMB(blocked), d.bookedMemMB(candidate)
+	if hostMemoryMB := d.HostMemoryBudgetMB(); hostMemoryMB > 0 && blockedMemMB+candMemMB > hostMemoryMB {
+		return true
+	}
+	if vmMemoryMB := d.ContainerMemoryBudgetMB(); bothContainer && vmMemoryMB > 0 && blockedMemMB+candMemMB > vmMemoryMB {
+		return true
 	}
 
 	// GPU exclusivity: two GPU units co-run only when two physical GPUs exist.
@@ -1485,11 +1519,14 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 		}
 	}
 
-	// Configured CPU budget (TB-75): harmless iff both bookings fit it together.
-	if budget := d.CPUBudgetCores(); budget > 0 {
-		if d.bookedCPUCores(blocked)+d.bookedCPUCores(candidate) > budget {
-			return true
-		}
+	// Configured CPU budgets (TB-75, TB-85): harmless iff both bookings fit
+	// them together, as for memory.
+	bookedCores := d.bookedCPUCores(blocked) + d.bookedCPUCores(candidate)
+	if hostCores := d.HostCPUBudgetCores(); hostCores > 0 && bookedCores > hostCores {
+		return true
+	}
+	if vmCores := d.ContainerCPUBudgetCores(); bothContainer && vmCores > 0 && bookedCores > vmCores {
+		return true
 	}
 
 	return false
@@ -2191,7 +2228,9 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 	if leaf.ExecutionSpec == nil {
 		return true, ""
 	}
-	return d.canAccommodateWU(&runtime.WorkUnit{ExecutionSpec: runtime.ExecutionSpec{
+	// The leaf's runtime decides which budgets the unit is booked against
+	// (TB-85): a native leaf's small units fill a slot beside a container.
+	return d.canAccommodateWU(&runtime.WorkUnit{LeafID: leaf.ID, Runtime: requiredRuntimeForLeaf(leaf), ExecutionSpec: runtime.ExecutionSpec{
 		MaxMemoryMB: leaf.ExecutionSpec.MaxMemoryMB,
 		MaxDiskMB:   leaf.ExecutionSpec.MaxDiskMB,
 		GPURequired: leaf.ExecutionSpec.GPURequired,
@@ -2237,17 +2276,24 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 }
 
 // memoryDeclarationFits reports whether a unit's declared memory fits this
-// machine's live memory budget, with the reason when it does not — both
-// figures, so the head's ledger and the volunteer's log say why the unit was
-// returned (TB-79). A unit declaring nothing is bounded to the per-task
-// default and always fits; with no configured budget everything fits.
+// machine's live memory budget for its runtime (memoryBudgetFor, TB-85), with
+// the reason when it does not — both figures, so the head's ledger and the
+// volunteer's log say why the unit was returned (TB-79). A unit declaring
+// nothing is bounded to the per-task default and always fits; with no
+// configured budget everything fits. A native or WASM unit is judged against
+// the configured limit, never the container engine VM's budget: it does not
+// run inside the VM, and a head that knows both figures sends it on the
+// larger one.
 func (d *Daemon) memoryDeclarationFits(wu *runtime.WorkUnit) (bool, string) {
 	if wu == nil {
 		return true, ""
 	}
-	declared, budget := int(wu.ExecutionSpec.MaxMemoryMB), d.MemoryBudgetMB()
+	declared, budget := int(wu.ExecutionSpec.MaxMemoryMB), d.memoryBudgetFor(wu)
 	if declared <= 0 || budget <= 0 || declared <= budget {
 		return true, ""
+	}
+	if isContainerUnit(wu) && d.MemoryLimitedByVM() {
+		return false, fmt.Sprintf("unit declares %d MB but container work on this machine is limited to %d MB by the container engine's VM; heads are told that figure for container leafs and only send ones that fit it", declared, budget)
 	}
 	return false, fmt.Sprintf("unit declares %d MB but this machine's memory budget is %d MB; heads are told the budget and only send leafs that fit it", declared, budget)
 }
@@ -3438,7 +3484,9 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 		hw := d.advertisedHardware()
 		d.logger.Info("resource limits changed: heads are told the new figures from the next poll, admission books against them now, and running tasks keep the ceilings they started with",
 			"max_memory_mb", newCfg.ResourceLimits.MaxMemoryMB, "advertised_max_memory_mb", hw.GetMaxMemoryMb(),
+			"advertised_host_max_memory_mb", hw.GetHostMaxMemoryMb(),
 			"max_cpu_cores", newCfg.ResourceLimits.MaxCPUCores, "advertised_max_cpu_cores", hw.GetMaxCpuCores(),
+			"advertised_host_max_cpu_cores", hw.GetHostMaxCpuCores(),
 			"max_disk_gb", newCfg.ResourceLimits.MaxDiskGB, "max_gpu_vram_pct", newCfg.ResourceLimits.MaxGPUVRAMPct,
 			"advertised_gpus", len(hw.GetGpus()))
 	}
@@ -3548,22 +3596,26 @@ func (d *Daemon) setAdvertisedMemoryMB(mb int) {
 
 // setAdvertisedResourceLimits rebuilds the resource_limits half of the
 // advertisement from the live configuration (TB-79): the memory and CPU
-// budgets (the configuration clipped to the container engine's VM where
-// there is one — MemoryBudgetMB, CPUBudgetCores), the disk allowance, the
-// bandwidth cap, and the GPU list with the configured share and the per-GPU
-// overrides applied to the detection the start-up advertisement was built
-// from — the same rules registration used (client.ApplyGPUConfig), so a
-// changed share advertises exactly what a restart would. The detected
-// figures (total memory, core count, free disk, the GPU models) are kept.
-// Without a retained detection the GPU list is left as it is.
+// budgets — max_memory_mb / max_cpu_cores the container budgets (the
+// configuration clipped to the container engine's VM where there is one —
+// ContainerMemoryBudgetMB, ContainerCPUBudgetCores), host_max_memory_mb /
+// host_max_cpu_cores the configuration itself, the budgets of native and WASM
+// work (client.SetHostBudgets, TB-85) — the disk allowance, the bandwidth
+// cap, and the GPU list with the configured share and the per-GPU overrides
+// applied to the detection the start-up advertisement was built from — the
+// same rules registration used (client.ApplyGPUConfig), so a changed share
+// advertises exactly what a restart would. The detected figures (total
+// memory, core count, free disk, the GPU models) are kept. Without a
+// retained detection the GPU list is left as it is.
 func (d *Daemon) setAdvertisedResourceLimits() {
-	memMB, cores := d.MemoryBudgetMB(), d.CPUBudgetCores()
+	memMB, cores := d.ContainerMemoryBudgetMB(), d.ContainerCPUBudgetCores()
 	d.hwMu.RLock()
 	detected := d.detectedGPUs
 	d.hwMu.RUnlock()
 	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) {
 		hw.MaxMemoryMb = int32(memMB)
 		hw.MaxCpuCores = int32(cores)
+		client.SetHostBudgets(hw, d.cfg.ResourceLimits)
 		hw.MaxDiskMb = int64(d.cfg.ResourceLimits.MaxDiskGB) * 1024
 		hw.MaxBandwidthMbps = int32(d.cfg.ResourceLimits.MaxBandwidthMbps)
 		if detected != nil {
@@ -3584,27 +3636,71 @@ func (d *Daemon) ContainerVMMemoryMB() int {
 	return engineMB
 }
 
-// MemoryBudgetMB is the whole-machine memory budget this daemon works to: the
+// HostMemoryBudgetMB is the whole-machine memory budget this daemon works to:
+// the configured max_memory_mb. Every running unit together stays within it,
+// and a unit that runs directly on the machine (native, WASM) is measured
+// against it alone (TB-85). It is advertised to heads as host_max_memory_mb,
+// the figure a head compares a native or WASM leaf with.
+func (d *Daemon) HostMemoryBudgetMB() int {
+	if d.cfg == nil {
+		return 0
+	}
+	return d.cfg.ResourceLimits.MaxMemoryMB
+}
+
+// ContainerMemoryBudgetMB is the memory budget container work gets: the
 // configured max_memory_mb, clipped to what the container engine's VM can hold
 // less headroom where the engine runs inside one (runtime.ContainerMemoryBudgetMB,
-// TB-63). It is the figure advertised to heads, booked at admission and given
-// to the container runtime as its ceiling, so all three agree. With no
-// container engine, or one that shares the host's RAM, it is the configuration.
-func (d *Daemon) MemoryBudgetMB() int {
-	cfgMB := 0
-	if d.cfg != nil {
-		cfgMB = d.cfg.ResourceLimits.MaxMemoryMB
+// TB-63). It is the max_memory_mb advertised to heads — every runtime's work
+// fits it, and a head compares a container leaf with it — the budget the
+// container units are booked against together, and the container runtime's
+// ceiling, so all three agree. With no container engine, or one that shares
+// the host's RAM, it is the configuration.
+//
+// It used to be the one memory budget for everything (MemoryBudgetMB), so on a
+// Mac whose VM was smaller than the limit, native and WASM work — which never
+// runs inside the VM — was booked, enforced and advertised at the VM's size
+// too (TB-85).
+func (d *Daemon) ContainerMemoryBudgetMB() int {
+	return runtime.ContainerMemoryBudgetMB(d.HostMemoryBudgetMB(), d.ContainerVMMemoryMB())
+}
+
+// memoryBudgetFor is the memory budget a unit is measured against: the
+// container budget for a container unit, the host budget for any other
+// (TB-85).
+func (d *Daemon) memoryBudgetFor(wu *runtime.WorkUnit) int {
+	if isContainerUnit(wu) {
+		return d.ContainerMemoryBudgetMB()
 	}
-	return runtime.ContainerMemoryBudgetMB(cfgMB, d.ContainerVMMemoryMB())
+	return d.HostMemoryBudgetMB()
+}
+
+// bookedMemMB is the memory admission books for a unit: its declaration
+// clamped to its runtime's budget (runtime.BookedMemMB) — the same figure that
+// runtime enforces (BG-16).
+func (d *Daemon) bookedMemMB(wu *runtime.WorkUnit) int {
+	if wu == nil {
+		return 0
+	}
+	return runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), d.memoryBudgetFor(wu))
+}
+
+// bookedContainerMemMB is bookedMemMB for a container unit and 0 for any
+// other — the bookings the container budget is summed from (TB-85).
+func (d *Daemon) bookedContainerMemMB(wu *runtime.WorkUnit) int {
+	if !isContainerUnit(wu) {
+		return 0
+	}
+	return d.bookedMemMB(wu)
 }
 
 // MemoryLimitedByVM reports whether the container engine's VM, not the
-// configuration, is what bounds this machine's memory budget (TB-63).
+// configuration, is what bounds container work's memory budget (TB-63).
 func (d *Daemon) MemoryLimitedByVM() bool {
 	if d.cfg == nil {
 		return false
 	}
-	return d.ContainerVMMemoryMB() > 0 && d.MemoryBudgetMB() < d.cfg.ResourceLimits.MaxMemoryMB
+	return d.ContainerVMMemoryMB() > 0 && d.ContainerMemoryBudgetMB() < d.cfg.ResourceLimits.MaxMemoryMB
 }
 
 // applyContainerMemoryBudget lowers the advertised memory budget to what the
@@ -3615,32 +3711,162 @@ func (d *Daemon) MemoryLimitedByVM() bool {
 // (registerContainerRuntime, before the heads are re-told).
 func (d *Daemon) applyContainerMemoryBudget() {
 	if d.MemoryLimitedByVM() {
-		d.setAdvertisedMemoryMB(d.MemoryBudgetMB())
+		d.setAdvertisedMemoryMB(d.ContainerMemoryBudgetMB())
 	}
 	d.refreshContainerMemoryNotice()
 }
 
 // refreshContainerMemoryNotice keeps the "container_memory_clipped" notice in
-// step with the facts: raised with one WARN whenever the configured memory
-// limit exceeds what the container engine's VM can hold, naming both figures
-// and the remedy; resolved when the limit fits (the VM was enlarged and the
-// engine re-detected, or the limit was lowered).
+// step with the facts. The VM clip is worth the volunteer's attention only when
+// it costs something (TB-92): when an enabled container leaf declares more
+// memory than the container engine's VM can hold, but no more than the memory
+// limit — the VM, not the limit, is then what keeps heads from sending it. The
+// notice and one WARN name the leaf, both figures and the remedy; the notice is
+// resolved once no enabled leaf is held back (the VM was enlarged and the
+// engine re-detected, or the limit or the enabled leafs changed).
+//
+// It used to be raised whenever the limit exceeded the VM's budget by any
+// margin — 31 MB, which the app's 256 MB slider stops could never close, was
+// enough to put a warning on every start — and, before TB-85, the clip was a
+// real loss for native work as well. A clip that holds nothing back is now
+// logged once at Info: native and WebAssembly work get the whole limit, so a
+// VM smaller than the limit is an ordinary, often deliberate, setup.
 func (d *Daemon) refreshContainerMemoryNotice() {
+	const code = "container_memory_clipped"
 	if !d.MemoryLimitedByVM() {
-		d.notices.Resolve("container_memory_clipped", "", "")
+		d.vmNotices.forget(code)
+		d.notices.Resolve(code, "", "")
 		return
 	}
 	cfgMB := d.cfg.ResourceLimits.MaxMemoryMB
-	budget := d.MemoryBudgetMB()
+	budget := d.ContainerMemoryBudgetMB()
 	engineMB := d.ContainerVMMemoryMB()
-	d.logger.Warn("container engine's VM is smaller than the memory limit; container work is limited to the VM — heads are told the smaller figure and only send leafs that fit it",
+	held := d.vmHeldContainerLeafs(func(l CachedLeafInfo) int {
+		if l.ExecutionSpec == nil {
+			return 0
+		}
+		return int(l.ExecutionSpec.MaxMemoryMB)
+	}, budget, cfgMB, "MB")
+	if !d.vmNotices.changed(code, fmt.Sprint(budget, engineMB, cfgMB, held)) {
+		return
+	}
+	if len(held) == 0 {
+		d.notices.Resolve(code, "", "")
+		d.logger.Info("container work is limited to what the container engine's VM can hold, and every enabled container leaf fits it; native and WebAssembly work use the whole memory limit",
+			"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
+			"container_memory_budget_mb", budget, "max_memory_mb", cfgMB)
+		return
+	}
+	d.logger.Warn("container engine's VM is smaller than an enabled container leaf needs; heads do not send this machine that leaf until the VM is enlarged",
 		"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
 		"container_memory_budget_mb", budget, "max_memory_mb", cfgMB,
-		"remedy", "enlarge the VM's memory (Podman: `podman machine stop`, `podman machine set --memory <MB>`, `podman machine start`; Podman Desktop or Docker Desktop: Settings → Resources) — or lower the memory limit to the budget so the two agree")
-	d.notices.Notify(NoticeWarn, "container_memory_clipped",
-		fmt.Sprintf("Container work on this machine is limited to %d MB: the container engine runs inside a virtual machine with %d MB, and %d MB is kept back for the machine itself. Your memory limit of %d MB is not what heads are told — they see %d MB and only send leafs that fit. To run bigger leafs, enlarge the machine's memory (Podman: `podman machine set --memory`; Podman Desktop or Docker Desktop: Settings → Resources) and restart Lettuce.",
-			budget, engineMB, runtime.ContainerVMHeadroomMB, cfgMB, budget),
+		"held_back_leafs", strings.Join(held, ", "),
+		"remedy", "enlarge the VM's memory (Podman: `podman machine stop`, `podman machine set --memory <MB>`, `podman machine start`; Podman Desktop or Docker Desktop: Settings → Resources)")
+	d.notices.Notify(NoticeWarn, code,
+		fmt.Sprintf("Container work on this machine is limited to %d MB: the container engine runs inside a virtual machine with %d MB, and %d MB is kept back for the machine itself. %s, so heads will not send %s here. Native and WebAssembly work still use your full %d MB limit. To run %s, enlarge the machine's memory (Podman: `podman machine set --memory`; Podman Desktop or Docker Desktop: Settings → Resources) and restart Lettuce.",
+			budget, engineMB, runtime.ContainerVMHeadroomMB, heldPhrase(held), heldObject(held), cfgMB, heldObject(held)),
 		"", "")
+}
+
+// refreshContainerVMNotices re-evaluates both VM-clip notices. Called when
+// what they depend on may have changed without a configuration change: the
+// leaf catalog, after the fetcher refreshes it (TB-92).
+func (d *Daemon) refreshContainerVMNotices() {
+	d.refreshContainerMemoryNotice()
+	d.refreshContainerCPUNotice()
+}
+
+// vmHeldContainerLeafs names the enabled container leafs the container
+// engine's VM keeps from running on this machine (TB-92): each needs — by
+// need, 0 when the leaf states nothing — more than the container budget but
+// no more than the configured limit (a limit of 0 is none), so enlarging the
+// VM, not raising the limit, is what would let a head send it. A leaf whose
+// head is not trusted for CONTAINER, or with no container runtime registered,
+// is left out: the VM is not what stops it. Each entry is "<name> needs <n>
+// <unit>", sorted and without repeats (a leaf enabled on two heads is one
+// entry).
+func (d *Daemon) vmHeldContainerLeafs(need func(CachedLeafInfo) int, containerBudget, limit int, unit string) []string {
+	if d.multiClient == nil || d.leafCache == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var held []string
+	for _, srv := range d.multiClient.Servers() {
+		for _, leaf := range d.enabledLeafs(srv.Name) {
+			rt, missing, untrusted := leafRuntimeVerdict(leaf, d.runtimeRegistry, srv.Config)
+			if rt != runtime.RuntimeContainer || missing || untrusted {
+				continue
+			}
+			n := need(leaf)
+			if n <= containerBudget || (limit > 0 && n > limit) {
+				continue
+			}
+			name := leaf.Name
+			if name == "" {
+				name = leaf.Slug
+			}
+			entry := fmt.Sprintf("%s needs %d %s", name, n, unit)
+			if !seen[entry] {
+				seen[entry] = true
+				held = append(held, entry)
+			}
+		}
+	}
+	sort.Strings(held)
+	return held
+}
+
+// heldPhrase joins vmHeldContainerLeafs' entries into the notice's sentence
+// ("GREP f14 needs 7000 MB", "A needs 3000 MB and B needs 7000 MB").
+func heldPhrase(held []string) string {
+	switch len(held) {
+	case 0:
+		return ""
+	case 1:
+		return held[0]
+	default:
+		return strings.Join(held[:len(held)-1], ", ") + " and " + held[len(held)-1]
+	}
+}
+
+// heldObject is the pronoun the notice refers back to the held leafs with.
+func heldObject(held []string) string {
+	if len(held) == 1 {
+		return "it"
+	}
+	return "them"
+}
+
+// vmNoticeState remembers, per VM-clip notice code, the facts the notice was
+// last raised or resolved for, so re-evaluating it — on every configuration
+// change, engine detection and leaf-catalog refresh (TB-92) — logs and counts
+// only a change, not every look.
+type vmNoticeState struct {
+	mu   sync.Mutex
+	last map[string]string
+}
+
+// changed records key as code's current facts and reports whether they differ
+// from the last recorded ones.
+func (s *vmNoticeState) changed(code, key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.last == nil {
+		s.last = map[string]string{}
+	}
+	if prev, ok := s.last[code]; ok && prev == key {
+		return false
+	}
+	s.last[code] = key
+	return true
+}
+
+// forget drops code's recorded facts: the clip is gone, and its return is
+// news again whatever it looks like.
+func (s *vmNoticeState) forget(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.last, code)
 }
 
 // containerKillNote explains an exit code 137 on a container unit: 137 is a
@@ -3654,7 +3880,7 @@ func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, exitCode int) string {
 	if wu == nil || exitCode != 137 || wu.Runtime != runtime.RuntimeContainer {
 		return ""
 	}
-	budget := d.MemoryBudgetMB()
+	budget := d.ContainerMemoryBudgetMB()
 	declared := int(wu.ExecutionSpec.MaxMemoryMB)
 	booked := runtime.BookedMemMB(declared, budget)
 	if engineMB := d.ContainerVMMemoryMB(); engineMB > 0 && declared > budget {

@@ -842,7 +842,11 @@ describe("LeafCard", () => {
 
   describe("TB-63: memory bounded by the container engine's virtual machine", () => {
     const grep = () =>
-      makeLeaf({ slug: "grep-f14", name: "GREP f14", execution_spec: { max_memory_mb: 7000 } });
+      makeLeaf({
+        slug: "grep-f14",
+        name: "GREP f14",
+        execution_spec: { image: "ghcr.io/example/grep:1.2", max_memory_mb: 7000 },
+      });
     const vmMachine = () =>
       makeMachine({ max_memory_mb: 1536, container_vm_memory_mb: 2048, memory_limited_by_vm: true });
 

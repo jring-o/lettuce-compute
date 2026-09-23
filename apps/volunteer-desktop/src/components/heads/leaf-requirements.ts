@@ -68,9 +68,21 @@ function containsFold(list: string[], value: string): boolean {
 }
 
 /**
+ * The budget a leaf is compared with: container work's for a container leaf
+ * (one whose spec names an image — the runtime the daemon picks first), the
+ * Settings allowance for any other, which runs on the machine itself rather
+ * than inside the container engine's virtual machine (TB-85). A host figure
+ * the daemon did not report falls back to container work's.
+ */
+function budgetFor(container: boolean, containerBudget: number, hostBudget: number): number {
+  return container || !(hostBudget > 0) ? containerBudget : hostBudget;
+}
+
+/**
  * The machine budgets a leaf needs, compared against what the running daemon
- * advertises. The comparison mirrors the CLI's `doctor` (classifyLeaf): a
- * budget the daemon reports as 0 is unknown, not zero, and is skipped; the
+ * advertises for the leaf's runtime (TB-85). The comparison mirrors the CLI's
+ * `doctor` (classifyLeaf): a budget the daemon reports as 0 is unknown, not
+ * zero, and is skipped; the
  * vendor gate keys on the execution spec's `gpu_required`, the compute
  * capability gate on the requirements' own flag, because that is how the
  * head's dispatch predicate keys them. VRAM is compared against the ALLOWED
@@ -84,6 +96,7 @@ export function leafRequirementItems(
   const spec = leaf.execution_spec;
   const rr = leaf.resource_requirements;
   const items: RequirementItem[] = [];
+  const container = !!spec?.image;
 
   const minDisk = rr?.min_disk_mb ?? 0;
   if (minDisk > 0) {
@@ -99,10 +112,11 @@ export function leafRequirementItems(
   const memory = spec?.max_memory_mb ?? 0;
   if (memory > 0) {
     const item: RequirementItem = { key: "memory", label: `${formatSizeMb(memory)} RAM` };
-    if (machine && machine.max_memory_mb > 0 && memory > machine.max_memory_mb) {
-      const [need, have] = formatSizePairMb(memory, machine.max_memory_mb);
+    const budget = machine ? budgetFor(container, machine.max_memory_mb, machine.host_max_memory_mb) : 0;
+    if (machine && budget > 0 && memory > budget) {
+      const [need, have] = formatSizePairMb(memory, budget);
       item.label = `${need} RAM`;
-      if (machine.memory_limited_by_vm) {
+      if (container && machine.memory_limited_by_vm) {
         // The budget is what the container engine's virtual machine can
         // hold, not what Settings allows (TB-63): name the machine and its
         // size — in the same unit as the pair, so the three figures read
@@ -123,14 +137,15 @@ export function leafRequirementItems(
   const cores = rr?.min_cpu_cores ?? 0;
   if (cores > 0) {
     const item: RequirementItem = { key: "cores", label: `${cores} ${cores === 1 ? "core" : "cores"}` };
-    if (machine && machine.max_cpu_cores > 0 && cores > machine.max_cpu_cores) {
-      if (machine.cpu_limited_by_vm) {
+    const budget = machine ? budgetFor(container, machine.max_cpu_cores, machine.host_max_cpu_cores) : 0;
+    if (machine && budget > 0 && cores > budget) {
+      if (container && machine.cpu_limited_by_vm) {
         // The budget is the container engine's virtual machine CPU count,
         // not what Settings allows (TB-75): name the machine, as for memory.
-        item.shortfall = `the container engine's virtual machine allows ${machine.max_cpu_cores}; it has ${machine.container_vm_cpus} CPUs`;
+        item.shortfall = `the container engine's virtual machine allows ${budget}; it has ${machine.container_vm_cpus} CPUs`;
         item.vmLimited = true;
       } else {
-        item.shortfall = `you allow ${machine.max_cpu_cores}`;
+        item.shortfall = `you allow ${budget}`;
       }
     }
     items.push(item);

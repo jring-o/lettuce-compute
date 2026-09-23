@@ -53,7 +53,7 @@ type ExecutionSlot struct {
 	processHandle  ProcessHandle  // for suspend/resume
 	suspended      bool
 	// cpuShare is the CPU share (cores) last pushed to this slot's process
-	// handle by ApplyCPUShare or the attach-time application (TB-75); 0 until
+	// handle by ApplyCPUShares or the attach-time application (TB-75); 0 until
 	// one has been. It lets a rebalance skip slots already at the new share.
 	cpuShare float64
 	// suspendPending records that a suspend (schedule gate / pause) was requested
@@ -126,16 +126,17 @@ type SlotManager struct {
 	logger       *slog.Logger
 	shuttingDown atomic.Bool
 	// cpuShareFn answers "what CPU share does a running task get right now"
-	// (the daemon's current equal split of the budget, TB-75). Consulted when
-	// a process handle is attached, so a task whose handle appears after the
-	// split changed — another task started between its creation and its
-	// registration — is brought to the current share at once. Nil means no
-	// CPU budget is shared.
-	cpuShareFn func() float64
+	// (the daemon's current split of the budgets, TB-75/TB-85: one share for a
+	// container task, one for a task that runs directly on the machine).
+	// Consulted when a process handle is attached, so a task whose handle
+	// appears after the split changed — another task started between its
+	// creation and its registration — is brought to the current share at
+	// once. Nil means no CPU budget is shared.
+	cpuShareFn func() runtime.CPUShares
 }
 
 // SetCPUShareSource wires the daemon's current-share function (see cpuShareFn).
-func (sm *SlotManager) SetCPUShareSource(fn func() float64) {
+func (sm *SlotManager) SetCPUShareSource(fn func() runtime.CPUShares) {
 	sm.cpuShareFn = fn
 }
 
@@ -556,6 +557,24 @@ func (sm *SlotManager) ActiveCount() int {
 	return count
 }
 
+// ActiveCountsByKind returns the number of active slots running a unit
+// directly on the machine (native, WASM) and the number running a container
+// unit — the two counts the CPU budgets are split by (TB-85).
+func (sm *SlotManager) ActiveCountsByKind() (host, container int) {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active {
+			if isContainerUnit(slot.wu) {
+				container++
+			} else {
+				host++
+			}
+		}
+		slot.mu.Unlock()
+	}
+	return host, container
+}
+
 // ActiveWorkUnits returns the work units of all currently active slots. Used by
 // the client work buffer to account for in-flight (running) work toward the
 // hours-based buffer target.
@@ -669,16 +688,18 @@ func (sm *SlotManager) StopAll() {
 	}
 }
 
-// TotalActiveMemoryMB returns the sum of booked memory across all active slots' WUs.
-// BG-16: books each unit at BookedMemMB (the same clamped number each runtime
-// enforces), so admission and enforcement share one denominator. memCeilingMB is the
-// volunteer's configured budget (config.ResourceLimits.MaxMemoryMB).
-func (sm *SlotManager) TotalActiveMemoryMB(memCeilingMB int) int {
+// TotalActiveMemoryMB returns the sum of the memory booked by all active
+// slots' WUs, each booked at book(wu). BG-16: the daemon books a unit at
+// BookedMemMB against its runtime's budget (bookedMemMB) — the same clamped
+// number that runtime enforces — so admission and enforcement share one
+// denominator; a book that returns 0 for some units sums the others alone
+// (the container units, for the container budget — TB-85).
+func (sm *SlotManager) TotalActiveMemoryMB(book func(*runtime.WorkUnit) int) int {
 	total := 0
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
 		if slot.active && slot.wu != nil {
-			total += runtime.BookedMemMB(int(slot.wu.ExecutionSpec.MaxMemoryMB), memCeilingMB)
+			total += book(slot.wu)
 		}
 		slot.mu.Unlock()
 	}
@@ -701,16 +722,19 @@ func (sm *SlotManager) TotalActiveCPUCores(book func(*runtime.WorkUnit) int) int
 	return total
 }
 
-// ApplyCPUShare gives every active slot's process shareCores of CPU — the
-// equal split of the budget the daemon recomputes when a task starts or
-// finishes (TB-75). A slot already at that share is skipped; a slot with no
-// handle yet is brought to the current share when its handle is attached
+// ApplyCPUShares gives every active slot's process its share of CPU — the
+// split of the budgets the daemon recomputes when a task starts or finishes
+// (TB-75): shares.Container for a container task, shares.Host for one that
+// runs directly on the machine (TB-85). A slot already at its share is
+// skipped, as is one whose share is 0 (no limit); a slot with no handle yet
+// is brought to the current share when its handle is attached
 // (attachProcessHandle). Failures are logged and the slot keeps the cap it
 // had: the share is a courtesy to the machine's owner, not a safety boundary.
-func (sm *SlotManager) ApplyCPUShare(shareCores float64) {
+func (sm *SlotManager) ApplyCPUShares(shares runtime.CPUShares) {
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
-		if slot.active && slot.processHandle != nil && slot.cpuShare != shareCores {
+		shareCores := shareFor(shares, slot.wu)
+		if slot.active && slot.processHandle != nil && shareCores > 0 && slot.cpuShare != shareCores {
 			if err := slot.processHandle.SetCPUShare(shareCores); err != nil {
 				sm.logger.Warn("failed to give a running task its new CPU share; it keeps its previous cap",
 					"slot", slot.ID, "cores", runtime.FormatCores(shareCores), "error", err)
@@ -721,6 +745,15 @@ func (sm *SlotManager) ApplyCPUShare(shareCores float64) {
 		}
 		slot.mu.Unlock()
 	}
+}
+
+// shareFor picks a unit's share out of the split: the container share for a
+// container unit, the host share for any other.
+func shareFor(shares runtime.CPUShares, wu *runtime.WorkUnit) float64 {
+	if isContainerUnit(wu) {
+		return shares.Container
+	}
+	return shares.Host
 }
 
 // OwnProcesses lists the containers of the active container tasks, with the
@@ -853,15 +886,16 @@ func (sm *SlotManager) SetProcessHandle(slotID int, handle ProcessHandle) {
 // running on unsuspended. Best-effort: a failed suspend is logged and the pending
 // flag cleared, matching SuspendAll's behavior.
 func (sm *SlotManager) attachProcessHandle(slot *ExecutionSlot, handle ProcessHandle) {
-	// The current share is read BEFORE this slot is locked: computing it
+	// The current split is read BEFORE this slot is locked: computing it
 	// counts the active slots, which takes every slot's lock in turn.
-	var share float64
+	var shares runtime.CPUShares
 	if handle != nil && sm.cpuShareFn != nil {
-		share = sm.cpuShareFn()
+		shares = sm.cpuShareFn()
 	}
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 	slot.processHandle = handle
+	share := shareFor(shares, slot.wu)
 	// Bring the task to the CURRENT CPU share (TB-75): the share it was
 	// created with is stale if another task started or finished between its
 	// creation and this registration, and a rebalance in that window could

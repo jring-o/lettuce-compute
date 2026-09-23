@@ -200,7 +200,9 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     expect(
-      await screen.findByText(/limited to 4 cores: the container engine's virtual machine has 4 CPUs, so heads are told 4/)
+      await screen.findByText(
+        /Container work on this machine is limited to 4 cores: the container engine's virtual machine has 4 CPUs\. Native and WebAssembly work can use all 6\./
+      )
     ).toBeInTheDocument();
     expect(screen.queryByText(/All running tasks share these/)).not.toBeInTheDocument();
   });

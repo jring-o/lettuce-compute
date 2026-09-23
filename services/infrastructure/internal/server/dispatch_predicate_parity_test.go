@@ -292,6 +292,8 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		VolunteerID:             requester,
 		MaxCPUCores:             s.RequesterMaxCPUCores,
 		MaxMemoryMB:             s.RequesterMaxMemoryMB,
+		HostMaxCPUCores:         s.RequesterHostMaxCPUCores,
+		HostMaxMemoryMB:         s.RequesterHostMaxMemoryMB,
 		MaxDiskMB:               1 << 40, // disk is analogous to CPU/memory; kept generous
 		HasGPU:                  s.RequesterHasGPU,
 		AvailableRuntimes:       s.RequesterRuntimes,

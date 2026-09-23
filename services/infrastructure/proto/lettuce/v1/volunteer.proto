@@ -273,6 +273,17 @@ message HardwareCapabilities {
   string os = 11;                    // GOOS: linux, darwin, windows
   string cpu_arch = 12;              // GOARCH: amd64, arm64
   string cpu_vendor = 13;            // GenuineIntel, AuthenticAMD, Apple, ... ("" if unknown)
+  // Per-runtime budgets (TB-85). On macOS and Windows the container engine runs
+  // inside a virtual machine, and container work can only be given what that VM
+  // holds; max_memory_mb and max_cpu_cores are then clipped to it, so every
+  // runtime's work fits them. Work that runs directly on the machine (NATIVE and
+  // WASM units) is not inside the VM and is bounded only by the volunteer's own
+  // limits, which these two fields carry. The dispatch gate compares a NATIVE or
+  // WASM leaf with them and a CONTAINER leaf with max_memory_mb / max_cpu_cores.
+  // 0 = not reported (a client predating them): the single figures apply to
+  // every runtime, as before.
+  int32 host_max_memory_mb = 14;
+  int32 host_max_cpu_cores = 15;
 }
 
 message GpuInfo {
