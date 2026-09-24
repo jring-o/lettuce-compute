@@ -15,6 +15,11 @@ import (
 // which temporarily overrides CommandExecutor and restores this blocker
 // when the test finishes.
 func TestMain(m *testing.M) {
+	// Run as the fake podman a machine-verb test started (fake_podman_test.go).
+	if os.Getenv(fakePodmanDirEnv) != "" {
+		os.Exit(fakePodmanMain(os.Args[1:]))
+	}
+
 	// Default-on: no test should ever hit real platform detection. Individual
 	// tests that exercise DetectGPUs against mocked executors clear this via
 	// the withMockExecutor helper.

@@ -4,15 +4,18 @@ package runtime
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"syscall"
 )
 
-func defaultCommandExecutor(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
-	defer cancel()
-	return defaultCommandExecutorCtx(ctx, name, args...)
+func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, name, args...)
 }
 
-func defaultCommandExecutorCtx(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).Output()
+// interruptCommand asks a command that has run past its timeout to stop:
+// SIGTERM, which podman handles by resetting its machine's "starting" flag
+// before it exits. A kill skips that clean-up.
+func interruptCommand(p *os.Process) error {
+	return p.Signal(syscall.SIGTERM)
 }

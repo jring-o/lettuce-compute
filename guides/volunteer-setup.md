@@ -158,6 +158,17 @@ start a Podman machine for you on first `start`.
   before. (Earlier builds started a stopped machine again within a minute,
   whoever had stopped it.)
 
+- **A slow machine start is waited for.** `podman machine start` can take a
+  minute or two on an Intel Mac, and `podman machine init` downloads the
+  machine's image first. Lettuce waits up to 5 minutes for a start or stop and
+  30 minutes for an init. A command still running then is interrupted so Podman
+  can clean up after itself (on Windows it is ended outright), and a machine that
+  came up anyway counts as started. Earlier builds gave up after 30 seconds: the
+  runtime card could show "podman machine start failed … signal: killed" in red
+  beside a running machine, and `podman machine list` could keep reading
+  "Currently starting" for it. If you still see that after updating,
+  `podman machine stop` then `podman machine start` clears it.
+
 - **Start Machine, Stop Machine and Setup return at once.** `podman machine
   start` can take a minute or two (longer on an Intel Mac), so the app hands
   the work to the daemon and the runtime card reads "Starting..." or
