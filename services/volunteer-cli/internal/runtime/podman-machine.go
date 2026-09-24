@@ -70,11 +70,15 @@ type PodmanMachineManager struct {
 	// command starts (TB-87). "start", "stop" or "setup"; empty otherwise.
 	pendingOp string
 	// lastOpErr is why the most recent init, start or stop failed, kept until
-	// the next one succeeds. Status reports it as MachineInfo.Error when the
-	// machine itself has no error to report, so a caller that only polls
-	// Status (the app's runtime card after an asynchronous verb) learns of the
-	// failure.
+	// the next one succeeds or the machine is found in the state that
+	// operation was for (settleLastOpErr). Status reports it as
+	// MachineInfo.Error when the machine itself has no error to report, so a
+	// caller that only polls Status (the app's runtime card after an
+	// asynchronous verb) learns of the failure.
 	lastOpErr string
+	// lastFailedOp is the operation lastOpErr belongs to: "init", "start",
+	// "setup" or "stop".
+	lastFailedOp string
 
 	// startedByThisProcess records whether THIS process actually issued the
 	// successful `podman machine start` that brought the machine up (set on
@@ -206,6 +210,7 @@ func (m *PodmanMachineManager) status(withPending bool) MachineInfo {
 	m.mu.Lock()
 	m.cachedInfo = &info
 	m.cachedAt = time.Now()
+	m.settleLastOpErr(info.Status)
 	info = m.withLastOpError(info)
 	m.mu.Unlock()
 
@@ -219,6 +224,25 @@ func (m *PodmanMachineManager) withLastOpError(info MachineInfo) MachineInfo {
 		info.Error = m.lastOpErr
 	}
 	return info
+}
+
+// settleLastOpErr drops the last failed operation's error once the machine is
+// found in the state that operation was for: running after a failed init,
+// start or setup, stopped after a failed stop. A start podman gave up on, or
+// that Lettuce stopped waiting for, can still bring the machine up, and a
+// machine can be started or stopped by hand; either way the error no longer
+// describes the machine, and shown beside a running engine it read as a
+// fault. An error beside a machine still in the other state stands. Called
+// with mu held.
+func (m *PodmanMachineManager) settleLastOpErr(status MachineStatus) {
+	if m.lastOpErr == "" {
+		return
+	}
+	stop := m.lastFailedOp == "stop"
+	if (status == MachineRunning && !stop) || (status == MachineStopped && stop) {
+		m.lastOpErr = ""
+		m.lastFailedOp = ""
+	}
 }
 
 // InvalidateStatus drops the cached machine state so the next Status runs a
@@ -316,6 +340,11 @@ func (m *PodmanMachineManager) machineStatus() MachineInfo {
 		info.Status = MachineRunning
 	case "stopped":
 		info.Status = MachineStopped
+	case "starting":
+		// A machine that is still booting. Not stopped: the daemon holds a
+		// machine it finds stopped as one the volunteer stopped, and must
+		// wait for a booting one instead.
+		info.Status = MachineStarting
 	default:
 		info.Status = MachineStopped
 	}
@@ -383,21 +412,23 @@ func (m *PodmanMachineManager) initLocked(cpus, memoryMB, diskGB int) error {
 
 	out, err := CommandExecutor(m.podmanBinary, args...)
 	if err != nil {
-		return m.recordOp(fmt.Errorf("podman machine init failed: %s: %w", strings.TrimSpace(string(out)), err))
+		return m.recordOp("init", fmt.Errorf("podman machine init failed: %s: %w", strings.TrimSpace(string(out)), err))
 	}
 
 	m.logger.Info("podman machine initialized")
-	return m.recordOp(nil)
+	return m.recordOp("init", nil)
 }
 
-// recordOp notes an operation's outcome for Status (lastOpErr) and returns
-// the error unchanged.
-func (m *PodmanMachineManager) recordOp(err error) error {
+// recordOp notes an operation's outcome for Status (lastOpErr, and the
+// operation it belongs to) and returns the error unchanged.
+func (m *PodmanMachineManager) recordOp(op string, err error) error {
 	m.mu.Lock()
 	if err != nil {
 		m.lastOpErr = err.Error()
+		m.lastFailedOp = op
 	} else {
 		m.lastOpErr = ""
+		m.lastFailedOp = ""
 	}
 	m.mu.Unlock()
 	return err
@@ -430,7 +461,26 @@ func (m *PodmanMachineManager) startLocked() error {
 
 	out, err := CommandExecutor(m.podmanBinary, "machine", "start")
 	if err != nil {
-		return m.recordOp(fmt.Errorf("podman machine start failed: %s: %w", strings.TrimSpace(string(out)), err))
+		startErr := fmt.Errorf("podman machine start failed: %s: %w", strings.TrimSpace(string(out)), err)
+		// A start can end in an error — podman's own, or its bound — after the
+		// machine has come up. A running machine is what the start was for.
+		if m.machineStatus().Status != MachineRunning {
+			return m.recordOp("start", startErr)
+		}
+		// Ownership only from a start this process stopped at its bound:
+		// podman was then part-way through bringing the machine up. A start
+		// podman ended by itself may have been its refusal of a machine
+		// somebody else already had running, and a machine left running at
+		// shutdown is the safe side of that doubt.
+		owned := errors.Is(err, errMachineVerbTimedOut)
+		m.logger.Warn("podman machine start reported a failure, but the machine is running; counting it as started",
+			"error", startErr, "started_by_this_process", owned)
+		if owned {
+			m.mu.Lock()
+			m.startedByThisProcess = true
+			m.mu.Unlock()
+		}
+		return m.recordOp("start", nil)
 	}
 
 	m.mu.Lock()
@@ -438,7 +488,7 @@ func (m *PodmanMachineManager) startLocked() error {
 	m.mu.Unlock()
 
 	m.logger.Info("podman machine started")
-	return m.recordOp(nil)
+	return m.recordOp("start", nil)
 }
 
 // Stop stops the Podman machine.
@@ -468,7 +518,16 @@ func (m *PodmanMachineManager) stopLocked() error {
 
 	out, err := CommandExecutor(m.podmanBinary, "machine", "stop")
 	if err != nil {
-		return m.recordOp(fmt.Errorf("podman machine stop failed: %s: %w", strings.TrimSpace(string(out)), err))
+		stopErr := fmt.Errorf("podman machine stop failed: %s: %w", strings.TrimSpace(string(out)), err)
+		// As for a start: a stop that ends in an error after the machine went
+		// down did what it was for. Reported as a failure, the app's stop hands
+		// the machine back to the re-detection loop, which starts it again.
+		if m.machineStatus().Status != MachineStopped {
+			return m.recordOp("stop", stopErr)
+		}
+		m.logger.Warn("podman machine stop reported a failure, but the machine is stopped; counting it as stopped", "error", stopErr)
+	} else {
+		m.logger.Info("podman machine stopped")
 	}
 
 	// The machine is down; this process no longer owns a start it should undo.
@@ -476,21 +535,22 @@ func (m *PodmanMachineManager) stopLocked() error {
 	m.startedByThisProcess = false
 	m.mu.Unlock()
 
-	m.logger.Info("podman machine stopped")
-	return m.recordOp(nil)
+	return m.recordOp("stop", nil)
 }
 
 // --- asynchronous verbs (TB-87) ---
 //
 // `podman machine start` and `stop` take 30-120 s on an ordinary Intel Mac
-// and can hang outright (podman #25121, #29074). The management API used to
-// run them to completion inside one request, and the app's 15 s client gave
-// up with "daemon unreachable" while the machine was in fact starting. Each
-// verb now returns as soon as the operation is accepted; Status reports
-// starting / stopping meanwhile and, on failure, carries the error until the
-// next operation succeeds. A caller learns the outcome by polling Status (the
-// app's runtime card) or through the done callback (the daemon bridge, which
-// registers the runtime after a successful start).
+// (see machineStartTimeout) and can hang outright (podman #25121, #29074).
+// The management API used to run them to completion inside one request, and
+// the app's 15 s client gave up with "daemon unreachable" while the machine
+// was in fact starting. Each verb now returns as soon as the operation is
+// accepted; Status reports starting / stopping meanwhile and, on failure,
+// carries the error until the next operation succeeds or the machine reaches
+// the state the failed one was for (settleLastOpErr). A caller learns the
+// outcome by polling Status (the app's runtime card) or through the done
+// callback (the daemon bridge, which registers the runtime after a
+// successful start).
 
 // StartAsync runs Start on its own goroutine. ErrMachineBusy when another
 // asynchronous operation is still in flight. done, if not nil, is called with
@@ -522,7 +582,7 @@ func (m *PodmanMachineManager) runAsync(op string, done func(error), run func() 
 		err := run()
 		// Setup's own refusals (not installed, an inspect error) do not pass
 		// through recordOp; record them here so Status carries them too.
-		m.recordOp(err)
+		m.recordOp(op, err)
 		if err != nil {
 			m.logger.Warn("podman machine operation failed", "operation", op, "error", err)
 		}

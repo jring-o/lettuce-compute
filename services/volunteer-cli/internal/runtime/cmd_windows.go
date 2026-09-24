@@ -4,20 +4,22 @@ package runtime
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"syscall"
 )
 
-func defaultCommandExecutor(name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultCommandTimeout)
-	defer cancel()
-	return defaultCommandExecutorCtx(ctx, name, args...)
-}
-
-func defaultCommandExecutorCtx(ctx context.Context, name string, args ...string) ([]byte, error) {
+func newCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
-	return cmd.Output()
+	return cmd
+}
+
+// interruptCommand stops a command that has run past its timeout. A process
+// started without a console cannot be sent a console interrupt, so on
+// Windows it is killed.
+func interruptCommand(p *os.Process) error {
+	return p.Kill()
 }
