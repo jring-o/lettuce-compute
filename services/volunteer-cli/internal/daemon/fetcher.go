@@ -121,9 +121,10 @@ type Fetcher struct {
 	// daemon; nil disables the skip.
 	leafNeedsAbsentGPUFn func(leaf CachedLeafInfo) bool
 
-	// leafClassBufferFullFn reports a leaf whose resource class — GPU work, the
-	// one class bounded tighter than the slot count — has already reached its
-	// own hours target (TB-48). Such a leaf is skipped BEFORE RequestWorkUnit:
+	// leafClassBufferFullFn reports a leaf whose resource class — GPU work, or
+	// container work where the container engine's VM runs fewer units at once
+	// than there are slots — has already reached its own hours target
+	// (TB-48). Such a leaf is skipped BEFORE RequestWorkUnit:
 	// asking for it would only produce arrivals the buffer refuses on the spot.
 	// A round in which every remaining leaf was skipped this way is "buffer
 	// full for what this machine can use", not "the head has no work" — Run
@@ -137,6 +138,11 @@ type Fetcher struct {
 	// Since TB-32 a full-by-hours buffer that cannot occupy an idle slot reports
 	// NOT full, so fetching continues in starved-backfill mode (below).
 	workBufferFullFn func() bool
+	// workInHandFn reports whether the buffer already holds the next unit for
+	// every slot (Daemon.workInHandForEverySlot). A head's empty answer to such
+	// a machine is not counted toward the "connected but getting no work"
+	// diagnostic. nil counts every empty answer.
+	workInHandFn func() bool
 	// starvedBackfillFn reports the TB-32 starved-backfill state: the buffer is
 	// full by hours but a slot is idle with nothing admissible buffered, so the
 	// ONLY point of fetching is to fill that slot. The fetcher then also applies
@@ -284,6 +290,12 @@ const runtimeAbandonPauseThreshold = 3
 // reclaim. See PreFetchQueue.DropLapsedReservations.
 const reservationDropMargin = 60 * time.Second
 
+// expiringDropThreshold is the fraction of a buffered unit's deadline that must
+// still remain for the unit to stay buffered: sweepBuffer drops it once 90 % of
+// the deadline, measured from fetch, has passed without a slot starting it. See
+// PreFetchQueue.DropExpiring.
+const expiringDropThreshold = 0.1
+
 // sweepBuffer drops buffered units that have aged out, on two independent
 // grounds, and gives back units a resource-limit change has made unrunnable.
 // Idempotent and cheap (one mutex, one pass over a short slice), so it is safe
@@ -291,7 +303,7 @@ const reservationDropMargin = 60 * time.Second
 // ticker — whichever is still running.
 func (f *Fetcher) sweepBuffer() {
 	// Deadline safety: drop at 90% of the unit's deadline.
-	f.queue.DropExpiring(0.1)
+	f.queue.DropExpiring(expiringDropThreshold)
 
 	// A unit whose declaration the live budget no longer covers (the memory
 	// limit was lowered after it was buffered, TB-79) can never start here:
@@ -362,6 +374,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafNeedsAbsentGPUFn:     d.leafNeedsAbsentGPU,
 		leafClassBufferFullFn:    d.leafClassBufferFull,
 		workBufferFullFn:         d.workBufferFull,
+		workInHandFn:             d.workInHandForEverySlot,
 		starvedBackfillFn:        d.starvedBackfill,
 		leafFitGateFn:            d.leafFitGate,
 		bufferAcceptsFn:          d.bufferAccepts,
@@ -384,7 +397,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 // head's retry delay, so this is roughly half a minute of genuine idleness,
 // long enough to skip a momentarily-empty queue but short enough to be useful.
 // A round that asked nothing (every leaf skipped before the request) is not a
-// poll and does not count (TB-60).
+// poll and does not count (TB-60), and neither is an empty answer while the
+// buffer already holds the next unit for every slot.
 const noWorkWarnThreshold = 5
 
 // idleWait is how long the fetcher sleeps when there is nothing to do right now
@@ -481,9 +495,11 @@ func (f *Fetcher) Run(ctx context.Context) {
 			if round.classFull > 0 {
 				// TB-48: every leaf left to ask about belongs to a resource class
 				// whose buffer is already at target — the GPU class on a host with
-				// more slots than GPUs. That is the buffer being full for what this
-				// machine can use, not the head having no work: wait on the loop's
-				// poll granularity (no RPC, no retry delay to obey).
+				// more slots than GPUs, or the container class on one whose engine's
+				// VM runs fewer container units at once than it has slots. That is
+				// the buffer being full for what this machine can use, not the head
+				// having no work: wait on the loop's poll granularity (no RPC, no
+				// retry delay to obey).
 				f.logger.Debug("fetcher: every requestable leaf is at its class buffer target, not requesting", "class_full_leafs", round.classFull)
 				if !f.sleep(ctx, idleWait) {
 					return
@@ -517,8 +533,18 @@ func (f *Fetcher) Run(ctx context.Context) {
 		}
 
 		if round.pushed == 0 {
-			f.logger.Debug("fetcher: fetchOne buffered no work")
-			f.noteEmptyRound()
+			// An empty answer counts toward the no-work diagnostic only while the
+			// machine is, or is about to be, without work. A buffer that already
+			// holds the next unit for every slot is not: on a fast host it is what
+			// a head's per-machine in-flight cap looks like from here (the head
+			// refuses a buffer deeper than the cap and does not say why), and the
+			// notice told such a volunteer the heads had no units for the machine
+			// beside a full queue.
+			inHand := f.workInHandFn != nil && f.workInHandFn()
+			f.logger.Debug("fetcher: fetchOne buffered no work", "work_in_hand_for_every_slot", inHand)
+			if !inHand {
+				f.noteEmptyRound()
+			}
 			// No work was buffered this cycle (no assignments, or every assignment
 			// was abandoned as unusable). The authoritative cadence is the head's
 			// retry delay, obeyed via NextContactAt by the head-eligibility gate at
@@ -539,7 +565,8 @@ func (f *Fetcher) Run(ctx context.Context) {
 // buffered nothing. When the streak reaches noWorkWarnThreshold it surfaces
 // the "connected but getting no work" diagnostic exactly once, instead of
 // leaving the operator staring at a silent, idle daemon. Run only calls it
-// for rounds that issued a request (TB-60).
+// for rounds that issued a request (TB-60) while the buffer did not already
+// hold the next unit for every slot.
 func (f *Fetcher) noteEmptyRound() {
 	f.emptyPolls++
 	if f.emptyPolls >= noWorkWarnThreshold && !f.warnedNoWork {

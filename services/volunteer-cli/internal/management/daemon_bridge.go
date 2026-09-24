@@ -122,7 +122,14 @@ type QueuedTaskInfo struct {
 	LeafName        string `json:"leaf_name"`
 	DeadlineSeconds int32  `json:"deadline_seconds"`
 	FetchedAt       string `json:"fetched_at"`
-	ServerName      string `json:"server_name"`
+	// StartWithinSeconds is how long a slot has left to start the unit before
+	// the daemon returns it to its head unrun, so another volunteer can still
+	// finish it by the deadline; absent when the unit has neither a deadline
+	// nor a reservation window. The deadline itself is counted afresh from the
+	// moment a slot starts the unit, so this, not the deadline, is the
+	// countdown for a queued unit.
+	StartWithinSeconds *int   `json:"start_within_seconds,omitempty"`
+	ServerName         string `json:"server_name"`
 }
 
 // ActiveTaskInfo describes an in-progress work unit.
@@ -289,13 +296,21 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 
 	var queuedTasks []QueuedTaskInfo
 	for _, qt := range b.daemon.GetQueuedTasks() {
-		queuedTasks = append(queuedTasks, QueuedTaskInfo{
+		info := QueuedTaskInfo{
 			WorkUnitID:      qt.WorkUnitID,
 			LeafName:        b.resolveLeafName(qt.LeafID),
 			DeadlineSeconds: qt.DeadlineSeconds,
 			FetchedAt:       qt.FetchedAt.UTC().Format(time.RFC3339),
 			ServerName:      qt.ServerName,
-		})
+		}
+		if !qt.StartBy.IsZero() {
+			within := int(time.Until(qt.StartBy).Seconds())
+			if within < 0 {
+				within = 0
+			}
+			info.StartWithinSeconds = &within
+		}
+		queuedTasks = append(queuedTasks, info)
 	}
 	if queuedTasks == nil {
 		queuedTasks = []QueuedTaskInfo{}
