@@ -75,6 +75,14 @@ export interface QueuedTaskInfo {
   leaf_name: string;
   deadline_seconds: number;
   fetched_at: string;
+  /**
+   * Seconds a slot has left to start the unit before the daemon returns it to
+   * its head unrun, so another volunteer can still finish it in time. Absent
+   * when the unit has neither a deadline nor a reservation window. The
+   * deadline itself is counted afresh once a slot starts the unit, so this is
+   * the countdown for a queued unit.
+   */
+  start_within_seconds?: number;
   server_name: string;
 }
 

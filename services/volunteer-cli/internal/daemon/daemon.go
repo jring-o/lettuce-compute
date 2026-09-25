@@ -2001,20 +2001,150 @@ func (d *Daemon) gpuBufferFullVerdict() (bool, string) {
 	return true, fmt.Sprintf("GPU work buffer full (over the hours target for %d GPU slot(s))", d.gpuSlots())
 }
 
-// leafClassBufferFull reports whether the resource class this leaf's units
-// belong to has already reached its own hours target, so the fetcher can skip
-// the leaf BEFORE issuing RequestWorkUnit (TB-48). Today the only class bounded
-// tighter than the slot count is GPU work; a CPU leaf is never class-full here
-// (the global target and workBufferFull govern it). Without this skip a one-GPU
-// host under its global target asked for GPU units every round and returned
-// each within seconds — the request-and-refuse churn TB-34 ended for the
-// global buffer.
-func (d *Daemon) leafClassBufferFull(leaf CachedLeafInfo) (bool, string) {
-	if !leafRequiresGPU(leaf) || !d.gpuBufferHoursFull() {
+// containerSlotsFor is how many container units shaped like wu can run at
+// once: the slot count, bounded by the container engine VM's budgets where
+// they are tighter than the configured ones — the VM's memory over the unit's
+// booked memory and the VM's CPUs over its booked cores, the two guards
+// canAccommodateWU applies to container work. Never below one: a unit the VM
+// holds only alone still runs, one at a time. For a unit that is not a
+// container unit, or on a machine whose container engine shares the host's
+// memory and CPUs (Linux), it is the slot count.
+func (d *Daemon) containerSlotsFor(wu *runtime.WorkUnit) int {
+	slots := d.maxSlots()
+	if !isContainerUnit(wu) {
+		return slots
+	}
+	n := slots
+	hostMemoryMB := d.HostMemoryBudgetMB()
+	if vmMemoryMB := d.ContainerMemoryBudgetMB(); vmMemoryMB > 0 && (hostMemoryMB <= 0 || vmMemoryMB < hostMemoryMB) {
+		if memMB := d.bookedMemMB(wu); memMB > 0 && vmMemoryMB/memMB < n {
+			n = vmMemoryMB / memMB
+		}
+	}
+	hostCores := d.HostCPUBudgetCores()
+	if vmCores := d.ContainerCPUBudgetCores(); vmCores > 0 && (hostCores <= 0 || vmCores < hostCores) {
+		if cores := d.bookedCPUCores(wu); cores > 0 && vmCores/cores < n {
+			n = vmCores / cores
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// containerBufferTargetSeconds is the hours target for the container class of
+// buffered work, measured for units shaped like wu: work_buffer_hours per
+// container unit the VM runs at once (containerSlotsFor). The global target
+// sizes the buffer by slots, but where the engine runs inside a VM that admits
+// fewer container units at once than there are slots, container units drain
+// through only that many — the GPU class's shape with the VM as the bound —
+// so on a two-slot Mac whose VM holds one unit the global figure
+// let the buffer queue about twice the buffer hours of container work, up to
+// the 90 %-of-deadline drop. Container units count against BOTH this and the
+// global target. Returns 0 when buffering is disabled (hours == 0).
+func (d *Daemon) containerBufferTargetSeconds(wu *runtime.WorkUnit) float64 {
+	hours := d.cfg.WorkBufferHours
+	if hours <= 0 {
+		return 0
+	}
+	return hours * 3600 * float64(d.containerSlotsFor(wu))
+}
+
+// bufferedContainerSeconds is bufferedSeconds restricted to container units —
+// the fill measured against containerBufferTargetSeconds.
+func (d *Daemon) bufferedContainerSeconds() float64 {
+	var total float64
+	for _, wu := range d.heldWorkUnits() {
+		if isContainerUnit(wu) {
+			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		}
+	}
+	return total
+}
+
+// bufferedContainerUnitCount counts held container units (the unit-count
+// fallback view of the container class).
+func (d *Daemon) bufferedContainerUnitCount() int {
+	n := 0
+	for _, wu := range d.heldWorkUnits() {
+		if isContainerUnit(wu) {
+			n++
+		}
+	}
+	return n
+}
+
+// containerBufferFullVerdict is the container class's fullness for units
+// shaped like wu, with the give-back wording for the bound that held (see
+// workBufferFullVerdict); "" when not full. The class exists only where the
+// VM runs fewer such units at once than there are slots: otherwise it is not
+// full, and the global target alone governs container work as it always has.
+func (d *Daemon) containerBufferFullVerdict(wu *runtime.WorkUnit) (bool, string) {
+	slots := d.containerSlotsFor(wu)
+	if !isContainerUnit(wu) || slots >= d.maxSlots() {
 		return false, ""
 	}
-	return true, fmt.Sprintf("GPU work buffer full (%.1f h of GPU units held against a target of %.1f h for %d GPU slot(s))",
-		d.bufferedGPUSeconds()/3600, d.gpuBufferTargetSeconds()/3600, d.gpuSlots())
+	held, cap := d.bufferedContainerUnitCount(), fallbackBufferUnitsPerSlot*slots
+	target := d.containerBufferTargetSeconds(wu)
+	if target <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("container work buffer full (work_buffer_hours is 0: %d of %d container units held; the container engine's VM runs %d at a time)", held, cap, slots)
+	}
+	sec := d.bufferedContainerSeconds()
+	if sec <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("container work buffer full (unit-count fallback: %d of %d container units held, no duration estimate yet; the container engine's VM runs %d at a time)", held, cap, slots)
+	}
+	if sec < target {
+		return false, ""
+	}
+	return true, fmt.Sprintf("container work buffer full (over the hours target for the %d unit(s) the container engine's VM runs at a time)", slots)
+}
+
+// leafShapeUnit is a work unit shaped like the leaf's declared execution spec
+// — its runtime, memory, disk and GPU need — for the checks that judge a leaf
+// before any of its units exists: the starved-backfill fit gate and the
+// container class. The head's per-unit numbers stay authoritative once units
+// arrive.
+func leafShapeUnit(leaf CachedLeafInfo) *runtime.WorkUnit {
+	wu := &runtime.WorkUnit{LeafID: leaf.ID, Runtime: requiredRuntimeForLeaf(leaf)}
+	if leaf.ExecutionSpec != nil {
+		wu.ExecutionSpec = runtime.ExecutionSpec{
+			MaxMemoryMB: leaf.ExecutionSpec.MaxMemoryMB,
+			MaxDiskMB:   leaf.ExecutionSpec.MaxDiskMB,
+			GPURequired: leaf.ExecutionSpec.GPURequired,
+		}
+	}
+	return wu
+}
+
+// leafClassBufferFull reports whether the resource class this leaf's units
+// belong to has already reached its own hours target, so the fetcher can skip
+// the leaf BEFORE issuing RequestWorkUnit (TB-48). Two classes are bounded
+// tighter than the slot count: GPU work, by the GPU count, and container work
+// on a machine whose container engine's VM runs fewer units of the leaf's
+// shape at once than there are slots. Any other leaf is never class-full here
+// (the global target and workBufferFull govern it). Without this skip a
+// one-GPU host under its global target asked for GPU units every round and
+// returned each within seconds — the request-and-refuse churn TB-34 ended for
+// the global buffer.
+func (d *Daemon) leafClassBufferFull(leaf CachedLeafInfo) (bool, string) {
+	if leafRequiresGPU(leaf) && d.gpuBufferHoursFull() {
+		return true, fmt.Sprintf("GPU work buffer full (%.1f h of GPU units held against a target of %.1f h for %d GPU slot(s))",
+			d.bufferedGPUSeconds()/3600, d.gpuBufferTargetSeconds()/3600, d.gpuSlots())
+	}
+	if shape := leafShapeUnit(leaf); isContainerUnit(shape) {
+		if full, _ := d.containerBufferFullVerdict(shape); full {
+			return true, fmt.Sprintf("container work buffer full (%.1f h of container units held against a target of %.1f h: the container engine's VM runs %d of this leaf's units at a time)",
+				d.bufferedContainerSeconds()/3600, d.containerBufferTargetSeconds(shape)/3600, d.containerSlotsFor(shape))
+		}
+	}
+	return false, ""
 }
 
 // bufferedSeconds sums the estimated seconds of work currently held: queued,
@@ -2216,6 +2346,20 @@ func (d *Daemon) starvedBackfill() bool {
 	return d.workBufferHoursFull() && d.idleSlotStarved()
 }
 
+// workInHandForEverySlot reports whether the machine already holds its next
+// unit for every slot: at least as many units waiting in the buffer as there
+// are slots, and no slot idle beside buffered work it cannot start
+// (idleSlotStarved). A head that answers such a machine with nothing is not
+// leaving it without work — on a fast host it is usually refusing a buffer
+// deeper than its per-machine in-flight cap — so the fetcher does not count
+// that answer toward the "connected but getting no work" diagnostic.
+func (d *Daemon) workInHandForEverySlot() bool {
+	if d.prefetchQueue == nil || d.prefetchQueue.Len() < d.maxSlots() {
+		return false
+	}
+	return !d.idleSlotStarved()
+}
+
 // leafFitGate reports whether a unit shaped like this leaf's declared
 // execution spec could currently be admitted to a slot (canAccommodateWU). In
 // starved-backfill mode the fetcher skips leafs that fail it: requesting the
@@ -2230,11 +2374,7 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 	}
 	// The leaf's runtime decides which budgets the unit is booked against
 	// (TB-85): a native leaf's small units fill a slot beside a container.
-	return d.canAccommodateWU(&runtime.WorkUnit{LeafID: leaf.ID, Runtime: requiredRuntimeForLeaf(leaf), ExecutionSpec: runtime.ExecutionSpec{
-		MaxMemoryMB: leaf.ExecutionSpec.MaxMemoryMB,
-		MaxDiskMB:   leaf.ExecutionSpec.MaxDiskMB,
-		GPURequired: leaf.ExecutionSpec.GPURequired,
-	}})
+	return d.canAccommodateWU(leafShapeUnit(leaf))
 }
 
 // bufferAccepts decides whether one more ARRIVING unit may be buffered, so a
@@ -2250,7 +2390,9 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 // (gpuBufferHoursFull, TB-48): under the global target but over the GPU one it
 // is refused the same way, because only gpuSlots of the slots can ever drain it
 // — on a one-GPU host the global target admitted slots × hours of GPU units, of
-// which one ran and the rest waited for the deadline drop.
+// which one ran and the rest waited for the deadline drop. A container unit is
+// likewise measured against the container class's target where the
+// container engine's VM runs fewer such units at once than there are slots.
 func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	// A unit whose declaration the budget cannot cover is returned before
 	// any Prepare cost (TB-79): the head sent it against an advertisement
@@ -2262,6 +2404,9 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	full, reason := d.workBufferFullVerdict()
 	if !full && wu.ExecutionSpec.GPURequired {
 		full, reason = d.gpuBufferFullVerdict()
+	}
+	if !full {
+		full, reason = d.containerBufferFullVerdict(wu)
 	}
 	if !full {
 		return true, ""
@@ -2343,6 +2488,8 @@ func (d *Daemon) bufferedUnitCount() int {
 // the no-estimate fallback is bounded by the GPU unit-count cap rather than a
 // full batch: a one-GPU host asking a head for 64 GPU units — the ask clamp the
 // head's logs showed every five minutes — can drain them only one at a time.
+// A container leaf whose units the container engine's VM runs fewer of at once
+// than there are slots is bounded the same way by the container class.
 func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64) int32 {
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
@@ -2354,6 +2501,14 @@ func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64
 	if gpu {
 		if gpuDeficit := d.gpuBufferTargetSeconds() - d.bufferedGPUSeconds(); gpuDeficit < deficit {
 			deficit = gpuDeficit
+		}
+	}
+	shape := leafShapeUnit(leaf)
+	containerSlots := d.containerSlotsFor(shape)
+	containerClass := isContainerUnit(shape) && containerSlots < d.maxSlots()
+	if containerClass {
+		if containerDeficit := d.containerBufferTargetSeconds(shape) - d.bufferedContainerSeconds(); containerDeficit < deficit {
+			deficit = containerDeficit
 		}
 	}
 	if deficit <= 0 {
@@ -2371,11 +2526,18 @@ func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64
 		// batch. The full-batch ask here was the first round of every leaf on
 		// the fleet (TB-84: 5–64 asked, two kept, the rest returned within
 		// seconds, and the batch-feedback cap then pinned the next ask at
-		// kept + 1). The GPU class was already bounded this way (TB-48).
+		// kept + 1). The GPU class was already bounded this way (TB-48), and
+		// the container class takes the smaller of its headroom and the rest.
+		headroom := d.fallbackBufferUnits() - d.bufferedUnitCount()
 		if gpu {
-			return clampBatch(int32(d.fallbackGPUBufferUnits() - d.bufferedGPUUnitCount()))
+			headroom = d.fallbackGPUBufferUnits() - d.bufferedGPUUnitCount()
 		}
-		return clampBatch(int32(d.fallbackBufferUnits() - d.bufferedUnitCount()))
+		if containerClass {
+			if h := fallbackBufferUnitsPerSlot*containerSlots - d.bufferedContainerUnitCount(); h < headroom {
+				headroom = h
+			}
+		}
+		return clampBatch(int32(headroom))
 	}
 	return clampBatch(int32(deficit / per))
 }
@@ -3406,7 +3568,10 @@ type QueuedTask struct {
 	LeafID          string
 	DeadlineSeconds int32
 	FetchedAt       time.Time
-	ServerName      string
+	// StartBy is when the buffer returns the unit to its head unrun if no
+	// slot has started it (PreFetchItem.StartBy); zero when it never will.
+	StartBy    time.Time
+	ServerName string
 }
 
 // GetQueuedTasks returns details of all work units in the prefetch queue.
@@ -3426,6 +3591,7 @@ func (d *Daemon) GetQueuedTasks() []QueuedTask {
 			LeafID:          item.WU.LeafID,
 			DeadlineSeconds: item.WU.DeadlineSeconds,
 			FetchedAt:       item.FetchedAt,
+			StartBy:         item.StartBy(expiringDropThreshold, reservationDropMargin),
 			ServerName:      serverName,
 		})
 	}

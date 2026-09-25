@@ -65,7 +65,7 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `not fetching work: disk-gated …` (`reason=…image store…`) | The container image-store volume (named in the reason) can't hold the fresh image pull an enabled leaf needs, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
 | `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance, for every enabled leaf. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
 | `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and no working Docker/Podman answered. The daemon keeps checking for one every minute and starts container work as soon as one answers (it re-registers with the head by itself), so this is also what a Docker Desktop or Podman machine that is still starting looks like. | Start or set up a container runtime (below) — no restart needed — or attach a head with native leafs. |
-| `connected but getting no work after repeated polls …` | The head was asked several times and had nothing for this machine: its queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `connected but getting no work after repeated polls …` | The head was asked several times and had nothing for this machine: its queue is empty right now, or filters exclude you. It is not raised while your buffer already holds a queued unit for every task slot: a head that declines to deepen a full buffer (for example because this machine already holds as many units as the head lets one machine hold) is not leaving it without work. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
 | `no runnable leafs: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse — so this is reported at once, not after polling. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
@@ -476,6 +476,16 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   the full per-slot buffer beside it. Without this bound such a machine hoarded
   GPU units only one slot could ever run and handed most of them back unrun at
   the deadline.
+- **On Windows and macOS, container work is buffered per unit the container
+  engine's machine can run at once.** There the engine runs inside a virtual
+  machine with its own memory and CPUs, and container units run only as many at
+  a time as fit in it. A Mac with two task slots whose Podman machine holds one
+  768 MB unit keeps about `work_buffer_hours` of container units, not twice that,
+  and asks for container leafs accordingly; native and WebAssembly units still
+  fill the full per-slot buffer beside them. Without this bound such a machine
+  queued container units for up to twice the buffer hours, and some waited so
+  long they were handed back unrun. On Linux, and wherever the engine's machine
+  runs a container unit per slot, nothing changes.
 - **It only asks for work it could be handed.** A leaf whose runtime this
   machine does not have, or that you have not trusted its head to run
   (`lettuce-volunteer heads trust <head> <runtime>` opts in), is never requested
@@ -552,7 +562,11 @@ Two things make this volunteer-friendly:
 - **Time spent waiting in your buffer does not count against the deadline.** The
   deadline clock starts when a free slot picks the unit up and begins running it,
   not when you fetched it. A unit can sit in a deep `work_buffer_hours` buffer for
-  a while and still get its full run window.
+  a while and still get its full run window. It cannot wait indefinitely: a unit
+  still waiting once 90 % of its deadline has passed since it was fetched (or a
+  minute before its reservation window ends, if that is sooner) is handed back to
+  the head unrun, so another volunteer can still finish it in time. The desktop
+  app's **Queued** list counts down to that moment ("must start within …").
 - **If you stop or crash, nothing is lost.** A reserved-but-never-started unit is
   re-offered once its reservation window passes; a started-but-never-finished unit
   is reassigned once its deadline passes. At worst a unit is re-dispatched, never
@@ -566,8 +580,8 @@ Two things make this volunteer-friendly:
 
 | Config key | Default | What it does |
 |---|---|---|
-| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task (per GPU for GPU-required units, which run one per GPU). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
-| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this, except that GPU units are bounded by the number of GPUs when that is smaller. |
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task (per GPU for GPU-required units, which run one per GPU; on Windows and macOS, per container unit the container engine's machine can run at once for container units). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this, except that GPU units are bounded by the number of GPUs when that is smaller, and container units on Windows and macOS by how many the container engine's machine can run at once. |
 
 ```bash
 ./lettuce-volunteer config set work_buffer_hours 4

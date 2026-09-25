@@ -32,6 +32,33 @@ type PreFetchItem struct {
 	TimesSkipped int
 }
 
+// StartBy is when the buffer gives this unit up if no slot has started it:
+// the earlier of the moment DropExpiring drops it (1 − threshold of its
+// deadline after fetch) and margin before its reservation window lapses
+// (DropLapsedReservations). Zero when the unit has neither a deadline nor a
+// reservation window. It is the countdown a volunteer needs for a queued unit:
+// the unit's deadline is counted afresh from the moment a slot starts it, so
+// while it waits the only clock that matters is this one — a queue deep enough
+// to reach the drop returns the unit unrun while a deadline counted from fetch
+// still looks distant.
+func (item *PreFetchItem) StartBy(threshold float64, margin time.Duration) time.Time {
+	if item == nil || item.WU == nil {
+		return time.Time{}
+	}
+	var by time.Time
+	if item.WU.DeadlineSeconds > 0 {
+		deadline := time.Duration(item.WU.DeadlineSeconds) * time.Second
+		by = item.FetchedAt.Add(time.Duration(float64(deadline) * (1.0 - threshold)))
+	}
+	if item.WU.ReservedUntilUnix > 0 {
+		lapse := time.Unix(item.WU.ReservedUntilUnix, 0).Add(-margin)
+		if by.IsZero() || lapse.Before(by) {
+			by = lapse
+		}
+	}
+	return by
+}
+
 // PreFetchQueue is a thread-safe queue of pre-fetched work units.
 type PreFetchQueue struct {
 	mu       sync.Mutex

@@ -179,11 +179,10 @@ function ActiveTaskCard({ task, actions, isVizActive }: { task: ActiveTaskInfo; 
   );
 }
 
-function QueuedTaskCard({ task }: { task: QueuedTaskInfo }) {
-  const fetchedAt = new Date(task.fetched_at);
-  const elapsed = Math.floor((Date.now() - fetchedAt.getTime()) / 1000);
-  const remaining = Math.max(0, task.deadline_seconds - elapsed);
-
+// A queued unit's countdown is how long a slot has to start it, not its
+// deadline: the deadline is counted afresh once the unit starts, and the
+// daemon returns a unit still waiting at 90 % of it to the head unrun.
+function QueuedTaskCard({ task }: { task: Pick<QueuedTaskInfo, "work_unit_id" | "leaf_name" | "start_within_seconds"> }) {
   return (
     <div className="flex items-center justify-between px-4 py-2 rounded-lg border bg-muted/30">
       <div className="flex items-center gap-2">
@@ -193,9 +192,14 @@ function QueuedTaskCard({ task }: { task: QueuedTaskInfo }) {
           {task.work_unit_id.slice(0, 8)}
         </code>
       </div>
-      <span className="text-xs text-muted-foreground">
-        {formatDuration(remaining)} deadline
-      </span>
+      {task.start_within_seconds != null && (
+        <span
+          className="text-xs text-muted-foreground"
+          title="If no slot starts this unit in time, Lettuce returns it to its head unrun so another volunteer can still finish it before the deadline."
+        >
+          must start within {formatDuration(task.start_within_seconds)}
+        </span>
+      )}
     </div>
   );
 }
@@ -618,7 +622,7 @@ export function OverviewPage() {
                 onClick={() => handleTaskClick(task)}
               >
                 {isQueuedTask(task) ? (
-                  <QueuedTaskCard task={{ work_unit_id: task.work_unit_id, leaf_name: task.leaf_name, deadline_seconds: task.deadline_seconds, fetched_at: new Date().toISOString(), server_name: task.head_name }} />
+                  <QueuedTaskCard task={{ work_unit_id: task.work_unit_id, leaf_name: task.leaf_name, start_within_seconds: queuedTasks.find((qt) => qt.work_unit_id === task.work_unit_id)?.start_within_seconds }} />
                 ) : (
                   <ActiveTaskCard task={task} actions={taskActions} isVizActive={vizTask?.work_unit_id === task.work_unit_id} />
                 )}

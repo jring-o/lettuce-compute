@@ -1465,6 +1465,37 @@ describe("OverviewPage", () => {
     expect(deadlineEl.className).toContain("text-red-500");
   });
 
+  // A queued unit's clock is the time a slot has to start it: the daemon
+  // returns a unit still waiting at 90 % of its deadline to the head unrun.
+  // A five-hour unit fetched three and a half hours ago used to read "1h 30m
+  // deadline" with one hour left before it was given up.
+  it("counts a queued unit down to when it must start, not to its deadline", () => {
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "active",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [],
+          queued_tasks: [
+            {
+              work_unit_id: "wu-queued-0001",
+              leaf_name: "Beyblade Arena",
+              deadline_seconds: 18000,
+              fetched_at: new Date(Date.now() - 12600 * 1000).toISOString(),
+              start_within_seconds: 3600,
+              server_name: "lbry",
+            },
+          ],
+          paused_reason: null,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    expect(screen.getByText("must start within 1h 0m")).toBeInTheDocument();
+    expect(screen.queryByText(/1h 30m deadline/)).not.toBeInTheDocument();
+  });
+
   it("renders progress bar with correct width style", () => {
     setupDefaultMocks({
       status: {
