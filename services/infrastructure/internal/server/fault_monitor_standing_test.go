@@ -10,6 +10,7 @@ import (
 
 	"github.com/lettuce-compute/infrastructure/internal/standing"
 	"github.com/lettuce-compute/infrastructure/internal/types"
+	"github.com/lettuce-compute/infrastructure/internal/volunteer"
 )
 
 // Unit tests (no DB) for the fault monitor's automatic-standing-backpressure WARN
@@ -160,5 +161,72 @@ func TestWarnStandingPopulation_ThrottleSuppressesSecondWarn(t *testing.T) {
 	}
 	if got := strings.Count(buf.String(), "automatic standing backpressure"); got != 2 {
 		t.Fatalf("WARN lines after throttle elapsed = %d, want 2", got)
+	}
+}
+
+// operatorSet marks an entry as set by hand through the admin API. The machine never
+// changes such a row, so it is not part of the population the machine holds.
+func operatorSet(e standing.Entry) standing.Entry {
+	e.Source = volunteer.StandingSourceOperator
+	return e
+}
+
+// automatic marks an entry as the machine's own (the stored default source).
+func automatic(e standing.Entry) standing.Entry {
+	e.Source = volunteer.StandingSourceAuto
+	return e
+}
+
+func TestWarnStandingPopulation_CountsOnlyTheMachinesOwnRows(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	vOperatorBench, vAutoBench, vAutoProbation := types.NewID(), types.NewID(), types.NewID()
+	repo := &fakeStandingPopulationRepo{entries: map[types.ID]standing.Entry{
+		// Benched by hand: the operator's own act, which the machine never touches.
+		vOperatorBench: operatorSet(benchedEntry(&future)),
+		vAutoBench:     automatic(benchedEntry(&future)),
+		vAutoProbation: automatic(probationEntry()),
+	}}
+	m, buf := newStandingTestMonitor(repo)
+
+	m.warnStandingPopulation(context.Background())
+
+	log := buf.String()
+	if got := strings.Count(log, "automatic standing backpressure"); got != 1 {
+		t.Fatalf("WARN lines = %d, want 1\nlog: %s", got, log)
+	}
+	// The "automatic" counts are the machine's rows only.
+	if !strings.Contains(log, " benched=1 ") {
+		t.Errorf("want benched=1 (the machine's bench only, not the operator's)\nlog: %s", log)
+	}
+	if !strings.Contains(log, " probation=1 ") {
+		t.Errorf("want probation=1\nlog: %s", log)
+	}
+	// Hand-set rows are reported apart, so the line still shows the whole population.
+	if !strings.Contains(log, "operator_benched=1") || !strings.Contains(log, "operator_probation=0") {
+		t.Errorf("want operator_benched=1 operator_probation=0\nlog: %s", log)
+	}
+	if strings.Contains(log, vOperatorBench.String()) {
+		t.Errorf("the id sample names the operator-benched account; it must sample the machine's rows only\nlog: %s", log)
+	}
+}
+
+func TestWarnStandingPopulation_OperatorRowsAloneNeverWarn(t *testing.T) {
+	// The live shape: the switch is turned on while one account is benched by hand and the
+	// machine holds no one. That is not a population the machine holds, so no WARN, and no
+	// throttle stamp either, so the WARN fires on the first scan the machine acts.
+	future := time.Now().Add(time.Hour)
+	repo := &fakeStandingPopulationRepo{entries: map[types.ID]standing.Entry{
+		types.NewID(): operatorSet(benchedEntry(&future)),
+		types.NewID(): operatorSet(probationEntry()),
+	}}
+	m, buf := newStandingTestMonitor(repo)
+
+	m.warnStandingPopulation(context.Background())
+
+	if strings.Contains(buf.String(), "automatic standing backpressure") {
+		t.Fatalf("operator-set rows alone must not WARN as the machine's population\nlog: %s", buf.String())
+	}
+	if !m.lastStandingPopulationWarn.IsZero() {
+		t.Fatalf("operator-set rows alone must not stamp the throttle")
 	}
 }

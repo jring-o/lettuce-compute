@@ -781,16 +781,45 @@ operator-only. Before enabling, watch the head's existing per-volunteer
 calibrate the thresholds (effective rates must order `0 < ok_rate < probation_rate <=
 bench_rate <= 1`). Once enabled, the head also logs a throttled
 `automatic standing backpressure` WARN naming how many accounts the machine currently
-holds benched versus on probation. Inspect the current non-OK population with
-`GET /api/v1/admin/standing` and release an account with
-`POST /api/v1/admin/standing/clear`.
+holds benched versus on probation. Accounts you set by hand are reported apart
+(`operator_benched`, `operator_probation`) and never raise that WARN on their own.
+Inspect the current non-OK population with `GET /api/v1/admin/standing`.
+
+**Releasing accounts.** Nothing resets an account's rejection signal, not even a
+release. The rate the machine acts on changes only as new results are adjudicated; time
+alone shrinks the signal (it halves every 7 days) but not the rate. So how you release
+an account decides whether it stays released:
+
+- **To release an account and keep it released** (for example, to undo a wrong
+  probation), set it `OK` by hand: `POST /api/v1/admin/standing` with
+  `{"volunteer_id": "<id>", "standing": "OK"}`. The row becomes operator-owned, so the
+  machine neither moves it nor records its results. `POST /api/v1/admin/standing/clear`
+  hands it back to the machine later, with the signal it had when you took it over,
+  shrunk only by the time that has passed.
+- **`POST /api/v1/admin/standing/clear`** returns an account to `OK` *and* to the
+  machine, with its signal unchanged. While the machine is on, an account whose rate is
+  still at or above `standing_probation_rate` goes back to `PROBATION` on its very next
+  adjudicated result, even an accepted one.
+- **Turning the machine off releases no one.** It stops recording results and moving
+  accounts, but the standings it set stay in force: a `BENCHED` account still gets no
+  work until its bench expires, and then stays on `PROBATION`, because only the machine
+  moves an account back to `OK`. To release everyone, list the non-OK accounts and clear
+  each one whose `standing_source` is `AUTO`; while the machine is off, a clear sticks.
+  If you turn the machine back on later, those accounts are judged on their old signal
+  again.
+- **After a leaf-level fault** that put a whole leaf's volunteers on probation (a broken
+  leaf makes honest results disagree): fix the leaf, then set each affected account `OK`
+  by hand as above, which takes effect whether the machine is on or off. There is no way
+  to erase the signal the broken leaf caused, so keep those accounts operator-owned until
+  it has decayed (several 7-day half-lives for a large burst) before handing them back
+  with `/clear`.
 
 These are `head.*` keys in `lettuce.yaml` (or the matching `LETTUCE_HEAD_*` env vars);
 all are OPTIONAL and take the defaults below when unset.
 
 | Key (env) | Default | What it does |
 |-----------|---------|--------------|
-| `standing_backpressure_enabled` (`LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED`) | `false` | Master switch. Off records no signal and leaves standing operator-only. Enable only after observing the WARN rates above. |
+| `standing_backpressure_enabled` (`LETTUCE_HEAD_STANDING_BACKPRESSURE_ENABLED`) | `false` | Master switch. Off records no signal and moves no account; standings the machine already set stay in force (see **Releasing accounts** above). Enable only after observing the WARN rates above. |
 | `standing_probation_rate` (`LETTUCE_HEAD_STANDING_PROBATION_RATE`) | `0.50` | Decayed rejection rate at which an `OK` account enters `PROBATION`. |
 | `standing_ok_rate` (`LETTUCE_HEAD_STANDING_OK_RATE`) | `0.25` | Decayed rejection rate at or below which a `PROBATION` account returns to `OK` — the hysteresis exit, kept strictly below the `PROBATION` entry rate. |
 | `standing_bench_rate` (`LETTUCE_HEAD_STANDING_BENCH_RATE`) | `0.75` | Decayed rejection rate at which a `PROBATION` account is `BENCHED`. |
