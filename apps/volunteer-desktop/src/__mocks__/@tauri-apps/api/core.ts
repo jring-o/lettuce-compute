@@ -20,6 +20,10 @@ export const hostCommandDefaults: Record<string, unknown> = {
   restart_daemon: undefined,
   get_data_dir: "/home/test/.lettuce",
   get_client_version: "0.0.0-test",
+  // The app's own log
+  get_log_dir: "/home/test/.lettuce/logs",
+  open_log_folder: undefined,
+  log_from_webview: undefined,
   // Host measurements
   system_metrics: { cpu_usage_pct: 0, memory_used_mb: 0, memory_total_mb: 0 },
   get_system_memory_mb: 16384,

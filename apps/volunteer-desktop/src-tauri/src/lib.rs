@@ -2,6 +2,7 @@ pub mod api;
 pub mod autostart;
 pub mod commands;
 pub mod container_runtime;
+pub mod logging;
 pub mod notifications;
 pub mod podman_installer;
 pub mod sidecar;

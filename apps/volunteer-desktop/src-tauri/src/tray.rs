@@ -169,48 +169,115 @@ pub fn start_version_tooltip(app: &AppHandle, tray: TrayIcon) {
     let app_version = app.package_info().version.to_string();
     std::thread::spawn(move || match sidecar::client_version() {
         Ok(v) => {
+            log::info!("{}", crate::logging::client_version_line(&v));
             let _ = tray.set_tooltip(Some(tooltip_text(&app_version, Some(&v))));
         }
-        Err(e) => eprintln!("[warn] could not read the bundled CLI version: {e}"),
+        Err(e) => log::warn!("could not read the bundled client's version: {e}"),
     });
 }
 
-fn handle_menu_event(app: &AppHandle, id: &str) {
-    match id {
-        "pause" => {
+/// What a tray item, or closing the window, does to the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowEffect {
+    Unchanged,
+    /// Show and focus it.
+    Show,
+    /// Show and focus it on the Settings page.
+    ShowSettings,
+    /// Hide it to the tray.
+    Hide,
+}
+
+/// What a tray item, or closing the window, does to computing. Only the
+/// Pause item and Quit change it. Showing or hiding the window never pauses
+/// or resumes: a pause the volunteer chose survives a look at the dashboard,
+/// and closing the window is not a way to stop (Pause and Quit are).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComputeEffect {
+    Unchanged,
+    /// Pause, Resume or Keep paused, by the daemon's state (`pause_menu`).
+    PauseResume,
+    /// Suspend the daemon's work, stop the daemon and exit the app.
+    SuspendAndQuit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Effect {
+    window: WindowEffect,
+    compute: ComputeEffect,
+}
+
+/// Closing the window: its close button, or Close Window in the macOS app
+/// menu. The app keeps running in the tray and the daemon keeps computing.
+const CLOSE_WINDOW: Effect = Effect {
+    window: WindowEffect::Hide,
+    compute: ComputeEffect::Unchanged,
+};
+
+fn menu_effect(id: &str) -> Option<Effect> {
+    let (window, compute) = match id {
+        "pause" => (WindowEffect::Unchanged, ComputeEffect::PauseResume),
+        "open" => (WindowEffect::Show, ComputeEffect::Unchanged),
+        "settings" => (WindowEffect::ShowSettings, ComputeEffect::Unchanged),
+        "quit" => (WindowEffect::Unchanged, ComputeEffect::SuspendAndQuit),
+        _ => return None,
+    };
+    Some(Effect { window, compute })
+}
+
+/// Carry out an effect: the window first, then computing.
+fn apply(app: &AppHandle, effect: Effect) {
+    if let Some(window) = app.get_webview_window("main") {
+        match effect.window {
+            WindowEffect::Unchanged => {}
+            WindowEffect::Show => {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            WindowEffect::ShowSettings => {
+                let _ = window.show();
+                let _ = window.set_focus();
+                let _ = app.emit("navigate:settings", ());
+            }
+            WindowEffect::Hide => {
+                let _ = window.hide();
+            }
+        }
+    }
+    match effect.compute {
+        ComputeEffect::Unchanged => {}
+        ComputeEffect::PauseResume => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 handle_pause_resume(&app).await;
             });
         }
-        "open" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
-            // Auto-resume compute when reopening after "close (X)" paused it.
-            tauri::async_runtime::spawn(async move {
-                if let Ok(info) = sidecar::read_daemon_json() {
-                    let client = ManagementClient::from_daemon_info(&info);
-                    let _ = client.resume().await;
-                }
-            });
-        }
-        "settings" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-                let _ = app.emit("navigate:settings", ());
-            }
-        }
-        "quit" => {
+        ComputeEffect::SuspendAndQuit => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 handle_quit(&app).await;
             });
         }
-        _ => {}
     }
+}
+
+/// The window's close request, which `main.rs` has already prevented: hide
+/// the window to the tray and leave computing as it is.
+pub fn close_to_tray(app: &AppHandle) {
+    apply(app, CLOSE_WINDOW);
+    log::info!("window closed: hidden to the tray; computing continues");
+}
+
+fn handle_menu_event(app: &AppHandle, id: &str) {
+    let Some(effect) = menu_effect(id) else {
+        return;
+    };
+    match effect.window {
+        WindowEffect::Show => log::info!("window opened from the tray"),
+        WindowEffect::ShowSettings => log::info!("window opened on Settings from the tray"),
+        WindowEffect::Unchanged | WindowEffect::Hide => {}
+    }
+    apply(app, effect);
 }
 
 async fn handle_pause_resume(_app: &AppHandle) {
@@ -227,23 +294,32 @@ async fn handle_pause_resume(_app: &AppHandle) {
             // state — active, or paused by a monitor — takes a user pause,
             // which holds after the automatic pause lifts (TB-89).
             if status.state == "paused" && status.paused_reason.as_deref() == Some("user") {
-                if let Err(e) = client.resume().await {
-                    eprintln!("[warn] the daemon refused to resume: {e}");
+                match client.resume().await {
+                    Ok(()) => log::info!("resumed from the tray"),
+                    Err(e) => log::warn!("the daemon refused to resume: {e}"),
                 }
-            } else if let Err(e) = client.pause().await {
-                eprintln!("[warn] the daemon refused to pause: {e}");
+            } else {
+                match client.pause().await {
+                    Ok(()) => log::info!("paused from the tray"),
+                    Err(e) => log::warn!("the daemon refused to pause: {e}"),
+                }
             }
         }
-        Err(_) => {}
+        Err(e) => log::warn!("tray Pause/Resume: could not read the daemon's status: {e}"),
     }
 }
 
 async fn handle_quit(app: &AppHandle) {
+    log::info!("quit chosen from the tray");
     // Suspend all compute, save PIDs, release Job Object, let daemon exit.
     // Frozen processes survive as orphans for next launch.
     // Must use spawn_blocking because suspend_and_quit_sidecar creates its own
     // tokio runtime — you can't call block_on from within an async context.
-    let _ = tokio::task::spawn_blocking(|| sidecar::suspend_and_quit_sidecar()).await;
+    match tokio::task::spawn_blocking(sidecar::suspend_and_quit_sidecar).await {
+        Ok(Err(e)) => log::warn!("could not suspend the volunteer daemon before quitting: {e}"),
+        Err(e) => log::warn!("could not suspend the volunteer daemon before quitting: {e}"),
+        Ok(Ok(())) => {}
+    }
     app.exit(0);
 }
 
@@ -354,6 +430,30 @@ mod tests {
                 "paused_reason {reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn closing_the_window_hides_it_and_computing_continues() {
+        assert_eq!(CLOSE_WINDOW.window, WindowEffect::Hide);
+        assert_eq!(CLOSE_WINDOW.compute, ComputeEffect::Unchanged);
+    }
+
+    #[test]
+    fn open_dashboard_shows_the_window_and_leaves_a_pause_alone() {
+        let open = menu_effect("open").unwrap();
+        assert_eq!(open.window, WindowEffect::Show);
+        assert_eq!(open.compute, ComputeEffect::Unchanged);
+        let settings = menu_effect("settings").unwrap();
+        assert_eq!(settings.window, WindowEffect::ShowSettings);
+        assert_eq!(settings.compute, ComputeEffect::Unchanged);
+    }
+
+    #[test]
+    fn only_pause_and_quit_change_computing() {
+        assert_eq!(menu_effect("pause").unwrap().compute, ComputeEffect::PauseResume);
+        assert_eq!(menu_effect("pause").unwrap().window, WindowEffect::Unchanged);
+        assert_eq!(menu_effect("quit").unwrap().compute, ComputeEffect::SuspendAndQuit);
+        assert_eq!(menu_effect("status"), None);
     }
 
     #[test]

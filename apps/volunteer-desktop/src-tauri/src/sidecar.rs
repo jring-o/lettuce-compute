@@ -16,7 +16,7 @@ use crate::api::DaemonInfo;
 /// Environment variable that relocates the data directory. When set to a
 /// non-empty path, the app reads and writes everything under that path
 /// instead of `~/.lettuce` (`daemon.json`, `config.yaml`, its own
-/// `milestones.json` and first-launch marker), and passes `--data-dir <path>`
+/// `milestones.json` and `logs/desktop.log`), and passes `--data-dir <path>`
 /// to every `lettuce-volunteer` command it runs, so the bundled client keeps
 /// the whole profile — config, identity keys, work directories, logs — in the
 /// same place. Two copies of the app with different values run as two
@@ -35,7 +35,7 @@ pub fn data_dir() -> PathBuf {
 /// is made absolute against the current directory once, here, so the app and
 /// the client (which absolutizes `--data-dir` against its own working
 /// directory) agree on the same folder.
-fn resolve_data_dir(override_value: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+pub(crate) fn resolve_data_dir(override_value: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     if let Some(dir) = override_path(override_value) {
         return std::path::absolute(&dir).unwrap_or(dir);
     }
@@ -191,6 +191,7 @@ impl SpawnedDaemon {
                 // is where the daemon says why it stopped.
                 let _ = self.stderr_done.recv_timeout(STDERR_DRAIN_GRACE);
                 self.exit = Some(status);
+                log_exit(self.pid, status, &self.tail());
             }
         }
         self.exit
@@ -203,6 +204,31 @@ impl SpawnedDaemon {
             .iter()
             .cloned()
             .collect()
+    }
+}
+
+/// How many of the daemon's last stderr lines the app log quotes for an exit
+/// that was not clean and gave no reason of its own. The daemon writes the
+/// same lines to its own log, so only enough to place the exit is copied.
+const LOGGED_TAIL_LINES: usize = 5;
+
+/// Record, once, how the daemon this process spawned ended: cleanly, with its
+/// own reason (`exit_reason`), or with its last stderr lines when it gave
+/// none.
+fn log_exit(pid: u32, status: ExitStatus, tail: &[String]) {
+    if status.success() {
+        log::info!("the volunteer daemon this app started (pid {pid}) exited cleanly");
+        return;
+    }
+    match exit_reason(tail) {
+        Some(reason) => log::warn!("the volunteer daemon (pid {pid}) exited ({status}): {reason}"),
+        None => {
+            let from = tail.len().saturating_sub(LOGGED_TAIL_LINES);
+            log::warn!(
+                "the volunteer daemon (pid {pid}) exited ({status}) without saying why; its last stderr lines: {}",
+                tail[from..].join(" | ")
+            );
+        }
     }
 }
 
@@ -311,6 +337,7 @@ fn spawn_daemon(mut cmd: Command) -> Result<SpawnOutcome, String> {
     }
 
     let pid = child.id();
+    log::info!("started the volunteer daemon (pid {pid})");
     *slot = Some(SpawnedDaemon {
         pid,
         child,
@@ -346,7 +373,18 @@ pub fn start_sidecar() -> Result<u32, String> {
 /// Start the daemon unless one is running (its own or adopted) or this
 /// process is already starting one.
 pub fn ensure_daemon_started() -> Result<(), String> {
-    if is_daemon_running() || matches!(spawned_state(), Spawned::Running) {
+    if let Ok(info) = read_daemon_json() {
+        if is_pid_alive(info.pid) {
+            if spawned_alive(info.pid).is_none() {
+                log::info!(
+                    "the volunteer daemon is already running (pid {}); the app uses it",
+                    info.pid
+                );
+            }
+            return Ok(());
+        }
+    }
+    if matches!(spawned_state(), Spawned::Running) {
         return Ok(());
     }
     start_sidecar().map(|_| ())
@@ -489,6 +527,22 @@ fn start_failure(status: ExitStatus, reason: Option<String>) -> String {
 /// after a config change the running daemon cannot apply in place (for
 /// example runtime trust).
 pub fn restart_daemon() -> Result<DaemonStart, String> {
+    log::info!("restarting the volunteer daemon");
+    let outcome = restart_daemon_steps();
+    match &outcome {
+        Ok(DaemonStart::Ready(info)) => {
+            log::info!("restart done: the volunteer daemon is up (pid {})", info.pid)
+        }
+        Ok(DaemonStart::Starting) => log::warn!(
+            "restart: the new volunteer daemon is still starting after {:?}",
+            DAEMON_START_TIMEOUT
+        ),
+        Err(e) => log::warn!("restart failed: {e}"),
+    }
+    outcome
+}
+
+fn restart_daemon_steps() -> Result<DaemonStart, String> {
     let previous = read_daemon_json()
         .ok()
         .filter(|info| is_pid_alive(info.pid));
@@ -499,7 +553,7 @@ pub fn restart_daemon() -> Result<DaemonStart, String> {
         // fail here — the wait below decides, and the forced path still works.
         if let Ok(out) = run_sidecar(&["stop"]) {
             if !out.status.success() {
-                eprintln!(
+                log::warn!(
                     "lettuce-volunteer stop: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
@@ -507,6 +561,10 @@ pub fn restart_daemon() -> Result<DaemonStart, String> {
         }
 
         if !wait_for_exit(prev.pid, Duration::from_secs(30)) {
+            log::warn!(
+                "the volunteer daemon (pid {}) did not stop within 30 s; stopping it by force",
+                prev.pid
+            );
             let forced = run_sidecar(&["stop", "--force"]);
             if !matches!(&forced, Ok(out) if out.status.success()) {
                 force_kill(prev.pid)?;

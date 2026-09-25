@@ -283,6 +283,109 @@ describe("SetupWizard", () => {
     });
   });
 
+  describe("Start at login", () => {
+    /** The commands invoked so far, in order. */
+    function commands(): string[] {
+      return vi.mocked(invoke).mock.calls.map(([cmd]) => cmd);
+    }
+
+    async function finish(user: User) {
+      await user.click(screen.getByText("Next"));
+      await screen.findByText("Container Runtime");
+      await user.click(await screen.findByRole("button", { name: "Skip — WASM and native only" }));
+      await screen.findByText("Add a server to start contributing compute.");
+      await testConnection(user);
+      await user.click(screen.getByText("Start Contributing"));
+    }
+
+    it("is asked on the Schedule step, ticked by default", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME });
+      render(<SetupWizard onComplete={vi.fn()} />);
+      await goToSchedule(user);
+
+      const box = screen.getByRole("checkbox", { name: /Start Lettuce when I log in/ });
+      expect(box).toBeChecked();
+      expect(screen.getByText(/Settings › General › Start on boot/)).toBeInTheDocument();
+      // Nothing is registered while the wizard is still being filled in.
+      expect(commands()).not.toContain("set_autostart");
+    });
+
+    it("turns it on once init has succeeded", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
+      const onComplete = vi.fn();
+      render(<SetupWizard onComplete={onComplete} />);
+      await goToSchedule(user);
+      await finish(user);
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalled());
+      expect(invoke).toHaveBeenCalledWith("set_autostart", { enabled: true });
+      expect(commands().indexOf("set_autostart")).toBeGreaterThan(commands().indexOf("run_init"));
+    });
+
+    it("switches it off when the box is unticked", async () => {
+      const user = setup();
+      mockInvoke({ detect_container_runtime: NO_RUNTIME, ...headRoutes });
+      const onComplete = vi.fn();
+      render(<SetupWizard onComplete={onComplete} />);
+      await goToSchedule(user);
+      await user.click(screen.getByRole("checkbox", { name: /Start Lettuce when I log in/ }));
+      await finish(user);
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalled());
+      expect(invoke).toHaveBeenCalledWith("set_autostart", { enabled: false });
+      expect(invoke).not.toHaveBeenCalledWith("set_autostart", { enabled: true });
+    });
+
+    it("is not touched before init has resolved, nor at all when init fails", async () => {
+      const user = setup();
+      let failInit: (reason: string) => void = () => {};
+      mockInvoke({
+        detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
+        run_init: () =>
+          new Promise((_, reject) => {
+            failInit = reject;
+          }),
+      });
+      const onComplete = vi.fn();
+      render(<SetupWizard onComplete={onComplete} />);
+      await goToSchedule(user);
+      await finish(user);
+
+      await waitFor(() => expect(commands()).toContain("run_init"));
+      expect(commands()).not.toContain("set_autostart");
+
+      await act(async () => {
+        failInit("Init failed: disk full");
+      });
+      await screen.findByText("Init failed: disk full");
+      expect(commands()).not.toContain("set_autostart");
+      expect(onComplete).not.toHaveBeenCalled();
+    });
+
+    it("a failure to register it does not fail setup", async () => {
+      const user = setup();
+      mockInvoke({
+        detect_container_runtime: NO_RUNTIME,
+        ...headRoutes,
+        set_autostart: () => {
+          throw "Failed to enable autostart: access denied";
+        },
+      });
+      const onInitialized = vi.fn();
+      const onComplete = vi.fn();
+      render(<SetupWizard onInitialized={onInitialized} onComplete={onComplete} />);
+      await goToSchedule(user);
+      await finish(user);
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalled());
+      expect(onInitialized).toHaveBeenCalled();
+      expect(screen.queryByText(/access denied/)).not.toBeInTheDocument();
+    });
+  });
+
   describe("ConnectStep — head preview and leaf selection", () => {
     it("shows head preview after successful test connection", async () => {
       const user = setup();

@@ -5,6 +5,7 @@ import {
   ChevronRight,
   Copy,
   Check,
+  FolderOpen,
   Monitor,
   Sun,
   Moon,
@@ -33,7 +34,9 @@ import {
 } from "@/lib/utils";
 import {
   getDataDir,
+  getLogDir,
   getSystemCpuCount,
+  openLogFolder,
   type ScheduleRange,
   type ThermalConfig,
   type YieldConfig,
@@ -324,6 +327,57 @@ function RestartButton() {
         )}
       </div>
       {error && <p className="text-xs text-destructive">Restart failed: {error}</p>}
+    </div>
+  );
+}
+
+/**
+ * Where the logs are, with a way to open the folder: `desktop.log` is this
+ * app's own log and `volunteer.log` the daemon's. The host opens the folder,
+ * so the web view never names a path to open.
+ */
+function LogFolder() {
+  const [logDir, setLogDir] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getLogDir()
+      .then((dir) => setLogDir(typeof dir === "string" && dir ? dir : null))
+      .catch(() => {});
+  }, []);
+
+  const handleOpen = async () => {
+    setError(null);
+    try {
+      await openLogFolder();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <label className="text-sm font-medium">Logs</label>
+      {logDir && (
+        <div className="flex items-center gap-2">
+          <code
+            className="flex-1 text-xs bg-muted rounded-md px-3 py-2 font-mono truncate"
+            title={logDir}
+          >
+            {logDir}
+          </code>
+          <CopyButton text={logDir} />
+        </div>
+      )}
+      <Button variant="outline" size="sm" onClick={handleOpen}>
+        <FolderOpen className="h-3.5 w-3.5 mr-1.5" />
+        Open log folder
+      </Button>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      <p className="text-xs text-muted-foreground">
+        desktop.log is this app's log; volunteer.log is the background program's. Attach both
+        when you report a problem.
+      </p>
     </div>
   );
 }
@@ -1165,7 +1219,12 @@ export function SettingsPage() {
               <option value="info">Info</option>
               <option value="debug">Debug</option>
             </select>
+            <p className="text-xs text-muted-foreground">
+              How much the background program writes to volunteer.log.
+            </p>
           </div>
+
+          <LogFolder />
 
           {/* Restart */}
           <div className="space-y-2 pt-2 border-t">

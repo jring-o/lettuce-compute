@@ -76,24 +76,46 @@ impl ManagementClient {
     }
 }
 
+/// Ask the daemon to bring a Podman machine to `desired_status` ("running" or
+/// "stopped") when it reports the opposite, and log what was found and done.
 pub fn ensure_podman_state(info: &DaemonInfo, desired_status: &str) {
     let action_status = if desired_status == "running" { "stopped" } else { "running" };
     let client = ManagementClient::from_daemon_info(info);
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
-        Err(_) => return,
+        Err(e) => {
+            log::warn!("container runtime: could not check the Podman machine: {e}");
+            return;
+        }
     };
     rt.block_on(async {
         let status = match client.get_container_runtime_status().await {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                log::warn!("container runtime: could not read its status from the daemon: {e}");
+                return;
+            }
         };
         if status.backend == "podman" && status.status == action_status {
-            if desired_status == "running" {
-                let _ = client.start_container_runtime().await;
+            let result = if desired_status == "running" {
+                client.start_container_runtime().await
             } else {
-                let _ = client.stop_container_runtime().await;
+                client.stop_container_runtime().await
+            };
+            match result {
+                Ok(_) => log::info!(
+                    "container runtime: the Podman machine was {action_status}; asked the daemon to make it {desired_status}"
+                ),
+                Err(e) => log::warn!(
+                    "container runtime: the Podman machine is {action_status} and the daemon refused to make it {desired_status}: {e}"
+                ),
             }
+        } else {
+            log::info!(
+                "container runtime: {} is {}; nothing to do",
+                if status.backend.is_empty() { "none" } else { status.backend.as_str() },
+                if status.status.is_empty() { "unknown" } else { status.status.as_str() }
+            );
         }
     });
 }

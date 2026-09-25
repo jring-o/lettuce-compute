@@ -3,12 +3,14 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 use tauri::AppHandle;
+use tauri_plugin_opener::OpenerExt;
 
 use crate::api::ManagementClient;
 use crate::autostart;
 use crate::container_runtime::{
     self, ContainerRuntimeDetection, ContainerRuntimeStatus, SetupRequest, SetupResponse,
 };
+use crate::logging;
 use crate::podman_installer::{self, PodmanPrerequisites};
 use crate::sidecar;
 use crate::updater;
@@ -463,6 +465,39 @@ pub async fn restart_daemon() -> Result<(), String> {
 #[tauri::command]
 pub fn get_data_dir() -> String {
     sidecar::data_dir().to_string_lossy().into_owned()
+}
+
+/// The folder that holds the app's log (`desktop.log`) and the daemon's
+/// (`volunteer.log`): `logs` under the data directory.
+#[tauri::command]
+pub fn get_log_dir() -> String {
+    logging::log_dir().to_string_lossy().into_owned()
+}
+
+/// Show the log folder in the system file manager, with `desktop.log`
+/// selected when it exists. The folder is the app's own; the web view cannot
+/// point this anywhere else, so it needs no opener permission.
+#[tauri::command]
+pub fn open_log_folder(app: AppHandle) -> Result<(), String> {
+    let file = logging::log_file();
+    let result = if file.is_file() {
+        app.opener().reveal_item_in_dir(&file)
+    } else {
+        app.opener()
+            .open_path(logging::log_dir().to_string_lossy(), None::<&str>)
+    };
+    result.map_err(|e| {
+        let message = format!("Could not open the log folder: {e}");
+        log::warn!("{message}");
+        message
+    })
+}
+
+/// A line for the app log from the web view: its uncaught errors, unhandled
+/// promise rejections, and console warnings and errors (`src/lib/webview-log.ts`).
+#[tauri::command]
+pub fn log_from_webview(level: String, message: String) {
+    logging::log_from_webview(&level, &message);
 }
 
 /// The bundled CLI's version string (`lettuce-volunteer --version`).

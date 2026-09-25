@@ -22,6 +22,7 @@ vi.mock("lucide-react", () => ({
   ChevronRight: (props: any) => <span data-testid="chevron-right" {...props} />,
   Copy: (props: any) => <span data-testid="copy-icon" {...props} />,
   Check: (props: any) => <span data-testid="check-icon" {...props} />,
+  FolderOpen: (props: any) => <span data-testid="folder-open-icon" {...props} />,
   AlertTriangle: (props: any) => <span data-testid="alert-icon" {...props} />,
   RefreshCw: (props: any) => <span data-testid="refresh-icon" {...props} />,
   Monitor: (props: any) => <span data-testid="monitor-icon" {...props} />,
@@ -858,6 +859,53 @@ describe("SettingsPage", () => {
 
     await user.click(screen.getByText("General"));
     expect(screen.getByText("Log Level")).toBeInTheDocument();
+  });
+
+  it("shows where the logs are and opens the folder through the host", async () => {
+    const user = userEvent.setup();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+    mockManagementApi(
+      { "GET /api/v1/heads": { heads: [], machine: noGpuMachine }, "GET /api/v1/status": {} },
+      (cmd) => (cmd === "get_log_dir" ? "/srv/profiles/second/logs" : defaultCommandResult(cmd))
+    );
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("General"));
+
+    expect(await screen.findByText("/srv/profiles/second/logs")).toBeInTheDocument();
+    expect(screen.getByText(/desktop\.log is this app's log; volunteer\.log is the background program's/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Open log folder" }));
+    // The host picks the folder; the web view passes no path.
+    expect(invoke).toHaveBeenCalledWith("open_log_folder");
+  });
+
+  it("says why the log folder could not be opened", async () => {
+    const user = userEvent.setup();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+    mockManagementApi(
+      { "GET /api/v1/heads": { heads: [], machine: noGpuMachine }, "GET /api/v1/status": {} },
+      (cmd) => {
+        if (cmd === "open_log_folder") throw "Could not open the log folder: not found";
+        return defaultCommandResult(cmd);
+      }
+    );
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("General"));
+    await user.click(screen.getByRole("button", { name: "Open log folder" }));
+
+    expect(await screen.findByText("Could not open the log folder: not found")).toBeInTheDocument();
   });
 
   it("calls updateConfig when log level changes", async () => {

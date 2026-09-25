@@ -1001,6 +1001,27 @@ export async function getDataDir(): Promise<string> {
   return invoke("get_data_dir");
 }
 
+/**
+ * The folder holding this app's log (`desktop.log`) and the daemon's
+ * (`volunteer.log`): `logs` under the data directory. Absolute.
+ */
+export async function getLogDir(): Promise<string> {
+  return invoke("get_log_dir");
+}
+
+/** Show the log folder in the system file manager, with `desktop.log` selected. */
+export async function openLogFolder(): Promise<void> {
+  await invoke("open_log_folder");
+}
+
+/**
+ * Turn start-at-login on or off (the login entry that starts the app in the
+ * tray). Switching it off when there is no entry succeeds.
+ */
+export async function setAutostart(enabled: boolean): Promise<void> {
+  await invoke("set_autostart", { enabled });
+}
+
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------

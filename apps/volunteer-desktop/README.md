@@ -30,9 +30,13 @@ runs; a **volunteer** is a person who lends their machine.
   same client. The command-line client remains the reference client: anything the app can do, the
   client can do, and the [volunteer setup guide](../../guides/volunteer-setup.md) applies to both.
 - Beyond the daemon, the app adds what a shell should: a first-run wizard, a tray icon with
-  pause/resume, desktop notifications, launch at login, an in-app installer for a container
-  runtime on Windows (see [Podman installer](#podman-installer)), and self-updates (see
-  [Updater and signing](#updater-and-signing)).
+  pause/resume, desktop notifications, launch at login (the wizard asks, and Settings → General →
+  Start on boot changes it), an in-app installer for a container runtime on Windows (see
+  [Podman installer](#podman-installer)), self-updates (see
+  [Updater and signing](#updater-and-signing)), and a log of its own (see [Logs](#logs)).
+- Closing the window hides it to the tray; computing continues until the volunteer presses Pause
+  (on the Overview or in the tray menu) or quits from the tray. Opening the dashboard again changes
+  nothing else, so a pause lasts until Resume, or until Lettuce restarts.
 
 The interface is a React application (`src/`) rendered by [Tauri 2](https://v2.tauri.app) in the
 operating system's web view; the Rust side (`src-tauri/src/`) owns process management, the tray,
@@ -42,7 +46,7 @@ notifications, and the updater.
 
 Everything a volunteer's install persists lives in one **data directory**: the client's
 `config.yaml`, the identity key pair (the account), work directories, logs and `daemon.json`, plus
-the app's own small files (its credit-milestone record and first-launch marker). By default that is
+the app's own files (its credit-milestone record and its log). By default that is
 `~/.lettuce` (`C:\Users\<you>\.lettuce` on Windows), the same directory the command-line client
 uses, which is why the app and the client can be used interchangeably on one install.
 
@@ -75,6 +79,27 @@ LETTUCE_DATA_DIR=~/lettuce-second npm run tauri dev
 
 The variable is read when the app starts; a Start-menu shortcut or the login-time autostart entry
 does not carry it, so a second profile is launched from a shell (or a shortcut) that sets it.
+
+## Logs
+
+Both logs live in `logs/` under the data directory:
+
+- **`volunteer.log`** is the daemon's: everything about heads, work and results. Settings →
+  General → Log Level sets how much it writes.
+- **`desktop.log`** is the app's own: each session's start (app version, operating system and
+  architecture, data directory, whether it was started at login, whether setup was still needed,
+  then the bundled client's version), the daemon it started or found running and how that ended,
+  restarts, update checks and installs, the Podman machine auto-start, the start-at-login entry,
+  the window being closed and reopened, tray actions, and the web view's own errors and warnings.
+  It is kept at Info (Debug in a debug build), rotated at 10 MB with five rotated copies kept,
+  and timestamped in local time with the UTC offset (or in UTC, marked `Z`, where the local
+  offset cannot be read). Everything is also written to stderr, so `npm run tauri dev` and a
+  Terminal launch still show it.
+
+Settings → General → **Open log folder** opens the folder with `desktop.log` selected and shows
+its path. When the folder cannot be written, the app still starts and logs to stderr only, saying
+why. Releases before this log existed wrote nothing of the app's own anywhere a volunteer could
+find it.
 
 ## Prerequisites
 
@@ -201,7 +226,15 @@ machine without Podman, and update the version here. If the Podman installer cha
 The app checks for a new version ten seconds after launch and every six hours, using Tauri's
 updater plugin (`src-tauri/src/updater.rs`). A check fetches a small JSON manifest, compares the
 version in it with the running version and, if the volunteer accepts, downloads the new installer,
-verifies its signature against the public key compiled into the app, and runs it.
+verifies its signature against the public key compiled into the app, and runs it. On macOS the
+update is not the DMG but the signed `Lettuce Compute.app.tar.gz` archive, which replaces the app
+bundle in place. The bundler builds that archive only because `bundle.targets` in
+`tauri.conf.json` lists `app` beside `dmg`: with the DMG alone it builds the `.app`, deletes it,
+signs nothing, and the manifest gets no macOS entry. Every release up to desktop-v2.1.1 was built
+that way, so no Mac install could update itself; one on any of those versions updates itself from
+the first release that carries the archive (its updater reads the same manifest address with the
+same public key). A unit test
+(`src/__tests__/tauri-config.test.ts`) keeps `app` in the list.
 
 ### Keys
 
@@ -253,8 +286,8 @@ services and the command-line client) are unchanged.
 | Job | Runs when | Does |
 | --- | --- | --- |
 | `desktop-check` | pull requests and pushes to `main` touching `apps/volunteer-desktop/**`, `services/volunteer-cli/**`, or the workflow | On Windows: sidecar script, Podman installer fetch, `npm ci`, `npm test`, `npm run build`, `cargo check --locked`. |
-| `desktop-release` | a pushed `desktop-vX.Y.Z` tag, or a manual run | Builds signed installers for Windows (MSI, NSIS), macOS (Apple Silicon and Intel DMGs), and Linux (AppImage, `.deb`) with [tauri-action](https://github.com/tauri-apps/tauri-action), and attaches them, the `.sig` files, and `latest.json` to a **draft** release named `Lettuce Compute desktop vX.Y.Z`. Refuses to build if the tag disagrees with the version in `tauri.conf.json`, `package.json`, and `Cargo.toml`. |
-| `desktop-promote` | a `desktop-v*` release being published, or a manual run with the `promote` input set to a published tag | Marks the release "not latest", re-points `desktop-latest`, and uploads the manifest. Refuses drafts. |
+| `desktop-release` | a pushed `desktop-vX.Y.Z` tag, or a manual run | Builds signed installers for Windows (MSI, NSIS), macOS (Apple Silicon and Intel DMGs, plus the signed `.app.tar.gz` update archives), and Linux (AppImage, `.deb`) with [tauri-action](https://github.com/tauri-apps/tauri-action), and attaches them, the `.sig` files, and `latest.json` to a **draft** release named `Lettuce Compute desktop vX.Y.Z`. Refuses to build if the tag disagrees with the version in `tauri.conf.json`, `package.json`, and `Cargo.toml`. |
+| `desktop-promote` | a `desktop-v*` release being published, or a manual run with the `promote` input set to a published tag | Checks that the manifest has a signed entry for `darwin-aarch64`, `darwin-x86_64`, `linux-x86_64` and `windows-x86_64` (`scripts/check-updater-manifest.sh`), marks the release "not latest", re-points `desktop-latest`, and uploads the manifest. Refuses drafts, and a manifest missing a platform unless a manual run sets `allow_partial`. |
 
 ## Releases
 
@@ -268,11 +301,21 @@ services and the command-line client) are unchanged.
    version stamp is a `git describe` string such as `0.11.1-12-gabcdef0`.
 3. **Tag and push**: `git tag desktop-vX.Y.Z <commit> && git push origin desktop-vX.Y.Z`. The
    "Desktop app" workflow builds every platform and creates the draft release.
-4. **Write the notes and publish.** Open the draft, replace the placeholder body with notes a
+4. **Check the draft.** It should carry 15 assets, among them a `.app.tar.gz` and its `.sig` for
+   each Mac architecture, and its `latest.json` should pass the promotion's check before anything
+   is published:
+
+   ```bash
+   gh release download desktop-vX.Y.Z --pattern latest.json -D /tmp/draft
+   bash scripts/check-updater-manifest.sh /tmp/draft/latest.json
+   ```
+
+   A failure here means the release would be refused at promotion after it is already public.
+5. **Write the notes and publish.** Open the draft, replace the placeholder body with notes a
    newcomer can follow (what the app does, the behaviour before, what changed and why, the
    behaviour after, and whether volunteers must do anything), and publish it with
    **"Set as the latest release" unchecked**.
-5. **Promotion is automatic.** Publishing triggers `desktop-promote`. Confirm with:
+6. **Promotion is automatic.** Publishing triggers `desktop-promote`. Confirm with:
 
    ```bash
    curl -fsSL https://github.com/jring-o/lettuce-compute/releases/download/desktop-latest/latest.json | jq .version
@@ -282,5 +325,6 @@ services and the command-line client) are unchanged.
    immediately on its next launch.
 
 To roll back, run the "Desktop app" workflow manually with `promote` set to the previous
-`desktop-vX.Y.Z` tag; the manifest returns to that version. To re-run a promotion that failed,
-do the same with the current tag.
+`desktop-vX.Y.Z` tag; the manifest returns to that version. A release up to desktop-v2.1.1 has no
+macOS entry, so rolling back to one also needs `allow_partial` ticked (Macs then keep the version
+they have). To re-run a promotion that failed, do the same with the current tag.

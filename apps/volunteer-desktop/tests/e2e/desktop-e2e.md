@@ -22,14 +22,18 @@ you ship. Record the build number, the OS, and the outcome of every numbered ste
   replay can only report that the files are gone. Check the bundled client's version
   against the release notes before starting.
 
-Whenever a step fails, the first place to look is the daemon log:
+Whenever a step fails, the first place to look is the two logs:
 
 ```
 ~/.lettuce/logs/volunteer.log          (Windows: %USERPROFILE%\.lettuce\logs\volunteer.log)
+~/.lettuce/logs/desktop.log            (Windows: %USERPROFILE%\.lettuce\logs\desktop.log)
 ```
 
-It is the same log the CLI writes; the app adds nothing of its own to it. Copy the tail of
-the log into the bug report together with the step number.
+`volunteer.log` is the daemon's, the same log the CLI writes: heads, work and results.
+`desktop.log` is the app's own: each session's start, the daemon it started or found, update
+checks, the login entry, the window being closed and reopened, tray actions, and the web
+view's errors. Settings → General → **Open log folder** opens the folder. Copy the tail of
+both logs into the bug report together with the step number.
 
 Other files that help when diagnosing:
 
@@ -51,9 +55,12 @@ Precondition: no `~/.lettuce` directory and no previous install of the app.
 | 1.1 | Install from the release-candidate package (MSI / DMG / AppImage or deb). | Installs without warnings other than the platform's usual unsigned-app prompts (note any). |
 | 1.2 | Launch the app. | The main window opens on the setup wizard's welcome step. No daemon is started yet (`~/.lettuce/daemon.json` does not exist). |
 | 1.3 | Check the tray. | The Lettuce tray icon is present; its menu shows a status item, Pause, Open Dashboard, Settings, Quit. |
+| 1.4 | Before touching the wizard, look for a login entry. | There is none: Windows, no `Lettuce Compute` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; macOS, no `~/Library/LaunchAgents/Lettuce Compute.plist`; Linux, no `~/.config/autostart/Lettuce Compute.desktop`. The app starts at login only if the wizard is finished with its box ticked (2.4, 2.8). |
+| 1.5 | Open `~/.lettuce/logs/desktop.log`. | It exists. Its first line names the app version, the operating system and architecture, the data directory, and that setup is not done yet; a line with the bundled client's version follows. |
 
-On failure: the app writes nothing before the wizard finishes, so a failure here is an
-installer or platform issue — capture the OS dialog text.
+On failure: before the wizard finishes the app writes only its own log (1.5), no config, no
+daemon files and no login entry, so a failure here is an installer or platform issue —
+capture the OS dialog text and `desktop.log`.
 
 ## 2. Setup wizard
 
@@ -62,11 +69,11 @@ installer or platform issue — capture the OS dialog text.
 | 2.1 | Welcome → Next. | Identity step. |
 | 2.2 | Identity: read the explanation, continue. | A key pair is generated on completion (later visible as the public key under Settings). |
 | 2.3 | Resources: set CPU cores below the machine's maximum and memory to about half of it. Note the values. | Sliders accept the values; the CPU slider's maximum is the machine's logical CPU count as the operating system reports it and its proposed default is half of that (on Linux and macOS a machine with more than 8 threads must show its real count, not 8 — the web view's own figure is capped there); the memory slider's maximum matches the machine's physical memory. |
-| 2.4 | Schedule: select **Always**. Then switch to **When idle** and set an idle threshold. Then switch to **Scheduled** and paint a window of a few hours on two days. Return to **Always** for the rest of the run. | Each mode shows its own controls (threshold field; weekly grid). Switching modes does not lose the resource values from 2.3. |
+| 2.4 | Schedule: select **Always**. Then switch to **When idle** and set an idle threshold. Then switch to **Scheduled** and paint a window of a few hours on two days. Return to **Always** for the rest of the run. Leave **Start Lettuce when I log in** ticked. | Each mode shows its own controls (threshold field; weekly grid). Switching modes does not lose the resource values from 2.3. Below them, **Start Lettuce when I log in** is shown, ticked, with a note that Settings → General → Start on boot changes it later. |
 | 2.5 | Container runtime: follow the step for your platform (Windows: WSL check then Podman install; macOS: Podman machine setup; Linux: bundled rootless Podman; or an existing Docker is detected). | The step ends in a ready state. Windows/macOS: the Podman machine is created with the CPU/memory/disk values from 2.3. |
 | 2.6 | Connect: before typing anything, look at the buttons. Then enter `lbry.science` and test the connection. | There is no skip option and **Start Contributing** is disabled until a head has been tested successfully (the daemon cannot run without one). After the test the head is reached; its name, description, and active leaves (including **beyblade-arena**) are listed. `https://` is added when omitted. |
 | 2.7 | Runtime trust for this head: turn **container** trust **on** and leave **native** trust **off**. | Both controls show their state clearly; native stays off. |
-| 2.8 | Finish. | The wizard shows "Setting up..." and closes once the daemon is listening; the main window shows the Overview tab. `~/.lettuce/config.yaml` exists with the resource values from 2.3, `scheduling.mode: ALWAYS`, the `lbry.science` server with `trusted_runtimes: [CONTAINER]`, and `~/.lettuce/daemon.json` appears within about a minute. If the container engine takes longer than three minutes to come up (a first Podman boot on an Intel Mac can), the wizard closes anyway and the bottom status bar reads **Starting…** until the daemon connects, then **Active**. |
+| 2.8 | Finish. | The wizard shows "Setting up..." and closes once the daemon is listening; the main window shows the Overview tab. `~/.lettuce/config.yaml` exists with the resource values from 2.3, `scheduling.mode: ALWAYS`, the `lbry.science` server with `trusted_runtimes: [CONTAINER]`, and `~/.lettuce/daemon.json` appears within about a minute. If the container engine takes longer than three minutes to come up (a first Podman boot on an Intel Mac can), the wizard closes anyway and the bottom status bar reads **Starting…** until the daemon connects, then **Active**. The login entry of 1.4 now exists and starts the app with `--minimized`; had the box in 2.4 been unticked there would be none. |
 | 2.9 | Tray status. | Shows the daemon as active (no work yet). The tray, notifications and the Podman auto-start are live from the moment the wizard finished `init`, even if the daemon start in 2.8 was slow. |
 | 2.10 | Daemon refusal (optional, needs a second throwaway data directory — see the README's `LETTUCE_DATA_DIR`): run the wizard again with a head address that answers the health check but that the daemon cannot register with, or edit `config.yaml` to an unreachable head and relaunch. | The wizard (or the bottom status bar after a relaunch) shows the daemon's own reason — "Lettuce could not start: could not connect to any configured server" — within seconds, never "Timed out waiting for daemon to start". |
 
@@ -115,10 +122,11 @@ old PID lingers, note the platform. 4.4 — search the log for `disk gate`.
 | 5.1 | Change a resource value (for example CPU cores) and save. | The value persists after closing and reopening the app; `config.yaml` matches. |
 | 5.2 | Use the **Restart daemon** button. | The daemon restarts (new PID in `daemon.json`); the app reconnects on its own; a running unit resumes from its checkpoint rather than starting over. |
 | 5.3 | Theme: choose **Dark**, quit the app from the tray, relaunch. | The app opens in dark theme. Repeat with **Light**, then set **System**. |
-| 5.4 | **Launch minimized** (start on boot): turn it on, log out and back in (or reboot). | The app starts with the daemon running and only the tray icon visible; no window opens until you choose Open Dashboard. Turn it off afterwards. |
+| 5.4 | **Start on boot** is on (from 2.4); log out and back in (or reboot). Then turn it off in Settings → General and log out and in again. | With it on, the app starts with the daemon running and only the tray icon visible; no window opens until you choose Open Dashboard, and opening and closing that window leaves the daemon computing. With it off, the app does not start at login, and relaunching the app does not turn it back on. |
 | 5.5 | Identity section. | The public key is shown; the regenerate option asks for confirmation and warns that credit is tied to the key. Do not confirm. |
 | 5.6 | Notifications: turn **Work unit completed** on. | A completion notification appears when the next unit finishes (revisit after section 3 if needed). |
 | 5.7 | Container runtime card. | It names the engine that answers: **Podman** with its version when lettuce found a Podman binary (machine figures and Start/Stop Machine below it), **Podman** with its version and a note that the machine is managed outside the app when Podman answers on the Docker-compatible socket (Podman Desktop's Docker compatibility), **Docker** for Docker itself. A Podman host is never labelled Docker or told to install Podman. |
+| 5.8 | General → **Open log folder**. | The file manager opens `~/.lettuce/logs` with `desktop.log` selected; the folder's path is shown above the button with a Copy button. `desktop.log` holds this session's start and the window closes and opens done so far. |
 
 ## 6. History
 
@@ -148,15 +156,17 @@ that directory must exist and hold an `index.html`.
 |---|---|---|
 | 7.1 | Tray → **Pause**. | The tray status changes to paused, the menu item becomes **Resume**, Overview shows the daemon paused (reason: user), and an active unit is suspended. |
 | 7.2 | Tray → **Resume**. | Everything returns to active; the unit continues. |
-| 7.3 | Close the main window with the window's close button. | The window hides to the tray and computing pauses; **Open Dashboard** brings the window back and resumes computing. |
+| 7.3 | Close the main window with the window's close button. | The window hides to the tray and computing continues: the tray still reads active and a running unit keeps running. **Open Dashboard** brings the window back and changes nothing else. |
 | 7.4 | With a unit running, tray → **Quit**. | The app exits within a few seconds (it used to take about 30 s on macOS and Linux: the app never reaped the daemon it had started, so the exited daemon lingered as a zombie that its liveness check counted as alive). The daemon has exited (`daemon.json` removed); the unit's process is frozen, not killed, and its work directory is preserved (`~/.lettuce/container-work/<unit id>` still exists). For a container unit, `podman ps -a` (or `docker ps -a`) shows the unit's container **paused**, and `~/.lettuce/active-tasks.json` records its `container_id`. |
 | 7.5 | Relaunch the app. | The daemon starts, adopts the frozen unit, and the unit resumes from where it was (progress continues from the previous figure; the log reports the unit resumed). For a container unit, `podman ps -a` shows **exactly one** container for the unit, now running: the paused one was unpaused and adopted (the log says `adopting the unit's container from the previous session`), not a second one created beside it. Any paused container left over from an older build is removed at this launch (`removed stranded work-unit container`). |
 | 7.6 | macOS only: with a unit running, quit through the application menu (**Lettuce Compute → Quit**, or ⌘Q), then repeat 7.5. | Exactly the result of 7.4 and 7.5: the daemon has exited, the unit is frozen (`ps` shows its process stopped, not running), and it resumes on relaunch. A daemon still computing after the app is gone is the bug. |
 | 7.7 | Settings → change the log level (a "restart required" change) → **Restart** in the banner. | The restart succeeds on the first try, within a few seconds: no "Daemon (PID …) did not exit after stop --force". `daemon.json` shows a new PID. |
-
 | 7.8 | Settings → Schedule → **Scheduled**, paint a window that is closed right now, save; look at Overview and the tray. Restore **Always** afterwards. | Overview shows **Paused — outside your schedule** with a **Change schedule** button in place of **Resume** (there is no Resume: only a pause you started can be resumed); the task list reads that computing is paused by the schedule; the tray's pause item reads **Paused by your schedule** and is greyed out. |
+| 7.9 | Overview → **Pause**, close the window, then tray → **Open Dashboard**. | Still paused (reason: user); the Overview offers **Resume**. Opening the dashboard never resumes a pause you chose. |
+| 7.10 | Tray → **Quit**; start the app with `--minimized` (as the login entry does); tray → **Open Dashboard**; close the window. | The daemon stays active throughout; nothing pauses it. |
 
-On failure: 7.4–7.6 — search the log for `preserving work directory` and `resum`; 7.7 — `ps -o pid,stat -p <old PID>` right after a failed restart (a `Z` state means the app did not reap its child).
+On failure: 7.3, 7.9, 7.10 — `desktop.log` records each window close and open, and every
+Pause and Resume chosen from the tray; 7.4–7.6 — search the log for `preserving work directory` and `resum`; 7.7 — `ps -o pid,stat -p <old PID>` right after a failed restart (a `Z` state means the app did not reap its child).
 
 ## 8. Update banner
 
