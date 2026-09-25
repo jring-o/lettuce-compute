@@ -10,6 +10,7 @@ use lettuce_compute_desktop_lib::api;
 use lettuce_compute_desktop_lib::autostart;
 use lettuce_compute_desktop_lib::commands;
 use lettuce_compute_desktop_lib::container_runtime;
+use lettuce_compute_desktop_lib::logging;
 use lettuce_compute_desktop_lib::notifications;
 use lettuce_compute_desktop_lib::sidecar;
 use lettuce_compute_desktop_lib::tray;
@@ -66,18 +67,24 @@ fn start_daemon_services(app: AppHandle, tray_icon: tauri::tray::TrayIcon, tray_
         // On a fresh install the wizard's `run_init` has usually started the
         // daemon already; `ensure_daemon_started` then does nothing.
         if let Err(e) = sidecar::ensure_daemon_started() {
-            eprintln!("[warn] failed to start the volunteer daemon: {e}");
+            log::warn!("failed to start the volunteer daemon: {e}");
             return;
         }
         match sidecar::wait_for_daemon(sidecar::DAEMON_START_TIMEOUT) {
             Ok(sidecar::DaemonStart::Ready(info)) => {
+                log::info!(
+                    "the volunteer daemon is up (pid {}, management port {})",
+                    info.pid,
+                    info.port
+                );
                 // Auto-start the container runtime if the Podman machine is stopped.
                 container_runtime::ensure_podman_state(&info, "running");
             }
-            Ok(sidecar::DaemonStart::Starting) => {
-                eprintln!("[warn] volunteer daemon is still starting after {:?}", sidecar::DAEMON_START_TIMEOUT)
-            }
-            Err(e) => eprintln!("[warn] volunteer daemon did not come up: {e}"),
+            Ok(sidecar::DaemonStart::Starting) => log::warn!(
+                "the volunteer daemon is still starting after {:?}",
+                sidecar::DAEMON_START_TIMEOUT
+            ),
+            Err(e) => log::warn!("the volunteer daemon did not come up: {e}"),
         }
     });
 }
@@ -91,7 +98,11 @@ fn main() {
         .skip(1)
         .any(|a| a == autostart::MINIMIZED_FLAG);
 
+    // Registered first, so every other plugin's start-up is logged too.
+    let (log_plugin, log_file_unavailable) = logging::plugin();
+
     tauri::Builder::default()
+        .plugin(log_plugin)
         .manage(viz::VizBaseDir(viz_base))
         .register_uri_scheme_protocol("lettuce-viz", move |_ctx, request| {
             let uri_path = percent_encoding::percent_decode_str(request.uri().path())
@@ -162,6 +173,9 @@ fn main() {
             commands::get_daemon_process_state,
             commands::restart_daemon,
             commands::get_data_dir,
+            commands::get_log_dir,
+            commands::open_log_folder,
+            commands::log_from_webview,
             commands::get_client_version,
             commands::system_metrics,
             commands::is_autostart_enabled,
@@ -186,18 +200,34 @@ fn main() {
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            let needs_wizard = sidecar::ensure_initialized().unwrap_or(true);
+
+            log::info!(
+                "{}",
+                logging::session_start_line(
+                    &app.package_info().version.to_string(),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    &sidecar::data_dir(),
+                    launch_minimized,
+                    needs_wizard,
+                )
+            );
+            if let Some(reason) = &log_file_unavailable {
+                log::warn!("this session is logged to stderr only: {reason}");
+            }
 
             // Set up system tray
             let (tray_icon, tray_items) =
                 tray::setup_tray(&app_handle).expect("Failed to set up system tray");
             tray::start_version_tooltip(&app_handle, tray_icon.clone());
 
-            // Set up auto-start (enables on first launch, refreshes the entry after)
+            // Refresh the login entry if it is on. A launch never turns it on:
+            // the setup wizard asks, and Settings › General can change it.
             autostart::setup_autostart(&app_handle);
 
             // Start the daemon-backed services now if this install is already
             // set up, otherwise when the wizard reports it is.
-            let needs_wizard = sidecar::ensure_initialized().unwrap_or(true);
             if needs_wizard {
                 let handle = app_handle.clone();
                 let icon = tray_icon.clone();
@@ -224,21 +254,12 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Intercept window close BEFORE the window is destroyed.
-            // Hide to tray + pause compute instead of closing.
+            // Intercept window close BEFORE the window is destroyed: the app
+            // keeps running in the tray and computing continues. Stopping is
+            // Pause (Overview or tray) or Quit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
-                // Pause compute so frozen processes use zero CPU.
-                if let Ok(info) = sidecar::read_daemon_json() {
-                    let client = api::ManagementClient::from_daemon_info(&info);
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        rt.block_on(async {
-                            let _ = client.pause().await;
-                        });
-                    });
-                }
+                tray::close_to_tray(window.app_handle());
             }
         })
         .build(tauri::generate_context!())
@@ -255,7 +276,7 @@ fn main() {
             // a no-op then.
             if let tauri::RunEvent::Exit = event {
                 if let Err(e) = sidecar::suspend_and_quit_sidecar() {
-                    eprintln!("[warn] could not suspend the volunteer daemon on exit: {e}");
+                    log::warn!("could not suspend the volunteer daemon on exit: {e}");
                 }
             }
         });

@@ -39,7 +39,7 @@
       "icons/icon.icns",
       "icons/icon.png"
     ],
-    "targets": ["msi", "nsis", "dmg", "appimage", "deb"],
+    "targets": ["msi", "nsis", "app", "dmg", "appimage", "deb"],
     "createUpdaterArtifacts": true,
     "externalBin": [
       "binaries/lettuce-volunteer"

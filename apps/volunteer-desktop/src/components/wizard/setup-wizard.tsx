@@ -26,6 +26,7 @@ import {
   getSystemMemoryMb,
   installPodman,
   runInit,
+  setAutostart,
   testServerConnection,
   waitForDaemon,
 } from "@/api/client";
@@ -55,6 +56,11 @@ interface WizardState {
   scheduleFromHour: number;
   scheduleToHour: number;
   scheduleDays: Weekday[];
+  /**
+   * Register the login entry that starts Lettuce in the tray at login. Asked
+   * on the Schedule step, applied only once setup has written the install.
+   */
+  startAtLogin: boolean;
   /** A container engine answered in the Container Runtime step. */
   containerRuntimeDetected: boolean;
   serverUrl: string;
@@ -435,6 +441,22 @@ function ScheduleStep({
           </div>
         </div>
       )}
+
+      <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-4">
+        <input
+          type="checkbox"
+          checked={state.startAtLogin}
+          onChange={(e) => onChange({ startAtLogin: e.target.checked })}
+          className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
+        />
+        <span className="space-y-1">
+          <span className="block text-sm font-medium">Start Lettuce when I log in</span>
+          <span className="block text-xs text-muted-foreground">
+            Lettuce starts in the tray when you log in and computes in the background until you
+            pause or quit it. You can change this later in Settings › General › Start on boot.
+          </span>
+        </span>
+      </label>
 
       <div className="flex justify-between">
         <Button variant="ghost" onClick={onBack}>
@@ -1089,6 +1111,7 @@ export function SetupWizard({ onInitialized, onComplete }: WizardProps) {
     scheduleFromHour: 20,
     scheduleToHour: 6,
     scheduleDays: [...WEEKDAYS],
+    startAtLogin: true,
     containerRuntimeDetected: false,
     serverUrl: "",
     connectionOk: false,
@@ -1179,6 +1202,11 @@ export function SetupWizard({ onInitialized, onComplete }: WizardProps) {
    * that refuses to start is reported in its own words, and one still coming
    * up at the deadline (a slow container engine) is not an error: the
    * dashboard opens and connects when it listens (TB-52).
+   *
+   * The login entry follows the volunteer's answer only once `init` has
+   * succeeded, so a wizard abandoned halfway leaves none; it is set either
+   * way, so an entry an earlier install left behind is cleared when the box
+   * is unticked.
    */
   const handleComplete = async () => {
     setIsSubmitting(true);
@@ -1215,6 +1243,12 @@ export function SetupWizard({ onInitialized, onComplete }: WizardProps) {
         trust,
         enabled_leafs: partialSelection ? state.enabledLeafSlugs : null,
       });
+      try {
+        await setAutostart(state.startAtLogin);
+      } catch {
+        // The host logs the failure. It costs the login entry, not the setup:
+        // Settings › General › Start on boot shows the real state.
+      }
       onInitialized?.();
       await waitForDaemon();
       onComplete();

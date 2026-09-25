@@ -11,11 +11,13 @@
 #                    with tauri-action, which attaches them, their .sig files and the
 #                    updater manifest (latest.json) to a DRAFT GitHub release. The
 #                    operator reviews the draft, writes the notes, and publishes it.
-#   desktop-promote  the moment a desktop-v* release is published. Copies latest.json
-#                    onto the fixed "desktop-latest" release the app's updater polls and
-#                    re-points the desktop-latest tag. Nothing reaches installed apps
-#                    until this job has run against a PUBLIC release, which is why it is
-#                    tied to publication rather than to the build.
+#   desktop-promote  the moment a desktop-v* release is published. Checks that its
+#                    latest.json has a signed entry for macOS (both architectures),
+#                    Linux and Windows, copies it onto the fixed "desktop-latest" release
+#                    the app's updater polls, and re-points the desktop-latest tag.
+#                    Nothing reaches installed apps until this job has run against a
+#                    PUBLIC release, which is why it is tied to publication rather than
+#                    to the build.
 #
 # Path filters are not evaluated for tag pushes (a GitHub rule), so the `paths:` under
 # `push:` only narrows branch pushes; every desktop-v* tag push starts the workflow.
@@ -45,6 +47,14 @@ on:
           latest.json should become the updater manifest.
         required: false
         default: ''
+      allow_partial:
+        description: >-
+          With promote only: accept a manifest that lacks one of the platforms the app ships
+          for, for example to roll back to desktop-v2.1.1 or earlier, which carry no macOS
+          entry. Installs on a missing platform get no update from it.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -226,9 +236,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.promote }}
+      ALLOW_PARTIAL: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_partial }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - name: Check the release is public and its manifest matches the tag
+      - name: Check the release is public and its manifest matches the tag and covers every platform
         run: |
           set -euo pipefail
           case "$TAG" in
@@ -245,7 +256,15 @@ jobs:
             echo "::error::latest.json on $TAG carries version $(jq -r .version manifest/latest.json), not $version"
             exit 1
           fi
-          echo "Manifest for $version covers: $(jq -r '.platforms | keys | join(", ")' manifest/latest.json)"
+          # Every platform the app ships for must be updatable from this manifest; a
+          # macOS build that produced no signed .app.tar.gz leaves no darwin entry.
+          if bash apps/volunteer-desktop/scripts/check-updater-manifest.sh manifest/latest.json; then
+            :
+          elif [ "$ALLOW_PARTIAL" = "true" ]; then
+            echo "::warning::Promoting a manifest that lacks a platform, as allow_partial asks. Installs on that platform get no update from it."
+          else
+            exit 1
+          fi
       # The volunteer command-line client's `update` command reads this repository's
       # "latest" release (releases/latest) and expects client binaries in it. A desktop
       # release must never occupy that slot.

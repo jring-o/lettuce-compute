@@ -44,8 +44,17 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<Option<UpdateInfo>, St
     }
 }
 
-/// Download and install an available update.
+/// Download and install an available update. A failure is logged as well as
+/// returned to the banner that asked for it.
 pub async fn install_update(app: &AppHandle) -> Result<(), String> {
+    let result = download_and_install(app).await;
+    if let Err(e) = &result {
+        log::warn!("update install failed: {e}");
+    }
+    result
+}
+
+async fn download_and_install(app: &AppHandle) -> Result<(), String> {
     let updater = app
         .updater()
         .map_err(|e| format!("Updater not available: {}", e))?;
@@ -55,6 +64,11 @@ pub async fn install_update(app: &AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("Update check failed: {}", e))?
         .ok_or_else(|| "No update available".to_string())?;
+    log::info!(
+        "installing the update from {} to {}",
+        app.package_info().version,
+        update.version
+    );
 
     let app_clone = app.clone();
 
@@ -131,15 +145,17 @@ async fn is_update_notification_enabled() -> bool {
     }
 }
 
-/// Whether a failed update check has already been logged this process. The
-/// check runs every six hours for the life of the app; an endpoint that is
-/// down (or, as today, a signing key that is not configured yet) would
-/// otherwise repeat the same line indefinitely.
+/// Whether a failed update check has already been logged as a warning this
+/// process. The check runs every six hours for the life of the app; an
+/// endpoint that is down, or a manifest with no entry for this platform,
+/// would otherwise repeat the same warning indefinitely, so later failures
+/// are logged at debug level.
 static CHECK_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 async fn do_update_check(app: &AppHandle) {
     match check_for_updates(app).await {
         Ok(Some(info)) => {
+            log::info!("update check: Lettuce Compute {} is available", info.version);
             // Only send OS notification if the user has update notifications enabled
             if is_update_notification_enabled().await {
                 let _ = app
@@ -162,10 +178,15 @@ async fn do_update_check(app: &AppHandle) {
                 },
             );
         }
-        Ok(None) => {}
+        Ok(None) => log::info!(
+            "update check: {} is the latest version",
+            app.package_info().version
+        ),
         Err(e) => {
             if !CHECK_FAILURE_LOGGED.swap(true, Ordering::SeqCst) {
-                eprintln!("[warn] update check failed (further failures are not logged): {e}");
+                log::warn!("update check failed (later failures are logged at debug level): {e}");
+            } else {
+                log::debug!("update check failed again: {e}");
             }
         }
     }
