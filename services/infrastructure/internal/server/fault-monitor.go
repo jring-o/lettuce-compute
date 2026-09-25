@@ -761,6 +761,11 @@ func topIneligibleLeaves(byLeaf map[string]int64, n int) []string {
 // continues. Each row is resolved through volunteer.EffectiveStanding, so an EXPIRED
 // bench counts as PROBATION (its re-entry to OK goes through the backpressure exit
 // threshold), never as BENCHED.
+//
+// Only the machine's own rows (standing_source AUTO) are the population it holds. A row
+// an operator set by hand is never changed by the machine, so it neither raises the WARN
+// nor counts under benched/probation; hand-set rows are reported apart
+// (operator_benched/operator_probation) on a WARN the machine's rows raise.
 func (m *FaultMonitor) warnStandingPopulation(ctx context.Context) {
 	if m.standingPopulationRepo == nil {
 		return
@@ -774,13 +779,22 @@ func (m *FaultMonitor) warnStandingPopulation(ctx context.Context) {
 		return
 	}
 	now := time.Now()
-	var benched, probation int
+	var benched, probation, operatorBenched, operatorProbation int
 	sample := make([]types.ID, 0, 5)
 	for id, e := range entries {
+		operatorSet := e.Source == volunteer.StandingSourceOperator
 		switch volunteer.EffectiveStanding(e.Standing, e.BenchedUntil, now) {
 		case volunteer.StandingBenched:
+			if operatorSet {
+				operatorBenched++
+				continue
+			}
 			benched++
 		case volunteer.StandingProbation:
+			if operatorSet {
+				operatorProbation++
+				continue
+			}
 			probation++
 		default:
 			// An AllNonOK row's stored standing is PROBATION or BENCHED, so it always
@@ -791,7 +805,7 @@ func (m *FaultMonitor) warnStandingPopulation(ctx context.Context) {
 			sample = append(sample, id)
 		}
 	}
-	// Nothing effectively non-OK -> no WARN and, crucially, no throttle stamp, so the
+	// Nothing the machine holds -> no WARN and, crucially, no throttle stamp, so the
 	// next scan re-reads and the WARN fires the moment a population first appears.
 	if benched == 0 && probation == 0 {
 		return
@@ -800,8 +814,10 @@ func (m *FaultMonitor) warnStandingPopulation(ctx context.Context) {
 	m.logger.Warn("volunteers held by automatic standing backpressure: PROBATION accounts are still dispatched and credited but never count toward agreement or cover redundancy; BENCHED accounts get no new work until their bench expires",
 		"benched", benched,
 		"probation", probation,
+		"operator_benched", operatorBenched,
+		"operator_probation", operatorProbation,
 		"sample_volunteer_ids", sample,
-		"remedy", "inspect with GET /api/v1/admin/standing, release with POST /api/v1/admin/standing/clear; thresholds are the LETTUCE_HEAD_STANDING_* knobs")
+		"remedy", "inspect with GET /api/v1/admin/standing; POST /api/v1/admin/standing with standing OK releases an account for good (the row becomes operator-owned), while POST /api/v1/admin/standing/clear hands it back to the machine with its rejection signal unchanged, so it can return to PROBATION on its next result; switching the machine off releases no one; thresholds are the LETTUCE_HEAD_STANDING_* knobs")
 }
 
 // cleanupCheckpointByID deletes checkpoint data for a work unit (best effort).

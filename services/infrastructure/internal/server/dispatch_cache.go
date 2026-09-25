@@ -1212,9 +1212,14 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// The machine's advertised budgets are logged alongside, because the whole diagnostic is
 	// "which of these is below what some leaf asked for" and reading them out of the database
 	// was the expensive half.
-	if taken == 0 && c.noteStarved(hostKey) &&
-		(rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0 ||
-			rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0) {
+	//
+	// The tally counts only the request's own scope (eligibleLocked checks the leaf filters
+	// first), so these reasons are about the leaves the machine asked for. The throttle is
+	// consulted only once a reason qualifies: an empty answer that writes nothing must not
+	// spend the machine's window and hide a genuine WARN a request later.
+	qualifies := rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0 ||
+		rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0
+	if taken == 0 && qualifies && c.noteStarved(hostKey) {
 		attrs := make([]any, 0, 20+2*numRejectReasons)
 		attrs = append(attrs,
 			"volunteer_id", volunteerID,
@@ -1266,9 +1271,10 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	return final, drained
 }
 
-// noteStarved reports whether the in-flight-cap starvation WARN should be emitted for
-// this machine now, stamping the machine's clock when it returns true. One line per
-// starveLogInterval per machine.
+// noteStarved reports whether the no-work WARN should be emitted for this machine now,
+// stamping the machine's clock when it returns true. One line per starveLogInterval per
+// machine. Call it only once the WARN is otherwise due, because a true answer spends the
+// machine's window.
 func (c *dispatchCache) noteStarved(hostKey types.ID) bool {
 	now := c.now()
 	c.starveMu.Lock()
@@ -1376,10 +1382,27 @@ func (r rejectReason) String() string {
 // id (the key for the in-flight cap, per-machine by TODO #19) — distinct so a user's rig
 // and laptop get independent in-flight budgets. The requester's SUBJECT (for distinctness)
 // is resolved from opts via requesterSubject.
+//
+// The request's own scope is checked FIRST. A candidate must pass every check to be
+// handed out, so the order changes only which reason a refused candidate is tallied
+// under, never whether it is refused (none of these checks has a side effect). What the
+// order decides is what HandOut's empty-answer WARN reports: a unit of a leaf the request
+// did not name is out of scope and counts as leaf_filter / blocked_leaf, not as "this
+// account already contributed" or "this machine is at its cap" — reasons the request
+// never met, which named a cause for an empty answer that no cap or account change could
+// have served.
 func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts workunit.AssignmentOptions, cand candidate) (bool, rejectReason) {
 	uid := cand.unit.ID
 	leafID := cand.unit.LeafID
 	subject := requesterSubject(volunteerID, opts)
+
+	// Leaf-id filter (preferred leafs) and blocked-leaf filter.
+	if len(opts.LeafIDs) > 0 && !containsID(opts.LeafIDs, leafID) {
+		return false, rejectLeafFilter
+	}
+	if containsID(opts.BlockedLeafIDs, leafID) {
+		return false, rejectBlockedLeaf
+	}
 
 	// Redundancy bounds, enforced by TWO checks that key on DIFFERENT numbers by design:
 	//   (1) COVERAGE (corroboration): only COUNTABLE copies close a unit's redundancy need
@@ -1517,13 +1540,6 @@ func (c *dispatchCache) eligibleLocked(volunteerID, hostKey types.ID, opts worku
 	// that reports no host).
 	if opts.MaxInflightPerVolunteer > 0 && c.inflight[hostKey] >= opts.MaxInflightPerVolunteer {
 		return false, rejectInflightCap
-	}
-	// Leaf-id filter (preferred leafs) and blocked-leaf filter.
-	if len(opts.LeafIDs) > 0 && !containsID(opts.LeafIDs, leafID) {
-		return false, rejectLeafFilter
-	}
-	if containsID(opts.BlockedLeafIDs, leafID) {
-		return false, rejectBlockedLeaf
 	}
 	// Homogeneous Redundancy: once a unit is pinned to a hardware class, only volunteers
 	// of that SAME class may take a copy (so redundant results are bit-comparable).
