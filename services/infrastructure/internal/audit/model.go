@@ -64,9 +64,11 @@ const (
 	// fetch + startup.
 	LeaseFloor = 10 * time.Minute
 	// QueuedLifetime bounds how long an unclaimed job waits before EXPIRED. Kept well
-	// under the default credit-maturation window (7 days) so a verdict lands while the
-	// unit's credit is still immature: worst case ≈ QueuedLifetime + MaxAttempts
-	// leases. Operators enabling audits should keep maturation days > 4.
+	// under any credit-maturation window an operator enables (maturation is off by
+	// default: CreditMaturationDays 0) so a verdict lands while the unit's credit is
+	// still immature: worst case ≈ QueuedLifetime + MaxAttempts leases. Audit
+	// enforcement refuses to start unless credit_maturation_days > 9 (config
+	// Validate), which also covers the second-runner confirmation cycles.
 	QueuedLifetime = 72 * time.Hour
 	// MaxConcurrentClaims caps one runner's simultaneously CLAIMED jobs, bounding how
 	// much of the backlog a broken or compromised runner can sit on. The runner CLI
