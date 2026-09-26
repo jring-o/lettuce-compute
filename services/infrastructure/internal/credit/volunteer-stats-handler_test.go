@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
@@ -192,4 +194,158 @@ func TestVolunteerStats_WithProjectBreakdown(t *testing.T) {
 	if got := byLeaf[proj2]; got.WorkUnitsCompleted != 2 || got.TotalCredit != 40.0 {
 		t.Errorf("proj2 breakdown = {wu:%d credit:%v}, want {wu:2 credit:40}", got.WorkUnitsCompleted, got.TotalCredit)
 	}
+}
+
+// TestVolunteerStats_NamesPublicLeafsOnly: the public per-account stats name only
+// PUBLIC leafs. An account with credit on a PUBLIC, an UNLISTED and a PRIVATE leaf gets
+// one per-leaf entry, and neither hidden leaf's id nor its name appears anywhere in the
+// body. The account totals keep every leaf's share, the response keeps its field set,
+// and the shared breakdown behind the account's own view and the operator breakdown
+// still lists all three.
+func TestVolunteerStats_NamesPublicLeafsOnly(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	userID := createTestUser(t, pool, "stats-visibility")
+	publicLeaf, publicName := createTestLeafWithVisibility(t, pool, &userID, "PUBLIC")
+	unlistedLeaf, unlistedName := createTestLeafWithVisibility(t, pool, &userID, "UNLISTED")
+	privateLeaf, privateName := createTestLeafWithVisibility(t, pool, &userID, "PRIVATE")
+	volID := createTestVolunteer(t, pool)
+
+	// One credited unit per leaf, with distinct amounts so each total shows which leafs
+	// it counted: 1 + 2 + 4.
+	creditRepo := NewPgxRepository(pool)
+	racRepo := NewPgxRACRepository(pool)
+	seeds := []struct {
+		leaf   types.ID
+		amount float64
+		sum    string
+	}{
+		{publicLeaf, 1, "a"},
+		{unlistedLeaf, 2, "b"},
+		{privateLeaf, 4, "c"},
+	}
+	for _, s := range seeds {
+		wu := createTestWorkUnit(t, pool, s.leaf)
+		res := createTestResult(t, pool, wu, volID, strings.Repeat(s.sum, 64))
+		if err := creditRepo.Create(ctx, &LedgerEntry{
+			VolunteerID: volID, LeafID: s.leaf, WorkUnitID: wu, ResultID: res, CreditAmount: s.amount,
+		}); err != nil {
+			t.Fatalf("create credit on %v: %v", s.leaf, err)
+		}
+		if err := racRepo.Upsert(ctx, volID, s.leaf, s.amount); err != nil {
+			t.Fatalf("upsert rac on %v: %v", s.leaf, err)
+		}
+	}
+
+	leafRepo := leaf.NewPgxRepository(pool)
+	handler := NewVolunteerStatsHandler(pool, volunteer.NewPgxRepository(pool), racRepo, creditRepo, leafRepo, testLogger())
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+
+	req := httptest.NewRequest("GET", "/api/v1/volunteers/"+volID.String()+"/stats", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+
+	for _, hidden := range []string{unlistedLeaf.String(), unlistedName, privateLeaf.String(), privateName} {
+		if strings.Contains(body, hidden) {
+			t.Errorf("public per-account stats name a non-PUBLIC leaf (%q): %s", hidden, body)
+		}
+	}
+
+	var resp VolunteerStatsResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Leafs) != 1 {
+		t.Fatalf("leafs = %+v, want only the PUBLIC leaf", resp.Leafs)
+	}
+	got := resp.Leafs[0]
+	if got.LeafID != publicLeaf || got.LeafName != publicName || got.TotalCredit != 1 || got.RAC != 1 || got.WorkUnitsCompleted != 1 {
+		t.Errorf("PUBLIC entry = %+v, want {%v %q credit 1, rac 1, 1 unit}", got, publicLeaf, publicName)
+	}
+
+	// The totals keep the hidden leafs' share (the fleet feed counts it too).
+	if resp.TotalCredit != 7 {
+		t.Errorf("total_credit = %v, want 7 (every leaf's credit)", resp.TotalCredit)
+	}
+	if resp.TotalWorkUnitsCompleted != 3 {
+		t.Errorf("total_work_units_completed = %d, want 3 (every leaf's units)", resp.TotalWorkUnitsCompleted)
+	}
+
+	// The field set is unchanged.
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &shape); err != nil {
+		t.Fatalf("decode response shape: %v", err)
+	}
+	assertJSONKeys(t, "response", shape,
+		"volunteer_id", "public_key", "total_credit", "total_work_units_completed", "total_work_units_rejected", "leafs")
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(shape["leafs"], &entries); err != nil {
+		t.Fatalf("decode leafs shape: %v", err)
+	}
+	for _, e := range entries {
+		assertJSONKeys(t, "leaf entry", e, "leaf_id", "leaf_name", "total_credit", "rac", "work_units_completed")
+	}
+
+	// The shared breakdown (the account's own view) still lists all three leafs.
+	bd, err := ComputeVolunteerBreakdown(ctx, pool, volID)
+	if err != nil {
+		t.Fatalf("ComputeVolunteerBreakdown: %v", err)
+	}
+	if n := len(bd.ByLeaf); n != 3 {
+		t.Errorf("shared breakdown lists %d leafs, want 3 (it must stay unfiltered)", n)
+	}
+
+	// So does the operator breakdown.
+	analysis := NewAnalysisHandler(pool, leafRepo, testLogger())
+	opMux := http.NewServeMux()
+	opMux.HandleFunc("GET /api/v1/volunteers/{id}/credit/breakdown", analysis.HandleVolunteerBreakdown)
+	opReq := httptest.NewRequest(http.MethodGet, "/api/v1/volunteers/"+volID.String()+"/credit/breakdown", nil)
+	opRec := httptest.NewRecorder()
+	opMux.ServeHTTP(opRec, opReq)
+	if opRec.Code != http.StatusOK {
+		t.Fatalf("operator breakdown status = %d, body = %s", opRec.Code, opRec.Body.String())
+	}
+	var op VolunteerBreakdown
+	if err := json.Unmarshal(opRec.Body.Bytes(), &op); err != nil {
+		t.Fatalf("decode operator breakdown: %v", err)
+	}
+	seen := map[types.ID]bool{}
+	for _, lc := range op.ByLeaf {
+		seen[lc.LeafID] = true
+	}
+	if !seen[publicLeaf] || !seen[unlistedLeaf] || !seen[privateLeaf] {
+		t.Errorf("operator breakdown by_leaf = %+v, want all three leafs", op.ByLeaf)
+	}
+}
+
+// assertJSONKeys fails unless obj has exactly the given keys.
+func assertJSONKeys(t *testing.T, what string, obj map[string]json.RawMessage, want ...string) {
+	t.Helper()
+	if len(obj) != len(want) {
+		t.Errorf("%s keys = %v, want exactly %v", what, keysOf(obj), want)
+		return
+	}
+	for _, k := range want {
+		if _, ok := obj[k]; !ok {
+			t.Errorf("%s keys = %v, want exactly %v", what, keysOf(obj), want)
+			return
+		}
+	}
+}
+
+func keysOf(obj map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(obj))
+	for k := range obj {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
