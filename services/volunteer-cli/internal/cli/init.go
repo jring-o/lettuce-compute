@@ -355,7 +355,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 			c.Thermal.Enabled = false
 		} else {
 			c.Thermal.Enabled = true
-			fmt.Println("Using default thresholds (CPU: 85/75°C, GPU: 80/70°C)")
+			fmt.Printf("Using default thresholds (CPU: pause %d°C, resume %d°C; GPU: pause %d°C, resume %d°C)\n",
+				c.Thermal.CPUPauseThresholdC, c.Thermal.CPUResumeThresholdC, c.Thermal.GPUPauseThresholdC, c.Thermal.GPUResumeThresholdC)
 		}
 
 		// Step 7: Server

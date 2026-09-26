@@ -85,12 +85,27 @@ function Section({
 /**
  * The sentence under the CPU slider: the allowance is a whole-machine total
  * that every running task shares equally (TB-75) — it used to be applied per
- * task, so "2 cores" with two tasks used four.
+ * task, so "2 cores" with two tasks used four. It states the rule rather than
+ * a worked case: every task books at least one core (more if its leaf needs
+ * more), so the allowance also caps how many tasks run — at one core, one at
+ * a time.
  */
 export function cpuShareCaption(cores: number): string {
-  const half = Number((cores / 2).toFixed(2));
-  const each = cores === 1 ? "half a core" : `${half} each`;
-  return `All running tasks share these ${cores} ${cores === 1 ? "core" : "cores"} equally: one task alone gets all ${cores}, two tasks get ${each}. Each task is told its share (LETTUCE_CPU_LIMIT).`;
+  const told = "Each task is told its share (LETTUCE_CPU_LIMIT).";
+  if (cores <= 1) {
+    return `Running tasks share this 1 core. Each task needs at least one core, so one task runs at a time. ${told}`;
+  }
+  return `All running tasks share these ${cores} cores equally. Each task books at least one core (more if its leaf needs more), so at most ${cores} run at once. ${told}`;
+}
+
+/** The sentence under the Network Bandwidth slider: what the figure holds, and what it cannot. */
+export function bandwidthCaption(mbps: number): string {
+  const scope =
+    "Container image pulls are made by the container engine and are not limited.";
+  if (mbps <= 0 || mbps >= 1024) {
+    return `Lettuce's transfers run at your connection's speed. Set a figure to keep its downloads under it, and separately its uploads. ${scope}`;
+  }
+  return `Lettuce's downloads together stay under ${mbps} Mbps, and so do its uploads (results and checkpoints). ${scope} Applies straight away.`;
 }
 
 function ResourceSlider({
@@ -517,6 +532,11 @@ export function SettingsPage() {
   // Whether the thermal CPU thresholds can see this machine's CPU at all
   // (TB-77). An older daemon does not say; assume they can, as before.
   const cpuTempReadable = machine?.cpu_temp_readable ?? true;
+  // The same for the GPU thresholds. An empty or missing source means the
+  // daemon has not detected it yet (or predates the field): say nothing and
+  // leave the fields alone rather than guess.
+  const gpuTempKnown = !!machine?.gpu_temp_source;
+  const gpuTempUnreadable = gpuTempKnown && machine?.gpu_temp_readable === false;
   const yieldMeasurable = machine?.yield_measurable ?? true;
   const dataDir = hostDataDir ?? config.data_dir;
 
@@ -641,8 +661,9 @@ export function SettingsPage() {
         />
         <p className="text-xs text-muted-foreground">
           A cap on what Lettuce may use for work files and cached container images, not
-          space it reserves. A leaf is fetched only when its declared need plus 2 GiB of
-          headroom fits inside this allowance.
+          space it reserves. A leaf is fetched only when Lettuce's own use plus the leaf's
+          declared need fits inside this allowance, and the disk keeps the leaf's need
+          plus 2 GiB free.
           {metrics?.disk_usage_known &&
             ` Lettuce is using ${formatGb(metrics.disk_used_mb)} right now.`}
         </p>
@@ -673,6 +694,9 @@ export function SettingsPage() {
             })
           }
         />
+        <p className="text-xs text-muted-foreground" data-testid="bandwidth-caption">
+          {bandwidthCaption(config.resource_limits.max_bandwidth_mbps)}
+        </p>
       </Section>
 
       {/* Section 2: Compute */}
@@ -757,9 +781,17 @@ export function SettingsPage() {
           <p className="text-xs text-muted-foreground" data-testid="thermal-cpu-unreadable">
             This machine's CPU temperature cannot be read
             {machine?.cpu_temp_detail ? ` (${machine.cpu_temp_detail})` : ""}, so the CPU
-            thresholds below have no effect here. GPU thresholds still apply where a GPU tool
-            reports a temperature, and the hardware's own thermal protection is unaffected.
+            thresholds below have no effect here.
+            {gpuTempKnown && !gpuTempUnreadable ? " The GPU thresholds still apply." : ""} The
+            hardware's own thermal protection is unaffected.
             {machine?.cpu_temp_remedy ? ` To enable them, ${machine.cpu_temp_remedy}.` : ""}
+          </p>
+        )}
+        {gpuTempUnreadable && (
+          <p className="text-xs text-muted-foreground" data-testid="thermal-gpu-unreadable">
+            No GPU temperature can be read on this machine
+            {machine?.gpu_temp_detail ? ` (${machine.gpu_temp_detail})` : ""}, so the GPU
+            thresholds below have no effect here.
           </p>
         )}
         <div className="space-y-2">
@@ -787,7 +819,7 @@ export function SettingsPage() {
             min={40}
             max={110}
             suffix="°C"
-            disabled={!thermal.enabled}
+            disabled={!thermal.enabled || gpuTempUnreadable}
             onCommit={(v) => updateThermal({ gpu_pause_threshold: v })}
           />
           <NumberField
@@ -796,7 +828,7 @@ export function SettingsPage() {
             min={30}
             max={110}
             suffix="°C"
-            disabled={!thermal.enabled}
+            disabled={!thermal.enabled || gpuTempUnreadable}
             onCommit={(v) => updateThermal({ gpu_resume_threshold: v })}
           />
           <NumberField

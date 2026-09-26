@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/infrastructure/netguard"
+	"github.com/lettuce-compute/volunteer-cli/internal/netlimit"
 )
 
 // DefaultMaxDownloadBytes is the default limit for external data downloads (100 MB).
@@ -54,17 +55,21 @@ const maxRedirects = 5
 // guard screen the proxy's IP instead of the destination. Redirects are followed but
 // bounded, so a legitimate storage 302 (presigned URL -> CDN) still works while every
 // hop is screened.
+//
+// Every connection is also paced to the volunteer's bandwidth limit
+// (resource_limits.max_bandwidth_mbps, see netlimit), so a download never runs
+// faster than the figure set; with no limit set that costs nothing.
 func NewGuardedHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout:       DefaultDownloadTimeout,
 		CheckRedirect: boundedRedirect,
 		Transport: &http.Transport{
 			Proxy: nil, // NEVER ProxyFromEnvironment — a proxy bypasses the dial guard
-			DialContext: (&net.Dialer{
+			DialContext: netlimit.DialContext((&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 				Control:   netguard.DialControl,
-			}).DialContext,
+			}).DialContext),
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			IdleConnTimeout:       90 * time.Second,
@@ -81,6 +86,26 @@ func boundedRedirect(req *http.Request, via []*http.Request) error {
 		return fmt.Errorf("too many redirects (max %d)", maxRedirects)
 	}
 	return nil
+}
+
+// clientForTransfer returns client, or a copy of it whose whole-request timeout
+// is widened so that a download of up to maxBytes can finish at the volunteer's
+// bandwidth limit. The fixed timeout was written for an unpaced link — five
+// minutes moves at most about 375 MB at 10 Mbps — so without this a limit would
+// turn a slow, healthy download into a failure. The copy shares the transport,
+// as the redirect-cap copy below does. With no limit set, or a client with no
+// timeout at all (a test's), client is returned unchanged.
+func clientForTransfer(client *http.Client, maxBytes int64) *http.Client {
+	if client == nil || client.Timeout <= 0 {
+		return client
+	}
+	want := netlimit.Allowance(client.Timeout, 0, maxBytes)
+	if want <= client.Timeout {
+		return client
+	}
+	c := *client
+	c.Timeout = want
+	return &c
 }
 
 // DownloadExternalData downloads data from an external URL through the production
@@ -109,16 +134,17 @@ func DownloadExternalDataWithClient(ctx context.Context, client *http.Client, ur
 		client = NewGuardedHTTPClient()
 	}
 
-	// Apply default timeout if context has no deadline.
+	// Apply default timeout if context has no deadline, widened for the
+	// bandwidth limit as the client's own timeout is.
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, DefaultDownloadTimeout)
+		ctx, cancel = context.WithTimeout(ctx, netlimit.Allowance(DefaultDownloadTimeout, 0, maxBytes))
 		defer cancel()
 	}
 
 	// Copy the client so the redirect cap is enforced here regardless of the
 	// injected client's own CheckRedirect; the copy shares the (guarded) transport.
-	c := *client
+	c := *clientForTransfer(client, maxBytes)
 	c.CheckRedirect = boundedRedirect
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

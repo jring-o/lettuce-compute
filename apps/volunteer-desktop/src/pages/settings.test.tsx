@@ -181,10 +181,27 @@ describe("SettingsPage", () => {
     render(<SettingsPage />);
     expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
     expect(screen.queryByText("CPU Cores")).not.toBeInTheDocument();
-    // The caption spells out the split for the configured 4 cores.
+    // The caption gives the rule for the configured 4 cores: a shared total,
+    // and at most 4 tasks, since each books at least one core.
     expect(
-      screen.getByText(/All running tasks share these 4 cores equally: one task alone gets all 4, two tasks get 2 each/)
+      screen.getByText(/All running tasks share these 4 cores equally\. Each task books at least one core \(more if its leaf needs more\), so at most 4 run at once/)
     ).toBeInTheDocument();
+    // Not the old worked case, which assumed one-core leaves.
+    expect(screen.queryByText(/two tasks get/)).not.toBeInTheDocument();
+  });
+
+  it("says one task runs at a time under a 1-core CPU allowance", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ resource_limits: { ...makeConfig().resource_limits, max_cpu_cores: 1 } }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.getByText(/Running tasks share this 1 core\. Each task needs at least one core, so one task runs at a time/)).toBeInTheDocument();
+    // Two tasks never run together on one core, so the caption must not say how they would split it.
+    expect(screen.queryByText(/half a core/)).not.toBeInTheDocument();
   });
 
   it("names the container engine's virtual machine when it bounds the CPU budget (TB-75)", async () => {
@@ -316,9 +333,12 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
+    // Two checks: Lettuce's use plus the leaf's need inside the allowance, and
+    // the 2 GiB in the free-space check — not inside the allowance.
     expect(
-      screen.getByText(/A leaf is fetched only when its declared need plus 2 GiB of headroom fits/)
+      screen.getByText(/Lettuce's own use plus the leaf's declared need fits inside this allowance, and the disk keeps the leaf's need plus 2 GiB free/)
     ).toBeInTheDocument();
+    expect(screen.queryByText(/2 GiB of headroom fits inside this allowance/)).not.toBeInTheDocument();
     expect(screen.getByText(/Lettuce is using 3.0 GiB right now/)).toBeInTheDocument();
   });
 
@@ -419,7 +439,73 @@ describe("SettingsPage", () => {
     expect(caption).toHaveTextContent(/brew install osx-cpu-temp/);
     expect(screen.getByLabelText("CPU pause above")).toBeDisabled();
     expect(screen.getByLabelText("CPU resume below")).toBeDisabled();
-    // GPU thresholds are unaffected.
+    // The daemon did not say where GPU temperatures come from, so the caption
+    // makes no promise about them and the GPU fields are left alone.
+    expect(caption).not.toHaveTextContent(/GPU thresholds still apply/);
+    expect(screen.getByLabelText("GPU pause above")).not.toBeDisabled();
+  });
+
+  it("says the GPU thresholds have no effect where no GPU temperature can be read, and disables them", async () => {
+    const user = userEvent.setup();
+    mockHeads({
+      heads: [],
+      machine: {
+        ...noGpuMachine,
+        cpu_temp_source: "sysfs",
+        cpu_temp_readable: true,
+        cpu_temp_detail: "reading thermal_zone0 (x86_pkg_temp)",
+        cpu_temp_remedy: "",
+        gpu_temp_source: "none",
+        gpu_temp_readable: false,
+        gpu_temp_detail: "no GPU detected",
+      } as typeof noGpuMachine,
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+
+    const caption = await screen.findByTestId("thermal-gpu-unreadable");
+    expect(caption).toHaveTextContent(/No GPU temperature can be read on this machine \(no GPU detected\)/);
+    expect(caption).toHaveTextContent(/GPU thresholds below have no effect here/);
+    await waitFor(() => expect(screen.getByLabelText("GPU pause above")).toBeDisabled());
+    expect(screen.getByLabelText("GPU resume below")).toBeDisabled();
+    expect(screen.getByLabelText("CPU pause above")).not.toBeDisabled();
+  });
+
+  it("says the GPU thresholds still apply when only the CPU cannot be read", async () => {
+    const user = userEvent.setup();
+    mockHeads({
+      heads: [],
+      machine: {
+        ...noGpuMachine,
+        cpu_temp_source: "none",
+        cpu_temp_readable: false,
+        cpu_temp_detail: "Windows only lets administrators read it",
+        cpu_temp_remedy: "",
+        gpu_temp_source: "nvidia-smi",
+        gpu_temp_readable: true,
+        gpu_temp_detail: "reading NVIDIA card 0 with nvidia-smi (58°C now)",
+      } as typeof noGpuMachine,
+    });
+    mockUseConfig.mockReturnValue({
+      config: makeConfig(),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    await user.click(screen.getByText("Thermal"));
+
+    const caption = await screen.findByTestId("thermal-cpu-unreadable");
+    await waitFor(() => expect(caption).toHaveTextContent(/The GPU thresholds still apply/));
+    expect(screen.queryByTestId("thermal-gpu-unreadable")).not.toBeInTheDocument();
     expect(screen.getByLabelText("GPU pause above")).not.toBeDisabled();
   });
 
@@ -716,6 +802,23 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
     expect(screen.getByText("Network Bandwidth")).toBeInTheDocument();
+    expect(screen.getByTestId("bandwidth-caption")).toHaveTextContent(/run at your connection's speed/);
+    expect(screen.getByTestId("bandwidth-caption")).toHaveTextContent(/image pulls .* are not limited/);
+  });
+
+  it("says what a set bandwidth limit holds and what it does not", () => {
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ resource_limits: { ...makeConfig().resource_limits, max_bandwidth_mbps: 20 } }),
+      isLoading: false,
+      updateConfig: vi.fn(),
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    const caption = screen.getByTestId("bandwidth-caption");
+    expect(caption).toHaveTextContent(/downloads together stay under 20 Mbps, and so do its uploads/);
+    expect(caption).toHaveTextContent(/Container image pulls are made by the container engine and are not limited/);
+    expect(caption).toHaveTextContent(/Applies straight away/);
   });
 
   it("renders Schedule section with schedule builder", () => {

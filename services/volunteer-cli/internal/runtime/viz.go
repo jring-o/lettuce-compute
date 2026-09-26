@@ -106,14 +106,18 @@ func EnsureVizBundle(ctx context.Context, dataDir string, vizURL string, expecte
 	return cachePath, nil
 }
 
-// downloadVizBundle downloads a URL to the given path using atomic write.
+// maxVizDownloadSize caps the compressed viz bundle a download may fetch.
+const maxVizDownloadSize = 500 * 1024 * 1024 // 500 MB
+
+// downloadVizBundle downloads a URL to the given path using atomic write, with
+// the client's timeout widened for the bandwidth limit (clientForTransfer).
 func downloadVizBundle(ctx context.Context, httpClient *http.Client, url, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := httpClient.Do(req)
+	resp, err := clientForTransfer(httpClient, maxVizDownloadSize).Do(req)
 	if err != nil {
 		return fmt.Errorf("download viz bundle: %w", err)
 	}
@@ -130,8 +134,7 @@ func downloadVizBundle(ctx context.Context, httpClient *http.Client, url, destPa
 	}
 	tmpPath := tmp.Name()
 
-	const maxDownloadSize = 500 * 1024 * 1024 // 500 MB
-	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, maxDownloadSize)); err != nil {
+	if _, err := io.Copy(tmp, io.LimitReader(resp.Body, maxVizDownloadSize)); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
 		return fmt.Errorf("write viz bundle: %w", err)
@@ -147,7 +150,7 @@ func downloadVizBundle(ctx context.Context, httpClient *http.Client, url, destPa
 }
 
 // F2: extraction-time decompression caps. The viz tarball is fetched as
-// COMPRESSED bytes (capped by maxDownloadSize); these constants bound the
+// COMPRESSED bytes (capped by maxVizDownloadSize); these constants bound the
 // DECOMPRESSED side, so a small gzip bomb cannot expand into multi-GB on disk
 // or in memory. Values mirror the dashboard route for consistency:
 //   - maxVizExtractedTotal: sum of decompressed payload bytes across the

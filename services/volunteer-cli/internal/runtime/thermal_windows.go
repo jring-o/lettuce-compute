@@ -8,16 +8,17 @@ package runtime
 // MSAcpi_ThermalZoneTemperature requires admin privileges and triggers
 // system prompts (DiskPart.exe UAC dialogs) on many machines. Rather
 // than risk disruptive system popups, we return 0 which causes the
-// thermal monitor to skip the CPU threshold check. GPU thermal
-// monitoring (via nvidia-smi/rocm-smi) still works.
+// thermal monitor to skip the CPU threshold check. An NVIDIA card's
+// temperature is still read, with nvidia-smi (gpu_thermal.go); no other
+// GPU tool is started on Windows.
 func readCPUTemperature() int {
 	return 0
 }
 
 // readSensors on Windows returns nothing, for the same reason
 // readCPUTemperature does: the WMI thermal class needs admin rights and can
-// raise UAC prompts, so no temperature is read at all. GPU monitoring via
-// nvidia-smi/rocm-smi is unaffected.
+// raise UAC prompts, so no sensor is read. An NVIDIA card's temperature comes
+// from nvidia-smi instead (gpu_thermal.go).
 func readSensors() []Sensor { return nil }
 
 // detectThermalCapability on Windows is always "none", and unfixable by the

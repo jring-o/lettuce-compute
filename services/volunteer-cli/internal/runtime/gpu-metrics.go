@@ -42,6 +42,17 @@ type GPUExecutionMetrics struct {
 	AvgUtilization float64
 }
 
+// Vendor is the card's vendor, "nvidia" or "amd".
+func (c *GPUMetricsCollector) Vendor() string { return c.vendor }
+
+// Tool names the command-line tool this collector reads the card with.
+func (c *GPUMetricsCollector) Tool() string {
+	if c.vendor == "amd" {
+		return "rocm-smi"
+	}
+	return "nvidia-smi"
+}
+
 // Collect takes a single snapshot of GPU metrics.
 func (c *GPUMetricsCollector) Collect() (*GPUMetricsSnapshot, error) {
 	switch c.vendor {
@@ -54,8 +65,15 @@ func (c *GPUMetricsCollector) Collect() (*GPUMetricsSnapshot, error) {
 	}
 }
 
+// collectCommand runs a vendor tool under the detection bound. The thermal
+// monitor calls Collect on every poll, and a hung tool must not hold up the
+// CPU check that shares the loop.
+func collectCommand(name string, args ...string) ([]byte, error) {
+	return runDetectionCommand(name, args...)
+}
+
 func (c *GPUMetricsCollector) collectNVIDIA() (*GPUMetricsSnapshot, error) {
-	out, err := CommandExecutor("nvidia-smi",
+	out, err := collectCommand("nvidia-smi",
 		"--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw",
 		"--format=csv,noheader,nounits",
 		"--id="+strconv.Itoa(c.deviceIdx))
@@ -96,7 +114,7 @@ func parseNvidiaMetrics(output string) (*GPUMetricsSnapshot, error) {
 }
 
 func (c *GPUMetricsCollector) collectAMD() (*GPUMetricsSnapshot, error) {
-	out, err := CommandExecutor("rocm-smi",
+	out, err := collectCommand("rocm-smi",
 		"-d", strconv.Itoa(c.deviceIdx),
 		"--showtemp", "--showuse", "--showmemuse", "--showpower", "--csv")
 	if err != nil {
@@ -106,6 +124,12 @@ func (c *GPUMetricsCollector) collectAMD() (*GPUMetricsSnapshot, error) {
 }
 
 // parseRocmMetrics parses rocm-smi metrics CSV output.
+//
+// rocm-smi reports up to three temperatures per card: edge, junction (the
+// hottest spot on the die) and memory. The edge sensor is the one comparable
+// with the single figure nvidia-smi reports and with the GPU thresholds; the
+// junction and memory sensors are designed to run 10-20 °C hotter. So the edge
+// reading is used when present, and otherwise the first temperature column.
 func parseRocmMetrics(output string) (*GPUMetricsSnapshot, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) < 2 {
@@ -116,6 +140,7 @@ func parseRocmMetrics(output string) (*GPUMetricsSnapshot, error) {
 	data := strings.Split(lines[1], ",")
 
 	snap := &GPUMetricsSnapshot{}
+	tempFromEdge := false
 	for i, col := range header {
 		if i >= len(data) {
 			break
@@ -125,8 +150,13 @@ func parseRocmMetrics(output string) (*GPUMetricsSnapshot, error) {
 
 		switch {
 		case strings.Contains(col, "temperature") || strings.Contains(col, "temp"):
+			edge := strings.Contains(col, "edge")
+			if tempFromEdge || (snap.TemperatureC > 0 && !edge) {
+				continue
+			}
 			if v, err := strconv.ParseFloat(val, 64); err == nil {
 				snap.TemperatureC = int(v)
+				tempFromEdge = edge
 			}
 		case strings.Contains(col, "gpu use") || strings.Contains(col, "utilization"):
 			val = strings.TrimSuffix(val, "%")

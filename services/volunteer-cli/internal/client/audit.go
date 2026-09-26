@@ -25,7 +25,7 @@ func (c *Client) ClaimAuditJob(ctx context.Context, req *lettucev1.ClaimAuditJob
 // this runner (completed or reclaimed) fails with FailedPrecondition; callers treat that
 // as job-done rather than retrying.
 func (c *Client) SubmitAuditResult(ctx context.Context, req *lettucev1.SubmitAuditResultRequest) (*lettucev1.SubmitAuditResultResponse, error) {
-	ctx, cancel := c.rpcCtx(ctx)
+	ctx, cancel := c.rpcCtxSized(ctx, req)
 	defer cancel()
 	return c.auditSvc.SubmitResult(ctx, req)
 }

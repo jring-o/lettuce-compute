@@ -156,6 +156,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// memory line so all three are read together.
 	rep.add(docInfo, "disk allowance", fmt.Sprintf("%d MB / %d GB (resource_limits.max_disk_gb) — a head only sends leafs whose required disk fits under this; this is the allowance you set, not free space (see 'disk space' above)",
 		caps.maxDiskMB, cfg.ResourceLimits.MaxDiskGB), "")
+	checkBandwidth(rep, cfg.ResourceLimits.MaxBandwidthMbps)
 	checkCPUBudget(rep, caps)
 	// The affinity fallback confines native work, which the configured limit
 	// bounds (TB-85), not container work's VM-clipped figure.
@@ -163,7 +164,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// The two automatic pauses that protect the machine's owner: whether the
 	// thermal thresholds can see the CPU at all (TB-77), and whether Lettuce
 	// yields to other programs (TB-83).
-	checkThermal(rep, cfg.Thermal, runtime.ThermalCapabilityReader())
+	checkThermal(rep, cfg.Thermal, doctorThermalCapability(logger))
 	checkYield(rep, cfg.Yield, probeYieldMeasurable())
 
 	fmt.Fprintln(out)
@@ -183,29 +184,72 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// checkThermal says what the thermal CPU thresholds are actually reading
-// (TB-77). The monitor treats an unreadable CPU as "never hot", so a machine
+// checkBandwidth says what resource_limits.max_bandwidth_mbps holds to the
+// figure, and names what it cannot reach, so a volunteer watching an image pull
+// run at full speed under a limit knows that is expected.
+func checkBandwidth(rep *doctorReport, mbps int) {
+	if mbps <= 0 {
+		rep.add(docInfo, "bandwidth", "unlimited (resource_limits.max_bandwidth_mbps 0)", "")
+		return
+	}
+	rep.add(docInfo, "bandwidth", fmt.Sprintf("%d Mbps (resource_limits.max_bandwidth_mbps) — Lettuce's downloads together stay under it, and so do its uploads; container image pulls (the container engine makes them), `lettuce-volunteer update` and the desktop app's own updates are not limited", mbps), "")
+}
+
+// doctorThermalCapability detects what the thermal monitor would read on this
+// machine: the platform's CPU source, and the GPU source the daemon's monitor
+// builds from the same GPU detection (one vendor-tool reading per card, plus
+// any Linux GPU thermal zone).
+func doctorThermalCapability(logger *slog.Logger) runtime.ThermalCapability {
+	cap := runtime.ThermalCapabilityReader()
+	gpus := detectGPUsFunc()
+	var sensors []runtime.Sensor
+	if runtime.SensorReader != nil {
+		sensors = runtime.SensorReader()
+	}
+	cap.GPUSource, cap.GPUReadable, cap.GPUDetail = runtime.DetectGPUThermal(gpus, runtime.GPUThermalCollectors(gpus, logger), sensors)
+	return cap
+}
+
+// checkThermal says what the thermal thresholds are actually reading (TB-77).
+// The monitor treats an unreadable temperature as "never hot", so a machine
 // without a CPU temperature source had "pause above 85 °C" configured, shown
 // in Settings, and doing nothing — a tester watched an Intel MacBook's die at
 // 100 °C under it. Fixable gaps (install the macOS helper, load a Linux
 // driver) are warnings; an unfixable one (Windows) is a line of information.
+// The GPU thresholds are reported the same way, by what the GPU source found.
 func checkThermal(rep *doctorReport, th config.ThermalConfig, cap runtime.ThermalCapability) {
 	if !th.Enabled {
 		rep.add(docInfo, "thermal", "off (thermal.enabled false) — work is never paused for temperature; hardware protection is unaffected", "")
 		return
 	}
 	if cap.CPUReadable {
-		rep.add(docOK, "thermal", fmt.Sprintf("CPU temperature from %s: %s — ALL work pauses at %d°C and resumes below %d°C (GPU: %d/%d°C where a GPU tool reports one)",
-			cap.CPUSource, cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC, th.GPUPauseThresholdC, th.GPUResumeThresholdC), "")
+		rep.add(docOK, "thermal", fmt.Sprintf("CPU temperature from %s: %s — ALL work pauses at %d°C and resumes below %d°C; %s",
+			cap.CPUSource, cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC, gpuThermalClause(th, cap, "")), "")
 		return
 	}
-	detail := fmt.Sprintf("on, but this machine's CPU temperature cannot be read: %s. The CPU thresholds (%d/%d°C) have no effect here; GPU thresholds apply only where a GPU tool reports a temperature; the hardware's own thermal protection is unaffected",
-		cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC)
+	detail := fmt.Sprintf("on, but this machine's CPU temperature cannot be read: %s. The CPU thresholds (%d/%d°C) have no effect here; %s; the hardware's own thermal protection is unaffected",
+		cap.Detail, th.CPUPauseThresholdC, th.CPUResumeThresholdC, gpuThermalClause(th, cap, " either"))
 	if cap.Fixable() {
 		rep.add(docWarn, "thermal", detail, cap.Remedy)
 		return
 	}
 	rep.add(docInfo, "thermal", detail, "")
+}
+
+// gpuThermalClause is the GPU half of the thermal row: where the GPU
+// temperature comes from and what the thresholds do, or that they have no
+// effect and why. either is appended to "no effect" when the CPU thresholds
+// have none too.
+func gpuThermalClause(th config.ThermalConfig, cap runtime.ThermalCapability, either string) string {
+	if cap.GPUReadable {
+		return fmt.Sprintf("GPU temperature from %s (%s) — ALL work pauses at %d°C and resumes below %d°C",
+			cap.GPUSource, cap.GPUDetail, th.GPUPauseThresholdC, th.GPUResumeThresholdC)
+	}
+	detail := cap.GPUDetail
+	if detail == "" {
+		detail = "no GPU source detected"
+	}
+	return fmt.Sprintf("the GPU thresholds (%d/%d°C) have no effect%s: %s", th.GPUPauseThresholdC, th.GPUResumeThresholdC, either, detail)
 }
 
 // probeYieldMeasurable takes one machine CPU sample the way the yield monitor

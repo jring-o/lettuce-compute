@@ -8,9 +8,9 @@ import {
 import { useApiQuery } from "./use-api";
 
 /**
- * The daemon's `GET /api/v1/metrics`. Only the disk figures are measured
- * there; CPU, memory and temperatures come back as 0. Use `useSystemMetrics`
- * for host CPU and memory.
+ * The daemon's `GET /api/v1/metrics`: the disk figures, and the temperatures
+ * the thermal monitor last read (0 when none is read). CPU and memory use come
+ * back as 0; use `useSystemMetrics` for host CPU and memory.
  */
 export function useMetrics(intervalMs: number = 3000): {
   metrics: MetricsResponse | null;

@@ -14,8 +14,8 @@ type ThermalConfig struct {
 	Enabled             bool
 	CPUPauseThresholdC  int // default 85
 	CPUResumeThresholdC int // default 75
-	GPUPauseThresholdC  int // default 80
-	GPUResumeThresholdC int // default 70
+	GPUPauseThresholdC  int // default 87
+	GPUResumeThresholdC int // default 77
 	PollIntervalSeconds int // default 10
 	MaxThrottleMinutes  int // default 30; 0 disables the ceiling
 }
@@ -121,16 +121,32 @@ type ThermalMonitor struct {
 	logger        *slog.Logger
 	pauseCh       chan<- bool
 	gpuCollectors []*GPUMetricsCollector
-	pollOverride  time.Duration    // for testing; 0 = use config
-	nowFn         func() time.Time // for testing; nil = time.Now
-	notices       NoticeSink       // optional; nil discards notices
-	// capability is where the CPU temperature comes from on this machine,
-	// detected once at Start (TB-77). Read through Capability.
+	// gpus is the hardware detection the collectors were built from
+	// (SetDetectedGPUs); it lets Start say which card cannot be read and why.
+	gpus         []*GpuDetectionResult
+	pollOverride time.Duration    // for testing; 0 = use config
+	nowFn        func() time.Time // for testing; nil = time.Now
+	notices      NoticeSink       // optional; nil discards notices
+	// capability is where the CPU and GPU temperatures come from on this
+	// machine, detected once at Start (TB-77). Read through Capability.
 	capability ThermalCapability
 
 	mu      sync.Mutex
 	stopCh  chan struct{}
 	stopped bool
+	// readings is what the last poll read, for GET /api/v1/metrics. Zero until
+	// the first poll, and always while protection is off (nothing is read).
+	readings ThermalReadings
+}
+
+// ThermalReadings is what the monitor's last poll read. A zero field means
+// nothing was read: no sensor, no tool that answered, or protection off.
+type ThermalReadings struct {
+	CPUTempC int
+	// GPUTempC is the hottest card or GPU sensor; GPUUsePct the busiest card's
+	// utilisation, as a vendor tool reports it.
+	GPUTempC  int
+	GPUUsePct int
 }
 
 // thermalCPUUnreadableCode is the notice raised once at start when thermal
@@ -185,8 +201,8 @@ func (t *ThermalMonitor) SetClockForTest(fn func() time.Time) {
 	t.nowFn = fn
 }
 
-// Capability reports where this machine's CPU temperature comes from, as
-// detected at Start (TB-77). Before Start it is the zero value.
+// Capability reports where this machine's CPU and GPU temperatures come from,
+// as detected at Start (TB-77). Before Start it is the zero value.
 func (t *ThermalMonitor) Capability() ThermalCapability {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -203,14 +219,22 @@ func (t *ThermalMonitor) Capability() ThermalCapability {
 // (install the macOS helper, load a Linux driver) and as information when
 // nothing they do will change it (Windows), so a box labelled "needs
 // attention" never holds what no one can act on.
+//
+// The GPU source is detected beside it: each card's vendor tool is asked once
+// and Linux GPU thermal zones are looked for, so the log, `doctor`, the
+// management API and the app can say whether the GPU thresholds act here.
 func (t *ThermalMonitor) announceCPUSource() (enabled bool) {
 	cap := ThermalCapabilityReader()
+	t.mu.Lock()
+	gpus, collectors := t.gpus, t.gpuCollectors
+	t.mu.Unlock()
+	cap.GPUSource, cap.GPUReadable, cap.GPUDetail = DetectGPUThermal(gpus, collectors, t.readSensors())
 	t.mu.Lock()
 	t.capability = cap
 	t.mu.Unlock()
 
 	if !t.config.Enabled {
-		t.logger.Info("thermal protection off (thermal.enabled false)", "cpu_source", cap.CPUSource)
+		t.logger.Info("thermal protection off (thermal.enabled false)", "cpu_source", cap.CPUSource, "gpu_source", cap.GPUSource)
 		return false
 	}
 	if cap.CPUReadable {
@@ -219,17 +243,24 @@ func (t *ThermalMonitor) announceCPUSource() (enabled bool) {
 			"detail", cap.Detail,
 			"cpu_pause_above", t.config.CPUPauseThresholdC,
 			"cpu_resume_below", t.config.CPUResumeThresholdC,
+			"gpu_source", cap.GPUSource,
+			"gpu_detail", cap.GPUDetail,
 			"gpu_pause_above", t.config.GPUPauseThresholdC,
 			"gpu_resume_below", t.config.GPUResumeThresholdC,
 		)
 		return true
 	}
 
-	t.logger.Warn("thermal protection cannot read this machine's CPU temperature; the CPU pause threshold has no effect (GPU thresholds and hardware protection are unaffected)",
+	gpuClause := "the GPU thresholds have no effect either (" + cap.GPUDetail + ")"
+	if cap.GPUReadable {
+		gpuClause = "the GPU thresholds still apply (" + cap.GPUDetail + ")"
+	}
+	t.logger.Warn("thermal protection cannot read this machine's CPU temperature; the CPU pause threshold has no effect ("+gpuClause+"; hardware protection is unaffected)",
 		"cpu_source", cap.CPUSource,
 		"detail", cap.Detail,
 		"remedy", cap.Remedy,
 		"cpu_pause_above", t.config.CPUPauseThresholdC,
+		"gpu_source", cap.GPUSource,
 	)
 	if t.notices == nil {
 		return true
@@ -238,8 +269,12 @@ func (t *ThermalMonitor) announceCPUSource() (enabled bool) {
 	if cap.Fixable() {
 		level = NoticeLevelWarn
 	}
-	msg := fmt.Sprintf("Thermal protection cannot read this machine's CPU temperature (%s), so the CPU pause threshold of %d°C has no effect. GPU thresholds still apply where a GPU tool reports a temperature, and the hardware's own thermal protection is unaffected.",
-		cap.Detail, t.config.CPUPauseThresholdC)
+	gpuSentence := "No GPU temperature can be read here either, so the GPU thresholds have no effect"
+	if cap.GPUReadable {
+		gpuSentence = fmt.Sprintf("The GPU pause threshold of %d°C still applies", t.config.GPUPauseThresholdC)
+	}
+	msg := fmt.Sprintf("Thermal protection cannot read this machine's CPU temperature (%s), so the CPU pause threshold of %d°C has no effect. %s, and the hardware's own thermal protection is unaffected.",
+		cap.Detail, t.config.CPUPauseThresholdC, gpuSentence)
 	if cap.Fixable() {
 		msg += " To enable it, " + cap.Remedy + "."
 	}
@@ -262,6 +297,31 @@ func (t *ThermalMonitor) SetGPUCollectors(collectors []*GPUMetricsCollector) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.gpuCollectors = collectors
+}
+
+// SetDetectedGPUs gives the monitor this machine's GPU detection: a collector
+// is built for every card a vendor tool on this platform can read
+// (GPUThermalCollectors), so the GPU thresholds judge its temperature. Must be
+// called before Start.
+func (t *ThermalMonitor) SetDetectedGPUs(gpus []*GpuDetectionResult) {
+	collectors := GPUThermalCollectors(gpus, t.logger)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.gpus = gpus
+	t.gpuCollectors = collectors
+}
+
+// Readings returns what the last poll read.
+func (t *ThermalMonitor) Readings() ThermalReadings {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.readings
+}
+
+func (t *ThermalMonitor) recordReadings(r ThermalReadings) {
+	t.mu.Lock()
+	t.readings = r
+	t.mu.Unlock()
 }
 
 // SetPollIntervalForTest overrides the poll interval (for testing only).
@@ -318,8 +378,9 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			cpuTemp := CPUTempReader()
-			gpuTemp := t.readGPUTemperature()
 			sensors := t.readSensors()
+			gpuTemp, gpuUse := t.readGPU(sensors)
+			t.recordReadings(ThermalReadings{CPUTempC: cpuTemp, GPUTempC: gpuTemp, GPUUsePct: gpuUse})
 			critPausing, critStillHot := criticalOverheats(sensors, criticalResumeMarginC)
 			critPausing = filterSuppressed(critPausing, suppressed, t.now())
 			critStillHot = filterSuppressed(critStillHot, suppressed, t.now())
@@ -516,23 +577,33 @@ func (t *ThermalMonitor) signal(ctx context.Context, pause bool) {
 	}
 }
 
-// readGPUTemperature reads the highest GPU temperature from all collectors.
-func (t *ThermalMonitor) readGPUTemperature() int {
+// readGPU returns the hottest GPU temperature — from every card's vendor tool
+// and from the Linux GPU thermal zones among sensors — and the busiest card's
+// utilisation. A temperature of 0 means none was read, which the threshold
+// check treats as unknown: it can neither cause a pause nor hold one.
+func (t *ThermalMonitor) readGPU(sensors []Sensor) (tempC, usePct int) {
 	t.mu.Lock()
 	collectors := t.gpuCollectors
 	t.mu.Unlock()
 
-	maxTemp := 0
 	for _, c := range collectors {
 		snap, err := c.Collect()
 		if err != nil {
 			continue
 		}
-		if snap.TemperatureC > maxTemp {
-			maxTemp = snap.TemperatureC
+		if snap.TemperatureC > tempC {
+			tempC = snap.TemperatureC
+		}
+		if snap.UtilizationPct > usePct {
+			usePct = snap.UtilizationPct
 		}
 	}
-	return maxTemp
+	for _, s := range sensors {
+		if s.Class == SensorGPU && s.TempC > tempC {
+			tempC = s.TempC
+		}
+	}
+	return tempC, usePct
 }
 
 // Stop signals the monitor to stop.

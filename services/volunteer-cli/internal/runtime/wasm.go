@@ -436,14 +436,15 @@ func verifyWasmMagic(path string) error {
 	return nil
 }
 
-// downloadToFile downloads a URL to the given path using atomic write.
+// downloadToFile downloads a URL to the given path using atomic write, with the
+// client's timeout widened for the bandwidth limit (clientForTransfer).
 func (w *WasmRuntime) downloadToFile(ctx context.Context, client *http.Client, url, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := clientForTransfer(client, DefaultMaxArtifactBytes).Do(req)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}

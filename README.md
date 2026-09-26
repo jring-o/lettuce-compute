@@ -125,15 +125,17 @@ head is told only what it is trusted for, and a head that dispatches a unit for 
 has that unit refused and handed straight back. Declining everything is durable; a later upgrade
 will not quietly re-grant it.
 
-Your machine also holds the line on resources. You set CPU cores, memory, disk, GPU VRAM share, and
-concurrent tasks. Each limit is a budget for the whole machine: the CPU cores you allow are shared
+Your machine also holds the line on resources. You set CPU cores, memory, disk, GPU VRAM share,
+network bandwidth, and concurrent tasks. Each limit is a budget for the whole machine: the CPU cores you allow are shared
 equally by every task that is running (a task alone gets them all; two tasks get half each, adjusted
 as tasks start and finish), and each task is told its share so it can size its worker pool. The
 client reserves exactly what it will enforce, using cgroups where available, container limits, or
-WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU gets
-too hot (where the machine lets a program read its CPU temperature: Linux, or a Mac with the
-`osx-cpu-temp` helper — the client tells you when it cannot), and, if you turn the setting on,
-pauses everything while other programs need the CPU.
+WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU or GPU
+gets too hot (where the machine lets a program read the temperature: the CPU on Linux, or on a Mac
+with the `osx-cpu-temp` helper; an NVIDIA GPU through `nvidia-smi`, an AMD GPU through `rocm-smi`
+on Linux and macOS — the client tells you when it cannot), keeps its downloads and its uploads
+under the bandwidth you set (container image pulls, which the container engine makes, excepted),
+and, if you turn the setting on, pauses everything while other programs need the CPU.
 
 ### Commands
 

@@ -117,8 +117,8 @@ type ThermalConfig struct {
 	Enabled             bool `yaml:"enabled" json:"enabled"`                             // default true
 	CPUPauseThresholdC  int  `yaml:"cpu_pause_threshold" json:"cpu_pause_threshold"`     // default 85
 	CPUResumeThresholdC int  `yaml:"cpu_resume_threshold" json:"cpu_resume_threshold"`   // default 75
-	GPUPauseThresholdC  int  `yaml:"gpu_pause_threshold" json:"gpu_pause_threshold"`     // default 80
-	GPUResumeThresholdC int  `yaml:"gpu_resume_threshold" json:"gpu_resume_threshold"`   // default 70
+	GPUPauseThresholdC  int  `yaml:"gpu_pause_threshold" json:"gpu_pause_threshold"`     // default 87
+	GPUResumeThresholdC int  `yaml:"gpu_resume_threshold" json:"gpu_resume_threshold"`   // default 77
 	PollIntervalSeconds int  `yaml:"poll_interval_seconds" json:"poll_interval_seconds"` // default 10
 
 	// MaxThrottleMinutes bounds one continuous throttle. 0 uses the default (30);
@@ -412,8 +412,10 @@ func Defaults() *Config {
 			Enabled:             true,
 			CPUPauseThresholdC:  85,
 			CPUResumeThresholdC: 75,
-			GPUPauseThresholdC:  80,
-			GPUResumeThresholdC: 70,
+			// Above the 83 °C or so a busy NVIDIA card holds by design under
+			// sustained load, so a GPU doing its normal work is not paused.
+			GPUPauseThresholdC:  87,
+			GPUResumeThresholdC: 77,
 			PollIntervalSeconds: 10,
 			MaxThrottleMinutes:  30,
 		},
@@ -917,21 +919,21 @@ func applyKeyComments(m *yaml.Node, comments map[string]string) {
 // Comment maps keyed by YAML field name. Edited alongside the struct so the
 // generated config stays self-documenting.
 var topLevelConfigComments = map[string]string{
-	"max_concurrent_tasks": "How many work units run at once - THIS is the workload throttle (the thermal thresholds are not). The buffer target scales with it.",
+	"max_concurrent_tasks": "Most work units that run at once. Fewer may run: the CPU, memory and GPU limits must also fit each one (with max_cpu_cores N, at most N tasks run). The thermal thresholds do not throttle how much runs. The buffer target scales with it.",
 	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
 	"container_cap_add":     "Linux capabilities to re-add to hardened containers. Default none (containers drop all capabilities).",
 	"container_gpu_relax_user": "Let GPU leaves relax the non-root/minimal-capability container posture when device access needs it. CPU leaves stay fully hardened.",
-	"resource_limits":      "Per-task resource ceilings. A head only sends leafs whose requirements fit under these - too low and you silently get no work.",
+	"resource_limits":      "What this machine offers Lettuce. max_cpu_cores, max_memory_mb and max_disk_gb are totals for ALL running work together, not per task; a head also only sends leafs whose own requirement fits under them - set them too low and you silently get no work.",
 	"scheduling":           "When the volunteer runs.",
-	"thermal":              "Hardware overheating protection. Temperatures in degrees C, NOT workload limits: ALL work freezes above the pause threshold and resumes below the resume threshold.",
+	"thermal":              "Hardware overheating protection. Temperatures in degrees C, NOT workload limits: ALL work freezes above the pause threshold and resumes below the resume threshold. Each threshold acts only where its temperature can be read; `lettuce-volunteer doctor` says which can.",
 	"yield":                "Yield to other programs. When enabled, ALL work pauses while programs other than Lettuce use more than cpu_pause_pct of the CPU (averaged over window_seconds) and resumes once they use less than cpu_resume_pct. Lettuce's own tasks never count.",
 }
 
 var resourceLimitsComments = map[string]string{
-	"max_cpu_cores":      "Max CPU cores a single work unit may use.",
-	"max_memory_mb":      "Memory ceiling. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
+	"max_cpu_cores":      "Most CPU cores Lettuce uses on this machine, in total. Running tasks share them equally (one task alone gets all of them, two get half each) and each task books at least one core, more if its leaf needs more, so at most this many tasks run at once whatever max_concurrent_tasks says. On Windows/macOS container work is also limited to the container engine VM's CPUs.",
+	"max_memory_mb":      "Most memory Lettuce's running work may use, in total: a unit starts only if its declared memory fits beside what is already running. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
 	"max_disk_gb":        "Disk capacity you offer: a head only sends leafs whose declared disk need fits under this, and Lettuce keeps its own footprint (work folders + container images) within it. A download needs only the LEAF's declared disk free (plus a 2 GB floor), never this whole number.",
-	"max_bandwidth_mbps": "Bandwidth cap in Mbps. 0 = unlimited.",
+	"max_bandwidth_mbps": "Most network speed Lettuce uses, in Mbps: its downloads together stay under this (programs, input data, checkpoints), and so do its uploads (results, checkpoints). Container image pulls are made by the container engine and are NOT limited. 0 = unlimited.",
 	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. A head compares a leaf's VRAM requirement against this share of your card, not the card itself, so at the default 50% a 6 GB card offers 3072 MB. 0 disables GPU work entirely.",
 	"max_pids":           "Max simultaneous processes/threads inside a container (fork-bomb cap). 0 uses the built-in default.",
 }
@@ -941,8 +943,8 @@ var thermalComments = map[string]string{
 	"max_throttle_minutes":  "How long work may stay frozen on one continuous overheat before the client resumes and re-checks. Stops a sensor that never cools (often not the CPU) from freezing you indefinitely. Negative means wait forever.",
 	"cpu_pause_threshold":   "degrees C - freeze ALL work when the CPU reaches this.",
 	"cpu_resume_threshold":  "degrees C - resume once the CPU cools below this (must be < cpu_pause_threshold).",
-	"gpu_pause_threshold":   "degrees C - freeze ALL work when the GPU reaches this.",
-	"gpu_resume_threshold":  "degrees C - resume once the GPU cools below this (must be < gpu_pause_threshold).",
+	"gpu_pause_threshold":   "degrees C - freeze ALL work when a GPU reaches this (read with nvidia-smi, rocm-smi on Linux/macOS, or a Linux GPU sensor).",
+	"gpu_resume_threshold":  "degrees C - resume once every GPU cools below this (must be < gpu_pause_threshold).",
 	"poll_interval_seconds": "How often temperatures are sampled, in seconds.",
 }
 
