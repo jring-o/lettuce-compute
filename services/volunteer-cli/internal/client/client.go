@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -14,6 +15,9 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/lettuce-compute/volunteer-cli/internal/netlimit"
 )
 
 // Client wraps a gRPC connection to the Lettuce infrastructure server.
@@ -82,7 +86,9 @@ func New(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 	}
 
 	conn, err := grpc.NewClient(cfg.ServerURL,
-		grpc.WithTransportCredentials(creds),
+		// Paced through the credentials rather than a custom dialer, so gRPC keeps
+		// dialing (and honouring a configured proxy) exactly as it does by default.
+		grpc.WithTransportCredentials(pacedCredentials{creds}),
 		// Do NOT let the resolver fetch a service config from DNS. gRPC's DNS resolver
 		// otherwise looks up a TXT record at "_grpc_config.<head hostname>" on every
 		// resolution — a name essentially no head publishes. On a network whose DNS answers
@@ -149,12 +155,51 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// pacedCredentials wraps the connection's transport credentials so the raw
+// connection each handshake secures is paced to the volunteer's bandwidth limit
+// (see netlimit). The raw connection, not the secured one: TLS records count
+// toward the limit like everything else on the wire. Every other method is the
+// wrapped credentials' own.
+type pacedCredentials struct {
+	credentials.TransportCredentials
+}
+
+func (p pacedCredentials) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return p.TransportCredentials.ClientHandshake(ctx, authority, netlimit.WrapConn(rawConn))
+}
+
+func (p pacedCredentials) Clone() credentials.TransportCredentials {
+	return pacedCredentials{p.TransportCredentials.Clone()}
+}
+
+// maxReplyBytes is the largest reply this client accepts: gRPC's default
+// receive limit, which the client does not raise.
+const maxReplyBytes = 4 * 1024 * 1024
+
 // rpcCtx returns ctx with the default request timeout if no deadline is set.
+// Under a bandwidth limit the timeout is widened by the time the largest reply
+// this client accepts takes to arrive at that rate (netlimit.Allowance), so
+// pacing alone cannot turn a large reply into a timeout.
 func (c *Client) rpcCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return c.rpcCtxSized(ctx, nil)
+}
+
+// rpcCtxSized is rpcCtx for an RPC that uploads a large request — a result or
+// a checkpoint of up to about 100 MB — whose own paced transfer time is added
+// too. The request is sized only when a limit is set.
+func (c *Client) rpcCtxSized(ctx context.Context, req proto.Message) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
-	return context.WithTimeout(ctx, c.requestTimeout)
+	timeout := c.requestTimeout
+	if netlimit.Mbps() > 0 {
+		var up int64
+		if req != nil {
+			up = int64(proto.Size(req))
+		}
+		timeout = netlimit.Allowance(timeout, up, maxReplyBytes)
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // GetServerStatus calls the GetServerStatus RPC.
@@ -191,7 +236,7 @@ func (c *Client) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWork
 
 // SubmitResult calls the SubmitResult RPC.
 func (c *Client) SubmitResult(ctx context.Context, req *lettucev1.SubmitResultRequest) (*lettucev1.SubmitResultResponse, error) {
-	ctx, cancel := c.rpcCtx(ctx)
+	ctx, cancel := c.rpcCtxSized(ctx, req)
 	defer cancel()
 	return c.svc.SubmitResult(ctx, req)
 }
@@ -207,7 +252,7 @@ func (c *Client) StartWork(ctx context.Context, req *lettucev1.StartWorkRequest)
 
 // SaveCheckpoint calls the SaveCheckpoint RPC.
 func (c *Client) SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpointRequest) (*lettucev1.SaveCheckpointResponse, error) {
-	ctx, cancel := c.rpcCtx(ctx)
+	ctx, cancel := c.rpcCtxSized(ctx, req)
 	defer cancel()
 	return c.svc.SaveCheckpoint(ctx, req)
 }

@@ -127,9 +127,11 @@ export interface StatusResponse {
 // ---------------------------------------------------------------------------
 
 /**
- * CPU, GPU, memory and temperature figures are reported as 0 by the daemon
- * (it has no platform collector yet); use `getSystemMetrics()` for host CPU
- * and memory. The disk figures are the fetch gate's own: `disk_used_mb` is
+ * CPU and memory use are reported as 0 by the daemon; use `getSystemMetrics()`
+ * for host CPU and memory. `cpu_temp_c`, `gpu_temp_c` and `gpu_usage_pct` are
+ * the thermal monitor's last reading — what the pause thresholds are judged
+ * against — and 0 when nothing is read: no sensor on this machine, or thermal
+ * protection is off. The disk figures are the fetch gate's own: `disk_used_mb` is
  * Lettuce's measured footprint (data directory plus cached container images)
  * and `disk_allowance_mb` the configured `max_disk_gb` it is budgeted
  * against. When `disk_usage_known` is false, `disk_used_mb` is not a
@@ -528,6 +530,16 @@ export interface MachineCapabilities {
   cpu_temp_readable: boolean;
   cpu_temp_detail: string;
   cpu_temp_remedy: string;
+  /**
+   * The same for the GPU thresholds: "nvidia-smi", "rocm-smi", "sysfs" (Linux
+   * GPU sensors), a "+"-joined combination, or "none". Empty while the daemon
+   * has not detected it yet, and from older daemons — not known, so assume
+   * nothing. When `gpu_temp_readable` is false with a source, the GPU
+   * thresholds have no effect on this machine — `gpu_temp_detail` says why.
+   */
+  gpu_temp_source: string;
+  gpu_temp_readable: boolean;
+  gpu_temp_detail: string;
   /**
    * Whether the yield setting can measure other programs' CPU use here.
    * True while the setting is off (nothing has tried); false only once
@@ -1124,6 +1136,10 @@ type RawMachineCapabilities = Omit<
   cpu_temp_readable?: boolean | null;
   cpu_temp_detail?: string | null;
   cpu_temp_remedy?: string | null;
+  // Absent from a daemon that does not read GPU temperatures: not known.
+  gpu_temp_source?: string | null;
+  gpu_temp_readable?: boolean | null;
+  gpu_temp_detail?: string | null;
   yield_measurable?: boolean | null;
   yield_unavailable?: string | null;
 };
@@ -1161,6 +1177,9 @@ function normaliseMachine(
     cpu_temp_readable: m.cpu_temp_readable ?? true,
     cpu_temp_detail: m.cpu_temp_detail ?? "",
     cpu_temp_remedy: m.cpu_temp_remedy ?? "",
+    gpu_temp_source: m.gpu_temp_source ?? "",
+    gpu_temp_readable: m.gpu_temp_readable ?? true,
+    gpu_temp_detail: m.gpu_temp_detail ?? "",
     yield_measurable: m.yield_measurable ?? true,
     yield_unavailable: m.yield_unavailable ?? "",
     max_gpu_vram_mb: m.max_gpu_vram_mb ?? 0,

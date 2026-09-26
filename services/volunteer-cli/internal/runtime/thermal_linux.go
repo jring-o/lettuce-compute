@@ -45,9 +45,10 @@ var cpuZoneTypes = []string{
 	"pkg_temp",
 }
 
-// gpuZoneTypes are zones that measure a GPU. Read so a GPU with no
-// nvidia-smi/rocm-smi collector still contributes, judged against the GPU
-// thresholds rather than the CPU ones.
+// gpuZoneTypes are zones that measure a GPU. The thermal monitor judges them
+// against the GPU thresholds, beside any nvidia-smi/rocm-smi reading, so a GPU
+// with no vendor tool (an ARM SoC's GPU, a card without ROCm installed) still
+// counts — and never against the CPU thresholds.
 var gpuZoneTypes = []string{
 	"amdgpu",
 	"radeon",

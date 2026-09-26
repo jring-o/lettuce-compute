@@ -17,6 +17,7 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/daemon"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
+	"github.com/lettuce-compute/volunteer-cli/internal/netlimit"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"github.com/spf13/cobra"
@@ -135,6 +136,12 @@ func runAuditRunner(cmd *cobra.Command, once bool, pollInterval time.Duration) e
 	pg := wireRuntimeResourceLimits(registry, cfg, logger)
 	if pg != nil {
 		defer pg.Close()
+	}
+	// The runner downloads artifacts and submits results in its own process, so
+	// it applies the bandwidth limit itself, as the daemon does.
+	netlimit.SetMbps(cfg.ResourceLimits.MaxBandwidthMbps)
+	if mbps := netlimit.Mbps(); mbps > 0 {
+		logger.Info("network bandwidth limited: downloads, and separately uploads, stay under the figure; container image pulls are not limited", "max_bandwidth_mbps", mbps)
 	}
 	// Same PB-27 ownership rule as the daemon: only undo a machine THIS process
 	// started; one that was already running is left exactly as found.

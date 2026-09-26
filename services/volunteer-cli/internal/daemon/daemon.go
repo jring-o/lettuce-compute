@@ -22,6 +22,7 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/client"
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
 	"github.com/lettuce-compute/volunteer-cli/internal/identity"
+	"github.com/lettuce-compute/volunteer-cli/internal/netlimit"
 	"github.com/lettuce-compute/volunteer-cli/internal/resource"
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 	"google.golang.org/grpc/codes"
@@ -473,6 +474,9 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	if hw == nil {
 		hw, detectedGPUs = client.DetectHardwareWithGPUs(cfg.Config)
 	}
+	// The GPU thresholds judge the cards this detection found, read with their
+	// vendor tools; without this the monitor had no GPU source at all.
+	thermalMonitor.SetDetectedGPUs(detectedGPUs)
 
 	// Run or load CPU benchmark for runtime estimation.
 	var benchFPOPS float64
@@ -647,6 +651,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.slotManager = NewSlotManager(maxSlots, d.logger)
 	d.slotManager.SetCPUShareSource(d.currentCPUShares)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+
+	// Pace this process's own transfers to the configured bandwidth limit
+	// before anything is downloaded or submitted; ApplyConfig keeps it live.
+	d.applyBandwidthLimit(d.cfg.ResourceLimits.MaxBandwidthMbps)
 
 	// Start resource monitor goroutine.
 	pauseCh := make(chan bool, 1)
@@ -3522,7 +3530,8 @@ func (d *Daemon) YieldSnapshot() runtime.YieldSnapshot {
 
 // ThermalCapability reports where this machine's CPU temperature comes from
 // (TB-77): as the thermal monitor detected when it started, or detected now
-// if the monitors have not started yet.
+// if the monitors have not started yet. The GPU source is known only once the
+// monitor has started; before that GPUSource is empty.
 func (d *Daemon) ThermalCapability() runtime.ThermalCapability {
 	if d.thermalMonitor != nil {
 		if cap := d.thermalMonitor.Capability(); cap.CPUSource != "" {
@@ -3530,6 +3539,17 @@ func (d *Daemon) ThermalCapability() runtime.ThermalCapability {
 		}
 	}
 	return runtime.ThermalCapabilityReader()
+}
+
+// ThermalReadings is what the thermal monitor's last poll read — the CPU and
+// GPU temperatures the pause thresholds were judged against, and the busiest
+// card's utilisation. All zero while thermal protection is off, since nothing
+// is read then, and before the first poll.
+func (d *Daemon) ThermalReadings() runtime.ThermalReadings {
+	if d.thermalMonitor == nil {
+		return runtime.ThermalReadings{}
+	}
+	return d.thermalMonitor.Readings()
 }
 
 // scheduleClosed reports whether the scheduler currently forbids running —
@@ -3689,6 +3709,7 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	d.initializeWeights()
 
 	if oldCfg == nil || oldCfg.ResourceLimits != newCfg.ResourceLimits || !reflect.DeepEqual(oldCfg.GPUOverrides, newCfg.GPUOverrides) {
+		d.applyBandwidthLimit(newCfg.ResourceLimits.MaxBandwidthMbps)
 		d.setAdvertisedResourceLimits()
 		hw := d.advertisedHardware()
 		d.logger.Info("resource limits changed: heads are told the new figures from the next poll, admission books against them now, and running tasks keep the ceilings they started with",
@@ -3715,6 +3736,29 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	if d.yieldMonitor != nil && (oldCfg == nil || oldCfg.Yield != newCfg.Yield) {
 		d.yieldMonitor.SetConfig(yieldMonitorConfig(newCfg.Yield))
 	}
+}
+
+// applyBandwidthLimit makes resource_limits.max_bandwidth_mbps the pace of the
+// transfers this process makes itself (netlimit): artifact, input-data and viz
+// downloads, result submission, checkpoints and every other RPC to a head,
+// each direction held to the figure separately. It takes effect on connections
+// already open. Image pulls are the container engine's own and are not
+// limited, which the log line says so a volunteer watching a pull at full
+// speed is not left guessing. Logged only when the figure changes.
+func (d *Daemon) applyBandwidthLimit(mbps int) {
+	if mbps < 0 {
+		mbps = 0
+	}
+	if netlimit.Mbps() == mbps {
+		return
+	}
+	netlimit.SetMbps(mbps)
+	if mbps == 0 {
+		d.logger.Info("network bandwidth limit removed: transfers run at the link's speed")
+		return
+	}
+	d.logger.Info("network bandwidth limited: this client's downloads, and separately its uploads, stay under the figure; container image pulls are made by the container engine and are not limited",
+		"max_bandwidth_mbps", mbps)
 }
 
 // yieldMonitorConfig maps the config file's yield block onto the monitor's
@@ -4160,6 +4204,15 @@ func (d *Daemon) SetMultiClientForTest(mc *MultiServerClient) {
 	d.multiClient = mc
 }
 
+// StartThermalMonitorForTest starts the daemon's thermal monitor as Run does,
+// polling every poll, so a test (here or in an external package such as
+// management) can see what it reads and signals without running the full
+// daemon loop. It stops with ctx.
+func (d *Daemon) StartThermalMonitorForTest(ctx context.Context, poll time.Duration) {
+	d.thermalMonitor.SetPollIntervalForTest(poll)
+	d.thermalMonitor.Start(ctx)
+}
+
 // RecordLeafFailureForTest drives the per-leaf failure breaker directly, so an
 // external test package (e.g. management) can assert that a recorded failure
 // reaches the API without running a work unit.
@@ -4508,7 +4561,9 @@ func (d *Daemon) retryPendingResults(ctx context.Context) {
 			continue
 		}
 
-		submitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		// A minute for the head, plus the time the stored request takes to
+		// upload under the volunteer's bandwidth limit, if one is set.
+		submitCtx, cancel := context.WithTimeout(ctx, netlimit.Allowance(60*time.Second, int64(len(pr.RequestProto)), 0))
 		resp, err := conn.Client.SubmitResult(submitCtx, &req)
 		cancel()
 		if err != nil {

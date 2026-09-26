@@ -626,6 +626,36 @@ Two consequences worth knowing:
 > so "2 cores" with two tasks used four. If you lowered the slider to work
 > around that, you can put it back.
 
+### Network bandwidth
+
+`resource_limits.max_bandwidth_mbps` (the **Network Bandwidth** slider in the
+desktop app) is the most network speed Lettuce uses, in megabits per second. It
+applies to each direction separately: everything the client downloads, together,
+stays under the figure, and everything it uploads, together, stays under it too.
+`0` (the slider's **Unlimited**) is the default and means no limit.
+
+```bash
+./lettuce-volunteer config set resource_limits.max_bandwidth_mbps 20
+```
+
+- **What it covers:** the program files and WebAssembly modules a leaf runs,
+  input data, visualization bundles, result uploads, checkpoints, and every
+  request to a head. The time limits on downloads and uploads stretch to match,
+  so a large file at a low limit is slow rather than a failure. Changed in the
+  app, the figure applies straight away, including to transfers already under
+  way; changed with `config set`, it applies when Lettuce next starts.
+- **What it does not cover:** **container image pulls.** The container engine
+  (Podman or Docker) downloads image layers itself, and neither offers a download
+  speed setting, so a container leaf's first unit — or any unit whose image is
+  referenced by tag rather than digest — pulls at your connection's speed. Nor
+  does it cover `lettuce-volunteer update`, the desktop app's own updates, or the
+  container engine's machine setup on Windows and macOS.
+- `lettuce-volunteer doctor` prints the figure in force. Heads are also told it,
+  for their information only.
+
+> **In earlier releases (through v0.13.1)** the setting was only reported to
+> heads; nothing limited a transfer by it.
+
 ### Thermal protection
 
 `lettuce-volunteer` watches CPU/GPU temperature and **freezes all work when the
@@ -642,8 +672,8 @@ thermal:
   enabled: true                # master switch for thermal protection
   cpu_pause_threshold: 85      # °C — freeze ALL work when the CPU reaches this
   cpu_resume_threshold: 75     # °C — resume once the CPU drops below this
-  gpu_pause_threshold: 80      # °C — freeze ALL work when the GPU reaches this
-  gpu_resume_threshold: 70     # °C — resume once the GPU drops below this
+  gpu_pause_threshold: 87      # °C — freeze ALL work when a GPU reaches this
+  gpu_resume_threshold: 77     # °C — resume once every GPU drops below this
   poll_interval_seconds: 10    # how often temperatures are sampled
   max_throttle_minutes: 30     # resume and re-check after this long frozen (negative = wait indefinitely)
 ```
@@ -659,13 +689,34 @@ thermal:
 > temperature cannot be read the CPU thresholds have **no effect**: the client says
 > so at start (`thermal protection cannot read this machine's CPU temperature` in
 > the log, a notice in the app, a `thermal` row in `lettuce-volunteer doctor`, and a
-> caption in the app's Thermal settings), the GPU thresholds still apply where
-> `nvidia-smi`/`rocm-smi` reports a temperature, and the hardware's own thermal
+> caption in the app's Thermal settings), and the hardware's own thermal
 > protection is unaffected. If you want the machine to back off under load rather
 > than heat, use *yield to other programs* below.
 
+> **Which machines can read the GPU temperature.** The client reads each GPU it
+> detected with the card maker's tool: `nvidia-smi` for NVIDIA cards (every
+> platform; it ships with the driver) and `rocm-smi` for AMD cards on Linux and
+> macOS — on Windows, AMD's tool asks for administrator rights, so the client does
+> not start it. On Linux, GPU sensors the kernel exposes (`amdgpu`, `gpu-thermal`
+> and similar) count too. An AMD card is judged by its *edge* temperature, the
+> figure comparable with NVIDIA's. Where no GPU temperature can be read — no GPU,
+> an Apple GPU, an AMD card on Windows — the GPU thresholds have no effect, and
+> the log, the `thermal` row in `doctor` and the app's Thermal settings (which
+> then disable the GPU fields) say so.
+
+> **GPU defaults changed.** New configurations pause at 87 °C and resume below
+> 77 °C, above the temperature a busy card holds by design, so a GPU doing normal
+> work is not paused. In earlier releases (through v0.13.1) the GPU thresholds had
+> no effect at all, and configurations written then keep the old 80/70 °C, which
+> many cards reach under sustained load. If you run GPU work, check the values —
+> the GPU fields in the app's Thermal settings, or
+> `lettuce-volunteer config set thermal.gpu_pause_threshold 87` and then
+> `lettuce-volunteer config set thermal.gpu_resume_threshold 77` (pause first:
+> each `config set` is validated on its own) — and restart Lettuce.
+
 > **Which sensors these apply to.** The CPU thresholds are compared against CPU
-> sensors only, and the GPU thresholds against GPU sensors only. Machines expose
+> sensors only, and the GPU thresholds against GPU readings only (the card maker's
+> tool, and Linux GPU sensors). Machines expose
 > plenty of other temperatures — the SSD, the WiFi chip, the chipset — and those
 > run hot by design, so judging them against a CPU's danger point would freeze
 > your work while your CPU was perfectly cool. They are still honoured, but only

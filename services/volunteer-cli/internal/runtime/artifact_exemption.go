@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lettuce-compute/volunteer-cli/internal/netlimit"
 )
 
 // Local-testing opt-in for the artifact netguard (PB-6).
@@ -87,7 +89,8 @@ var (
 
 // unguardedArtifactClient is NewGuardedHTTPClient without the netguard dial
 // screen — every other property (no env proxy, bounded redirects, timeouts,
-// connection limits) is kept identical so the opt-in relaxes exactly one thing.
+// connection limits, bandwidth pacing) is kept identical so the opt-in relaxes
+// exactly one thing.
 func unguardedArtifactClient() *http.Client {
 	unguardedClientOnce.Do(func() {
 		unguardedClient = &http.Client{
@@ -95,10 +98,10 @@ func unguardedArtifactClient() *http.Client {
 			CheckRedirect: boundedRedirect,
 			Transport: &http.Transport{
 				Proxy: nil, // never ProxyFromEnvironment; parity with the guarded client
-				DialContext: (&net.Dialer{
+				DialContext: netlimit.DialContext((&net.Dialer{
 					Timeout:   10 * time.Second,
 					KeepAlive: 30 * time.Second,
-				}).DialContext,
+				}).DialContext),
 				ForceAttemptHTTP2:     true,
 				MaxIdleConns:          100,
 				IdleConnTimeout:       90 * time.Second,

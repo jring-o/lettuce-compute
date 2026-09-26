@@ -652,8 +652,9 @@ export function OverviewPage() {
       )}
 
       {/* Machine gauges: CPU and memory are measured by the app itself (the
-          daemon reports zeros for them); disk is the daemon's own footprint
-          against its allowance. */}
+          daemon reports zeros for them); the CPU temperature is the daemon's
+          thermal monitor's reading, shown where one is read; disk is the
+          daemon's own footprint against its allowance. */}
       {(system || metrics) && (
         <div className="space-y-3">
           <h2 className="text-sm font-medium text-muted-foreground">Resources</h2>

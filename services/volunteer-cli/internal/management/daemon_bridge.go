@@ -408,15 +408,26 @@ type MetricsResponse struct {
 	DiskUsedMB      int64 `json:"disk_used_mb"`
 	DiskAllowanceMB int64 `json:"disk_allowance_mb"`
 	DiskUsageKnown  bool  `json:"disk_usage_known"`
-	CPUTempC        int   `json:"cpu_temp_c"`
-	GPUTempC        int   `json:"gpu_temp_c"`
+	// The temperatures and GPUUsagePct are the thermal monitor's last reading
+	// (Daemon.ThermalReadings) — the same figures the pause thresholds are
+	// judged against, not a second sample: the app polls every few seconds
+	// and a GPU reading starts a process. 0 means not read: this machine
+	// exposes no such sensor, or thermal protection is off, when nothing is
+	// read at all.
+	CPUTempC int `json:"cpu_temp_c"`
+	GPUTempC int `json:"gpu_temp_c"`
 }
 
-// GetMetrics returns current resource usage metrics. The CPU/GPU/memory/
-// temperature fields still require platform-specific collection and remain
-// zero until that is integrated.
+// GetMetrics returns current resource usage metrics. CPUUsagePct and the
+// memory figures are not measured by the daemon and stay zero; the desktop app
+// takes them from its own host metrics.
 func (b *DaemonBridge) GetMetrics() MetricsResponse {
-	resp := MetricsResponse{}
+	readings := b.daemon.ThermalReadings()
+	resp := MetricsResponse{
+		CPUTempC:    readings.CPUTempC,
+		GPUTempC:    readings.GPUTempC,
+		GPUUsagePct: float64(readings.GPUUsePct),
+	}
 	usedMB, allowanceMB, ok := b.daemon.DiskUsage()
 	resp.DiskAllowanceMB = allowanceMB
 	resp.DiskUsageKnown = ok
@@ -1214,6 +1225,14 @@ type MachineCapabilities struct {
 	CPUTempReadable bool   `json:"cpu_temp_readable"`
 	CPUTempDetail   string `json:"cpu_temp_detail"`
 	CPUTempRemedy   string `json:"cpu_temp_remedy,omitempty"`
+	// The same for the GPU thresholds: GPUTempSource is "nvidia-smi",
+	// "rocm-smi", "sysfs", a "+"-joined combination, "none", or "" while the
+	// thermal monitor has not started (not yet known). GPUTempReadable false
+	// with a source means the GPU thresholds have no effect on this machine;
+	// GPUTempDetail says which cards are read, or why none is.
+	GPUTempSource   string `json:"gpu_temp_source"`
+	GPUTempReadable bool   `json:"gpu_temp_readable"`
+	GPUTempDetail   string `json:"gpu_temp_detail"`
 	// Whether the yield monitor can measure other programs' CPU use here
 	// (TB-83). Reported as true while the monitor is off (nothing has tried);
 	// false only once sampling has actually failed, with YieldUnavailable
@@ -1260,6 +1279,9 @@ func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 		CPUTempReadable:        thermal.CPUReadable,
 		CPUTempDetail:          thermal.Detail,
 		CPUTempRemedy:          thermal.Remedy,
+		GPUTempSource:          thermal.GPUSource,
+		GPUTempReadable:        thermal.GPUReadable,
+		GPUTempDetail:          thermal.GPUDetail,
 		YieldMeasurable:        !yield.Enabled || yield.Measurable,
 		YieldUnavailable:       yield.Unavailable,
 	}
