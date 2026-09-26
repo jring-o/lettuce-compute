@@ -1,8 +1,8 @@
 package runtime
 
-// ThermalCapability says where this machine's CPU temperature comes from — or
-// that it comes from nowhere, which the thermal monitor's threshold check
-// otherwise treats exactly like "the CPU is cool" (TB-77).
+// ThermalCapability says where this machine's CPU and GPU temperatures come
+// from — or that they come from nowhere, which the thermal monitor's threshold
+// check otherwise treats exactly like "the part is cool" (TB-77).
 //
 // A reading of 0 has always meant "unknown" to the monitor: it can never pause
 // work, and it silently keeps a paused daemon paused only by the GPU or a

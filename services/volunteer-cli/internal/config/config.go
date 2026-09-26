@@ -930,7 +930,7 @@ var topLevelConfigComments = map[string]string{
 }
 
 var resourceLimitsComments = map[string]string{
-	"max_cpu_cores":      "Most CPU cores Lettuce uses on this machine, in total. Running tasks share them equally (one task alone gets all of them, two get half each) and each task books at least one core, more if its leaf needs more, so at most this many tasks run at once whatever max_concurrent_tasks says. On Windows/macOS container work is also limited to the container engine VM's CPUs.",
+	"max_cpu_cores":      "Most CPU cores Lettuce uses on this machine, in total. Running tasks share them equally (a task alone gets them all) and each task books at least one core, more if its leaf needs more, so at most this many tasks run at once whatever max_concurrent_tasks says. On Windows/macOS container work is also limited to the container engine VM's CPUs.",
 	"max_memory_mb":      "Most memory Lettuce's running work may use, in total: a unit starts only if its declared memory fits beside what is already running. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
 	"max_disk_gb":        "Disk capacity you offer: a head only sends leafs whose declared disk need fits under this, and Lettuce keeps its own footprint (work folders + container images) within it. A download needs only the LEAF's declared disk free (plus a 2 GB floor), never this whole number.",
 	"max_bandwidth_mbps": "Most network speed Lettuce uses, in Mbps: its downloads together stay under this (programs, input data, checkpoints), and so do its uploads (results, checkpoints). Container image pulls are made by the container engine and are NOT limited. 0 = unlimited.",
