@@ -216,7 +216,7 @@ describe("HeadSection", () => {
     expect(screen.getByText("https://lettuce.science")).toBeInTheDocument();
   });
 
-  it("Use Defaults button calls onResetDefaults", async () => {
+  it("Use Leaf Defaults button calls onResetDefaults and says the head's weight is kept", async () => {
     const user = userEvent.setup();
     const onResetDefaults = vi.fn();
 
@@ -228,8 +228,44 @@ describe("HeadSection", () => {
       />
     );
 
-    await user.click(screen.getByText("Use Defaults"));
+    const button = screen.getByRole("button", { name: "Use Leaf Defaults" });
+    expect(button).toHaveAttribute("title", expect.stringContaining("The head's own weight is kept"));
+    await user.click(button);
     expect(onResetDefaults).toHaveBeenCalledOnce();
+  });
+
+  // The CLI takes any positive weight (`heads weight <head> 200`). The range
+  // used to stop at 100, so a 200 sat pinned at the end and the first move
+  // wrote 100 or less over it.
+  it("shows a weight above 100 set from the CLI where it is, and keeps the range as it is dragged down", () => {
+    const onHeadWeightChange = vi.fn();
+    const head = makeHead({
+      weight: 200,
+      leafs: [makeLeaf({ effective_weight: 200 }), makeLeaf({ id: "leaf-2", slug: "mandelbrot", effective_weight: 50 })],
+    });
+    const { rerender } = render(
+      <HeadSection head={head} {...defaultProps} onHeadWeightChange={onHeadWeightChange} />
+    );
+
+    const [headSlider, leafSlider, otherLeaf] = screen.getAllByRole("slider") as HTMLInputElement[];
+    expect(headSlider.value).toBe("200");
+    expect(Number(headSlider.max)).toBeGreaterThanOrEqual(200);
+    expect(leafSlider.value).toBe("200");
+    expect(Number(leafSlider.max)).toBeGreaterThanOrEqual(200);
+    expect(otherLeaf.value).toBe("50");
+    expect(otherLeaf.max).toBe("100");
+    expect(onHeadWeightChange).not.toHaveBeenCalled();
+
+    rerender(<HeadSection head={{ ...head, weight: 150 }} {...defaultProps} onHeadWeightChange={onHeadWeightChange} />);
+    const moved = screen.getAllByRole("slider")[0] as HTMLInputElement;
+    expect(moved.value).toBe("150");
+    expect(moved.max).toBe("200");
+  });
+
+  it("says under each weight slider that the number is a share of compute time", () => {
+    render(<HeadSection head={makeHead()} {...defaultProps} />);
+    expect(screen.getByText(/this head's share of this machine's compute time/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/this leaf's share of the head's compute time/i)).toHaveLength(2);
   });
 
   it("shows leaf weight sliders when 2+ enabled leafs", () => {

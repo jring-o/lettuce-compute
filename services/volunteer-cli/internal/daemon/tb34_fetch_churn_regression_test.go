@@ -100,7 +100,7 @@ func TestTB34_ReturnedTailCapsNextAsk(t *testing.T) {
 	d := newFetcherTestDaemon(servers)
 	queue := NewPreFetchQueue(16, d.logger)
 	f := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
-	f.batchSizeFn = func(CachedLeafInfo, float64) int32 { return 64 }
+	f.batchSizeFn = func(CachedLeafInfo, float64, float64) int32 { return 64 }
 	// Accept the first arrival of each round, refuse the rest — the arrival guard's
 	// shape when a batch overshoots the target.
 	acceptedThisRound := 0
@@ -113,7 +113,7 @@ func TestTB34_ReturnedTailCapsNextAsk(t *testing.T) {
 	}
 
 	leaf := CachedLeafInfo{ID: "leaf-1", Slug: "leaf-1", Name: "Leaf One", State: "ACTIVE"}
-	pushed, stop := f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil)
+	pushed, stop := f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil, 1)
 	if stop || pushed != 1 {
 		t.Fatalf("round 1: pushed=%d stop=%v, want pushed=1 (tail of 2 returned)", pushed, stop)
 	}
@@ -122,7 +122,7 @@ func TestTB34_ReturnedTailCapsNextAsk(t *testing.T) {
 	}
 
 	acceptedThisRound = 0
-	if _, _ = f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil); len(askedMax) != 2 {
+	if _, _ = f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil, 1); len(askedMax) != 2 {
 		t.Fatalf("expected a second RequestWorkUnit, got %d calls", len(askedMax))
 	}
 	if askedMax[0] != 64 {

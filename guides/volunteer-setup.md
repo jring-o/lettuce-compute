@@ -884,11 +884,23 @@ expression are present, the window wins.
 
 ## Choosing what you work on
 
-By default your volunteer spreads work across every head you've attached and
-every leaf each head offers, in proportion to how far behind each one is. You
-can nudge those proportions — or opt out of specific leafs — with two command
-groups. Both write to `~/.lettuce/config.yaml` and take effect on the **next
-daemon start**.
+By default your volunteer shares your machine's compute time equally across
+every head you've attached, and each head's time across the leafs it offers
+(equally, unless the head sets different default weights for them). You can
+change those shares — or opt out of specific leafs — with two
+command groups. Both write to `~/.lettuce/config.yaml` and take effect on the
+**next daemon start**. The desktop app's Projects page sets the same weights with
+its sliders, and applies them at once.
+
+A weight is a **share of compute time**, not of the number of tasks. The
+volunteer books every unit it fetches at the time the unit is expected to take
+on this machine (corrected to the time it actually took once it finishes), asks
+first the head and leaf furthest below their share, and asks each for its share
+of the work buffer rather than the whole buffer at once. So a leaf whose units run
+for 50 minutes and one whose units run for 10 minutes, at equal weights, each get
+about half your machine's time. The balance is kept over roughly the last day:
+older work counts for less and less, and a restart continues it from the local
+run history.
 
 ### Prioritize a head
 
@@ -900,30 +912,37 @@ of them:
 ./lettuce-volunteer heads weight lbry.science 200
 ```
 
-Heads are picked by how far each is below its target share, so a head at weight
-`200` receives roughly twice the share of one at the default `100`. Weight is a
-*ratio*, not a cap — a higher number just means "send more of my work here."
+A head at weight `200` gets about twice the compute time of one at the default
+`100`. Weight is a *ratio*, not a cap: a higher number just means "spend more of
+my machine's time here", and a head with no work for your machine takes none
+while the others share its time.
 
 ### Prioritize, enable, or disable leafs
 
-Within a head you can do the same per leaf, and opt a leaf in or out entirely:
+Within a head you can do the same per leaf, and opt a leaf in or out entirely. A
+leaf's weight is its share of its head's compute time; a leaf with no weight of
+yours uses the head's default for it (usually `100`):
 
 ```bash
 ./lettuce-volunteer leafs list                  # leafs across your heads + their state
-./lettuce-volunteer leafs weight beyblade-arena 200   # more of this leaf
+./lettuce-volunteer leafs weight beyblade-arena 200   # twice the time of a leaf at 100
 ./lettuce-volunteer leafs disable some-leaf     # never run this one
 ./lettuce-volunteer leafs enable some-leaf      # run it again
-./lettuce-volunteer leafs reset                 # back to the head's defaults
+./lettuce-volunteer leafs reset                 # every leaf on, no leaf weights
 ```
 
 Add `--server <name>` to any `leafs` command to scope it to one head; omit it to
 apply across all of them. Disabling every leaf of a head is allowed: the head stays
 attached and is simply asked for no work until you enable one again (the desktop
-app's leaf checkboxes work the same way).
+app's leaf checkboxes work the same way). In the app, **Use Leaf Defaults** under a
+head does what `leafs reset --server <that head>` does. Neither changes the head's
+own weight.
 
-> **Capability still wins.** These preferences only re-rank work you can already
-> run — they can't make you eligible for a leaf your machine can't handle (e.g. a
-> GPU leaf on a GPU-less box). Use `doctor` to see what you're eligible for.
+> **Capability still wins.** Weights and these preferences only steer which work is
+> fetched among what your machine can already run — they can't make you eligible
+> for a leaf your machine can't handle (e.g. a GPU leaf on a GPU-less box, or a leaf
+> whose units need more memory than your limit allows). Use `doctor` to see what
+> you're eligible for.
 
 ## Updating
 

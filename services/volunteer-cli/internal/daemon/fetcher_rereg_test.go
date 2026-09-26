@@ -53,7 +53,7 @@ func TestFetcher_HostUnknownRefusal_RoutesToReRegister(t *testing.T) {
 		return "fresh-id", nil
 	}
 
-	pushed, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil)
+	pushed, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil, 1)
 
 	if calls != 1 {
 		t.Fatalf("reRegisterFn calls = %d, want 1 (host-unknown must route to re-register, not the too-old path)", calls)
@@ -87,7 +87,7 @@ func TestFetcher_HostUnknownRefusal_AdoptsEmptyReRegister(t *testing.T) {
 	fetcher := newReRegTestFetcher(t, head)
 	fetcher.reRegisterFn = func(_ context.Context, _ *ServerConnection) (string, error) { return "", nil }
 
-	_, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil)
+	_, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil, 1)
 	if !stop {
 		t.Error("stop = false, want true")
 	}
@@ -114,7 +114,7 @@ func TestFetcher_HostUnknownRefusal_ReRegisterFailureBacksOff(t *testing.T) {
 		return "", fmt.Errorf("head down")
 	}
 
-	_, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil)
+	_, stop := fetcher.requestAndBuffer(context.Background(), head, reRegTestLeaf, []string{"leaf-1"}, nil, 1)
 	if !stop {
 		t.Error("stop = false, want true")
 	}

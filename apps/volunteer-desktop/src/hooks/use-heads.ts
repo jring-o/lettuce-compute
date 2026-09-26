@@ -282,33 +282,37 @@ export function useDebouncedHeadWeight(): {
   return { write };
 }
 
-// Debounced write — for leaf weight sliders. `head` carries the leaf list
-// the weights and enabled set are derived from.
+// Debounced write — for leaf weight sliders. Only the leafs the volunteer
+// moved are written: every other saved weight (one set from the CLI, say) is
+// kept as the daemon holds it, and a leaf on its head's default stays on it
+// rather than being pinned at the default's current value. Moves on several
+// sliders inside one debounce window are all written.
 export function useDebouncedLeafWeight(): {
-  write: (head: HeadInfo, leafSlug: string, weight: number) => void;
+  write: (head: HeadRef, leafSlug: string, weight: number) => void;
 } {
   const { client } = useClient();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef(new Map<string, { head: HeadRef; weights: Record<string, number> }>());
 
   const write = useCallback(
-    (head: HeadInfo, leafSlug: string, weight: number) => {
+    (head: HeadRef, leafSlug: string, weight: number) => {
       if (!client) return;
+      const pending = pendingRef.current.get(head.grpc_address) ?? { head, weights: {} };
+      pending.weights[leafSlug] = weight;
+      pendingRef.current.set(head.grpc_address, pending);
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(async () => {
-        const weights: Record<string, number> = {};
-        for (const leaf of head.leafs) {
-          weights[leaf.slug] = leaf.slug === leafSlug ? weight : leaf.effective_weight;
+        const moves = [...pendingRef.current.values()];
+        pendingRef.current.clear();
+        for (const { head: target, weights } of moves) {
+          await writeServerConfig(client, target, (s) => ({
+            ...s,
+            leaf_preferences: {
+              ...s.leaf_preferences,
+              weights: { ...s.leaf_preferences?.weights, ...weights },
+            },
+          }));
         }
-        const enabledSlugs = head.leafs.filter((l) => l.enabled).map((l) => l.slug);
-
-        await writeServerConfig(client, head, (s) => ({
-          ...s,
-          leaf_preferences: {
-            mode: enabledSlugs.length === head.leafs.length ? "ALL" : "SPECIFIC",
-            weights,
-            enabled: enabledSlugs.length === head.leafs.length ? undefined : enabledSlugs,
-          },
-        }));
       }, 300);
     },
     [client]

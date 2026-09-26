@@ -140,26 +140,30 @@ export function ProjectsPage() {
         )
       );
 
-      // Debounced write for continuous slider input, from the leaf list as
-      // rendered (it already carries this slider's earlier moves).
+      // Debounced write for continuous slider input: this leaf's weight only.
       writeLeafWeight(head, leafSlug, weight);
     },
     [setHeads, writeLeafWeight]
   );
 
+  // Every leaf on, and no leaf weights: the head's defaults, as `leafs reset`
+  // does. The empty map is what clears the saved weights — a body without
+  // `weights` keeps them. The head publishes each leaf's default weight, so
+  // the page shows what the daemon reads back rather than assuming 100.
   const handleResetDefaults = useCallback(
     (head: HeadInfo) => {
-      // Update local state immediately
-      setHeads((prev) =>
-        prev.map((h) =>
-          h.grpc_address === head.grpc_address
-            ? { ...h, leafs: h.leafs.map((l) => ({ ...l, enabled: true, effective_weight: 100 })) }
-            : h
-        )
-      );
-      writeLeafPrefs(head, { mode: "ALL" });
+      writeLeafPrefs(head, { mode: "ALL", weights: {} })
+        .then(() => refetch())
+        .catch((err: unknown) => {
+          setToastType("error");
+          setToast(
+            err instanceof Error
+              ? `Failed to reset leaf preferences: ${err.message}`
+              : "Failed to reset leaf preferences"
+          );
+        });
     },
-    [setHeads, writeLeafPrefs]
+    [writeLeafPrefs, refetch]
   );
 
   // `useWriteHeadTrust` records the pending restart itself (trust is read

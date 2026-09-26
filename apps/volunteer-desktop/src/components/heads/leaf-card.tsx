@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { emit } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Slider } from "@/components/ui/slider";
 import { cn, formatExactMb } from "@/lib/utils";
+import { WeightSlider } from "./weight-slider";
 import type { LeafInfo, ContainerRuntimeStatus, MachineCapabilities } from "@/api/client";
 import {
   leafRuntimes,
@@ -298,15 +298,11 @@ export function LeafCard({
         </div>
       </div>
       {showWeightSlider && leaf.enabled && (
-        <div className="pl-7 space-y-1">
-          <div className="flex justify-between text-xs text-muted-foreground">
-            <span>Weight</span>
-            <span>{leaf.effective_weight}</span>
-          </div>
-          <Slider
-            min={1}
-            max={100}
+        <div className="pl-7">
+          <WeightSlider
+            label="Weight"
             value={leaf.effective_weight}
+            caption="This leaf's share of the head's compute time on this machine, against the other enabled leafs' weights."
             onChange={onWeightChange}
           />
         </div>

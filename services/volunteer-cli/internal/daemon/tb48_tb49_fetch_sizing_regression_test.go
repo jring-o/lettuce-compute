@@ -132,7 +132,7 @@ func TestTB48_GPULeafAskSizedByGPUDeficit(t *testing.T) {
 		{CachedLeafInfo{ID: "cpu-3h", Slug: "cpu-3h", EstimatedDurationSeconds: 10800},
 			5, "16 h global target ÷ 3 h per unit — CPU leafs keep the slot-count target"},
 	} {
-		f.requestAndBuffer(context.Background(), head, tc.leaf, []string{tc.leaf.ID}, nil)
+		f.requestAndBuffer(context.Background(), head, tc.leaf, []string{tc.leaf.ID}, nil, 1)
 		mu.Lock()
 		got, seen := asked[tc.leaf.ID]
 		mu.Unlock()

@@ -186,7 +186,7 @@ func TestTB84_FleetRoundKeepsWhatItAsksFor(t *testing.T) {
 	f := NewFetcher(d, d.prefetchQueue, d.weightedSelector, d.leafCache)
 
 	leaf := CachedLeafInfo{ID: "leaf-1", Slug: "leaf-1", Name: "Leaf One", State: "ACTIVE"}
-	pushed, stop := f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil)
+	pushed, stop := f.requestAndBuffer(context.Background(), servers[0], leaf, []string{leaf.ID}, nil, 1)
 	if stop {
 		t.Fatal("round stopped")
 	}

@@ -499,6 +499,16 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	leafCache := NewLeafCache(5*time.Minute, cfg.Logger)
 	ws := NewWeightedSelector()
 
+	// The weights' balance of compute time continues from the runs history.jsonl
+	// recorded recently, so a restart does not begin a new race between the
+	// heads and leaves; nothing else about it is kept across restarts.
+	if entries, err := ReadAllHistory(cfg.Config.DataDir); err != nil {
+		cfg.Logger.Warn("weights: could not read the run history; the compute-time balance starts empty", "error", err)
+	} else {
+		cfg.Logger.Info("weights: compute-time balance continued from recent history",
+			"runs", ws.SeedFromHistory(entries), "window", weightBalanceWindow.String(), "half_life", weightBalanceHalfLife.String())
+	}
+
 	// Initialize head weights from config.
 	headWeights := make(map[string]int, len(cfg.Config.Servers))
 	for _, srv := range cfg.Config.Servers {
@@ -2523,12 +2533,25 @@ func (d *Daemon) bufferedUnitCount() int {
 // A container leaf whose units the container engine's VM runs fewer of at once
 // than there are slots is bounded the same way by the container class.
 func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64) int32 {
+	return d.requestShareBatchSize(leaf, estSecondsPerUnit, 1)
+}
+
+// requestShareBatchSize is requestBatchSize for the part of the buffer the head
+// and leaf weights give this request: share of the hours deficit (of the
+// unit-count headroom when nothing estimates a unit's length), so the leaves
+// of a head, and the heads, fill the buffer interleaved in proportion to their
+// weights instead of the first one asked taking all of it. The GPU and
+// container classes still bound the ask by their own deficits.
+func (d *Daemon) requestShareBatchSize(leaf CachedLeafInfo, estSecondsPerUnit, share float64) int32 {
+	if share <= 0 || share > 1 {
+		share = 1
+	}
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
 		// Buffering disabled (hours == 0): unit-count fallback, one at a time.
 		return 1
 	}
-	deficit := target - d.bufferedSeconds()
+	deficit := (target - d.bufferedSeconds()) * share
 	gpu := leafRequiresGPU(leaf)
 	if gpu {
 		if gpuDeficit := d.gpuBufferTargetSeconds() - d.bufferedGPUSeconds(); gpuDeficit < deficit {
@@ -2569,7 +2592,7 @@ func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64
 				headroom = h
 			}
 		}
-		return clampBatch(int32(headroom))
+		return clampBatch(int32(float64(headroom) * share))
 	}
 	return clampBatch(int32(deficit / per))
 }
@@ -4731,8 +4754,17 @@ func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpu
 }
 
 // writeHistory appends one history entry; outcome is empty or one of the
-// HistoryOutcome values.
+// HistoryOutcome values. The run's active seconds replace its estimate in the
+// weights' balance, whatever the head made of the result: the run used the
+// machine's time.
 func (d *Daemon) writeHistory(wu *runtime.WorkUnit, wallClockSeconds, cpuSeconds int64, accepted bool, outcome, serverName string) {
+	if d.weightedSelector != nil {
+		ran := cpuSeconds
+		if ran <= 0 {
+			ran = wallClockSeconds
+		}
+		d.weightedSelector.RecordCompletion(serverName, wu.LeafID, wu.ID, float64(ran))
+	}
 	leafName, _ := d.resolveLeafInfo(wu.LeafID)
 	if leafName == wu.LeafID {
 		leafName = ""

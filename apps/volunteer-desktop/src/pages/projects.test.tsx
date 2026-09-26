@@ -245,18 +245,26 @@ describe("ProjectsPage", () => {
     expect(weightLabels.length).toBe(2);
   });
 
-  it("Use Defaults button resets leaf preferences", async () => {
+  // The defaults button puts the head's leafs back where `leafs reset` does:
+  // every leaf on and no leaf weights. It used to send `{ mode: "ALL" }` alone,
+  // which the daemon reads as "keep the weights", so every weight stayed in
+  // config.yaml, kept steering fetching and came back on the next refresh,
+  // while the page showed 100 everywhere. The page now re-reads what the
+  // daemon holds instead of assuming 100.
+  it("the leaf defaults button clears the leaf weights and re-reads the heads", async () => {
     const user = userEvent.setup();
 
     render(<ProjectsPage />);
 
-    const defaultBtns = screen.getAllByText("Use Defaults");
+    const defaultBtns = screen.getAllByRole("button", { name: /^Use (Leaf )?Defaults$/ });
     await user.click(defaultBtns[0]);
 
     expect(mockWriteLeafPrefs).toHaveBeenCalledWith(
       expect.objectContaining({ name: "lettuce.science", grpc_address: "lettuce.science:443" }),
-      { mode: "ALL" }
+      { mode: "ALL", weights: {} }
     );
+    await waitFor(() => expect(mockRefetch).toHaveBeenCalled());
+    expect(mockSetHeads).not.toHaveBeenCalled();
   });
 
   it("Add Server button opens dialog", async () => {
@@ -587,8 +595,8 @@ describe("ProjectsPage", () => {
     await user.click(screen.getAllByRole("checkbox")[0]);
     expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "SPECIFIC", enabled: ["mandelbrot"] });
 
-    await user.click(screen.getByText("Use Defaults"));
-    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "ALL" });
+    await user.click(screen.getByText("Use Leaf Defaults"));
+    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "ALL", weights: {} });
 
     await user.click(screen.getByText("Detach"));
     await user.click(screen.getByText("Confirm"));

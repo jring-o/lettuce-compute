@@ -78,11 +78,12 @@ anything long-running.
    ./lettuce-volunteer start
    ```
 
-Attach to as many heads as you like. Each gets a weight, and the client keeps their shares balanced
-over time; leafs are ranked the same way within a head. Weights are ratios, not caps.
+Attach to as many heads as you like. Each gets a weight, a share of your machine's compute time that
+the client keeps balanced over time, however long each head's tasks run; leafs share their head's
+time the same way. Weights are ratios, not caps.
 
 ```bash
-./lettuce-volunteer heads weight head.example.com 200     # twice the share
+./lettuce-volunteer heads weight head.example.com 200     # twice the compute time
 ./lettuce-volunteer leafs disable some-leaf               # never take this one
 ./lettuce-volunteer schedule set --from 20:00 --to 06:00  # overnight only
 ```

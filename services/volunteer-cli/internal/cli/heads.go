@@ -73,10 +73,14 @@ func newHeadsWeightCmd() *cobra.Command {
 		Short: "Set this volunteer's fetch-priority weight for a head",
 		Long: `Set this volunteer's local fetch-priority weight for a configured head.
 
-Heads are selected in deficit order across their weights, so a head with
-weight 200 receives roughly twice the share of your work as one with weight
-100 (the default). Use ` + "`lettuce-volunteer heads list`" + ` to see the
-configured head names.
+A weight is a share of this machine's compute time. The client books every
+unit it fetches at the time the unit is expected to take here, and asks first
+the head furthest behind its share, so a head at weight 200 gets about twice
+the compute time of one at 100 (the default), however long each head's units
+run. The balance is kept over roughly the last day, and a restart continues
+it. Weights are ratios, not caps: a head with no work for this machine takes
+none, and the others share its time. Use ` + "`lettuce-volunteer heads list`" + `
+to see the configured head names.
 
 The change is saved to config.yaml and takes effect on the next daemon start.`,
 		Args: cobra.ExactArgs(2),

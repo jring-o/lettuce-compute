@@ -764,8 +764,9 @@ func TestFetcher_ZeroRequestsWhenBufferFull(t *testing.T) {
 }
 
 // TestFetcher_BatchPushesAllAndRecordsEach: a single RequestWorkUnit that returns
-// N assignments must push N descriptors into the buffer and record N assignments
-// with the selector (RecordAssignment once per unit).
+// N assignments must push N descriptors into the buffer and book N units with
+// the selector (RecordAssignment once per unit; with nothing estimating these
+// units' length, each is booked at unknownUnitSeconds).
 func TestFetcher_BatchPushesAllAndRecordsEach(t *testing.T) {
 	const batch = 3
 	served := false
@@ -804,9 +805,10 @@ func TestFetcher_BatchPushesAllAndRecordsEach(t *testing.T) {
 	if got := queue.Len(); got != batch {
 		t.Errorf("queue length = %d, want %d (every assignment in the batch buffered)", got, batch)
 	}
-	// RecordAssignment increments the selector's assigned count per unit.
-	if got := d.weightedSelector.AssignedCount("server-a", "leaf-1"); got != batch {
-		t.Errorf("RecordAssignment count = %d, want %d (once per buffered unit)", got, batch)
+	// RecordAssignment books every buffered unit to the leaf the request named
+	// (on the real clock, so the booking has faded a hair by the time it is read).
+	if got := d.weightedSelector.BookedSeconds("server-a", "leaf-1"); got < batch*unknownUnitSeconds-1 || got > batch*unknownUnitSeconds {
+		t.Errorf("booked seconds = %g, want %g (once per buffered unit)", got, batch*unknownUnitSeconds)
 	}
 }
 

@@ -522,7 +522,7 @@ func TestSelectHead_DefaultWeight(t *testing.T) {
 			t.Fatal("expected non-nil head")
 		}
 		counts[head.Name]++
-		ws.RecordAssignment(head.Name, "leaf")
+		ws.RecordAssignment(head.Name, "leaf", "", 600)
 	}
 
 	// Both should get roughly 50 (both default to 100 weight).
