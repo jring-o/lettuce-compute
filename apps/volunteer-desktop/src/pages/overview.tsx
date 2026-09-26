@@ -526,7 +526,7 @@ export function OverviewPage() {
               Resume
             </Button>
           )}
-          {isPaused && !canResume && pausedReason === "scheduled" && (
+          {isPaused && !canResume && (pausedReason === "scheduled" || pausedReason === "idle_unknown") && (
             <Button variant="outline" size="sm" onClick={() => emit("navigate:settings")}>
               Change schedule
             </Button>

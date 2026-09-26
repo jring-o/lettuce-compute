@@ -32,13 +32,16 @@ fn load_tray_icon(state: &TrayState) -> Image<'static> {
 }
 
 /// Human wording for the daemon's `paused_reason`. "scheduled" means outside
-/// the configured computing hours; "busy" means other programs are using
-/// more of the CPU than the yield setting allows (TB-83); other reasons are
-/// shown as sent so an unfamiliar value is still visible.
+/// the configured computing hours; "idle_unknown" means a When Idle schedule
+/// on a computer whose idle time cannot be read, which never ends on its own;
+/// "busy" means other programs are using more of the CPU than the yield
+/// setting allows (TB-83); other reasons are shown as sent so an unfamiliar
+/// value is still visible.
 fn paused_text(reason: Option<&str>) -> String {
     match reason {
         None | Some("") => "Paused".into(),
         Some("scheduled") => "Paused — outside your schedule".into(),
+        Some("idle_unknown") => "Paused — can't tell when this computer is idle".into(),
         Some("busy") => "Paused — your computer is busy".into(),
         Some(other) => format!("Paused — {other}"),
     }
@@ -395,6 +398,15 @@ mod tests {
         );
         assert_eq!(status_text(&status("paused", None)), "Paused");
         assert_eq!(status_text(&status("paused", Some(""))), "Paused");
+    }
+
+    #[test]
+    fn unreadable_idle_time_is_not_called_a_schedule_pause() {
+        assert_eq!(
+            status_text(&status("paused", Some("idle_unknown"))),
+            "Paused — can't tell when this computer is idle"
+        );
+        assert_ne!(pause_menu(&status("paused", Some("idle_unknown"))).0, "Resume");
     }
 
     #[test]

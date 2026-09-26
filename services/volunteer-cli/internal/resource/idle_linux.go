@@ -3,31 +3,50 @@
 package resource
 
 import (
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
 )
 
+// IdleDetectionRemedy says what makes this computer's idle time readable
+// when GetIdleSeconds cannot read it.
+const IdleDetectionRemedy = "install xprintidle (X11 desktops), or run Lettuce inside a desktop session that provides the org.freedesktop.ScreenSaver idle time"
+
 // GetIdleSeconds returns the number of seconds since the last user input.
-// On Linux, it tries D-Bus ScreenSaver API first, then xprintidle.
-// Returns 0 (never idle) if detection fails — safe fallback that keeps the
-// daemon paused in WHEN_IDLE mode.
+// On Linux, it tries the D-Bus ScreenSaver API first, then xprintidle. When
+// neither answers — a headless machine, a daemon started over SSH or as a
+// service, a desktop without either — it returns an error wrapping
+// ErrIdleUnknown; the scheduler then treats the machine as not idle and says
+// why.
 func GetIdleSeconds() (int, error) {
-	// Try D-Bus org.freedesktop.ScreenSaver.GetSessionIdleTime.
-	if ms, err := dbusIdleMillis(); err == nil {
-		return int(ms / 1000), nil
-	}
+	return firstIdleReading([]idleSource{
+		{name: "D-Bus ScreenSaver", read: dbusIdleSeconds},
+		{name: "xprintidle", read: xprintidleSeconds},
+	})
+}
 
-	// Try xprintidle (returns milliseconds).
-	if out, err := exec.Command("xprintidle").Output(); err == nil {
-		ms, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
-		if err == nil {
-			return int(ms / 1000), nil
-		}
+// xprintidleSeconds runs xprintidle, which prints milliseconds and needs an
+// X display.
+func xprintidleSeconds() (int, error) {
+	out, err := exec.Command("xprintidle").Output()
+	if err != nil {
+		return 0, err
 	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return int(ms / 1000), nil
+}
 
-	// All detection failed — return 0 (never idle, safe fallback).
-	return 0, nil
+// dbusIdleSeconds queries the session bus's ScreenSaver interface.
+func dbusIdleSeconds() (int, error) {
+	ms, err := dbusIdleMillis()
+	if err != nil {
+		return 0, err
+	}
+	return int(ms / 1000), nil
 }
 
 // dbusIdleMillis queries the D-Bus ScreenSaver interface for idle time in ms.
@@ -57,5 +76,5 @@ func dbusIdleMillis() (int64, error) {
 		}
 	}
 
-	return 0, exec.ErrNotFound
+	return 0, errors.New("no idle time in the dbus-send reply")
 }

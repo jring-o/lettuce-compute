@@ -2573,6 +2573,33 @@ describe("OverviewPage", () => {
     });
   });
 
+  describe("a When Idle schedule on a computer whose idle time cannot be read", () => {
+    it("says computing will not start on its own and offers Change schedule", async () => {
+      const user = userEvent.setup();
+      setupDefaultMocks({
+        status: {
+          status: {
+            state: "paused",
+            uptime_seconds: 3600,
+            connected_servers: 1,
+            active_tasks: [],
+            queued_tasks: [],
+            failing_leafs: [],
+            paused_reason: "idle_unknown",
+          },
+        },
+      });
+      render(<OverviewPage />);
+
+      expect(screen.getByText(/cannot tell when it is idle here/)).toBeInTheDocument();
+      expect(screen.queryByText(/outside your schedule/)).not.toBeInTheDocument();
+      expect(screen.queryByText("Resume")).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Change schedule" }));
+      expect(emit).toHaveBeenCalledWith("navigate:settings");
+    });
+  });
+
   describe("TB-89: a user pause is offered during an automatic pause", () => {
     function pausedFor(reason: "user" | "scheduled" | "thermal" | "busy") {
       setupDefaultMocks({

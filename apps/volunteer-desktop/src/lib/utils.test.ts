@@ -231,6 +231,10 @@ describe("pausedLabel", () => {
   it("words a yield pause as the computer being busy (TB-83)", () => {
     expect(pausedLabel("busy")).toBe("Paused — your computer is busy");
   });
+
+  it("does not call an unreadable idle time an ordinary schedule pause", () => {
+    expect(pausedLabel("idle_unknown")).toBe("Paused — can't tell when this computer is idle");
+  });
 });
 
 describe("formatDateTime", () => {
@@ -348,5 +352,10 @@ describe("pauseIsResumable / pausedExplanation (TB-72)", () => {
     expect(pausedExplanation("busy")).toMatch(/other programs are using the CPU/);
     expect(pauseIsResumable("busy")).toBe(false);
     expect(pausedExplanation(null)).toBe("Computing is paused.");
+  });
+
+  it("says an unreadable idle time will not end on its own", () => {
+    expect(pausedExplanation("idle_unknown")).toMatch(/cannot tell when it is idle.*will not start on its own.*Settings/);
+    expect(pauseIsResumable("idle_unknown")).toBe(false);
   });
 });
