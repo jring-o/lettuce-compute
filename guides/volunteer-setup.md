@@ -575,7 +575,11 @@ Two things make this volunteer-friendly:
 - **Finishing slightly late still counts.** If a slot paused mid-unit (say on a
   scheduled pause) and you submit just after the deadline, the head still accepts
   the finished result as long as the unit hasn't already been validated by someone
-  else — so you keep the credit instead of losing work you already did.
+  else — so you keep the credit instead of losing work you already did. A result
+  that arrives after the unit is already finalized, late or not (other volunteers'
+  results completed it while yours ran), is one the head no longer needs: the client
+  does not resend it, and History and `lettuce-volunteer history` list the run as
+  **not needed**. It earns no credit.
 
 ### Tuning the buffer
 

@@ -52,19 +52,26 @@ function groupByDay(entries: HistoryEntry[]): Map<string, HistoryEntry[]> {
  * `validation_status` records whether the head accepted the submission when
  * it arrived — not whether the result later passed validation, which (like
  * credit) is decided on the head afterwards. The labels say exactly that.
+ * "not_needed" is neither: the unit was already finalized, so the head did
+ * not need this result.
  */
 const HEAD_ACCEPTED_STYLES = {
   accepted: "bg-green-500/10 text-green-600 border-green-500/20",
   rejected: "bg-red-500/10 text-red-600 border-red-500/20",
+  not_needed: "bg-gray-500/10 text-gray-500 border-gray-500/20",
 } as const;
 
 const HEAD_ACCEPTED_LABELS = {
   accepted: "Head accepted",
   rejected: "Head rejected",
+  not_needed: "Not needed",
 } as const;
 
 export const HEAD_ACCEPTED_TOOLTIP =
   "Whether the head accepted this submission when it arrived. Validation and credit are decided later on the head and are not shown here.";
+
+export const NOT_NEEDED_TOOLTIP =
+  "The head had already finalized this unit when the result arrived: other machines' results completed it, or it was finalized after this copy's deadline. It did not need this result, and it gives no credit for it.";
 
 /** `HistoryEntry.credit_earned` is 0 until the daemon tracks per-unit credit; a zero is not shown. */
 function creditLabel(credit: number): string | null {
@@ -125,7 +132,9 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
           <span className="text-sm font-medium text-primary shrink-0">{credit}</span>
         )}
         <span
-          title={HEAD_ACCEPTED_TOOLTIP}
+          title={
+            entry.validation_status === "not_needed" ? NOT_NEEDED_TOOLTIP : HEAD_ACCEPTED_TOOLTIP
+          }
           className={cn(
             "inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium shrink-0",
             HEAD_ACCEPTED_STYLES[entry.validation_status]
@@ -153,15 +162,25 @@ function HistoryRow({ entry, hasResult, onViewResult }: HistoryRowProps) {
               <span className="text-muted-foreground">Head</span>
               <span className="ml-2 font-medium">{entry.head_name || "—"}</span>
             </div>
-            <div className="col-span-2">
-              <span className="text-muted-foreground">Head accepted</span>
-              <span className="ml-2 font-medium">
-                {entry.validation_status === "accepted" ? "Yes" : "No"}
-              </span>
-              <span className="ml-2 text-muted-foreground">
-                — on submission; validation and credit are decided later on the head
-              </span>
-            </div>
+            {entry.validation_status === "not_needed" ? (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">Head accepted</span>
+                <span className="ml-2 font-medium">Not needed</span>
+                <span className="ml-2 text-muted-foreground">
+                  — the head had already finalized this unit, so it did not need this result; no credit
+                </span>
+              </div>
+            ) : (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">Head accepted</span>
+                <span className="ml-2 font-medium">
+                  {entry.validation_status === "accepted" ? "Yes" : "No"}
+                </span>
+                <span className="ml-2 text-muted-foreground">
+                  — on submission; validation and credit are decided later on the head
+                </span>
+              </div>
+            )}
             <div className="col-span-2 flex items-center gap-2">
               <span className="text-muted-foreground">Work Unit ID</span>
               <code className="font-mono font-medium">{entry.work_unit_id}</code>
@@ -604,6 +623,7 @@ export function HistoryPage({ active = true }: HistoryPageProps) {
           <option value="all">All submissions</option>
           <option value="accepted">Head accepted</option>
           <option value="rejected">Head rejected</option>
+          <option value="not_needed">Not needed</option>
         </select>
 
         {/* Export */}

@@ -68,10 +68,13 @@ func printHistory(w io.Writer, all []daemon.HistoryEntry, limit int, names map[s
 		shown = shown[:limit]
 	}
 
-	accepted := 0
+	accepted, notNeeded := 0, 0
 	for _, e := range all {
-		if e.ResultAccepted {
+		switch {
+		case e.ResultAccepted:
 			accepted++
+		case e.NotNeeded():
+			notNeeded++
 		}
 	}
 
@@ -80,7 +83,10 @@ func printHistory(w io.Writer, all []daemon.HistoryEntry, limit int, names map[s
 	fmt.Fprintf(tw, "WORK UNIT\tLEAF\tSERVER\tCOMPLETED\tDURATION\tHEAD ACCEPTED\n")
 	for _, e := range shown {
 		acceptedCell := "yes"
-		if !e.ResultAccepted {
+		switch {
+		case e.NotNeeded():
+			acceptedCell = "not needed"
+		case !e.ResultAccepted:
 			acceptedCell = "no"
 		}
 		server := e.ServerName
@@ -108,6 +114,10 @@ func printHistory(w io.Writer, all []daemon.HistoryEntry, limit int, names map[s
 
 	fmt.Fprintf(w, "\nShowing %d of %d completed %s; the head accepted %d on submission.\n",
 		len(shown), len(all), plural(len(all), "unit", "units"), accepted)
+	if notNeeded > 0 {
+		fmt.Fprintf(w, "%d %s not needed: the head had already finalized the unit (other machines' results completed it, or it was finalized after this copy's deadline), so it earns no credit.\n",
+			notNeeded, plural(notNeeded, "was", "were"))
+	}
 	fmt.Fprintln(w, "Head acceptance is not credit: validation happens later on the head (see `lettuce-volunteer credit`).")
 	if len(shown) < len(all) {
 		fmt.Fprintln(w, "Use --limit N to show more (0 = all).")

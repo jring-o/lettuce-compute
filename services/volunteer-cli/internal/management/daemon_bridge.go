@@ -789,12 +789,16 @@ type HistoryResponse struct {
 
 // HistoryEntryInfo describes a completed work unit.
 type HistoryEntryInfo struct {
-	WorkUnitID       string `json:"work_unit_id"`
-	LeafName         string `json:"leaf_name"`
-	CompletedAt      string `json:"completed_at"`
-	DurationSeconds  int64  `json:"duration_seconds"`
-	CPUSeconds       int64  `json:"cpu_seconds"`
-	CreditEarned     int    `json:"credit_earned"`
+	WorkUnitID      string `json:"work_unit_id"`
+	LeafName        string `json:"leaf_name"`
+	CompletedAt     string `json:"completed_at"`
+	DurationSeconds int64  `json:"duration_seconds"`
+	CPUSeconds      int64  `json:"cpu_seconds"`
+	CreditEarned    int    `json:"credit_earned"`
+	// ValidationStatus is the head's answer to the submission when it arrived:
+	// "accepted", "rejected", or "not_needed" when the head had already
+	// finalized the unit and did not need the result. Validation and credit
+	// are decided later on the head and are not reflected here.
 	ValidationStatus string `json:"validation_status"`
 	HeadName         string `json:"head_name"`
 }
@@ -867,8 +871,11 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 	result := make([]HistoryEntryInfo, len(page))
 	for i, e := range page {
 		validationStatus := "rejected"
-		if e.ResultAccepted {
+		switch {
+		case e.ResultAccepted:
 			validationStatus = "accepted"
+		case e.NotNeeded():
+			validationStatus = "not_needed"
 		}
 		result[i] = HistoryEntryInfo{
 			WorkUnitID:       e.WorkUnitID,

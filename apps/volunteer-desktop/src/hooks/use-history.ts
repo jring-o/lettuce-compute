@@ -4,10 +4,11 @@ import type { HistoryEntry, HistoryParams } from "../api/client";
 
 /**
  * Filter on `validation_status`, which records whether the head ACCEPTED the
- * submission when it arrived. Validation and credit are decided later on the
- * head and are not reflected here.
+ * submission when it arrived, or did not need it because the unit was already
+ * finalized. Validation and credit are decided later on the head and are not
+ * reflected here.
  */
-export type HeadAcceptedFilter = "all" | "accepted" | "rejected";
+export type HeadAcceptedFilter = "all" | "accepted" | "rejected" | "not_needed";
 
 export interface HistoryFilters {
   /**

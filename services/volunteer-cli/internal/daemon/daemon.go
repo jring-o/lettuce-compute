@@ -1023,6 +1023,42 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	// nothing about whether the artifact runs here.
 	d.noteLeafSuccess(wu)
 
+	// wallClock is elapsed time INCLUDING any period the unit spent suspended —
+	// frozen by a thermal throttle, the resource monitor, or a schedule window
+	// closing. activeSeconds subtracts that: the time it was actually computing.
+	wallClock := result.Result.Metrics.WallClockSeconds
+	active := activeSeconds(wallClock, result.TotalPausedDur)
+
+	// Record the unit's duration for this leaf's estimate (TB-58).
+	//
+	// This must use the ACTIVE duration, not the raw wall clock (TB-18). The
+	// figure scales every future estimate for this leaf and is persisted to
+	// durations.json — so a single unit that happened to be suspended mid-run
+	// once poisoned the estimate for days across restarts, and the client
+	// throttled its own work intake in response. Observed: a unit reporting
+	// 10212 s wall clock for ~1400 s of computation after a 2 h 28 min thermal
+	// freeze, against a normal range of 146–2821 s for that leaf on that host.
+	//
+	// Elapsed rather than CPU time is deliberate and stays: competing load from
+	// the volunteer's own other work genuinely does make a unit take longer here,
+	// and the estimate should reflect that. Suspension is the opposite case —
+	// time the unit was not running at all.
+	//
+	// It is recorded here, before the submission, because what it measures is
+	// the run: a result that only reaches the head on a resend, or one the head
+	// no longer needs, took exactly as long on this machine as one accepted at
+	// once.
+	if d.durations != nil && active > 0 {
+		d.durations.Record(wu.LeafID, wu.RscFpopsEst, float64(active))
+		d.logger.Debug("unit duration recorded for the leaf's estimate",
+			"work_unit_id", wu.ID,
+			"leaf_id", wu.LeafID,
+			"active_seconds", active,
+			"completions_held", d.durations.Completions(wu.LeafID),
+			"estimate_seconds", d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst),
+		)
+	}
+
 	// Persist result JSON for replay if the leaf has a viz bundle. The bundle
 	// the runtime extracted into the work directory is already gone (the slot
 	// removed the work directory on completion), so SaveResult re-extracts a
@@ -1047,6 +1083,24 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	submitReq := d.buildSubmitRequest(wu, result.Result, conn)
 	submitResp, err := conn.Client.SubmitResult(ctx, submitReq)
 	if err != nil {
+		// A definitive refusal is the head's final answer on this result: the
+		// identical bytes resent later would get the same one, so it is neither
+		// persisted nor resent. The retry worker applies the same test.
+		switch classifySubmitError(err) {
+		case submitRefusedNotNeeded:
+			d.noteResultNotNeeded(wu, conn.Name, wallClock, active, err)
+			return
+		case submitRefusedFinal:
+			st, _ := status.FromError(err)
+			d.logger.Warn("submit result rejected by head; not resending",
+				"work_unit_id", wu.ID,
+				"slot", result.SlotID,
+				"server", conn.Name,
+				"code", st.Code(),
+				"message", st.Message(),
+			)
+			return
+		}
 		// Don't drop a finished result on a network blip — persist it and let the
 		// retry worker resubmit (now and on future daemon starts). See item 6.
 		d.logger.Error("submit result failed; persisting for retry",
@@ -1067,37 +1121,6 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 		"volunteer_id", conn.VolunteerID,
 		"slot", result.SlotID,
 	)
-
-	// wallClock is elapsed time INCLUDING any period the unit spent suspended —
-	// frozen by a thermal throttle, the resource monitor, or a schedule window
-	// closing. activeSeconds subtracts that: the time it was actually computing.
-	wallClock := result.Result.Metrics.WallClockSeconds
-	active := activeSeconds(wallClock, result.TotalPausedDur)
-
-	// Record the unit's duration for this leaf's estimate (TB-58).
-	//
-	// This must use the ACTIVE duration, not the raw wall clock (TB-18). The
-	// figure scales every future estimate for this leaf and is persisted to
-	// durations.json — so a single unit that happened to be suspended mid-run
-	// once poisoned the estimate for days across restarts, and the client
-	// throttled its own work intake in response. Observed: a unit reporting
-	// 10212 s wall clock for ~1400 s of computation after a 2 h 28 min thermal
-	// freeze, against a normal range of 146–2821 s for that leaf on that host.
-	//
-	// Elapsed rather than CPU time is deliberate and stays: competing load from
-	// the volunteer's own other work genuinely does make a unit take longer here,
-	// and the estimate should reflect that. Suspension is the opposite case —
-	// time the unit was not running at all.
-	if d.durations != nil && active > 0 {
-		d.durations.Record(wu.LeafID, wu.RscFpopsEst, float64(active))
-		d.logger.Debug("unit duration recorded for the leaf's estimate",
-			"work_unit_id", wu.ID,
-			"leaf_id", wu.LeafID,
-			"active_seconds", active,
-			"completions_held", d.durations.Completions(wu.LeafID),
-			"estimate_seconds", d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst),
-		)
-	}
 
 	d.recordHistory(wu, wallClock, active, submitResp.Accepted, conn.Name)
 }
@@ -4573,10 +4596,16 @@ func (d *Daemon) retryPendingResults(ctx context.Context) {
 			// stop the unbounded disk+RPC retry leak. Anything else (transport
 			// failure, non-status error, or a transient/unclassified code) is kept
 			// for the next sweep.
-			if st, ok := status.FromError(err); ok && isTerminalSubmitCode(st.Code()) {
-				d.logger.Warn("pending result: rejected by head, dropping",
-					"work_unit_id", pr.WorkUnitID, "server", pr.ServerName,
-					"code", st.Code(), "message", st.Message())
+			if refusal := classifySubmitError(err); refusal != submitRetryable {
+				if refusal == submitRefusedNotNeeded {
+					d.noteResultNotNeeded(&runtime.WorkUnit{ID: pr.WorkUnitID, LeafID: pr.LeafID},
+						pr.ServerName, pr.WallClockSeconds, pr.CPUSeconds, err)
+				} else {
+					st, _ := status.FromError(err)
+					d.logger.Warn("pending result: rejected by head, dropping",
+						"work_unit_id", pr.WorkUnitID, "server", pr.ServerName,
+						"code", st.Code(), "message", st.Message())
+				}
 				if delErr := DeletePendingResult(d.cfg.DataDir, pr.WorkUnitID); delErr != nil {
 					d.logger.Warn("pending result: failed to delete after rejection",
 						"work_unit_id", pr.WorkUnitID, "error", delErr)
@@ -4623,6 +4652,61 @@ func isTerminalSubmitCode(code codes.Code) bool {
 	}
 }
 
+// submitRefusal is what a SubmitResult error means for the result it carried.
+type submitRefusal int
+
+const (
+	// submitRetryable: the result may still land — a transport failure, a
+	// non-status error, or a transient code. It is kept and resent.
+	submitRetryable submitRefusal = iota
+	// submitRefusedNotNeeded: the head had already finalized the work unit, so
+	// it did not need this result. Final, and not a fault of this machine.
+	submitRefusedNotNeeded
+	// submitRefusedFinal: any other definitive rejection (isTerminalSubmitCode).
+	submitRefusedFinal
+)
+
+// headUnitFinalizedRefusal is the text of the head's FailedPrecondition refusal
+// of a result for a work unit that was already finalized: "work unit already
+// finalized; result is too late to accept". The status carries no structured
+// reason, so this text is the only way to tell it from the head's other
+// FailedPrecondition answer to a submission, "no active assignment for this
+// volunteer and work unit". A refusal worded otherwise is still final; it is
+// only not recognised as "not needed".
+const headUnitFinalizedRefusal = "already finalized"
+
+// classifySubmitError sorts a SubmitResult error into the three cases the
+// first submission and the retry worker both act on, so the two paths answer
+// "is this final?" with one predicate.
+func classifySubmitError(err error) submitRefusal {
+	st, ok := status.FromError(err)
+	if !ok || !isTerminalSubmitCode(st.Code()) {
+		return submitRetryable
+	}
+	if st.Code() == codes.FailedPrecondition && strings.Contains(st.Message(), headUnitFinalizedRefusal) {
+		return submitRefusedNotNeeded
+	}
+	return submitRefusedFinal
+}
+
+// noteResultNotNeeded records a run whose result the head refused because the
+// work unit was already finalized: other machines' results completed it while
+// this copy ran, or it was finalized after this copy's deadline lapsed. Nothing
+// went wrong on this machine and nothing is lost — the head records no result,
+// no credit and no penalty for it — so it is logged at Info, not as a failure,
+// and it goes into the local history marked "not needed" so the run is not
+// missing from the volunteer's own record.
+func (d *Daemon) noteResultNotNeeded(wu *runtime.WorkUnit, serverName string, wallClockSeconds, activeSeconds int64, err error) {
+	st, _ := status.FromError(err)
+	d.logger.Info("result not needed: the head had already finalized this work unit (other machines' results completed it, or it was finalized after this copy's deadline); it earns no credit and is not resent",
+		"work_unit_id", wu.ID,
+		"leaf_id", wu.LeafID,
+		"server", serverName,
+		"message", st.Message(),
+	)
+	d.writeHistory(wu, wallClockSeconds, activeSeconds, false, HistoryOutcomeNotNeeded, serverName)
+}
+
 // serverByName returns the active server connection with the given name, or nil.
 func (d *Daemon) serverByName(name string) *ServerConnection {
 	if d.multiClient == nil {
@@ -4643,6 +4727,12 @@ func (d *Daemon) serverByName(name string) *ServerConnection {
 // prefix even with the daemon stopped (TB-46). resolveLeafInfo answers with the
 // id itself when the leaf is unknown; that is not a name and is not recorded.
 func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpuSeconds int64, accepted bool, serverName string) {
+	d.writeHistory(wu, wallClockSeconds, cpuSeconds, accepted, "", serverName)
+}
+
+// writeHistory appends one history entry; outcome is empty or one of the
+// HistoryOutcome values.
+func (d *Daemon) writeHistory(wu *runtime.WorkUnit, wallClockSeconds, cpuSeconds int64, accepted bool, outcome, serverName string) {
 	leafName, _ := d.resolveLeafInfo(wu.LeafID)
 	if leafName == wu.LeafID {
 		leafName = ""
@@ -4656,6 +4746,7 @@ func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpu
 		WallClockSeconds: wallClockSeconds,
 		CPUSeconds:       cpuSeconds,
 		ResultAccepted:   accepted,
+		Outcome:          outcome,
 	}); histErr != nil {
 		d.logger.Warn("failed to write history entry", "error", histErr)
 	}
