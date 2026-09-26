@@ -167,10 +167,14 @@ type Fetcher struct {
 	// keeps everything.
 	unfitBufferedFn func(wu *runtime.WorkUnit) string
 	// batchSizeFn returns how many assignments to request for a leaf given an
-	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest]. The leaf
-	// is passed so a GPU-required leaf is sized against the GPU class's own
-	// deficit, not the whole buffer's (TB-48).
-	batchSizeFn func(leaf CachedLeafInfo, estSecondsPerUnit float64) int32
+	// estimate of seconds-per-unit and the share of the buffer's deficit the
+	// head and leaf weights give it (1 = all of it), clamped to
+	// [1, maxBatchPerRequest]. The leaf is passed so a GPU-required leaf is
+	// sized against the GPU class's own deficit, not the whole buffer's (TB-48).
+	batchSizeFn func(leaf CachedLeafInfo, estSecondsPerUnit, share float64) int32
+	// unitEstSecondsFn estimates wall-clock seconds for one arrived unit: the
+	// figure it is booked at against the weights (0 = unknown).
+	unitEstSecondsFn func(leafID string, rscFpopsEst float64) float64
 	// leafEstSecondsFn estimates wall-clock seconds for ONE unit of the given leaf
 	// (0 = unknown), used to size the per-leaf batch request BEFORE any of that
 	// leaf's units have been buffered (#29). It prefers the leaf-level,
@@ -379,7 +383,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafFitGateFn:            d.leafFitGate,
 		bufferAcceptsFn:          d.bufferAccepts,
 		unfitBufferedFn:          d.unfitBuffered,
-		batchSizeFn:              d.requestBatchSize,
+		batchSizeFn:              d.requestShareBatchSize,
+		unitEstSecondsFn:         d.estSecondsForUnit,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		noteArrivalEstFn:         d.noteArrivalEstimate,
 		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
@@ -735,8 +740,12 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 	}
 
 	// Try heads in deficit order, skipping any still waiting out their
-	// server-directed retry delay.
+	// server-directed retry delay. A head reached and left without work
+	// (every leaf skipped or answered empty) is spent: its share of the
+	// buffer's deficit passes to the heads still in play this round. A head
+	// only waiting out its delay stays in play.
 	tried := make(map[string]bool)
+	spent := make(map[string]bool)
 	for len(tried) < len(available) {
 		head := f.selector.SelectHead(filterOut(available, tried))
 		if head == nil {
@@ -750,6 +759,8 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			f.logger.Debug("fetcher: head waiting out retry delay", "server", head.Name, "next_contact_at", head.NextContactAt)
 			continue
 		}
+		headShare := f.selector.HeadShare(head.Name, filterOut(available, spent))
+		spent[head.Name] = true
 
 		// TB-59: if this machine's runtimes changed since this head last heard
 		// them (a container engine detected after start), re-register before
@@ -786,7 +797,7 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			}
 			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
 			round.requested++
-			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs)
+			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs, headShare)
 			if pushed > 0 {
 				round.pushed = pushed
 				return round, nil
@@ -795,7 +806,11 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 		}
 		f.logger.Debug("fetcher: trying server", "server", head.Name, "enabled_leafs", len(enabled), "leaf_slugs", leafSlugs(enabled))
 
+		// Every pre-request skip runs before the first request, so the leaves
+		// left are the ones this machine can ask this head for right now: the
+		// leaves a weight's share is taken among.
 		orderedLeafs := f.selector.SelectLeafByDeficitOrder(head.Name, enabled)
+		requestable := make([]CachedLeafInfo, 0, len(orderedLeafs))
 		for _, leaf := range orderedLeafs {
 			// TB-49: a leaf whose runtime this machine never advertised to this
 			// head — not registered here, or the volunteer has not trusted the
@@ -879,8 +894,17 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 				}
 			}
 
+			requestable = append(requestable, leaf)
+		}
+
+		for i, leaf := range requestable {
+			// Ask for the leaf's own share of the deficit, not the whole buffer,
+			// so a head's leaves fill it interleaved. The leaves ahead of this
+			// one were asked this round and had nothing, so their shares pass
+			// to the ones still in play: the last one is asked for the head's.
+			share := headShare * f.selector.LeafShare(head.Name, leaf, requestable[i:])
 			round.requested++
-			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil)
+			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil, share)
 			if pushed > 0 {
 				round.pushed = pushed
 				return round, nil
@@ -898,7 +922,8 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 }
 
 // anyLeafInfo is the placeholder leaf descriptor used for the no-cached-leafs
-// any-leaf request path. Its slug labels the assignment-recording bucket.
+// any-leaf request path. The units it brings are booked to the leaves the
+// head says they belong to.
 var anyLeafInfo = CachedLeafInfo{ID: "", Slug: "any"}
 
 // mergeUnique returns a∪b preserving order and dropping duplicates and empties.
@@ -917,21 +942,24 @@ func mergeUnique(a, b []string) []string {
 
 // requestAndBuffer issues one RequestWorkUnit to head for the given leaf filter,
 // stamps the server-directed retry delay, and buffers every assignment in the
-// reply. It returns the number of units buffered and whether the caller should
-// stop trying further leafs on this head (true on transport error or rate-limit).
-func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string) (pushed int, stop bool) {
-	// Size the batch request from the remaining hours deficit. The per-unit
-	// seconds estimate comes from the leaf-level, benchmark-independent estimate
-	// (#29) so short-unit leafs fill work_buffer_hours on the FIRST request rather
-	// than idling at the flat ceiling. The hours-deficit math in batchSizeFn binds;
-	// maxBatchPerRequest is only a safety ceiling.
+// reply. share is the part of the buffer's hours deficit the weights give this
+// head and leaf (1 = all of it). It returns the number of units buffered and
+// whether the caller should stop trying further leafs on this head (true on
+// transport error or rate-limit).
+func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string, share float64) (pushed int, stop bool) {
+	// Size the batch request from this head's and leaf's share of the remaining
+	// hours deficit. The per-unit seconds estimate comes from the leaf-level,
+	// benchmark-independent estimate (#29) so short-unit leafs fill
+	// work_buffer_hours on the FIRST request rather than idling at the flat
+	// ceiling. The hours-deficit math in batchSizeFn binds; maxBatchPerRequest is
+	// only a safety ceiling.
 	var estSec float64
 	if f.leafEstSecondsFn != nil {
 		estSec = f.leafEstSecondsFn(leaf)
 	}
 	maxAssignments := int32(1)
 	if f.batchSizeFn != nil {
-		maxAssignments = f.batchSizeFn(leaf, estSec)
+		maxAssignments = f.batchSizeFn(leaf, estSec, share)
 	}
 	// TB-34 batch feedback: after a round whose tail this buffer returned, cap the
 	// ask at what that round actually kept + 1 until a round is kept in full — the
@@ -950,7 +978,8 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		heldIDs = f.heldWorkUnitIDsFn()
 	}
 
-	f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug, "max_assignments", maxAssignments, "held", len(heldIDs))
+	f.logger.Debug("fetcher: requesting work unit", "server", head.Name, "leaf_id", leaf.ID, "leaf_slug", leaf.Slug, "max_assignments", maxAssignments, "share", share, "held", len(heldIDs))
+	f.selector.NoteAsked(head.Name, leafKey(leaf))
 	resp, err := head.Client.RequestWorkUnit(ctx, &lettucev1.RequestWorkUnitRequest{
 		VolunteerId:      head.VolunteerID,
 		PublicKey:        f.pubKey,
@@ -1259,8 +1288,21 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 
 		f.logger.Debug("fetcher: buffered work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID)
 
-		// RecordAssignment is called once per buffered unit.
-		f.selector.RecordAssignment(head.Name, leaf.Slug)
+		// Book the buffered unit against the weights at its expected length, to
+		// the leaf the request named (the head's own leaf for an any-leaf
+		// request). Nothing returned or abandoned above is booked.
+		booked := leafKey(leaf)
+		if leaf.ID == "" && wu.LeafID != "" {
+			booked = wu.LeafID
+		}
+		var estSec float64
+		if f.unitEstSecondsFn != nil {
+			estSec = f.unitEstSecondsFn(wu.LeafID, wu.RscFpopsEst)
+		}
+		if estSec <= 0 && f.leafEstSecondsFn != nil {
+			estSec = f.leafEstSecondsFn(leaf)
+		}
+		f.selector.RecordAssignment(head.Name, booked, wu.ID, estSec)
 		pushed++
 	}
 	return pushed, returned

@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { LeafCard } from "./leaf-card";
+import { WeightSlider } from "./weight-slider";
 import {
   RuntimeTrustFields,
   choiceFromTrustedRuntimes,
@@ -189,18 +189,12 @@ export function HeadSection({
 
           {/* Head weight slider */}
           {showHeadWeight && (
-            <div className="space-y-1">
-              <div className="flex justify-between text-xs text-muted-foreground">
-                <span>Head weight</span>
-                <span>{head.weight}</span>
-              </div>
-              <Slider
-                min={1}
-                max={100}
-                value={head.weight}
-                onChange={onHeadWeightChange}
-              />
-            </div>
+            <WeightSlider
+              label="Head weight"
+              value={head.weight}
+              caption="This head's share of this machine's compute time, against the other heads' weights."
+              onChange={onHeadWeightChange}
+            />
           )}
 
           {/* Freshness of the leaf figures */}
@@ -234,8 +228,13 @@ export function HeadSection({
 
           {/* Actions */}
           <div className="flex items-center justify-between pt-1">
-            <Button variant="outline" size="sm" onClick={onResetDefaults}>
-              Use Defaults
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onResetDefaults}
+              title="Turns on every leaf of this head and returns each leaf's weight to the head's default. The head's own weight is kept."
+            >
+              Use Leaf Defaults
             </Button>
             {confirmDetach ? (
               <div className="flex gap-1">

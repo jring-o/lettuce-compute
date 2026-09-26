@@ -714,8 +714,17 @@ describe("useDebouncedLeafWeight", () => {
     vi.useRealTimers();
   });
 
-  it("writes the head's leaf weights to its config alias after the debounce", async () => {
-    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer()]));
+  // Only the moved leaf is written. A weight the volunteer set elsewhere (200
+  // from the CLI) is kept as the daemon holds it, and a leaf on its head's
+  // default stays on it: the write used to pin every leaf at the weight the
+  // page showed, so a later change to the head's default no longer reached it.
+  it("writes only the moved leaf's weight to the head's config alias after the debounce", async () => {
+    mockConfigFn.mockResolvedValue(
+      makeConfig([
+        makeServer(),
+        makeLbryServer({ leaf_preferences: { mode: "SPECIFIC", enabled: ["prime", "cli"], weights: { cli: 200 } } }),
+      ])
+    );
     mockUpdateConfigFn.mockResolvedValue({});
     const head: HeadInfo = {
       ...mockHeadsData[0],
@@ -723,6 +732,7 @@ describe("useDebouncedLeafWeight", () => {
       leafs: [
         { ...mockHeadsData[0].leafs[0], slug: "prime", effective_weight: 50 },
         { ...mockHeadsData[0].leafs[0], id: "leaf-2", slug: "mandel", effective_weight: 30, enabled: false },
+        { ...mockHeadsData[0].leafs[0], id: "leaf-3", slug: "cli", effective_weight: 200 },
       ],
     };
 
@@ -742,9 +752,30 @@ describe("useDebouncedLeafWeight", () => {
         expect.objectContaining({ name: "lettuce.science" }),
         expect.objectContaining({
           name: "lbry.science",
-          leaf_preferences: { mode: "SPECIFIC", weights: { prime: 80, mandel: 30 }, enabled: ["prime"] },
+          leaf_preferences: { mode: "SPECIFIC", enabled: ["prime", "cli"], weights: { cli: 200, prime: 80 } },
         }),
       ],
+    });
+  });
+
+  it("writes every slider moved inside one debounce window", async () => {
+    mockConfigFn.mockResolvedValue(makeConfig([makeServer(), makeLbryServer()]));
+    mockUpdateConfigFn.mockResolvedValue({});
+
+    const { result } = renderHook(() => useDebouncedLeafWeight());
+    act(() => {
+      result.current.write(titledHead, "prime", 80);
+      result.current.write(titledHead, "mandel", 20);
+      result.current.write(titledHead, "prime", 90);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(mockUpdateConfigFn).toHaveBeenCalledOnce();
+    expect(mockUpdateConfigFn.mock.calls[0][0].servers?.[1]).toMatchObject({
+      name: "lbry.science",
+      leaf_preferences: { mode: "ALL", weights: { prime: 90, mandel: 20 } },
     });
   });
 });

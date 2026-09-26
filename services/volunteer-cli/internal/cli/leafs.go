@@ -589,8 +589,19 @@ func runLeafsDisable(cmd *cobra.Command, args []string) error {
 func newLeafsWeightCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "weight <slug> <weight>",
-		Short: "Set custom weight for a leaf",
-		Args:  cobra.ExactArgs(2),
+		Short: "Set a leaf's share of its head's compute time on this machine",
+		Long: `Set a custom weight for a leaf.
+
+Within a head, the leafs share the head's part of this machine's compute
+time by weight: a leaf at 200 gets about twice the compute time of one at 100,
+however long each leaf's units run. A leaf with no weight set uses the head's
+default for it (usually 100). Weights steer only which leaf is asked for work:
+they cannot make this machine run a leaf it is not eligible for, such as one
+that needs more memory than the limit allows. ` + "`lettuce-volunteer leafs reset`" + `
+clears the weights.
+
+The change is saved to config.yaml and takes effect on the next daemon start.`,
+		Args: cobra.ExactArgs(2),
 		RunE:  runLeafsWeight,
 	}
 	cmd.Flags().String("server", "", "server name (applies to all if omitted)")
