@@ -1,6 +1,7 @@
 package credit
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
@@ -233,10 +234,32 @@ func (h *VolunteerStatsHandler) handleGetVolunteerStats(w http.ResponseWriter, r
 		rejected = 0
 	}
 
+	// The per-leaf list names PUBLIC leafs only. This route is public and runs without a
+	// viewer, so every caller is anonymous, and an anonymous caller may list PUBLIC leafs
+	// only — the rule the leaf list route applies. A PRIVATE leaf is hidden from everyone
+	// but its creator and admins, and an UNLISTED leaf is kept out of every listing, so
+	// neither may be named in an account's public breakdown. The breakdown itself stays
+	// unfiltered: the account's own view and the operator breakdown share it and must see
+	// every leaf.
+	//
+	// The account totals deliberately keep the hidden leafs' share. They say only that
+	// some unnamed work exists, the public fleet feed already counts that credit in the
+	// account's total, and leaving it out would make the two public figures disagree.
+	publicLeafs, err := h.publicLeafIDs(r.Context(), bd.ByLeaf)
+	if err != nil {
+		l.Error("failed to read leaf visibility", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.Internal("failed to compute volunteer stats", err))
+		return
+	}
+
 	// Build the per-leaf breakdown from the ledger, attaching RAC per leaf.
 	leafs := make([]LeafStatsEntry, 0, len(bd.ByLeaf))
 	totalWorkUnits := 0
 	for _, lc := range bd.ByLeaf {
+		totalWorkUnits += lc.WorkUnits
+		if !publicLeafs[lc.LeafID] {
+			continue
+		}
 		leafs = append(leafs, LeafStatsEntry{
 			LeafID:             lc.LeafID,
 			LeafName:           lc.LeafName,
@@ -244,7 +267,6 @@ func (h *VolunteerStatsHandler) handleGetVolunteerStats(w http.ResponseWriter, r
 			RAC:                racByLeaf[lc.LeafID],
 			WorkUnitsCompleted: lc.WorkUnits,
 		})
-		totalWorkUnits += lc.WorkUnits
 	}
 
 	resp := VolunteerStatsResponse{
@@ -257,6 +279,34 @@ func (h *VolunteerStatsHandler) handleGetVolunteerStats(w http.ResponseWriter, r
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// publicLeafIDs reports which of the given leafs are PUBLIC. A leaf it cannot confirm as
+// PUBLIC is absent from the set, so a caller that names only members of the set fails
+// closed.
+func (h *VolunteerStatsHandler) publicLeafIDs(ctx context.Context, byLeaf []LeafCredit) (map[types.ID]bool, error) {
+	public := make(map[types.ID]bool, len(byLeaf))
+	if len(byLeaf) == 0 {
+		return public, nil
+	}
+	ids := make([]types.ID, 0, len(byLeaf))
+	for _, lc := range byLeaf {
+		ids = append(ids, lc.LeafID)
+	}
+	rows, err := h.pool.Query(ctx,
+		"SELECT id FROM leafs WHERE id = ANY($1) AND visibility = 'PUBLIC'", ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id types.ID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		public[id] = true
+	}
+	return public, rows.Err()
 }
 
 func (h *VolunteerStatsHandler) handleLookupVolunteer(w http.ResponseWriter, r *http.Request) {

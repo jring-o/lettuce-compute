@@ -74,6 +74,14 @@ func createTestUser(t *testing.T, pool *pgxpool.Pool, username string) types.ID 
 
 func createTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID) types.ID {
 	t.Helper()
+	id, _ := createTestLeafWithVisibility(t, pool, creatorID, "PUBLIC")
+	return id
+}
+
+// createTestLeafWithVisibility is createTestLeaf with the given visibility (PUBLIC,
+// UNLISTED or PRIVATE); it also returns the leaf's name.
+func createTestLeafWithVisibility(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID, visibility string) (types.ID, string) {
+	t.Helper()
 	ctx := context.Background()
 	id := types.NewID()
 	slug := "test-leaf-" + uuid.New().String()[:8]
@@ -91,14 +99,14 @@ func createTestLeaf(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID) types
 			'{"transfer_strategy":"INLINE","aggregation_format":"JSON","max_input_size_bytes":1048576}',
 			'{"credit_per_validated_work_unit":1.5}',
 			'{"min_cpu_cores":1,"min_memory_mb":512,"min_disk_mb":1024,"gpu_required":false}',
-			false, 'PUBLIC', $5
+			false, $6, $5
 		)`,
-		id, "Test Leaf "+slug, slug, "A test leaf for credit tests", creatorID,
+		id, "Test Leaf "+slug, slug, "A test leaf for credit tests", creatorID, visibility,
 	)
 	if err != nil {
 		t.Fatalf("failed to create test leaf: %v", err)
 	}
-	return id
+	return id, "Test Leaf " + slug
 }
 
 func createTestWorkUnit(t *testing.T, pool *pgxpool.Pool, leafID types.ID) types.ID {
