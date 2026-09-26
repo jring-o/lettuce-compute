@@ -1043,6 +1043,6 @@ func RegisterBrowserVolunteerRoutes(mux *http.ServeMux, pool *pgxpool.Pool, volu
 	// NOTE: the browser REST heartbeat (POST /api/v1/volunteers/heartbeat) is
 	// removed. Browser/WASM units run-start at assignment time (immediate Assign in
 	// handleBrowserRequestWork) and liveness is deadline-based: a closed-tab unit is
-	// reclaimed at its deadline (or the synthetic NoDeadline ceiling) by the fault
+	// reclaimed at its deadline (the leaf's, else the head's default) by the fault
 	// monitor. The browser submit path keeps its active-assignment precondition.
 }

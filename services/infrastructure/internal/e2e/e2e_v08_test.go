@@ -74,7 +74,7 @@ func TestV08_Scenario1_MapReduceFullLifecycle(t *testing.T) {
 		RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:  "INLINE",
@@ -206,7 +206,7 @@ func TestV08_Scenario2_MonteCarloStatistics(t *testing.T) {
 		NumericTolerance: floatPtr(0.01), MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:  "INLINE",
@@ -387,7 +387,7 @@ func TestV08_Scenario3_CustomBulkUpload(t *testing.T) {
 		RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:   "INLINE",
@@ -667,7 +667,7 @@ func TestV08_Scenario5_LazyGeneration(t *testing.T) {
 		NumericTolerance: floatPtr(0.01), MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:  "INLINE",
@@ -916,7 +916,7 @@ func TestV08_Scenario6_AllPatternsRegression(t *testing.T) {
 				RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 			}
 			ftCfg := leaf.FaultToleranceConfig{
-				HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+				HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 			}
 			dataCfg := leaf.DataConfig{
 				TransferStrategy:   "INLINE",

@@ -199,6 +199,8 @@ services:
       # by default (~30s); leave unset to keep the default, or set negative to disable.
       LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS: ${LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS:-}
       LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER:-}
+      # Default work-unit deadline for leafs that set no deadline_seconds (built-in 6h).
+      LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS: ${LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS:-}
       # --- Reliability-weighted adaptive work quota (TODO #54) --- ON by
       # default; both OPTIONAL (leave unset to keep the built-in defaults).
       # Grounds each machine's in-flight buffer in observed throughput instead

@@ -528,7 +528,6 @@ func TestBetaE2E_Checkpointing(t *testing.T) {
 	ftCfg := leaf.FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  300,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 		CheckpointingEnabled:      true,
 		CheckpointIntervalSeconds: &cpInterval,

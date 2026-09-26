@@ -6,40 +6,34 @@ import (
 	"github.com/lettuce-compute/infrastructure/internal/leaf"
 )
 
-// TestSetNoDeadlineCeilingSeconds_LiveKnob asserts that overriding the synthetic
-// NoDeadline reclaim ceiling actually changes the deadline_seconds stamped on a
-// NoDeadline leaf's work units (the operator knob is not a silent no-op).
-func TestSetNoDeadlineCeilingSeconds_LiveKnob(t *testing.T) {
-	orig := noDeadlineCeilingSeconds
-	t.Cleanup(func() { noDeadlineCeilingSeconds = orig })
+// TestResolveDeadlineSeconds_HeadDefaultIsLive asserts that the head's
+// default_deadline_seconds setting actually changes the deadline_seconds stamped on
+// the units of a leaf that sets no deadline of its own (the setting is not a silent
+// no-op), and leaves a leaf's own deadline alone.
+func TestResolveDeadlineSeconds_HeadDefaultIsLive(t *testing.T) {
+	orig := leaf.HeadDefaultDeadlineSeconds()
+	t.Cleanup(func() { leaf.SetHeadDefaultDeadlineSeconds(orig) })
 
-	noDeadline := &leaf.Leaf{
-		FaultToleranceConfig: leaf.FaultToleranceConfig{NoDeadline: true},
-	}
+	noLeafDeadline := &leaf.Leaf{}
+	own := 5400
 	withDeadline := &leaf.Leaf{
-		FaultToleranceConfig: leaf.FaultToleranceConfig{DeadlineMultiplier: 2.0},
+		FaultToleranceConfig: leaf.FaultToleranceConfig{DeadlineSeconds: &own},
 	}
 
-	// Default: stamps the package constant.
-	if got := ResolveDeadlineSeconds(noDeadline); got != NoDeadlineCeilingSeconds {
-		t.Fatalf("default ceiling: expected %d, got %d", NoDeadlineCeilingSeconds, got)
+	// Default: the built-in 6h.
+	if got := ResolveDeadlineSeconds(noLeafDeadline); got != leaf.BuiltinDefaultDeadlineSeconds {
+		t.Fatalf("built-in default: expected %d, got %d", leaf.BuiltinDefaultDeadlineSeconds, got)
 	}
 
-	// Operator lowers the ceiling for tighter reclaim.
-	const tighter = 1800
-	SetNoDeadlineCeilingSeconds(tighter)
-	if got := ResolveDeadlineSeconds(noDeadline); got != tighter {
-		t.Fatalf("after lowering ceiling: expected %d, got %d", tighter, got)
+	// The operator setting moves the stamped value.
+	const tighter = 3600
+	leaf.SetHeadDefaultDeadlineSeconds(tighter)
+	if got := ResolveDeadlineSeconds(noLeafDeadline); got != tighter {
+		t.Fatalf("configured default: expected %d, got %d", tighter, got)
 	}
 
-	// A leaf with a real deadline is unaffected by the ceiling.
-	if got := ResolveDeadlineSeconds(withDeadline); got != int(DefaultDurationSeconds*2.0) {
-		t.Fatalf("real-deadline leaf: expected %d, got %d", int(DefaultDurationSeconds*2.0), got)
-	}
-
-	// Non-positive override is ignored (keeps current effective value).
-	SetNoDeadlineCeilingSeconds(0)
-	if got := ResolveDeadlineSeconds(noDeadline); got != tighter {
-		t.Fatalf("non-positive override should be ignored: expected %d, got %d", tighter, got)
+	// A leaf with its own deadline is unaffected by the head default.
+	if got := ResolveDeadlineSeconds(withDeadline); got != own {
+		t.Fatalf("leaf deadline: expected %d, got %d", own, got)
 	}
 }

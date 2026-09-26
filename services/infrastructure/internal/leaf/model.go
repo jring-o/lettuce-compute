@@ -260,55 +260,84 @@ func (c ValidationConfig) EffectiveMinQuorum() int {
 type FaultToleranceConfig struct {
 	// HeartbeatIntervalSeconds and MissedHeartbeatsThreshold are DEPRECATED and
 	// INERT: v0.3.0 removed per-task heartbeats in favour of deadline-based
-	// reassignment (DeadlineMultiplier + the StartWork-stamped reclaim deadline).
-	// They are no longer required, range-checked, or read by any liveness logic.
-	// The fields are retained only so older callers that still send them do not
-	// break; new callers should omit them.
-	HeartbeatIntervalSeconds  int     `json:"heartbeat_interval_seconds"`
-	MissedHeartbeatsThreshold int     `json:"missed_heartbeats_threshold"`
-	DeadlineMultiplier        float64 `json:"deadline_multiplier"`
-	// DeadlineSeconds, when set (> 0), is the absolute per-work-unit hard deadline
-	// in seconds and takes precedence over deadline_multiplier. It lets an operator
-	// state a real deadline directly instead of relying on a multiplier applied to a
-	// fixed baseline runtime estimate, so the resulting deadline can be matched to
-	// how long a unit actually takes (and to how long volunteers may pause). Omitted
-	// or <= 0 means "derive from deadline_multiplier". Ignored when NoDeadline.
-	DeadlineSeconds *int `json:"deadline_seconds,omitempty"`
-	// NoDeadline disables the hard wall-clock deadline for this leaf's work units
-	// at the execution level: ResolveDeadlineSeconds stamps a large synthetic
-	// reclaim ceiling (NoDeadlineCeilingSeconds, default 6h, operator-tunable via
-	// head.no_deadline_ceiling_seconds) which the runtime treats as effectively no
-	// timeout. With per-task heartbeats removed, liveness is purely deadline-based,
-	// so the ceiling (rather than a literal 0) guarantees the head always reclaims a
-	// unit whose volunteer vanished — FindExpiredWorkUnits covers it because
-	// deadline_seconds > 0. Defaults to false (deadline enforced via
-	// DeadlineMultiplier).
-	NoDeadline                bool  `json:"no_deadline"`
+	// reassignment (the StartWork-stamped reclaim deadline). They are no longer
+	// required, range-checked, or read by any liveness logic. The fields are
+	// retained only so older callers that still send them do not break; new
+	// callers should omit them.
+	HeartbeatIntervalSeconds  int `json:"heartbeat_interval_seconds"`
+	MissedHeartbeatsThreshold int `json:"missed_heartbeats_threshold"`
+	// DeadlineSeconds is the leaf's own per-work-unit deadline in seconds. When set
+	// (> 0) it is the deadline every unit of this leaf is stamped with; omitted (or
+	// null) means the leaf sets none and its units get the head's default deadline
+	// (head.default_deadline_seconds, 6h unless the operator changes it). Those are
+	// the only two sources: a unit always carries a positive deadline, which the
+	// volunteer enforces as an execution timeout from run start and the head
+	// enforces by expiring the copy, so no unit runs without one.
+	//
+	// The retired deadline_multiplier and no_deadline keys are no longer fields
+	// here; a config update that still sends them is translated onto this field by
+	// TranslateRetiredDeadlineKeys.
+	DeadlineSeconds           *int  `json:"deadline_seconds,omitempty"`
 	MaxReassignments          int   `json:"max_reassignments"`
 	CheckpointingEnabled      bool  `json:"checkpointing_enabled"`
 	CheckpointIntervalSeconds *int  `json:"checkpoint_interval_seconds"`
 	MaxCheckpointSizeBytes    int64 `json:"max_checkpoint_size_bytes"`
 }
 
-// DefaultWorkUnitDurationSeconds is the baseline per-unit runtime (in seconds)
-// that deadline_multiplier scales to derive a work-unit deadline when no explicit
-// deadline_seconds is configured.
-const DefaultWorkUnitDurationSeconds = 3600
+// BuiltinDefaultDeadlineSeconds is the head's default work-unit deadline (6h) when
+// the operator has not set head.default_deadline_seconds. It mirrors
+// config.defaultDefaultDeadlineSeconds.
+const BuiltinDefaultDeadlineSeconds = 21600
 
-// ResolveDeadlineSeconds returns the per-work-unit hard deadline implied by this
-// fault-tolerance config, NOT accounting for NoDeadline (callers apply the
-// NoDeadline reclaim ceiling separately). An explicit deadline_seconds (> 0) wins;
-// otherwise the deadline is DefaultWorkUnitDurationSeconds * deadline_multiplier
-// (multiplier floored at 1.0).
+// headDefaultDeadlineSeconds is the deadline stamped on a unit whose leaf sets no
+// deadline_seconds. main.go sets it once at startup from
+// head.default_deadline_seconds via SetHeadDefaultDeadlineSeconds, before any
+// generation path runs (eager HTTP generation, the lazy generation manager and
+// custom bulk upload are all wired afterwards), so no synchronization is needed.
+var headDefaultDeadlineSeconds = BuiltinDefaultDeadlineSeconds
+
+// SetHeadDefaultDeadlineSeconds sets the head's default work-unit deadline, the
+// one a unit gets when its leaf sets no deadline_seconds. A non-positive value
+// leaves the current default in place. Call it before serving any generation
+// request.
+func SetHeadDefaultDeadlineSeconds(seconds int) {
+	if seconds > 0 {
+		headDefaultDeadlineSeconds = seconds
+	}
+}
+
+// HeadDefaultDeadlineSeconds returns the head's default work-unit deadline.
+func HeadDefaultDeadlineSeconds() int {
+	return headDefaultDeadlineSeconds
+}
+
+// Deadline sources reported by DeadlineSource.
+const (
+	DeadlineSourceLeaf        = "leaf"
+	DeadlineSourceHeadDefault = "head_default"
+)
+
+// ResolveDeadlineSeconds returns the deadline a work unit of this leaf is stamped
+// with: the leaf's deadline_seconds when set (> 0), else the head's default. There
+// is no other source.
 func (c FaultToleranceConfig) ResolveDeadlineSeconds() int {
-	if c.DeadlineSeconds != nil && *c.DeadlineSeconds > 0 {
+	if c.hasLeafDeadline() {
 		return *c.DeadlineSeconds
 	}
-	multiplier := c.DeadlineMultiplier
-	if multiplier <= 0 {
-		multiplier = 1.0
+	return headDefaultDeadlineSeconds
+}
+
+// DeadlineSource reports where ResolveDeadlineSeconds takes the deadline from:
+// DeadlineSourceLeaf or DeadlineSourceHeadDefault.
+func (c FaultToleranceConfig) DeadlineSource() string {
+	if c.hasLeafDeadline() {
+		return DeadlineSourceLeaf
 	}
-	return int(float64(DefaultWorkUnitDurationSeconds) * multiplier)
+	return DeadlineSourceHeadDefault
+}
+
+func (c FaultToleranceConfig) hasLeafDeadline() bool {
+	return c.DeadlineSeconds != nil && *c.DeadlineSeconds > 0
 }
 
 // Generation mode constants.

@@ -275,7 +275,6 @@ func TestHeadsLeafsE2E_PreFetchDeadline(t *testing.T) {
 		FTConfig: leaf.FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  60,
 			MissedHeartbeatsThreshold: 3,
-			DeadlineMultiplier:        3.0,
 			MaxReassignments:          3,
 		},
 		DataConfig:   defaultDataConfig(),

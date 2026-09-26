@@ -367,57 +367,28 @@ func TestResolveCodeArtifactRef_NoBinaries(t *testing.T) {
 	}
 }
 
-func TestResolveDeadlineSeconds(t *testing.T) {
+func TestResolveDeadlineSeconds_LeafDeadline(t *testing.T) {
 	proj := &leaf.Leaf{
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0,
+			DeadlineSeconds: intPtr(10800),
 		},
 	}
-	deadline := generate.ResolveDeadlineSeconds(proj)
-	if deadline != 10800 { // 3600 * 3.0
-		t.Errorf("expected 10800, got %d", deadline)
+	if deadline := generate.ResolveDeadlineSeconds(proj); deadline != 10800 {
+		t.Errorf("expected the leaf's 10800, got %d", deadline)
 	}
 }
 
-func TestResolveDeadlineSeconds_ZeroMultiplier(t *testing.T) {
-	proj := &leaf.Leaf{
-		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 0,
-		},
-	}
+func TestResolveDeadlineSeconds_NoLeafDeadlineGetsTheHeadDefault(t *testing.T) {
+	proj := &leaf.Leaf{}
 	deadline := generate.ResolveDeadlineSeconds(proj)
-	if deadline != 3600 { // fallback: 3600 * 1.0
-		t.Errorf("expected 3600, got %d", deadline)
+	// Never 0: FindExpiredWorkUnits skips a unit whose deadline_seconds is not
+	// positive, so a unit on a vanished volunteer would never be reclaimed.
+	if deadline != leaf.HeadDefaultDeadlineSeconds() || deadline <= 0 {
+		t.Errorf("expected the head default %d, got %d", leaf.HeadDefaultDeadlineSeconds(), deadline)
 	}
 }
 
-func TestResolveDeadlineSeconds_ExplicitOverridesMultiplier(t *testing.T) {
-	explicit := 86400
-	proj := &leaf.Leaf{
-		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0, // would give 10800; the explicit value must win
-			DeadlineSeconds:    &explicit,
-		},
-	}
-	if deadline := generate.ResolveDeadlineSeconds(proj); deadline != explicit {
-		t.Errorf("expected explicit deadline %d, got %d", explicit, deadline)
-	}
-}
-
-func TestResolveDeadlineSeconds_NoDeadline(t *testing.T) {
-	proj := &leaf.Leaf{
-		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			NoDeadline:         true,
-			DeadlineMultiplier: 3.0, // ignored when NoDeadline is set
-		},
-	}
-	deadline := generate.ResolveDeadlineSeconds(proj)
-	// Post-heartbeat-removal: NoDeadline stamps a synthetic reclaim ceiling (not 0)
-	// so a unit on a vanished volunteer is always reclaimed by FindExpiredWorkUnits.
-	if deadline != generate.NoDeadlineCeilingSeconds {
-		t.Errorf("expected synthetic ceiling %d, got %d", generate.NoDeadlineCeilingSeconds, deadline)
-	}
-}
+func intPtr(v int) *int { return &v }
 
 // --- Windowed decode equivalence + lazy pacing (design §4.7, BG-22 sub) ---
 
@@ -717,8 +688,8 @@ func newTestProject() *leaf.Leaf {
 			Binaries: map[string]string{"linux-amd64": "sha256:abc123"},
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0,
-			MaxReassignments:   3,
+			DeadlineSeconds:  intPtr(10800),
+			MaxReassignments: 3,
 		},
 	}
 }
@@ -765,7 +736,7 @@ func TestGenerate_BasicSweep(t *testing.T) {
 		if wu.CodeArtifactRef != "sha256:abc123" {
 			t.Errorf("wrong code_artifact_ref: %s", wu.CodeArtifactRef)
 		}
-		if wu.DeadlineSeconds != 10800 { // 3600 * 3.0
+		if wu.DeadlineSeconds != 10800 { // the leaf's deadline_seconds
 			t.Errorf("wrong deadline_seconds: %d", wu.DeadlineSeconds)
 		}
 		if wu.MaxReassignments != 3 {

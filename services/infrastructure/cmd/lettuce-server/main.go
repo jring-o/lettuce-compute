@@ -92,11 +92,16 @@ func main() {
 		logger.Warn("SECURITY: LETTUCE_BINARY_URL_ALLOW_INSECURE is set — leaf URL SSRF screening (https-required, no internal IPs) is DISABLED. This must NEVER be set in production; unset it unless this is a local dev/test head.")
 	}
 
-	// Apply the operator-tuned NoDeadline reclaim ceiling so it actually changes
-	// the deadline_seconds stamped on NoDeadline work units (eager generation, the
-	// lazy generation manager, and custom bulk upload all read this). Done before
-	// any generation path is wired so the knob is never a silent no-op.
-	generate.SetNoDeadlineCeilingSeconds(cfg.Head.EffectiveNoDeadlineCeilingSeconds())
+	// Apply the head's default work-unit deadline, the one stamped on units whose
+	// leaf sets no deadline_seconds (eager generation, the lazy generation manager,
+	// and custom bulk upload all read it, as does the activation-time adequacy
+	// warning). Done before any generation path is wired so the setting is never a
+	// silent no-op.
+	leaf.SetHeadDefaultDeadlineSeconds(cfg.Head.EffectiveDefaultDeadlineSeconds())
+	if cfg.Head.UsesRetiredDeadlineCeilingName() {
+		logger.Warn("head.no_deadline_ceiling_seconds (LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS) is a retired name; set head.default_deadline_seconds (LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS) instead",
+			"default_deadline_seconds", cfg.Head.EffectiveDefaultDeadlineSeconds())
+	}
 
 	// Load TLS config.
 	tlsCfg, err := server.LoadTLSConfig(cfg.TLS)

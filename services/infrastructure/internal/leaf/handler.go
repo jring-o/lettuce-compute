@@ -526,6 +526,17 @@ func (h *LeafHandler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			apierror.WriteError(w, apierror.ValidationError("invalid fault_tolerance_config", nil))
 			return
 		}
+		// deadline_multiplier and no_deadline are retired: the typed merge above drops
+		// them, so translate them from the raw block onto deadline_seconds and log it.
+		notes, apiErr := TranslateRetiredDeadlineKeys(raw, &merged)
+		if apiErr != nil {
+			apierror.WriteError(w, apiErr)
+			return
+		}
+		for _, note := range notes {
+			l.Warn("leaf update used a retired deadline setting",
+				append([]any{"leaf_id", id, "note", note}, actorAttrs(r)...)...)
+		}
 		ApplyFaultToleranceConfigDefaults(&merged)
 		if apiErr := ValidateFaultToleranceConfig(&merged); apiErr != nil {
 			apierror.WriteError(w, apiErr)
@@ -734,17 +745,14 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 	// On going live, surface the work-unit deadline this leaf's units will carry
 	// (otherwise invisible to operators) and warn if it is too short for the work.
 	if target == StateActive {
-		if p.FaultToleranceConfig.NoDeadline {
-			l.Info("leaf activated", "leaf_id", id, "no_deadline", true)
-		} else {
-			l.Info("leaf activated",
-				"leaf_id", id,
-				"work_unit_deadline_seconds", p.FaultToleranceConfig.ResolveDeadlineSeconds(),
-				"max_cpu_seconds", p.ExecutionConfig.MaxCPUSeconds,
-			)
-			for _, warning := range DeadlineAdequacyWarnings(p) {
-				l.Warn("leaf deadline may be too short for its work", "leaf_id", id, "warning", warning)
-			}
+		l.Info("leaf activated",
+			"leaf_id", id,
+			"work_unit_deadline_seconds", p.FaultToleranceConfig.ResolveDeadlineSeconds(),
+			"deadline_source", p.FaultToleranceConfig.DeadlineSource(),
+			"max_cpu_seconds", p.ExecutionConfig.MaxCPUSeconds,
+		)
+		for _, warning := range DeadlineAdequacyWarnings(p) {
+			l.Warn("leaf deadline may be too short for its work", "leaf_id", id, "warning", warning)
 		}
 	}
 

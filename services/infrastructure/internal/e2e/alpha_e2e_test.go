@@ -741,7 +741,6 @@ func createAndActivateProject(
 	ftCfg := leaf.FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  60,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 	}
 	dataCfg := leaf.DataConfig{

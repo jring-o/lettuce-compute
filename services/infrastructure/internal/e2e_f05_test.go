@@ -250,7 +250,6 @@ func TestE2EF05Lifecycle(t *testing.T) {
 	ftCfg := leaf.FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  300,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 	}
 	dataCfg := leaf.DataConfig{

@@ -165,8 +165,7 @@ func testProject() *leaf.Leaf {
 			Binaries: map[string]string{"linux_amd64": "https://example.com/bin"},
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0,
-			MaxReassignments:   3,
+			MaxReassignments: 3,
 		},
 	}
 }

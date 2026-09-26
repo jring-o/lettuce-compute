@@ -116,7 +116,6 @@ func validProject() *Leaf {
 		FaultToleranceConfig: FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  300,
 			MissedHeartbeatsThreshold: 3,
-			DeadlineMultiplier:        3.0,
 			MaxReassignments:          3,
 		},
 		DataConfig: DataConfig{
@@ -154,8 +153,8 @@ func TestCanActivate_InvalidValidationConfig(t *testing.T) {
 func TestCanActivate_InvalidFaultToleranceConfig(t *testing.T) {
 	p := validProject()
 	// HeartbeatIntervalSeconds is deprecated/inert and no longer validated; use a
-	// still-checked field (deadline_multiplier must be 1.0-10.0) to trigger failure.
-	p.FaultToleranceConfig.DeadlineMultiplier = 0 // invalid
+	// still-checked field (a non-positive deadline_seconds) to trigger failure.
+	p.FaultToleranceConfig.DeadlineSeconds = intPtr(0) // invalid
 
 	err := CanActivate(p)
 	assertConfigIncomplete(t, err, "fault_tolerance_config")
@@ -171,8 +170,8 @@ func TestCanActivate_InvalidDataConfig(t *testing.T) {
 
 func TestCanActivate_MultipleConfigsInvalid(t *testing.T) {
 	p := validProject()
-	p.ExecutionConfig.Runtime = ""                // invalid
-	p.FaultToleranceConfig.DeadlineMultiplier = 0 // invalid (deprecated heartbeat fields no longer validated)
+	p.ExecutionConfig.Runtime = ""                     // invalid
+	p.FaultToleranceConfig.DeadlineSeconds = intPtr(0) // invalid (deprecated heartbeat fields no longer validated)
 
 	err := CanActivate(p)
 	if err == nil {

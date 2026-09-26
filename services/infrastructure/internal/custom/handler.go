@@ -134,10 +134,10 @@ func (h *BulkUploadHandler) HandleBulkUpload(w http.ResponseWriter, r *http.Requ
 	// PB-19: bulk upload is explicitly allowed in CONFIGURING, where the leaf may
 	// not have had any config PUT yet — its stored FaultToleranceConfig is then the
 	// zero struct, and stamping its raw values onto rows (MaxReassignments 0 against
-	// the schema's >= 1 check, DeadlineMultiplier 0 into the deadline resolution)
-	// failed the INSERT into a raw 500. Resolve the DOCUMENTED defaults first — the
-	// exact ones a config PUT applies (ApplyFaultToleranceConfigDefaults, e.g.
-	// max_reassignments 3, deadline_multiplier 3.0) — so the documented
+	// the schema's >= 1 check) failed the INSERT into a raw 500. Resolve the
+	// DOCUMENTED defaults first — the exact ones a config PUT applies
+	// (ApplyFaultToleranceConfigDefaults, e.g. max_reassignments 3; a leaf with no
+	// deadline_seconds gets the head's default deadline) — so the documented
 	// create → configure-transition → bulk flow succeeds with the same values the
 	// leaf would get at its eventual config PUT. Only the local copy is defaulted;
 	// the stored config is untouched.

@@ -1085,7 +1085,6 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 		return &FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  300,
 			MissedHeartbeatsThreshold: 3,
-			DeadlineMultiplier:        3.0,
 			MaxReassignments:          3,
 			CheckpointingEnabled:      false,
 		}
@@ -1129,14 +1128,13 @@ func TestValidateFaultToleranceConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "deadline multiplier zero rejected",
-			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 0 },
-			wantErr: true,
-			errMsg:  "deadline_multiplier",
+			name:    "no deadline_seconds accepted (the head's default applies)",
+			modify:  func(c *FaultToleranceConfig) { c.DeadlineSeconds = nil },
+			wantErr: false,
 		},
 		{
-			name:    "deadline multiplier high value accepted (no upper bound)",
-			modify:  func(c *FaultToleranceConfig) { c.DeadlineMultiplier = 240.0 },
+			name:    "explicit deadline_seconds high value accepted (no upper bound)",
+			modify:  func(c *FaultToleranceConfig) { d := 864000; c.DeadlineSeconds = &d },
 			wantErr: false,
 		},
 		{
@@ -2022,8 +2020,8 @@ func TestApplyFaultToleranceConfigDefaults(t *testing.T) {
 		if c.MissedHeartbeatsThreshold != 3 {
 			t.Errorf("expected missed_heartbeats_threshold 3, got %d", c.MissedHeartbeatsThreshold)
 		}
-		if c.DeadlineMultiplier != 3.0 {
-			t.Errorf("expected deadline_multiplier 3.0, got %f", c.DeadlineMultiplier)
+		if c.DeadlineSeconds != nil {
+			t.Errorf("expected no deadline_seconds default (the head's default applies), got %d", *c.DeadlineSeconds)
 		}
 		if c.MaxReassignments != 3 {
 			t.Errorf("expected max_reassignments 3, got %d", c.MaxReassignments)
@@ -2034,7 +2032,7 @@ func TestApplyFaultToleranceConfigDefaults(t *testing.T) {
 		c := &FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  600,
 			MissedHeartbeatsThreshold: 5,
-			DeadlineMultiplier:        5.0,
+			DeadlineSeconds:           intPtr(18000),
 			MaxReassignments:          5,
 		}
 		ApplyFaultToleranceConfigDefaults(c)
@@ -2044,8 +2042,8 @@ func TestApplyFaultToleranceConfigDefaults(t *testing.T) {
 		if c.MissedHeartbeatsThreshold != 5 {
 			t.Errorf("expected missed_heartbeats_threshold 5, got %d", c.MissedHeartbeatsThreshold)
 		}
-		if c.DeadlineMultiplier != 5.0 {
-			t.Errorf("expected deadline_multiplier 5.0, got %f", c.DeadlineMultiplier)
+		if c.DeadlineSeconds == nil || *c.DeadlineSeconds != 18000 {
+			t.Errorf("expected deadline_seconds 18000 kept, got %v", c.DeadlineSeconds)
 		}
 		if c.MaxReassignments != 5 {
 			t.Errorf("expected max_reassignments 5, got %d", c.MaxReassignments)

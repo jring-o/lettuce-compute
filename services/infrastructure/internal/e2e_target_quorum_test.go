@@ -68,7 +68,7 @@ func TestE2E_TargetQuorum_ValidateAtQuorumAndSupersede(t *testing.T) {
 		RedundancyFactor: 2, TargetCopies: 3, MinQuorum: 2,
 		AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 	}
-	ftCfg := leaf.FaultToleranceConfig{DeadlineMultiplier: 3.0, MaxReassignments: 3}
+	ftCfg := leaf.FaultToleranceConfig{MaxReassignments: 3}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy: "INLINE", AggregationFormat: "JSON",
 		MaxInputSizeBytes: 1048576, MaxOutputSizeBytes: 104857600,

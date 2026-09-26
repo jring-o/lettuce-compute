@@ -238,10 +238,10 @@ func (s *seeder) configureLeaf(ctx context.Context, leafID string) error {
 		},
 		"fault_tolerance_config": map[string]any{
 			// heartbeat fields are deprecated/inert (deadline-based reassignment
-			// replaced per-task heartbeats); only deadline_multiplier and
-			// max_reassignments are still used.
-			"deadline_multiplier": 3.0,
-			"max_reassignments":   3,
+			// replaced per-task heartbeats). deadline_seconds is the leaf's own
+			// per-unit deadline (3 h here); without it the head's default applies.
+			"deadline_seconds":  10800,
+			"max_reassignments": 3,
 		},
 		"data_config": map[string]any{
 			"transfer_strategy":     "INLINE",
