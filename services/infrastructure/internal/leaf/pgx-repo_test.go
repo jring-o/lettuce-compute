@@ -97,7 +97,6 @@ func newTestLeaf(creatorID *types.ID) *Leaf {
 		FaultToleranceConfig: FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  300,
 			MissedHeartbeatsThreshold: 3,
-			DeadlineMultiplier:        3.0,
 			MaxReassignments:          3,
 		},
 		DataConfig: DataConfig{

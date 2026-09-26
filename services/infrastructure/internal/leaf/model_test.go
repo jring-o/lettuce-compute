@@ -159,7 +159,6 @@ func TestFaultToleranceConfigJSON(t *testing.T) {
 	cfg := FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  300,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 		CheckpointingEnabled:      true,
 		CheckpointIntervalSeconds: &interval,
@@ -293,7 +292,6 @@ func TestProjectJSONRoundTrip(t *testing.T) {
 		FaultToleranceConfig: FaultToleranceConfig{
 			HeartbeatIntervalSeconds:  300,
 			MissedHeartbeatsThreshold: 3,
-			DeadlineMultiplier:        3.0,
 			MaxReassignments:          3,
 		},
 		DataConfig: DataConfig{

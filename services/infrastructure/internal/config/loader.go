@@ -324,6 +324,14 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.FlushBatchSize = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS must be an integer: %w", err)
+		}
+		cfg.Head.DefaultDeadlineSeconds = n
+	}
+	// The retired name of LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS, read when that is unset.
 	if v := os.Getenv("LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

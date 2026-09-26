@@ -266,10 +266,14 @@ Three things:
 - **Deadline strategy.** Liveness is deadline-based: the head reassigns any
   work unit not submitted by its deadline — there are NO per-task heartbeats.
 
-For long-running leafs (hours+), set `no_deadline: true` so a wall-clock
-deadline doesn't kill genuine work; the head then reclaims a unit only after a
-generous ceiling (`no_deadline_ceiling_seconds`, default 6 h). (This is the
-GREP pattern.)
+Every work unit has a deadline: the leaf's `deadline_seconds` if you set one,
+otherwise the head's default (`default_deadline_seconds`, 6 h unless the head
+operator changes it). A volunteer stops a unit that runs past it, so a slow
+machine loses its finished work. Set `deadline_seconds` to several times how
+long a slow volunteer's machine takes to run one unit, with room for pauses —
+for long-running leafs (hours+) that is usually well beyond 6 h. Keep it at
+least the unit's `max_cpu_seconds`; the head warns at activation when it is
+shorter.
 
 (The leaf config still carries a legacy `heartbeat_interval_seconds` field that
 no longer drives liveness; the next skill fills a safe default, so you don't
@@ -336,8 +340,8 @@ from there. Use this template:
 ## Cost
 - Per-unit estimate: <seconds / minutes>  (→ estimated_duration_seconds)
 - Total work units: <N>
-- Deadline strategy: <default deadline / no_deadline for long-running>
-- `no_deadline:` <true/false>
+- Deadline strategy: <the head's default (6 h) / a leaf deadline, and why>
+- `deadline_seconds:` <seconds, or "omit — head default">
 
 ## Aggregation
 - Pattern: <plot / sum / mean / filter / reduce>

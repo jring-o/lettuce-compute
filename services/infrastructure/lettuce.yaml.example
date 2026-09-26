@@ -168,11 +168,13 @@ head:
   flush_interval_ms: 100             # env: LETTUCE_HEAD_FLUSH_INTERVAL_MS
   flush_batch_size: 200              # env: LETTUCE_HEAD_FLUSH_BATCH_SIZE
 
-  # Reclaim ceiling (seconds) for no-deadline leafs: with per-task heartbeats removed,
-  # a unit on a vanished volunteer is reclaimed at the latest after this. This is a
-  # DEADLINE, not a lease, so it is intentionally NOT bound by the 1800s threshold.
-  # It is stamped into each no-deadline unit's deadline_seconds at generation time,
-  # so lowering it tightens reclaim for newly generated units (already-generated
-  # units keep the value stamped when they were created). Lower it for tighter
-  # reclaim of no-deadline work, or set a real deadline instead.
-  no_deadline_ceiling_seconds: 21600 # env: LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS
+  # Default work-unit deadline (seconds) for leafs that set no deadline_seconds of
+  # their own; a leaf's fault_tolerance_config.deadline_seconds overrides it. A
+  # volunteer stops a unit that runs this long, and the head reassigns a copy not
+  # returned by then. This is a DEADLINE, not a lease, so it is intentionally NOT
+  # bound by the 1800s threshold. It is stamped into each unit's deadline_seconds
+  # at generation time, so a change reaches only newly generated units
+  # (already-generated units keep the value stamped when they were created).
+  # The retired name no_deadline_ceiling_seconds (env
+  # LETTUCE_HEAD_NO_DEADLINE_CEILING_SECONDS) is still read when this is unset.
+  default_deadline_seconds: 21600    # env: LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS

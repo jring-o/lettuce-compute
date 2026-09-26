@@ -158,8 +158,7 @@ func newTestLeaf() *leaf.Leaf {
 			Binaries: map[string]string{"linux-amd64": "sha256:abc123"},
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0,
-			MaxReassignments:   3,
+			MaxReassignments: 3,
 		},
 		DataConfig: leaf.DataConfig{
 			SplittingStrategy: &strategy,

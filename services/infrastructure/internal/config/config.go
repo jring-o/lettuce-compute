@@ -147,10 +147,16 @@ type HeadConfig struct {
 	// FlushBatchSize flushes early once this many pending reservation writes
 	// accumulate. Default 200.
 	FlushBatchSize int `yaml:"flush_batch_size"`
-	// NoDeadlineCeilingSeconds is the synthetic reclaim ceiling applied to NoDeadline
-	// leafs so a unit on a vanished volunteer is always reclaimed (heartbeats are
-	// gone). This is the DEADLINE, not a lease, so it is NOT bound by the 30-min
-	// stale threshold. Default 21600 (6h), operator-tunable.
+	// DefaultDeadlineSeconds is the deadline stamped on a work unit whose leaf sets
+	// no deadline_seconds of its own; a leaf's deadline_seconds overrides it. The
+	// volunteer stops a unit at its deadline and the head reassigns a copy not
+	// returned by then. This is a DEADLINE, not a lease, so it is NOT bound by the
+	// 30-min stale threshold. Stamped at generation, so a change reaches only units
+	// created afterwards. Default 21600 (6h).
+	DefaultDeadlineSeconds int `yaml:"default_deadline_seconds"`
+	// NoDeadlineCeilingSeconds is the retired name of DefaultDeadlineSeconds,
+	// still read when DefaultDeadlineSeconds is unset (the head logs a notice at
+	// boot when it is used).
 	NoDeadlineCeilingSeconds int `yaml:"no_deadline_ceiling_seconds"`
 
 	// --- TODO #54: reliability-weighted ADAPTIVE work quota ---
@@ -480,11 +486,11 @@ const (
 	staleVolunteerThresholdSeconds = 1800
 
 	// --- Layer 2 dispatch-cache defaults ---
-	defaultReadyPoolSize            = 2000
-	defaultRefillBatchSize          = 500
-	defaultFlushIntervalMs          = 100
-	defaultFlushBatchSize           = 200
-	defaultNoDeadlineCeilingSeconds = 21600 // 6h
+	defaultReadyPoolSize          = 2000
+	defaultRefillBatchSize        = 500
+	defaultFlushIntervalMs        = 100
+	defaultFlushBatchSize         = 200
+	defaultDefaultDeadlineSeconds = 21600 // 6h; mirrors leaf.BuiltinDefaultDeadlineSeconds
 
 	// --- Optional DID identity-binding defaults ---
 	defaultDIDResolverURL            = "https://plc.directory"
@@ -661,8 +667,11 @@ func (h HeadConfig) Validate() error {
 	if h.FlushBatchSize < 0 {
 		return fmt.Errorf("head.flush_batch_size must be >= 0, got %d", h.FlushBatchSize)
 	}
-	// NoDeadlineCeilingSeconds is a DEADLINE, not a lease, so it is intentionally
-	// NOT bound by the 30-min stale threshold (a 6h reclaim ceiling is valid).
+	// The default deadline is a DEADLINE, not a lease, so it is intentionally NOT
+	// bound by the 30-min stale threshold (a 6h default is valid).
+	if h.DefaultDeadlineSeconds < 0 {
+		return fmt.Errorf("head.default_deadline_seconds must be >= 0, got %d", h.DefaultDeadlineSeconds)
+	}
 	if h.NoDeadlineCeilingSeconds < 0 {
 		return fmt.Errorf("head.no_deadline_ceiling_seconds must be >= 0, got %d", h.NoDeadlineCeilingSeconds)
 	}
@@ -1052,13 +1061,23 @@ func (h HeadConfig) EffectiveFlushBatchSize() int {
 	return h.FlushBatchSize
 }
 
-// EffectiveNoDeadlineCeilingSeconds returns the synthetic reclaim ceiling for
-// NoDeadline leafs, default 21600 (6h).
-func (h HeadConfig) EffectiveNoDeadlineCeilingSeconds() int {
-	if h.NoDeadlineCeilingSeconds <= 0 {
-		return defaultNoDeadlineCeilingSeconds
+// EffectiveDefaultDeadlineSeconds returns the head's default work-unit deadline:
+// default_deadline_seconds when set, else the retired no_deadline_ceiling_seconds
+// when set, else 21600 (6h).
+func (h HeadConfig) EffectiveDefaultDeadlineSeconds() int {
+	if h.DefaultDeadlineSeconds > 0 {
+		return h.DefaultDeadlineSeconds
 	}
-	return h.NoDeadlineCeilingSeconds
+	if h.NoDeadlineCeilingSeconds > 0 {
+		return h.NoDeadlineCeilingSeconds
+	}
+	return defaultDefaultDeadlineSeconds
+}
+
+// UsesRetiredDeadlineCeilingName reports whether the default deadline comes from
+// the retired no_deadline_ceiling_seconds name, so the head can say so at boot.
+func (h HeadConfig) UsesRetiredDeadlineCeilingName() bool {
+	return h.DefaultDeadlineSeconds <= 0 && h.NoDeadlineCeilingSeconds > 0
 }
 
 // EffectiveInstanceID returns this head replica's stable identity as a types.ID

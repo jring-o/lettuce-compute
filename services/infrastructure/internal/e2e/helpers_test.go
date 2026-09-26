@@ -404,7 +404,6 @@ func defaultFTConfig() leaf.FaultToleranceConfig {
 	return leaf.FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  60,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 	}
 }

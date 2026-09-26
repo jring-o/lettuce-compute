@@ -195,8 +195,8 @@ func makeCustomProject() *leaf.Leaf {
 			Image:   &img,
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 3.0,
-			MaxReassignments:   3,
+			DeadlineSeconds:  intPtr(10800),
+			MaxReassignments: 3,
 		},
 		DataConfig: leaf.DataConfig{
 			MaxInputSizeBytes:  1048576, // 1 MB
@@ -261,7 +261,7 @@ func TestHandleBulkUpload(t *testing.T) {
 					if wu.CodeArtifactRef != "python:3.12" {
 						t.Errorf("work unit %d: expected code_artifact_ref 'python:3.12', got %q", i, wu.CodeArtifactRef)
 					}
-					// deadline = 3600 * 3.0 = 10800
+					// the leaf's own deadline_seconds
 					if wu.DeadlineSeconds != 10800 {
 						t.Errorf("work unit %d: expected deadline_seconds 10800, got %d", i, wu.DeadlineSeconds)
 					}

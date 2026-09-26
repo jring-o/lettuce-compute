@@ -300,10 +300,11 @@ func (h *WorkUnitHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 // handleRequeue resets a stuck work unit back to QUEUED so it can be reassigned.
 // Operator-authed (the router wraps it with requireAuth + requireLeafOwnership).
 // It exists for units stranded in ASSIGNED/RUNNING — e.g. a volunteer that
-// vanished mid-pull or mid-run — which for no_deadline leaves are never
-// auto-expired and would otherwise be orphaned with no way to reset them.
-// It reuses the same transition path as volunteer abandonment
-// (TransitionToExpired → Reassign).
+// vanished mid-pull or mid-run — so an operator can reset one at once instead of
+// waiting for its deadline (every unit is stamped with one: the leaf's, else the
+// head's default), and can reset a legacy unit stamped with no positive deadline,
+// which is never auto-expired. It reuses the same transition path as volunteer
+// abandonment (TransitionToExpired → Reassign).
 func (h *WorkUnitHandler) handleRequeue(w http.ResponseWriter, r *http.Request) {
 	l := logging.LoggerFromContext(r.Context(), h.logger)
 

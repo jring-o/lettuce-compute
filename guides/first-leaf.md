@@ -364,7 +364,7 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_retries": 3
     },
     "fault_tolerance_config": {
-      "deadline_multiplier": 3.0,
+      "deadline_seconds": 10800,
       "max_reassignments": 3
     },
     "data_config": {
@@ -398,8 +398,7 @@ What the key settings mean:
 | `compare_fields` / `ignore_fields` (important with redundancy ≥ 2) | Which output fields the comparison covers. **Without them, every field of the output JSON is compared** — including non-semantic fields like `compute_time_ms`, which differ between two honest volunteers and would make their otherwise-matching results DISAGREE. Set `compare_fields` to the science that must match (here the `result` field), or `ignore_fields` to drop known-noisy fields. With `redundancy_factor: 1` nothing is ever compared, but set it anyway so raising redundancy later doesn't silently start rejecting honest results. |
 | `agreement_threshold: 1.0` | Fraction of the redundant copies that must agree to validate (the quorum). `1.0` = unanimous. |
 | `max_total_copies` / `max_error_copies` (optional) | Hard caps that bound a non-converging unit. `max_total_copies` is the dead-letter ceiling (default `target_copies + 6`): once this many copies have been created with the quorum still unmet, the unit is parked `FAILED` (recoverable by the operator via the work-unit `revive` endpoint — see the head-setup guide). `max_error_copies` bounds timed-out/abandoned/disagreeing copies (default unlimited); when set it must be at least `target_copies`, so an honest run of expiries alone cannot trip it. Copies a volunteer returns **unused** because its work buffer could not hold them count toward neither cap, and a volunteer that abandons a unit **without ever starting it** (an unreachable container engine, no runtime, a prepare failure) counts **once** toward both caps however often it repeats — only real attempts, and distinct volunteers' failures, spend a unit's budget. Both operator-tunable per leaf; omit for the defaults. |
-| `deadline_multiplier: 3.0` | Sets each work unit's timeout. By default `deadline_seconds = 3600 × multiplier` (so `3.0` = 3h, `0.5` = 30min); set an explicit `deadline_seconds` (next row) to give an absolute deadline instead. Any value, no cap. **Stamped at generation** — changing it only affects newly generated units. A copy not returned by its deadline is redispatched to another volunteer (no per-attempt cap; a hopeless unit eventually dead-letters after `redundancy_factor + 6` total copies). `max_reassignments` is a deprecated no-op, kept only so older configs still validate. |
-| `deadline_seconds` (optional) | An absolute per-work-unit deadline in seconds that **overrides** `deadline_multiplier` when set — use it to match the deadline to how long a unit really takes (and to how long your volunteers tend to pause), instead of the fixed 3600s baseline. Must be > 0; for no hard deadline use `no_deadline: true` instead. At activation the head logs the resolved deadline and **warns when it is shorter than `max_cpu_seconds`** — the case where a unit that uses its full CPU budget could never be returned in time. |
+| `deadline_seconds: 10800` (optional) | This leaf's deadline for each work unit, in seconds (here 3 h). A volunteer stops a unit that runs this long, and the head gives a copy not returned by then to another volunteer (no per-attempt cap; a hopeless unit eventually dead-letters after `redundancy_factor + 6` total copies). **Omit it and the unit gets the head's default deadline** (`default_deadline_seconds`, 6 h unless the head operator changes it). Those are the only two sources: every unit has a deadline, so set it to several times how long a slow volunteer's machine takes, with room for pauses. A longer deadline also means a copy can wait longer in a volunteer's buffer before it is dropped, and a volunteer whose copy failed waits longer before it is offered that unit again. **Stamped at generation** — changing it only affects newly generated units. At activation the head logs the deadline and where it came from, and **warns when it is shorter than `max_cpu_seconds`** — the case where a unit that uses its full CPU budget could never be returned in time. The retired `deadline_multiplier` and `no_deadline` keys are still accepted on an update and translated (a multiplier `m` becomes `deadline_seconds = 3600 × m`; `no_deadline: true` removes the leaf's deadline, so the head default applies), with a note in the head log. `max_reassignments` is a deprecated no-op, kept only so older configs still validate. |
 | `aggregation_config.output_field: "result"` | The JSON field the aggregator reads from each result (the π estimate). |
 | `max_output_size_bytes: 10485760` | Hard cap (bytes) on a single result payload — the server **rejects** larger submissions. Must be > 0; size it to the largest reasonable result for this leaf. |
 
@@ -556,7 +555,7 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_retries": 3
     },
     "fault_tolerance_config": {
-      "deadline_multiplier": 3.0,
+      "deadline_seconds": 10800,
       "max_reassignments": 3
     },
     "data_config": {

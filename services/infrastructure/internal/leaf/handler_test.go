@@ -929,7 +929,6 @@ func fullConfigUpdate() UpdateLeafRequest {
 	ftCfg := FaultToleranceConfig{
 		HeartbeatIntervalSeconds:  300,
 		MissedHeartbeatsThreshold: 3,
-		DeadlineMultiplier:        3.0,
 		MaxReassignments:          3,
 	}
 	dataCfg := DataConfig{

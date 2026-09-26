@@ -76,8 +76,7 @@ func graceStartedUnit(t *testing.T, pool *pgxpool.Pool, grpcClient lettucev1.Vol
 		MaxRetries:         3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		DeadlineMultiplier: 3.0,
-		MaxReassignments:   3,
+		MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:   "INLINE",

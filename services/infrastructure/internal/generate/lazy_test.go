@@ -199,7 +199,6 @@ func makeMonteCarloProject(isOngoing bool, numTrials int) *leaf.Leaf {
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
 			MaxReassignments:  3,
-			DeadlineMultiplier: 3.0,
 		},
 		ExecutionConfig: leaf.ExecutionConfig{
 			Binaries: map[string]string{"linux_amd64": "https://example.com/bin"},
@@ -224,7 +223,6 @@ func makeParamSweepProject() *leaf.Leaf {
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
 			MaxReassignments:  3,
-			DeadlineMultiplier: 3.0,
 		},
 		ExecutionConfig: leaf.ExecutionConfig{
 			Binaries: map[string]string{"linux_amd64": "https://example.com/bin"},

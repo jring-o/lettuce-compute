@@ -276,7 +276,7 @@ func TestFaultMonitorScanOnce_BufferedCopyAbandon(t *testing.T) {
 // TestFaultMonitorScanOnce_RunningDeadlineVsZero asserts the running-deadline sweep
 // only fires for copies with a positive deadline: a RUNNING copy with deadline_seconds
 // > 0, past its deadline, is closed EXPIRED, while a RUNNING copy with deadline_seconds
-// = 0 (a NoDeadline leaf) is NEVER swept and stays live. The per-copy snapshot keeps
+// = 0 (a legacy unit stamped with no positive deadline) is NEVER swept and stays live. The per-copy snapshot keeps
 // the sweep index-driven with no join.
 func TestFaultMonitorScanOnce_RunningDeadlineVsZero(t *testing.T) {
 	pool, cleanup := fmTestPool(t)

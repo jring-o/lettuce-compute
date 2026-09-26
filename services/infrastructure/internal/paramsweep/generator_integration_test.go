@@ -106,8 +106,8 @@ func createTestLeafDB(t *testing.T, pool *pgxpool.Pool, creatorID *types.ID) *le
 			Binaries: map[string]string{"linux-amd64": "sha256:testbinary"},
 		},
 		FaultToleranceConfig: leaf.FaultToleranceConfig{
-			DeadlineMultiplier: 2.0,
-			MaxReassignments:   5,
+			DeadlineSeconds:  intPtr(7200),
+			MaxReassignments: 5,
 		},
 	}
 }
@@ -184,7 +184,7 @@ func TestIntegration_Generate_BasicSweep(t *testing.T) {
 		if wu.CodeArtifactRef != "sha256:testbinary" {
 			t.Errorf("wrong code_artifact_ref: %s", wu.CodeArtifactRef)
 		}
-		if wu.DeadlineSeconds != 7200 { // 3600 * 2.0
+		if wu.DeadlineSeconds != 7200 { // the leaf's deadline_seconds
 			t.Errorf("expected deadline_seconds 7200, got %d", wu.DeadlineSeconds)
 		}
 		if wu.MaxReassignments != 5 {

@@ -201,7 +201,7 @@ func TestF19_MapReduceE2E(t *testing.T) {
 		RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:   "INLINE",
@@ -332,7 +332,7 @@ func TestF19_MonteCarloE2E(t *testing.T) {
 		NumericTolerance: floatPtr(0.001), MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:   "INLINE",
@@ -518,7 +518,7 @@ func TestF19_CustomE2E(t *testing.T) {
 		RedundancyFactor: 1, AgreementThreshold: 1.0, ComparisonMode: "EXACT", MaxRetries: 3,
 	}
 	ftCfg := leaf.FaultToleranceConfig{
-		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, DeadlineMultiplier: 3.0, MaxReassignments: 3,
+		HeartbeatIntervalSeconds: 60, MissedHeartbeatsThreshold: 3, MaxReassignments: 3,
 	}
 	dataCfg := leaf.DataConfig{
 		TransferStrategy:   "INLINE",

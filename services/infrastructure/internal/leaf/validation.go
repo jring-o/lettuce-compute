@@ -189,9 +189,8 @@ func ApplyFaultToleranceConfigDefaults(c *FaultToleranceConfig) {
 	if c.MissedHeartbeatsThreshold == 0 {
 		c.MissedHeartbeatsThreshold = 3
 	}
-	if c.DeadlineMultiplier == 0 {
-		c.DeadlineMultiplier = 3.0
-	}
+	// DeadlineSeconds has no default here: a leaf that sets none gets the head's
+	// default deadline, resolved at generation (ResolveDeadlineSeconds).
 	if c.MaxReassignments == 0 {
 		c.MaxReassignments = 3
 	}
@@ -896,21 +895,16 @@ func validateExternalOutputHost(h string) *apierror.APIError {
 //
 // heartbeat_interval_seconds and missed_heartbeats_threshold are DEPRECATED and
 // INERT: v0.3.0 removed per-task heartbeats in favour of deadline-based
-// reassignment (DeadlineMultiplier + the StartWork-stamped reclaim deadline), so
-// these two fields no longer drive anything. They are intentionally not required
-// or range-checked here — any value (including 0 / omitted) is accepted — but the
-// struct fields are retained so older callers that still send them do not break.
+// reassignment (the StartWork-stamped reclaim deadline), so these two fields no
+// longer drive anything. They are intentionally not required or range-checked
+// here — any value (including 0 / omitted) is accepted — but the struct fields
+// are retained so older callers that still send them do not break.
 func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
-	// Deadline multiplier: head-owned, no upper bound. Must be positive.
-	if c.DeadlineMultiplier <= 0 {
-		return apierror.ValidationError("deadline_multiplier must be greater than 0",
-			validationDetail{Field: "deadline_multiplier", Reason: "out_of_range"})
-	}
-
-	// Explicit absolute deadline, when provided, must be positive. Use no_deadline
-	// for "no hard deadline" rather than a zero/negative deadline_seconds.
+	// The leaf's own deadline, when provided, must be positive. A leaf that wants
+	// the head's default deadline omits it (or sends null); there is no "no
+	// deadline" setting, because every unit is stopped at its deadline.
 	if c.DeadlineSeconds != nil && *c.DeadlineSeconds <= 0 {
-		return apierror.ValidationError("deadline_seconds must be greater than 0 when set; use no_deadline for no hard deadline",
+		return apierror.ValidationError("deadline_seconds must be greater than 0 when set; omit it (or send null) to use the head's default deadline",
 			validationDetail{Field: "deadline_seconds", Reason: "must_be_positive"})
 	}
 
@@ -944,21 +938,112 @@ func ValidateFaultToleranceConfig(c *FaultToleranceConfig) *apierror.APIError {
 // footgun: a deadline shorter than the unit's own CPU budget, which guarantees a
 // slow or paused volunteer loses its finished work to deadline reassignment.
 //
-// A no_deadline leaf has no hard deadline (its units run under the head reclaim
-// ceiling), so it is never flagged.
+// Every leaf is checked against the deadline its units actually get, the head's
+// default included: a leaf that sets no deadline_seconds is stopped at the head
+// default like any other.
 func DeadlineAdequacyWarnings(p *Leaf) []string {
-	if p.FaultToleranceConfig.NoDeadline {
-		return nil
-	}
 	var warnings []string
-	deadline := p.FaultToleranceConfig.ResolveDeadlineSeconds()
+	ftc := p.FaultToleranceConfig
+	deadline := ftc.ResolveDeadlineSeconds()
 	maxRun := p.ExecutionConfig.MaxCPUSeconds
 	if maxRun > 0 && deadline < maxRun {
+		source := "the leaf's deadline_seconds"
+		if ftc.DeadlineSource() == DeadlineSourceHeadDefault {
+			source = "the head's default, because the leaf sets no deadline_seconds"
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"work-unit deadline (%ds) is shorter than max_cpu_seconds (%ds): a unit that uses its full CPU budget cannot be returned before the deadline and will be reassigned. Set a longer fault_tolerance_config.deadline_seconds (or deadline_multiplier), or a smaller execution_config.max_cpu_seconds.",
-			deadline, maxRun))
+			"work-unit deadline (%ds, %s) is shorter than max_cpu_seconds (%ds): a unit that uses its full CPU budget cannot be returned before the deadline and will be reassigned. Set a longer fault_tolerance_config.deadline_seconds, or a smaller execution_config.max_cpu_seconds.",
+			deadline, source, maxRun))
 	}
 	return warnings
+}
+
+// RetiredDeadlineSecondsPerMultiplier is the fixed one-hour baseline the retired
+// deadline_multiplier scaled: a multiplier m meant a deadline of m × 3600 seconds.
+const RetiredDeadlineSecondsPerMultiplier = 3600
+
+// TranslateRetiredDeadlineKeys applies the two retired deadline keys of a
+// fault_tolerance_config update onto c, which already holds the merged block, and
+// returns a note for each retired key it found so the caller can log it.
+//
+// A unit's deadline now has two sources only: the leaf's deadline_seconds, else
+// the head's default. The retired keys map onto that as follows:
+//   - no_deadline: true meant "use the head's reclaim ceiling", which is the head
+//     default now, so it clears the leaf's deadline_seconds. As before, it wins
+//     over a deadline_seconds or deadline_multiplier sent alongside it.
+//   - deadline_multiplier m > 0 meant m × 3600 seconds, so it sets
+//     deadline_seconds to that, unless the same update sends a deadline_seconds
+//     value, which won before and still wins (and is validated as sent).
+//   - no_deadline: false and a zero or null multiplier change nothing.
+//
+// A negative multiplier, or a value of the wrong type, is refused. raw may be
+// empty (no block supplied); a block that is not a JSON object is left to the
+// caller's own typed unmarshal to report.
+func TranslateRetiredDeadlineKeys(raw json.RawMessage, c *FaultToleranceConfig) ([]string, *apierror.APIError) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		return nil, nil
+	}
+	rawNoDeadline, sentNoDeadline := keys["no_deadline"]
+	rawMultiplier, sentMultiplier := keys["deadline_multiplier"]
+	if !sentNoDeadline && !sentMultiplier {
+		return nil, nil
+	}
+
+	var noDeadline *bool
+	if sentNoDeadline {
+		if err := json.Unmarshal(rawNoDeadline, &noDeadline); err != nil {
+			return nil, apierror.ValidationError("no_deadline must be a boolean (it is retired; omit deadline_seconds to use the head's default deadline)",
+				validationDetail{Field: "no_deadline", Reason: "invalid_type"})
+		}
+	}
+	var multiplier *float64
+	if sentMultiplier {
+		if err := json.Unmarshal(rawMultiplier, &multiplier); err != nil || (multiplier != nil && *multiplier < 0) {
+			return nil, apierror.ValidationError("deadline_multiplier is retired; set deadline_seconds instead",
+				validationDetail{Field: "deadline_multiplier", Reason: "retired"})
+		}
+	}
+
+	var notes []string
+	if noDeadline != nil && *noDeadline {
+		c.DeadlineSeconds = nil
+		notes = append(notes, fmt.Sprintf(
+			"no_deadline is retired: no_deadline=true now means the leaf sets no deadline_seconds, so its units get the head's default deadline (%ds)",
+			headDefaultDeadlineSeconds))
+		if multiplier != nil {
+			notes = append(notes, "deadline_multiplier is retired and was ignored because no_deadline=true was sent with it")
+		}
+		return notes, nil
+	}
+	if sentNoDeadline {
+		notes = append(notes, "no_deadline is retired and was ignored")
+	}
+	if multiplier == nil || *multiplier == 0 {
+		if sentMultiplier {
+			notes = append(notes, "deadline_multiplier is retired and was ignored")
+		}
+		return notes, nil
+	}
+	if sentDeadline, ok := keys["deadline_seconds"]; ok && string(sentDeadline) != "null" {
+		notes = append(notes, "deadline_multiplier is retired and was ignored because deadline_seconds was sent with it")
+		return notes, nil
+	}
+	d := int(float64(RetiredDeadlineSecondsPerMultiplier) * *multiplier)
+	if d <= 0 {
+		// A multiplier too small to make a whole second: refuse it rather than
+		// store an invalid deadline_seconds.
+		return nil, apierror.ValidationError("deadline_multiplier is retired; set deadline_seconds instead",
+			validationDetail{Field: "deadline_multiplier", Reason: "retired"})
+	}
+	c.DeadlineSeconds = &d
+	notes = append(notes, fmt.Sprintf(
+		"deadline_multiplier is retired: %g was translated to deadline_seconds %d (%g × %ds)",
+		*multiplier, d, *multiplier, RetiredDeadlineSecondsPerMultiplier))
+	return notes, nil
 }
 
 // ValidateDataConfig validates data transfer and splitting configuration. isOngoing is the
