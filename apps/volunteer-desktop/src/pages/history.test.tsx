@@ -256,13 +256,42 @@ describe("HistoryPage", () => {
     expect(within(row).getByText("Head rejected")).toBeInTheDocument();
   });
 
+  // A run whose unit the head had already finalized: the head did not need the
+  // result. It is neither accepted nor rejected, and the page must not say either.
+  it("labels a run the head did not need 'Not needed' and says why", async () => {
+    const user = userEvent.setup();
+    mockUseHistory.mockReturnValue(
+      historyState({
+        entries: [makeMockEntry({ leaf_name: "Late Leaf", validation_status: "not_needed" })],
+      })
+    );
+
+    render(<HistoryPage />);
+    const row = screen.getByTestId("history-row");
+    const badge = within(row).getByText("Not needed");
+    expect(badge).toHaveAttribute("title", expect.stringMatching(/already finalized this unit/));
+    expect(within(row).queryByText("Head rejected")).not.toBeInTheDocument();
+
+    await user.click(rowLabel("Late Leaf"));
+    expect(screen.queryByText("No")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/already finalized this unit, so it did not need this result; no credit/)
+    ).toBeInTheDocument();
+  });
+
   it("offers the head-accepted filter with honest option labels", () => {
     mockUseHistory.mockReturnValue(historyState());
 
     render(<HistoryPage />);
     const select = screen.getByLabelText("Head accepted") as HTMLSelectElement;
     const labels = Array.from(select.options).map((o) => o.text);
-    expect(labels).toEqual(["All submissions", "Head accepted", "Head rejected"]);
+    expect(labels).toEqual(["All submissions", "Head accepted", "Head rejected", "Not needed"]);
+    expect(Array.from(select.options).map((o) => o.value)).toEqual([
+      "all",
+      "accepted",
+      "rejected",
+      "not_needed",
+    ]);
     expect(select).toHaveAttribute("title", HEAD_ACCEPTED_TOOLTIP);
   });
 

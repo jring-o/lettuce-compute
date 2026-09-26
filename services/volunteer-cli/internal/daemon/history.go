@@ -26,6 +26,24 @@ type HistoryEntry struct {
 	WallClockSeconds int64     `json:"wall_clock_seconds"`
 	CPUSeconds       int64     `json:"cpu_seconds"`
 	ResultAccepted   bool      `json:"result_accepted"`
+	// Outcome is set when the submission ended some other way than the head
+	// accepting or rejecting the result. Its one value is
+	// HistoryOutcomeNotNeeded, which comes with ResultAccepted false. Empty on
+	// every other entry, including all entries written before the field existed.
+	Outcome string `json:"outcome,omitempty"`
+}
+
+// HistoryOutcomeNotNeeded marks a run whose result the head did not need: the
+// work unit was already finalized when the result arrived, because other
+// machines' results completed it while this copy ran or because it was
+// finalized after this copy's deadline lapsed. The run finished on this
+// machine, but its result was neither accepted nor rejected, and it earns no
+// credit.
+const HistoryOutcomeNotNeeded = "not_needed"
+
+// NotNeeded reports whether the head did not need this entry's result.
+func (e HistoryEntry) NotNeeded() bool {
+	return e.Outcome == HistoryOutcomeNotNeeded
 }
 
 // HistoryFilePath returns the path to the history JSONL file.

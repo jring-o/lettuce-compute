@@ -161,7 +161,13 @@ export interface HistoryEntry {
   cpu_seconds: number;
   /** Always 0 today: per-unit credit is not tracked locally. */
   credit_earned: number;
-  validation_status: "accepted" | "rejected";
+  /**
+   * The head's answer to the submission when it arrived. "not_needed": the
+   * head had already finalized the unit (other machines' results completed
+   * it, or it was finalized after this copy's deadline), so it did not need
+   * this result and gives no credit for it.
+   */
+  validation_status: "accepted" | "rejected" | "not_needed";
   head_name: string;
 }
 
