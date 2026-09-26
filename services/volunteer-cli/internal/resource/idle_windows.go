@@ -14,6 +14,10 @@ var (
 	procGetTickCount = kernel32W.NewProc("GetTickCount") // kernel32W declared in limiter_windows.go
 )
 
+// IdleDetectionRemedy says what makes this computer's idle time readable
+// when GetIdleSeconds cannot read it. Windows has no alternative source.
+const IdleDetectionRemedy = ""
+
 type lastInputInfo struct {
 	cbSize uint32
 	dwTime uint32
@@ -25,7 +29,7 @@ func GetIdleSeconds() (int, error) {
 	info := lastInputInfo{cbSize: uint32(unsafe.Sizeof(lastInputInfo{}))}
 	ret, _, err := procLastInput.Call(uintptr(unsafe.Pointer(&info)))
 	if ret == 0 {
-		return 0, fmt.Errorf("GetLastInputInfo: %w", err)
+		return 0, fmt.Errorf("%w (GetLastInputInfo: %v)", ErrIdleUnknown, err)
 	}
 
 	tickCount, _, _ := procGetTickCount.Call()

@@ -135,12 +135,15 @@ export function formatGb(mb: number): string {
 
 /**
  * Human wording for the daemon's `paused_reason`. "scheduled" is the
- * configured computing hours; other reasons are shown as the daemon sent
- * them, so an unfamiliar value is still visible rather than hidden.
+ * configured computing hours; "idle_unknown" is a "When Idle" schedule on a
+ * computer whose idle time cannot be read, which never ends on its own; other
+ * reasons are shown as the daemon sent them, so an unfamiliar value is still
+ * visible rather than hidden.
  */
 export function pausedLabel(reason: string | null | undefined): string {
   if (!reason) return "Paused";
   if (reason === "scheduled") return "Paused — outside your schedule";
+  if (reason === "idle_unknown") return "Paused — can't tell when this computer is idle";
   if (reason === "busy") return "Paused — your computer is busy";
   return `Paused — ${reason}`;
 }
@@ -162,6 +165,9 @@ export function pausedExplanation(reason: string | null | undefined): string {
   if (reason === "user") return "Computing is paused. Resume to start contributing.";
   if (reason === "scheduled") {
     return "Computing is paused by your schedule and starts again when the next window opens. Change the schedule in Settings to compute now.";
+  }
+  if (reason === "idle_unknown") {
+    return "Your schedule computes only while this computer is idle, but Lettuce cannot tell when it is idle here, so computing will not start on its own. Choose Always On or Scheduled in Settings to compute.";
   }
   if (reason === "thermal") {
     return "Computing is paused while the machine cools down. It starts again on its own.";

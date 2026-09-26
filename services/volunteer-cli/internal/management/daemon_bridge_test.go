@@ -59,6 +59,22 @@ func TestComputeTaskStatus_SuspendedScheduled(t *testing.T) {
 	}
 }
 
+// A task frozen because "run when idle" cannot read the idle time is held by
+// the schedule, and says why, instead of "reason not reported".
+func TestComputeTaskStatus_SuspendedIdleUnknown(t *testing.T) {
+	task := daemon.CurrentTask{Suspended: true}
+	status, reason := computeTaskStatus(task, "idle_unknown", true)
+	if status != "suspended_scheduled" {
+		t.Errorf("status = %q, want %q", status, "suspended_scheduled")
+	}
+	want := "Waiting for idle time, which this computer cannot report"
+	if reason == nil {
+		t.Errorf("reason = nil, want %q", want)
+	} else if *reason != want {
+		t.Errorf("reason = %q, want %q", *reason, want)
+	}
+}
+
 func TestComputeTaskStatus_PerSlotSuspendedNoDaemonPause(t *testing.T) {
 	// Slot suspended but daemon not paused -> suspended_user (per-slot user action).
 	task := daemon.CurrentTask{Suspended: true}

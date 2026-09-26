@@ -30,9 +30,10 @@ export type DaemonState = "active" | "paused" | "stopped";
  * Why the daemon is paused: "user" (pause button or CLI), "thermal" (CPU or
  * GPU over the configured temperature), "busy" (other programs are using
  * more of the CPU than the yield setting allows), "scheduled" (outside the
- * configured computing hours).
+ * configured computing hours), "idle_unknown" (a "When Idle" schedule on a
+ * computer whose idle time cannot be read, so it never starts on its own).
  */
-export type PausedReason = "user" | "thermal" | "busy" | "scheduled";
+export type PausedReason = "user" | "thermal" | "busy" | "scheduled" | "idle_unknown";
 
 /**
  * "suspended" (without a suffix) is a task frozen while the daemon is paused

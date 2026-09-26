@@ -283,6 +283,59 @@ func checkAccountInfo(rep *doctorReport) {
 		return
 	}
 	rep.add(docInfo, "schedule", describeSchedule(cfg.Scheduling), "")
+	if cfg.Scheduling.Mode == "WHEN_IDLE" {
+		failing, known := daemonIdleUnavailable(cfg.DataDir)
+		checkIdleDetection(rep, cfg.Scheduling.IdleThresholdMins, failing, known, resource.GetIdleSeconds)
+	}
+}
+
+// checkIdleDetection says whether "run when idle" can read this computer's
+// idle time. When no idle source answers, the schedule never opens, so the
+// volunteer never computes while every other check passes. The running
+// daemon's verdict comes first: it reads idle time in its own session, which
+// for a daemon the desktop app started is the desktop's, not this terminal's.
+// Without a daemon, the reading is taken here, and a failure is a warning
+// because a daemon started elsewhere may still see a desktop session.
+func checkIdleDetection(rep *doctorReport, thresholdMins int, daemonFailing, daemonKnown bool, probe func() (int, error)) {
+	if daemonFailing {
+		rep.add(docFail, "idle time", `the running daemon cannot read this computer's idle time, so "run when idle" never starts work`, idleRemedy())
+		return
+	}
+	secs, err := probe()
+	switch {
+	case err == nil:
+		rep.add(docOK, "idle time", fmt.Sprintf("readable — idle for %s now; work starts after %d min idle", formatDurationSeconds(secs), thresholdMins), "")
+	case daemonKnown:
+		rep.add(docInfo, "idle time", fmt.Sprintf("cannot be read from this terminal (%v); the running daemon, in its own session, reports no trouble reading it", err), "")
+	default:
+		rep.add(docWarn, "idle time", fmt.Sprintf(`cannot be read from this terminal (%v) — a daemon started from here would never start work in "run when idle" mode`, err), idleRemedy())
+	}
+}
+
+// idleRemedy says how to make "run when idle" work, or what to choose instead.
+func idleRemedy() string {
+	alternative := "run always (`lettuce-volunteer schedule clear`) or during set hours (`lettuce-volunteer schedule set --from 20:00 --to 06:00`) instead"
+	if resource.IdleDetectionRemedy != "" {
+		return resource.IdleDetectionRemedy + "; or " + alternative
+	}
+	return alternative
+}
+
+// daemonIdleUnavailable asks the running daemon whether it holds a live
+// notice that its idle readings fail. known is false when no daemon answered.
+func daemonIdleUnavailable(dataDir string) (failing, known bool) {
+	var resp struct {
+		Notices []daemon.Notice `json:"notices"`
+	}
+	if err := managementGet(dataDir, "/api/v1/notices", &resp); err != nil {
+		return false, false
+	}
+	for _, n := range resp.Notices {
+		if n.Code == daemon.IdleUnavailableNoticeCode && n.ResolvedAt == nil {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // describeSchedule renders the scheduling config as a one-line human summary.

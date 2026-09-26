@@ -4,32 +4,25 @@ package resource
 
 import (
 	"os/exec"
-	"regexp"
-	"strconv"
-	"strings"
 )
 
-// idleTimeRe matches HIDIdleTime output from ioreg (value in nanoseconds).
-var idleTimeRe = regexp.MustCompile(`"HIDIdleTime"\s*=\s*(\d+)`)
+// IdleDetectionRemedy says what makes this computer's idle time readable
+// when GetIdleSeconds cannot read it. macOS has no alternative source.
+const IdleDetectionRemedy = ""
 
 // GetIdleSeconds returns the number of seconds since the last user input.
-// On macOS, it parses the HIDIdleTime from ioreg (nanoseconds).
-// Returns 0 (never idle) if detection fails.
+// On macOS, it parses the HIDIdleTime from ioreg (nanoseconds). When ioreg
+// fails or reports no HIDIdleTime it returns an error wrapping
+// ErrIdleUnknown; the scheduler then treats the machine as not idle and says
+// why.
 func GetIdleSeconds() (int, error) {
+	return firstIdleReading([]idleSource{{name: "ioreg HIDIdleTime", read: ioregIdleSeconds}})
+}
+
+func ioregIdleSeconds() (int, error) {
 	out, err := exec.Command("ioreg", "-c", "IOHIDSystem", "-d", "4").Output()
 	if err != nil {
-		return 0, nil // safe fallback
+		return 0, err
 	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		if m := idleTimeRe.FindStringSubmatch(line); len(m) == 2 {
-			ns, err := strconv.ParseInt(m[1], 10, 64)
-			if err != nil {
-				continue
-			}
-			return int(ns / 1_000_000_000), nil
-		}
-	}
-
-	return 0, nil // safe fallback
+	return parseHIDIdleTime(string(out))
 }

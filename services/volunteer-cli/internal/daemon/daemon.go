@@ -545,6 +545,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	// the live memory ceiling into the registered runtimes (BG-16, TB-75,
 	// TB-79).
 	d.wireRuntimeLimits(pg, limiter)
+	scheduler.OnIdleDetectionChange(d.noteIdleDetection)
 	yieldMonitor.SetSampler(runtime.NewCPULoadSampler(runtime.NewMachineCPUSampler(), d.ownCPUSeconds, goruntime.NumCPU(), nil))
 	return d
 }
@@ -3205,6 +3206,15 @@ const (
 	pauseSourceBusy     = "busy"      // the yield monitor: other programs need the CPU (TB-83)
 )
 
+// pauseReasonIdleUnknown is the reason reported in place of "scheduled" while
+// "run when idle" cannot read this computer's idle time (scheduleReason), and
+// IdleUnavailableNoticeCode the notice raised meanwhile (noteIdleDetection),
+// which `doctor` also looks for.
+const (
+	pauseReasonIdleUnknown    = "idle_unknown"
+	IdleUnavailableNoticeCode = "idle_detection_unavailable"
+)
+
 // setAutoPause records one automatic source's pause (on) or resume (off)
 // and re-derives the daemon's paused state and reported reason from ALL the
 // sources. Before the yield monitor joined, one flag was overwritten by
@@ -3438,7 +3448,8 @@ func (d *Daemon) IsPaused() bool {
 // paused. A user pause outranks everything (it is the state `resume` undoes);
 // then the signal-driven reason — "thermal" over "busy" over "scheduled" when
 // several sources hold at once (setAutoPause); then the live schedule verdict
-// (TB-44).
+// (TB-44). A schedule pause is reported as "idle_unknown" instead while "run
+// when idle" cannot read the idle time (scheduleReason).
 func (d *Daemon) PauseReason() string {
 	d.mu.Lock()
 	if d.userPaused {
@@ -3448,24 +3459,56 @@ func (d *Daemon) PauseReason() string {
 	if d.paused {
 		reason := d.pauseReason
 		d.mu.Unlock()
+		if reason == pauseSourceResource {
+			return d.scheduleReason()
+		}
 		return reason
 	}
 	d.mu.Unlock()
 	if d.scheduleClosed() {
-		return "scheduled"
+		return d.scheduleReason()
 	}
 	return ""
+}
+
+// scheduleReason names a schedule pause: "idle_unknown" while "run when idle"
+// cannot read this computer's idle time, so the pause will not end on its own
+// and must not be reported as an ordinary wait for the schedule; otherwise
+// "scheduled".
+func (d *Daemon) scheduleReason() string {
+	if d.scheduler != nil && d.scheduler.IdleDetectionError() != nil {
+		return pauseReasonIdleUnknown
+	}
+	return pauseSourceResource
 }
 
 // PauseDetail is one sentence of detail behind PauseReason, or "" when the
 // reason needs none. For "busy" it is the measured share of the CPU other
 // programs are using and both thresholds, so `status` and the app can say
-// what the volunteer's setting saw (TB-83).
+// what the volunteer's setting saw (TB-83). For "idle_unknown" it says what
+// the failed idle reading means and what fixes it.
 func (d *Daemon) PauseDetail() string {
-	if d.PauseReason() != pauseSourceBusy || d.yieldMonitor == nil {
-		return ""
+	switch d.PauseReason() {
+	case pauseSourceBusy:
+		if d.yieldMonitor == nil {
+			return ""
+		}
+		return runtime.DescribeYieldPause(d.yieldMonitor.Snapshot())
+	case pauseReasonIdleUnknown:
+		return resource.DescribeIdleUnavailable()
 	}
-	return runtime.DescribeYieldPause(d.yieldMonitor.Snapshot())
+	return ""
+}
+
+// noteIdleDetection keeps the idle-detection notice in step with the
+// scheduler: raised when idle readings start failing in "run when idle" mode,
+// resolved when they work again.
+func (d *Daemon) noteIdleDetection(err error) {
+	if err != nil {
+		d.notices.Notify(NoticeWarn, IdleUnavailableNoticeCode, resource.DescribeIdleUnavailable(), "", "")
+		return
+	}
+	d.notices.Resolve(IdleUnavailableNoticeCode, "", "")
 }
 
 // YieldSnapshot reports the yield monitor's state (TB-83); the zero value

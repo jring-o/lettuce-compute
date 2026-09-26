@@ -89,7 +89,8 @@ type StatusResponse struct {
 	PausedReason     *string          `json:"paused_reason"`
 	// PausedDetail is one sentence behind PausedReason when the reason has
 	// one — for "busy", the share of the CPU other programs are using and
-	// the two thresholds (TB-83). Absent otherwise.
+	// the two thresholds (TB-83); for "idle_unknown", why "run when idle"
+	// cannot start and what fixes it. Absent otherwise.
 	PausedDetail string `json:"paused_detail,omitempty"`
 	// ClientVersion is this volunteer build's version string (what
 	// `lettuce-volunteer --version` prints), so a client can compare it with
@@ -170,6 +171,10 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused
 		case "scheduled":
 			status = "suspended_scheduled"
 			r := "Outside scheduled computing hours"
+			return status, &r
+		case "idle_unknown":
+			status = "suspended_scheduled"
+			r := "Waiting for idle time, which this computer cannot report"
 			return status, &r
 		case "busy":
 			status = "suspended_busy"
