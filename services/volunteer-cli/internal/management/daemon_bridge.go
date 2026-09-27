@@ -1515,6 +1515,59 @@ type HeadCredit struct {
 	VolunteerID string  `json:"volunteer_id"`
 	TotalCredit float64 `json:"total_credit"`
 	Available   bool    `json:"available"` // false if the head was unreachable or predates GetMyContribution
+	// WorkStatus is the account's results by validation state and copies in
+	// progress on this head. It is null when the head did not report them (it was
+	// unreachable, or it predates the figures), which is not the same as zero.
+	WorkStatus *HeadWorkStatus `json:"work_status"`
+}
+
+// HeadWorkStatus is one head's per-leaf count of the account's results by
+// validation state and its copies by progress.
+type HeadWorkStatus struct {
+	ByLeaf []LeafWorkStatus `json:"by_leaf"`
+}
+
+// LeafWorkStatus counts the account's results on one leaf by validation state,
+// and its copies of that leaf's work by progress. Only agreed results earn credit.
+type LeafWorkStatus struct {
+	LeafID   string `json:"leaf_id"`
+	LeafName string `json:"leaf_name"`
+
+	ResultsPending                     int `json:"results_pending"`
+	ResultsAgreed                      int `json:"results_agreed"`
+	ResultsDisagreed                   int `json:"results_disagreed"`
+	ResultsAwaitingContentVerification int `json:"results_awaiting_content_verification"`
+	ResultsContentVerificationFailed   int `json:"results_content_verification_failed"`
+	ResultsSuperseded                  int `json:"results_superseded"`
+
+	RunsStopped          int `json:"runs_stopped"`
+	CopiesRunning        int `json:"copies_running"`
+	CopiesWaitingToStart int `json:"copies_waiting_to_start"`
+}
+
+// headWorkStatus converts a GetMyContribution work status, or returns nil when
+// the head sent none.
+func headWorkStatus(ws *lettucev1.WorkStatus) *HeadWorkStatus {
+	if ws == nil {
+		return nil
+	}
+	out := &HeadWorkStatus{ByLeaf: make([]LeafWorkStatus, 0, len(ws.GetByLeaf()))}
+	for _, ls := range ws.GetByLeaf() {
+		out.ByLeaf = append(out.ByLeaf, LeafWorkStatus{
+			LeafID:                             ls.GetLeafId(),
+			LeafName:                           ls.GetLeafName(),
+			ResultsPending:                     int(ls.GetResultsPending()),
+			ResultsAgreed:                      int(ls.GetResultsAgreed()),
+			ResultsDisagreed:                   int(ls.GetResultsDisagreed()),
+			ResultsAwaitingContentVerification: int(ls.GetResultsAwaitingContentVerification()),
+			ResultsContentVerificationFailed:   int(ls.GetResultsContentVerificationFailed()),
+			ResultsSuperseded:                  int(ls.GetResultsSuperseded()),
+			RunsStopped:                        int(ls.GetRunsStopped()),
+			CopiesRunning:                      int(ls.GetCopiesRunning()),
+			CopiesWaitingToStart:               int(ls.GetCopiesWaitingToStart()),
+		})
+	}
+	return out
 }
 
 // GetCredit returns the volunteer ACCOUNT's credit. It asks each attached head for
@@ -1567,6 +1620,7 @@ func (b *DaemonBridge) creditFromHeads() (CreditSummary, bool) {
 		anyAnswered = true
 		hc.Available = true
 		hc.TotalCredit = resp.GetTotalCredit()
+		hc.WorkStatus = headWorkStatus(resp.GetWorkStatus())
 		if hc.VolunteerID == "" {
 			hc.VolunteerID = resp.GetVolunteerId()
 		}

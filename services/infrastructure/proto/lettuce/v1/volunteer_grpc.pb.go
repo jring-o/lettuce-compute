@@ -79,9 +79,10 @@ type VolunteerServiceClient interface {
 	// Server marks the assignment as ABANDONED and requeues the work unit.
 	AbandonWorkUnit(ctx context.Context, in *AbandonWorkUnitRequest, opts ...grpc.CallOption) (*AbandonWorkUnitResponse, error)
 	// Return the CALLER's own credit contribution, aggregated across every leaf and
-	// every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
-	// identity key), not the host, so this already sums a volunteer's machines into
-	// one total. The caller's identity is derived from the VERIFIED per-request
+	// every machine the caller runs, with its results by validation state and its
+	// copies in progress per leaf (work_status). Credit is keyed to the ACCOUNT (the
+	// Ed25519 identity key), not the host, so this already sums a volunteer's
+	// machines into one total. The caller's identity is derived from the VERIFIED per-request
 	// signature (the authenticated public key), NOT from any request field — so a
 	// volunteer can only ever see its own credit. Authenticated (not a public
 	// method). This is the self-service counterpart to the operator-only REST
@@ -254,9 +255,10 @@ type VolunteerServiceServer interface {
 	// Server marks the assignment as ABANDONED and requeues the work unit.
 	AbandonWorkUnit(context.Context, *AbandonWorkUnitRequest) (*AbandonWorkUnitResponse, error)
 	// Return the CALLER's own credit contribution, aggregated across every leaf and
-	// every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
-	// identity key), not the host, so this already sums a volunteer's machines into
-	// one total. The caller's identity is derived from the VERIFIED per-request
+	// every machine the caller runs, with its results by validation state and its
+	// copies in progress per leaf (work_status). Credit is keyed to the ACCOUNT (the
+	// Ed25519 identity key), not the host, so this already sums a volunteer's
+	// machines into one total. The caller's identity is derived from the VERIFIED per-request
 	// signature (the authenticated public key), NOT from any request field — so a
 	// volunteer can only ever see its own credit. Authenticated (not a public
 	// method). This is the self-service counterpart to the operator-only REST

@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, formatDuration, formatCreditAmount } from "@/lib/utils";
 import { VizFrame } from "@/components/viz/VizFrame";
+import { WorkStatusByHead } from "@/components/work-status";
 import type { HistoryEntry, CreditSummary, ResultEntry } from "@/api/client";
 
 function formatTime(iso: string): string {
@@ -661,8 +662,18 @@ export function HistoryPage({ active = true }: HistoryPageProps) {
             `md` (the 900 px default window qualifies) it is the right-hand
             column beside the list. */}
         {credit && (credit.by_head?.length || credit.by_leaf.length > 0) && (
-          <div data-testid="credit-breakdown" className="md:order-last">
+          <div data-testid="credit-breakdown" className="md:order-last space-y-4">
             <CreditBreakdown credit={credit} />
+            {credit.source === "head" && credit.by_head.some((h) => h.available) && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm font-medium">Your Results by State</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <WorkStatusByHead heads={credit.by_head} />
+                </CardContent>
+              </Card>
+            )}
           </div>
         )}
 

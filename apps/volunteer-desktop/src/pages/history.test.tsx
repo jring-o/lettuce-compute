@@ -547,6 +547,60 @@ describe("HistoryPage", () => {
     expect(screen.getAllByText("1,234.5 (100%)").length).toBeGreaterThan(0);
   });
 
+  it("shows the account's results by state beside its credit", () => {
+    mockUseHistory.mockReturnValue(
+      historyState({ entries: [makeMockEntry({ completed_at: new Date().toISOString() })] })
+    );
+    mockUseCredit.mockReturnValue({
+      credit: {
+        total_credit: 10,
+        today: 0,
+        this_week: 0,
+        this_month: 0,
+        by_leaf: [],
+        by_head: [
+          {
+            head_name: "scios",
+            volunteer_id: "v1",
+            total_credit: 10,
+            available: true,
+            work_status: {
+              by_leaf: [
+                {
+                  leaf_id: "gpu",
+                  leaf_name: "GPU leaf",
+                  results_pending: 523,
+                  results_agreed: 10,
+                  results_disagreed: 0,
+                  results_awaiting_content_verification: 0,
+                  results_content_verification_failed: 0,
+                  results_superseded: 0,
+                  runs_stopped: 0,
+                  copies_running: 1,
+                  copies_waiting_to_start: 2,
+                },
+              ],
+            },
+          },
+          { head_name: "old-head", volunteer_id: "v1", total_credit: 0, available: true },
+        ],
+        source: "head",
+      } as CreditSummary,
+      isLoading: false,
+      error: null,
+    });
+
+    render(<HistoryPage />);
+    const sidebar = screen.getByTestId("credit-breakdown");
+    expect(within(sidebar).getByText("Your Results by State")).toBeInTheDocument();
+    expect(within(sidebar).getByText("Waiting for validation")).toBeInTheDocument();
+    expect(within(sidebar).getByText("523")).toBeInTheDocument();
+    expect(within(sidebar).getByText("1 running, 2 waiting to start")).toBeInTheDocument();
+    expect(
+      within(sidebar).getByText("Not reported by this head (it runs an older version)")
+    ).toBeInTheDocument();
+  });
+
   // --- Export ---
 
   it("CSV export uses the documented header and fills head_name from heads data", async () => {

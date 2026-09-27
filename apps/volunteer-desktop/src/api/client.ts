@@ -637,6 +637,40 @@ export interface HeadCredit {
   total_credit: number;
   /** False when the head was unreachable or too old to report credit. */
   available: boolean;
+  /**
+   * The account's results by validation state and copies in progress on this
+   * head. Null (or absent) when the head did not report them — it was
+   * unreachable, or it predates the figures — which is not the same as zero.
+   */
+  work_status?: HeadWorkStatus | null;
+}
+
+/** One head's count of the account's results and copies, leaf by leaf. */
+export interface HeadWorkStatus {
+  by_leaf: LeafWorkStatus[];
+}
+
+/**
+ * The account's results on one leaf by validation state, and its copies of that
+ * leaf's work units by progress. Only agreed results earn credit.
+ */
+export interface LeafWorkStatus {
+  leaf_id: string;
+  leaf_name: string;
+  /** Waiting for validation; on a leaf that needs agreeing results, for a different account's result. */
+  results_pending: number;
+  results_agreed: number;
+  results_disagreed: number;
+  /** The head has not yet fetched and checked the uploaded output. */
+  results_awaiting_content_verification: number;
+  /** The uploaded output could not be fetched or checked. */
+  results_content_verification_failed: number;
+  /** Never compared: the work unit was retired first. */
+  results_superseded: number;
+  /** Runs stopped because enough results arrived while they ran; they leave no result. */
+  runs_stopped: number;
+  copies_running: number;
+  copies_waiting_to_start: number;
 }
 
 /**
@@ -1322,7 +1356,13 @@ export class ManagementClient {
 
   async credit(): Promise<CreditSummary> {
     const resp = await this.request<CreditSummary>("GET", "/api/v1/credit");
-    return { ...resp, by_leaf: list(resp.by_leaf), by_head: list(resp.by_head) };
+    return {
+      ...resp,
+      by_leaf: list(resp.by_leaf),
+      by_head: list(resp.by_head).map((h) =>
+        h.work_status ? { ...h, work_status: { by_leaf: list(h.work_status.by_leaf) } } : h
+      ),
+    };
   }
 
   async results(): Promise<ResultsResponse> {

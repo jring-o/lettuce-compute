@@ -58,9 +58,10 @@ service VolunteerService {
   rpc AbandonWorkUnit(AbandonWorkUnitRequest) returns (AbandonWorkUnitResponse);
 
   // Return the CALLER's own credit contribution, aggregated across every leaf and
-  // every machine the caller runs. Credit is keyed to the ACCOUNT (the Ed25519
-  // identity key), not the host, so this already sums a volunteer's machines into
-  // one total. The caller's identity is derived from the VERIFIED per-request
+  // every machine the caller runs, with its results by validation state and its
+  // copies in progress per leaf (work_status). Credit is keyed to the ACCOUNT (the
+  // Ed25519 identity key), not the host, so this already sums a volunteer's
+  // machines into one total. The caller's identity is derived from the VERIFIED per-request
   // signature (the authenticated public key), NOT from any request field — so a
   // volunteer can only ever see its own credit. Authenticated (not a public
   // method). This is the self-service counterpart to the operator-only REST
@@ -483,6 +484,38 @@ message GetMyContributionResponse {
   repeated ResourceTypeContribution by_resource_type = 4; // cpu_only / gpu split
   repeated DailyContribution daily = 5;            // last 30 days
   repeated WeeklyContribution weekly = 6;          // last 12 weeks
+  // The account's own results by validation state and copies by progress, per
+  // leaf. Every head that reports them sets this, with no leaves when the account
+  // has nothing here; an older head leaves it unset, so a client can tell "not
+  // reported" from zero. PRIVATE leaves are included: this is the account's own
+  // authenticated view, not a public page.
+  WorkStatus work_status = 7;
+}
+
+// WorkStatus is the calling account's work on one head, leaf by leaf.
+message WorkStatus {
+  repeated LeafWorkStatus by_leaf = 1;
+}
+
+// LeafWorkStatus counts the calling account's results on one leaf by validation
+// state, and its copies of that leaf's work units by progress. Only credit follows
+// AGREED results; the other counts are work the account did or holds that has
+// not (or not yet) been credited.
+message LeafWorkStatus {
+  string leaf_id = 1;
+  string leaf_name = 2;
+  // Results, by validation state.
+  int32 results_pending = 3;                        // waiting for validation; on a leaf that needs agreeing results, for a different account's result
+  int32 results_agreed = 4;                         // validated and credited
+  int32 results_disagreed = 5;                      // did not agree with the accepted result
+  int32 results_awaiting_content_verification = 6;  // the head has not yet fetched and checked the uploaded output
+  int32 results_content_verification_failed = 7;    // the uploaded output could not be fetched or checked
+  int32 results_superseded = 8;                     // never compared: the work unit was retired first
+  // Copies. A copy stopped because the unit validated while it ran leaves no
+  // result, so it is counted here rather than above.
+  int32 runs_stopped = 9;                           // closed after it started, because enough results had arrived
+  int32 copies_running = 10;                        // open and started
+  int32 copies_waiting_to_start = 11;               // open, held in a work buffer, not yet started
 }
 
 message LeafContribution {

@@ -251,6 +251,19 @@ describe("ManagementClient", () => {
       expect(result.by_leaf).toEqual([]);
       expect(result.by_head).toEqual([]);
     });
+
+    it("keeps each head's work status, normalising a null leaf list", async () => {
+      respond({
+        total_credit: 0, today: 0, this_week: 0, this_month: 0, by_leaf: [], source: "head",
+        by_head: [
+          { head_name: "a", volunteer_id: "v", total_credit: 0, available: true, work_status: { by_leaf: null } },
+          { head_name: "b", volunteer_id: "v", total_credit: 0, available: true, work_status: null },
+        ],
+      });
+      const result = await client.credit();
+      expect(result.by_head[0].work_status).toEqual({ by_leaf: [] });
+      expect(result.by_head[1].work_status).toBeNull();
+    });
   });
 
   describe("heads", () => {

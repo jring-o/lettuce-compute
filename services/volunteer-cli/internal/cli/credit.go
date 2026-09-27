@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"text/tabwriter"
 
+	"github.com/lettuce-compute/volunteer-cli/internal/management"
 	"github.com/spf13/cobra"
 )
 
@@ -19,6 +20,10 @@ func newCreditCmd() *cobra.Command {
 			"every machine you run under the same account — not just this host. When no\n" +
 			"head can be reached it falls back to a local estimate from this host's\n" +
 			"history.\n\n" +
+			"It also lists, per head and leaf, your results by state (waiting for\n" +
+			"validation, agreed, did not agree, ...), runs stopped because enough results\n" +
+			"arrived, and the copies you hold in progress, so work that has not earned\n" +
+			"credit yet is visible too.\n\n" +
 			"The daemon must be running (`lettuce-volunteer start`).",
 		RunE: runCredit,
 	}
@@ -33,10 +38,11 @@ type creditCommandResponse struct {
 	Source      string  `json:"source"`
 	DayBoundary string  `json:"day_boundary"`
 	ByHead      []struct {
-		HeadName    string  `json:"head_name"`
-		VolunteerID string  `json:"volunteer_id"`
-		TotalCredit float64 `json:"total_credit"`
-		Available   bool    `json:"available"`
+		HeadName    string                     `json:"head_name"`
+		VolunteerID string                     `json:"volunteer_id"`
+		TotalCredit float64                    `json:"total_credit"`
+		Available   bool                       `json:"available"`
+		WorkStatus  *management.HeadWorkStatus `json:"work_status"`
 	} `json:"by_head"`
 	ByLeaf []struct {
 		LeafID   string  `json:"leaf_id"`
@@ -93,7 +99,77 @@ func runCredit(cmd *cobra.Command, args []string) error {
 		_ = w.Flush()
 	}
 
+	if cr.Source == "head" {
+		printWorkStatus(cr)
+	}
+
 	return nil
+}
+
+// printWorkStatus lists, per head and leaf, the account's results by validation
+// state and its copies in progress: the work that credit alone does not show.
+// Only non-zero lines print. A head that answered without the figures (an older
+// head) says so rather than printing zeros; an unreachable head is already marked
+// in the table above.
+func printWorkStatus(cr creditCommandResponse) {
+	anyAnswered := false
+	for _, h := range cr.ByHead {
+		anyAnswered = anyAnswered || h.Available
+	}
+	if !anyAnswered {
+		return
+	}
+
+	fmt.Println("\nYour results by state (all your machines):")
+	anyPending := false
+	for _, h := range cr.ByHead {
+		if !h.Available {
+			continue
+		}
+		fmt.Printf("  %s\n", labelOrDash(h.HeadName))
+		if h.WorkStatus == nil {
+			fmt.Println("    not reported by this head (it runs an older version)")
+			continue
+		}
+		if len(h.WorkStatus.ByLeaf) == 0 {
+			fmt.Println("    no results or copies on this head yet")
+			continue
+		}
+		for _, l := range h.WorkStatus.ByLeaf {
+			name := l.LeafName
+			if name == "" {
+				name = l.LeafID
+			}
+			fmt.Printf("    %s\n", labelOrDash(name))
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			for _, row := range []struct {
+				label string
+				n     int
+			}{
+				{"waiting for validation", l.ResultsPending},
+				{"agreed (credited)", l.ResultsAgreed},
+				{"did not agree", l.ResultsDisagreed},
+				{"checking the uploaded output", l.ResultsAwaitingContentVerification},
+				{"the uploaded output could not be checked", l.ResultsContentVerificationFailed},
+				{"not compared (the work unit was retired)", l.ResultsSuperseded},
+				{"stopped: enough results arrived while it ran", l.RunsStopped},
+			} {
+				if row.n > 0 {
+					fmt.Fprintf(w, "      %s\t%d\n", row.label, row.n)
+				}
+			}
+			if l.CopiesRunning > 0 || l.CopiesWaitingToStart > 0 {
+				fmt.Fprintf(w, "      in progress\t%d running, %d waiting to start\n", l.CopiesRunning, l.CopiesWaitingToStart)
+			}
+			_ = w.Flush()
+			anyPending = anyPending || l.ResultsPending > 0
+		}
+	}
+	if anyPending {
+		fmt.Println("\n  A result earns credit only once it is validated. On a leaf that needs")
+		fmt.Println("  agreeing results, that takes a matching result from a different account;")
+		fmt.Println("  your own other machines are never sent the same work unit.")
+	}
 }
 
 // formatCredit renders a credit amount without trailing noise: whole numbers print

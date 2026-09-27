@@ -146,7 +146,7 @@ and, if you turn the setting on, pauses everything while other programs need the
 | `start` / `stop` | Run or stop the daemon |
 | `status` | Running tasks with progress and ETA, buffered work, credit, failing leafs |
 | `doctor` | Pass/fail diagnosis of connectivity, runtimes, disk, memory, eligibility |
-| `credit` | Your credit, per head and per leaf, asked of each head directly |
+| `credit` | Your credit, per head and per leaf, and your results by state (waiting for validation, agreed, did not agree, in progress), asked of each head directly |
 | `attach` / `detach` | Add or remove a head; `--leaf` pins a single leaf |
 | `heads` | `list`, `weight`, `trust` |
 | `leafs` | `list`, `enable`, `disable`, `weight`, `reset` |

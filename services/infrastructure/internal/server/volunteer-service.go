@@ -2575,7 +2575,8 @@ func (s *volunteerService) AbandonWorkUnit(ctx context.Context, req *lettucev1.A
 }
 
 // GetMyContribution returns the CALLER's own credit contribution, aggregated
-// across every leaf and every machine the account runs. The caller is identified
+// across every leaf and every machine the account runs, and its results by
+// validation state and copies in progress per leaf. The caller is identified
 // ONLY by the cryptographically verified public key set by the gRPC auth
 // interceptor (GetMyContribution is NOT in grpcPublicMethods, so the interceptor
 // has already verified the per-request signature); the request carries no identity
@@ -2595,7 +2596,9 @@ func (s *volunteerService) GetMyContribution(ctx context.Context, _ *lettucev1.G
 		// yet (e.g. it has not registered on this head). Report an empty, zero
 		// breakdown rather than an error.
 		if apiErr, ok := err.(*apierror.APIError); ok && apiErr.HTTPStatus == 404 {
-			return &lettucev1.GetMyContributionResponse{}, nil
+			// The work status is still set, empty: this head reports it, and the
+			// account simply has nothing here.
+			return &lettucev1.GetMyContributionResponse{WorkStatus: &lettucev1.WorkStatus{}}, nil
 		}
 		s.logger.Error("GetMyContribution: failed to resolve volunteer", "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
@@ -2606,8 +2609,38 @@ func (s *volunteerService) GetMyContribution(ctx context.Context, _ *lettucev1.G
 		s.logger.Error("GetMyContribution: failed to compute breakdown", "volunteer_id", vol.ID, "error", err)
 		return nil, status.Errorf(codes.Internal, "internal error")
 	}
+	ws, err := credit.ComputeVolunteerWorkStatus(ctx, s.pool, vol.ID)
+	if err != nil {
+		s.logger.Error("GetMyContribution: failed to compute work status", "volunteer_id", vol.ID, "error", err)
+		return nil, status.Errorf(codes.Internal, "internal error")
+	}
 
-	return contributionResponseFromBreakdown(bd), nil
+	resp := contributionResponseFromBreakdown(bd)
+	resp.WorkStatus = workStatusResponse(ws)
+	return resp, nil
+}
+
+// workStatusResponse maps the account's per-leaf result and copy counts into the
+// GetMyContribution work status. It never returns nil: a set, empty WorkStatus is
+// how the reply says "reported, and nothing here".
+func workStatusResponse(ws []credit.LeafWorkStatus) *lettucev1.WorkStatus {
+	out := &lettucev1.WorkStatus{ByLeaf: make([]*lettucev1.LeafWorkStatus, 0, len(ws))}
+	for _, ls := range ws {
+		out.ByLeaf = append(out.ByLeaf, &lettucev1.LeafWorkStatus{
+			LeafId:                             ls.LeafID.String(),
+			LeafName:                           ls.LeafName,
+			ResultsPending:                     int32(ls.ResultsPending),
+			ResultsAgreed:                      int32(ls.ResultsAgreed),
+			ResultsDisagreed:                   int32(ls.ResultsDisagreed),
+			ResultsAwaitingContentVerification: int32(ls.ResultsAwaitingContentVerification),
+			ResultsContentVerificationFailed:   int32(ls.ResultsContentVerificationFailed),
+			ResultsSuperseded:                  int32(ls.ResultsSuperseded),
+			RunsStopped:                        int32(ls.RunsStopped),
+			CopiesRunning:                      int32(ls.CopiesRunning),
+			CopiesWaitingToStart:               int32(ls.CopiesWaitingToStart),
+		})
+	}
+	return out
 }
 
 // contributionResponseFromBreakdown maps the shared credit.VolunteerBreakdown into
