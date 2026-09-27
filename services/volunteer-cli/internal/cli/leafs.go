@@ -92,6 +92,9 @@ type leafsAPIHead struct {
 	// LeafsRefreshedAt is when this head's QUEUED/VOLUNTEERS/HOSTS figures were
 	// last fetched. Zero when nothing has been cached yet (TB-14).
 	LeafsRefreshedAt time.Time `json:"leafs_refreshed_at"`
+	// NoWork is the reason the head gave on its latest empty work reply that
+	// named one; nil when there is none (or from a daemon predating it).
+	NoWork *headNoWorkAPI `json:"no_work,omitempty"`
 }
 
 type leafsAPILeaf struct {

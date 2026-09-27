@@ -1320,16 +1320,21 @@ func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts w
 	}
 
 	assignStart := time.Now()
-	results, _ := cache.HandOut(volunteerID, opts, n)
+	results, _, noWork := cache.HandOutWithReason(volunteerID, opts, n)
 	// The near-zero in-memory hand-out duration folds into the latency signal,
 	// lowering the latency-saturation component of the load estimate.
 	s.loadEstimator.recordAssignLatency(time.Since(assignStart))
 
 	if len(results) == 0 {
-		return &lettucev1.RequestWorkUnitResponse{
+		// The empty reply says why, when the cause is the requester's own state (its
+		// in-flight cap, its account's results or standing, its speed on record); every
+		// other cause stays UNSPECIFIED.
+		resp := &lettucev1.RequestWorkUnitResponse{
 			Assignments:       nil,
 			RetryAfterSeconds: retryAfter,
-		}, nil
+		}
+		noWork.apply(resp)
+		return resp, nil
 	}
 
 	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(results))

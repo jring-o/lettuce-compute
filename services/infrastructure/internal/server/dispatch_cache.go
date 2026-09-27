@@ -882,6 +882,14 @@ func (c *dispatchCache) drainLeafRefills() []types.ID {
 // On return it also reports whether the pool is now below the low watermark (so the
 // caller can nudge the refiller).
 func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOptions, n int) (results []handOutResult, drained bool) {
+	results, drained, _ = c.HandOutWithReason(volunteerID, opts, n)
+	return results, drained
+}
+
+// HandOutWithReason is HandOut plus, when it hands out nothing, the requester-specific
+// reason the empty reply carries (see dispatch_no_work_reason.go). The reason is the zero
+// value (UNSPECIFIED) whenever anything was handed out.
+func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.AssignmentOptions, n int) (results []handOutResult, drained bool, noWork noWorkReply) {
 	if n < 1 {
 		n = 1
 	}
@@ -937,7 +945,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 					"host_id", hostKey,
 					"min_send_interval", c.cfg.minSendInterval)
 			}
-			return nil, false
+			return nil, false, noWorkReply{}
 		}
 	}
 	kept := c.ready[:0]
@@ -946,6 +954,14 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// nothing can explain itself ("why did this volunteer get zero work"). Stack-allocated
 	// fixed array — incremented per rejected candidate only, never allocates.
 	var rejects [numRejectReasons]int
+	// The volunteer's half of the same question: the refusals within the request's own
+	// scope, in the classes the empty reply can name. Counted only while nothing has been
+	// taken, because a reply that carries work carries no reason; the cap's re-check runs
+	// at most until one unit shows the cap binding.
+	var noWorkT noWorkTally
+	noWorkScope := c.noWorkScopeLocked(opts)
+	noCapOpts := opts
+	noCapOpts.MaxInflightPerVolunteer = 0
 	// FIX 1: scan front-to-back, but STOP scanning once n reservations are taken and
 	// splice the unscanned tail back in one append (below), instead of copying every
 	// trailing element tail-into-kept under the global lock (the O(pool) latency
@@ -964,6 +980,9 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		c.scanCount++ // TEST-ONLY: count candidates actually visited (FIX-1 early-exit probe).
 		if ok, reason := c.eligibleLocked(volunteerID, hostKey, opts, cand); !ok {
 			rejects[reason]++
+			if taken == 0 {
+				noWorkT.noteLocked(c, volunteerID, hostKey, noCapOpts, noWorkScope, cand, reason)
+			}
 			kept = append(kept, cand)
 			continue
 		}
@@ -1066,6 +1085,9 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// governs only the spacing between real hand-outs.
 	if taken > 0 && c.cfg.minSendInterval > 0 {
 		c.lastHandOut[hostKey] = c.now()
+	}
+	if taken == 0 {
+		noWork = c.noWorkReplyLocked(volunteerID, hostKey, opts, noWorkT)
 	}
 	c.mu.Unlock()
 
@@ -1195,7 +1217,7 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// WARN, throttled per machine, with the full tally so the mix is visible. At the client
 	// every such refusal looks identical — an empty response — and on a production head the
 	// tally above is Debug-only, so these left no trace at all and explaining one took a
-	// database session. Four reasons qualify:
+	// database session. Six reasons qualify:
 	//
 	//   in-flight cap (TB-13)       — starved by work it is already charged for, or by stale
 	//                                 claims it never returned; not an empty queue.
@@ -1203,11 +1225,17 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	//                                 check. Disk and cores reach it only from a TB-15+ head,
 	//                                 the three GPU dimensions only from a TB-21+ head, and an
 	//                                 older client checks none of them however new the head is.
-	//   benched / already-contributed (TB-27) — every ready unit refuses this ACCOUNT
-	//                                 specifically: a recent failed copy benches it, or it
-	//                                 already contributed a result. On a small fleet this is
-	//                                 how a stranded unit presents, and it ran 10+ hours with
-	//                                 zero head-side signal before this arm existed.
+	//   benched / already-contributed (TB-27) — units refuse this ACCOUNT specifically: a
+	//                                 recent failed copy benches it, or it already contributed
+	//                                 a result. On a small fleet this is how a stranded unit
+	//                                 presents, and it ran 10+ hours with zero head-side signal
+	//                                 before this arm existed.
+	//   account standing BENCHED    — the account gets no dispatch at all until the bench
+	//                                 lapses or an operator clears it.
+	//   infeasible deadline         — by the account's stored benchmark (whichever of its
+	//                                 machines registered last), the unit cannot finish before
+	//                                 its deadline. At Debug only, this refusal used to leave
+	//                                 no Info trace.
 	//
 	// The machine's advertised budgets are logged alongside, because the whole diagnostic is
 	// "which of these is below what some leaf asked for" and reading them out of the database
@@ -1218,7 +1246,8 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	// consulted only once a reason qualifies: an empty answer that writes nothing must not
 	// spend the machine's window and hide a genuine WARN a request later.
 	qualifies := rejects[rejectInflightCap] > 0 || rejects[rejectCapabilityMismatch] > 0 ||
-		rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0
+		rejects[rejectBenched] > 0 || rejects[rejectAlreadyContributed] > 0 ||
+		rejects[rejectStandingBenched] > 0 || rejects[rejectInfeasibleDeadline] > 0
 	if taken == 0 && qualifies && c.noteStarved(hostKey) {
 		attrs := make([]any, 0, 20+2*numRejectReasons)
 		attrs = append(attrs,
@@ -1262,13 +1291,19 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 		case rejects[rejectCapabilityMismatch] > 0:
 			msg = "no work handed out: no leaf fits this machine's advertised capabilities " +
 				"(compare the budgets logged here against the leafs' resource_requirements)"
+		case rejects[rejectStandingBenched] > 0:
+			msg = "no work handed out: this account is BENCHED (standing)"
+		case rejects[rejectInfeasibleDeadline] > 0:
+			msg = "no work handed out: by the account's stored benchmark, the requested units cannot " +
+				"finish before their deadlines (rsc_fpops_est / benchmark > deadline_seconds; the " +
+				"benchmark is whichever machine registered last)"
 		default:
-			msg = "no work handed out: every ready unit refuses this account specifically " +
+			msg = "no work handed out: the requested units refuse this account specifically " +
 				"(a recent failed copy benches it, or it already contributed a result — see the refused_* tally)"
 		}
 		c.logger.Warn(msg, attrs...)
 	}
-	return final, drained
+	return final, drained, noWork
 }
 
 // noteStarved reports whether the no-work WARN should be emitted for this machine now,

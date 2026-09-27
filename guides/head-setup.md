@@ -649,13 +649,27 @@ the only one you should actively calibrate is `target_request_rate_per_sec`.
 | Key (env) | Default | What it does |
 |-----------|---------|--------------|
 | `max_batch_per_request` (`LETTUCE_HEAD_MAX_BATCH_PER_REQUEST`) | `64` | Safety ceiling on how many work units one work request may return. This is a cap, not the limiter — the actual batch is sized by each volunteer's work-buffer deficit and per-unit duration estimate. |
-| `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max live copies (running + buffered) one volunteer may hold across all units. Also caps how deep a volunteer's hours-based work buffer can fill. |
+| `max_inflight_per_volunteer` (`LETTUCE_HEAD_MAX_INFLIGHT_PER_VOLUNTEER`) | `10` | Max live copies (running + buffered) one volunteer may hold across all units. Also caps how deep a volunteer's hours-based work buffer can fill. A machine refused because of it is told so, with the figure and how many it holds, and does not ask again until one of its copies finishes. |
 | `min_retry_delay_seconds` (`LETTUCE_HEAD_MIN_RETRY_DELAY_SECONDS`) | `30` | Server-directed retry delay handed out when quiet. Stamped on **every** reply (including no-work). This is **advisory** — well-behaved volunteers obey it, but a self-compiled client can ignore it; see `min_send_interval_seconds` for the server-enforced counterpart. |
 | `max_retry_delay_seconds` (`LETTUCE_HEAD_MAX_RETRY_DELAY_SECONDS`) | `900` | Retry delay under full load. Must stay below the 1800s stale-volunteer threshold (validated at startup). |
 | `retry_delay_jitter_pct` (`LETTUCE_HEAD_RETRY_DELAY_JITTER_PCT`) | `0.20` | Server-side ± jitter on the stamped delay so a fleet does not re-contact in lockstep. |
 | `target_request_rate_per_sec` (`LETTUCE_HEAD_TARGET_REQUEST_RATE_PER_SEC`) | `500` | Per-head work-request rate the load estimator treats as "fully loaded". **Not calibrated** — measure your single-head dispatch ceiling with `swarm-sim` (see `CONTRIBUTING.md`) and set this to it. The 2026-06-01 reference run measured ~240 assignments/sec on a single head, well below the default. |
 | `lease_seconds` (`LETTUCE_HEAD_LEASE_SECONDS`) | `900` | Fallback hold for a buffered copy **only when its work unit has no positive deadline**. Normally a buffered copy is held until its own `deadline_seconds`, so this rarely applies (a leaf with no `deadline_seconds` gets the `default_deadline_seconds` deadline). No longer bound by the 1800s stale-volunteer threshold — the hold is the deadline, not a short liveness lease. |
 | `min_send_interval_seconds` (`LETTUCE_HEAD_MIN_SEND_INTERVAL_SECONDS`) | `30` (**on**) | Minimum seconds between **successful work hand-outs to one volunteer** (keyed on its verified identity). Unlike the advisory `min_retry_delay_seconds` above — which a self-compiled volunteer can simply ignore — this is a **server-side hard floor** the head enforces itself, so a volunteer that polls aggressively (or hacks its client to ignore the retry delay) still gets at most one batch per interval and cannot grab a disproportionate share of a scarce queue. An early request is still served — it just returns no new work. **Enabled by default** at `30` (≈ `min_retry_delay_seconds`, so a well-behaved volunteer never trips it; the default is clamped to never exceed `max_retry_delay_seconds`). Set it **negative** (e.g. `-1`) to **disable** — the per-identity/per-IP rate limits and `max_inflight_per_volunteer` still apply regardless. A positive value must be ≤ `max_retry_delay_seconds`. Enforced per replica (in-memory); under multi-replica scale-out a volunteer that reconnects to another replica gets a fresh clock, so treat it as a strong throttle, not an exact quota. |
+
+**Why a machine got nothing.** An empty work reply names its cause when the cause
+is the requesting volunteer's own state: its machine holds as many copies as this
+head lets it hold, its account already has a result on (or a copy of) every unit it
+could take, a recent failed copy keeps it off a unit for about one deadline, its
+account is benched (with the bench's end, if it has one), or — by the benchmark the
+head has on record for the account — a unit could not finish before its deadline.
+The reason is worked out over the leaves the request named (or, when it named none,
+the public leaves), so it never reveals another volunteer's state, queue depths, or
+a leaf the volunteer could not see; every other cause, including an empty leaf, is
+sent without a reason. Volunteer builds that understand it show it in place of the
+generic "getting no work" warning. On the head side, the throttled
+`no work handed out` WARN (one per machine per five minutes) is written for the same
+requester-specific causes plus a capability mismatch, each with its own message.
 
 `LETTUCE_TRUSTED_PROXIES` also governs **per-client rate limiting** on the gRPC
 port: with it set, volunteers behind your reverse proxy are bucketed per real

@@ -143,6 +143,15 @@ type Fetcher struct {
 	// a machine is not counted toward the "connected but getting no work"
 	// diagnostic. nil counts every empty answer.
 	workInHandFn func() bool
+	// heldFromHeadFn counts the units this machine holds (buffered or running)
+	// from one head, so a head that answered INFLIGHT_CAP is asked again only
+	// once one of them is done. nil counts zero, which leaves the cap wait to its
+	// time limit.
+	heldFromHeadFn func(headName string) int
+	// idleSlotsFn reports how many slots sit idle with nothing in the buffer the
+	// picker would start, and how many slots there are. A head's stated reason is
+	// worth a warning only while it leaves a slot like that. nil reports none.
+	idleSlotsFn func() (idle, total int)
 	// starvedBackfillFn reports the TB-32 starved-backfill state: the buffer is
 	// full by hours but a slot is idle with nothing admissible buffered, so the
 	// ONLY point of fetching is to fill that slot. The fetcher then also applies
@@ -379,6 +388,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafClassBufferFullFn:    d.leafClassBufferFull,
 		workBufferFullFn:         d.workBufferFull,
 		workInHandFn:             d.workInHandForEverySlot,
+		heldFromHeadFn:           d.heldFromHead,
+		idleSlotsFn:              d.starvedIdleSlots,
 		starvedBackfillFn:        d.starvedBackfill,
 		leafFitGateFn:            d.leafFitGate,
 		bufferAcceptsFn:          d.bufferAccepts,
@@ -403,7 +414,9 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 // long enough to skip a momentarily-empty queue but short enough to be useful.
 // A round that asked nothing (every leaf skipped before the request) is not a
 // poll and does not count (TB-60), and neither is an empty answer while the
-// buffer already holds the next unit for every slot.
+// buffer already holds the next unit for every slot, a round in which a head
+// said why it sent nothing, or a round while a head is holding this machine at
+// its in-flight cap.
 const noWorkWarnThreshold = 5
 
 // idleWait is how long the fetcher sleeps when there is nothing to do right now
@@ -471,7 +484,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// out its retry delay, sleep until the earliest NextContactAt (or a poll
 		// tick), issuing no requests in the meantime.
 		if wait, ok := f.waitUntilHeadEligible(); ok {
-			f.enterWait("head_retry_delay", "fetcher: all heads waiting out retry delay", "wait", wait)
+			f.enterWait("head_retry_delay", "fetcher: every head is waiting out its retry delay or holding this machine at its in-flight cap", "wait", wait)
 			if !f.sleep(ctx, wait) {
 				return
 			}
@@ -539,15 +552,21 @@ func (f *Fetcher) Run(ctx context.Context) {
 
 		if round.pushed == 0 {
 			// An empty answer counts toward the no-work diagnostic only while the
-			// machine is, or is about to be, without work. A buffer that already
-			// holds the next unit for every slot is not: on a fast host it is what
-			// a head's per-machine in-flight cap looks like from here (the head
-			// refuses a buffer deeper than the cap and does not say why), and the
-			// notice told such a volunteer the heads had no units for the machine
-			// beside a full queue.
+			// machine is, or is about to be, without work, and only when no head
+			// said why. A buffer that already holds the next unit for every slot is
+			// not without work: on a fast host it is what a head's per-machine
+			// in-flight cap looks like from a head too old to say so (the head
+			// refuses a buffer deeper than the cap), and the notice told such a
+			// volunteer the heads had no units for the machine beside a full
+			// queue. A head that named its reason has its own notice, and a head
+			// holding this machine at its cap has work for it: above five slots
+			// per head the buffer can never hold a unit per slot under a cap of
+			// ten, so only the stated cap keeps the diagnostic honest there.
 			inHand := f.workInHandFn != nil && f.workInHandFn()
-			f.logger.Debug("fetcher: fetchOne buffered no work", "work_in_hand_for_every_slot", inHand)
-			if !inHand {
+			capped := f.anyHeadCapWaiting()
+			f.logger.Debug("fetcher: fetchOne buffered no work", "work_in_hand_for_every_slot", inHand,
+				"explained_answers", round.explained, "head_holding_cap", capped)
+			if !inHand && round.explained == 0 && !capped {
 				f.noteEmptyRound()
 			}
 			// No work was buffered this cycle (no assignments, or every assignment
@@ -591,6 +610,7 @@ func (f *Fetcher) noteWorkArrived() {
 	f.emptyPolls = 0
 	f.warnedNoWork = false
 	f.notices.Resolve("no_work", "", "")
+	f.resolveCapNoticesIfBusy()
 }
 
 // sleep waits for d or until ctx is cancelled. Returns false if ctx was
@@ -617,13 +637,19 @@ func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
 	var earliest time.Time
 	any := false
 	for _, srv := range f.availableServers() {
-		if !now.Before(srv.NextContactAt) {
+		next := srv.NextContactAt
+		if f.capWaiting(srv) && srv.capWaitUntil.After(next) {
+			// Held at its in-flight cap until a copy finishes: re-checked on the
+			// poll granularity below, so a completion is noticed within idleWait.
+			next = srv.capWaitUntil
+		}
+		if !now.Before(next) {
 			// Contactable now.
 			return 0, false
 		}
 		any = true
-		if earliest.IsZero() || srv.NextContactAt.Before(earliest) {
-			earliest = srv.NextContactAt
+		if earliest.IsZero() || next.Before(earliest) {
+			earliest = next
 		}
 	}
 	if !any {
@@ -698,6 +724,8 @@ type fetchRound struct {
 	pushed    int
 	requested int
 	classFull int
+	// explained counts the empty answers whose head named a reason.
+	explained int
 }
 
 // fetchRound is fetchOne with the round's accounting; fetchOne keeps the
@@ -759,6 +787,13 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			f.logger.Debug("fetcher: head waiting out retry delay", "server", head.Name, "next_contact_at", head.NextContactAt)
 			continue
 		}
+		// A head holding this machine at its in-flight cap has nothing for it until
+		// one of its copies is done: its share of the deficit passes on.
+		if f.capWaiting(head) {
+			f.logger.Debug("fetcher: head is holding this machine at its in-flight cap; waiting for a copy to finish", "server", head.Name, "held", head.capWaitHeld)
+			spent[head.Name] = true
+			continue
+		}
 		headShare := f.selector.HeadShare(head.Name, filterOut(available, spent))
 		spent[head.Name] = true
 
@@ -797,10 +832,13 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			}
 			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
 			round.requested++
-			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs, headShare)
-			if pushed > 0 {
-				round.pushed = pushed
+			ans := f.ask(ctx, head, anyLeafInfo, leafIDs, blockedIDs, headShare)
+			if ans.pushed > 0 {
+				round.pushed = ans.pushed
 				return round, nil
+			}
+			if ans.explained {
+				round.explained++
 			}
 			continue
 		}
@@ -904,13 +942,17 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			// to the ones still in play: the last one is asked for the head's.
 			share := headShare * f.selector.LeafShare(head.Name, leaf, requestable[i:])
 			round.requested++
-			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil, share)
-			if pushed > 0 {
-				round.pushed = pushed
+			ans := f.ask(ctx, head, leaf, []string{leaf.ID}, nil, share)
+			if ans.pushed > 0 {
+				round.pushed = ans.pushed
 				return round, nil
 			}
-			if stop {
-				// Transport error or rate-limit on this head: stop trying its leafs.
+			if ans.explained {
+				round.explained++
+			}
+			if ans.stop {
+				// Transport error or rate-limit on this head, or it is holding this
+				// machine at its in-flight cap: stop trying its leafs.
 				break
 			}
 			// No work / all-abandoned for this leaf: try the next leaf.
@@ -940,13 +982,28 @@ func mergeUnique(a, b []string) []string {
 	return out
 }
 
-// requestAndBuffer issues one RequestWorkUnit to head for the given leaf filter,
-// stamps the server-directed retry delay, and buffers every assignment in the
-// reply. share is the part of the buffer's hours deficit the weights give this
-// head and leaf (1 = all of it). It returns the number of units buffered and
-// whether the caller should stop trying further leafs on this head (true on
-// transport error or rate-limit).
+// requestAndBuffer is ask for callers that need only the units buffered and
+// whether to stop trying this head's leafs.
 func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string, share float64) (pushed int, stop bool) {
+	ans := f.ask(ctx, head, leaf, leafIDs, blockedIDs, share)
+	return ans.pushed, ans.stop
+}
+
+// askResult is what one RequestWorkUnit came to: the units buffered, whether
+// the caller should stop trying further leafs on this head (a transport error,
+// a rate-limit, or a head holding this machine at its in-flight cap), and
+// whether an empty reply named its reason.
+type askResult struct {
+	pushed    int
+	stop      bool
+	explained bool
+}
+
+// ask issues one RequestWorkUnit to head for the given leaf filter, stamps the
+// server-directed retry delay, and buffers every assignment in the reply, or
+// handles the reason an empty reply gives. share is the part of the buffer's
+// hours deficit the weights give this head and leaf (1 = all of it).
+func (f *Fetcher) ask(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, leafIDs, blockedIDs []string, share float64) askResult {
 	// Size the batch request from this head's and leaf's share of the remaining
 	// hours deficit. The per-unit seconds estimate comes from the leaf-level,
 	// benchmark-independent estimate (#29) so short-unit leafs fill
@@ -998,7 +1055,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 			// jittered LOCAL backoff to this head's NextContactAt. Logged at Info
 			// (not Warn) since it is normal flow control.
 			f.applyResourceExhaustedBackoff(head, leaf.Slug, err)
-			return 0, true
+			return askResult{stop: true}
 		}
 		if ok && st.Code() == codes.NotFound {
 			// DEFENSIVE: the no-work NotFound sentinel was removed from the protocol
@@ -1009,7 +1066,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 			f.logger.Debug("fetcher: head returned NotFound (treated as no-work)", "server", head.Name, "leaf_slug", leaf.Slug)
 			head.Available = true
 			head.Backoff = 0
-			return 0, false
+			return askResult{}
 		}
 		// HOST-UNKNOWN self-heal (BG-25): a non-empty host id this head no longer
 		// recognizes (a head reset, a mint-time eviction, or an operator revocation).
@@ -1031,7 +1088,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 					head.HostID = newID
 					f.logger.Info("fetcher: re-registered after host-unknown refusal",
 						"server", head.Name, "host_id_issued", newID != "")
-					return 0, true
+					return askResult{stop: true}
 				}
 				f.logger.Warn("fetcher: re-register after host-unknown refusal failed; backing off",
 					"server", head.Name, "error", rerr)
@@ -1048,7 +1105,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 					head.Backoff = f.maxBackoff
 				}
 			}
-			return 0, true
+			return askResult{stop: true}
 		}
 		// "Volunteer too old": the head's version-coupling rejection. Surface a
 		// distinct, actionable WARN rather than burying it in the generic transport
@@ -1075,7 +1132,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 				head.Backoff = f.maxBackoff
 			}
 		}
-		return 0, true
+		return askResult{stop: true}
 	}
 
 	// Success: obey the server-directed retry delay on EVERY reply, including the
@@ -1091,14 +1148,22 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	// No-work is an OK response carrying an empty assignments list (the
 	// codes.NotFound sentinel was removed from the protocol).
 	if len(resp.Assignments) == 0 {
-		f.logger.Debug("fetcher: no work for leaf (empty assignments)", "server", head.Name, "leaf_slug", leaf.Slug, "retry_after_s", resp.RetryAfterSeconds)
-		return 0, false
+		f.logger.Debug("fetcher: no work for leaf (empty assignments)", "server", head.Name, "leaf_slug", leaf.Slug,
+			"retry_after_s", resp.RetryAfterSeconds, "reason", resp.GetNoWorkReason().String())
+		explained := f.noteNoWorkReason(head, leaf, resp)
+		// A head holding this machine at its in-flight cap refuses every leaf alike:
+		// asking it for the next one only repeats the answer.
+		capped := resp.GetNoWorkReason() == lettucev1.NoWorkReason_NO_WORK_REASON_INFLIGHT_CAP
+		return askResult{stop: capped, explained: explained}
 	}
 
 	// Prepare and buffer every assignment in the batch.
 	kept, returned := f.bufferBatch(ctx, head, leaf, resp.Assignments)
 	f.noteBatchOutcome(head.Name, leaf.ID, kept, returned)
-	return kept, false
+	if kept > 0 {
+		f.noteHeadServed(head, leaf)
+	}
+	return askResult{pushed: kept}
 }
 
 // batchCapKey keys the per-head-per-leaf batch cap (see batchCap).

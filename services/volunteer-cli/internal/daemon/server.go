@@ -34,6 +34,14 @@ type ServerConnection struct {
 	// It lives on the per-head connection (not the Fetcher) so it survives the
 	// fetcher being recreated on pause/resume. Zero means "contact immediately".
 	NextContactAt time.Time
+
+	// capWaitUntil and capWaitHeld hold this head back after it answered that this
+	// machine is at its per-machine in-flight cap: the fetcher does not ask it again
+	// until the machine holds fewer of its units than capWaitHeld (a copy finished or
+	// was given back) or until capWaitUntil. Zero capWaitUntil = not waiting. Owned
+	// by the fetcher goroutine, like NextContactAt.
+	capWaitUntil time.Time
+	capWaitHeld  int
 }
 
 // DaemonState is persisted to disk so the status command can show per-server info.

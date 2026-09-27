@@ -18,7 +18,7 @@ import (
 func newStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show current state: daemon, servers, running tasks with progress, and credit earned",
+		Short: "Show current state: daemon, servers, running tasks with progress, why a head is sending no work, and credit earned",
 		RunE:  runStatus,
 	}
 }
@@ -119,6 +119,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	// note and keep the rest of the output, so `status` never fails wholesale.
 	if st.DaemonRunning {
 		printActiveTasks(cfg.DataDir)
+		if heads, err := fetchHeadsFromAPI(); err == nil {
+			printHeadNoWork(os.Stdout, heads.Heads)
+		}
 		printCredit(cfg.DataDir)
 	}
 

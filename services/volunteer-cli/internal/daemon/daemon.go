@@ -2348,11 +2348,25 @@ func (d *Daemon) idleSlotStarved() bool {
 	if d.slotManager == nil || d.prefetchQueue == nil {
 		return false
 	}
+	if d.occupiedSlots() >= d.maxSlots() {
+		return false
+	}
+	return !d.prefetchQueue.HasRunnable(func(item *PreFetchItem) bool {
+		if item.WU == nil {
+			return false
+		}
+		ok, _ := d.canAccommodateWU(item.WU)
+		return ok
+	}, d.itemMayDelay)
+}
+
+// occupiedSlots counts the slots running a unit or about to: a unit in the
+// queue→slot handoff counts as if it already occupied its slot, minus any
+// overlap with slots that just turned active.
+func (d *Daemon) occupiedSlots() int {
 	_, starting := d.prefetchQueue.HeldSnapshot()
 	occupied := d.slotManager.ActiveCount()
 	if len(starting) > 0 {
-		// A unit in the handoff is about to occupy a slot; count it as if it
-		// already had, minus any overlap with slots that just turned active.
 		active := make(map[string]struct{})
 		for _, wu := range d.slotManager.ActiveWorkUnits() {
 			if wu != nil {
@@ -2368,16 +2382,35 @@ func (d *Daemon) idleSlotStarved() bool {
 			}
 		}
 	}
-	if occupied >= d.maxSlots() {
-		return false
+	return occupied
+}
+
+// starvedIdleSlots reports how many slots sit idle with nothing in the buffer
+// the picker would start there (idleSlotStarved), and how many slots there
+// are. A head's stated reason for sending no work is worth a warning only
+// while it leaves slots like these.
+func (d *Daemon) starvedIdleSlots() (idle, total int) {
+	total = d.maxSlots()
+	if !d.idleSlotStarved() {
+		return 0, total
 	}
-	return !d.prefetchQueue.HasRunnable(func(item *PreFetchItem) bool {
-		if item.WU == nil {
-			return false
+	if idle = total - d.occupiedSlots(); idle < 0 {
+		idle = 0
+	}
+	return idle, total
+}
+
+// heldFromHead counts the units this machine holds from the named head —
+// buffered, mid-handoff or running — so a head that is holding the machine at
+// its in-flight cap is asked again once one of them is done.
+func (d *Daemon) heldFromHead(name string) int {
+	n := 0
+	for _, wu := range d.heldWorkUnits() {
+		if wu.SourceHead == name {
+			n++
 		}
-		ok, _ := d.canAccommodateWU(item.WU)
-		return ok
-	}, d.itemMayDelay)
+	}
+	return n
 }
 
 // starvedBackfill reports whether the ONLY reason fetching is open is an idle

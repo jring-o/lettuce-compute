@@ -142,7 +142,7 @@ func TestNoWorkWarn_RequestedLeafAllContributedStillWarns(t *testing.T) {
 		t.Fatalf("no-work WARNs = %d, want 1; log:\n%s", len(warns), buf.String())
 	}
 	w := warns[0]
-	if msg, _ := w["msg"].(string); !strings.Contains(msg, "refuses this account specifically") {
+	if msg, _ := w["msg"].(string); !strings.Contains(msg, "refuse this account specifically") {
 		t.Errorf("WARN msg = %q, want the account arm", msg)
 	}
 	if got := recInt(w, "refused_"+rejectAlreadyContributed.String()); got != 3 {
