@@ -167,6 +167,52 @@ message RequestWorkUnitRequest {
 message RequestWorkUnitResponse {
   repeated WorkUnitAssignment assignments = 1; // 0..N units; empty = no work right now
   int32 retry_after_seconds = 2;               // server-directed retry delay (authoritative)
+
+  // Why an EMPTY reply is empty, when the cause is the requester's own state.
+  // Set only when assignments is empty; UNSPECIFIED otherwise. The head works it
+  // out over the leaves the request named (or, for a request that named none,
+  // the PUBLIC leaves) and never says anything about other volunteers or about
+  // a leaf the requester could not see, so every other cause — an empty or
+  // drained leaf, units already covered by other volunteers' copies, a hidden
+  // leaf — is UNSPECIFIED, as is every reply from a head that predates it.
+  NoWorkReason no_work_reason = 3;
+  // INFLIGHT_CAP only: how many copies (running and buffered) this head lets
+  // the requesting machine hold at once right now, and how many it holds.
+  int32 inflight_cap = 4;
+  int32 inflight_held = 5;
+  // INFEASIBLE_DEADLINE only: a refused unit's deadline, and how long the head
+  // estimates it would take (the leaf's rsc_fpops_est divided by the benchmark
+  // the head has on record for the ACCOUNT — the last of its machines to
+  // register, which need not be the requesting one).
+  int64 deadline_seconds = 6;
+  int64 estimated_seconds = 7;
+  // ACCOUNT_BENCHED only: when the bench ends, as unix seconds; 0 when it has
+  // no end time and lasts until an operator clears it.
+  int64 benched_until_unix = 8;
+}
+
+// NoWorkReason is the requester-specific cause of an empty work reply. When
+// several apply, the head reports the first in this order: ACCOUNT_BENCHED,
+// INFLIGHT_CAP, INFEASIBLE_DEADLINE, BENCH_COOLDOWN, ALREADY_CONTRIBUTED.
+enum NoWorkReason {
+  // No work right now for a reason the head does not name, or an older head.
+  NO_WORK_REASON_UNSPECIFIED = 0;
+  // This machine holds as many copies as the head lets it hold at once, and
+  // at least one requested unit would otherwise have been handed out.
+  NO_WORK_REASON_INFLIGHT_CAP = 1;
+  // This account (or another account bound to the same identity) already has
+  // a result on, or holds a copy of, every requested unit the head could
+  // otherwise have handed out.
+  NO_WORK_REASON_ALREADY_CONTRIBUTED = 2;
+  // A recent copy of a requested unit, held by this account, failed or
+  // lapsed; the head offers that unit to other volunteers first for about one
+  // deadline.
+  NO_WORK_REASON_BENCH_COOLDOWN = 3;
+  // The head has paused sending work to this account (account standing).
+  NO_WORK_REASON_ACCOUNT_BENCHED = 4;
+  // By the benchmark the head has on record for this account, a requested
+  // unit could not finish before its deadline.
+  NO_WORK_REASON_INFEASIBLE_DEADLINE = 5;
 }
 
 // WorkUnitAssignment is a single work unit dispatched to a volunteer. A

@@ -170,6 +170,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	fmt.Fprintln(out)
 	fmt.Fprintf(out, "Heads (%d configured):\n", len(cfg.Servers))
 	checkHeads(cmd.Context(), rep, logger, caps, fetchDaemonLeafDiskGates())
+	// What the running daemon last heard from each head that sent it no work and
+	// said why. Nothing when the daemon is down or no head gave a reason.
+	if resp, err := fetchHeadsFromAPI(); err == nil {
+		checkHeadNoWork(rep, resp.Heads)
+	}
 
 	fmt.Fprintln(out)
 	switch {

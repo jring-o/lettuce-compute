@@ -1087,15 +1087,32 @@ type HeadInfo struct {
 	// rejected this volunteer build as too old — at registration or on a
 	// work request — and stays true until a later request to the head
 	// succeeds; the remedy is `lettuce-volunteer update`.
-	HeadVersion    string       `json:"head_version"`
-	UpdateRequired bool         `json:"update_required"`
-	Leafs          []LeafDetail `json:"leafs"`
+	HeadVersion    string `json:"head_version"`
+	UpdateRequired bool   `json:"update_required"`
+	// NoWork is the reason this head gave on its most recent empty work reply
+	// that named one (the machine at the head's in-flight cap, the account's
+	// results or standing, the speed on record against a deadline), until the
+	// head sends work again. Absent when there is none, or from a head that
+	// predates the reason.
+	NoWork *HeadNoWorkInfo `json:"no_work,omitempty"`
+	Leafs  []LeafDetail    `json:"leafs"`
 	// LeafsRefreshedAt is when this head's leaf figures below were last fetched.
 	// The daemon refreshes the leaf cache only inside the fetch path, so their age
 	// is unbounded: a host with a full buffer, or one slot held by a long unit,
 	// carries the same numbers for hours. Zero when nothing has been cached yet
 	// (rendered as unknown, never as "now") — TB-14.
 	LeafsRefreshedAt time.Time `json:"leafs_refreshed_at,omitzero"`
+}
+
+// HeadNoWorkInfo is a head's stated reason for sending no work: a machine-
+// readable code (inflight_cap, already_contributed, bench_cooldown,
+// account_benched, infeasible_deadline), its plain-language explanation, the
+// leaf it concerned when it concerned one, and when the head said it.
+type HeadNoWorkInfo struct {
+	Reason  string    `json:"reason"`
+	Message string    `json:"message"`
+	Leaf    string    `json:"leaf,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 // LeafExecutionSpec is the JSON representation of a leaf's execution spec for the management API.
@@ -1338,6 +1355,9 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 			VolunteerID:    serverVolunteerID[name],
 			HeadVersion:    hs.HeadVersion,
 			UpdateRequired: hs.UpdateRequired,
+		}
+		if nw := hs.NoWork; nw.Reason != "" {
+			hi.NoWork = &HeadNoWorkInfo{Reason: nw.Reason, Message: nw.Message, Leaf: nw.Leaf, At: nw.At}
 		}
 
 		// Fill from cache if available.

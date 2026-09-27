@@ -1,6 +1,9 @@
 package daemon
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Per-head version and update-required state.
 //
@@ -27,6 +30,22 @@ type HeadStatus struct {
 	// UpdateRequired is true once this head has rejected this volunteer build
 	// as too old, until a later RPC to the head succeeds.
 	UpdateRequired bool
+	// NoWork is the reason the head gave on its most recent explained empty
+	// work reply; the zero value when there is none, or once the head sends
+	// work again.
+	NoWork HeadNoWork
+}
+
+// HeadNoWork is a head's stated reason for sending no work: the notice code,
+// its volunteer-facing wording, the leaf it concerned (its label and id; empty
+// for a reason about the machine or the account, or a request that named no
+// leaf), and when the head said it.
+type HeadNoWork struct {
+	Reason  string
+	Message string
+	Leaf    string
+	LeafID  string
+	At      time.Time
 }
 
 // HeadStatusTracker holds HeadStatus per head gRPC address. It is written from
@@ -92,4 +111,47 @@ func (t *HeadStatusTracker) Get(addr string) HeadStatus {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.byAddr[addr]
+}
+
+// SetNoWork records the head's latest stated reason for sending no work.
+func (t *HeadStatusTracker) SetNoWork(addr string, nw HeadNoWork) {
+	if t == nil || addr == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.byAddr[addr]
+	st.NoWork = nw
+	t.byAddr[addr] = st
+}
+
+// ClearNoWork forgets the head's stated reason: it sent work.
+func (t *HeadStatusTracker) ClearNoWork(addr string) {
+	if t == nil || addr == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, ok := t.byAddr[addr]
+	if !ok || st.NoWork.Reason == "" {
+		return
+	}
+	st.NoWork = HeadNoWork{}
+	t.byAddr[addr] = st
+}
+
+// ClearNoWorkFor forgets the head's stated reason if it concerned leafID: the head
+// has since answered for that leaf without one, so it no longer applies.
+func (t *HeadStatusTracker) ClearNoWorkFor(addr, leafID string) {
+	if t == nil || addr == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st, ok := t.byAddr[addr]
+	if !ok || st.NoWork.Reason == "" || st.NoWork.LeafID != leafID {
+		return
+	}
+	st.NoWork = HeadNoWork{}
+	t.byAddr[addr] = st
 }

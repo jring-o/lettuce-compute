@@ -21,6 +21,79 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// NoWorkReason is the requester-specific cause of an empty work reply. When
+// several apply, the head reports the first in this order: ACCOUNT_BENCHED,
+// INFLIGHT_CAP, INFEASIBLE_DEADLINE, BENCH_COOLDOWN, ALREADY_CONTRIBUTED.
+type NoWorkReason int32
+
+const (
+	// No work right now for a reason the head does not name, or an older head.
+	NoWorkReason_NO_WORK_REASON_UNSPECIFIED NoWorkReason = 0
+	// This machine holds as many copies as the head lets it hold at once, and
+	// at least one requested unit would otherwise have been handed out.
+	NoWorkReason_NO_WORK_REASON_INFLIGHT_CAP NoWorkReason = 1
+	// This account (or another account bound to the same identity) already has
+	// a result on, or holds a copy of, every requested unit the head could
+	// otherwise have handed out.
+	NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED NoWorkReason = 2
+	// A recent copy of a requested unit, held by this account, failed or
+	// lapsed; the head offers that unit to other volunteers first for about one
+	// deadline.
+	NoWorkReason_NO_WORK_REASON_BENCH_COOLDOWN NoWorkReason = 3
+	// The head has paused sending work to this account (account standing).
+	NoWorkReason_NO_WORK_REASON_ACCOUNT_BENCHED NoWorkReason = 4
+	// By the benchmark the head has on record for this account, a requested
+	// unit could not finish before its deadline.
+	NoWorkReason_NO_WORK_REASON_INFEASIBLE_DEADLINE NoWorkReason = 5
+)
+
+// Enum value maps for NoWorkReason.
+var (
+	NoWorkReason_name = map[int32]string{
+		0: "NO_WORK_REASON_UNSPECIFIED",
+		1: "NO_WORK_REASON_INFLIGHT_CAP",
+		2: "NO_WORK_REASON_ALREADY_CONTRIBUTED",
+		3: "NO_WORK_REASON_BENCH_COOLDOWN",
+		4: "NO_WORK_REASON_ACCOUNT_BENCHED",
+		5: "NO_WORK_REASON_INFEASIBLE_DEADLINE",
+	}
+	NoWorkReason_value = map[string]int32{
+		"NO_WORK_REASON_UNSPECIFIED":         0,
+		"NO_WORK_REASON_INFLIGHT_CAP":        1,
+		"NO_WORK_REASON_ALREADY_CONTRIBUTED": 2,
+		"NO_WORK_REASON_BENCH_COOLDOWN":      3,
+		"NO_WORK_REASON_ACCOUNT_BENCHED":     4,
+		"NO_WORK_REASON_INFEASIBLE_DEADLINE": 5,
+	}
+)
+
+func (x NoWorkReason) Enum() *NoWorkReason {
+	p := new(NoWorkReason)
+	*p = x
+	return p
+}
+
+func (x NoWorkReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (NoWorkReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_lettuce_v1_volunteer_proto_enumTypes[0].Descriptor()
+}
+
+func (NoWorkReason) Type() protoreflect.EnumType {
+	return &file_proto_lettuce_v1_volunteer_proto_enumTypes[0]
+}
+
+func (x NoWorkReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use NoWorkReason.Descriptor instead.
+func (NoWorkReason) EnumDescriptor() ([]byte, []int) {
+	return file_proto_lettuce_v1_volunteer_proto_rawDescGZIP(), []int{0}
+}
+
 type GetServerStatusRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -540,8 +613,29 @@ type RequestWorkUnitResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Assignments       []*WorkUnitAssignment  `protobuf:"bytes,1,rep,name=assignments,proto3" json:"assignments,omitempty"`                                         // 0..N units; empty = no work right now
 	RetryAfterSeconds int32                  `protobuf:"varint,2,opt,name=retry_after_seconds,json=retryAfterSeconds,proto3" json:"retry_after_seconds,omitempty"` // server-directed retry delay (authoritative)
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Why an EMPTY reply is empty, when the cause is the requester's own state.
+	// Set only when assignments is empty; UNSPECIFIED otherwise. The head works it
+	// out over the leaves the request named (or, for a request that named none,
+	// the PUBLIC leaves) and never says anything about other volunteers or about
+	// a leaf the requester could not see, so every other cause — an empty or
+	// drained leaf, units already covered by other volunteers' copies, a hidden
+	// leaf — is UNSPECIFIED, as is every reply from a head that predates it.
+	NoWorkReason NoWorkReason `protobuf:"varint,3,opt,name=no_work_reason,json=noWorkReason,proto3,enum=lettuce.volunteer.v1.NoWorkReason" json:"no_work_reason,omitempty"`
+	// INFLIGHT_CAP only: how many copies (running and buffered) this head lets
+	// the requesting machine hold at once right now, and how many it holds.
+	InflightCap  int32 `protobuf:"varint,4,opt,name=inflight_cap,json=inflightCap,proto3" json:"inflight_cap,omitempty"`
+	InflightHeld int32 `protobuf:"varint,5,opt,name=inflight_held,json=inflightHeld,proto3" json:"inflight_held,omitempty"`
+	// INFEASIBLE_DEADLINE only: a refused unit's deadline, and how long the head
+	// estimates it would take (the leaf's rsc_fpops_est divided by the benchmark
+	// the head has on record for the ACCOUNT — the last of its machines to
+	// register, which need not be the requesting one).
+	DeadlineSeconds  int64 `protobuf:"varint,6,opt,name=deadline_seconds,json=deadlineSeconds,proto3" json:"deadline_seconds,omitempty"`
+	EstimatedSeconds int64 `protobuf:"varint,7,opt,name=estimated_seconds,json=estimatedSeconds,proto3" json:"estimated_seconds,omitempty"`
+	// ACCOUNT_BENCHED only: when the bench ends, as unix seconds; 0 when it has
+	// no end time and lasts until an operator clears it.
+	BenchedUntilUnix int64 `protobuf:"varint,8,opt,name=benched_until_unix,json=benchedUntilUnix,proto3" json:"benched_until_unix,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RequestWorkUnitResponse) Reset() {
@@ -584,6 +678,48 @@ func (x *RequestWorkUnitResponse) GetAssignments() []*WorkUnitAssignment {
 func (x *RequestWorkUnitResponse) GetRetryAfterSeconds() int32 {
 	if x != nil {
 		return x.RetryAfterSeconds
+	}
+	return 0
+}
+
+func (x *RequestWorkUnitResponse) GetNoWorkReason() NoWorkReason {
+	if x != nil {
+		return x.NoWorkReason
+	}
+	return NoWorkReason_NO_WORK_REASON_UNSPECIFIED
+}
+
+func (x *RequestWorkUnitResponse) GetInflightCap() int32 {
+	if x != nil {
+		return x.InflightCap
+	}
+	return 0
+}
+
+func (x *RequestWorkUnitResponse) GetInflightHeld() int32 {
+	if x != nil {
+		return x.InflightHeld
+	}
+	return 0
+}
+
+func (x *RequestWorkUnitResponse) GetDeadlineSeconds() int64 {
+	if x != nil {
+		return x.DeadlineSeconds
+	}
+	return 0
+}
+
+func (x *RequestWorkUnitResponse) GetEstimatedSeconds() int64 {
+	if x != nil {
+		return x.EstimatedSeconds
+	}
+	return 0
+}
+
+func (x *RequestWorkUnitResponse) GetBenchedUntilUnix() int64 {
+	if x != nil {
+		return x.BenchedUntilUnix
 	}
 	return 0
 }
@@ -2923,10 +3059,16 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x10blocked_leaf_ids\x18\x05 \x03(\tR\x0eblockedLeafIds\x12'\n" +
 	"\x0fmax_assignments\x18\x06 \x01(\x05R\x0emaxAssignments\x12+\n" +
 	"\x12held_work_unit_ids\x18\a \x03(\tR\x0fheldWorkUnitIds\x12\x17\n" +
-	"\ahost_id\x18\b \x01(\tR\x06hostId\"\x95\x01\n" +
+	"\ahost_id\x18\b \x01(\tR\x06hostId\"\xad\x03\n" +
 	"\x17RequestWorkUnitResponse\x12J\n" +
 	"\vassignments\x18\x01 \x03(\v2(.lettuce.volunteer.v1.WorkUnitAssignmentR\vassignments\x12.\n" +
-	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\"\xfa\x05\n" +
+	"\x13retry_after_seconds\x18\x02 \x01(\x05R\x11retryAfterSeconds\x12H\n" +
+	"\x0eno_work_reason\x18\x03 \x01(\x0e2\".lettuce.volunteer.v1.NoWorkReasonR\fnoWorkReason\x12!\n" +
+	"\finflight_cap\x18\x04 \x01(\x05R\vinflightCap\x12#\n" +
+	"\rinflight_held\x18\x05 \x01(\x05R\finflightHeld\x12)\n" +
+	"\x10deadline_seconds\x18\x06 \x01(\x03R\x0fdeadlineSeconds\x12+\n" +
+	"\x11estimated_seconds\x18\a \x01(\x03R\x10estimatedSeconds\x12,\n" +
+	"\x12benched_until_unix\x18\b \x01(\x03R\x10benchedUntilUnix\"\xfa\x05\n" +
 	"\x12WorkUnitAssignment\x12 \n" +
 	"\fwork_unit_id\x18\x01 \x01(\tR\n" +
 	"workUnitId\x12\x17\n" +
@@ -3139,7 +3281,14 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x10execution_failed\x18\x03 \x01(\bR\x0fexecutionFailed\x12#\n" +
 	"\rerror_message\x18\x04 \x01(\tR\ferrorMessage\"7\n" +
 	"\x19SubmitAuditResultResponse\x12\x1a\n" +
-	"\baccepted\x18\x01 \x01(\bR\baccepted2\xda\t\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted*\xe6\x01\n" +
+	"\fNoWorkReason\x12\x1e\n" +
+	"\x1aNO_WORK_REASON_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bNO_WORK_REASON_INFLIGHT_CAP\x10\x01\x12&\n" +
+	"\"NO_WORK_REASON_ALREADY_CONTRIBUTED\x10\x02\x12!\n" +
+	"\x1dNO_WORK_REASON_BENCH_COOLDOWN\x10\x03\x12\"\n" +
+	"\x1eNO_WORK_REASON_ACCOUNT_BENCHED\x10\x04\x12&\n" +
+	"\"NO_WORK_REASON_INFEASIBLE_DEADLINE\x10\x052\xda\t\n" +
 	"\x10VolunteerService\x12n\n" +
 	"\x0fGetServerStatus\x12,.lettuce.volunteer.v1.GetServerStatusRequest\x1a-.lettuce.volunteer.v1.GetServerStatusResponse\x12t\n" +
 	"\x11RegisterVolunteer\x12..lettuce.volunteer.v1.RegisterVolunteerRequest\x1a/.lettuce.volunteer.v1.RegisterVolunteerResponse\x12\x89\x01\n" +
@@ -3168,103 +3317,106 @@ func file_proto_lettuce_v1_volunteer_proto_rawDescGZIP() []byte {
 	return file_proto_lettuce_v1_volunteer_proto_rawDescData
 }
 
+var file_proto_lettuce_v1_volunteer_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_proto_lettuce_v1_volunteer_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_proto_lettuce_v1_volunteer_proto_goTypes = []any{
-	(*GetServerStatusRequest)(nil),           // 0: lettuce.volunteer.v1.GetServerStatusRequest
-	(*GetServerStatusResponse)(nil),          // 1: lettuce.volunteer.v1.GetServerStatusResponse
-	(*RegisterVolunteerRequest)(nil),         // 2: lettuce.volunteer.v1.RegisterVolunteerRequest
-	(*RegisterVolunteerResponse)(nil),        // 3: lettuce.volunteer.v1.RegisterVolunteerResponse
-	(*GetRegistrationChallengeRequest)(nil),  // 4: lettuce.volunteer.v1.GetRegistrationChallengeRequest
-	(*GetRegistrationChallengeResponse)(nil), // 5: lettuce.volunteer.v1.GetRegistrationChallengeResponse
-	(*RequestWorkUnitRequest)(nil),           // 6: lettuce.volunteer.v1.RequestWorkUnitRequest
-	(*RequestWorkUnitResponse)(nil),          // 7: lettuce.volunteer.v1.RequestWorkUnitResponse
-	(*WorkUnitAssignment)(nil),               // 8: lettuce.volunteer.v1.WorkUnitAssignment
-	(*SubmitResultRequest)(nil),              // 9: lettuce.volunteer.v1.SubmitResultRequest
-	(*SubmitResultResponse)(nil),             // 10: lettuce.volunteer.v1.SubmitResultResponse
-	(*StartWorkRequest)(nil),                 // 11: lettuce.volunteer.v1.StartWorkRequest
-	(*StartWorkResponse)(nil),                // 12: lettuce.volunteer.v1.StartWorkResponse
-	(*SaveCheckpointRequest)(nil),            // 13: lettuce.volunteer.v1.SaveCheckpointRequest
-	(*SaveCheckpointResponse)(nil),           // 14: lettuce.volunteer.v1.SaveCheckpointResponse
-	(*GetCheckpointRequest)(nil),             // 15: lettuce.volunteer.v1.GetCheckpointRequest
-	(*GetCheckpointResponse)(nil),            // 16: lettuce.volunteer.v1.GetCheckpointResponse
-	(*HardwareCapabilities)(nil),             // 17: lettuce.volunteer.v1.HardwareCapabilities
-	(*GpuInfo)(nil),                          // 18: lettuce.volunteer.v1.GpuInfo
-	(*ExecutionMetadata)(nil),                // 19: lettuce.volunteer.v1.ExecutionMetadata
-	(*ExecutionSpec)(nil),                    // 20: lettuce.volunteer.v1.ExecutionSpec
-	(*LeafResourceRequirements)(nil),         // 21: lettuce.volunteer.v1.LeafResourceRequirements
-	(*GetHeadInfoRequest)(nil),               // 22: lettuce.volunteer.v1.GetHeadInfoRequest
-	(*GetHeadInfoResponse)(nil),              // 23: lettuce.volunteer.v1.GetHeadInfoResponse
-	(*LeafInfo)(nil),                         // 24: lettuce.volunteer.v1.LeafInfo
-	(*AbandonWorkUnitRequest)(nil),           // 25: lettuce.volunteer.v1.AbandonWorkUnitRequest
-	(*AbandonWorkUnitResponse)(nil),          // 26: lettuce.volunteer.v1.AbandonWorkUnitResponse
-	(*GetMyContributionRequest)(nil),         // 27: lettuce.volunteer.v1.GetMyContributionRequest
-	(*GetMyContributionResponse)(nil),        // 28: lettuce.volunteer.v1.GetMyContributionResponse
-	(*LeafContribution)(nil),                 // 29: lettuce.volunteer.v1.LeafContribution
-	(*ResourceTypeContribution)(nil),         // 30: lettuce.volunteer.v1.ResourceTypeContribution
-	(*DailyContribution)(nil),                // 31: lettuce.volunteer.v1.DailyContribution
-	(*WeeklyContribution)(nil),               // 32: lettuce.volunteer.v1.WeeklyContribution
-	(*ClaimAuditJobRequest)(nil),             // 33: lettuce.volunteer.v1.ClaimAuditJobRequest
-	(*ClaimAuditJobResponse)(nil),            // 34: lettuce.volunteer.v1.ClaimAuditJobResponse
-	(*AuditJob)(nil),                         // 35: lettuce.volunteer.v1.AuditJob
-	(*SubmitAuditResultRequest)(nil),         // 36: lettuce.volunteer.v1.SubmitAuditResultRequest
-	(*SubmitAuditResultResponse)(nil),        // 37: lettuce.volunteer.v1.SubmitAuditResultResponse
-	nil,                                      // 38: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
-	nil,                                      // 39: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	nil,                                      // 40: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	nil,                                      // 41: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	(NoWorkReason)(0),                        // 0: lettuce.volunteer.v1.NoWorkReason
+	(*GetServerStatusRequest)(nil),           // 1: lettuce.volunteer.v1.GetServerStatusRequest
+	(*GetServerStatusResponse)(nil),          // 2: lettuce.volunteer.v1.GetServerStatusResponse
+	(*RegisterVolunteerRequest)(nil),         // 3: lettuce.volunteer.v1.RegisterVolunteerRequest
+	(*RegisterVolunteerResponse)(nil),        // 4: lettuce.volunteer.v1.RegisterVolunteerResponse
+	(*GetRegistrationChallengeRequest)(nil),  // 5: lettuce.volunteer.v1.GetRegistrationChallengeRequest
+	(*GetRegistrationChallengeResponse)(nil), // 6: lettuce.volunteer.v1.GetRegistrationChallengeResponse
+	(*RequestWorkUnitRequest)(nil),           // 7: lettuce.volunteer.v1.RequestWorkUnitRequest
+	(*RequestWorkUnitResponse)(nil),          // 8: lettuce.volunteer.v1.RequestWorkUnitResponse
+	(*WorkUnitAssignment)(nil),               // 9: lettuce.volunteer.v1.WorkUnitAssignment
+	(*SubmitResultRequest)(nil),              // 10: lettuce.volunteer.v1.SubmitResultRequest
+	(*SubmitResultResponse)(nil),             // 11: lettuce.volunteer.v1.SubmitResultResponse
+	(*StartWorkRequest)(nil),                 // 12: lettuce.volunteer.v1.StartWorkRequest
+	(*StartWorkResponse)(nil),                // 13: lettuce.volunteer.v1.StartWorkResponse
+	(*SaveCheckpointRequest)(nil),            // 14: lettuce.volunteer.v1.SaveCheckpointRequest
+	(*SaveCheckpointResponse)(nil),           // 15: lettuce.volunteer.v1.SaveCheckpointResponse
+	(*GetCheckpointRequest)(nil),             // 16: lettuce.volunteer.v1.GetCheckpointRequest
+	(*GetCheckpointResponse)(nil),            // 17: lettuce.volunteer.v1.GetCheckpointResponse
+	(*HardwareCapabilities)(nil),             // 18: lettuce.volunteer.v1.HardwareCapabilities
+	(*GpuInfo)(nil),                          // 19: lettuce.volunteer.v1.GpuInfo
+	(*ExecutionMetadata)(nil),                // 20: lettuce.volunteer.v1.ExecutionMetadata
+	(*ExecutionSpec)(nil),                    // 21: lettuce.volunteer.v1.ExecutionSpec
+	(*LeafResourceRequirements)(nil),         // 22: lettuce.volunteer.v1.LeafResourceRequirements
+	(*GetHeadInfoRequest)(nil),               // 23: lettuce.volunteer.v1.GetHeadInfoRequest
+	(*GetHeadInfoResponse)(nil),              // 24: lettuce.volunteer.v1.GetHeadInfoResponse
+	(*LeafInfo)(nil),                         // 25: lettuce.volunteer.v1.LeafInfo
+	(*AbandonWorkUnitRequest)(nil),           // 26: lettuce.volunteer.v1.AbandonWorkUnitRequest
+	(*AbandonWorkUnitResponse)(nil),          // 27: lettuce.volunteer.v1.AbandonWorkUnitResponse
+	(*GetMyContributionRequest)(nil),         // 28: lettuce.volunteer.v1.GetMyContributionRequest
+	(*GetMyContributionResponse)(nil),        // 29: lettuce.volunteer.v1.GetMyContributionResponse
+	(*LeafContribution)(nil),                 // 30: lettuce.volunteer.v1.LeafContribution
+	(*ResourceTypeContribution)(nil),         // 31: lettuce.volunteer.v1.ResourceTypeContribution
+	(*DailyContribution)(nil),                // 32: lettuce.volunteer.v1.DailyContribution
+	(*WeeklyContribution)(nil),               // 33: lettuce.volunteer.v1.WeeklyContribution
+	(*ClaimAuditJobRequest)(nil),             // 34: lettuce.volunteer.v1.ClaimAuditJobRequest
+	(*ClaimAuditJobResponse)(nil),            // 35: lettuce.volunteer.v1.ClaimAuditJobResponse
+	(*AuditJob)(nil),                         // 36: lettuce.volunteer.v1.AuditJob
+	(*SubmitAuditResultRequest)(nil),         // 37: lettuce.volunteer.v1.SubmitAuditResultRequest
+	(*SubmitAuditResultResponse)(nil),        // 38: lettuce.volunteer.v1.SubmitAuditResultResponse
+	nil,                                      // 39: lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	nil,                                      // 40: lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	nil,                                      // 41: lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	nil,                                      // 42: lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
 }
 var file_proto_lettuce_v1_volunteer_proto_depIdxs = []int32{
-	17, // 0: lettuce.volunteer.v1.RegisterVolunteerRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
-	17, // 1: lettuce.volunteer.v1.RequestWorkUnitRequest.current_available:type_name -> lettuce.volunteer.v1.HardwareCapabilities
-	8,  // 2: lettuce.volunteer.v1.RequestWorkUnitResponse.assignments:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	38, // 3: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
-	20, // 4: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
-	19, // 5: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
-	18, // 6: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
-	39, // 7: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
-	40, // 8: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
-	24, // 9: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
-	41, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
-	20, // 11: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
-	21, // 12: lettuce.volunteer.v1.LeafInfo.resource_requirements:type_name -> lettuce.volunteer.v1.LeafResourceRequirements
-	29, // 13: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
-	30, // 14: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
-	31, // 15: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
-	32, // 16: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
-	17, // 17: lettuce.volunteer.v1.ClaimAuditJobRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
-	35, // 18: lettuce.volunteer.v1.ClaimAuditJobResponse.job:type_name -> lettuce.volunteer.v1.AuditJob
-	8,  // 19: lettuce.volunteer.v1.AuditJob.assignment:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
-	0,  // 20: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
-	2,  // 21: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
-	4,  // 22: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
-	6,  // 23: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
-	9,  // 24: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
-	11, // 25: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
-	22, // 26: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
-	13, // 27: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
-	15, // 28: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
-	25, // 29: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
-	27, // 30: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
-	33, // 31: lettuce.volunteer.v1.AuditService.ClaimJob:input_type -> lettuce.volunteer.v1.ClaimAuditJobRequest
-	36, // 32: lettuce.volunteer.v1.AuditService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitAuditResultRequest
-	1,  // 33: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
-	3,  // 34: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
-	5,  // 35: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
-	7,  // 36: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
-	10, // 37: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
-	12, // 38: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
-	23, // 39: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
-	14, // 40: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
-	16, // 41: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
-	26, // 42: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
-	28, // 43: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
-	34, // 44: lettuce.volunteer.v1.AuditService.ClaimJob:output_type -> lettuce.volunteer.v1.ClaimAuditJobResponse
-	37, // 45: lettuce.volunteer.v1.AuditService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitAuditResultResponse
-	33, // [33:46] is the sub-list for method output_type
-	20, // [20:33] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	18, // 0: lettuce.volunteer.v1.RegisterVolunteerRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
+	18, // 1: lettuce.volunteer.v1.RequestWorkUnitRequest.current_available:type_name -> lettuce.volunteer.v1.HardwareCapabilities
+	9,  // 2: lettuce.volunteer.v1.RequestWorkUnitResponse.assignments:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
+	0,  // 3: lettuce.volunteer.v1.RequestWorkUnitResponse.no_work_reason:type_name -> lettuce.volunteer.v1.NoWorkReason
+	39, // 4: lettuce.volunteer.v1.WorkUnitAssignment.env_vars:type_name -> lettuce.volunteer.v1.WorkUnitAssignment.EnvVarsEntry
+	21, // 5: lettuce.volunteer.v1.WorkUnitAssignment.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
+	20, // 6: lettuce.volunteer.v1.SubmitResultRequest.metadata:type_name -> lettuce.volunteer.v1.ExecutionMetadata
+	19, // 7: lettuce.volunteer.v1.HardwareCapabilities.gpus:type_name -> lettuce.volunteer.v1.GpuInfo
+	40, // 8: lettuce.volunteer.v1.ExecutionSpec.binaries:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinariesEntry
+	41, // 9: lettuce.volunteer.v1.ExecutionSpec.binary_checksums:type_name -> lettuce.volunteer.v1.ExecutionSpec.BinaryChecksumsEntry
+	25, // 10: lettuce.volunteer.v1.GetHeadInfoResponse.leafs:type_name -> lettuce.volunteer.v1.LeafInfo
+	42, // 11: lettuce.volunteer.v1.GetHeadInfoResponse.default_leaf_weights:type_name -> lettuce.volunteer.v1.GetHeadInfoResponse.DefaultLeafWeightsEntry
+	21, // 12: lettuce.volunteer.v1.LeafInfo.execution_spec:type_name -> lettuce.volunteer.v1.ExecutionSpec
+	22, // 13: lettuce.volunteer.v1.LeafInfo.resource_requirements:type_name -> lettuce.volunteer.v1.LeafResourceRequirements
+	30, // 14: lettuce.volunteer.v1.GetMyContributionResponse.by_leaf:type_name -> lettuce.volunteer.v1.LeafContribution
+	31, // 15: lettuce.volunteer.v1.GetMyContributionResponse.by_resource_type:type_name -> lettuce.volunteer.v1.ResourceTypeContribution
+	32, // 16: lettuce.volunteer.v1.GetMyContributionResponse.daily:type_name -> lettuce.volunteer.v1.DailyContribution
+	33, // 17: lettuce.volunteer.v1.GetMyContributionResponse.weekly:type_name -> lettuce.volunteer.v1.WeeklyContribution
+	18, // 18: lettuce.volunteer.v1.ClaimAuditJobRequest.hardware:type_name -> lettuce.volunteer.v1.HardwareCapabilities
+	36, // 19: lettuce.volunteer.v1.ClaimAuditJobResponse.job:type_name -> lettuce.volunteer.v1.AuditJob
+	9,  // 20: lettuce.volunteer.v1.AuditJob.assignment:type_name -> lettuce.volunteer.v1.WorkUnitAssignment
+	1,  // 21: lettuce.volunteer.v1.VolunteerService.GetServerStatus:input_type -> lettuce.volunteer.v1.GetServerStatusRequest
+	3,  // 22: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:input_type -> lettuce.volunteer.v1.RegisterVolunteerRequest
+	5,  // 23: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:input_type -> lettuce.volunteer.v1.GetRegistrationChallengeRequest
+	7,  // 24: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:input_type -> lettuce.volunteer.v1.RequestWorkUnitRequest
+	10, // 25: lettuce.volunteer.v1.VolunteerService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitResultRequest
+	12, // 26: lettuce.volunteer.v1.VolunteerService.StartWork:input_type -> lettuce.volunteer.v1.StartWorkRequest
+	23, // 27: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:input_type -> lettuce.volunteer.v1.GetHeadInfoRequest
+	14, // 28: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:input_type -> lettuce.volunteer.v1.SaveCheckpointRequest
+	16, // 29: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:input_type -> lettuce.volunteer.v1.GetCheckpointRequest
+	26, // 30: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:input_type -> lettuce.volunteer.v1.AbandonWorkUnitRequest
+	28, // 31: lettuce.volunteer.v1.VolunteerService.GetMyContribution:input_type -> lettuce.volunteer.v1.GetMyContributionRequest
+	34, // 32: lettuce.volunteer.v1.AuditService.ClaimJob:input_type -> lettuce.volunteer.v1.ClaimAuditJobRequest
+	37, // 33: lettuce.volunteer.v1.AuditService.SubmitResult:input_type -> lettuce.volunteer.v1.SubmitAuditResultRequest
+	2,  // 34: lettuce.volunteer.v1.VolunteerService.GetServerStatus:output_type -> lettuce.volunteer.v1.GetServerStatusResponse
+	4,  // 35: lettuce.volunteer.v1.VolunteerService.RegisterVolunteer:output_type -> lettuce.volunteer.v1.RegisterVolunteerResponse
+	6,  // 36: lettuce.volunteer.v1.VolunteerService.GetRegistrationChallenge:output_type -> lettuce.volunteer.v1.GetRegistrationChallengeResponse
+	8,  // 37: lettuce.volunteer.v1.VolunteerService.RequestWorkUnit:output_type -> lettuce.volunteer.v1.RequestWorkUnitResponse
+	11, // 38: lettuce.volunteer.v1.VolunteerService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitResultResponse
+	13, // 39: lettuce.volunteer.v1.VolunteerService.StartWork:output_type -> lettuce.volunteer.v1.StartWorkResponse
+	24, // 40: lettuce.volunteer.v1.VolunteerService.GetHeadInfo:output_type -> lettuce.volunteer.v1.GetHeadInfoResponse
+	15, // 41: lettuce.volunteer.v1.VolunteerService.SaveCheckpoint:output_type -> lettuce.volunteer.v1.SaveCheckpointResponse
+	17, // 42: lettuce.volunteer.v1.VolunteerService.GetCheckpoint:output_type -> lettuce.volunteer.v1.GetCheckpointResponse
+	27, // 43: lettuce.volunteer.v1.VolunteerService.AbandonWorkUnit:output_type -> lettuce.volunteer.v1.AbandonWorkUnitResponse
+	29, // 44: lettuce.volunteer.v1.VolunteerService.GetMyContribution:output_type -> lettuce.volunteer.v1.GetMyContributionResponse
+	35, // 45: lettuce.volunteer.v1.AuditService.ClaimJob:output_type -> lettuce.volunteer.v1.ClaimAuditJobResponse
+	38, // 46: lettuce.volunteer.v1.AuditService.SubmitResult:output_type -> lettuce.volunteer.v1.SubmitAuditResultResponse
+	34, // [34:47] is the sub-list for method output_type
+	21, // [21:34] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_proto_lettuce_v1_volunteer_proto_init() }
@@ -3277,13 +3429,14 @@ func file_proto_lettuce_v1_volunteer_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_lettuce_v1_volunteer_proto_rawDesc), len(file_proto_lettuce_v1_volunteer_proto_rawDesc)),
-			NumEnums:      0,
+			NumEnums:      1,
 			NumMessages:   42,
 			NumExtensions: 0,
 			NumServices:   2,
 		},
 		GoTypes:           file_proto_lettuce_v1_volunteer_proto_goTypes,
 		DependencyIndexes: file_proto_lettuce_v1_volunteer_proto_depIdxs,
+		EnumInfos:         file_proto_lettuce_v1_volunteer_proto_enumTypes,
 		MessageInfos:      file_proto_lettuce_v1_volunteer_proto_msgTypes,
 	}.Build()
 	File_proto_lettuce_v1_volunteer_proto = out.File
