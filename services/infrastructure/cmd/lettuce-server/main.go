@@ -472,6 +472,8 @@ func main() {
 			// TODO #54: reliability-weighted adaptive in-flight quota.
 			ReliabilityQuotaEnabled: cfg.Head.EffectiveReliabilityQuotaEnabled(),
 			ReliabilityQuotaFloor:   cfg.Head.EffectiveReliabilityQuotaFloor(),
+			// The in-flight ceiling scales with the machine (copies per core and GPU).
+			MaxInflightPerCore: cfg.Head.EffectiveMaxInflightPerCore(),
 		})
 	// Registration admission cap (design §4.1) — the same resolved policy the router
 	// hands the browser register path, so both create surfaces enforce one number.

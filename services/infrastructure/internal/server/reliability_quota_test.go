@@ -52,40 +52,89 @@ func newQuotaCache(enabled bool, floor, flatCap int, relRepo reliability.Reposit
 	return c, wuRepo, leafRepo
 }
 
+// setHostScore warms host's reliability score as the budget refresher would.
+func (c *dispatchCache) setHostScore(host types.ID, score float64) {
+	c.budgetMu.Lock()
+	c.hostScoreCache[host] = score
+	c.budgetMu.Unlock()
+}
+
 // TestEffectiveInflightCap covers the per-host cap resolution: disabled -> flat cap;
-// enabled+miss -> cold-start floor (bounded by the flat cap); enabled+hit -> the warmed
-// budget; unbounded flat cap -> inert.
+// enabled+miss -> cold-start floor (bounded by the flat cap); enabled+hit -> the budget the
+// warmed score earns; unbounded flat cap -> inert.
 func TestEffectiveInflightCap(t *testing.T) {
 	host := types.NewID()
 
-	// Disabled: always the flat cap, regardless of any warmed budget.
+	// Disabled: always the flat cap, regardless of any warmed score or ceiling.
 	cDis, _, _ := newQuotaCache(false, 2, 10, nil)
-	cDis.hostBudgetCache[host] = 4 // even if present, ignored when disabled
-	if got := cDis.effectiveInflightCap(host, 10); got != 10 {
+	cDis.setHostScore(host, 1.875)
+	if got := cDis.effectiveInflightCap(host, 10, 64); got != 10 {
 		t.Errorf("disabled effectiveInflightCap = %d, want flat cap 10", got)
 	}
 
-	// Enabled, no warmed budget -> cold-start floor.
+	// Enabled, no warmed score -> cold-start floor, however high the ceiling.
 	cEn, _, _ := newQuotaCache(true, 2, 10, nil)
-	if got := cEn.effectiveInflightCap(host, 10); got != 2 {
+	if got := cEn.effectiveInflightCap(host, 10, 64); got != 2 {
 		t.Errorf("enabled+miss effectiveInflightCap = %d, want floor 2 (cold start)", got)
 	}
 
-	// Enabled, warmed budget -> that budget.
-	cEn.hostBudgetCache[host] = 7
-	if got := cEn.effectiveInflightCap(host, 10); got != 7 {
-		t.Errorf("enabled+hit effectiveInflightCap = %d, want warmed budget 7", got)
+	// Enabled, warmed score short of the ramp -> the ramp's budget (2 + 8*1.875/5 = 5).
+	cEn.setHostScore(host, 1.875)
+	if got := cEn.effectiveInflightCap(host, 10, 64); got != 5 {
+		t.Errorf("enabled+hit effectiveInflightCap = %d, want warmed budget 5", got)
+	}
+
+	// Enabled, score well past the ramp, ceiling at the flat cap -> exactly the flat cap.
+	cEn.setHostScore(host, 1000)
+	if got := cEn.effectiveInflightCap(host, 10, 10); got != 10 {
+		t.Errorf("enabled, ceiling = flat cap: effectiveInflightCap = %d, want 10", got)
+	}
+	// ...and with a higher ceiling -> that ceiling.
+	if got := cEn.effectiveInflightCap(host, 10, 64); got != 64 {
+		t.Errorf("enabled, ceiling 64: effectiveInflightCap = %d, want 64", got)
 	}
 
 	// Enabled but floor above the flat cap is bounded by the cap on a miss.
 	cHi, _, _ := newQuotaCache(true, 20, 5, nil)
-	if got := cHi.effectiveInflightCap(types.NewID(), 5); got != 5 {
+	if got := cHi.effectiveInflightCap(types.NewID(), 5, 5); got != 5 {
 		t.Errorf("floor>cap miss = %d, want flat cap 5", got)
 	}
 
 	// Unbounded flat cap (<=0): the quota is inert.
-	if got := cEn.effectiveInflightCap(types.NewID(), 0); got != 0 {
+	if got := cEn.effectiveInflightCap(types.NewID(), 0, 0); got != 0 {
 		t.Errorf("unbounded flat cap = %d, want 0 (inert)", got)
+	}
+}
+
+// TestInflightCeiling_PerCoreSetting: the ceiling is max(flat cap, per-core x (cores +
+// GPUs)), the larger of the two advertised core figures counts, the default is 2 per core,
+// and a negative setting turns the scaling off.
+func TestInflightCeiling_PerCoreSetting(t *testing.T) {
+	c, _, _ := newQuotaCache(true, 2, 10, nil)
+	v := types.NewID()
+
+	opts := capableOpts(v, 10)
+	opts.MaxCPUCores = 4
+	opts.HostMaxCPUCores = 24 // native/WASM figure above a clipped container figure
+	opts.GPUVendors = []string{"NVIDIA"}
+	if got := c.inflightCeiling(opts); got != 50 {
+		t.Errorf("default per-core ceiling = %d, want 2*(24+1) = 50", got)
+	}
+
+	small := capableOpts(v, 10)
+	small.MaxCPUCores = 4
+	if got := c.inflightCeiling(small); got != 10 {
+		t.Errorf("4-core ceiling = %d, want the flat cap 10", got)
+	}
+
+	c.cfg.maxInflightPerCore = 3
+	if got := c.inflightCeiling(opts); got != 75 {
+		t.Errorf("per-core 3 ceiling = %d, want 3*(24+1) = 75", got)
+	}
+
+	c.cfg.maxInflightPerCore = -1
+	if got := c.inflightCeiling(opts); got != 10 {
+		t.Errorf("scaling off: ceiling = %d, want the flat cap 10", got)
 	}
 }
 
@@ -113,11 +162,11 @@ func TestHandOut_ReliabilityQuota_CapsInflight(t *testing.T) {
 		t.Fatalf("cold-start hand-out = %d, want 2 (cold-start floor binds)", len(resCold))
 	}
 
-	// Enabled, warmed budget 5: exactly 5 handed out.
+	// Enabled, warmed score earning a budget of 5: exactly 5 handed out.
 	cWarm, _, leafRepoWarm := newQuotaCache(true, 2, 10, nil)
 	stage(cWarm, leafRepoWarm, 20)
 	vWarm := types.NewID()
-	cWarm.hostBudgetCache[vWarm] = 5 // meterID(vol, nil) == vol when no host reported
+	cWarm.setHostScore(vWarm, 1.875) // meterID(vol, nil) == vol when no host reported
 	resWarm, _ := cWarm.HandOut(vWarm, capableOpts(vWarm, 10), 20)
 	if len(resWarm) != 5 {
 		t.Fatalf("warmed-budget hand-out = %d, want 5 (adaptive budget binds)", len(resWarm))
@@ -133,8 +182,9 @@ func TestHandOut_ReliabilityQuota_CapsInflight(t *testing.T) {
 	}
 }
 
-// TestRefreshBudgetsOnce_DerivesAndSwaps verifies the off-hot-path refresher turns reliability
-// scores into per-host budgets and swaps the map in.
+// TestRefreshBudgetsOnce_DerivesAndSwaps verifies the off-hot-path refresher swaps the
+// hosts' reliability scores in, and that the budgets the hot path derives from them are the
+// ramp's: a well-scored host gets the full cap, a zero-score host the floor.
 func TestRefreshBudgetsOnce_DerivesAndSwaps(t *testing.T) {
 	reliableHost := types.NewID()
 	newHost := types.NewID()
@@ -147,29 +197,33 @@ func TestRefreshBudgetsOnce_DerivesAndSwaps(t *testing.T) {
 	c.refreshBudgetsOnce(context.Background())
 
 	c.budgetMu.Lock()
-	defer c.budgetMu.Unlock()
-	if got := c.hostBudgetCache[reliableHost]; got != 10 {
+	scores := len(c.hostScoreCache)
+	c.budgetMu.Unlock()
+	if scores != 2 {
+		t.Fatalf("refresher stored %d scores, want 2", scores)
+	}
+	if got := c.effectiveInflightCap(reliableHost, 10, 10); got != 10 {
 		t.Errorf("reliable host budget = %d, want cap 10", got)
 	}
-	if got := c.hostBudgetCache[newHost]; got != 2 {
+	if got := c.effectiveInflightCap(newHost, 10, 10); got != 2 {
 		t.Errorf("zero-score host budget = %d, want floor 2", got)
 	}
 }
 
 // TestRefreshBudgetsOnce_KeepsStaleOnError verifies a failed list does not clobber the
-// existing (good) budget map.
+// existing (good) score map.
 func TestRefreshBudgetsOnce_KeepsStaleOnError(t *testing.T) {
 	host := types.NewID()
 	repo := &fakeReliabilityRepo{listErr: context.DeadlineExceeded}
 	c, _, _ := newQuotaCache(true, 2, 10, repo)
-	c.hostBudgetCache[host] = 8 // a previously-computed budget
+	c.setHostScore(host, 8) // a previously-read score
 
 	c.refreshBudgetsOnce(context.Background())
 
 	c.budgetMu.Lock()
 	defer c.budgetMu.Unlock()
-	if got := c.hostBudgetCache[host]; got != 8 {
-		t.Errorf("budget after failed refresh = %d, want preserved 8", got)
+	if got, ok := c.hostScoreCache[host]; !ok || got != 8 {
+		t.Errorf("score after failed refresh = %v (present %v), want preserved 8", got, ok)
 	}
 }
 
@@ -182,7 +236,7 @@ func TestRunBudgetRefresher_NoopWhenDisabled(t *testing.T) {
 	c.runBudgetRefresher(context.Background(), time.Hour)
 	c.budgetMu.Lock()
 	defer c.budgetMu.Unlock()
-	if len(c.hostBudgetCache) != 0 {
-		t.Errorf("disabled refresher populated %d budgets, want 0", len(c.hostBudgetCache))
+	if len(c.hostScoreCache) != 0 {
+		t.Errorf("disabled refresher populated %d scores, want 0", len(c.hostScoreCache))
 	}
 }

@@ -187,6 +187,7 @@ jobs:
           LETTUCE_ARTIFACT_RETENTION=last:2
           LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED=false
           LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR=7
+          LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE=3
           LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS=7200
           VIZ_BUNDLE_ALLOWED_ORIGINS=https://cdn.ci.example.com
           EOF
@@ -205,6 +206,8 @@ jobs:
             || { echo "FAIL: LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED from .env does not reach the infrastructure container"; exit 1; }
           jq -e '.services.infrastructure.environment.LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR == "7"' /tmp/rendered.json >/dev/null \
             || { echo "FAIL: LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR from .env does not reach the infrastructure container"; exit 1; }
+          jq -e '.services.infrastructure.environment.LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE == "3"' /tmp/rendered.json >/dev/null \
+            || { echo "FAIL: LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE from .env does not reach the infrastructure container"; exit 1; }
           jq -e '.services.infrastructure.environment.LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS == "7200"' /tmp/rendered.json >/dev/null \
             || { echo "FAIL: LETTUCE_HEAD_DEFAULT_DEADLINE_SECONDS from .env does not reach the infrastructure container"; exit 1; }
           jq -e '.services.dashboard.environment.VIZ_BUNDLE_ALLOWED_ORIGINS == "https://cdn.ci.example.com"' /tmp/rendered.json >/dev/null \

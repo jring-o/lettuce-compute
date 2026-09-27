@@ -98,6 +98,69 @@ func TestBudgetSingleBadAmongManyGoodsBarelyMoves(t *testing.T) {
 	}
 }
 
+func TestCeiling(t *testing.T) {
+	tests := []struct {
+		name                         string
+		flatCap, perUnit, cores, gpu int
+		want                         int
+	}{
+		{"small machine keeps the flat cap", 10, 2, 2, 0, 10},
+		{"five cores is exactly the flat cap", 10, 2, 5, 0, 10},
+		{"six cores passes it", 10, 2, 6, 0, 12},
+		{"cores and GPUs both count", 10, 2, 32, 1, 66},
+		{"GPUs alone count", 10, 2, 0, 8, 16},
+		{"scaling off keeps the flat cap", 10, 0, 256, 1, 10},
+		{"negative scaling is off", 10, -1, 256, 1, 10},
+		{"unbounded flat cap stays unbounded", 0, 2, 256, 1, 0},
+		{"negative figures count as none", 10, 2, -4, -1, 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Ceiling(tt.flatCap, tt.perUnit, tt.cores, tt.gpu); got != tt.want {
+				t.Errorf("Ceiling(%d, %d, %d, %d) = %d, want %d", tt.flatCap, tt.perUnit, tt.cores, tt.gpu, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScaledBudget(t *testing.T) {
+	const floor, cap, ramp = 2, 10, 5.0
+	tests := []struct {
+		name    string
+		score   float64
+		ceiling int
+		want    int
+	}{
+		{"cold host -> floor, whatever its ceiling", 0, 512, floor},
+		{"inside the ramp -> Budget", 2.5, 512, 6},
+		{"at the ramp -> the flat cap", 5, 512, cap},
+		{"one unit past the ramp -> one more", 6, 512, 11},
+		{"part of a unit earns nothing yet", 5.9, 512, cap},
+		{"seven past the ramp -> seven more", 12, 512, 17},
+		{"far past the ramp -> the ceiling", 10000, 64, 64},
+		{"ceiling at the flat cap -> the flat cap", 10000, cap, cap},
+		{"ceiling below the flat cap -> the flat cap", 10000, 4, cap},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ScaledBudget(tt.score, floor, cap, tt.ceiling, ramp); got != tt.want {
+				t.Errorf("ScaledBudget(%v, %d, %d, %d, %v) = %d, want %d", tt.score, floor, cap, tt.ceiling, ramp, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestScaledBudgetMatchesBudgetUpToTheFlatCap: with no headroom above the flat cap the
+// scaled budget is Budget exactly, so small machines see no change.
+func TestScaledBudgetMatchesBudgetUpToTheFlatCap(t *testing.T) {
+	const floor, cap = 2, 10
+	for score := -2.0; score <= 50; score += 0.25 {
+		if got, want := ScaledBudget(score, floor, cap, cap, DefaultRampUnits), Budget(score, floor, cap, DefaultRampUnits); got != want {
+			t.Fatalf("score %v: ScaledBudget = %d, Budget = %d", score, got, want)
+		}
+	}
+}
+
 func maxInt(a, b int) int {
 	if a > b {
 		return a

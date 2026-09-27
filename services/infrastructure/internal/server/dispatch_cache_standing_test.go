@@ -244,21 +244,22 @@ func TestEligibleLocked_ConcurrencyCapStaysRaw(t *testing.T) {
 // use separate caches so the first requester draining its (redundancy-1) units cannot affect
 // the other's ready pool.
 func TestHandOut_ProbationInflightFloor(t *testing.T) {
-	const floor, flatCap, budget, nUnits = 1, 10, 5, 3
+	const floor, flatCap, nUnits = 1, 10, 3
+	// score earns a budget of 1 + 9*2.5/5 = 5.5 -> 6, above the floor, so the floor (not a
+	// miss) differentiates.
+	const score = 2.5
 
-	// stageThree stages nUnits redundancy-1 units on a warmed leaf and warms host's budget.
+	// stageThree stages nUnits redundancy-1 units on a warmed leaf and warms host's score.
 	stageThree := func(c *dispatchCache, leafRepo *fakeLeafRepo, host types.ID) {
 		leafID := types.NewID()
 		c.warm(nativeLeaf(leafID, 1, false, 0), leafRepo)
 		for i := 0; i < nUnits; i++ {
 			c.stageUnit(types.NewID(), leafID, 1, 0)
 		}
-		c.budgetMu.Lock()
-		c.hostBudgetCache[host] = budget // above the floor, so the floor (not a miss) differentiates
-		c.budgetMu.Unlock()
+		c.setHostScore(host, score)
 	}
 
-	// OK requester: budget 5 >= 3, takes all three units it asks for.
+	// OK requester: budget 6 >= 3, takes all three units it asks for.
 	okVol := types.NewID()
 	cOK, _, leafRepoOK := newQuotaCache(true, floor, flatCap, nil)
 	stageThree(cOK, leafRepoOK, okVol)
