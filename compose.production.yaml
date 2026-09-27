@@ -1,7 +1,9 @@
-# Bounded log rotation for every service (BG-29). Without an explicit logging
-# key Docker's default json-file driver grows one unbounded log file per
-# container until the host disk fills; 50MB x 5 files caps each container at
-# 250MB while keeping enough history for incident forensics. Applied per
+# Bounded log rotation for every service except the head (BG-29). Without an
+# explicit logging key Docker's default json-file driver grows one unbounded log
+# file per container until the host disk fills; 50MB x 5 files caps each
+# container at 250MB. A json-file log belongs to its container: when `up -d`
+# recreates the container (after a rebuild or an .env change) the old log is
+# deleted with it, so these logs start again at every recreate. Applied per
 # service via the YAML anchor below (the logging key is not inheritable any
 # other way in compose).
 x-default-logging: &default-logging
@@ -9,6 +11,22 @@ x-default-logging: &default-logging
   options:
     max-size: "50m"
     max-file: "5"
+
+# The head (infrastructure) logs to the host's systemd journal instead, because
+# its log is the record of what it handed out and refused, and every deploy
+# recreates its container. Journal entries outlive the container:
+# `docker compose logs infrastructure` still shows the current container, and
+#   journalctl -t lettuce-infrastructure -o cat
+# shows the lines of every head container, across deploys (add `--since`, or
+# `-o verbose` to see which replica wrote a line, in CONTAINER_NAME). The
+# journal's own limit bounds the disk it uses (journald.conf SystemMaxUse; by
+# default 10% of the filesystem, at most 4GB, shared with the host's other
+# logs). Needs a host running systemd-journald, as Ubuntu and other systemd
+# distributions do.
+x-head-logging: &head-logging
+  driver: journald
+  options:
+    tag: lettuce-infrastructure
 
 # Every service also carries (BG-31):
 #   - an image PINNED BY DIGEST — a mutable tag can be re-pointed on the registry
@@ -86,7 +104,7 @@ services:
         VERSION: ${LETTUCE_VERSION:-dev}
     init: true
     restart: unless-stopped
-    logging: *default-logging
+    logging: *head-logging
     mem_limit: ${INFRA_MEM_LIMIT:-1g}
     pids_limit: ${INFRA_PIDS_LIMIT:-512}
     ulimits:

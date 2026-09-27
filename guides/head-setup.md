@@ -451,10 +451,27 @@ docker compose -f compose.production.yaml logs -f                 # all services
 docker compose -f compose.production.yaml logs -f infrastructure  # one service
 ```
 
-Every service's container log is rotation-bounded in `compose.production.yaml`
-(json-file driver, 50 MB × 5 files per container), so logs cannot fill the host
-disk. Adjust the `x-default-logging` anchor at the top of the compose file if
-you want more or less history.
+`docker compose logs` shows the current containers only. For the other
+services that is all there is: their logs are rotation-bounded json-file logs
+(50 MB × 5 files per container, the `x-default-logging` anchor at the top of
+`compose.production.yaml`), and Docker deletes such a log together with its
+container, so each one starts again whenever an update recreates the container.
+
+The head (`infrastructure`) logs to the host's systemd journal instead (the
+`x-head-logging` anchor), so its history survives updates. Read every head
+container's lines, across updates and replicas, with `journalctl`:
+
+```bash
+journalctl -t lettuce-infrastructure -o cat --since "7 days ago"   # the head's JSON lines
+journalctl -t lettuce-infrastructure -o verbose -n 1               # CONTAINER_NAME says which replica
+journalctl --disk-usage                                            # the whole journal's size
+```
+
+The journal's own limit keeps it from filling the disk: journald's
+`SystemMaxUse`, by default 10% of the filesystem and at most 4 GB, shared with
+the host's other logs; set it in `/etc/systemd/journald.conf` if you want more
+or less history. On Ubuntu, rsyslog also copies journal lines into
+`/var/log/syslog`, which logrotate rotates weekly and keeps for four weeks.
 
 ### Resource limits
 
@@ -567,6 +584,22 @@ Migrations run automatically on startup (booting several replicas at once is
 safe — the migration runner takes an internal advisory lock, so exactly one
 replica applies them and the others wait; see
 [guides/migrations.md](migrations.md)).
+
+**The first update that moves the head's log to the journal** (the
+`x-head-logging` anchor in `compose.production.yaml`) recreates the head one
+last time under the old json-file log, which is deleted with it. To keep that
+history, save it just before `up -d` (`logs/` is ignored by git):
+
+```bash
+mkdir -p logs
+docker compose -f compose.production.yaml logs --no-log-prefix infrastructure \
+  | gzip > logs/infrastructure-$(date -u +%Y%m%dT%H%MZ).log.gz
+```
+
+Leave out `--no-log-prefix` if you run more than one head replica, so each line
+keeps the replica that wrote it. After the update,
+`journalctl -t lettuce-infrastructure -o cat | grep 'startup complete'` should
+show the new head's startup line; from then on, later updates keep the history.
 
 **Upgrading across the container-hardening + secrets-hardening releases**
 (non-root containers, resource limits, a required Redis password, boot-time
