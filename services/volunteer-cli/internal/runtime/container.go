@@ -59,6 +59,8 @@ type ContainerRuntime struct {
 	gpuRelaxUser bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
 	httpClient   *http.Client // for viz bundle downloads
 
+	usagePollOverride time.Duration // for testing; 0 = containerUsageInterval
+
 	// wantedImages, when set, returns every image ref the volunteer currently
 	// wants cached (all enabled leaves across all heads). The stale-image reaper
 	// keeps these; see SetWantedImages / reapStaleImages.
@@ -818,7 +820,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		return nil, c.classifyEngineError(fmt.Errorf("start container: %w", err))
 	}
 
-	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx, false)
 }
 
 // removeContainer is the best-effort removal every started container of a
@@ -856,15 +858,15 @@ func (c *ContainerRuntime) adoptContainer(ctx context.Context, wu *WorkUnit, pre
 	if wu.ExecutionSpec.GPURequired {
 		selectedGPU, gpuDeviceIdx = c.selectGPU(wu.ExecutionSpec.GPUType)
 	}
-	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx, true)
 }
 
 // runContainer supervises a started container of the unit to completion —
-// the deadline, the /work disk watchdog, GPU metrics, the graceful stop on
-// cancellation, log capture, the output read and the metrics — and is shared
-// by Execute (a container it just created) and adoptContainer (one a previous
-// session left running). selectedGPU may be nil.
-func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult, containerID string, selectedGPU *GpuDetectionResult, gpuDeviceIdx int) (*ExecutionResult, error) {
+// the deadline, the /work disk watchdog, GPU and CPU/memory metrics, the
+// graceful stop on cancellation, log capture and the output read — and is
+// shared by Execute (a container it just created) and adoptContainer (one a
+// previous session left running, adopted true). selectedGPU may be nil.
+func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult, containerID string, selectedGPU *GpuDetectionResult, gpuDeviceIdx int, adopted bool) (*ExecutionResult, error) {
 	outputDir := filepath.Join(prep.WorkDir, "output")
 	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
 
@@ -890,6 +892,22 @@ func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep 
 			close(gpuMetricsDone)
 		}()
 	}
+
+	// CPU time and peak memory, read while the container runs: the engine
+	// reports neither once it has exited.
+	usage := &containerUsage{}
+	if adopted {
+		// An adopted container's counters include the time it ran in the
+		// previous session, and this run's wall clock starts now.
+		base, err := c.readContainerUsage(ctx, containerID)
+		if err != nil {
+			c.logger.Info("could not read the adopted container's CPU time so far; this run's CPU time will not be reported",
+				"work_unit_id", wu.ID, "container", shortImageID(containerID), "error", err)
+		}
+		usage.setBaseline(base)
+	}
+	stopUsage := c.startContainerUsageSampler(ctx, containerID, usage)
+	defer stopUsage()
 
 	startTime := time.Now()
 
@@ -924,6 +942,7 @@ func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep 
 	// Wait for container to exit.
 	exitCode, err := c.dockerClient.ContainerWait(waitCtx, containerID)
 	wallClock := time.Since(startTime)
+	stopUsage()
 
 	// Stop GPU metrics collection.
 	if gpuMetricsCancel != nil {
@@ -981,13 +1000,6 @@ func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep 
 		)
 	}
 
-	// Inspect container for resource stats.
-	stats, inspectErr := c.dockerClient.ContainerInspect(ctx, containerID)
-	if inspectErr != nil {
-		c.logger.Warn("failed to inspect container", "error", inspectErr)
-		stats = &ContainerStats{}
-	}
-
 	// Read output.
 	outputData, err := c.readOutput(outputDir)
 	if err != nil {
@@ -995,7 +1007,7 @@ func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep 
 	}
 
 	// Build metrics.
-	metrics := c.buildMetrics(stats, wallClock)
+	metrics := c.buildMetrics(usage, wallClock)
 
 	// Merge GPU metrics.
 	if gpuExecMetrics != nil {
@@ -1126,19 +1138,27 @@ func (c *ContainerRuntime) selectGPU(gpuType string) (*GpuDetectionResult, int) 
 	return nil, -1
 }
 
-// buildMetrics maps Docker container stats to ExecutionMetrics.
-func (c *ContainerRuntime) buildMetrics(stats *ContainerStats, wallClock time.Duration) ExecutionMetrics {
+// buildMetrics maps a run's container usage readings to ExecutionMetrics. A
+// figure the engine never gave is left 0 rather than made up: CPU time and
+// cores when the run's CPU was not measured, the peak memory when no reading
+// arrived.
+func (c *ContainerRuntime) buildMetrics(usage *containerUsage, wallClock time.Duration) ExecutionMetrics {
 	metrics := ExecutionMetrics{
 		WallClockSeconds: int64(math.Ceil(wallClock.Seconds())),
 	}
 
-	if stats == nil {
+	if usage == nil {
 		return metrics
 	}
 
-	metrics.CPUSecondsUser = float64(stats.CPUUsageUser) / 1e9
-	metrics.CPUSecondsSystem = float64(stats.CPUUsageKernel) / 1e9
-	metrics.PeakMemoryMB = int32(stats.MemoryPeak / (1024 * 1024))
+	metrics.PeakMemoryMB = int32(usage.peakMemory() / (1024 * 1024))
+
+	user, kernel, measured := usage.cpu()
+	if !measured {
+		return metrics
+	}
+	metrics.CPUSecondsUser = float64(user) / 1e9
+	metrics.CPUSecondsSystem = float64(kernel) / 1e9
 
 	// Estimate CPU cores used from total CPU time / wall clock.
 	totalCPU := metrics.CPUSecondsUser + metrics.CPUSecondsSystem

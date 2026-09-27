@@ -99,7 +99,10 @@ type DockerClient interface {
 	ContainerStart(ctx context.Context, containerID string) error
 	ContainerWait(ctx context.Context, containerID string) (int64, error)
 	ContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error)
-	ContainerInspect(ctx context.Context, containerID string) (*ContainerStats, error)
+	// ContainerUsage is one stats reading of a running container: its CPU
+	// time so far and its working set now. The engine answers only while the
+	// container runs; afterwards it returns errContainerNotRunning.
+	ContainerUsage(ctx context.Context, containerID string) (*ContainerStats, error)
 	// ContainerStop requests a graceful stop: the backend sends the entrypoint a
 	// termination signal and kills it only if it does not exit within timeout. Used
 	// on cancellation so a leaf can flush a final checkpoint before it is killed.
@@ -184,15 +187,17 @@ type DeviceMapping struct {
 	Permissions     string // e.g., "rwm"
 }
 
-// ContainerStats holds resource usage from a completed container.
+// ContainerStats is one stats reading of a running container.
 type ContainerStats struct {
-	CPUUsageTotal  uint64 // nanoseconds
-	CPUUsageUser   uint64
-	CPUUsageKernel uint64
-	MemoryPeak     int64 // bytes
-	NetworkRxBytes int64
-	NetworkTxBytes int64
+	CPUUsageUser   uint64 // nanoseconds since the container started
+	CPUUsageKernel uint64 // nanoseconds since the container started
+	MemoryBytes    uint64 // working set at the reading
 }
+
+// errContainerNotRunning is a stats request the engine could not answer
+// because the container is not running. Docker replies with an empty reading
+// and Podman with an error body, both as a success.
+var errContainerNotRunning = errors.New("container is not running")
 
 // dockerClientWrapper wraps the Docker SDK client to implement DockerClient.
 type dockerClientWrapper struct {
@@ -598,19 +603,41 @@ func (d *dockerClientWrapper) ContainerLogs(ctx context.Context, containerID str
 	return reader, nil
 }
 
-func (d *dockerClientWrapper) ContainerInspect(ctx context.Context, containerID string) (*ContainerStats, error) {
-	inspect, err := d.cli.ContainerInspect(ctx, containerID)
+func (d *dockerClientWrapper) ContainerUsage(ctx context.Context, containerID string) (*ContainerStats, error) {
+	resp, err := d.cli.ContainerStatsOneShot(ctx, containerID)
 	if err != nil {
-		return nil, fmt.Errorf("container inspect: %w", err)
+		return nil, fmt.Errorf("container stats: %w", err)
 	}
+	defer resp.Body.Close()
+	var stats container.StatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return nil, fmt.Errorf("decode container stats: %w", err)
+	}
+	// A reading always carries the time it was taken; the answers for a
+	// container that is not running carry none.
+	if stats.Read.IsZero() {
+		return nil, errContainerNotRunning
+	}
+	return &ContainerStats{
+		CPUUsageUser:   stats.CPUStats.CPUUsage.UsageInUsermode,
+		CPUUsageKernel: stats.CPUStats.CPUUsage.UsageInKernelmode,
+		MemoryBytes:    workingSetBytes(stats.MemoryStats),
+	}, nil
+}
 
-	stats := &ContainerStats{}
-	if inspect.State != nil && inspect.HostConfig != nil {
-		// Peak memory from HostConfig limit as a fallback; real stats come from
-		// the stats API but inspect gives us what we need for basic metrics.
-		stats.MemoryPeak = inspect.HostConfig.Memory
+// workingSetBytes is a container's memory use without the inactive page
+// cache the kernel can reclaim, as `docker stats` shows it: Docker's usage
+// counts that cache and reports it apart in memory.stat (total_inactive_file
+// on cgroup v1, inactive_file on v2). Podman's compatibility API sends no
+// breakdown, so its usage is taken as reported.
+func workingSetBytes(m container.MemoryStats) uint64 {
+	if v, ok := m.Stats["total_inactive_file"]; ok && v < m.Usage {
+		return m.Usage - v
 	}
-	return stats, nil
+	if v := m.Stats["inactive_file"]; v < m.Usage {
+		return m.Usage - v
+	}
+	return m.Usage
 }
 
 func (d *dockerClientWrapper) ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error {

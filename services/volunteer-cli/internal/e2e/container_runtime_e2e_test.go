@@ -24,15 +24,15 @@ import (
 
 // mockDockerClient implements runtime.DockerClient for E2E testing.
 type mockDockerClient struct {
-	pingFn             func(ctx context.Context) error
-	imagePullFn        func(ctx context.Context, ref string) error
-	imageExistsFn      func(ctx context.Context, ref string) (bool, error)
-	containerCreateFn  func(ctx context.Context, cfg *runtime.ContainerConfig) (string, error)
-	containerStartFn   func(ctx context.Context, containerID string) error
-	containerWaitFn    func(ctx context.Context, containerID string) (int64, error)
-	containerLogsFn    func(ctx context.Context, containerID string) (io.ReadCloser, error)
-	containerInspectFn func(ctx context.Context, containerID string) (*runtime.ContainerStats, error)
-	containerRemoveFn  func(ctx context.Context, containerID string) error
+	pingFn            func(ctx context.Context) error
+	imagePullFn       func(ctx context.Context, ref string) error
+	imageExistsFn     func(ctx context.Context, ref string) (bool, error)
+	containerCreateFn func(ctx context.Context, cfg *runtime.ContainerConfig) (string, error)
+	containerStartFn  func(ctx context.Context, containerID string) error
+	containerWaitFn   func(ctx context.Context, containerID string) (int64, error)
+	containerLogsFn   func(ctx context.Context, containerID string) (io.ReadCloser, error)
+	containerUsageFn  func(ctx context.Context, containerID string) (*runtime.ContainerStats, error)
+	containerRemoveFn func(ctx context.Context, containerID string) error
 
 	lastCreateConfig *runtime.ContainerConfig
 }
@@ -111,9 +111,9 @@ func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	return io.NopCloser(bytes.NewReader([]byte("mock logs"))), nil
 }
 
-func (m *mockDockerClient) ContainerInspect(ctx context.Context, containerID string) (*runtime.ContainerStats, error) {
-	if m.containerInspectFn != nil {
-		return m.containerInspectFn(ctx, containerID)
+func (m *mockDockerClient) ContainerUsage(ctx context.Context, containerID string) (*runtime.ContainerStats, error) {
+	if m.containerUsageFn != nil {
+		return m.containerUsageFn(ctx, containerID)
 	}
 	return &runtime.ContainerStats{}, nil
 }

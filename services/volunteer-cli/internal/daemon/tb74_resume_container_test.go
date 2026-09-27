@@ -65,7 +65,7 @@ func (e *tb74Engine) ContainerLogs(_ context.Context, _ string) (io.ReadCloser, 
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (e *tb74Engine) ContainerInspect(_ context.Context, _ string) (*runtime.ContainerStats, error) {
+func (e *tb74Engine) ContainerUsage(_ context.Context, _ string) (*runtime.ContainerStats, error) {
 	return &runtime.ContainerStats{}, nil
 }
 
