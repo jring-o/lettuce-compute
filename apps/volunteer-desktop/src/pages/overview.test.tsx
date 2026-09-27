@@ -484,6 +484,54 @@ describe("OverviewPage", () => {
     expect(screen.getByText("Credit Breakdown")).toBeInTheDocument();
   });
 
+  it("shows the account's results by state in the expanded credit breakdown", async () => {
+    const user = userEvent.setup();
+    setupDefaultMocks({
+      credit: {
+        credit: {
+          total_credit: 10,
+          today: 0,
+          this_week: 0,
+          this_month: 0,
+          by_leaf: [],
+          by_head: [
+            {
+              head_name: "scios",
+              volunteer_id: "vol-1234567890",
+              total_credit: 10,
+              available: true,
+              work_status: {
+                by_leaf: [
+                  {
+                    leaf_id: "gpu",
+                    leaf_name: "GPU leaf",
+                    results_pending: 523,
+                    results_agreed: 0,
+                    results_disagreed: 0,
+                    results_awaiting_content_verification: 0,
+                    results_content_verification_failed: 0,
+                    results_superseded: 0,
+                    runs_stopped: 2,
+                    copies_running: 0,
+                    copies_waiting_to_start: 0,
+                  },
+                ],
+              },
+            },
+          ],
+          source: "head",
+        },
+      },
+    });
+
+    render(<OverviewPage />);
+    await user.click(screen.getByText("Credit Breakdown"));
+    expect(screen.getByText("Results by state")).toBeInTheDocument();
+    expect(screen.getByText("GPU leaf")).toBeInTheDocument();
+    expect(screen.getByText("523")).toBeInTheDocument();
+    expect(screen.getByText("Stopped: enough results arrived while it ran")).toBeInTheDocument();
+  });
+
   // TB-57: head-derived day buckets are by UTC date and cannot follow this
   // machine's clock, so the Overview must say so beside the counters.
   it("labels head-derived credit counters as UTC days", () => {
@@ -886,7 +934,8 @@ describe("OverviewPage", () => {
     // Click to expand
     await user.click(screen.getByText("Credit Breakdown"));
 
-    expect(screen.getByText("lettuce.science")).toBeInTheDocument();
+    // The head is named under "By head" and again under "Results by state".
+    expect(screen.getAllByText("lettuce.science").length).toBeGreaterThan(0);
     expect(screen.getByText("3,000")).toBeInTheDocument();
     expect(screen.getByText("Prime Study")).toBeInTheDocument();
     expect(screen.getByText("Mandelbrot")).toBeInTheDocument();

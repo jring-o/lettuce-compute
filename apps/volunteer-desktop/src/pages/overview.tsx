@@ -8,6 +8,7 @@ import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import { VizFrame, describeVizUnavailable, type VizUnavailableReason } from "@/components/viz/VizFrame";
 import { ResourceGauge } from "@/components/resource-gauge";
 import { CreditDisplay } from "@/components/credit-display";
+import { WorkStatusByHead } from "@/components/work-status";
 import { NoticesPanel } from "@/components/notices-panel";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -263,6 +264,14 @@ function CreditBreakdownSection({ credit }: { credit: CreditSummary }) {
                   <span>{formatCredit(leaf.credit)}</span>
                 </div>
               ))}
+            </div>
+          )}
+          {credit.source === "head" && credit.by_head.some((h) => h.available) && (
+            <div className="space-y-1">
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                Results by state
+              </p>
+              <WorkStatusByHead heads={credit.by_head} />
             </div>
           )}
         </div>

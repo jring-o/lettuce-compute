@@ -340,6 +340,9 @@ past that, additional machines still run and earn credit — they just share one
 work budget instead of getting their own. For honest verification, your own
 machines are still treated as one account for redundancy, so they won't
 corroborate each other's results — that needs genuinely different contributors.
+`lettuce-volunteer credit`, and the desktop app's History page, show your whole
+account's results on each head by state beside your credit, so results still
+waiting for a different contributor's matching result are visible too.
 
 ### Moving the data dir to another user (keep the same identity)
 
