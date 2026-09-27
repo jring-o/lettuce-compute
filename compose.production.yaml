@@ -207,6 +207,9 @@ services:
       # of claimed specs. Full description: .env.example and guides/head-setup.md.
       LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED: ${LETTUCE_HEAD_RELIABILITY_QUOTA_ENABLED:-}
       LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR: ${LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR:-}
+      # A proven machine's in-flight ceiling: copies per advertised core and GPU
+      # (built-in 2; negative gives every machine the flat cap).
+      LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE: ${LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE:-}
       # --- Automatic standing backpressure (BG-24b) --- OFF by default; all OPTIONAL
       # (leave unset to keep the built-in defaults). The machine folds adjudicated
       # results into a decayed per-volunteer rejection rate and auto-manages account

@@ -179,6 +179,15 @@ type HeadConfig struct {
 	// over a few validated units. Unset (<= 0) -> defaultReliabilityQuotaFloor (2). Override
 	// via LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR.
 	ReliabilityQuotaFloor int `yaml:"reliability_quota_floor"`
+	// MaxInflightPerCore scales a machine's in-flight ceiling with the machine: the ceiling is
+	// this many copies per advertised CPU core and per GPU, or MaxInflightPerVolunteer when
+	// that is more, so a machine too small to exceed the flat cap keeps it exactly. The
+	// reliability quota ramps a host above the flat cap toward its ceiling one copy per
+	// validated unit past the ramp, so a claimed core count earns nothing until its results
+	// validate; with the quota disabled every host keeps the flat cap. Unset (0) ->
+	// defaultMaxInflightPerCore (2); negative turns the scaling off (the flat cap for every
+	// machine). Override via LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE.
+	MaxInflightPerCore int `yaml:"max_inflight_per_core"`
 
 	// --- Optional ATProto DID identity binding ---
 	//
@@ -480,6 +489,11 @@ const (
 	// defaultReliabilityQuotaFloor is the cold-start in-flight buffer for a host with no
 	// measured signal yet (#54). Small but non-zero so an honest new host is never starved.
 	defaultReliabilityQuotaFloor = 2
+	// defaultMaxInflightPerCore is the in-flight ceiling's copies per advertised CPU core and
+	// per GPU. A machine runs at most one task per core, so 2 leaves room for a waiting copy
+	// behind every running one; a machine with 5 cores or fewer (GPUs counted) keeps the
+	// default flat cap of 10.
+	defaultMaxInflightPerCore = 2
 	// staleVolunteerThresholdSeconds mirrors StaleVolunteerMonitor's 30-min
 	// inactivity threshold; retry delay and lease must stay strictly below it so a
 	// throttled-but-healthy volunteer is never marked inactive.
@@ -1009,6 +1023,17 @@ func (h HeadConfig) EffectiveReliabilityQuotaFloor() int {
 		return defaultReliabilityQuotaFloor
 	}
 	return h.ReliabilityQuotaFloor
+}
+
+// EffectiveMaxInflightPerCore returns the copies per advertised CPU core and per GPU that a
+// machine's in-flight ceiling scales by: unset (0) -> defaultMaxInflightPerCore (2); any
+// other value verbatim, a negative one meaning the scaling is off (every machine keeps the
+// flat cap). The dispatch cache reads the same convention.
+func (h HeadConfig) EffectiveMaxInflightPerCore() int {
+	if h.MaxInflightPerCore == 0 {
+		return defaultMaxInflightPerCore
+	}
+	return h.MaxInflightPerCore
 }
 
 // EffectiveReadyPoolSize returns the dispatch-cache ready-pool cap, default 2000.

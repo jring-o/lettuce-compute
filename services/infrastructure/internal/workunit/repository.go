@@ -19,7 +19,7 @@ type AssignmentOptions struct {
 	HasGPU                  bool
 	MaxGPUVRAMMB            int
 	AvailableRuntimes       []string
-	GPUVendors              []string // ["NVIDIA", "AMD"] — vendors of volunteer's GPUs
+	GPUVendors              []string // ["NVIDIA", "NVIDIA"] — one vendor entry per advertised GPU (the dispatch cache counts them for the in-flight ceiling)
 	GPUComputeCapabilities  []string // ["8.6", "gfx1030"] — compute capabilities
 	MaxInflightPerVolunteer int      // server-enforced cap on concurrent assigned WUs
 	// HRClass is the requesting volunteer's hardware class (CPU vendor + OS + arch). When

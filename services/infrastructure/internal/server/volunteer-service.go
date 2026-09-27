@@ -303,6 +303,11 @@ type HeadDispatchConfig struct {
 	// ReliabilityQuotaFloor is the cold-start / fully-throttled in-flight buffer a host with
 	// no measured signal gets. main.go fills it from HeadConfig.EffectiveReliabilityQuotaFloor().
 	ReliabilityQuotaFloor int
+	// MaxInflightPerCore is the in-flight ceiling's copies per advertised CPU core and per
+	// GPU; the reliability quota ramps a proven host above the flat cap toward it. 0 ->
+	// defaultMaxInflightPerCore (2); negative turns the scaling off. main.go fills it from
+	// HeadConfig.EffectiveMaxInflightPerCore().
+	MaxInflightPerCore int
 }
 
 // SetHeadConfig sets the head identity for GetHeadInfo gRPC responses and the
@@ -545,6 +550,7 @@ func (s *volunteerService) StartDispatchCache(ctx context.Context) <-chan struct
 		claimLease:              time.Duration(claimLeaseSeconds) * time.Second,
 		reliabilityQuotaEnabled: s.dispatchCfg.ReliabilityQuotaEnabled,
 		reliabilityFloor:        s.dispatchCfg.ReliabilityQuotaFloor,
+		maxInflightPerCore:      s.dispatchCfg.MaxInflightPerCore,
 	}
 	// artifactVersionRepo (the same *leaf.PgxRepository) lets the cache resolve the
 	// current/pinned artifact version per assignment and pin units for homogeneous

@@ -282,6 +282,13 @@ func applyEnvOverrides(cfg *Config) error {
 		}
 		cfg.Head.ReliabilityQuotaFloor = n
 	}
+	if v := os.Getenv("LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE must be an integer: %w", err)
+		}
+		cfg.Head.MaxInflightPerCore = n
+	}
 	if v := os.Getenv("LETTUCE_HEAD_READY_POOL_SIZE"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {

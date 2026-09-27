@@ -26,8 +26,9 @@ const HalfLifeSeconds = 604800
 
 // Default ramp tunables. These are the in-memory shaping constants; the [floor, cap] bound
 // itself is operator-configured (floor via LETTUCE_HEAD_RELIABILITY_QUOTA_FLOOR, cap = the
-// existing max_inflight_per_volunteer), so a warmed reliable host reaches exactly today's
-// flat cap.
+// existing max_inflight_per_volunteer), so a warmed reliable host reaches exactly the flat
+// cap. Above the flat cap, a host whose machine is big enough to have a higher Ceiling
+// earns one more copy per net-good point past the ramp (ScaledBudget).
 const (
 	// DefaultGoodStep is added to the (decayed) score per validated copy.
 	DefaultGoodStep = 1.0
@@ -79,6 +80,54 @@ func Budget(score float64, floor, cap int, rampUnits float64) int {
 		return cap
 	}
 	return b
+}
+
+// Ceiling is the most copies one machine may hold at once, however good its record: the
+// flat cap, or perUnit copies for each advertised CPU core and each GPU when that is more.
+// A machine's running copies are bounded by its cores (each task books at least one), so
+// with perUnit >= 2 the ceiling leaves room for a waiting copy behind every running one,
+// and a machine small enough that the product is below the flat cap keeps the flat cap
+// exactly. perUnit <= 0 turns the scaling off (the flat cap for every machine), and an
+// unbounded flat cap (<= 0) stays unbounded.
+func Ceiling(flatCap, perUnit, cpuCores, gpus int) int {
+	if flatCap <= 0 || perUnit <= 0 {
+		return flatCap
+	}
+	if cpuCores < 0 {
+		cpuCores = 0
+	}
+	if gpus < 0 {
+		gpus = 0
+	}
+	if scaled := perUnit * (cpuCores + gpus); scaled > flatCap {
+		return scaled
+	}
+	return flatCap
+}
+
+// ScaledBudget is Budget with headroom above the flat cap for a machine whose Ceiling is
+// higher. Up to the flat cap it is exactly Budget: floor -> cap over rampUnits. Past the
+// ramp, each further net-good point of score adds one copy, up to the ceiling:
+//
+//	budget = min(ceiling, cap + floor(score - rampUnits))
+//
+// So a big machine reaches its ceiling only by returning work that validates (the score is
+// the decayed count of validated copies, less the penalties), and a client that merely
+// claims many cores gains nothing above the flat cap until its results do. A ceiling at or
+// below the flat cap leaves Budget unchanged.
+func ScaledBudget(score float64, floor, cap, ceiling int, rampUnits float64) int {
+	b := Budget(score, floor, cap, rampUnits)
+	if ceiling <= cap || rampUnits <= 0 || score <= rampUnits {
+		return b
+	}
+	scaled := ceiling
+	if extra := score - rampUnits; extra < float64(ceiling-cap) {
+		scaled = cap + int(extra)
+	}
+	if scaled < b {
+		return b
+	}
+	return scaled
 }
 
 // BudgetInput is one host's current (read-time-decayed) reliability score, returned by

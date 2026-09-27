@@ -743,6 +743,36 @@ func TestHeadDispatchEnvOverrides(t *testing.T) {
 	}
 }
 
+// TestHeadMaxInflightPerCore: the in-flight ceiling's copies per core default to 2 when
+// unset, a set value (negative = scaling off) is returned verbatim, and the env override
+// threads through Load.
+func TestHeadMaxInflightPerCore(t *testing.T) {
+	if got := (HeadConfig{}).EffectiveMaxInflightPerCore(); got != 2 {
+		t.Errorf("EffectiveMaxInflightPerCore() = %d, want 2 (default)", got)
+	}
+	if got := (HeadConfig{MaxInflightPerCore: 4}).EffectiveMaxInflightPerCore(); got != 4 {
+		t.Errorf("EffectiveMaxInflightPerCore(4) = %d, want 4", got)
+	}
+	if got := (HeadConfig{MaxInflightPerCore: -1}).EffectiveMaxInflightPerCore(); got != -1 {
+		t.Errorf("EffectiveMaxInflightPerCore(-1) = %d, want -1 (scaling off, verbatim)", got)
+	}
+
+	clearLettuceEnv(t)
+	path := writeTestConfig(t, `head: { name: "from-yaml" }`)
+	t.Setenv("LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE", "-1")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Head.MaxInflightPerCore != -1 {
+		t.Errorf("MaxInflightPerCore = %d, want -1 from env", cfg.Head.MaxInflightPerCore)
+	}
+	t.Setenv("LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE", "two")
+	if _, err := Load(path); err == nil {
+		t.Error("Load() with a non-integer LETTUCE_HEAD_MAX_INFLIGHT_PER_CORE: want an error")
+	}
+}
+
 // TestHeadMaintenanceAdmissionCap exercises the FIX-4 maintenance-admission knob:
 // the Effective accessor returns 0 to derive (default and negative), a positive
 // value verbatim; the env override threads through Load; Validate rejects negative.
