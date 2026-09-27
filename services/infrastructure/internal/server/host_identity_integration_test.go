@@ -257,6 +257,84 @@ func TestHostIssuance_RegisterUnknownIDReturnsEmpty(t *testing.T) {
 	}
 }
 
+// TestHostIssuance_RecordsClientVersionOnHostRow: the build a registration reports lands in
+// that machine's hosts.hardware_capabilities under "client_version" — on the mint and on
+// every echo-refresh, the latest winning — while the account row never carries it; a
+// registration that does not report it succeeds and leaves the key absent.
+func TestHostIssuance_RecordsClientVersionOnHostRow(t *testing.T) {
+	pool, client, cleanup := setupHostIssuanceServer(t, 10)
+	defer cleanup()
+	ctx := context.Background()
+	key := newHostKeyPair(t)
+
+	register := func(hostID, version string) *lettucev1.RegisterVolunteerResponse {
+		t.Helper()
+		resp, err := client.RegisterVolunteer(signHost(ctx, key), &lettucev1.RegisterVolunteerRequest{
+			PublicKey:         key.pub,
+			AvailableRuntimes: []string{"NATIVE"},
+			Hardware: &lettucev1.HardwareCapabilities{
+				CpuCores: 4, MaxCpuCores: 4,
+				MemoryTotalMb: 8192, MaxMemoryMb: 8192,
+			},
+			HostId:        hostID,
+			ClientVersion: version,
+		})
+		if err != nil {
+			t.Fatalf("RegisterVolunteer(hostID=%q, client_version=%q): %v", hostID, version, err)
+		}
+		return resp
+	}
+	// NULL (the key absent) scans as nil.
+	hostVersion := func(id string) *string {
+		t.Helper()
+		var v *string
+		if err := pool.QueryRow(ctx,
+			"SELECT hardware_capabilities->>'client_version' FROM hosts WHERE id = $1", id).Scan(&v); err != nil {
+			t.Fatalf("read host client_version: %v", err)
+		}
+		return v
+	}
+	accountVersion := func(id string) *string {
+		t.Helper()
+		var v *string
+		if err := pool.QueryRow(ctx,
+			"SELECT hardware_capabilities->>'client_version' FROM volunteers WHERE id = $1", id).Scan(&v); err != nil {
+			t.Fatalf("read account client_version: %v", err)
+		}
+		return v
+	}
+	deref := func(p *string) string {
+		if p == nil {
+			return "<absent>"
+		}
+		return *p
+	}
+
+	first := register("", "0.14.0")
+	if first.HostId == "" {
+		t.Fatal("first register should mint a host id")
+	}
+	if got := hostVersion(first.HostId); got == nil || *got != "0.14.0" {
+		t.Errorf("after the mint, host client_version = %s, want 0.14.0", deref(got))
+	}
+	if got := accountVersion(first.VolunteerId); got != nil {
+		t.Errorf("the account row must not carry client_version, got %q", *got)
+	}
+
+	register(first.HostId, "0.14.1")
+	if got := hostVersion(first.HostId); got == nil || *got != "0.14.1" {
+		t.Errorf("after an echo-refresh with a new build, host client_version = %s, want 0.14.1", deref(got))
+	}
+
+	register(first.HostId, "")
+	if got := hostVersion(first.HostId); got != nil {
+		t.Errorf("after a registration that does not report it, host client_version = %q, want the key absent", *got)
+	}
+	if got := accountVersion(first.VolunteerId); got != nil {
+		t.Errorf("the account row must not carry client_version, got %q", *got)
+	}
+}
+
 // TestHostIssuance_MintRefusedAtCapReturnsEmpty: at cap 1 with the first host freshly active,
 // a second mint request is refused (empty response id) and the account stays at one row.
 func TestHostIssuance_MintRefusedAtCapReturnsEmpty(t *testing.T) {

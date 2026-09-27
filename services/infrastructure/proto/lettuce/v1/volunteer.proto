@@ -111,6 +111,12 @@ message RegisterVolunteerRequest {
   // additive fields wire-safe in both directions).
   string pow_challenge_id = 7;       // id from GetRegistrationChallenge
   fixed64 pow_nonce = 8;             // solution nonce
+  // This machine's volunteer build: the string `lettuce-volunteer --version`
+  // prints (the desktop app's bundled client reports the same). OPTIONAL and
+  // informational — the head records it on this machine's hosts row and logs it,
+  // so the operator can see which build each machine runs; it gates nothing. A
+  // client that predates it omits it, and the head records nothing.
+  string client_version = 9;
 }
 
 message RegisterVolunteerResponse {

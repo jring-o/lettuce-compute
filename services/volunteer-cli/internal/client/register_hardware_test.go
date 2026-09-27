@@ -55,7 +55,7 @@ func TestRegister_ReusesDetectedHardware(t *testing.T) {
 	cfg := config.Defaults()
 	cached := &lettucev1.HardwareCapabilities{CpuModel: "cached-cpu", CpuCores: 12, MemoryTotalMb: 65536}
 
-	if _, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, filepath.Join(t.TempDir(), "config.yaml"), cached, "NATIVE"); err != nil {
+	if _, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, filepath.Join(t.TempDir(), "config.yaml"), "", cached, "NATIVE"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 

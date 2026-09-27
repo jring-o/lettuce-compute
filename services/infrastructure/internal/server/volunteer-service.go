@@ -730,6 +730,11 @@ var validSchedulingModes = map[string]bool{
 	"SCHEDULED": true,
 }
 
+// maxClientVersionLen bounds RegisterVolunteerRequest.client_version. A release
+// build's string is a few bytes ("0.14.0"); a source build's `git describe`
+// output is a few dozen.
+const maxClientVersionLen = 128
+
 func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1.RegisterVolunteerRequest) (*lettucev1.RegisterVolunteerResponse, error) {
 	// Validate public_key: must be exactly 32 bytes.
 	if len(req.PublicKey) != 32 {
@@ -770,6 +775,10 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 	}
 	if req.Hardware.HostMaxMemoryMb < 0 || req.Hardware.HostMaxMemoryMb > req.Hardware.MemoryTotalMb {
 		return nil, status.Errorf(codes.InvalidArgument, "hardware.host_max_memory_mb must be >= 0 and <= memory_total_mb")
+	}
+	// The build string is stored and logged on every registration, so bound it.
+	if len(req.ClientVersion) > maxClientVersionLen {
+		return nil, status.Errorf(codes.InvalidArgument, "client_version must be at most %d bytes", maxClientVersionLen)
 	}
 
 	// Validate available_runtimes: at least one, all valid.
@@ -876,8 +885,10 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 			issuedHostID := s.resolveRegisteredHost(ctx, v.ID, req, hw, now)
 
 			// Per-WU-lifecycle Info (one per registration): restores per-volunteer visibility
-			// now that the generic gRPC access log is demoted to Debug.
-			s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true)
+			// now that the generic gRPC access log is demoted to Debug. client_version is
+			// empty for a build that does not report it.
+			s.logger.Info("volunteer registered", "volunteer_id", v.ID, "is_new", true,
+				"host_id", issuedHostID, "client_version", req.ClientVersion)
 
 			return &lettucev1.RegisterVolunteerResponse{
 				VolunteerId: v.ID.String(),
@@ -943,7 +954,8 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 	// (echo-refresh a known id; mint on an empty request id) + warm the per-host caches.
 	issuedHostID := s.resolveRegisteredHost(ctx, existing.ID, req, hw, now)
 
-	s.logger.Info("volunteer registered", "volunteer_id", existing.ID, "is_new", false)
+	s.logger.Info("volunteer registered", "volunteer_id", existing.ID, "is_new", false,
+		"host_id", issuedHostID, "client_version", req.ClientVersion)
 
 	return &lettucev1.RegisterVolunteerResponse{
 		VolunteerId: existing.ID.String(),
@@ -969,10 +981,15 @@ func (s *volunteerService) RegisterVolunteer(ctx context.Context, req *lettucev1
 // The returned string rides RegisterVolunteerResponse.host_id verbatim. Also warms the
 // dispatch cache's per-host runtime + ownership snapshots so the machine's first work
 // request resolves in memory. Returns "" in unit tests with no pool (nil hostRepo).
+//
+// Both writes record the request's client_version in the row's hardware_capabilities,
+// so a re-registration overwrites it and a build that does not report it leaves the key
+// absent. It is added here, not in the caller, so it never reaches the account row.
 func (s *volunteerService) resolveRegisteredHost(ctx context.Context, volunteerID types.ID, req *lettucev1.RegisterVolunteerRequest, hw volunteer.HardwareCapabilities, now time.Time) string {
 	if s.hostRepo == nil {
 		return ""
 	}
+	hw.ClientVersion = req.GetClientVersion()
 	var displayName *string
 	if req.DisplayName != "" {
 		displayName = &req.DisplayName

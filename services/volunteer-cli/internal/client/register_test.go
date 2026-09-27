@@ -31,8 +31,11 @@ func TestBuildRegistrationRequest(t *testing.T) {
 		MaxMemoryMb:   8192,
 	}
 
-	req := BuildRegistrationRequest(pub, "host-abc", hw, cfg, "NATIVE", "CONTAINER")
+	req := BuildRegistrationRequest(pub, "host-abc", "0.14.0", hw, cfg, "NATIVE", "CONTAINER")
 
+	if req.ClientVersion != "0.14.0" {
+		t.Errorf("ClientVersion = %q, want %q", req.ClientVersion, "0.14.0")
+	}
 	if len(req.PublicKey) != ed25519.PublicKeySize {
 		t.Errorf("PublicKey length = %d, want %d", len(req.PublicKey), ed25519.PublicKeySize)
 	}
@@ -66,14 +69,14 @@ func TestBuildRegistrationRequest_AdvertisesExactlyWhatCallerPasses(t *testing.T
 	}
 	cfg := config.Defaults()
 
-	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg, "NATIVE", "WASM")
+	req := BuildRegistrationRequest(pub, "host-abc", "", nil, cfg, "NATIVE", "WASM")
 
 	if len(req.AvailableRuntimes) != 2 || req.AvailableRuntimes[0] != "NATIVE" || req.AvailableRuntimes[1] != "WASM" {
 		t.Errorf("AvailableRuntimes = %v, want [NATIVE WASM] (exactly the caller's list)", req.AvailableRuntimes)
 	}
 
 	// No runtimes passed advertises none — never a value resurrected from config.
-	req = BuildRegistrationRequest(pub, "host-abc", nil, cfg)
+	req = BuildRegistrationRequest(pub, "host-abc", "", nil, cfg)
 	if len(req.AvailableRuntimes) != 0 {
 		t.Errorf("AvailableRuntimes = %v, want none when the caller passes none", req.AvailableRuntimes)
 	}
@@ -101,7 +104,7 @@ func TestRegisterNewVolunteer(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -147,7 +150,7 @@ func TestRegisterUpdateExisting(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	volID, isNew, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -176,7 +179,7 @@ func TestRegisterSendsPublicKey(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -193,6 +196,35 @@ func TestRegisterSendsPublicKey(t *testing.T) {
 			t.Errorf("PublicKey mismatch at byte %d", i)
 			break
 		}
+	}
+}
+
+// Register sends this build's version string, which the head records on the
+// machine's host row.
+func TestRegisterSendsClientVersion(t *testing.T) {
+	withMockHardware(t)
+	mock := &mockVolunteerService{}
+	addr, cleanup := startMockServer(t, mock)
+	defer cleanup()
+
+	client := newTestClient(t, addr)
+	defer client.Close()
+
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	cfg := config.Defaults()
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+
+	if _, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, "0.14.0", DetectHardware(cfg)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if mock.registerReq == nil {
+		t.Fatal("registerReq is nil (server didn't receive the request)")
+	}
+	if got := mock.registerReq.GetClientVersion(); got != "0.14.0" {
+		t.Errorf("sent ClientVersion = %q, want %q", got, "0.14.0")
 	}
 }
 
@@ -213,7 +245,7 @@ func TestRegisterDetectsHardware(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -249,7 +281,7 @@ func TestRegisterRPCError(t *testing.T) {
 	cfg := config.Defaults()
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 
-	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	_, _, _, err = Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error from Register when RPC fails")
 	}
@@ -286,7 +318,7 @@ func TestRegisterConfigSaveError(t *testing.T) {
 	// Try to save config inside a file (not a directory) — should fail.
 	configPath := filepath.Join(tmpFile, "subdir", "config.yaml")
 
-	volID, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	volID, _, _, err := Register(context.Background(), client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error when config save fails")
 	}
@@ -305,7 +337,7 @@ func TestBuildRegistrationRequestNilHardware(t *testing.T) {
 	cfg := config.Defaults()
 
 	// Nil hardware should not panic — it's a valid proto field.
-	req := BuildRegistrationRequest(pub, "host-abc", nil, cfg)
+	req := BuildRegistrationRequest(pub, "host-abc", "", nil, cfg)
 
 	if req.Hardware != nil {
 		t.Error("expected nil hardware when nil is passed")
@@ -335,7 +367,7 @@ func TestRegisterCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	_, _, _, err = Register(ctx, client, pub, nil, "", cfg, configPath, DetectHardware(cfg))
+	_, _, _, err = Register(ctx, client, pub, nil, "", cfg, configPath, "", DetectHardware(cfg))
 	if err == nil {
 		t.Fatal("expected error with cancelled context")
 	}

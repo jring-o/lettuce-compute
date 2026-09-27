@@ -68,15 +68,9 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 	if !ok {
 		return "", fmt.Errorf("head client does not support re-registration")
 	}
-	hostname, _ := os.Hostname()
-	resp, err := rc.RegisterVolunteer(ctx, &lettucev1.RegisterVolunteerRequest{
-		PublicKey:         d.pubKey,
-		DisplayName:       hostname,
-		Hardware:          d.advertisedHardware(),
-		AvailableRuntimes: d.advertisedRuntimesFor(head.Config),
-		SchedulingMode:    d.cfg.Scheduling.Mode,
-		HostId:            "", // discard the refused id: empty => the head mints a fresh one
-	})
+	// Host id "": discard the refused id — empty => the head mints a fresh one.
+	req := client.BuildRegistrationRequest(d.pubKey, "", d.clientVersion, d.advertisedHardware(), d.cfg, d.advertisedRuntimesFor(head.Config)...)
+	resp, err := rc.RegisterVolunteer(ctx, req)
 	if err != nil {
 		return "", err
 	}
