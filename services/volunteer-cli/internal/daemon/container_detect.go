@@ -967,7 +967,7 @@ func (d *Daemon) readvertiseIfPending(ctx context.Context, head *ServerConnectio
 		return
 	}
 	advertised := d.advertisedRuntimesFor(head.Config)
-	req := client.BuildRegistrationRequest(d.pubKey, head.HostID, d.advertisedHardware(), d.cfg, advertised...)
+	req := client.BuildRegistrationRequest(d.pubKey, head.HostID, d.clientVersion, d.advertisedHardware(), d.cfg, advertised...)
 	resp, err := rc.RegisterVolunteer(ctx, req)
 	if err != nil {
 		d.logger.Warn("daemon: could not advertise this machine's new runtimes to head; will retry on its next contact",

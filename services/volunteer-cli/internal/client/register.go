@@ -26,7 +26,11 @@ import (
 // hostID is the SERVER-ISSUED id this machine previously received from THIS head
 // (echoed so the head refreshes the same hosts row), or empty to ask the head to mint
 // one. Host identity is head-minted only (BG-25); clients never generate it.
-func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
+//
+// clientVersion is this build's version string (what `lettuce-volunteer --version`
+// prints). The head records it on this machine's hosts row, so the operator can see
+// which build each machine runs.
+func BuildRegistrationRequest(pub ed25519.PublicKey, hostID, clientVersion string, hw *lettucev1.HardwareCapabilities, cfg *config.Config, availableRuntimes ...string) *lettucev1.RegisterVolunteerRequest {
 	runtimes := availableRuntimes
 	hostname, _ := os.Hostname()
 	return &lettucev1.RegisterVolunteerRequest{
@@ -38,7 +42,8 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev
 		// Server-issued per-machine host id (BG-25): the previously issued id for this
 		// head echoed back, or empty to request a mint. The head keys per-machine
 		// metering on the id it returns; empty => per-account fallback.
-		HostId: hostID,
+		HostId:        hostID,
+		ClientVersion: clientVersion,
 	}
 }
 
@@ -59,12 +64,13 @@ func BuildRegistrationRequest(pub ed25519.PublicKey, hostID string, hw *lettucev
 // host-less until a later register mints one. store may be nil (the flow then runs
 // host-less and persists nothing).
 //
-// availableRuntimes advertises the runtimes actually available on this machine
-// for this head — see BuildRegistrationRequest.
+// clientVersion and availableRuntimes are this build's version string and the
+// runtimes actually available on this machine for this head — see
+// BuildRegistrationRequest.
 //
 // Returns the account's volunteer id, whether this was a new registration, and the
 // head-issued host id (possibly empty).
-func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, store *identity.HostIDStore, headKey string, cfg *config.Config, configPath string, hw *lettucev1.HardwareCapabilities, availableRuntimes ...string) (string, bool, string, error) {
+func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, store *identity.HostIDStore, headKey string, cfg *config.Config, configPath, clientVersion string, hw *lettucev1.HardwareCapabilities, availableRuntimes ...string) (string, bool, string, error) {
 	// Echo the stored per-head id (empty on first contact => the head mints one under
 	// the per-account cap). A read error is non-fatal: fall back to empty and let the
 	// head mint a fresh id.
@@ -77,7 +83,7 @@ func Register(ctx context.Context, client *Client, pub ed25519.PublicKey, store 
 		}
 	}
 
-	req := BuildRegistrationRequest(pub, storedHostID, hw, cfg, availableRuntimes...)
+	req := BuildRegistrationRequest(pub, storedHostID, clientVersion, hw, cfg, availableRuntimes...)
 	resp, err := registerWithPow(ctx, client, pub, req)
 	if err != nil {
 		return "", false, "", fmt.Errorf("registering volunteer: %w", err)

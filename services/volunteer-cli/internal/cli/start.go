@@ -267,7 +267,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		// trusted to run (WASM always; CONTAINER/NATIVE per the attach-time trust choice).
 		advertised := advertisedForServer(registry, srv)
 		logger.Info("advertising runtimes to head", "server", name, "advertised", advertised)
-		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, hardware, advertised...)
+		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, version, hardware, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",

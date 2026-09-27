@@ -109,6 +109,13 @@ type HardwareCapabilities struct {
 	// client predating them). See BudgetsFor.
 	HostMaxMemoryMB int `json:"host_max_memory_mb,omitempty"`
 	HostMaxCPUCores int `json:"host_max_cpu_cores,omitempty"`
+	// ClientVersion is not hardware: it is the volunteer build the machine last
+	// registered with (RegisterVolunteerRequest.client_version), kept as a key in
+	// the host row's JSONB so recording it needs no schema change. Registration
+	// sets it on the HOSTS row only — on the account row, shared by every machine
+	// under the key, it would just name whichever machine registered last — and a
+	// client that does not report it leaves it empty (the key absent).
+	ClientVersion string `json:"client_version,omitempty"`
 }
 
 // HRClass returns the volunteer's Homogeneous-Redundancy hardware class — a coarse

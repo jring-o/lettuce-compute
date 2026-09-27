@@ -29,6 +29,7 @@ type stubHostRepo struct {
 
 	getByIDFn func(id types.ID) (*volunteer.Host, error)
 	mintFn    func(h *volunteer.Host) (bool, error)
+	upsertFn  func(h *volunteer.Host) error // when set, replaces upsertErr
 	upsertErr error
 
 	getByIDCalls        int
@@ -52,11 +53,14 @@ func (s *stubHostRepo) Mint(_ context.Context, h *volunteer.Host, capPerAccount 
 	return true, nil
 }
 
-func (s *stubHostRepo) Upsert(_ context.Context, _ *volunteer.Host) error {
+func (s *stubHostRepo) Upsert(_ context.Context, h *volunteer.Host) error {
 	s.mu.Lock()
 	s.upsertCalls++
-	err := s.upsertErr
+	fn, err := s.upsertFn, s.upsertErr
 	s.mu.Unlock()
+	if fn != nil {
+		return fn(h)
+	}
 	return err
 }
 

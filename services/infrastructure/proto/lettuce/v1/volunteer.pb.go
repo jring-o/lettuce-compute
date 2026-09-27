@@ -230,8 +230,14 @@ type RegisterVolunteerRequest struct {
 	// additive fields wire-safe in both directions).
 	PowChallengeId string `protobuf:"bytes,7,opt,name=pow_challenge_id,json=powChallengeId,proto3" json:"pow_challenge_id,omitempty"` // id from GetRegistrationChallenge
 	PowNonce       uint64 `protobuf:"fixed64,8,opt,name=pow_nonce,json=powNonce,proto3" json:"pow_nonce,omitempty"`                   // solution nonce
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// This machine's volunteer build: the string `lettuce-volunteer --version`
+	// prints (the desktop app's bundled client reports the same). OPTIONAL and
+	// informational — the head records it on this machine's hosts row and logs it,
+	// so the operator can see which build each machine runs; it gates nothing. A
+	// client that predates it omits it, and the head records nothing.
+	ClientVersion string `protobuf:"bytes,9,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RegisterVolunteerRequest) Reset() {
@@ -318,6 +324,13 @@ func (x *RegisterVolunteerRequest) GetPowNonce() uint64 {
 		return x.PowNonce
 	}
 	return 0
+}
+
+func (x *RegisterVolunteerRequest) GetClientVersion() string {
+	if x != nil {
+		return x.ClientVersion
+	}
+	return ""
 }
 
 type RegisterVolunteerResponse struct {
@@ -3027,7 +3040,7 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
 	"\x0euptime_seconds\x18\x03 \x01(\x03R\ruptimeSeconds\x12'\n" +
-	"\x0fdatabase_status\x18\x04 \x01(\tR\x0edatabaseStatus\"\xdc\x02\n" +
+	"\x0fdatabase_status\x18\x04 \x01(\tR\x0edatabaseStatus\"\x83\x03\n" +
 	"\x18RegisterVolunteerRequest\x12\x1d\n" +
 	"\n" +
 	"public_key\x18\x01 \x01(\fR\tpublicKey\x12!\n" +
@@ -3037,7 +3050,8 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x0fscheduling_mode\x18\x05 \x01(\tR\x0eschedulingMode\x12\x17\n" +
 	"\ahost_id\x18\x06 \x01(\tR\x06hostId\x12(\n" +
 	"\x10pow_challenge_id\x18\a \x01(\tR\x0epowChallengeId\x12\x1b\n" +
-	"\tpow_nonce\x18\b \x01(\x06R\bpowNonce\"w\n" +
+	"\tpow_nonce\x18\b \x01(\x06R\bpowNonce\x12%\n" +
+	"\x0eclient_version\x18\t \x01(\tR\rclientVersion\"w\n" +
 	"\x19RegisterVolunteerResponse\x12!\n" +
 	"\fvolunteer_id\x18\x01 \x01(\tR\vvolunteerId\x12\x1e\n" +
 	"\n" +
