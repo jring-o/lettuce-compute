@@ -1256,6 +1256,16 @@ type LeafDetail struct {
 	// CPU is this machine's CPU arrangement for the leaf: the volunteer's
 	// override and what it comes to.
 	CPU *LeafCPU `json:"cpu,omitempty"`
+	// Deadline is the daemon's verdict on whether this leaf's units can
+	// finish before their deadline here: Blocked when the fetcher skips it.
+	Deadline *LeafDeadline `json:"deadline,omitempty"`
+}
+
+// LeafDeadline is whether the daemon skips a leaf because its units cannot
+// finish before their deadline on this machine, and why.
+type LeafDeadline struct {
+	Blocked bool   `json:"blocked"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // LeafCPU is this machine's CPU arrangement for a leaf. CoresOverride and
@@ -1531,6 +1541,8 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 				}
 				gs := b.daemon.LeafDiskGateStatus(leaf)
 				ld.DiskGate = &LeafDiskGate{Blocked: gs.Blocked, Reason: gs.Reason, RaiseToGB: gs.RaiseToGB}
+				blocked, why := b.daemon.LeafDeadlineStatus(leaf)
+				ld.Deadline = &LeafDeadline{Blocked: blocked, Reason: why}
 				cs := b.daemon.LeafCPUStatus(leaf)
 				ld.CPU = &LeafCPU{
 					CoresOverride:      cs.CoresOverride,
@@ -1878,6 +1890,12 @@ func (b *DaemonBridge) ResumeTask(workUnitID string) error {
 // AbortTask cancels a single task by work unit ID, killing its process.
 func (b *DaemonBridge) AbortTask(workUnitID string) error {
 	return b.daemon.AbortTask(workUnitID)
+}
+
+// GetRunPreview is what would run together on this machine under the
+// current settings (Daemon.RunPreview).
+func (b *DaemonBridge) GetRunPreview() daemon.RunPreview {
+	return b.daemon.RunPreview()
 }
 
 // RestartTask stops a running task and runs its unit again from the start

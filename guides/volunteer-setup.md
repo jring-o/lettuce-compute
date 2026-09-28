@@ -69,6 +69,9 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 | `head sent no work, and said why` (`reason=…`; a notice with that reason as its code, and a line under "Why a head is sending no work" in `lettuce-volunteer status` and in `doctor`) | The head named a reason that is about this machine or your account, not an empty queue. See [When the head says why](#when-the-head-says-why) below. | Depends on the reason; most need nothing from you. |
 | `no runnable leafs: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse — so this is reported at once, not after polling. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `idle detection failed: "run when idle" cannot start work …` (`idle_detection_unavailable` in the app's **Needs attention** list; `status` reads `Paused: idle_unknown`; `doctor` has an `idle time` row) | Your schedule is **run when idle** (`WHEN_IDLE`), and nothing on this machine can say how long it has been idle, so the schedule never opens. On Linux the volunteer asks the desktop session's D-Bus ScreenSaver interface, then `xprintidle`; a headless machine, a daemon started over SSH or as a service, or a desktop with neither has no idle source. On macOS it reads `ioreg`. The WARN repeats once an hour while it lasts. | On a Linux desktop, install `xprintidle` (X11) or run Lettuce inside a desktop session that provides the ScreenSaver idle time. Otherwise run always (`lettuce-volunteer schedule clear`) or during set hours (`schedule set --from 20:00 --to 06:00`), then restart the daemon. The log says `idle detection works again` once a reading succeeds. |
+| `not fetching a leaf this machine cannot finish before its deadline` (`deadline_too_short_here` in the app's **Needs attention** list, per leaf; WILL FETCH `no` in `lettuce-volunteer leafs list`; "Will not fetch" on the leaf's card) | The leaf's tasks have taken so long on this machine — the middle of its last few runs, scaled to the most cores a task of it could be given here — that with a 25 % margin one would not finish within the leaf's deadline, counting the hours your schedule keeps work stopped and your CPU time limit. The volunteer stops asking for the leaf, and gives back any of its units it holds un-run, so another volunteer finishes them in time. The notice gives the figures. | What the notice suggests: more cores for the leaf's tasks where it can use them (its cores setting, or your CPU limit), a higher CPU time limit, a wider schedule — or disable the leaf here. It clears by itself once the arithmetic fits. Until a leaf has completed on this machine there is nothing to judge by, and it is fetched as usual. |
+| `an enabled leaf can never start on this machine under its limits` (`leaf_cannot_start` in **Needs attention**) | The leaf needs more cores per task, or more memory per task, than your limits allow in total, so heads never send it here. | Raise the limit the notice names to the figure it gives, or disable the leaf. |
+| `the CPU limit runs one task at a time on a machine that could run several` (`cpu_limit_one_task`, information) | Your CPU limit is so low that only one task runs at a time — often a limit set as if it were "cores per task" — while this machine's CPUs and your memory limit would run several. | If you want more at once, set the CPU limit to the figure the notice gives. If one at a time is what you want, set `max_running_tasks: 1` and the notice stays away. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
 | `container engine stopped answering …` (`container_engine_unreachable` in the app's **Needs attention** list; the runtime card reads "not answering") | The Docker or Podman engine Lettuce was using has stopped answering on its socket — Docker Desktop quit, the Podman machine was stopped, or (macOS) the machine still says "running" but its API socket is dead. Lettuce paused container work at once, returned every buffered container unit to its head **un-run** (nothing is billed to you or the unit), told the heads it has no container runtime for now, and re-checks the engine every minute. WASM and native leafs keep running. | Start the engine again (`podman machine start`, or Docker Desktop). A Podman machine that reports running with a dead socket is fixed by `podman machine stop` then `podman machine start`. Container work resumes by itself within a minute of the engine answering — no restart; the log line is `container engine answering again`. |
@@ -766,6 +769,39 @@ saves checkpoints, in which case it continues from the last one. The head still
 holds the unit as yours, so its deadline keeps counting from when it first started
 and its result is accepted as usual. **Abort** is different: it stops the task and
 does not run it again.
+
+### Sizing your machine
+
+Lettuce shows what would run together on your machine under your current settings,
+worked out by the same arithmetic that starts tasks, so it is what will happen rather
+than an estimate:
+
+```text
+$ ./lettuce-volunteer doctor
+  ...
+  info  runs together GREP 2 cores, Beyblade 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them (when the buffer holds work of every enabled leaf in turn)
+  info  each alone    GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each
+```
+
+The desktop app shows the same as **What runs together here** on the Projects page and
+under the CPU settings. "Together" assumes the buffer holds work of every enabled leaf
+in turn; "each alone" is what one leaf would do by itself. A task that "would wait" is
+a wide one that the free cores are kept for, rather than started beside narrower tasks.
+
+To size your machine:
+
+1. **Set the CPU limit to what Lettuce may use in total** — not per task. Read "runs
+   together": if it runs fewer tasks than you want, raise the limit; if a leaf's tasks
+   get fewer cores than you want, give that leaf a cores setting (see above).
+2. **Check each leaf can start.** A leaf that needs more cores or memory per task than
+   your limits allow never arrives; Lettuce says so in **Needs attention**.
+3. **Mind the deadlines.** A leaf whose tasks take too long here to finish before their
+   deadline is not fetched, and the notice says what would bring it back — usually more
+   cores for its tasks. Settings that stretch a run (a lower CPU time limit, a narrower
+   schedule) count against the deadline too.
+4. **Changes apply to tasks started afterwards.** When you save a CPU setting while tasks
+   are running, the app says so and offers to restart them with the new settings (see
+   [Restarting a task](#restarting-a-task)).
 
 ### Network bandwidth
 

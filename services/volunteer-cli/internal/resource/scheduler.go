@@ -155,6 +155,58 @@ func (s *Scheduler) ShouldRun() bool {
 	}
 }
 
+// RunSecondsWithin is how much of the window [from, from+d) the schedule
+// lets work run: all of it in ALWAYS mode; in SCHEDULED mode the hours its
+// windows open (ranges are whole hours; a cron expression is judged minute by
+// minute, as ShouldRun judges it). known is false in WHEN_IDLE mode, where
+// when the machine will be idle cannot be told in advance, and for a mode
+// this build does not know: the whole window is returned then. The CPU time
+// limit and the deadline check use it to count the schedule's gaps inside a
+// unit's deadline.
+func (s *Scheduler) RunSecondsWithin(from time.Time, d time.Duration) (seconds float64, known bool) {
+	if d <= 0 {
+		return 0, true
+	}
+	switch s.mode {
+	case "ALWAYS":
+		return d.Seconds(), true
+	case "SCHEDULED":
+	default:
+		return d.Seconds(), false
+	}
+	end := from.Add(d)
+	// The next boundary in local time: schedule windows open and close on the
+	// local clock's hours (or, for cron, minutes).
+	nextBoundary := func(t time.Time) time.Time {
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour()+1, 0, 0, 0, t.Location())
+	}
+	open := func(t time.Time) bool { return matchesScheduleRanges(s.scheduleRanges, t) }
+	if len(s.scheduleRanges) == 0 {
+		if s.cronExpr == "" {
+			return 0, true
+		}
+		nextBoundary = func(t time.Time) time.Time {
+			return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute()+1, 0, 0, t.Location())
+		}
+		open = func(t time.Time) bool {
+			match, err := matchesCron(s.cronExpr, t)
+			return err == nil && match
+		}
+	}
+	var total time.Duration
+	for t := from; t.Before(end); {
+		next := nextBoundary(t)
+		if next.After(end) {
+			next = end
+		}
+		if open(t) {
+			total += next.Sub(t)
+		}
+		t = next
+	}
+	return total.Seconds(), true
+}
+
 // WaitUntilActive blocks until the scheduler says the daemon should run.
 // It polls every 10 seconds. Returns immediately if already active.
 // Returns error if the context is cancelled.

@@ -269,3 +269,25 @@ func TestLeafsListShowsCoresAndHowManyRunAtOnce(t *testing.T) {
 		t.Errorf("no footnote for the starred figures:\n%s", out)
 	}
 }
+
+// TestLeafsListSaysWhyALeafIsSkippedForItsDeadline: a leaf the daemon skips
+// because its units cannot finish before their deadline here is WILL FETCH
+// "no", with the daemon's reason under the table.
+func TestLeafsListSaysWhyALeafIsSkippedForItsDeadline(t *testing.T) {
+	machine, servers := containerOnlyMachine()
+	head := twoLeafHead()
+	verdict := `[{"deadline":{"blocked":true,"reason":"cannot finish before its deadline on this machine: needs about 6 h 15 min (a median 5 hours at 2 cores, +25 %), has 6 hours"}}]`
+	if err := json.Unmarshal([]byte(verdict), &head.Leafs); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	printLeafsTable(&buf, &leafsAPIResponse{Heads: []leafsAPIHead{head}, Machine: machine}, servers)
+	out := buf.String()
+	row := rowFor(out, head.Leafs[0].Slug)
+	if !strings.HasSuffix(strings.TrimSpace(row), "no") {
+		t.Errorf("WILL FETCH for a leaf skipped for its deadline should be no: %q", row)
+	}
+	if !strings.Contains(out, "its units cannot finish before its deadline on this machine: needs about 6 h 15 min") {
+		t.Errorf("the reason is not under the table:\n%s", out)
+	}
+}

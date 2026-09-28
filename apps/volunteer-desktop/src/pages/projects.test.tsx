@@ -54,8 +54,13 @@ vi.mock("@/hooks/use-heads", () => ({
   }),
 }));
 
+// The preview of what runs together and the running-tasks note poll through
+// useApiQuery; mockUseApiQuery answers them.
+const mockUseApiQuery = vi.fn(() => ({ data: null, isLoading: false, error: null, refetch: vi.fn() }));
+
 vi.mock("@/hooks/use-api", () => ({
   useClient: () => mockUseClient(),
+  useApiQuery: () => mockUseApiQuery(),
 }));
 
 const mockUseContainerRuntime = vi.fn();

@@ -254,6 +254,13 @@ export function LeafCard({
             </div>
           )}
 
+          {leaf.deadline?.blocked && (
+            <p className="text-xs text-amber-700 dark:text-amber-400 mt-1" data-testid="leaf-deadline-blocked">
+              Will not fetch: its units {leaf.deadline.reason || "cannot finish before their deadline on this machine"}.
+              More cores for its tasks (below), a higher CPU time limit or a wider schedule can bring it back.
+            </p>
+          )}
+
           {diskGate?.blocked && (
             <div className="mt-1 space-y-1">
               <p className="text-xs text-amber-700 dark:text-amber-400">

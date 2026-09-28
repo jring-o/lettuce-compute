@@ -30,6 +30,10 @@ type PreFetchItem struct {
 	// TimesSkipped counts units started past this one while it waited for
 	// capacity — PopFit's starvation guard (TB-22).
 	TimesSkipped int
+	// RunStarted marks a unit the volunteer restarted: its head already holds
+	// it as running here, so it is started as asked, not judged again for the
+	// buffer's give-backs.
+	RunStarted bool
 }
 
 // StartBy is when the buffer gives this unit up if no slot has started it:

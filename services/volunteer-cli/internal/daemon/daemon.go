@@ -252,6 +252,10 @@ type Daemon struct {
 	// learned duration changes (TB-58).
 	arrivalEstMu    sync.Mutex
 	arrivalFpopsEst map[string]float64
+	// arrivalDeadline is the deadline, in seconds, of the most recent arrived
+	// unit of each leaf, so the deadline check judges a leaf by it before
+	// asking for more (deadline_skip.go). Guarded by arrivalEstMu.
+	arrivalDeadline map[string]int32
 
 	// Fetch-gate hysteresis (TB-34): once the buffer fills to the hours target,
 	// fetching stays closed until the REMAINING buffered work drains below the
@@ -324,6 +328,12 @@ type Daemon struct {
 	// cpuThrottle tracks the running tasks' CPU throttling between readings
 	// (cpu_throttle.go).
 	cpuThrottle cpuThrottleWatch
+	// setupNotices remembers what the re-evaluated CPU setup notices last
+	// said (cpu_setup_notices.go); setupNoticeMu serializes their refresh,
+	// which the buffer maintenance, a settings change and a catalog refresh
+	// all run.
+	setupNoticeMu sync.Mutex
+	setupNotices  setupNoticeState
 
 	// Per-head version and update-required state (see head_status.go),
 	// keyed by gRPC address. Seeded at start-up from registration, then kept
@@ -633,6 +643,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// notices name the enabled leafs the clip holds back, and say nothing when
 	// it holds none back (TB-92).
 	d.refreshContainerVMNotices()
+	d.refreshCPUSetupNotices()
 
 	// Give the container runtime the keep-set for its stale-image reaper: every
 	// image an enabled leaf wants cached, so a re-pushed mutable tag's superseded
@@ -1080,7 +1091,7 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	// no longer needs, took exactly as long on this machine as one accepted at
 	// once.
 	if d.durations != nil && active > 0 {
-		d.durations.Record(wu.LeafID, wu.RscFpopsEst, float64(active))
+		d.durations.RecordRun(wu.LeafID, wu.RscFpopsEst, float64(active), wu.CPUGrant.Cores, wu.DeadlineSeconds)
 		d.logger.Debug("unit duration recorded for the leaf's estimate",
 			"work_unit_id", wu.ID,
 			"leaf_id", wu.LeafID,
@@ -1342,6 +1353,26 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 		}
 		// A unit is starting: the next dead end is news again.
 		d.slotFillLog.outcome = ""
+
+		// One that could no longer finish before its deadline here — its
+		// leaf's run time rose, or the cores, CPU time or schedule it would
+		// run under shrank, since it was fetched — goes back un-run for a
+		// machine that can, rather than being started only to be stopped at
+		// its deadline. A unit restarted by the volunteer is already running
+		// at its head and is started as asked.
+		if !item.RunStarted {
+			if why := d.unitDeadlineUnfit(item.WU); why != "" {
+				d.slotManager.ReturnSlotID(slotID)
+				d.logger.Info("returning a buffered unit that cannot finish before its deadline here",
+					"work_unit_id", item.WU.ID, "leaf_id", item.WU.LeafID, "reason", why)
+				d.abandonItem(item, why)
+				if item.Runtime != nil && item.Prep != nil {
+					item.Runtime.Cleanup(item.Prep)
+				}
+				d.prefetchQueue.FinishStart(item.WU.ID)
+				continue
+			}
+		}
 
 		// The cores it is given, decided now against the running tasks and the
 		// units still waiting, and kept for its whole run.
@@ -2819,6 +2850,11 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	if ok, why := d.memoryDeclarationFits(wu); !ok {
 		return false, why
 	}
+	// A unit this machine cannot finish before its deadline is returned
+	// before any Prepare cost, whatever the buffer holds (deadline_skip.go).
+	if why := d.unitDeadlineUnfit(wu); why != "" {
+		return false, why
+	}
 	full, reason := d.workBufferFullVerdict()
 	if !full && wu.ExecutionSpec.GPURequired {
 		full, reason = d.gpuBufferFullVerdict()
@@ -2876,7 +2912,9 @@ func (d *Daemon) unfitBuffered(wu *runtime.WorkUnit) string {
 	if wu != nil && runtimeKeyForWU(wu) == runtime.RuntimeContainer && d.containerEngineDown() {
 		return "container engine unreachable"
 	}
-	return ""
+	// One that can no longer finish before its deadline here goes back
+	// un-run for a machine that can (deadline_skip.go).
+	return d.unitDeadlineUnfit(wu)
 }
 
 // fallbackBufferUnits is the unit-count cap used when an hours estimate is
@@ -4143,11 +4181,12 @@ func (d *Daemon) requeueForRestart(result SlotResult) {
 	prep.PausedAccrued = 0
 	prep.OriginalStartedAt = time.Time{}
 	q.PushFront(&PreFetchItem{
-		WU:        wu,
-		Prep:      prep,
-		Runtime:   result.Runtime,
-		Conn:      result.Conn,
-		FetchedAt: result.FetchedAt,
+		WU:         wu,
+		Prep:       prep,
+		Runtime:    result.Runtime,
+		Conn:       result.Conn,
+		FetchedAt:  result.FetchedAt,
+		RunStarted: true,
 	})
 	d.logger.Info("task restarting from the start with the current settings",
 		"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "slot", result.SlotID)
@@ -4269,9 +4308,11 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 
 	// A raised memory limit does not raise what the container engine's VM can
 	// hold (TB-63): say so again against the new figure, or clear the notice
-	// when the limit now fits. The CPU limit likewise (TB-75).
+	// when the limit now fits. The CPU limit likewise (TB-75). And the
+	// notices about a CPU setup that works against the volunteer.
 	d.refreshContainerMemoryNotice()
 	d.refreshContainerCPUNotice()
+	d.refreshCPUSetupNotices()
 
 	// The yield block is live (TB-90): the monitor judges its next sample
 	// against the new thresholds, turning the setting off releases a pause it
@@ -5056,6 +5097,7 @@ func (d *Daemon) runBufferMaintenance(ctx context.Context) {
 			if f != nil {
 				f.sweepBuffer()
 			}
+			d.refreshCPUSetupNotices()
 		}
 	}
 }

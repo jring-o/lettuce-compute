@@ -48,6 +48,15 @@ vi.mock("@/components/container-runtime-status", () => ({
   ),
 }));
 
+// The preview of what runs together and the running-tasks note are tested
+// on their own; here they show what the page hands them.
+vi.mock("@/components/run-preview-card", () => ({
+  RunPreviewCard: (props: any) => <div data-testid="run-preview-probe" data-refresh={String(props.refreshKey)} />,
+}));
+vi.mock("@/components/restart-running-tasks-note", () => ({
+  RestartRunningTasksNote: (props: any) => <div data-testid="restart-note-probe" data-show={String(props.show)} />,
+}));
+
 import { useConfig } from "@/hooks/use-config";
 import { useMetrics } from "@/hooks/use-metrics";
 
@@ -1636,5 +1645,21 @@ describe("CPU time setting", () => {
     expect(cpuTimeCaption(5)).toContain("run 1 s of every 20 s");
     expect(cpuTimeCaption(95)).toContain("run 19 s of every 20 s");
     expect(cpuTimeCaption(100)).toContain("Work runs continuously");
+  });
+});
+
+describe("CPU setting saved", () => {
+  it("asks the preview again and offers to restart running tasks once the CPU limit is saved", async () => {
+    const updateConfig = vi.fn(() => Promise.resolve());
+    mockUseConfig.mockReturnValue({ config: makeConfig(), isLoading: false, updateConfig, toast: null });
+    render(<SettingsPage />);
+    expect(screen.getByTestId("restart-note-probe")).toHaveAttribute("data-show", "false");
+    const slider = screen
+      .getByText("CPU Cores — for all running tasks together")
+      .parentElement!.parentElement!.querySelector("input[type='range']") as HTMLInputElement;
+    fireEvent.change(slider, { target: { value: "2" } });
+    await waitFor(() => expect(screen.getByTestId("restart-note-probe")).toHaveAttribute("data-show", "true"));
+    expect(screen.getByTestId("run-preview-probe")).toHaveAttribute("data-refresh", "1");
+    expect(updateConfig).toHaveBeenCalledWith({ resource_limits: expect.objectContaining({ max_cpu_cores: 2 }) });
   });
 });

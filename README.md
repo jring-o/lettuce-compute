@@ -142,7 +142,10 @@ gets too hot (where the machine lets a program read the temperature: the CPU on 
 with the `osx-cpu-temp` helper; an NVIDIA GPU through `nvidia-smi`, an AMD GPU through `rocm-smi`
 on Linux and macOS — the client tells you when it cannot), keeps its downloads and its uploads
 under the bandwidth you set (container image pulls, which the container engine makes, excepted),
-and, if you turn the setting on, pauses everything while other programs need the CPU.
+and, if you turn the setting on, pauses everything while other programs need the CPU. It does not
+fetch work it could not finish before the deadline on your machine, tells you when a setting works
+against you (a CPU limit that runs one task at a time, a leaf that can never start), and shows what
+would run together under your settings (`doctor`, and the desktop app's Projects page).
 
 ### Commands
 

@@ -85,3 +85,18 @@ func liveLeafCPU(live *leafsAPIResponse, srv config.ServerConfig, slug string) *
 	}
 	return nil
 }
+
+// checkRunPreview prints what would run together on this machine under the
+// current settings, from the running daemon (the scheduler's own arithmetic,
+// so the lines say what it does): the tasks started when the buffer holds
+// work of every enabled leaf in turn, and each leaf on its own. Nothing is
+// printed when no daemon answers.
+func checkRunPreview(rep *doctorReport, dataDir string) {
+	var p daemon.RunPreview
+	if err := managementGet(dataDir, "/api/v1/run-preview", &p); err != nil || len(p.Alone) == 0 {
+		return
+	}
+	together, alone := daemon.DescribeRunPreview(p)
+	rep.add(docInfo, "runs together", together+" (when the buffer holds work of every enabled leaf in turn)", "")
+	rep.add(docInfo, "each alone", alone, "")
+}

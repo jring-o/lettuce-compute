@@ -208,12 +208,20 @@ func (d *Daemon) bookedContainerCPUCores(wu *runtime.WorkUnit) int {
 // resumer call it for the unit they start, and every surface that shows a
 // grant shows the one recorded on the unit.
 func (d *Daemon) grantCPU(wu *runtime.WorkUnit, waiting []*runtime.WorkUnit) runtime.CPUGrant {
+	return d.grantFrom(d.runningLedger(), wu, waiting)
+}
+
+// grantFrom is grantCPU against a given ledger: what the budgets have free
+// before wu starts. The slot filler passes the running tasks' ledger; the
+// preview of what would run together (run_preview.go) passes the ledger of
+// the tasks it has placed so far, so both decide a grant the same way.
+func (d *Daemon) grantFrom(ledger budgetLedger, wu *runtime.WorkUnit, waiting []*runtime.WorkUnit) runtime.CPUGrant {
 	budget := d.cpuBudgetFor(wu)
 	if budget <= 0 {
 		return runtime.CPUGrant{}
 	}
 	minCores, maxCores := d.unitCoreRange(wu)
-	ledger := d.runningLedger()
+	ledger = ledger.clone()
 	ledger.take(d, wu, minCores)
 	for _, w := range waiting {
 		if ledger.coresFreeFor(wu) <= 0 {
@@ -269,14 +277,42 @@ type budgetLedger struct {
 // anything is ever charged against it.
 const noBound = math.MaxInt32
 
-// runningLedger is the budgets less what the running tasks hold.
+// clone is a copy of the ledger whose charges do not reach the original (the
+// per-leaf counts are a map).
+func (l budgetLedger) clone() budgetLedger {
+	c := l
+	c.leafRunning = make(map[string]int, len(l.leafRunning))
+	for k, v := range l.leafRunning {
+		c.leafRunning[k] = v
+	}
+	return c
+}
+
+// runningLedger is the budgets less what the running tasks hold; unbounded
+// while the daemon has no slot manager (not running).
 func (d *Daemon) runningLedger() budgetLedger {
-	l := budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound,
-		leafRunning: make(map[string]int)}
 	sm := d.slotManager // one read: the daemon clears it when it stops
 	if sm == nil {
-		return l
+		return unboundedLedger()
 	}
+	return d.ledgerFor(sm)
+}
+
+// emptyLedger is the budgets with nothing running: where the preview of
+// what would run together starts.
+func (d *Daemon) emptyLedger() budgetLedger {
+	return d.ledgerFor(&SlotManager{})
+}
+
+// unboundedLedger is a ledger with no budget set.
+func unboundedLedger() budgetLedger {
+	return budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound,
+		leafRunning: make(map[string]int)}
+}
+
+// ledgerFor is the budgets less what sm's running tasks hold.
+func (d *Daemon) ledgerFor(sm *SlotManager) budgetLedger {
+	l := unboundedLedger()
 	for _, wu := range sm.ActiveWorkUnits() {
 		if wu != nil {
 			l.leafRunning[wu.LeafID]++
