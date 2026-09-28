@@ -67,16 +67,17 @@ func cappedGrepUnit(i int) *runtime.WorkUnit {
 	return &runtime.WorkUnit{ID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i), LeafID: "leaf-grep", RscFpopsEst: 600, SourceHead: "head-1"}
 }
 
-// TestLeafOverride_CappedLeafIsBufferedOnlyForWhatItRuns is the incumbent
-// platform's issue #4322 by construction: a leaf the volunteer caps at one
-// running task, with 10-minute units and a 2-hour buffer, is asked for at
-// most 2 h × 1 task ÷ 10 min = 12 units, holds no more, and is not asked
-// again while those are held — even though the eight-core machine's global
-// buffer (2 h × 8 tasks) is nowhere near full. A running-task cap the fetcher
-// did not plan for is exactly how the incumbent's client came to request up
-// to its thousand-job limit. Pre-fix the cap did not exist and the leaf was
-// buffered for all eight slots: the ask was 64 (the per-request ceiling) and
-// 96 units were accepted.
+// TestLeafOverride_CappedLeafIsBufferedOnlyForWhatItRuns: a leaf the
+// volunteer caps at one running task, with 10-minute units and a 2-hour
+// buffer, is asked for at most 2 h × 1 task ÷ 10 min = 12 units, holds no
+// more, and is not asked again while those are held — even though the
+// eight-core machine's global buffer (2 h × 8 tasks) is nowhere near full. A
+// running-task cap the fetcher does not plan for is how a volunteer client
+// comes to request far more work than it can run before the deadlines (the
+// incumbent platform's client once asked for up to its thousand-job limit
+// this way). Pre-fix the cap did not exist and the leaf was buffered for all
+// eight slots: the ask was 64 (the per-request ceiling) and 96 units were
+// accepted.
 func TestLeafOverride_CappedLeafIsBufferedOnlyForWhatItRuns(t *testing.T) {
 	d, grep := overrideHost(t, &mockClient{}, "max_running:\n  grep: 1\n")
 
