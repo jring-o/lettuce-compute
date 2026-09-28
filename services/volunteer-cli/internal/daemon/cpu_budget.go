@@ -255,27 +255,28 @@ const noBound = math.MaxInt32
 // runningLedger is the budgets less what the running tasks hold.
 func (d *Daemon) runningLedger() budgetLedger {
 	l := budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound}
-	if d.slotManager == nil {
+	sm := d.slotManager // one read: the daemon clears it when it stops
+	if sm == nil {
 		return l
 	}
 	if host := d.HostCPUBudgetCores(); host > 0 {
-		l.hostCores = host - d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+		l.hostCores = host - sm.TotalActiveCPUCores(d.bookedCPUCores)
 	}
 	if d.containerCPUBudgetBinds() {
-		l.containerCores = d.ContainerCPUBudgetCores() - d.slotManager.TotalActiveCPUCores(d.bookedContainerCPUCores)
+		l.containerCores = d.ContainerCPUBudgetCores() - sm.TotalActiveCPUCores(d.bookedContainerCPUCores)
 	}
 	hostMemMB := d.HostMemoryBudgetMB()
 	if hostMemMB > 0 {
-		l.hostMemMB = hostMemMB - d.slotManager.TotalActiveMemoryMB(d.bookedMemMB)
+		l.hostMemMB = hostMemMB - sm.TotalActiveMemoryMB(d.bookedMemMB)
 	}
 	if vmMemMB := d.ContainerMemoryBudgetMB(); vmMemMB > 0 && (hostMemMB <= 0 || vmMemMB < hostMemMB) {
-		l.containerMemMB = vmMemMB - d.slotManager.TotalActiveMemoryMB(d.bookedContainerMemMB)
+		l.containerMemMB = vmMemMB - sm.TotalActiveMemoryMB(d.bookedContainerMemMB)
 	}
 	if n := len(d.advertisedHardware().GetGpus()); n > 0 {
-		l.gpus = n - d.slotManager.ActiveGPUCount()
+		l.gpus = n - sm.ActiveGPUCount()
 	}
 	if limit := d.maxRunningTasks(); limit > 0 {
-		l.tasks = limit - d.slotManager.ActiveCount()
+		l.tasks = limit - sm.ActiveCount()
 	}
 	return l
 }

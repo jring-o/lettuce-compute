@@ -139,10 +139,11 @@ func (d *Daemon) readThrottle(ctx context.Context, t throttleTarget) (runtime.CP
 // a leaf whose task it cannot judge (a first reading, a minute it barely ran)
 // keeps the state it had.
 func (d *Daemon) checkCPUThrottling(ctx context.Context) {
-	if d.slotManager == nil {
+	sm := d.slotManager // one read: the daemon clears it when it stops
+	if sm == nil {
 		return
 	}
-	targets := d.slotManager.throttleTargets()
+	targets := sm.throttleTargets()
 	readings := make(map[string]runtime.CPUThrottle, len(targets))
 	for _, t := range targets {
 		if r, ok := d.readThrottle(ctx, t); ok {

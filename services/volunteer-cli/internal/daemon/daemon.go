@@ -1203,8 +1203,8 @@ func (d *Daemon) heldWorkUnits() []*runtime.WorkUnit {
 		seen[wu.ID] = struct{}{}
 		held = append(held, wu)
 	}
-	if d.prefetchQueue != nil {
-		queued, starting := d.prefetchQueue.HeldSnapshot()
+	if q := d.prefetchQueue; q != nil {
+		queued, starting := q.HeldSnapshot()
 		for _, item := range queued {
 			add(item.WU)
 		}
@@ -1212,8 +1212,8 @@ func (d *Daemon) heldWorkUnits() []*runtime.WorkUnit {
 			add(item.WU)
 		}
 	}
-	if d.slotManager != nil {
-		for _, wu := range d.slotManager.ActiveWorkUnits() {
+	if sm := d.slotManager; sm != nil {
+		for _, wu := range sm.ActiveWorkUnits() {
 			add(wu)
 		}
 	}
@@ -1406,7 +1406,11 @@ func refusalKind(reason string) string {
 // On refusal it returns the human-readable reason; it logs nothing itself —
 // callers run it on a 1-second tick and own the throttling (TB-23).
 func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
-	if d.slotManager == nil {
+	// One read of the slot manager: the daemon clears it when it stops, while
+	// the fetcher may still be asking (it reaches here through the idle-slot
+	// and fit checks).
+	sm := d.slotManager
+	if sm == nil {
 		return true, ""
 	}
 
@@ -1431,7 +1435,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// within max_memory_mb.
 	hostMemoryMB := d.HostMemoryBudgetMB()
 	if hostMemoryMB > 0 {
-		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(d.bookedMemMB)
+		activeMemoryMB := sm.TotalActiveMemoryMB(d.bookedMemMB)
 		if activeMemoryMB+wuMemoryMB > hostMemoryMB {
 			return false, fmt.Sprintf("configured memory budget: %d MB active + %d MB unit exceeds max_memory_mb %d",
 				activeMemoryMB, wuMemoryMB, hostMemoryMB)
@@ -1444,7 +1448,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// start beside a 768 MB container on a 1,024 MB limit.
 	if vmMemoryMB := d.ContainerMemoryBudgetMB(); isContainerUnit(wu) && vmMemoryMB > 0 &&
 		(hostMemoryMB <= 0 || vmMemoryMB < hostMemoryMB) {
-		activeContainerMB := d.slotManager.TotalActiveMemoryMB(d.bookedContainerMemMB)
+		activeContainerMB := sm.TotalActiveMemoryMB(d.bookedContainerMemMB)
 		if activeContainerMB+wuMemoryMB > vmMemoryMB {
 			return false, fmt.Sprintf("container memory budget: %d MB of container work active + %d MB unit exceeds the %d MB the container engine's VM can hold",
 				activeContainerMB, wuMemoryMB, vmMemoryMB)
@@ -1462,9 +1466,9 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// 3. GPU exclusivity: one GPU work unit per physical GPU.
 	if wu.ExecutionSpec.GPURequired {
 		gpuCount := len(d.advertisedHardware().GetGpus())
-		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
+		if gpuCount > 0 && sm.ActiveGPUCount() >= gpuCount {
 			return false, fmt.Sprintf("all GPUs busy: %d of %d running GPU work units",
-				d.slotManager.ActiveGPUCount(), gpuCount)
+				sm.ActiveGPUCount(), gpuCount)
 		}
 	}
 
@@ -1481,7 +1485,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// before the CPU budget, so a refusal for cores means every other check
 	// passed (coreWaitFor).
 	if limit := d.maxRunningTasks(); limit > 0 {
-		if running := d.slotManager.ActiveCount(); running >= limit {
+		if running := sm.ActiveCount(); running >= limit {
 			return false, fmt.Sprintf("running tasks cap: %d task(s) running, max_running_tasks is %d", running, limit)
 		}
 	}
@@ -1495,7 +1499,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	wuCores := d.bookedCPUCores(wu)
 	hostCores := d.HostCPUBudgetCores()
 	if hostCores > 0 {
-		activeCores := d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+		activeCores := sm.TotalActiveCPUCores(d.bookedCPUCores)
 		if activeCores+wuCores > hostCores {
 			return false, fmt.Sprintf("configured CPU budget: %d core(s) booked by running tasks + %d for this unit exceeds max_cpu_cores %d",
 				activeCores, wuCores, hostCores)
@@ -1503,7 +1507,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	}
 	if vmCores := d.ContainerCPUBudgetCores(); isContainerUnit(wu) && vmCores > 0 &&
 		(hostCores <= 0 || vmCores < hostCores) {
-		activeContainerCores := d.slotManager.TotalActiveCPUCores(d.bookedContainerCPUCores)
+		activeContainerCores := sm.TotalActiveCPUCores(d.bookedContainerCPUCores)
 		if activeContainerCores+wuCores > vmCores {
 			return false, fmt.Sprintf("container CPU budget: %d core(s) booked by running container tasks + %d for this unit exceeds the %d CPUs of the container engine's VM",
 				activeContainerCores, wuCores, vmCores)
@@ -1839,8 +1843,8 @@ func (d *Daemon) maxSlots() int {
 	if limit := d.maxRunningTasks(); limit > 0 && limit < n {
 		n = limit
 	}
-	if d.slotManager != nil {
-		if pool := d.slotManager.Size(); pool < n {
+	if sm := d.slotManager; sm != nil {
+		if pool := sm.Size(); pool < n {
 			n = pool
 		}
 	}
@@ -1969,10 +1973,11 @@ func (p *slotPicker) waitingForCores() bool {
 // waitingUnits is the work units waiting in the buffer, in order — what a
 // starting unit's grant sets cores aside for (grantCPU).
 func (d *Daemon) waitingUnits() []*runtime.WorkUnit {
-	if d.prefetchQueue == nil {
+	q := d.prefetchQueue
+	if q == nil {
 		return nil
 	}
-	queued, _ := d.prefetchQueue.HeldSnapshot()
+	queued, _ := q.HeldSnapshot()
 	wus := make([]*runtime.WorkUnit, 0, len(queued))
 	for _, it := range queued {
 		if it != nil && it.WU != nil {
@@ -2496,7 +2501,8 @@ func (d *Daemon) workBufferFullVerdict() (bool, string) {
 // healthy case — when every slot is busy it returns
 // false before touching the queue.
 func (d *Daemon) idleSlotStarved() bool {
-	if d.slotManager == nil || d.prefetchQueue == nil {
+	q := d.prefetchQueue // one read: the daemon clears it when it stops
+	if d.slotManager == nil || q == nil {
 		return false
 	}
 	if d.occupiedSlots() >= d.maxSlots() {
@@ -2506,7 +2512,7 @@ func (d *Daemon) idleSlotStarved() bool {
 		return false
 	}
 	picker := d.newSlotPicker(nil)
-	if d.prefetchQueue.HasRunnable(picker.fits, d.itemMayDelay, picker.holds) {
+	if q.HasRunnable(picker.fits, d.itemMayDelay, picker.holds) {
 		return false
 	}
 	return !picker.waitingForCores()
@@ -2533,11 +2539,16 @@ func (d *Daemon) coresTaken() bool {
 // queue→slot handoff counts as if it already occupied its slot, minus any
 // overlap with slots that just turned active.
 func (d *Daemon) occupiedSlots() int {
-	_, starting := d.prefetchQueue.HeldSnapshot()
-	occupied := d.slotManager.ActiveCount()
+	// One read of each: the daemon clears them when it stops.
+	sm, q := d.slotManager, d.prefetchQueue
+	if sm == nil || q == nil {
+		return 0
+	}
+	_, starting := q.HeldSnapshot()
+	occupied := sm.ActiveCount()
 	if len(starting) > 0 {
 		active := make(map[string]struct{})
-		for _, wu := range d.slotManager.ActiveWorkUnits() {
+		for _, wu := range sm.ActiveWorkUnits() {
 			if wu != nil {
 				active[wu.ID] = struct{}{}
 			}
@@ -2598,7 +2609,7 @@ func (d *Daemon) starvedBackfill() bool {
 // deeper than its per-machine in-flight cap — so the fetcher does not count
 // that answer toward the "connected but getting no work" diagnostic.
 func (d *Daemon) workInHandForEverySlot() bool {
-	if d.prefetchQueue == nil || d.prefetchQueue.Len() < d.maxSlots() {
+	if q := d.prefetchQueue; q == nil || q.Len() < d.maxSlots() {
 		return false
 	}
 	return !d.idleSlotStarved()
