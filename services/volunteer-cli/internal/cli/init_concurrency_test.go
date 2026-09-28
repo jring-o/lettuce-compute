@@ -9,10 +9,10 @@ import (
 )
 
 // TestInitNonInteractive_DoesNotAutoScaleConcurrency verifies that non-interactive
-// init (the path the desktop app uses) leaves max_concurrent_tasks at the safe
-// default of 1 instead of scaling it to the CPU-core count. Auto-scaling
-// previously let the daemon run several memory-bound containers at once and
-// oversubscribe RAM.
+// init (the path the desktop app uses) sets no running-task cap: how many tasks
+// run at once follows from the CPU and memory limits admission books against.
+// An earlier init scaled a task count to the CPU cores, which let the daemon
+// run several memory-bound containers at once and oversubscribe RAM.
 func TestInitNonInteractive_DoesNotAutoScaleConcurrency(t *testing.T) {
 	dir := t.TempDir()
 	cfgFile := filepath.Join(dir, "config.yaml")
@@ -37,7 +37,7 @@ func TestInitNonInteractive_DoesNotAutoScaleConcurrency(t *testing.T) {
 	if loaded.ResourceLimits.MaxCPUCores != 8 {
 		t.Errorf("MaxCPUCores = %d, want 8 (flag should be honored)", loaded.ResourceLimits.MaxCPUCores)
 	}
-	if loaded.MaxConcurrentTasks != 1 {
-		t.Errorf("MaxConcurrentTasks = %d, want 1 (must not auto-scale to CPU cores)", loaded.MaxConcurrentTasks)
+	if loaded.MaxRunningTasks != 0 {
+		t.Errorf("MaxRunningTasks = %d, want 0 (no cap; the limits decide)", loaded.MaxRunningTasks)
 	}
 }

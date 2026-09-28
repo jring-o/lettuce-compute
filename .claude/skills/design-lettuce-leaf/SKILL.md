@@ -275,6 +275,12 @@ for long-running leafs (hours+) that is usually well beyond 6 h. Keep it at
 least the unit's `max_cpu_seconds`; the head warns at activation when it is
 shorter.
 
+Decide how many cores one unit can use: a minimum it runs on and a maximum it can
+put to use (`resource_requirements.min_cpu_cores` / `max_cpu_cores`). A volunteer
+grants each unit whole cores between the two and holds it to them, so a unit's run
+time depends on its grant: estimate the deadline at the minimum. A single-threaded
+program is 1–1.
+
 (The leaf config still carries a legacy `heartbeat_interval_seconds` field that
 no longer drives liveness; the next skill fills a safe default, so you don't
 design around it.)

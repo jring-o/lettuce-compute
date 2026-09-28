@@ -22,6 +22,7 @@ type PendingResult struct {
 	RequestProto     []byte    `json:"request_proto"` // marshaled lettucev1.SubmitResultRequest
 	WallClockSeconds int64     `json:"wall_clock_seconds"`
 	CPUSeconds       int64     `json:"cpu_seconds"`
+	CPUCores         int       `json:"cpu_cores,omitempty"` // the cores the run was granted (0 from an older client)
 	CreatedAt        time.Time `json:"created_at"`
 }
 

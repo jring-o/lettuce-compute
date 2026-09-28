@@ -54,7 +54,7 @@ func tb48FetchHost(t *testing.T, mc *mockClient) (*Daemon, *ServerConnection) {
 	servers := []*ServerConnection{{Client: mc, VolunteerID: "vol-1", Name: "gpu-head", Available: true}}
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = 2
-	d.cfg.MaxConcurrentTasks = 8
+	setTestSlots(d.cfg, 8)
 	d.benchmarkFPOPS = 1.0
 	d.slotManager = NewSlotManager(8, d.logger)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)

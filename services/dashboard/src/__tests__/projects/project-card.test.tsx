@@ -217,6 +217,35 @@ describe("ProjectCard", () => {
     expect(req.textContent).not.toContain("cores");
   });
 
+  it("shows the core range a leaf declares", () => {
+    const ranged = {
+      ...baseLeaf,
+      resource_requirements: {
+        min_cpu_cores: 2,
+        max_cpu_cores: 4,
+        gpu_required: false,
+      },
+    };
+    render(<ProjectCard leaf={ranged} />);
+    const req = screen.getByTestId("resource-requirements");
+    expect(req.textContent).toContain("2–4 cores");
+  });
+
+  it("shows one figure when the max equals the min", () => {
+    const fixed = {
+      ...baseLeaf,
+      resource_requirements: {
+        min_cpu_cores: 1,
+        max_cpu_cores: 1,
+        gpu_required: false,
+      },
+    };
+    render(<ProjectCard leaf={fixed} />);
+    const req = screen.getByTestId("resource-requirements");
+    expect(req.textContent).toContain("1 core");
+    expect(req.textContent).not.toContain("–");
+  });
+
   it("shows just 'CPU' when requirements have no cores or memory", () => {
     const emptyReqs = {
       ...baseLeaf,

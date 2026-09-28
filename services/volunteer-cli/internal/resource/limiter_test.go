@@ -93,7 +93,7 @@ func TestEnforce_ReturnsCleanup(t *testing.T) {
 	l := NewLimiter(slog.Default())
 	limits := &TaskLimits{
 		MaxMemoryMB: 256,
-		CPU:         runtime.CPUGrant{ShareCores: 1, BudgetCores: 1},
+		CPU:         runtime.CPUGrant{Cores: 1, BudgetCores: 1},
 	}
 	// Enforce against a disposable child, never the test process itself (see
 	// startLimiterTestChild). It should return a non-nil cleanup without error
@@ -114,7 +114,7 @@ func TestEnforce_ChildProcess(t *testing.T) {
 	l := NewLimiter(slog.Default())
 	limits := &TaskLimits{
 		MaxMemoryMB: 256,
-		CPU:         runtime.CPUGrant{ShareCores: 1, BudgetCores: 1},
+		CPU:         runtime.CPUGrant{Cores: 1, BudgetCores: 1},
 	}
 	// A live, non-self PID exercises the real enforce path (prlimit64 +
 	// sched_setaffinity on Linux) without capping the test binary's own
@@ -133,8 +133,10 @@ func TestEnforce_ChildProcess(t *testing.T) {
 func TestEnforce_ZeroLimits(t *testing.T) {
 	l := NewLimiter(slog.Default())
 	limits := &TaskLimits{}
-	pid := os.Getpid()
-	cleanup, err := l.Enforce(pid, limits)
+	// A child, not the test process: even with no limits, Enforce lowers the
+	// process's priority, and the test binary would keep it (and hand it to
+	// every child it starts afterwards).
+	cleanup, err := l.Enforce(startLimiterTestChild(t), limits)
 	if err != nil {
 		t.Skipf("Enforce with zero limits returned error: %v", err)
 	}
@@ -149,7 +151,7 @@ func TestApply_NoError(t *testing.T) {
 	l := NewLimiter(slog.Default())
 	limits := &TaskLimits{
 		MaxMemoryMB: 512,
-		CPU:         runtime.CPUGrant{ShareCores: 2, BudgetCores: 2},
+		CPU:         runtime.CPUGrant{Cores: 2, BudgetCores: 2},
 	}
 	cmd := exec.Command("echo", "test")
 	if err := l.Apply(cmd, limits); err != nil {

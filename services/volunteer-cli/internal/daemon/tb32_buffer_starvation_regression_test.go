@@ -141,7 +141,7 @@ func tb32FetchDaemon(t *testing.T, mc *mockClient) (*Daemon, []*ServerConnection
 	}
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = 2
-	d.cfg.MaxConcurrentTasks = 2
+	setTestSlots(d.cfg, 2)
 	d.cfg.ResourceLimits.MaxMemoryMB = 8192
 	d.benchmarkFPOPS = 1.0
 	d.slotManager = NewSlotManager(2, d.logger)

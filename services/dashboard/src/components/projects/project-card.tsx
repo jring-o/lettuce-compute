@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Box, Cpu, FileCode, Gpu, Users } from "lucide-react";
 import type { TaskPattern } from "@/types/infrastructure";
-import { formatMemory } from "@/lib/utils";
+import { formatCoreRange, formatMemory } from "@/lib/utils";
 
 import { Badge } from "@/components/ui/badge";
 import {
@@ -45,8 +45,9 @@ function formatResources(
       : "";
     return { icon: Gpu, text: `GPU${vram}` };
   }
-  const cores = requirements.min_cpu_cores
-    ? `${requirements.min_cpu_cores} core${requirements.min_cpu_cores > 1 ? "s" : ""}`
+  const coreRange = formatCoreRange(requirements.min_cpu_cores, requirements.max_cpu_cores);
+  const cores = coreRange
+    ? `${coreRange} core${coreRange === "1" ? "" : "s"}`
     : "";
   const memory = requirements.max_memory_mb
     ? `${formatMemory(requirements.max_memory_mb)} RAM`

@@ -101,7 +101,7 @@ function makeConfig(overrides: Partial<ConfigResponse> = {}): ConfigResponse {
     },
     servers: [],
     log_level: "info",
-    max_concurrent_tasks: 1,
+    max_running_tasks: 0,
     work_buffer_hours: 2,
     ...overrides,
   };
@@ -170,7 +170,7 @@ describe("SettingsPage", () => {
     expect(screen.getByText("Resource Limits")).toBeInTheDocument();
   });
 
-  it("renders CPU cores slider as a total shared by all running tasks (TB-75)", () => {
+  it("renders CPU cores slider as a total the tasks' grants share (TB-75)", () => {
     mockUseConfig.mockReturnValue({
       config: makeConfig(),
       isLoading: false,
@@ -179,15 +179,39 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
+    expect(screen.getByText("CPU Cores — for all running tasks together")).toBeInTheDocument();
     expect(screen.queryByText("CPU Cores")).not.toBeInTheDocument();
-    // The caption gives the rule for the configured 4 cores: a shared total,
-    // and at most 4 tasks, since each books at least one core.
+    // The caption gives the rule for the configured 4 cores: each task is
+    // given the cores its leaf can use, together within the total, held to
+    // them, and a change reaches tasks started afterwards.
     expect(
-      screen.getByText(/All running tasks share these 4 cores equally\. Each task books at least one core \(more if its leaf needs more\), so at most 4 run at once/)
+      screen.getByText(/Each task is given the cores its leaf can use — at least its minimum, as many as are free — and the tasks' cores together stay within these 4, so up to 4 one-core tasks run at once/)
     ).toBeInTheDocument();
-    // Not the old worked case, which assumed one-core leaves.
-    expect(screen.queryByText(/two tasks get/)).not.toBeInTheDocument();
+    expect(screen.getByText(/A change applies to tasks started afterwards/)).toBeInTheDocument();
+    // Not the equal split the allowance used to be.
+    expect(screen.queryByText(/equally/)).not.toBeInTheDocument();
+  });
+
+  it("offers an optional running task limit, off by default", () => {
+    const updateConfig = vi.fn();
+    mockUseConfig.mockReturnValue({
+      config: makeConfig({ max_running_tasks: 0 }),
+      isLoading: false,
+      updateConfig,
+      toast: null,
+    });
+
+    render(<SettingsPage />);
+    expect(screen.getByText("No limit")).toBeInTheDocument();
+    expect(screen.getByTestId("running-tasks-caption")).toHaveTextContent(
+      "No limit: as many tasks run at once as your CPU and memory limits hold."
+    );
+    const slider = screen
+      .getByText("Running task limit")
+      .parentElement!.parentElement!.querySelector("input[type='range']") as HTMLInputElement;
+    expect(slider).toHaveAttribute("min", "0");
+    fireEvent.change(slider, { target: { value: "2" } });
+    expect(updateConfig).toHaveBeenCalledWith({ max_running_tasks: 2 });
   });
 
   it("says one task runs at a time under a 1-core CPU allowance", () => {
@@ -199,7 +223,7 @@ describe("SettingsPage", () => {
     });
 
     render(<SettingsPage />);
-    expect(screen.getByText(/Running tasks share this 1 core\. Each task needs at least one core, so one task runs at a time/)).toBeInTheDocument();
+    expect(screen.getByText(/Each task needs at least one core, so with 1 core one task runs at a time/)).toBeInTheDocument();
     // Two tasks never run together on one core, so the caption must not say how they would split it.
     expect(screen.queryByText(/half a core/)).not.toBeInTheDocument();
   });
@@ -1260,16 +1284,16 @@ describe("SettingsPage", () => {
 
     render(<SettingsPage />);
 
-    // Resource Limits is open by default and contains "CPU Cores — shared by all running tasks"
-    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
+    // Resource Limits is open by default and contains "CPU Cores — for all running tasks together"
+    expect(screen.getByText("CPU Cores — for all running tasks together")).toBeInTheDocument();
 
     // Click to collapse
     await user.click(screen.getByText("Resource Limits"));
-    expect(screen.queryByText("CPU Cores — shared by all running tasks")).not.toBeInTheDocument();
+    expect(screen.queryByText("CPU Cores — for all running tasks together")).not.toBeInTheDocument();
 
     // Click again to expand
     await user.click(screen.getByText("Resource Limits"));
-    expect(screen.getByText("CPU Cores — shared by all running tasks")).toBeInTheDocument();
+    expect(screen.getByText("CPU Cores — for all running tasks together")).toBeInTheDocument();
   });
 
   it("calls updateConfig with correct notifications partial when credit milestones toggle is clicked", async () => {
@@ -1478,10 +1502,10 @@ describe("SettingsPage", () => {
       delete (navigator as { hardwareConcurrency?: number }).hardwareConcurrency;
     });
 
-    it("sizes the CPU cores and concurrent-tasks sliders from the host's core count", async () => {
+    it("sizes the CPU cores and running-task-limit sliders from the host's core count", async () => {
       mockHostCpuCount(256);
       mockUseConfig.mockReturnValue({
-        config: makeConfig({ max_concurrent_tasks: 1 }),
+        config: makeConfig({ max_running_tasks: 0 }),
         isLoading: false,
         updateConfig: vi.fn(),
         toast: null,
@@ -1492,8 +1516,8 @@ describe("SettingsPage", () => {
       await waitFor(() => {
         expect(screen.getByText("4 / 256 cores")).toBeInTheDocument();
       });
-      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "256");
-      expect(sliderFor("Concurrent Tasks")).toHaveAttribute("max", "256");
+      expect(sliderFor("CPU Cores — for all running tasks together")).toHaveAttribute("max", "256");
+      expect(sliderFor("Running task limit")).toHaveAttribute("max", "256");
     });
 
     it("never clamps a saved core count above the detected total", async () => {
@@ -1514,8 +1538,8 @@ describe("SettingsPage", () => {
       await waitFor(() => {
         expect(screen.getByText("128 / 8 cores")).toBeInTheDocument();
       });
-      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "128");
-      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveValue("128");
+      expect(sliderFor("CPU Cores — for all running tasks together")).toHaveAttribute("max", "128");
+      expect(sliderFor("CPU Cores — for all running tasks together")).toHaveValue("128");
     });
 
     it("falls back to the web view's figure only when the host cannot report a count", async () => {
@@ -1536,7 +1560,7 @@ describe("SettingsPage", () => {
         ).toBe(true);
       });
       expect(screen.getByText("4 / 8 cores")).toBeInTheDocument();
-      expect(sliderFor("CPU Cores — shared by all running tasks")).toHaveAttribute("max", "8");
+      expect(sliderFor("CPU Cores — for all running tasks together")).toHaveAttribute("max", "8");
     });
   });
 

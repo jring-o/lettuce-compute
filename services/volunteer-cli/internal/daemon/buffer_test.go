@@ -17,13 +17,23 @@ func newBufferTestDaemon(t *testing.T, hours float64, maxSlots int, benchFPOPS f
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	cfg := config.Defaults()
 	cfg.WorkBufferHours = hours
-	cfg.MaxConcurrentTasks = maxSlots
+	setTestSlots(cfg, maxSlots)
 	return &Daemon{
 		cfg:            cfg,
 		logger:         logger,
 		benchmarkFPOPS: benchFPOPS,
 		prefetchQueue:  NewPreFetchQueue(workBufferQueueDepth, logger),
 		slotManager:    NewSlotManager(maxSlots, logger),
+	}
+}
+
+// setTestSlots makes a test daemon run n tasks at once, the way
+// max_concurrent_tasks: n did before tasks were given cores: n as the
+// running-task cap, on a CPU budget of at least n one-core tasks.
+func setTestSlots(cfg *config.Config, n int) {
+	cfg.MaxRunningTasks = n
+	if cfg.ResourceLimits.MaxCPUCores < n {
+		cfg.ResourceLimits.MaxCPUCores = n
 	}
 }
 

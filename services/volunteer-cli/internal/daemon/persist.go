@@ -44,6 +44,12 @@ type PersistedTask struct {
 	// quit that suspended the unit leaves the container paused; without the id
 	// the relaunch re-ran the unit beside its frozen twin (TB-74).
 	ContainerID             string            `json:"container_id,omitempty"`
+	// CPUGrantCores is the cores the task was granted when it started. A task
+	// adopted on the next launch (a frozen process, a paused container) is
+	// still held to that grant, so it is booked at it again; a task run again
+	// from the start is given a new one. 0 from an older client: the adopted
+	// task is booked at its leaf's minimum.
+	CPUGrantCores int `json:"cpu_grant_cores,omitempty"`
 	// ReservedUntilUnix and FetchedAt are used for buffered (not-yet-started) tasks
 	// persisted from the prefetch queue: the reservation window drives the on-resume
 	// lapse check, and the fetch time drives the deadline-expiry check, so a restored

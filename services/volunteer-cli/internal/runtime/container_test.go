@@ -39,19 +39,11 @@ type MockDockerClient struct {
 	ContainerListFn        func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 	ContainerPauseFn       func(ctx context.Context, containerID string) error
 	ContainerUnpauseFn     func(ctx context.Context, containerID string) error
-	ContainerUpdateCPUFn   func(ctx context.Context, containerID string, quota, period int64) error
 	ContainerCPUNanosFn    func(ctx context.Context, containerID string) (uint64, error)
+	ContainerExecOutputFn  func(ctx context.Context, containerID string, cmd []string) ([]byte, error)
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
-	// CPUUpdates records every ContainerUpdateCPU call (TB-75).
-	CPUUpdates []CPUUpdateCall
-}
-
-// CPUUpdateCall is one recorded ContainerUpdateCPU call.
-type CPUUpdateCall struct {
-	ContainerID   string
-	Quota, Period int64
 }
 
 func (m *MockDockerClient) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
@@ -61,12 +53,11 @@ func (m *MockDockerClient) ContainerCPUNanos(ctx context.Context, containerID st
 	return 0, nil
 }
 
-func (m *MockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
-	m.CPUUpdates = append(m.CPUUpdates, CPUUpdateCall{ContainerID: containerID, Quota: quota, Period: period})
-	if m.ContainerUpdateCPUFn != nil {
-		return m.ContainerUpdateCPUFn(ctx, containerID, quota, period)
+func (m *MockDockerClient) ContainerExecOutput(ctx context.Context, containerID string, cmd []string) ([]byte, error) {
+	if m.ContainerExecOutputFn != nil {
+		return m.ContainerExecOutputFn(ctx, containerID, cmd)
 	}
-	return nil
+	return nil, fmt.Errorf("exec not configured")
 }
 
 func (m *MockDockerClient) Ping(ctx context.Context) error {

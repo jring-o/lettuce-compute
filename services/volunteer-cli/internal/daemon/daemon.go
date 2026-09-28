@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -315,6 +316,9 @@ type Daemon struct {
 	notices *NoticeLog
 	// vmNotices de-duplicates the VM-clip notices' re-evaluation (TB-92).
 	vmNotices vmNoticeState
+	// cpuThrottle tracks the running tasks' CPU throttling between readings
+	// (cpu_throttle.go).
+	cpuThrottle cpuThrottleWatch
 
 	// Per-head version and update-required state (see head_status.go),
 	// keyed by gRPC address. Seeded at start-up from registration, then kept
@@ -591,10 +595,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.mu.Unlock()
 	}()
 
-	maxSlots := d.cfg.MaxConcurrentTasks
-	if maxSlots <= 0 {
-		maxSlots = 1
-	}
+	slotPool := slotPoolSize(d.cfg)
 
 	serverNames := make([]string, len(d.multiClient.Servers()))
 	for i, s := range d.multiClient.Servers() {
@@ -603,7 +604,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.logger.Info("daemon started",
 		"servers", serverNames,
 		"server_count", len(serverNames),
-		"max_concurrent_tasks", maxSlots,
+		"max_cpu_cores", d.cfg.ResourceLimits.MaxCPUCores,
+		"max_running_tasks", d.cfg.MaxRunningTasks,
 		"runtimes", d.runtimeRegistry.AvailableRuntimes(),
 		"scheduling_mode", d.cfg.Scheduling.Mode,
 	)
@@ -652,8 +654,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is governed by work_buffer_hours (see workBufferFull); the queue's hard
 	// maxDepth is only a safety ceiling on descriptor count, so it is set well
 	// above the hours target to avoid being the binding constraint.
-	d.slotManager = NewSlotManager(maxSlots, d.logger)
-	d.slotManager.SetCPUShareSource(d.currentCPUShares)
+	d.slotManager = NewSlotManager(slotPool, d.logger)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 
 	// Pace this process's own transfers to the configured bandwidth limit
@@ -735,6 +736,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// out. This goroutine keeps running across pauses and outlives every fetcher
 	// restart.
 	go d.runBufferMaintenance(ctx)
+	go d.runCPUThrottleWatch(ctx)
 
 	// Late container-engine detection (TB-59): while no container runtime is
 	// registered and a head is trusted for one, keep probing for an engine so
@@ -938,10 +940,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wu := result.WU
 	conn := result.Conn
-
-	// The slot is already inactive: the survivors share the CPU budget among
-	// fewer tasks from now on (TB-75).
-	d.rebalanceCPUShares()
 
 	if result.Err != nil {
 		if errors.Is(result.Err, context.Canceled) {
@@ -1205,8 +1203,8 @@ func (d *Daemon) heldWorkUnits() []*runtime.WorkUnit {
 		seen[wu.ID] = struct{}{}
 		held = append(held, wu)
 	}
-	if d.prefetchQueue != nil {
-		queued, starting := d.prefetchQueue.HeldSnapshot()
+	if q := d.prefetchQueue; q != nil {
+		queued, starting := q.HeldSnapshot()
 		for _, item := range queued {
 			add(item.WU)
 		}
@@ -1214,8 +1212,8 @@ func (d *Daemon) heldWorkUnits() []*runtime.WorkUnit {
 			add(item.WU)
 		}
 	}
-	if d.slotManager != nil {
-		for _, wu := range d.slotManager.ActiveWorkUnits() {
+	if sm := d.slotManager; sm != nil {
+		for _, wu := range sm.ActiveWorkUnits() {
 			add(wu)
 		}
 	}
@@ -1285,27 +1283,24 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 			return // no available slots
 		}
 
-		item := d.prefetchQueue.PopFit(func(it *PreFetchItem) bool {
-			ok, reason := d.canAccommodateWU(it.WU)
-			if !ok {
-				// Once per unit at Info, then Debug: this check runs on a
-				// 1-second tick, and per-check Info was ~30k identical
-				// lines/day on a machine waiting for capacity (TB-23).
-				// The Debug follow-up is logged only when the kind of
-				// reason changes, for the same tick (TB-91).
-				kind := refusalKind(reason)
-				if it.BlockedSince.IsZero() {
-					it.BlockedSince = time.Now()
-					d.logger.Info("buffered work unit waiting for capacity",
-						"work_unit_id", it.WU.ID, "leaf_id", it.WU.LeafID, "reason", reason)
-				} else if kind != it.BlockedReason {
-					d.logger.Debug("buffered work unit still waiting for capacity",
-						"work_unit_id", it.WU.ID, "reason", reason)
-				}
-				it.BlockedReason = kind
+		picker := d.newSlotPicker(func(it *PreFetchItem, reason string) {
+			// Once per unit at Info, then Debug: this check runs on a
+			// 1-second tick, and per-check Info was ~30k identical
+			// lines/day on a machine waiting for capacity (TB-23).
+			// The Debug follow-up is logged only when the kind of
+			// reason changes, for the same tick (TB-91).
+			kind := refusalKind(reason)
+			if it.BlockedSince.IsZero() {
+				it.BlockedSince = time.Now()
+				d.logger.Info("buffered work unit waiting for capacity",
+					"work_unit_id", it.WU.ID, "leaf_id", it.WU.LeafID, "reason", reason)
+			} else if kind != it.BlockedReason {
+				d.logger.Debug("buffered work unit still waiting for capacity",
+					"work_unit_id", it.WU.ID, "reason", reason)
 			}
-			return ok
-		}, d.itemMayDelay)
+			it.BlockedReason = kind
+		})
+		item := d.prefetchQueue.PopFit(picker.fits, d.itemMayDelay, picker.holds)
 		if item == nil {
 			// Queue empty, nothing currently fits, or backfill is held for a
 			// starved unit — return the slot and wait for capacity to change.
@@ -1319,11 +1314,16 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 		// A unit is starting: the next dead end is news again.
 		d.slotFillLog.outcome = ""
 
+		// The cores it is given, decided now against the running tasks and the
+		// units still waiting, and kept for its whole run.
+		item.WU.CPUGrant = d.grantCPU(item.WU, d.waitingUnits())
+
 		startAttrs := []any{
 			"work_unit_id", item.WU.ID,
 			"leaf_id", item.WU.LeafID,
 			"slot", slotID,
 			"server", item.Conn.Name,
+			"cpu_cores", item.WU.CPUGrant.Cores,
 		}
 		if !item.BlockedSince.IsZero() {
 			startAttrs = append(startAttrs, "waited_for_capacity", time.Since(item.BlockedSince).Round(time.Second).String())
@@ -1340,10 +1340,6 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 			}
 		} else {
 			d.persistActiveTasks()
-			// One more task shares the CPU budget: shrink the others' shares
-			// to the new equal split (TB-75). The newcomer reads the same
-			// split when its runtime starts it.
-			d.rebalanceCPUShares()
 		}
 		// End the handoff only now: on success the active slot carries the unit
 		// (set before StartSlot returned), on failure it was abandoned to the
@@ -1383,7 +1379,7 @@ func refusalKind(reason string) string {
 }
 
 // canAccommodateWU checks whether there are enough resources to run the WU
-// before admitting it to a slot. It applies four guards (only run
+// before admitting it to a slot. It applies these guards (only run
 // what the machine can actually fit):
 //
 //  1. Configured budget — the sum of declared per-WU memory across active slots
@@ -1403,11 +1399,18 @@ func refusalKind(reason string) string {
 //     was ample doesn't start after the disk filled up (TB-24). A refused unit
 //     waits in the buffer like a memory-refused one; the head's reservation
 //     expiry reclaims it if space never frees.
+//  5. Running-task cap — max_running_tasks, when the volunteer set one.
+//  6. CPU budget — the running tasks' grants plus this unit's minimum cores
+//     within max_cpu_cores (and container work within the engine VM's CPUs).
 //
 // On refusal it returns the human-readable reason; it logs nothing itself —
 // callers run it on a 1-second tick and own the throttling (TB-23).
 func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
-	if d.slotManager == nil {
+	// One read of the slot manager: the daemon clears it when it stops, while
+	// the fetcher may still be asking (it reaches here through the idle-slot
+	// and fit checks).
+	sm := d.slotManager
+	if sm == nil {
 		return true, ""
 	}
 
@@ -1432,7 +1435,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// within max_memory_mb.
 	hostMemoryMB := d.HostMemoryBudgetMB()
 	if hostMemoryMB > 0 {
-		activeMemoryMB := d.slotManager.TotalActiveMemoryMB(d.bookedMemMB)
+		activeMemoryMB := sm.TotalActiveMemoryMB(d.bookedMemMB)
 		if activeMemoryMB+wuMemoryMB > hostMemoryMB {
 			return false, fmt.Sprintf("configured memory budget: %d MB active + %d MB unit exceeds max_memory_mb %d",
 				activeMemoryMB, wuMemoryMB, hostMemoryMB)
@@ -1445,7 +1448,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// start beside a 768 MB container on a 1,024 MB limit.
 	if vmMemoryMB := d.ContainerMemoryBudgetMB(); isContainerUnit(wu) && vmMemoryMB > 0 &&
 		(hostMemoryMB <= 0 || vmMemoryMB < hostMemoryMB) {
-		activeContainerMB := d.slotManager.TotalActiveMemoryMB(d.bookedContainerMemMB)
+		activeContainerMB := sm.TotalActiveMemoryMB(d.bookedContainerMemMB)
 		if activeContainerMB+wuMemoryMB > vmMemoryMB {
 			return false, fmt.Sprintf("container memory budget: %d MB of container work active + %d MB unit exceeds the %d MB the container engine's VM can hold",
 				activeContainerMB, wuMemoryMB, vmMemoryMB)
@@ -1463,9 +1466,9 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// 3. GPU exclusivity: one GPU work unit per physical GPU.
 	if wu.ExecutionSpec.GPURequired {
 		gpuCount := len(d.advertisedHardware().GetGpus())
-		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
+		if gpuCount > 0 && sm.ActiveGPUCount() >= gpuCount {
 			return false, fmt.Sprintf("all GPUs busy: %d of %d running GPU work units",
-				d.slotManager.ActiveGPUCount(), gpuCount)
+				sm.ActiveGPUCount(), gpuCount)
 		}
 	}
 
@@ -1478,17 +1481,25 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 		}
 	}
 
-	// 5. Configured CPU budget (TB-75): the cores booked by the running tasks
-	// plus this unit's must stay within max_cpu_cores, and a container unit's,
-	// with the other container tasks', within the container engine VM's CPUs
-	// (TB-85). Each unit books its leaf's minimum core requirement, floor 1,
-	// so the equal share the running tasks are given never drops below what a
-	// leaf declared it needs — and at most budget tasks run at once, whatever
-	// max_concurrent_tasks allows.
+	// 5. The optional cap on running tasks (max_running_tasks). Checked
+	// before the CPU budget, so a refusal for cores means every other check
+	// passed (coreWaitFor).
+	if limit := d.maxRunningTasks(); limit > 0 {
+		if running := sm.ActiveCount(); running >= limit {
+			return false, fmt.Sprintf("running tasks cap: %d task(s) running, max_running_tasks is %d", running, limit)
+		}
+	}
+
+	// 6. Configured CPU budget (TB-75): the cores granted to the
+	// running tasks plus this unit's minimum must stay within max_cpu_cores,
+	// and a container unit's, with the other container tasks', within the
+	// container engine VM's CPUs (TB-85). How many run at once follows: N
+	// cores run up to N one-core tasks, fewer wider ones. Always the last
+	// check (coreWaitFor).
 	wuCores := d.bookedCPUCores(wu)
 	hostCores := d.HostCPUBudgetCores()
 	if hostCores > 0 {
-		activeCores := d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+		activeCores := sm.TotalActiveCPUCores(d.bookedCPUCores)
 		if activeCores+wuCores > hostCores {
 			return false, fmt.Sprintf("configured CPU budget: %d core(s) booked by running tasks + %d for this unit exceeds max_cpu_cores %d",
 				activeCores, wuCores, hostCores)
@@ -1496,7 +1507,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	}
 	if vmCores := d.ContainerCPUBudgetCores(); isContainerUnit(wu) && vmCores > 0 &&
 		(hostCores <= 0 || vmCores < hostCores) {
-		activeContainerCores := d.slotManager.TotalActiveCPUCores(d.bookedContainerCPUCores)
+		activeContainerCores := sm.TotalActiveCPUCores(d.bookedContainerCPUCores)
 		if activeContainerCores+wuCores > vmCores {
 			return false, fmt.Sprintf("container CPU budget: %d core(s) booked by running container tasks + %d for this unit exceeds the %d CPUs of the container engine's VM",
 				activeContainerCores, wuCores, vmCores)
@@ -1820,13 +1831,160 @@ const workBufferQueueDepth = 256
 // (TB-84): from then on the learned median books every unit.
 const fallbackBufferUnitsPerSlot = 2
 
-// maxSlots returns the configured concurrent-task count (>= 1).
+// maxSlots is how many tasks this machine can run at once (>= 1): the most
+// units of any one enabled leaf the CPU and memory budgets hold together
+// (runnableAtOnce), bounded by max_running_tasks when the volunteer set one
+// and by the slot pool. The work buffer and the idle-slot diagnostics count
+// in these slots — work_buffer_hours per task that can run. It used to be
+// max_concurrent_tasks, which defaulted to 1 whatever the budgets allowed
+//.
 func (d *Daemon) maxSlots() int {
-	n := d.cfg.MaxConcurrentTasks
-	if n <= 0 {
+	n := d.runnableAtOnce()
+	if limit := d.maxRunningTasks(); limit > 0 && limit < n {
+		n = limit
+	}
+	if sm := d.slotManager; sm != nil {
+		if pool := sm.Size(); pool < n {
+			n = pool
+		}
+	}
+	if n < 1 {
 		n = 1
 	}
 	return n
+}
+
+// maxRunningTasks is the volunteer's optional cap on running tasks
+// (max_running_tasks); 0 when none is set.
+func (d *Daemon) maxRunningTasks() int {
+	if d.cfg == nil || d.cfg.MaxRunningTasks < 0 {
+		return 0
+	}
+	return d.cfg.MaxRunningTasks
+}
+
+// runnableAtOnce is the most units of one enabled leaf the budgets run
+// together: for each leaf, its runtime's CPU budget over the leaf's minimum
+// cores and its memory budget over the leaf's booked memory, whichever is
+// fewer; the largest of those. With no leaf known yet it is the CPU budget
+// (one-core units). An upper bound for a mix of leafs, which run fewer
+// together than the most parallel of them alone.
+func (d *Daemon) runnableAtOnce() int {
+	best := 0
+	for _, leaf := range d.allEnabledLeafs() {
+		if n := d.leafRunnableAtOnce(leaf); n > best {
+			best = n
+		}
+	}
+	if best == 0 {
+		best = d.HostCPUBudgetCores()
+	}
+	return best
+}
+
+// leafRunnableAtOnce is how many units of leaf the budgets of its runtime
+// run together, each at its minimum cores and booked memory (at least one).
+func (d *Daemon) leafRunnableAtOnce(leaf CachedLeafInfo) int {
+	cores, memMB := d.HostCPUBudgetCores(), d.HostMemoryBudgetMB()
+	if requiredRuntimeForLeaf(leaf) == runtime.RuntimeContainer {
+		cores, memMB = d.ContainerCPUBudgetCores(), d.ContainerMemoryBudgetMB()
+	}
+	n := math.MaxInt32
+	if cores > 0 {
+		minCores, _ := coreRangeOf(leaf)
+		if minCores > cores {
+			minCores = cores
+		}
+		n = cores / minCores
+	}
+	if memMB > 0 && leaf.ExecutionSpec != nil {
+		if booked := runtime.BookedMemMB(int(leaf.ExecutionSpec.MaxMemoryMB), memMB); booked > 0 && memMB/booked < n {
+			n = memMB / booked
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// slotPoolSize is how many execution slots the daemon allocates at start: as
+// many as the machine has CPUs, or the configured core budget or task cap if
+// either is larger. Every task holds at least one core, so no more can run at
+// once; admission, not the pool, decides how many do.
+func slotPoolSize(cfg *config.Config) int {
+	n := goruntime.NumCPU()
+	if cfg != nil {
+		if cfg.ResourceLimits.MaxCPUCores > n {
+			n = cfg.ResourceLimits.MaxCPUCores
+		}
+		if cfg.MaxRunningTasks > n {
+			n = cfg.MaxRunningTasks
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// slotPicker asks the slot picker's questions about buffered units, for
+// PopFit and HasRunnable alike, so the watchdog asks exactly what the picker
+// asks (TB-45): fits is admission (canAccommodateWU), and passes each refusal
+// to onRefusal when that is set; holds is the cores veto (coreWait.holdsBack).
+// One picker serves one scan, remembering which units wait only for cores, so
+// each unit's admission is worked out once per scan.
+type slotPicker struct {
+	d         *Daemon
+	onRefusal func(it *PreFetchItem, reason string)
+	waits     map[*PreFetchItem]coreWait
+}
+
+func (d *Daemon) newSlotPicker(onRefusal func(it *PreFetchItem, reason string)) *slotPicker {
+	return &slotPicker{d: d, onRefusal: onRefusal, waits: make(map[*PreFetchItem]coreWait)}
+}
+
+func (p *slotPicker) fits(it *PreFetchItem) bool {
+	if it == nil || it.WU == nil {
+		return false
+	}
+	ok, reason := p.d.canAccommodateWU(it.WU)
+	if !ok {
+		if w, forCores := p.d.coreWaitFor(it.WU, reason); forCores {
+			p.waits[it] = w
+		}
+		if p.onRefusal != nil {
+			p.onRefusal(it, reason)
+		}
+	}
+	return ok
+}
+
+func (p *slotPicker) holds(blocked, candidate *PreFetchItem) bool {
+	w, waiting := p.waits[blocked]
+	return waiting && candidate != nil && candidate.WU != nil && w.holdsBack(p.d, candidate.WU)
+}
+
+// waitingForCores reports whether the scan met a unit refused only for cores.
+func (p *slotPicker) waitingForCores() bool {
+	return len(p.waits) > 0
+}
+
+// waitingUnits is the work units waiting in the buffer, in order — what a
+// starting unit's grant sets cores aside for (grantCPU).
+func (d *Daemon) waitingUnits() []*runtime.WorkUnit {
+	q := d.prefetchQueue
+	if q == nil {
+		return nil
+	}
+	queued, _ := q.HeldSnapshot()
+	wus := make([]*runtime.WorkUnit, 0, len(queued))
+	for _, it := range queued {
+		if it != nil && it.WU != nil {
+			wus = append(wus, it.WU)
+		}
+	}
+	return wus
 }
 
 // estSecondsForUnit estimates wall-clock seconds for one unit of a leaf — the
@@ -2336,33 +2494,61 @@ func (d *Daemon) workBufferFullVerdict() (bool, string) {
 // empty buffer beside an idle slot counts: a single running unit whose
 // estimate exceeds the whole hours target starves the other slot the same
 // way. A slot whose unit is mid queue→slot handoff is occupied, not idle
-// (TB-33). Cheap in the healthy case — when every slot is busy it returns
+// (TB-33). Nor is a slot whose cores are taken: when the running
+// tasks' grants leave fewer cores free than any enabled leaf's minimum, or a
+// buffered unit waits only for cores (the picker holds them for it), the
+// machine is busy or has its next unit in hand, not starved. Cheap in the
+// healthy case — when every slot is busy it returns
 // false before touching the queue.
 func (d *Daemon) idleSlotStarved() bool {
-	if d.slotManager == nil || d.prefetchQueue == nil {
+	q := d.prefetchQueue // one read: the daemon clears it when it stops
+	if d.slotManager == nil || q == nil {
 		return false
 	}
 	if d.occupiedSlots() >= d.maxSlots() {
 		return false
 	}
-	return !d.prefetchQueue.HasRunnable(func(item *PreFetchItem) bool {
-		if item.WU == nil {
-			return false
+	if d.coresTaken() {
+		return false
+	}
+	picker := d.newSlotPicker(nil)
+	if q.HasRunnable(picker.fits, d.itemMayDelay, picker.holds) {
+		return false
+	}
+	return !picker.waitingForCores()
+}
+
+// coresTaken reports whether the running tasks' grants leave fewer cores of
+// the CPU budget free than the smallest minimum of any enabled leaf, so no
+// unit could start for want of cores however many slots are counted idle.
+func (d *Daemon) coresTaken() bool {
+	free := d.runningLedger().hostCores
+	need := 0
+	for _, leaf := range d.allEnabledLeafs() {
+		if minCores, _ := coreRangeOf(leaf); need == 0 || minCores < need {
+			need = minCores
 		}
-		ok, _ := d.canAccommodateWU(item.WU)
-		return ok
-	}, d.itemMayDelay)
+	}
+	if need == 0 {
+		need = 1
+	}
+	return free < need
 }
 
 // occupiedSlots counts the slots running a unit or about to: a unit in the
 // queue→slot handoff counts as if it already occupied its slot, minus any
 // overlap with slots that just turned active.
 func (d *Daemon) occupiedSlots() int {
-	_, starting := d.prefetchQueue.HeldSnapshot()
-	occupied := d.slotManager.ActiveCount()
+	// One read of each: the daemon clears them when it stops.
+	sm, q := d.slotManager, d.prefetchQueue
+	if sm == nil || q == nil {
+		return 0
+	}
+	_, starting := q.HeldSnapshot()
+	occupied := sm.ActiveCount()
 	if len(starting) > 0 {
 		active := make(map[string]struct{})
-		for _, wu := range d.slotManager.ActiveWorkUnits() {
+		for _, wu := range sm.ActiveWorkUnits() {
 			if wu != nil {
 				active[wu.ID] = struct{}{}
 			}
@@ -2423,7 +2609,7 @@ func (d *Daemon) starvedBackfill() bool {
 // deeper than its per-machine in-flight cap — so the fetcher does not count
 // that answer toward the "connected but getting no work" diagnostic.
 func (d *Daemon) workInHandForEverySlot() bool {
-	if d.prefetchQueue == nil || d.prefetchQueue.Len() < d.maxSlots() {
+	if q := d.prefetchQueue; q == nil || q.Len() < d.maxSlots() {
 		return false
 	}
 	return !d.idleSlotStarved()
@@ -3652,6 +3838,7 @@ type CurrentTask struct {
 	ServerName            string
 	ProcessID             int
 	FetchedAt             time.Time
+	CPUCores              int // the cores the task was granted when it started (0 = no CPU limit)
 }
 
 // GetCurrentTasks returns info about all in-progress work units across all slots.
@@ -3754,7 +3941,8 @@ func (d *Daemon) GetMultiClient() *MultiServerClient {
 }
 
 // ApplyConfig applies new configuration to the running daemon without restart.
-// Changing max_concurrent_tasks requires a restart — slot count is fixed at init.
+// A changed CPU budget or max_running_tasks bounds the tasks started
+// afterwards; running tasks keep the grants they started with.
 //
 // The resource_limits block is live (TB-79): a change reaches, in this one
 // call, the budgets admission books against (they read the configuration),
@@ -3770,13 +3958,6 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	oldCfg := d.cfg
 	d.cfg = newCfg
 	d.mu.Unlock()
-
-	if oldCfg != nil && newCfg.MaxConcurrentTasks != oldCfg.MaxConcurrentTasks && oldCfg.MaxConcurrentTasks > 0 {
-		d.logger.Warn("max_concurrent_tasks changed — restart daemon to apply",
-			"old", oldCfg.MaxConcurrentTasks,
-			"new", newCfg.MaxConcurrentTasks,
-		)
-	}
 
 	// Reinitialize weights from new config.
 	d.initializeWeights()
@@ -3796,11 +3977,9 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 
 	// A raised memory limit does not raise what the container engine's VM can
 	// hold (TB-63): say so again against the new figure, or clear the notice
-	// when the limit now fits. The CPU limit likewise (TB-75) — and a changed
-	// CPU budget is re-split among the tasks already running at once.
+	// when the limit now fits. The CPU limit likewise (TB-75).
 	d.refreshContainerMemoryNotice()
 	d.refreshContainerCPUNotice()
-	d.rebalanceCPUShares()
 
 	// The yield block is live (TB-90): the monitor judges its next sample
 	// against the new thresholds, turning the setting off releases a pause it
@@ -4540,6 +4719,7 @@ func (d *Daemon) persistPendingResult(wu *runtime.WorkUnit, result SlotResult, c
 		RequestProto:     blob,
 		WallClockSeconds: wallClock,
 		CPUSeconds:       cpuSeconds,
+		CPUCores:         wu.CPUGrant.Cores,
 		CreatedAt:        time.Now().UTC(),
 	}); err != nil {
 		d.logger.Error("failed to persist pending result", "work_unit_id", wu.ID, "error", err)
@@ -4674,7 +4854,7 @@ func (d *Daemon) retryPendingResults(ctx context.Context) {
 		}
 		d.logger.Info("pending result resubmitted",
 			"work_unit_id", pr.WorkUnitID, "accepted", resp.Accepted, "server", pr.ServerName)
-		d.recordHistory(&runtime.WorkUnit{ID: pr.WorkUnitID, LeafID: pr.LeafID},
+		d.recordHistory(&runtime.WorkUnit{ID: pr.WorkUnitID, LeafID: pr.LeafID, CPUGrant: runtime.CPUGrant{Cores: pr.CPUCores}},
 			pr.WallClockSeconds, pr.CPUSeconds, resp.Accepted, pr.ServerName)
 	}
 }
@@ -4790,7 +4970,7 @@ func (d *Daemon) writeHistory(wu *runtime.WorkUnit, wallClockSeconds, cpuSeconds
 		if ran <= 0 {
 			ran = wallClockSeconds
 		}
-		d.weightedSelector.RecordCompletion(serverName, wu.LeafID, wu.ID, float64(ran))
+		d.weightedSelector.RecordCompletion(serverName, wu.LeafID, wu.ID, float64(ran), wu.CPUGrant.Cores)
 	}
 	leafName, _ := d.resolveLeafInfo(wu.LeafID)
 	if leafName == wu.LeafID {
@@ -4804,6 +4984,7 @@ func (d *Daemon) writeHistory(wu *runtime.WorkUnit, wallClockSeconds, cpuSeconds
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: wallClockSeconds,
 		CPUSeconds:       cpuSeconds,
+		CPUCores:         wu.CPUGrant.Cores,
 		ResultAccepted:   accepted,
 		Outcome:          outcome,
 	}); histErr != nil {
@@ -4893,11 +5074,11 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 				break
 			}
 
-			// Resume the frozen process. Its CPU cap was set by the previous
-			// session's limiter and cannot be rewritten by this one (the cgroup
-			// or Job Object bookkeeping died with that process), so the handle
-			// carries no CPU adjuster: it keeps the share it was given.
-			handle := NewNativeProcessHandle(pt.PID, nil)
+			// Resume the frozen process. It is still held to the CPU grant the
+			// previous session gave it (the cgroup or Job Object bookkeeping
+			// died with that session, so it cannot be changed), and it is
+			// booked at that grant again below.
+			handle := NewNativeProcessHandle(pt.PID)
 			if err := handle.Resume(); err != nil {
 				d.logger.Warn("failed to resume orphan process, will re-execute",
 					"pid", pt.PID, "error", err)
@@ -4961,6 +5142,9 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 					WUResp:    &lettucev1.WorkUnitAssignment{}, // heartbeat interval removed
 					FetchedAt: time.Now(),
 				}
+
+				// Booked at the grant it is still held to.
+				wu.CPUGrant = d.adoptedCPUGrant(wu, pt.CPUGrantCores)
 
 				if startErr := d.slotManager.StartSlot(ctx, slotID, item, d); startErr != nil {
 					d.logger.Warn("failed to start slot for resumed orphan",
@@ -5072,6 +5256,15 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			Conn:      conn,
 			WUResp:    &lettucev1.WorkUnitAssignment{}, // heartbeat interval removed
 			FetchedAt: time.Now(),
+		}
+
+		// The cores it runs on: an adopted container is still held to
+		// the grant it started with; a unit run again from the start is given
+		// a new one, beside what has resumed so far.
+		if adoptedBy != nil {
+			wu.CPUGrant = d.adoptedCPUGrant(wu, pt.CPUGrantCores)
+		} else {
+			wu.CPUGrant = d.grantCPU(wu, d.waitingUnits())
 		}
 
 		if startErr := d.slotManager.StartSlot(ctx, slotID, item, d); startErr != nil {

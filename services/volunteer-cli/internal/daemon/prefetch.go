@@ -135,12 +135,19 @@ const maxBackfillStarts = 16
 // the running work lasted, while blocking exactly the backfills that could
 // not have delayed the capped unit by one second.
 //
-// Returns nil if no acceptable item is reachable. Both predicates are called
+// holds(blocked, candidate), when non-nil, is a veto with no tolerance: it
+// reports that candidate would take capacity blocked is waiting for, and such
+// a candidate may not pass blocked at all. The daemon uses it for cores
+//: a unit waiting for more cores than are free would otherwise wait
+// behind every narrow unit that fits the moment one core frees, however many
+// of them jumped it.
+//
+// Returns nil if no acceptable item is reachable. The predicates are called
 // while holding the queue lock, so they must not call back into the queue.
-func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) *PreFetchItem {
+func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool, mayDelay, holds func(blocked, candidate *PreFetchItem) bool) *PreFetchItem {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	i := q.scanFit(fits, mayDelay)
+	i := q.scanFit(fits, mayDelay, holds)
 	if i < 0 {
 		return nil
 	}
@@ -161,18 +168,19 @@ func (q *PreFetchQueue) PopFit(fits func(*PreFetchItem) bool, mayDelay func(bloc
 }
 
 // scanFit returns the index of the first item accepted by fits that no capped
-// item ahead of it vetoes, or -1. Callers hold q.mu. Every item ahead of a
+// or holding item ahead of it vetoes, or -1. Callers hold q.mu. Every item ahead of a
 // candidate failed fits this scan (first-fit), so the veto question is exactly
 // "has this unfitting unit exhausted its tolerance for delaying jumps, and is
-// the candidate such a jump".
-func (q *PreFetchQueue) scanFit(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) int {
+// the candidate such a jump", or "does this unfitting unit hold what the
+// candidate would take".
+func (q *PreFetchQueue) scanFit(fits func(*PreFetchItem) bool, mayDelay, holds func(blocked, candidate *PreFetchItem) bool) int {
 scan:
 	for i, item := range q.items {
 		if !fits(item) {
 			continue
 		}
 		for _, ahead := range q.items[:i] {
-			if ahead.TimesSkipped >= maxBackfillStarts && mayDelay(ahead, item) {
+			if ahead.TimesSkipped >= maxBackfillStarts && mayDelay(ahead, item) || holds != nil && holds(ahead, item) {
 				continue scan
 			}
 		}
@@ -187,10 +195,10 @@ scan:
 // running a parallel whole-queue scan: TB-45's freeze stayed silent precisely
 // because the watchdog's predicate disagreed with the picker's about whether
 // the fitting unit behind a capped head was startable.
-func (q *PreFetchQueue) HasRunnable(fits func(*PreFetchItem) bool, mayDelay func(blocked, candidate *PreFetchItem) bool) bool {
+func (q *PreFetchQueue) HasRunnable(fits func(*PreFetchItem) bool, mayDelay, holds func(blocked, candidate *PreFetchItem) bool) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.scanFit(fits, mayDelay) >= 0
+	return q.scanFit(fits, mayDelay, holds) >= 0
 }
 
 // FinishStart ends a unit's queue→slot handoff: fillSlots calls it once the

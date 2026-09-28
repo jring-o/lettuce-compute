@@ -33,12 +33,14 @@ const tieEpsilon = 1e-9
 
 // WeightedSelector implements deficit-based weighted selection for both head
 // (server) and leaf levels. The deficit compares each head's and leaf's
-// share of this machine's recent compute time, as booked here, with its
-// share of the weights: a head at weight 200 is due about twice the hours of
-// one at 100, whatever its units' lengths.
+// share of this machine's recent compute time, as booked here in
+// core-seconds (seconds times the cores a unit holds), with its share
+// of the weights: a head at weight 200 is due about twice the core-hours of
+// one at 100, whatever its units' lengths and widths.
 //
-// Every buffered unit is booked at its estimated seconds and corrected to the
-// active seconds it took when it completes. The booked time fades with
+// Every buffered unit is booked at its estimated seconds times the fewest
+// cores it will be granted, and corrected to the active seconds it took times
+// the cores it was granted when it completes. The booked time fades with
 // weightBalanceHalfLife, and at start it is seeded from the recent
 // history.jsonl, so a restart continues the balance instead of starting a new
 // one. Nothing is persisted.
@@ -315,12 +317,17 @@ func (w *WeightedSelector) addLocked(serverName, leaf string, now, when time.Tim
 }
 
 // RecordAssignment books one buffered unit to its head and leaf at its
-// estimated seconds (unknownUnitSeconds when there is no estimate).
-func (w *WeightedSelector) RecordAssignment(serverName, leaf, workUnitID string, seconds float64) {
+// estimated seconds (unknownUnitSeconds when there is no estimate) times the
+// cores it will hold (at least one): a unit that runs on three cores uses
+// three times the machine of a one-core unit of the same length.
+func (w *WeightedSelector) RecordAssignment(serverName, leaf, workUnitID string, seconds float64, cores int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if seconds <= 0 {
 		seconds = unknownUnitSeconds
+	}
+	if cores > 1 {
+		seconds *= float64(cores)
 	}
 	now := w.now()
 	w.addLocked(serverName, leaf, now, now, seconds)
@@ -335,9 +342,13 @@ func (w *WeightedSelector) RecordAssignment(serverName, leaf, workUnitID string,
 }
 
 // RecordCompletion replaces a unit's booking with the active seconds it
-// took, dated as the booking was. A unit booked before this daemon started
-// (a result resent after a restart) is booked now, at those seconds.
-func (w *WeightedSelector) RecordCompletion(serverName, leaf, workUnitID string, seconds float64) {
+// took times the cores it was granted (at least one), dated as the booking
+// was. A unit booked before this daemon started (a result resent after a
+// restart) is booked now, at those seconds.
+func (w *WeightedSelector) RecordCompletion(serverName, leaf, workUnitID string, seconds float64, cores int) {
+	if cores > 1 {
+		seconds *= float64(cores)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	now := w.now()
@@ -354,7 +365,8 @@ func (w *WeightedSelector) RecordCompletion(serverName, leaf, workUnitID string,
 
 // SeedFromHistory books the runs history.jsonl recorded within
 // weightBalanceWindow, each at its active seconds (its wall-clock seconds
-// when no active figure was recorded) and dated when it completed. Every run
+// when no active figure was recorded) times the cores it was granted (one
+// for a run recorded before grants were), dated when it completed. Every run
 // counts, whatever the head made of its result: each used the machine's
 // time. Entries that name no head or leaf are skipped. It returns how many
 // runs were booked.
@@ -373,6 +385,9 @@ func (w *WeightedSelector) SeedFromHistory(entries []HistoryEntry) int {
 		}
 		if seconds <= 0 {
 			continue
+		}
+		if e.CPUCores > 1 {
+			seconds *= float64(e.CPUCores)
 		}
 		w.addLocked(e.ServerName, e.LeafID, now, e.CompletedAt, seconds)
 		seeded++

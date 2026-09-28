@@ -164,7 +164,7 @@ function makeConfig(servers: ConfigResponse["servers"] = []): ConfigResponse {
     },
     servers,
     log_level: "info",
-    max_concurrent_tasks: 1,
+    max_running_tasks: 0,
   };
 }
 

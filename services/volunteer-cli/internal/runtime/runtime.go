@@ -58,6 +58,13 @@ type WorkUnit struct {
 	// on-disk copy that could drift from the config (PB-31).
 	SourceHead string
 
+	// CPUGrant is the CPU the daemon gave this unit when it started: whole
+	// cores between its leaf's minimum and maximum, held for the whole run.
+	// The runtime enforces it and tells the task. Zero until the unit starts;
+	// a runtime driven outside the daemon (the audit runner) then uses its own
+	// fixed budget.
+	CPUGrant CPUGrant
+
 	// Checkpoint fields (from RequestWorkUnitResponse)
 	HasCheckpoint             bool  // true if a checkpoint exists for this reassigned WU
 	CheckpointSequence        int32 // sequence number of the latest checkpoint

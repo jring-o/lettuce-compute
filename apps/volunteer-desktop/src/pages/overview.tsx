@@ -114,6 +114,15 @@ function ActiveTaskCard({ task, actions, isVizActive }: { task: ActiveTaskInfo; 
               {runtime.label}
             </span>
           )}
+          {(task.cpu_cores ?? 0) > 0 && (
+            <span
+              className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+              title="The cores this task was given when it started. It is held to them for its whole run."
+              data-testid="task-cpu-cores"
+            >
+              {task.cpu_cores} {task.cpu_cores === 1 ? "core" : "cores"}
+            </span>
+          )}
           {task.viz_bundle_path && (
             <span className="inline-flex items-center rounded border border-indigo-500/20 bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-medium text-indigo-600">
               Viz

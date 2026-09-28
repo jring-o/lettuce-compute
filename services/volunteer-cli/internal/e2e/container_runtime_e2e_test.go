@@ -137,12 +137,12 @@ func (m *mockDockerClient) ContainerUnpause(ctx context.Context, containerID str
 	return nil
 }
 
-func (m *mockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
-	return nil
-}
-
 func (m *mockDockerClient) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
 	return 0, nil
+}
+
+func (m *mockDockerClient) ContainerExecOutput(ctx context.Context, containerID string, cmd []string) ([]byte, error) {
+	return nil, nil
 }
 
 func (m *mockDockerClient) Close() error { return nil }

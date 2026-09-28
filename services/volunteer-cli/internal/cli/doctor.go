@@ -158,6 +158,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		caps.maxDiskMB, cfg.ResourceLimits.MaxDiskGB), "")
 	checkBandwidth(rep, cfg.ResourceLimits.MaxBandwidthMbps)
 	checkCPUBudget(rep, caps)
+	checkCPUGrants(rep, cfg.ResourceLimits.MaxCPUCores, cfg.DataDir)
 	// The affinity fallback confines native work, which the configured limit
 	// bounds (TB-85), not container work's VM-clipped figure.
 	checkCPUEnforcement(rep, caps.configCPUCores)
@@ -659,9 +660,10 @@ func checkContainer(rep *doctorReport, logger *slog.Logger) (usable bool, vmMemo
 }
 
 // checkCPUBudget prints the CPU budgets heads are told — the most CPU Lettuce
-// uses on this machine, shared equally by every running task (TB-75). Before
-// this the line read as a per-task figure and, in fact, was one: every task
-// got the whole number, so N tasks could use N times it. On a host whose
+// uses on this machine, which every running task's grant together stays
+// within (TB-75). Before TB-75 the line read as a per-task figure and,
+// in fact, was one: every task got the whole number, so N tasks could use N
+// times it. On a host whose
 // container engine runs inside a VM, container work's budget is the
 // configured limit clipped to the VM's vCPUs, and the line names both — the
 // VM bounds container leafs only, native and WebAssembly work gets the whole
@@ -671,17 +673,52 @@ func checkCPUBudget(rep *doctorReport, caps volunteerCaps) {
 	switch {
 	case caps.cpuLimitedByVM:
 		rep.add(docInfo, "cpu limit",
-			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) for native and WebAssembly work, shared equally by all running tasks; container work is limited to %d, the CPUs of the virtual machine the container engine runs inside — a head only sends container leafs whose required cores fit under %d; to run bigger ones, give the machine more CPUs (Podman: `podman machine set --cpus`; Podman Desktop or Docker Desktop: Settings → Resources)",
+			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) for native and WebAssembly work — each running task is given the cores its leaf can use, together within this; container work is limited to %d, the CPUs of the virtual machine the container engine runs inside — a head only sends container leafs whose required cores fit under %d; to run bigger ones, give the machine more CPUs (Podman: `podman machine set --cpus`; Podman Desktop or Docker Desktop: Settings → Resources)",
 				caps.configCPUCores, caps.containerVMCPUs, caps.maxCPUCores), "")
 	case caps.containerVMCPUs > 0:
 		rep.add(docInfo, "cpu limit",
-			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — the most Lettuce uses on this machine, shared equally by all running tasks; a head only sends leafs whose required cores fit under this; the container engine's virtual machine has %d CPUs, enough to honor it",
+			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — the most Lettuce uses on this machine: each running task is given the cores its leaf can use, together within this; a head only sends leafs whose required cores fit under this; the container engine's virtual machine has %d CPUs, enough to honor it",
 				caps.maxCPUCores, caps.containerVMCPUs), "")
 	default:
 		rep.add(docInfo, "cpu limit",
-			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — the most Lettuce uses on this machine, shared equally by all running tasks; a head only sends leafs whose required cores fit under this",
+			fmt.Sprintf("%d cores (resource_limits.max_cpu_cores) — the most Lettuce uses on this machine: each running task is given the cores its leaf can use, together within this; a head only sends leafs whose required cores fit under this",
 				caps.maxCPUCores), "")
 	}
+}
+
+// checkCPUGrants lists the cores each running task was granted, read
+// from the running daemon: each task holds its grant for its whole run, and
+// the grants together stay within the CPU limit. A change to the limit
+// applies to tasks started afterwards, which is why a running task can hold
+// more or fewer cores than a new one would get. Nothing is printed when no
+// daemon answers or nothing runs.
+func checkCPUGrants(rep *doctorReport, limit int, dataDir string) {
+	var resp struct {
+		ActiveTasks []struct {
+			LeafName string `json:"leaf_name"`
+			CPUCores int    `json:"cpu_cores"`
+		} `json:"active_tasks"`
+	}
+	if err := managementGet(dataDir, "/api/v1/status", &resp); err != nil || len(resp.ActiveTasks) == 0 {
+		return
+	}
+	parts := make([]string, 0, len(resp.ActiveTasks))
+	total := 0
+	for _, t := range resp.ActiveTasks {
+		name := t.LeafName
+		if name == "" {
+			name = "a task"
+		}
+		if t.CPUCores > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", name, t.CPUCores))
+			total += t.CPUCores
+		} else {
+			parts = append(parts, name+" (not held to a core count)")
+		}
+	}
+	rep.add(docInfo, "cpu grants",
+		fmt.Sprintf("%s — %d of %d cores granted to running tasks; each task keeps the cores it was given until it finishes, so a changed limit applies to tasks started afterwards",
+			strings.Join(parts, ", "), total, limit), "")
 }
 
 // checkMemoryBudget prints the memory budgets heads are told. On a host whose

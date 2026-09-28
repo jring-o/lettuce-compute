@@ -43,24 +43,38 @@ The flow you'll follow:
 
 ---
 
-## Sizing your worker pool (recommended)
+## Declaring your cores and sizing your worker pool (recommended)
 
-A volunteer's CPU allowance is a budget for the whole machine that every running
-task shares equally, and the volunteer client caps each task at its share (a
-container CPU quota, a cgroup or Job Object cap for native work). Inside a
-container `os.cpu_count()` / `runtime.NumCPU()` / `nproc` still report every CPU
-of the machine, so a program that sizes its thread pool from them oversubscribes
-its cap and stalls on throttling instead of computing.
+Declare how many CPU cores one unit of your leaf can use, as a range in the leaf's
+`resource_requirements`:
 
-Size the pool from what the task was actually given instead. The client sets, for
-every runtime:
+- **`min_cpu_cores`** — the fewest cores a unit can run on. A head only sends your
+  leaf to volunteers whose CPU allowance covers it.
+- **`max_cpu_cores`** — the most cores a unit can put to use (at least
+  `min_cpu_cores`). Leave it equal to the minimum for a single-threaded program.
 
-- **`LETTUCE_CPU_LIMIT`** — the task's share in cores, possibly fractional (`2`,
-  `1.5`, `0.5`). Round it to whole threads, never below one.
+A volunteer's CPU allowance is a budget for the whole machine. When your unit
+starts, the volunteer client **grants** it whole cores between your minimum and
+maximum — as many as the machine has free once other waiting work has its minimum
+set aside — and holds the task to them for its whole run (a container CPU quota, a
+cgroup or Job Object cap for native work), at the lowest priority. A leaf that
+declares no maximum gets exactly its minimum, and the head logs a warning when
+such a leaf is activated.
+
+Inside a container `os.cpu_count()` / `runtime.NumCPU()` / `nproc` still report
+every CPU of the machine, so a program that sizes its thread pool from them
+oversubscribes its grant and stalls on throttling instead of computing; the
+volunteer is shown a notice naming your leaf when that happens. Size the pool
+from what the task was actually given instead. The client sets, for every
+runtime:
+
+- **`LETTUCE_CPU_LIMIT`** — the cores the task was granted, a whole number
+  between your leaf's minimum and maximum.
 - **`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
-  `NUMEXPR_MAX_THREADS`** — the same figure as a whole thread count, which
-  OpenMP, NumPy/SciPy (OpenBLAS/MKL) and numexpr read on their own; a library
-  that honours them needs no code change.
+  `NUMEXPR_MAX_THREADS`, `DOCLING_NUM_THREADS`** — the same figure, which OpenMP,
+  NumPy/SciPy (OpenBLAS/MKL), numexpr and Docling read on their own; a library
+  that honours them needs no code change. Size an ONNX Runtime session or any
+  other thread pool you create yourself from `LETTUCE_CPU_LIMIT`.
 
 ```python
 import math, os
@@ -73,9 +87,9 @@ workers := max(1, int(math.Round(limit)))
 ```
 
 On Linux the same figure can be read from the cgroup (`/sys/fs/cgroup/cpu.max`:
-quota ÷ period). The share is fixed for the life of the process — the cap moves
-when other tasks on the machine start or finish, but a running process is not
-told — so read it once at start-up and do not re-derive it from the CPU count.
+quota ÷ period). The grant is fixed for the life of the process, so read it once
+at start-up and do not re-derive it from the CPU count. (The samples above also
+accept a fractional figure, which clients before per-task grants could send.)
 
 ---
 
@@ -355,6 +369,10 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_disk_mb": 64,
       "max_cpu_seconds": 30
     },
+    "resource_requirements": {
+      "min_cpu_cores": 1,
+      "max_cpu_cores": 1
+    },
     "validation_config": {
       "redundancy_factor": 1,
       "agreement_threshold": 1.0,
@@ -548,6 +566,10 @@ curl -s -X PUT $HEAD/api/v1/leafs/$LEAF_ID \
       "max_disk_mb": 256,
       "max_cpu_seconds": 300
     },
+    "resource_requirements": {
+      "min_cpu_cores": 1,
+      "max_cpu_cores": 1
+    },
     "validation_config": {
       "redundancy_factor": 1,
       "agreement_threshold": 1.0,
@@ -677,8 +699,10 @@ resource needs. Check these in order:
 3. **Runtime trust.** NATIVE and CONTAINER runs are per-head opt-ins on the volunteer
    side (`lettuce-volunteer heads trust <head> …`); a WASM-only volunteer never takes
    your NATIVE leaf. `lettuce-volunteer doctor` on the volunteer shows what it will run.
-4. **Resource fit.** A volunteer only receives units whose declared memory/disk fit
-   under its configured limits — an oversized `max_memory_mb` silently matches nobody.
+4. **Resource fit.** A volunteer only receives units whose declared memory/disk and
+   `min_cpu_cores` fit under its configured limits — an oversized `max_memory_mb` or
+   minimum core count silently matches nobody (`max_cpu_cores` never excludes anyone:
+   a volunteer with fewer cores grants fewer).
    On macOS and Windows a `CONTAINER` leaf must also fit the volunteer's container
    engine virtual machine (its memory less 512 MB, and its CPUs), which is often smaller
    than the volunteer's limit; a `NATIVE` or `WASM` leaf is matched against the limit

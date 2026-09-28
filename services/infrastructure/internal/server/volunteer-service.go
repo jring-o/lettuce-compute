@@ -677,6 +677,7 @@ func (s *volunteerService) GetHeadInfo(ctx context.Context, _ *lettucev1.GetHead
 		li.ResourceRequirements = &lettucev1.LeafResourceRequirements{
 			MinDiskMb:            int64(resourceReqs.MinDiskMB),
 			MinCpuCores:          int32(resourceReqs.MinCPUCores),
+			MaxCpuCores:          int32(resourceReqs.ResolveMaxCPUCores()),
 			MinGpuVramMb:         int32(resourceReqs.MinGPUVRAMMB),
 			GpuType:              execConfig.GPUType,
 			GpuComputeCapability: derefString(resourceReqs.GPUComputeCapability),

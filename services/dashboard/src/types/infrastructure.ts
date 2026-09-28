@@ -115,6 +115,8 @@ export interface CreditConfig {
 
 export interface ResourceRequirements {
   min_cpu_cores?: number;
+  // The most cores one unit can use; 0 or missing means min_cpu_cores.
+  max_cpu_cores?: number;
   // Memory requirement = the container limit (execution_config.max_memory_mb),
   // surfaced here in list summaries. There is no separate min_memory_mb.
   max_memory_mb?: number;

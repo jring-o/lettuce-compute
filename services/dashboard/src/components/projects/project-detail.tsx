@@ -5,7 +5,7 @@ import type { AggregationResult, TaskPattern } from "@/types/infrastructure";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
-import { formatDate, formatMemory, formatNumber, LEAF_STATE_VARIANTS, TASK_PATTERN_LABELS } from "@/lib/utils";
+import { formatCoreRange, formatDate, formatMemory, formatNumber, LEAF_STATE_VARIANTS, TASK_PATTERN_LABELS } from "@/lib/utils";
 import type { Leaf, LeafStats } from "@/types/infrastructure";
 import { MarkdownRenderer } from "./markdown-renderer";
 import { ContributeSection } from "./contribute-section";
@@ -51,6 +51,10 @@ export function ProjectDetail({
 }: ProjectDetailProps) {
   const agreementRate = stats?.agreement_rate ?? null;
   const isContainer = leaf.execution_config?.runtime === "CONTAINER";
+  const cpuCoreRange = formatCoreRange(
+    leaf.resource_requirements?.min_cpu_cores ?? 1,
+    leaf.resource_requirements?.max_cpu_cores,
+  );
 
   return (
     <div data-testid="leaf-detail" className="grid gap-8 lg:grid-cols-3">
@@ -185,8 +189,7 @@ export function ProjectDetail({
             <div className="flex items-center gap-2 text-sm">
               <Cpu className="size-4 text-muted-foreground" />
               <span data-testid="cpu-requirement">
-                {leaf.resource_requirements?.min_cpu_cores ?? 1} CPU core
-                {(leaf.resource_requirements?.min_cpu_cores ?? 1) !== 1 ? "s" : ""}
+                {cpuCoreRange} CPU core{cpuCoreRange !== "1" ? "s" : ""}
               </span>
             </div>
             <div className="flex items-center gap-2 text-sm">

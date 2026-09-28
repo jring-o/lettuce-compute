@@ -60,7 +60,7 @@ func TestEnforceFallbackSetsDataLimitNotAddressSpace(t *testing.T) {
 	asBefore := readRlimit(t, pid, syscall.RLIMIT_AS)
 
 	const declaredMB = 128
-	limits := &TaskLimits{MaxMemoryMB: declaredMB, CPU: runtime.CPUGrant{ShareCores: 1, BudgetCores: 1}}
+	limits := &TaskLimits{MaxMemoryMB: declaredMB, CPU: runtime.CPUGrant{Cores: 1, BudgetCores: 1}}
 	cleanup, err := l.Enforce(pid, limits)
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
@@ -100,7 +100,7 @@ func TestEnforceFallbackLeavesMemoryUnlimitedWhenUndeclared(t *testing.T) {
 
 	before := readRlimit(t, pid, syscall.RLIMIT_DATA)
 
-	cleanup, err := l.Enforce(pid, &TaskLimits{CPU: runtime.CPUGrant{ShareCores: 1, BudgetCores: 1}})
+	cleanup, err := l.Enforce(pid, &TaskLimits{CPU: runtime.CPUGrant{Cores: 1, BudgetCores: 1}})
 	if err != nil {
 		t.Fatalf("Enforce: %v", err)
 	}

@@ -16,7 +16,7 @@ func TestSelectHead_SingleServer(t *testing.T) {
 		if got != srv {
 			t.Fatalf("iteration %d: expected alpha, got %v", i, got)
 		}
-		ws.RecordAssignment("alpha", "leaf-1", "", 600)
+		ws.RecordAssignment("alpha", "leaf-1", "", 600, 1)
 	}
 }
 
@@ -33,7 +33,7 @@ func TestSelectHead_EqualWeights(t *testing.T) {
 	for i := 0; i < n; i++ {
 		head := ws.SelectHead(available)
 		counts[head.Name]++
-		ws.RecordAssignment(head.Name, "leaf-1", "", 600)
+		ws.RecordAssignment(head.Name, "leaf-1", "", 600, 1)
 	}
 
 	// With equal weights, expect ~50/50. Chi-squared test.
@@ -61,7 +61,7 @@ func TestSelectHead_UnequalWeights(t *testing.T) {
 	for i := 0; i < n; i++ {
 		head := ws.SelectHead(available)
 		counts[head.Name]++
-		ws.RecordAssignment(head.Name, "leaf-1", "", 600)
+		ws.RecordAssignment(head.Name, "leaf-1", "", 600, 1)
 	}
 
 	// Expected: alpha=750, beta=250. Chi-squared test.
@@ -91,7 +91,7 @@ func TestSelectLeaf_EqualWeights(t *testing.T) {
 	for i := 0; i < n; i++ {
 		id := ws.SelectLeaf("srv", leafs)
 		counts[id]++
-		ws.RecordAssignment("srv", id, "", 600)
+		ws.RecordAssignment("srv", id, "", 600, 1)
 	}
 
 	// Each should be ~300. Chi-squared test with 2 df, p<0.01 critical = 9.210.
@@ -120,7 +120,7 @@ func TestSelectLeaf_UnequalWeights(t *testing.T) {
 	for i := 0; i < n; i++ {
 		id := ws.SelectLeaf("srv", leafs)
 		counts[id]++
-		ws.RecordAssignment("srv", id, "", 600)
+		ws.RecordAssignment("srv", id, "", 600, 1)
 	}
 
 	// Expected: a=500, b=300, c=200.
@@ -159,9 +159,9 @@ func fixedClock(start time.Time) (now func() time.Time, advance func(time.Durati
 func TestRecordAssignment_BooksSeconds(t *testing.T) {
 	ws := NewWeightedSelector()
 	ws.now, _ = fixedClock(time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
-	ws.RecordAssignment("srv-a", "leaf-1", "u1", 600)
-	ws.RecordAssignment("srv-a", "leaf-1", "u2", 600)
-	ws.RecordAssignment("srv-a", "leaf-2", "u3", 3000)
+	ws.RecordAssignment("srv-a", "leaf-1", "u1", 600, 1)
+	ws.RecordAssignment("srv-a", "leaf-1", "u2", 600, 1)
+	ws.RecordAssignment("srv-a", "leaf-2", "u3", 3000, 1)
 
 	if got := ws.HeadBookedSeconds("srv-a"); got != 4200 {
 		t.Errorf("head booked = %g, want 4200", got)
@@ -173,7 +173,7 @@ func TestRecordAssignment_BooksSeconds(t *testing.T) {
 		t.Errorf("leaf-2 booked = %g, want 3000", got)
 	}
 	// A unit nothing estimates yet is booked at unknownUnitSeconds.
-	ws.RecordAssignment("srv-a", "leaf-3", "u4", 0)
+	ws.RecordAssignment("srv-a", "leaf-3", "u4", 0, 1)
 	if got := ws.BookedSeconds("srv-a", "leaf-3"); got != unknownUnitSeconds {
 		t.Errorf("unknown unit booked = %g, want %g", got, unknownUnitSeconds)
 	}
@@ -185,12 +185,12 @@ func TestBookedSeconds_FadeWithTheHalfLife(t *testing.T) {
 	ws := NewWeightedSelector()
 	var advance func(time.Duration)
 	ws.now, advance = fixedClock(time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
-	ws.RecordAssignment("srv", "leaf", "u1", 3600)
+	ws.RecordAssignment("srv", "leaf", "u1", 3600, 1)
 	advance(weightBalanceHalfLife)
 	if got := ws.BookedSeconds("srv", "leaf"); math.Abs(got-1800) > 1e-6 {
 		t.Errorf("after one half-life = %g, want 1800", got)
 	}
-	ws.RecordAssignment("srv", "leaf", "u2", 3600)
+	ws.RecordAssignment("srv", "leaf", "u2", 3600, 1)
 	advance(weightBalanceHalfLife)
 	if got := ws.BookedSeconds("srv", "leaf"); math.Abs(got-(900+1800)) > 1e-6 {
 		t.Errorf("after two half-lives with a second booking = %g, want 2700", got)
@@ -204,21 +204,21 @@ func TestRecordCompletion_ReplacesTheEstimate(t *testing.T) {
 	ws := NewWeightedSelector()
 	var advance func(time.Duration)
 	ws.now, advance = fixedClock(time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
-	ws.RecordAssignment("srv", "leaf-a", "u1", unknownUnitSeconds)
-	ws.RecordCompletion("srv", "leaf-a", "u1", 600)
+	ws.RecordAssignment("srv", "leaf-a", "u1", unknownUnitSeconds, 1)
+	ws.RecordCompletion("srv", "leaf-a", "u1", 600, 1)
 	if got := ws.BookedSeconds("srv", "leaf-a"); math.Abs(got-600) > 1e-6 {
 		t.Errorf("after completion = %g, want 600 (the hour's estimate replaced by the ten minutes it took)", got)
 	}
 	// Corrected a half-life later, the correction fades with the booking.
-	ws.RecordAssignment("srv", "leaf-b", "u2", 1000)
+	ws.RecordAssignment("srv", "leaf-b", "u2", 1000, 1)
 	advance(weightBalanceHalfLife)
-	ws.RecordCompletion("srv", "leaf-b", "u2", 3000)
+	ws.RecordCompletion("srv", "leaf-b", "u2", 3000, 1)
 	if got := ws.BookedSeconds("srv", "leaf-b"); math.Abs(got-1500) > 1e-6 {
 		t.Errorf("late completion = %g, want 1500 (3000 s booked a half-life ago)", got)
 	}
 	// A completion never booked here is booked now; a second completion of
 	// the same unit is then a new booking too, never a double correction.
-	ws.RecordCompletion("srv", "leaf-c", "u3", 700)
+	ws.RecordCompletion("srv", "leaf-c", "u3", 700, 1)
 	if got := ws.BookedSeconds("srv", "leaf-c"); got != 700 {
 		t.Errorf("unbooked completion = %g, want 700", got)
 	}

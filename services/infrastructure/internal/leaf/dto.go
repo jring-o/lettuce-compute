@@ -82,6 +82,7 @@ type resourceSubset struct {
 	GPUType      string `json:"gpu_type,omitempty"`
 	GPUMinVRAMMB int    `json:"gpu_min_vram_mb,omitempty"`
 	MinCPUCores  int    `json:"min_cpu_cores"`
+	MaxCPUCores  int    `json:"max_cpu_cores"`
 	MaxMemoryMB  int    `json:"max_memory_mb"`
 }
 
@@ -108,6 +109,7 @@ func ToLeafSummary(p *Leaf) LeafSummary {
 			GPUType:      p.ExecutionConfig.GPUType,
 			GPUMinVRAMMB: p.ResourceRequirements.MinGPUVRAMMB,
 			MinCPUCores:  p.ResourceRequirements.MinCPUCores,
+			MaxCPUCores:  p.ResourceRequirements.ResolveMaxCPUCores(),
 			MaxMemoryMB:  p.ExecutionConfig.MaxMemoryMB,
 		},
 		Runtime:           p.ExecutionConfig.Runtime,

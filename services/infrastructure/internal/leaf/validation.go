@@ -958,6 +958,21 @@ func DeadlineAdequacyWarnings(p *Leaf) []string {
 	return warnings
 }
 
+// CoreRangeWarnings reports, at activation, a leaf that declares no
+// max_cpu_cores. Advisory only: such a leaf's units are each granted exactly
+// min_cpu_cores and held to them, which is right for a single-threaded program
+// but silently starves one that could use more threads — so the author is told
+// rather than left to find out from slow runs.
+func CoreRangeWarnings(p *Leaf) []string {
+	rr := p.ResourceRequirements
+	if rr.MaxCPUCores > 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"resource_requirements.max_cpu_cores is not set, so each unit is given exactly min_cpu_cores (%d) and held to them. If the program can use more threads, set max_cpu_cores to the most it can use; volunteers then grant each unit between the two and tell it the figure in LETTUCE_CPU_LIMIT.",
+		rr.MinCPUCores)}
+}
+
 // RetiredDeadlineSecondsPerMultiplier is the fixed one-hour baseline the retired
 // deadline_multiplier scaled: a multiplier m meant a deadline of m × 3600 seconds.
 const RetiredDeadlineSecondsPerMultiplier = 3600
@@ -1210,6 +1225,17 @@ func ValidateResourceRequirements(r *ResourceRequirements) *apierror.APIError {
 	if r.MinCPUCores < 1 {
 		return apierror.ValidationError("min_cpu_cores must be at least 1",
 			validationDetail{Field: "min_cpu_cores", Reason: "must_be_positive"})
+	}
+	// max_cpu_cores is optional (0: a unit gets exactly min_cpu_cores), but a
+	// declared range must be one.
+	if r.MaxCPUCores < 0 {
+		return apierror.ValidationError("max_cpu_cores must be non-negative (0 means the same as min_cpu_cores)",
+			validationDetail{Field: "max_cpu_cores", Reason: "must_be_non_negative"})
+	}
+	if r.MaxCPUCores > 0 && r.MaxCPUCores < r.MinCPUCores {
+		return apierror.ValidationError(
+			fmt.Sprintf("max_cpu_cores (%d) must be at least min_cpu_cores (%d)", r.MaxCPUCores, r.MinCPUCores),
+			validationDetail{Field: "max_cpu_cores", Reason: "below_min_cpu_cores"})
 	}
 	if r.MinDiskMB <= 0 {
 		return apierror.ValidationError("min_disk_mb must be a positive integer",

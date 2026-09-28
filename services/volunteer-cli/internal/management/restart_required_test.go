@@ -1,35 +1,29 @@
 package management
 
 import (
-	"fmt"
 	"net/http"
 	"testing"
 )
 
-// max_concurrent_tasks is fixed when the daemon starts (it is the slot
-// count), so a change to it needs a restart just as a trust change does; an
-// unchanged value does not.
-func TestUpdateConfig_MaxConcurrentTasksRequiresRestart(t *testing.T) {
+// max_running_tasks is live: the cap bounds the next task admitted, so a
+// change to it needs no restart (the retired max_concurrent_tasks it replaces
+// was the slot count, fixed when the daemon started). It is saved and
+// returned as sent.
+func TestUpdateConfig_MaxRunningTasksIsLive(t *testing.T) {
 	env := setupTestEnv(t)
 
-	current := env.daemon.GetConfig().MaxConcurrentTasks
-	resp, body := putServers(t, env, fmt.Sprintf(`{"max_concurrent_tasks": %d}`, current))
+	resp, body := putServers(t, env, `{"max_running_tasks": 3}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %v", resp.StatusCode, body)
 	}
 	if body["restart_required"] != false {
-		t.Errorf("restart_required = %v, want false when max_concurrent_tasks is unchanged", body["restart_required"])
+		t.Errorf("restart_required = %v, want false: max_running_tasks applies to the next task admitted", body["restart_required"])
 	}
-
-	resp, body = putServers(t, env, fmt.Sprintf(`{"max_concurrent_tasks": %d}`, current+1))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %v", resp.StatusCode, body)
+	if int(body["max_running_tasks"].(float64)) != 3 {
+		t.Errorf("max_running_tasks = %v, want 3", body["max_running_tasks"])
 	}
-	if body["restart_required"] != true {
-		t.Errorf("restart_required = %v, want true when max_concurrent_tasks changed", body["restart_required"])
-	}
-	if int(body["max_concurrent_tasks"].(float64)) != current+1 {
-		t.Errorf("max_concurrent_tasks = %v, want %d", body["max_concurrent_tasks"], current+1)
+	if got := env.daemon.GetConfig().MaxRunningTasks; got != 3 {
+		t.Errorf("daemon's max_running_tasks = %d, want 3 (applied without a restart)", got)
 	}
 
 	// An unrelated change alone still needs no restart.

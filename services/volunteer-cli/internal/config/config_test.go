@@ -25,8 +25,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.Leafs.Mode != "ALL" {
 		t.Errorf("default leaf mode = %q, want ALL", cfg.Leafs.Mode)
 	}
-	if cfg.MaxConcurrentTasks != 1 {
-		t.Errorf("default MaxConcurrentTasks = %d, want 1", cfg.MaxConcurrentTasks)
+	if cfg.MaxRunningTasks != 0 {
+		t.Errorf("default MaxRunningTasks = %d, want 0 (no cap)", cfg.MaxRunningTasks)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("default LogLevel = %q, want info", cfg.LogLevel)
@@ -289,8 +289,8 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "zero concurrent tasks",
-			modify:  func(c *Config) { c.MaxConcurrentTasks = 0 },
+			name:    "negative max running tasks",
+			modify:  func(c *Config) { c.MaxRunningTasks = -1 },
 			wantErr: true,
 		},
 		{

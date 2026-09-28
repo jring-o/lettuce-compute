@@ -143,7 +143,7 @@ func TestTB83_OwnCPUSecondsAddsEverySource(t *testing.T) {
 	sm.slots[0].active = true
 	sm.slots[0].processHandle = NewContainerProcessHandle(client, "c1")
 	sm.slots[1].active = true
-	sm.slots[1].processHandle = NewNativeProcessHandle(4242, nil)
+	sm.slots[1].processHandle = NewNativeProcessHandle(4242)
 
 	d := &Daemon{logger: newTestLogger(), slotManager: sm, processGroup: &fakeProcessGroup{groups: map[string]float64{"4242": 7}}}
 	self, err := runtime.SelfCPUSeconds()
@@ -203,7 +203,7 @@ func TestTB83_OwnProcessesListsActiveHandles(t *testing.T) {
 	sm.slots[0].active = true
 	sm.slots[0].processHandle = NewContainerProcessHandle(client, "abc")
 	sm.slots[1].active = true
-	sm.slots[1].processHandle = NewNativeProcessHandle(1, nil)
+	sm.slots[1].processHandle = NewNativeProcessHandle(1)
 	sm.slots[2].active = false
 	sm.slots[2].processHandle = NewContainerProcessHandle(client, "inactive")
 

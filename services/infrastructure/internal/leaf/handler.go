@@ -750,9 +750,14 @@ func (h *LeafHandler) handleTransition(w http.ResponseWriter, r *http.Request, t
 			"work_unit_deadline_seconds", p.FaultToleranceConfig.ResolveDeadlineSeconds(),
 			"deadline_source", p.FaultToleranceConfig.DeadlineSource(),
 			"max_cpu_seconds", p.ExecutionConfig.MaxCPUSeconds,
+			"min_cpu_cores", p.ResourceRequirements.MinCPUCores,
+			"max_cpu_cores", p.ResourceRequirements.ResolveMaxCPUCores(),
 		)
 		for _, warning := range DeadlineAdequacyWarnings(p) {
 			l.Warn("leaf deadline may be too short for its work", "leaf_id", id, "warning", warning)
+		}
+		for _, warning := range CoreRangeWarnings(p) {
+			l.Warn("leaf declares no core range", "leaf_id", id, "warning", warning)
 		}
 	}
 

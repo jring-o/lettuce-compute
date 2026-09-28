@@ -44,7 +44,7 @@ func TestSetByPathAllIntFields(t *testing.T) {
 		{"resource_limits.max_bandwidth_mbps", func(c *Config) int { return c.ResourceLimits.MaxBandwidthMbps }},
 		{"resource_limits.max_gpu_vram_pct", func(c *Config) int { return c.ResourceLimits.MaxGPUVRAMPct }},
 		{"scheduling.idle_threshold_mins", func(c *Config) int { return c.Scheduling.IdleThresholdMins }},
-		{"max_concurrent_tasks", func(c *Config) int { return c.MaxConcurrentTasks }},
+		{"max_running_tasks", func(c *Config) int { return c.MaxRunningTasks }},
 	}
 
 	for _, tt := range tests {
@@ -92,7 +92,7 @@ func TestGetByPathAllFields(t *testing.T) {
 	cfg.PubKeyFile = "/p"
 	cfg.VolunteerID = "vol-1"
 	cfg.LogLevel = "warn"
-	cfg.MaxConcurrentTasks = 3
+	cfg.MaxRunningTasks = 3
 	cfg.ResourceLimits.MaxCPUCores = 4
 	cfg.ResourceLimits.MaxMemoryMB = 1024
 	cfg.ResourceLimits.MaxDiskGB = 5
@@ -109,7 +109,7 @@ func TestGetByPathAllFields(t *testing.T) {
 		"pubkey_file":                    "/p",
 		"volunteer_id":                   "vol-1",
 		"log_level":                      "warn",
-		"max_concurrent_tasks":           "3",
+		"max_running_tasks":              "3",
 		"resource_limits.max_cpu_cores":  "4",
 		"resource_limits.max_memory_mb":  "1024",
 		"resource_limits.max_disk_gb":    "5",

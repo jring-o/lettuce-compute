@@ -51,7 +51,7 @@ func reasonHost(t *testing.T, heads, slots, running, queued int, reply func(h in
 	d.notices = NewNoticeLog()
 	d.headStatus = NewHeadStatusTracker()
 	d.cfg.WorkBufferHours = 2
-	d.cfg.MaxConcurrentTasks = slots
+	setTestSlots(d.cfg, slots)
 	d.cfg.ResourceLimits.MaxCPUCores = slots // keep the CPU budget out of the picture
 	d.cfg.ResourceLimits.MaxMemoryMB = 1 << 20
 	d.benchmarkFPOPS = 1

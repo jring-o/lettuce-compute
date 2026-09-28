@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -47,6 +48,7 @@ type statusActiveTask struct {
 	LeafName              string  `json:"leaf_name"`
 	HeadName              string  `json:"head_name"`
 	RuntimeType           string  `json:"runtime_type"`
+	CPUCores              int     `json:"cpu_cores"`
 	ProgressPct           int     `json:"progress_pct"`
 	ElapsedSeconds        int     `json:"elapsed_seconds"`
 	EstimatedRemainingSec *int    `json:"estimated_remaining_seconds"`
@@ -183,7 +185,7 @@ func printActiveTasks(dataDir string) {
 	} else {
 		fmt.Printf("Active tasks (%d):\n", len(sr.ActiveTasks))
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "  LEAF\tRUNTIME\tPROGRESS\tELAPSED\tETA\tSTATUS")
+		fmt.Fprintln(w, "  LEAF\tRUNTIME\tCORES\tPROGRESS\tELAPSED\tETA\tSTATUS")
 		for _, t := range sr.ActiveTasks {
 			eta := "—"
 			if t.EstimatedRemainingSec != nil {
@@ -193,9 +195,15 @@ func printActiveTasks(dataDir string) {
 			if t.StatusReason != nil && *t.StatusReason != "" {
 				status = fmt.Sprintf("%s (%s)", t.TaskStatus, *t.StatusReason)
 			}
-			fmt.Fprintf(w, "  %s\t%s\t%d%%\t%s\t%s\t%s\n",
+			// The cores the task was granted when it started and is held to.
+			cores := "—"
+			if t.CPUCores > 0 {
+				cores = strconv.Itoa(t.CPUCores)
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%d%%\t%s\t%s\t%s\n",
 				labelOrDash(t.LeafName),
 				labelOrDash(strings.ToLower(t.RuntimeType)),
+				cores,
 				t.ProgressPct,
 				formatDurationSeconds(t.ElapsedSeconds),
 				eta,

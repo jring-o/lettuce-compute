@@ -11,16 +11,16 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
-// TB-75 regression tests, Linux limiter half: the cgroup path enforces the
-// task's SHARE of the budget (fractional, rewritable), and the affinity
-// fallback — which cannot express a fraction — confines every task to the
-// same budget-sized CPU set, so the total is still bounded by the budget.
+// TB-75 regression tests, Linux limiter half: the cgroup path holds a
+// task to its grant, and the affinity fallback — which cannot hold one
+// process to a quota — confines every task to the same budget-sized CPU set,
+// so the total is still bounded by the budget.
 
-// TestTB75_CgroupCPUMaxIsTheShareAndCanBeRewritten: cpu.max carries the
-// share's exact CFS quota (1.5 cores = "150000 100000"); a rewrite replaces
-// it; a share of 0 lifts the cap. Written to a scratch directory standing in
-// for the cgroup scope, since delegation is not available on CI.
-func TestTB75_CgroupCPUMaxIsTheShareAndCanBeRewritten(t *testing.T) {
+// TestTB75_CgroupCPUMaxIsTheGrant: cpu.max carries the grant's CFS quota
+// (3 cores = "300000 100000"); a grant of 0 lifts the cap. Written to a
+// scratch directory standing in for the cgroup scope, since delegation is not
+// available on CI.
+func TestTB75_CgroupCPUMaxIsTheGrant(t *testing.T) {
 	dir := t.TempDir()
 	read := func() string {
 		b, err := os.ReadFile(filepath.Join(dir, "cpu.max"))
@@ -29,17 +29,17 @@ func TestTB75_CgroupCPUMaxIsTheShareAndCanBeRewritten(t *testing.T) {
 		}
 		return string(b)
 	}
-	if err := writeCPUMax(dir, 1.5); err != nil {
+	if err := writeCPUMax(dir, 3); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(); got != "150000 100000" {
-		t.Errorf("cpu.max for 1.5 cores = %q, want \"150000 100000\"", got)
+	if got := read(); got != "300000 100000" {
+		t.Errorf("cpu.max for 3 cores = %q, want \"300000 100000\"", got)
 	}
 	if err := writeCPUMax(dir, 2); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(); got != "200000 100000" {
-		t.Errorf("cpu.max after the rewrite to 2 cores = %q, want \"200000 100000\"", got)
+		t.Errorf("cpu.max for 2 cores = %q, want \"200000 100000\"", got)
 	}
 	if err := writeCPUMax(dir, 0); err != nil {
 		t.Fatal(err)
@@ -49,28 +49,39 @@ func TestTB75_CgroupCPUMaxIsTheShareAndCanBeRewritten(t *testing.T) {
 	}
 }
 
-// TestTB75_FallbackPinsEveryTaskToTheBudgetSet: on the affinity fallback a
-// task granted half a core of a 2-core budget is pinned to the budget's two
-// CPUs, not to one CPU (which would halve the machine's throughput) and not
-// to the whole machine (the pre-fix behaviour once N tasks were each pinned
-// to N CPUs of their own count). SetCPU re-pins to a changed budget.
-func TestTB75_FallbackPinsEveryTaskToTheBudgetSet(t *testing.T) {
+// TestFallbackPinsEachTaskToItsGrant: on the affinity fallback each
+// task is pinned to as many of the budget's CPUs as it was granted, the ones
+// the fewest running tasks are on, so a 4-core budget runs a 2-core GREP on
+// two CPUs and two 1-core tasks on one each, never beyond the budget's four;
+// a task that ends frees its CPUs for the next. Pre-fix every task was pinned
+// to the whole budget's set, so no task was held to its own grant.
+func TestFallbackPinsEachTaskToItsGrant(t *testing.T) {
 	rec := withFakeAffinity(t, []int{0, 1, 2, 3, 4, 5, 6, 7}, nil)
 	l := &LinuxLimiter{logger: testLimiter().logger, useCgroups: false}
 
-	cleanup, err := l.enforceFallback(4242, &TaskLimits{CPU: runtime.CPUGrant{ShareCores: 0.5, BudgetCores: 2}})
-	if err != nil {
-		t.Fatalf("enforceFallback: %v", err)
+	start := func(pid, cores int) (func(), []int) {
+		t.Helper()
+		cleanup, err := l.enforceFallback(pid, &TaskLimits{CPU: runtime.CPUGrant{Cores: cores, BudgetCores: 4}})
+		if err != nil {
+			t.Fatalf("enforceFallback: %v", err)
+		}
+		return cleanup, rec.cpus
 	}
-	defer cleanup()
-	if want := []int{0, 1}; !reflect.DeepEqual(rec.cpus, want) {
-		t.Errorf("pinned to %v, want the 2-core budget's set %v", rec.cpus, want)
+	endGrep, grep := start(100, 2)
+	_, bb1 := start(101, 1)
+	_, bb2 := start(102, 1)
+	for _, c := range []struct {
+		name string
+		got  []int
+		want []int
+	}{{"GREP (2 cores)", grep, []int{0, 1}}, {"first Beyblade", bb1, []int{2}}, {"second Beyblade", bb2, []int{3}}} {
+		if !reflect.DeepEqual(c.got, c.want) {
+			t.Errorf("%s pinned to %v, want %v", c.name, c.got, c.want)
+		}
 	}
 
-	if err := l.SetCPU(4242, runtime.CPUGrant{ShareCores: 1, BudgetCores: 3}); err != nil {
-		t.Fatalf("SetCPU: %v", err)
-	}
-	if want := []int{0, 1, 2}; !reflect.DeepEqual(rec.cpus, want) {
-		t.Errorf("after a budget change pinned to %v, want %v", rec.cpus, want)
+	endGrep()
+	if _, next := start(103, 2); !reflect.DeepEqual(next, []int{0, 1}) {
+		t.Errorf("after the GREP task ended the next 2-core task was pinned to %v, want the freed %v", next, []int{0, 1})
 	}
 }

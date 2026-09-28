@@ -413,6 +413,12 @@ message LeafResourceRequirements {
   // execution-spec flag reports a GPU-less machine eligible for a leaf that sets
   // just this one. Read them together, never alone.
   bool gpu_required = 6;
+  // The most cores one unit of this leaf can use. min_cpu_cores stays the
+  // dispatch gate (the fewest a unit can run on); the client grants each task
+  // between the two, as many as its CPU budget has free, holds the task to that
+  // grant and tells it the figure. 0 (a head too old to send it, or a leaf that
+  // declares none) means the same as min_cpu_cores.
+  int32 max_cpu_cores = 7;
 }
 
 // --- v0.9.0.1 Head & Leaf discovery ---

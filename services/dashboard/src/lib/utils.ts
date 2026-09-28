@@ -35,6 +35,16 @@ export function formatMemory(mb: number): string {
   return `${mb} MB`;
 }
 
+// formatCoreRange renders a leaf's CPU cores per unit: "2" when it runs on a
+// fixed count, "2–4" when it declares a range (a volunteer's client grants
+// each unit between the two). A max of 0, missing, or at or below the min means
+// no range. Returns "" when min is not set.
+export function formatCoreRange(min?: number, max?: number): string {
+  if (!min) return "";
+  if (max && max > min) return `${min}–${max}`;
+  return `${min}`;
+}
+
 /**
  * Badge variant mapping for leaf states.
  * Shared across leaf list page and leaf dashboard.

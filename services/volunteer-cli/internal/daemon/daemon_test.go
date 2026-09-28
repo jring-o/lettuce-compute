@@ -958,8 +958,6 @@ func (tl *testLimiter) Enforce(_ int, _ *resource.TaskLimits) (func(), error) {
 	return func() {}, nil
 }
 
-func (tl *testLimiter) SetCPU(_ int, _ runtime.CPUGrant) error { return nil }
-
 func (tl *testLimiter) CheckDiskSpace(_ string, _ int) error {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()

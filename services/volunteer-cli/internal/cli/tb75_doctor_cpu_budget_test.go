@@ -10,7 +10,8 @@ import (
 //
 // `doctor`'s "cpu limit" line read as a per-task figure ("a head only sends
 // leafs whose required cores fit under this") and never mentioned that the
-// number is the whole machine's budget, shared by every running task, or that
+// number is the whole machine's budget, which every running task's grant
+// stays within, or that
 // the container engine's virtual machine bounds it on macOS/Windows.
 
 // tb75VMCaps is a Mac with max_cpu_cores 6 and a 4-vCPU Podman machine, as
@@ -23,7 +24,8 @@ func tb75VMCaps() volunteerCaps {
 }
 
 // TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM: the line says the
-// figure is shared by all running tasks; when the VM bounds container work,
+// figure is a total the running tasks' grants stay within; when the
+// VM bounds container work,
 // it names both figures — the limit native and WebAssembly work keeps (TB-85)
 // and the VM's count for container work — and the machine to enlarge, as
 // information (TB-92); a VM that honors the limit says so; no VM prints the
@@ -36,7 +38,7 @@ func TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM(t *testing.T) {
 	if rep.warns != 0 {
 		t.Errorf("VM-bounded budget: warns=%d, want 0 (the clip is information)\n%s", rep.warns, out)
 	}
-	for _, want := range []string{"6 cores", "native and WebAssembly work", "container work is limited to 4", "shared equally", "podman machine set --cpus"} {
+	for _, want := range []string{"6 cores", "native and WebAssembly work", "container work is limited to 4", "each running task is given the cores its leaf can use", "podman machine set --cpus"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("cpu limit line lacks %q:\n%s", want, out)
 		}
@@ -45,7 +47,7 @@ func TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM(t *testing.T) {
 	buf.Reset()
 	rep = &doctorReport{w: &buf}
 	checkCPUBudget(rep, volunteerCaps{maxCPUCores: 2, configCPUCores: 2, containerVMCPUs: 4})
-	if rep.warns != 0 || !strings.Contains(buf.String(), "shared equally by all running tasks") || !strings.Contains(buf.String(), "4 CPUs, enough to honor it") {
+	if rep.warns != 0 || !strings.Contains(buf.String(), "each running task is given the cores its leaf can use") || !strings.Contains(buf.String(), "4 CPUs, enough to honor it") {
 		t.Errorf("VM that honors the limit: warns=%d\n%s", rep.warns, buf.String())
 	}
 
@@ -53,7 +55,7 @@ func TestTB75_DoctorCPULineSaysSharedTotalAndNamesTheVM(t *testing.T) {
 	rep = &doctorReport{w: &buf}
 	checkCPUBudget(rep, volunteerCaps{maxCPUCores: 2, configCPUCores: 2})
 	out = buf.String()
-	if rep.warns != 0 || !strings.Contains(out, "2 cores (resource_limits.max_cpu_cores)") || !strings.Contains(out, "shared equally by all running tasks") || strings.Contains(out, "virtual machine") {
+	if rep.warns != 0 || !strings.Contains(out, "2 cores (resource_limits.max_cpu_cores)") || !strings.Contains(out, "each running task is given the cores its leaf can use") || strings.Contains(out, "virtual machine") {
 		t.Errorf("no-VM line:\n%s", out)
 	}
 }

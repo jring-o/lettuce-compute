@@ -81,7 +81,7 @@ function makeConfig(): ConfigResponse {
     },
     servers: [],
     log_level: "info",
-    max_concurrent_tasks: 1,
+    max_running_tasks: 0,
     work_buffer_hours: 2,
   };
 }
@@ -200,7 +200,8 @@ describe("needsRestart and the shared restart store", () => {
     // Live since the client's TB-79 fix: re-advertised on the next poll.
     expect(needsRestart({ resource_limits: { max_cpu_cores: 2 } })).toBe(false);
     expect(needsRestart({ resource_limits: { max_memory_mb: 6912 } })).toBe(false);
-    expect(needsRestart({ max_concurrent_tasks: 2 })).toBe(true);
+    // The optional cap on running tasks bounds the next task admitted.
+    expect(needsRestart({ max_running_tasks: 2 })).toBe(false);
     expect(needsRestart({ log_level: "debug" })).toBe(true);
     expect(needsRestart({ work_buffer_hours: 3 })).toBe(false);
     expect(needsRestart({ notifications: { errors: false } })).toBe(false);

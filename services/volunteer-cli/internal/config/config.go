@@ -72,10 +72,14 @@ type Config struct {
 
 	Servers []ServerConfig `yaml:"servers,omitempty"`
 
-	MaxConcurrentTasks int     `yaml:"max_concurrent_tasks"`
-	WorkBufferHours    float64 `yaml:"work_buffer_hours"` // hours of work to keep buffered per slot (default 2.0; 0 = a small unit-count fallback)
-	LogLevel           string  `yaml:"log_level"`
-	ResultCacheMaxMB   int     `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
+	// MaxRunningTasks is an optional extra cap on how many work units run at
+	// once; 0 (the default) sets none, so the number follows from the CPU and
+	// memory budgets and the cores each task is given. It replaces the retired
+	// max_concurrent_tasks, which had to be raised before more than one task ran.
+	MaxRunningTasks  int     `yaml:"max_running_tasks"`
+	WorkBufferHours  float64 `yaml:"work_buffer_hours"` // hours of work to keep buffered per slot (default 2.0; 0 = a small unit-count fallback)
+	LogLevel         string  `yaml:"log_level"`
+	ResultCacheMaxMB int     `yaml:"result_cache_max_mb"` // max MB for viz result cache (default 500)
 
 	// Logging output. By default logs are written to both stderr and a
 	// size-rotated JSON file under <DataDir>/logs/ so problems remain
@@ -426,15 +430,15 @@ func Defaults() *Config {
 			WindowSeconds:       30,
 			PollIntervalSeconds: 5,
 		},
-		MaxConcurrentTasks: 1,
-		WorkBufferHours:    2.0,
-		LogLevel:           "info",
-		LogToFile:          true,
-		LogToStderr:        true,
-		LogMaxSizeMB:       10,
-		LogMaxBackups:      5,
-		LogMaxAgeDays:      0,
-		ResultCacheMaxMB:   500,
+		MaxRunningTasks:  0,
+		WorkBufferHours:  2.0,
+		LogLevel:         "info",
+		LogToFile:        true,
+		LogToStderr:      true,
+		LogMaxSizeMB:     10,
+		LogMaxBackups:    5,
+		LogMaxAgeDays:    0,
+		ResultCacheMaxMB: 500,
 	}
 }
 
@@ -787,6 +791,11 @@ var deprecatedKeyHints = map[string]string{
 	// while contradicting the daemon. Name the real mechanism in the advisory.
 	"available_runtimes":   `retired: which runtimes run is decided per head by servers[].trusted_runtimes (see "lettuce-volunteer heads trust") plus a live engine check at daemon start. Delete the key.`,
 	"allow_native_runtime": `retired: NATIVE is enabled per head via servers[].trusted_runtimes (see "lettuce-volunteer heads trust"). Delete the key.`,
+	// Retired when tasks began to be given the cores their leaf needs: how many
+	// run at once now follows from the CPU and memory limits, so the old default
+	// of 1 — written into nearly every config — would have kept one task running
+	// on any machine. Its value is not carried over.
+	"max_concurrent_tasks": `retired: how many tasks run at once now follows from max_cpu_cores and max_memory_mb (each task is given the cores its leaf can use). To cap the number anyway, set max_running_tasks. Delete the key.`,
 }
 
 // detectUnknownKeys re-decodes the raw config bytes with strict field checking
@@ -919,8 +928,8 @@ func applyKeyComments(m *yaml.Node, comments map[string]string) {
 // Comment maps keyed by YAML field name. Edited alongside the struct so the
 // generated config stays self-documenting.
 var topLevelConfigComments = map[string]string{
-	"max_concurrent_tasks": "Most work units that run at once. Fewer may run: the CPU, memory and GPU limits must also fit each one (with max_cpu_cores N, at most N tasks run). The thermal thresholds do not throttle how much runs. The buffer target scales with it.",
-	"work_buffer_hours":    "Hours of work to keep buffered per concurrent task. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
+	"max_running_tasks":    "Optional cap on how many work units run at once; 0 = no cap. Without one, as many run as max_cpu_cores and max_memory_mb hold: each task is given the cores its leaf can use (at least its minimum) and memory for its declared need. The buffer target scales with how many can run.",
+	"work_buffer_hours":    "Hours of work to keep buffered per task that can run at once. Larger = fewer, bigger requests; 0 = a small fixed unit count.",
 	"container_cap_add":     "Linux capabilities to re-add to hardened containers. Default none (containers drop all capabilities).",
 	"container_gpu_relax_user": "Let GPU leaves relax the non-root/minimal-capability container posture when device access needs it. CPU leaves stay fully hardened.",
 	"resource_limits":      "What this machine offers Lettuce. max_cpu_cores, max_memory_mb and max_disk_gb are totals for ALL running work together, not per task; a head also only sends leafs whose own requirement fits under them - set them too low and you silently get no work.",
@@ -930,7 +939,7 @@ var topLevelConfigComments = map[string]string{
 }
 
 var resourceLimitsComments = map[string]string{
-	"max_cpu_cores":      "Most CPU cores Lettuce uses on this machine, in total. Running tasks share them equally (a task alone gets them all) and each task books at least one core, more if its leaf needs more, so at most this many tasks run at once whatever max_concurrent_tasks says. On Windows/macOS container work is also limited to the container engine VM's CPUs.",
+	"max_cpu_cores":      "Most CPU cores Lettuce uses on this machine, in total. Each task is given the cores its leaf can use - at least the leaf's minimum, at most its maximum, as many as are free - and held to them at the lowest priority; the tasks' cores together never exceed this. So N here runs up to N one-core tasks at once. A change applies to tasks started afterwards. On Windows/macOS container work is also limited to the container engine VM's CPUs.",
 	"max_memory_mb":      "Most memory Lettuce's running work may use, in total: a unit starts only if its declared memory fits beside what is already running. A head only sends leafs whose per-unit memory fits under this; set it too low and you match no work.",
 	"max_disk_gb":        "Disk capacity you offer: a head only sends leafs whose declared disk need fits under this, and Lettuce keeps its own footprint (work folders + container images) within it. A download needs only the LEAF's declared disk free (plus a 2 GB floor), never this whole number.",
 	"max_bandwidth_mbps": "Most network speed Lettuce uses, in Mbps: its downloads together stay under this (programs, input data, checkpoints), and so do its uploads (results, checkpoints). Container image pulls are made by the container engine and are NOT limited. 0 = unlimited.",
@@ -1014,8 +1023,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.MaxConcurrentTasks < 1 {
-		return fmt.Errorf("max_concurrent_tasks must be >= 1, got %d", c.MaxConcurrentTasks)
+	if c.MaxRunningTasks < 0 {
+		return fmt.Errorf("max_running_tasks must be >= 0 (0 = no cap beyond the CPU and memory limits), got %d", c.MaxRunningTasks)
 	}
 	if c.WorkBufferHours < 0 {
 		return fmt.Errorf("work_buffer_hours must be >= 0 (0 = small unit-count fallback), got %g", c.WorkBufferHours)
@@ -1170,12 +1179,12 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
 		c.LogMaxAgeDays = v
-	case "max_concurrent_tasks":
+	case "max_running_tasks":
 		v, err := strconv.Atoi(value)
 		if err != nil {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
-		c.MaxConcurrentTasks = v
+		c.MaxRunningTasks = v
 	case "work_buffer_hours":
 		v, err := strconv.ParseFloat(value, 64)
 		if err != nil {
@@ -1331,8 +1340,8 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return strconv.Itoa(c.LogMaxBackups), nil
 	case "log_max_age_days":
 		return strconv.Itoa(c.LogMaxAgeDays), nil
-	case "max_concurrent_tasks":
-		return strconv.Itoa(c.MaxConcurrentTasks), nil
+	case "max_running_tasks":
+		return strconv.Itoa(c.MaxRunningTasks), nil
 	case "work_buffer_hours":
 		return strconv.FormatFloat(c.WorkBufferHours, 'g', -1, 64), nil
 	case "resource_limits.max_cpu_cores":
