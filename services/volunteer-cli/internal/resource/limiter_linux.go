@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -20,6 +22,12 @@ import (
 type LinuxLimiter struct {
 	logger     *slog.Logger
 	useCgroups bool
+
+	// pins records the CPUs each running task was pinned to on the affinity
+	// fallback, so the next task is pinned to the CPUs the fewest tasks are
+	// on and the tasks' grants spread across the budget's CPUs.
+	pinMu sync.Mutex
+	pins  map[int][]int
 }
 
 func newPlatformLimiter(logger *slog.Logger) Limiter {
@@ -65,27 +73,63 @@ func (l *LinuxLimiter) Apply(cmd *exec.Cmd, limits *TaskLimits) error {
 	return nil
 }
 
-// Enforce applies post-start resource limits (cgroups or prlimit+affinity).
+// Enforce applies post-start resource limits (cgroups or prlimit+affinity),
+// and on either path runs the task at the lowest priority.
 func (l *LinuxLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
+	l.lowerPriority(pid)
 	if l.useCgroups {
 		return l.enforceCgroups(pid, limits)
 	}
 	return l.enforceFallback(pid, limits)
 }
 
-// SetCPU gives a running task its new share of the CPU budget (TB-75): on
-// the cgroup path its cpu.max is rewritten to the share's quota; on the
-// affinity fallback, which cannot express a fraction, the process is pinned
-// to the budget's CPU set again (a changed budget moves the set; an unchanged
-// one is a no-op).
-func (l *LinuxLimiter) SetCPU(pid int, cpu runtime.CPUGrant) error {
-	if l.useCgroups {
-		return writeCPUMax(cgroupPathFor(pid), cpu.ShareCores)
+// lowestNice is the nice value every task runs at: the lowest priority the
+// ordinary scheduler offers, so the owner's own programs are served first
+// whenever the CPUs are contended. It lowers only the task's priority, never
+// what it may use: a task on an idle machine runs as fast as before.
+const lowestNice = 19
+
+// lowerPriority sets every thread of pid to lowestNice. On Linux a nice value
+// belongs to a thread, not to a process, and a task's runtime may already
+// have started threads by the time Enforce runs; threads and child processes
+// created afterwards inherit the value. Best-effort: a failure is logged and
+// the task runs on at the priority it had.
+func (l *LinuxLimiter) lowerPriority(pid int) {
+	var failed int
+	var lastErr error
+	tids := threadIDs(pid)
+	for _, tid := range tids {
+		// A thread that exited since the listing (ESRCH) needs nothing.
+		if err := syscall.Setpriority(syscall.PRIO_PROCESS, tid, lowestNice); err != nil && err != syscall.ESRCH {
+			failed++
+			lastErr = err
+		}
 	}
-	if cpu.BudgetCores > 0 {
-		l.applyCPUAffinity(pid, cpu.BudgetCores)
+	if failed > 0 {
+		l.logger.Warn("could not lower the task's priority; it runs at normal priority",
+			"pid", pid, "threads", len(tids), "failed", failed, "error", lastErr)
+		return
 	}
-	return nil
+	l.logger.Debug("set task priority", "pid", pid, "nice", lowestNice, "threads", len(tids))
+}
+
+// threadIDs lists the threads of pid from /proc, or pid alone when the listing
+// cannot be read.
+func threadIDs(pid int) []int {
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return []int{pid}
+	}
+	tids := make([]int, 0, len(entries))
+	for _, e := range entries {
+		if tid, err := strconv.Atoi(e.Name()); err == nil {
+			tids = append(tids, tid)
+		}
+	}
+	if len(tids) == 0 {
+		return []int{pid}
+	}
+	return tids
 }
 
 // cgroupPathFor is the per-process cgroup v2 scope the cgroup path creates.
@@ -93,17 +137,27 @@ func cgroupPathFor(pid int) string {
 	return fmt.Sprintf("/sys/fs/cgroup/lettuce-%d", pid)
 }
 
-// writeCPUMax sets a cgroup's CPU bandwidth to shareCores: cpu.max =
-// "{quota} {period}" with quota = share × period, so 1.5 cores is
-// "150000 100000". A share of 0 lifts the cap ("max 100000").
-func writeCPUMax(cgroupPath string, shareCores float64) error {
-	quota, period := runtime.CFSQuota(shareCores)
+// writeCPUMax sets a cgroup's CPU bandwidth to cores: cpu.max =
+// "{quota} {period}" with quota = cores × period, so 3 cores is
+// "300000 100000". A grant of 0 lifts the cap ("max 100000").
+func writeCPUMax(cgroupPath string, cores int) error {
+	quota, period := runtime.CFSQuota(cores)
 	cpuMax := fmt.Sprintf("max %d", runtime.CFSPeriodMicros)
 	if quota > 0 {
 		cpuMax = fmt.Sprintf("%d %d", quota, period)
 	}
 	if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(cpuMax), 0o644); err != nil {
 		return fmt.Errorf("set cpu.max: %w", err)
+	}
+	return nil
+}
+
+// writeCPUWeight gives a cgroup the lowest CPU weight, cpu.weight 1 (the
+// default is 100): when the CPUs are contended, every thread and child in the
+// group yields to the owner's programs. Its cpu.max still caps what it may use.
+func writeCPUWeight(cgroupPath string) error {
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.weight"), []byte("1"), 0o644); err != nil {
+		return fmt.Errorf("set cpu.weight: %w", err)
 	}
 	return nil
 }
@@ -131,16 +185,23 @@ func (l *LinuxLimiter) enforceCgroups(pid int, limits *TaskLimits) (func(), erro
 		l.logger.Debug("cgroup memory limit set", "bytes", memBytes)
 	}
 
-	// Set the CPU limit to this task's SHARE of the budget — not, as before,
-	// the whole budget for every process, which let N tasks use N times the
-	// limit (TB-75). Fractional shares are exact here (CFS quota).
-	if limits.CPU.ShareCores > 0 {
-		if err := writeCPUMax(cgroupPath, limits.CPU.ShareCores); err != nil {
+	// Set the CPU limit to this task's grant — not, as before, the whole
+	// budget for every process, which let N tasks use N times the limit
+	// (TB-75).
+	if limits.CPU.Cores > 0 {
+		if err := writeCPUMax(cgroupPath, limits.CPU.Cores); err != nil {
 			cleanup()
 			return nil, err
 		}
-		quota, period := runtime.CFSQuota(limits.CPU.ShareCores)
-		l.logger.Debug("cgroup CPU limit set", "quota", quota, "period", period, "cores", runtime.FormatCores(limits.CPU.ShareCores), "budget_cores", limits.CPU.BudgetCores)
+		quota, period := runtime.CFSQuota(limits.CPU.Cores)
+		l.logger.Debug("cgroup CPU limit set", "quota", quota, "period", period, "cores", limits.CPU.Cores, "budget_cores", limits.CPU.BudgetCores)
+	}
+
+	// Lowest weight: covers the whole group, including threads and children
+	// the per-thread nice value (lowerPriority) could miss. A courtesy, so a
+	// failure is logged and the task keeps its limits.
+	if err := writeCPUWeight(cgroupPath); err != nil {
+		l.logger.Warn("could not give the task's cgroup the lowest CPU weight", "pid", pid, "cgroup", cgroupPath, "error", err)
 	}
 
 	// Assign the process to the cgroup.
@@ -219,10 +280,9 @@ func (l *LinuxLimiter) enforceFallback(pid int, limits *TaskLimits) (func(), err
 	// Permitted {2..7} with a 4-core budget pinned the process to {2,3} — half
 	// the requested allowance — and nothing was logged at any level.
 	//
-	// An affinity mask cannot express a task's fractional SHARE of the budget
-	// (TB-75), so every task is pinned to the same budget-sized set: the sum
-	// of what they can use is then bounded by the budget, which is the promise
-	// — the tasks share those CPUs by the kernel's ordinary scheduling.
+	// Each task is pinned to as many of the budget's CPUs as it was granted
+	//, the ones the fewest other tasks are pinned to: a task is held
+	// to its grant, and the tasks together stay within the budget's CPUs.
 	//
 	// Note this is the fallback path only: containers get a CFS quota
 	// (runtime/container.go) and cgroup-capable hosts get cpu.max above, both of
@@ -230,47 +290,92 @@ func (l *LinuxLimiter) enforceFallback(pid int, limits *TaskLimits) (func(), err
 	// left when cgroup delegation is unavailable, which is the common case on an
 	// unprivileged desktop.
 	if limits.CPU.BudgetCores > 0 {
-		l.applyCPUAffinity(pid, limits.CPU.BudgetCores)
+		cores := limits.CPU.Cores
+		if cores <= 0 || cores > limits.CPU.BudgetCores {
+			cores = limits.CPU.BudgetCores
+		}
+		l.applyCPUAffinity(pid, limits.CPU.BudgetCores, cores)
 	}
 
-	return func() {}, nil
+	return func() { l.unpin(pid) }, nil
 }
 
-// applyCPUAffinity restricts pid to maxCores of its permitted CPUs.
+// applyCPUAffinity pins pid to cores of the first budgetCores of its
+// permitted CPUs: the ones the fewest other running tasks are pinned to, so
+// each task is held to its grant and the tasks' grants spread across the
+// budget's CPUs.
 //
-// When the process is already confined to no more than maxCores, the call is
-// skipped: pinning could only narrow it further, which is not what a "use at
-// most N cores" budget means.
-func (l *LinuxLimiter) applyCPUAffinity(pid, maxCores int) {
+// When the process is already confined to no more than cores CPUs, the call
+// is skipped: pinning could only narrow it further, which is not what a "use
+// at most N cores" grant means.
+func (l *LinuxLimiter) applyCPUAffinity(pid, budgetCores, cores int) {
 	permitted, err := getAffinityFn(pid)
 	if err != nil {
 		l.logger.Warn("CPU limit not applied: could not read permitted CPUs",
-			"error", err, "pid", pid, "max_cpu_cores", maxCores,
+			"error", err, "pid", pid, "cpu_cores", cores,
 			"consequence", "work is not confined to the configured core count")
 		return
 	}
 	if len(permitted) == 0 {
 		l.logger.Warn("CPU limit not applied: no permitted CPUs reported",
-			"pid", pid, "max_cpu_cores", maxCores,
+			"pid", pid, "cpu_cores", cores,
 			"consequence", "work is not confined to the configured core count")
 		return
 	}
 
-	if len(permitted) <= maxCores {
-		l.logger.Debug("CPU affinity left as-is: already within the configured limit",
-			"pid", pid, "permitted_cpus", len(permitted), "max_cpu_cores", maxCores)
+	if len(permitted) <= cores {
+		l.logger.Debug("CPU affinity left as-is: already within the task's grant",
+			"pid", pid, "permitted_cpus", len(permitted), "cpu_cores", cores)
 		return
 	}
 
-	chosen := permitted[:maxCores]
+	budget := permitted
+	if budgetCores > 0 && budgetCores < len(budget) {
+		budget = budget[:budgetCores]
+	}
+	chosen := l.leastPinned(budget, cores)
 	if err := setAffinityFn(pid, chosen); err != nil {
 		l.logger.Warn("CPU limit not applied: sched_setaffinity failed",
-			"error", err, "pid", pid, "max_cpu_cores", maxCores,
+			"error", err, "pid", pid, "cpu_cores", cores,
 			"requested_cpus", chosen, "permitted_cpus", permitted,
 			"consequence", "work is not confined to the configured core count")
 		return
 	}
+	l.pinMu.Lock()
+	if l.pins == nil {
+		l.pins = make(map[int][]int)
+	}
+	l.pins[pid] = chosen
+	l.pinMu.Unlock()
 	l.logger.Debug("set CPU affinity", "pid", pid, "cores", len(chosen), "cpus", chosen)
+}
+
+// leastPinned picks n of cpus, the ones the fewest running tasks are pinned
+// to (earlier CPUs first on a tie), in ascending order.
+func (l *LinuxLimiter) leastPinned(cpus []int, n int) []int {
+	if n >= len(cpus) {
+		return append([]int(nil), cpus...)
+	}
+	l.pinMu.Lock()
+	load := make(map[int]int)
+	for _, pinned := range l.pins {
+		for _, cpu := range pinned {
+			load[cpu]++
+		}
+	}
+	l.pinMu.Unlock()
+	order := append([]int(nil), cpus...)
+	sort.SliceStable(order, func(i, j int) bool { return load[order[i]] < load[order[j]] })
+	chosen := order[:n]
+	sort.Ints(chosen)
+	return chosen
+}
+
+// unpin forgets the CPUs a task that has ended was pinned to.
+func (l *LinuxLimiter) unpin(pid int) {
+	l.pinMu.Lock()
+	delete(l.pins, pid)
+	l.pinMu.Unlock()
 }
 
 // getAffinityFn and setAffinityFn are the sched_getaffinity / sched_setaffinity
@@ -373,4 +478,18 @@ func (l *LinuxLimiter) CheckDiskSpace(path string, requiredMB int) error {
 	}
 
 	return nil
+}
+
+// CPUThrottling reads how often a task's CPU quota stopped it, from its
+// cgroup's cpu.stat. Only the cgroup path holds a task to a quota and counts
+// the stops; on the affinity fallback there is no reading.
+func (l *LinuxLimiter) CPUThrottling(pid int) (runtime.CPUThrottle, bool) {
+	if !l.useCgroups {
+		return runtime.CPUThrottle{}, false
+	}
+	b, err := os.ReadFile(filepath.Join(cgroupPathFor(pid), "cpu.stat"))
+	if err != nil {
+		return runtime.CPUThrottle{}, false
+	}
+	return runtime.ParseCPUStat(b)
 }

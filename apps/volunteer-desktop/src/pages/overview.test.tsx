@@ -1306,6 +1306,28 @@ describe("OverviewPage", () => {
     expect(dot).toBeInTheDocument();
   });
 
+  it("shows the cores each running task was given", () => {
+    setupDefaultMocks({
+      status: {
+        status: {
+          state: "active",
+          uptime_seconds: 3600,
+          connected_servers: 1,
+          active_tasks: [
+            makeTask({ work_unit_id: "wu-grant-grep01", leaf_name: "GREP", cpu_cores: 3 }),
+            makeTask({ work_unit_id: "wu-grant-bb0001", leaf_name: "Beyblade", cpu_cores: 1 }),
+            makeTask({ work_unit_id: "wu-grant-old001", leaf_name: "Older daemon" }),
+          ],
+          paused_reason: null,
+        },
+      },
+    });
+    render(<OverviewPage />);
+    const badges = screen.getAllByTestId("task-cpu-cores").map((b) => b.textContent);
+    // A daemon older than per-task grants sends no figure: no badge.
+    expect(badges).toEqual(["3 cores", "1 core"]);
+  });
+
   it("renders Native runtime badge", () => {
     setupDefaultMocks({
       status: {

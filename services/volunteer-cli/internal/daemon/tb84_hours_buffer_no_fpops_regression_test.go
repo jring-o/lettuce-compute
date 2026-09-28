@@ -179,7 +179,7 @@ func TestTB84_FleetRoundKeepsWhatItAsksFor(t *testing.T) {
 	servers := []*ServerConnection{{Client: mc, VolunteerID: "vol-1", Name: "server-a", Available: true}}
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = 2
-	d.cfg.MaxConcurrentTasks = 1
+	setTestSlots(d.cfg, 1)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 	d.slotManager = NewSlotManager(1, d.logger)
 	d.durations = tb84Tracker(t)

@@ -50,7 +50,7 @@ func testLimiter() *LinuxLimiter {
 func TestApplyCPUAffinity_RequestsPermittedCPUsNotFirstN(t *testing.T) {
 	rec := withFakeAffinity(t, []int{4, 5, 6, 7, 8, 9}, nil)
 
-	testLimiter().applyCPUAffinity(4242, 4)
+	testLimiter().applyCPUAffinity(4242, 4, 4)
 
 	if rec.pid != 4242 {
 		t.Fatalf("sched_setaffinity not called (pid=%d); the CPU limit was silently skipped", rec.pid)
@@ -75,7 +75,7 @@ func TestApplyCPUAffinity_RequestsPermittedCPUsNotFirstN(t *testing.T) {
 func TestApplyCPUAffinity_ReportedFieldCaseRequestsNothingUnpermitted(t *testing.T) {
 	rec := withFakeAffinity(t, []int{4, 5, 6, 7}, nil)
 
-	testLimiter().applyCPUAffinity(80081, 4)
+	testLimiter().applyCPUAffinity(80081, 4, 4)
 
 	for _, cpu := range rec.cpus {
 		if cpu < 4 {
@@ -91,7 +91,7 @@ func TestApplyCPUAffinity_ReportedFieldCaseRequestsNothingUnpermitted(t *testing
 func TestApplyCPUAffinity_PartialOverlapPinsFullCoreCount(t *testing.T) {
 	rec := withFakeAffinity(t, []int{2, 3, 4, 5, 6, 7}, nil)
 
-	testLimiter().applyCPUAffinity(1, 4)
+	testLimiter().applyCPUAffinity(1, 4, 4)
 
 	if got := len(rec.cpus); got != 4 {
 		t.Fatalf("pinned to %d CPUs (%v), want 4 — the volunteer configured a 4-core budget", got, rec.cpus)
@@ -106,7 +106,7 @@ func TestApplyCPUAffinity_PartialOverlapPinsFullCoreCount(t *testing.T) {
 func TestApplyCPUAffinity_UnrestrictedHostTakesFirstN(t *testing.T) {
 	rec := withFakeAffinity(t, []int{0, 1, 2, 3, 4, 5, 6, 7}, nil)
 
-	testLimiter().applyCPUAffinity(1, 4)
+	testLimiter().applyCPUAffinity(1, 4, 4)
 
 	want := []int{0, 1, 2, 3}
 	if !reflect.DeepEqual(rec.cpus, want) {
@@ -119,7 +119,7 @@ func TestApplyCPUAffinity_UnrestrictedHostTakesFirstN(t *testing.T) {
 func TestApplyCPUAffinity_SkipsWhenAlreadyWithinLimit(t *testing.T) {
 	rec := withFakeAffinity(t, []int{4, 5}, nil)
 
-	testLimiter().applyCPUAffinity(1, 4)
+	testLimiter().applyCPUAffinity(1, 4, 4)
 
 	if rec.pid != -1 {
 		t.Errorf("sched_setaffinity called with %v; a process already confined to 2 CPUs must not be narrowed by a 4-core budget", rec.cpus)
@@ -129,7 +129,7 @@ func TestApplyCPUAffinity_SkipsWhenAlreadyWithinLimit(t *testing.T) {
 // A syscall failure must not panic and must leave the process running.
 func TestApplyCPUAffinity_SetFailureIsSurvivable(t *testing.T) {
 	withFakeAffinity(t, []int{4, 5, 6, 7}, syscall.EINVAL)
-	testLimiter().applyCPUAffinity(1, 2) // must not panic
+	testLimiter().applyCPUAffinity(1, 2, 2) // must not panic
 }
 
 // sysGetAffinity must decode a multi-word mask, since bit N of word W is CPU

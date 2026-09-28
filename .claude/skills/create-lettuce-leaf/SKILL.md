@@ -200,6 +200,13 @@ it **best-effort** (swallow any write error and never fail the unit), and ideall
 **atomically** (temp file in the same dir, then rename) so a reader never sees a partial
 value.
 
+**Size threads from the cores the task is given.** A volunteer grants each task whole cores
+between the leaf's `resource_requirements.min_cpu_cores` and `max_cpu_cores`, holds it to them,
+and tells it the figure in `$LETTUCE_CPU_LIMIT` (also in `OMP_NUM_THREADS` and the other
+thread-pool variables). A program that starts one thread per CPU it can see runs more threads
+than its grant and stalls; size every pool the code creates (a process pool, ONNX Runtime
+sessions) from `$LETTUCE_CPU_LIMIT`.
+
 If the user's code doesn't do this, **wrap it**: add a thin entrypoint that reads the params
 file, calls their existing function, writes the output JSON, and writes progress as it goes —
 leaving their actual computation intact. Mirror the patterns in `guides/examples/` — both
@@ -292,6 +299,12 @@ paths to skip), or assert `compare_all_fields: true` if every field really is de
 This is not optional and there is deliberately no silent default: comparing every field
 included nondeterministic runtime metadata, and honest results were being rejected over a
 one-millisecond difference in a timing field. Pick the fields that carry the science.
+
+**Declare the core range** in `resource_requirements`: `min_cpu_cores`, the fewest cores a unit
+runs on (a head only sends the leaf to volunteers whose allowance covers it), and
+`max_cpu_cores`, the most it can put to use. A single-threaded program is 1 and 1; a program
+whose threads scale sets the maximum to what it can use. With no maximum a unit gets exactly
+its minimum, and the head warns at activation.
 
 Two more constraints the validator enforces, so get them right the first time:
 `agreement_threshold` must be **greater than 0.5** on any leaf dispatching two or more copies,

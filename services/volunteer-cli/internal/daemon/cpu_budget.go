@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"math"
 	"os/exec"
 	"strings"
 
@@ -10,41 +11,40 @@ import (
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
-// The CPU budget (TB-75): resource_limits.max_cpu_cores is the most CPU
-// Lettuce may use on the whole machine, shared equally by the running tasks.
+// The CPU budget and the grant each task is given.
 //
-// It used to be a per-task figure — every container and native process was
-// given the full max_cpu_cores as its own quota and nothing booked cores at
-// admission — so the real ceiling was max_cpu_cores × max_concurrent_tasks,
-// while the Settings page showed the number as a share of the machine beside
-// the memory budget, which admission has always summed bookings against. A
-// tester who allowed 2 cores and 2 tasks filled all four vCPUs of his Podman
-// machine. This file is the daemon's side of the fix:
+// resource_limits.max_cpu_cores is the most CPU Lettuce may use on the whole
+// machine (TB-75). It used to be shared EQUALLY by the running tasks and
+// re-split live on every start and finish, so a GREP unit that could use three
+// cores got the same share as the one-core Beyblade beside it and ran past its
+// deadline, while a volunteer who wanted N one-core tasks had to raise both
+// the core total and max_concurrent_tasks. Now:
 //
-//   - HostCPUBudgetCores is the configuration: the most CPU all running tasks
-//     together may use, and the budget a task that runs directly on the
-//     machine (native, WASM) draws on. ContainerCPUBudgetCores is that clipped
-//     to the container engine VM's vCPUs where the engine runs inside one (the
-//     CPU twin of the TB-63 memory clip): container tasks all run inside the
-//     VM and can never together use more. Heads are told both (TB-85), and
-//     admission books a unit against each that applies to it. The clip used to
-//     be the one figure for everything, so a Mac whose VM had fewer CPUs than
-//     the limit held its native work to the VM's size too.
-//   - cpuGrantFor is what a task starting now is given: its runtime's share of
-//     the split (runtime.SplitCPUBudget) — an equal share of the host budget,
-//     the container tasks together capped at the container budget. The
-//     runtimes read it at start; rebalanceCPUShares pushes the new split to
-//     every running task through its process handle whenever a task starts or
-//     finishes.
-//   - bookedCPUCores is what admission books per unit: the leaf's minimum
-//     core requirement (floor 1), so the equal share never drops below what a
-//     leaf declared it needs, and at most budget tasks run at once whatever
-//     max_concurrent_tasks says.
+//   - Each leaf declares a core RANGE: min_cpu_cores, the head's dispatch gate
+//     and the fewest a unit runs on, and max_cpu_cores, the most it can use
+//     (leafCoreRange; a head too old to send the max, or a leaf that declares
+//     none, is min–min).
+//   - A task starting is GRANTED whole cores between the two (grantCPU): its
+//     minimum, plus as many of the budget's free cores as are left once the
+//     units waiting in the buffer that could start beside it have their
+//     minimums set aside, up to its maximum. It keeps the grant until it
+//     finishes; the runtime holds it there and tells it the figure. The grants
+//     of the running tasks together never exceed the budget.
+//   - Admission books a running task at its grant and a unit about to start at
+//     its minimum (bookedCPUCores), so how many run at once follows from the
+//     budget and the grants; max_running_tasks is only an optional extra cap.
+//   - A unit waiting only for cores is not starved by narrower units behind
+//     it: none may start on cores it is waiting for (coreWait).
+//
+// HostCPUBudgetCores is the configuration, the budget a task that runs
+// directly on the machine (native, WASM) draws on; ContainerCPUBudgetCores is
+// that clipped to the container engine VM's vCPUs where the engine runs inside
+// one, which bounds container tasks together (TB-85).
 
 // HostCPUBudgetCores is the whole-machine CPU budget this daemon works to:
-// the configured max_cpu_cores. Every running task together stays within it,
-// and a task that runs directly on the machine (native, WASM) is measured
-// against it alone (TB-85).
+// the configured max_cpu_cores. Every running task's grant together stays
+// within it, and a task that runs directly on the machine (native, WASM) is
+// measured against it alone (TB-85).
 func (d *Daemon) HostCPUBudgetCores() int {
 	if d.cfg == nil {
 		return 0
@@ -56,7 +56,7 @@ func (d *Daemon) HostCPUBudgetCores() int {
 // configured max_cpu_cores, clipped to the number of vCPUs the container
 // engine's VM has where the engine runs inside one (runtime.ContainerCPUBudget).
 // It is the max_cpu_cores heads are told — every runtime's work fits it — and
-// the budget container tasks are booked against and share. With no container
+// the budget container tasks' grants are summed against. With no container
 // engine, or one that shares the host's CPUs (Linux), it is the configuration.
 func (d *Daemon) ContainerCPUBudgetCores() int {
 	return runtime.ContainerCPUBudget(d.HostCPUBudgetCores(), d.ContainerVMCPUs())
@@ -69,6 +69,13 @@ func (d *Daemon) cpuBudgetFor(wu *runtime.WorkUnit) int {
 		return d.ContainerCPUBudgetCores()
 	}
 	return d.HostCPUBudgetCores()
+}
+
+// containerCPUBudgetBinds reports whether the container budget is tighter than
+// the host budget, so container tasks are summed against it too.
+func (d *Daemon) containerCPUBudgetBinds() bool {
+	host, vm := d.HostCPUBudgetCores(), d.ContainerCPUBudgetCores()
+	return vm > 0 && (host <= 0 || vm < host)
 }
 
 // ContainerVMCPUs reports the number of vCPUs of the VM the registered
@@ -91,88 +98,76 @@ func (d *Daemon) CPULimitedByVM() bool {
 	return d.ContainerVMCPUs() > 0 && d.ContainerCPUBudgetCores() < d.cfg.ResourceLimits.MaxCPUCores
 }
 
-// currentCPUShares is the split of the CPU budgets among the tasks running
-// right now (runtime.SplitCPUBudget, TB-85). Wired into the slot manager as
-// its share source.
-func (d *Daemon) currentCPUShares() runtime.CPUShares {
-	hostTasks, containerTasks := d.activeTaskCounts()
-	return runtime.SplitCPUBudget(d.HostCPUBudgetCores(), d.ContainerCPUBudgetCores(), hostTasks, containerTasks)
+// leafCoreRange is the leaf's declared core range per unit from the leaf
+// cache: min_cpu_cores (at least 1) and max_cpu_cores (at least the min). A
+// leaf the cache does not hold, or a head too old to send requirements, is
+// 1–1; a head too old to send the max is min–min.
+func (d *Daemon) leafCoreRange(leafID string) (minCores, maxCores int) {
+	l, _ := d.cachedLeaf(leafID)
+	return coreRangeOf(l)
 }
 
-// activeTaskCounts is the number of running tasks of each kind: those that
-// run directly on the machine and container ones.
-func (d *Daemon) activeTaskCounts() (host, container int) {
-	if d.slotManager == nil {
-		return 0, 0
+// coreRangeOf is leafCoreRange for a leaf already in hand.
+func coreRangeOf(l CachedLeafInfo) (minCores, maxCores int) {
+	minCores, maxCores = 1, 0
+	if l.ResourceRequirements != nil {
+		if n := int(l.ResourceRequirements.MinCPUCores); n > minCores {
+			minCores = n
+		}
+		maxCores = int(l.ResourceRequirements.MaxCPUCores)
 	}
-	return d.slotManager.ActiveCountsByKind()
+	if maxCores < minCores {
+		maxCores = minCores
+	}
+	return minCores, maxCores
 }
 
-// cpuGrantFor is what a task starting now is given: its runtime's share of
-// the budgets among the tasks running once it has started (the caller's slot
-// is already active when a runtime asks; a count of zero for its kind is read
-// as one, the share a lone task would get), and the budget the share is part
-// of — the container budget for a container task, the host budget for a task
-// that runs directly on the machine. Wired into every runtime as its grant
-// source (wireRuntimeCPU).
-func (d *Daemon) cpuGrantFor(container bool) runtime.CPUGrant {
-	hostTasks, containerTasks := d.activeTaskCounts()
-	if container && containerTasks < 1 {
-		containerTasks = 1
+// cachedLeaf finds a leaf in the leaf cache by id, across every head.
+func (d *Daemon) cachedLeaf(leafID string) (CachedLeafInfo, bool) {
+	if d.leafCache == nil || leafID == "" {
+		return CachedLeafInfo{}, false
 	}
-	if !container && hostTasks < 1 {
-		hostTasks = 1
-	}
-	shares := runtime.SplitCPUBudget(d.HostCPUBudgetCores(), d.ContainerCPUBudgetCores(), hostTasks, containerTasks)
-	if container {
-		return runtime.CPUGrant{ShareCores: shares.Container, BudgetCores: d.ContainerCPUBudgetCores()}
-	}
-	return runtime.CPUGrant{ShareCores: shares.Host, BudgetCores: d.HostCPUBudgetCores()}
-}
-
-// rebalanceCPUShares gives every running task its current share of the
-// budgets. Called after a slot starts and after one finishes — the two events
-// that change the split — and when a budget itself changes (a config change,
-// the engine VM's clip).
-func (d *Daemon) rebalanceCPUShares() {
-	if d.slotManager == nil {
-		return
-	}
-	shares := d.currentCPUShares()
-	if shares.Host <= 0 && shares.Container <= 0 {
-		return
-	}
-	d.slotManager.ApplyCPUShares(shares)
-}
-
-// nativeSetCPU is how a native process handle rewrites its process's CPU cap:
-// through the limiter that enforced it, with the host budget so the affinity
-// fallback can re-pin to a changed budget.
-func (d *Daemon) nativeSetCPU(pid int, shareCores float64) error {
-	if d.limiter == nil {
-		return nil
-	}
-	return d.limiter.SetCPU(pid, runtime.CPUGrant{ShareCores: shareCores, BudgetCores: d.HostCPUBudgetCores()})
-}
-
-// bookedCPUCores is the number of cores admission books for a unit: its
-// leaf's minimum core requirement (resource_requirements.min_cpu_cores, the
-// figure the head's dispatch gate compares against the budget of the leaf's
-// runtime), never below one, and never above that budget (cpuBudgetFor — a
-// VM clip can put the container budget under a requirement the head already
-// admitted; such a unit runs alone). Booking the minimum keeps every running
-// task's equal share at or above what its leaf declared it needs.
-func (d *Daemon) bookedCPUCores(wu *runtime.WorkUnit) int {
-	cores := 1
-	if wu != nil {
-		if minCores := d.leafMinCPUCores(wu.LeafID); minCores > cores {
-			cores = minCores
+	for _, leafs := range d.leafCache.AllLeafs() {
+		for _, l := range leafs {
+			if l.ID == leafID {
+				return l, true
+			}
 		}
 	}
-	if budget := d.cpuBudgetFor(wu); budget > 0 && cores > budget {
-		cores = budget
+	return CachedLeafInfo{}, false
+}
+
+// unitCoreRange is the core range a unit can be granted: its leaf's range,
+// clipped to the budget of the unit's runtime (cpuBudgetFor — a VM clip can
+// put the container budget under a minimum the head already admitted; such a
+// unit runs on the whole budget, alone).
+func (d *Daemon) unitCoreRange(wu *runtime.WorkUnit) (minCores, maxCores int) {
+	minCores, maxCores = 1, 1
+	if wu != nil {
+		minCores, maxCores = d.leafCoreRange(wu.LeafID)
 	}
-	return cores
+	if budget := d.cpuBudgetFor(wu); budget > 0 {
+		if minCores > budget {
+			minCores = budget
+		}
+		if maxCores > budget {
+			maxCores = budget
+		}
+	}
+	return minCores, maxCores
+}
+
+// bookedCPUCores is the number of cores a unit holds against the CPU budget:
+// a running task's grant, and for a unit not started yet the fewest it would
+// be granted (unitCoreRange's minimum). Admission sums the running tasks'
+// grants and adds the candidate's minimum, so a unit starts only when its
+// minimum fits beside what is already granted.
+func (d *Daemon) bookedCPUCores(wu *runtime.WorkUnit) int {
+	if wu != nil && wu.CPUGrant.Cores > 0 {
+		return wu.CPUGrant.Cores
+	}
+	minCores, _ := d.unitCoreRange(wu)
+	return minCores
 }
 
 // bookedContainerCPUCores is bookedCPUCores for a container unit and 0 for
@@ -184,39 +179,208 @@ func (d *Daemon) bookedContainerCPUCores(wu *runtime.WorkUnit) int {
 	return d.bookedCPUCores(wu)
 }
 
-// leafMinCPUCores is the leaf's declared minimum core requirement from the
-// leaf cache, 0 when unknown (no cache, a leaf the cache does not hold, or a
-// head too old to send requirements).
-func (d *Daemon) leafMinCPUCores(leafID string) int {
-	if d.leafCache == nil || leafID == "" {
-		return 0
+// grantCPU decides the CPU a unit about to start is given: its minimum, plus
+// the cores the budget still has free once the running tasks' grants, its own
+// minimum and the minimums of the units in waiting that could start beside it
+// are counted, up to its maximum. waiting is the buffer in order (the unit
+// itself, if present, is skipped); a waiting unit is counted only if it fits
+// what is left of the CPU, memory and GPU budgets and the running-task cap
+// (budgetLedger), so cores are never held back for a unit that could not start
+// anyway. A unit that finds less than its minimum free (a task resumed after
+// the budget was lowered) is given its minimum. Zero when no CPU budget is set.
+//
+// This is the one place a grant is decided: the slot filler and the task
+// resumer call it for the unit they start, and every surface that shows a
+// grant shows the one recorded on the unit.
+func (d *Daemon) grantCPU(wu *runtime.WorkUnit, waiting []*runtime.WorkUnit) runtime.CPUGrant {
+	budget := d.cpuBudgetFor(wu)
+	if budget <= 0 {
+		return runtime.CPUGrant{}
 	}
-	for _, leafs := range d.leafCache.AllLeafs() {
-		for _, l := range leafs {
-			if l.ID == leafID && l.ResourceRequirements != nil {
-				return int(l.ResourceRequirements.MinCPUCores)
-			}
+	minCores, maxCores := d.unitCoreRange(wu)
+	ledger := d.runningLedger()
+	ledger.take(d, wu, minCores)
+	for _, w := range waiting {
+		if ledger.coresFreeFor(wu) <= 0 {
+			break // nothing left to hold back or to add
 		}
+		if w == nil || (wu != nil && w.ID == wu.ID) || !ledger.fits(d, w) {
+			continue
+		}
+		ledger.take(d, w, d.bookedCPUCores(w))
 	}
-	return 0
+	extra := ledger.coresFreeFor(wu)
+	if extra < 0 {
+		extra = 0
+	}
+	cores := minCores + extra
+	if cores > maxCores {
+		cores = maxCores
+	}
+	return runtime.CPUGrant{Cores: cores, BudgetCores: budget}
 }
 
-// wireRuntimeLimits attaches the resource limiter, the process group, the
-// live CPU grant and the live memory ceiling to the registered runtimes. The
-// limiter is enforced against a PER-UNIT set of limits (taskLimits): the
-// memory ceiling is BookedMemMB(declared, host budget) — the same clamped
-// number admission books a native unit at — so native enforcement matches
-// admission instead of always capping at the whole configured budget (BG-16);
-// the CPU is the task's share of the budget at the moment it starts (TB-75),
-// the same grant the task is told through its environment. Both are read when the task
-// starts, so a limit changed while the daemon runs bounds the next task
-// (TB-79); the closure used to hold the start-up configuration's struct.
+// adoptedCPUGrant is the grant a task adopted from the previous session (a
+// frozen process, a paused container) is booked at: the cores it was granted
+// when it started, which it is still held to, or its minimum when the state
+// file came from a client that did not record them.
+func (d *Daemon) adoptedCPUGrant(wu *runtime.WorkUnit, cores int) runtime.CPUGrant {
+	budget := d.cpuBudgetFor(wu)
+	if budget <= 0 {
+		return runtime.CPUGrant{}
+	}
+	if cores <= 0 {
+		cores, _ = d.unitCoreRange(wu)
+	}
+	return runtime.CPUGrant{Cores: cores, BudgetCores: budget}
+}
+
+// budgetLedger is what the configured budgets have free: CPU cores and memory
+// on the machine and, where they are tighter, inside the container engine's
+// VM; physical GPUs; and room under max_running_tasks. A figure goes negative
+// when what runs exceeds a budget lowered since it started; noBound stands
+// for a budget that is not set. Built from the running tasks (runningLedger)
+// and charged with each unit taken, it lets grantCPU ask of a waiting unit the
+// budget questions admission asks (canAccommodateWU).
+type budgetLedger struct {
+	hostCores, containerCores int
+	hostMemMB, containerMemMB int
+	gpus, tasks               int
+}
+
+// noBound is a budgetLedger figure for a budget that is not set: larger than
+// anything is ever charged against it.
+const noBound = math.MaxInt32
+
+// runningLedger is the budgets less what the running tasks hold.
+func (d *Daemon) runningLedger() budgetLedger {
+	l := budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound}
+	if d.slotManager == nil {
+		return l
+	}
+	if host := d.HostCPUBudgetCores(); host > 0 {
+		l.hostCores = host - d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+	}
+	if d.containerCPUBudgetBinds() {
+		l.containerCores = d.ContainerCPUBudgetCores() - d.slotManager.TotalActiveCPUCores(d.bookedContainerCPUCores)
+	}
+	hostMemMB := d.HostMemoryBudgetMB()
+	if hostMemMB > 0 {
+		l.hostMemMB = hostMemMB - d.slotManager.TotalActiveMemoryMB(d.bookedMemMB)
+	}
+	if vmMemMB := d.ContainerMemoryBudgetMB(); vmMemMB > 0 && (hostMemMB <= 0 || vmMemMB < hostMemMB) {
+		l.containerMemMB = vmMemMB - d.slotManager.TotalActiveMemoryMB(d.bookedContainerMemMB)
+	}
+	if n := len(d.advertisedHardware().GetGpus()); n > 0 {
+		l.gpus = n - d.slotManager.ActiveGPUCount()
+	}
+	if limit := d.maxRunningTasks(); limit > 0 {
+		l.tasks = limit - d.slotManager.ActiveCount()
+	}
+	return l
+}
+
+// fits reports whether wu, at its minimum cores and booked memory, fits what
+// the ledger has left.
+func (l budgetLedger) fits(d *Daemon, wu *runtime.WorkUnit) bool {
+	if wu == nil {
+		return false
+	}
+	cores, memMB := d.bookedCPUCores(wu), d.bookedMemMB(wu)
+	container := isContainerUnit(wu)
+	switch {
+	case cores > l.hostCores,
+		container && cores > l.containerCores,
+		memMB > l.hostMemMB,
+		container && memMB > l.containerMemMB,
+		wu.ExecutionSpec.GPURequired && l.gpus <= 0,
+		l.tasks <= 0:
+		return false
+	}
+	return true
+}
+
+// take charges the ledger with wu running on cores.
+func (l *budgetLedger) take(d *Daemon, wu *runtime.WorkUnit, cores int) {
+	memMB := d.bookedMemMB(wu)
+	l.hostCores -= cores
+	l.hostMemMB -= memMB
+	if isContainerUnit(wu) {
+		l.containerCores -= cores
+		l.containerMemMB -= memMB
+	}
+	if wu != nil && wu.ExecutionSpec.GPURequired {
+		l.gpus--
+	}
+	l.tasks--
+}
+
+// coresFreeFor is how many more cores the ledger could give wu: the host
+// cores it has left, and for a container unit no more than the container
+// budget has left. Negative when a budget is overcommitted.
+func (l budgetLedger) coresFreeFor(wu *runtime.WorkUnit) int {
+	free := l.hostCores
+	if isContainerUnit(wu) && l.containerCores < free {
+		free = l.containerCores
+	}
+	return free
+}
+
+// The two admission refusals that mean "not enough free cores", by kind
+// (refusalKind): the whole-machine budget and the container engine VM's.
+const (
+	refusalHostCPU      = "configured CPU budget"
+	refusalContainerCPU = "container CPU budget"
+)
+
+// coreWait is a buffered unit refused only for cores: every other admission
+// check passed (the CPU checks come last), so it starts as soon as enough
+// cores are free. pool names the budget it is short of (one of the two
+// refusal kinds above); need is its minimum.
+type coreWait struct {
+	pool string
+	need int
+}
+
+// coreWaitFor reads a unit's admission refusal: a coreWait when the refusal
+// was for cores, else false.
+func (d *Daemon) coreWaitFor(wu *runtime.WorkUnit, reason string) (coreWait, bool) {
+	switch kind := refusalKind(reason); kind {
+	case refusalHostCPU, refusalContainerCPU:
+		return coreWait{pool: kind, need: d.bookedCPUCores(wu)}, true
+	}
+	return coreWait{}, false
+}
+
+// holdsBack reports whether starting candidate now would take cores the
+// waiting unit needs. The waiting unit is already short of cores in
+// its pool, so a candidate drawing on that pool puts its start further off
+// for as long as the candidate runs — a stream of narrow units could keep a
+// wide one waiting indefinitely, since every narrow unit fits the moment one
+// core frees. The one harmless case is a task on the machine itself behind a
+// container unit short of the VM's cores: it does not draw on the VM, and is
+// allowed when the machine keeps enough cores for the container unit.
+func (w coreWait) holdsBack(d *Daemon, candidate *runtime.WorkUnit) bool {
+	if w.pool == refusalContainerCPU && !isContainerUnit(candidate) {
+		return d.runningLedger().hostCores-d.bookedCPUCores(candidate) < w.need
+	}
+	return true
+}
+
+// wireRuntimeLimits attaches the resource limiter, the process group and the
+// live memory ceiling to the registered runtimes. The limiter is enforced
+// against a PER-UNIT set of limits (taskLimits): the memory ceiling is
+// BookedMemMB(declared, host budget) — the same clamped number admission books
+// a native unit at — so native enforcement matches admission instead of always
+// capping at the whole configured budget (BG-16); the CPU is the grant the
+// daemon gave the unit, the same one the task is told through its
+// environment. Both are read when the task starts, so a limit changed while
+// the daemon runs bounds the next task (TB-79).
 func (d *Daemon) wireRuntimeLimits(pg ProcessGroup, limiter resource.Limiter) {
 	if d.runtimeRegistry == nil {
 		return
 	}
 	for _, rt := range d.runtimeRegistry.runtimes {
-		d.wireRuntimeCPU(rt)
 		d.wireRuntimeMemory(rt)
 		nr, ok := rt.(*runtime.NativeRuntime)
 		if !ok {
@@ -253,11 +417,11 @@ func (d *Daemon) taskLimits(declaredMemMB int, cpu runtime.CPUGrant) *resource.T
 
 // wireRuntimeMemory gives one runtime the daemon's live memory budget for its
 // kind of work as the ceiling it clamps a unit's declaration to at start
-// (TB-79), the memory twin of wireRuntimeCPU: the container budget for the
-// container runtime, the host budget for WASM, which runs inside the daemon
-// process on the machine itself (TB-85). Also called for a container runtime
-// that appears after start (registerContainerRuntime). The native runtime's
-// ceiling travels through the limiter closure (taskLimits) instead.
+// (TB-79): the container budget for the container runtime, the host budget for
+// WASM, which runs inside the daemon process on the machine itself (TB-85).
+// Also called for a container runtime that appears after start
+// (registerContainerRuntime). The native runtime's ceiling travels through the
+// limiter closure (taskLimits) instead.
 func (d *Daemon) wireRuntimeMemory(rt runtime.Runtime) {
 	switch r := rt.(type) {
 	case *runtime.ContainerRuntime:
@@ -271,29 +435,6 @@ func (d *Daemon) wireRuntimeMemory(rt runtime.Runtime) {
 	}
 }
 
-// wireRuntimeCPU gives one runtime the daemon's live CPU grant for its kind
-// of work (cpuGrantFor) as the source it consults when a task starts. Also
-// called for a container runtime that appears after start
-// (registerContainerRuntime).
-func (d *Daemon) wireRuntimeCPU(rt runtime.Runtime) {
-	containerGrant := func() runtime.CPUGrant { return d.cpuGrantFor(true) }
-	hostGrant := func() runtime.CPUGrant { return d.cpuGrantFor(false) }
-	switch r := rt.(type) {
-	case *runtime.ContainerRuntime:
-		if r != nil {
-			r.SetCPUGrantSource(containerGrant)
-		}
-	case *runtime.NativeRuntime:
-		if r != nil {
-			r.SetCPUGrantSource(hostGrant)
-		}
-	case *runtime.WasmRuntime:
-		if r != nil {
-			r.SetCPUGrantSource(hostGrant)
-		}
-	}
-}
-
 // setAdvertisedCPUCores replaces the advertised hardware with a copy whose
 // CPU budget is cores (the late-detection clip; see updateAdvertisedHardware).
 func (d *Daemon) setAdvertisedCPUCores(cores int) {
@@ -301,17 +442,16 @@ func (d *Daemon) setAdvertisedCPUCores(cores int) {
 }
 
 // applyContainerCPUBudget lowers the advertised CPU budget to the container
-// engine VM's vCPU count when that is below the configuration, raises the
-// volunteer-facing notice, and re-splits the (possibly smaller) container
-// budget among the tasks already running. Called once a container runtime is
-// registered — at start and on a late detection, before the heads are
-// re-told — beside its memory twin (applyContainerMemoryBudget).
+// engine VM's vCPU count when that is below the configuration and raises the
+// volunteer-facing notice. Called once a container runtime is registered — at
+// start and on a late detection, before the heads are re-told — beside its
+// memory twin (applyContainerMemoryBudget). Running tasks keep their grants;
+// the clip bounds the grants of tasks started afterwards.
 func (d *Daemon) applyContainerCPUBudget() {
 	if d.CPULimitedByVM() {
 		d.setAdvertisedCPUCores(d.ContainerCPUBudgetCores())
 	}
 	d.refreshContainerCPUNotice()
-	d.rebalanceCPUShares()
 }
 
 // refreshContainerCPUNotice keeps the "container_cpu_clipped" notice in step

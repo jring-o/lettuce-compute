@@ -225,8 +225,8 @@ func wireRuntimeResourceLimits(registry *daemon.RuntimeRegistry, cfg *config.Con
 		return pg
 	}
 	// The runner executes one job at a time, so each task is granted the whole
-	// CPU budget (TB-75); the daemon's equal split among concurrent tasks does
-	// not apply here.
+	// CPU budget; the daemon's per-task grants among concurrent tasks do not
+	// apply here.
 	nr.SetCPUBudget(limits.MaxCPUCores)
 	perUnitLimits := func(declaredMemMB int, cpu runtime.CPUGrant) *resource.TaskLimits {
 		return &resource.TaskLimits{

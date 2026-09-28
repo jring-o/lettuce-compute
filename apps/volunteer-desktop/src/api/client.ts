@@ -69,6 +69,11 @@ export interface ActiveTaskInfo {
   head_name: string;
   runtime_type: RuntimeType;
   process_id: number | null;
+  /**
+   * Cores the task was given when it started and is held to for its run.
+   * 0 or absent: no CPU limit, or a daemon older than per-task grants.
+   */
+  cpu_cores?: number;
 }
 
 export interface QueuedTaskInfo {
@@ -334,9 +339,13 @@ export interface ConfigResponse {
   notifications: NotificationConfig;
   servers: ServerConfig[];
   log_level: string;
-  max_concurrent_tasks: number;
   /**
-   * Hours of work kept buffered per concurrent task (daemon default 2).
+   * Optional cap on how many tasks run at once; 0 = none (as many run as the
+   * CPU and memory limits hold). Absent from a daemon older than the setting.
+   */
+  max_running_tasks?: number;
+  /**
+   * Hours of work kept buffered per task that can run at once (daemon default 2).
    * 0 means the daemon's small fixed unit-count fallback.
    */
   work_buffer_hours: number;
@@ -363,8 +372,8 @@ export interface ConfigUpdate {
   notifications?: Partial<NotificationConfig>;
   leafs?: Partial<LeafFilter>;
   log_level?: string;
-  max_concurrent_tasks?: number;
-  /** Hours of work to keep buffered per concurrent task (daemon default 2). */
+  max_running_tasks?: number;
+  /** Hours of work to keep buffered per task that can run at once (daemon default 2). */
   work_buffer_hours?: number;
   servers?: ServerConfigUpdate[];
 }
@@ -401,6 +410,8 @@ export interface ExecutionSpec {
 export interface LeafResourceRequirements {
   min_disk_mb?: number;
   min_cpu_cores?: number;
+  /** The most cores one unit can use; a task is granted between the two. Absent from older heads. */
+  max_cpu_cores?: number;
   /** Compared against the machine's ALLOWED VRAM (`max_gpu_vram_mb`), not the card size. */
   min_gpu_vram_mb?: number;
   gpu_type?: string;
@@ -502,8 +513,9 @@ export interface MachineCapabilities {
    */
   max_cpu_cores: number;
   /**
-   * The whole-machine CPU budget every running task shares equally, and the
-   * budget of native and WebAssembly work: the Settings allowance (TB-85).
+   * The whole-machine CPU budget the running tasks' grants together stay
+   * within, and the budget of native and WebAssembly work: the Settings
+   * allowance (TB-85).
    */
   host_max_cpu_cores: number;
   /**

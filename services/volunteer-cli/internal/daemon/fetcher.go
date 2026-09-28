@@ -184,6 +184,9 @@ type Fetcher struct {
 	// unitEstSecondsFn estimates wall-clock seconds for one arrived unit: the
 	// figure it is booked at against the weights (0 = unknown).
 	unitEstSecondsFn func(leafID string, rscFpopsEst float64) float64
+	// unitCoresFn is the cores an arrived unit is booked at against the
+	// weights: the fewest it will be granted (nil = one).
+	unitCoresFn func(wu *runtime.WorkUnit) int
 	// leafEstSecondsFn estimates wall-clock seconds for ONE unit of the given leaf
 	// (0 = unknown), used to size the per-leaf batch request BEFORE any of that
 	// leaf's units have been buffered (#29). It prefers the leaf-level,
@@ -396,6 +399,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		unfitBufferedFn:          d.unfitBuffered,
 		batchSizeFn:              d.requestShareBatchSize,
 		unitEstSecondsFn:         d.estSecondsForUnit,
+		unitCoresFn:              d.bookedCPUCores,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		noteArrivalEstFn:         d.noteArrivalEstimate,
 		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
@@ -1353,7 +1357,8 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 
 		f.logger.Debug("fetcher: buffered work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID)
 
-		// Book the buffered unit against the weights at its expected length, to
+		// Book the buffered unit against the weights at its expected length and
+		// the fewest cores it will be granted (core-seconds), to
 		// the leaf the request named (the head's own leaf for an any-leaf
 		// request). Nothing returned or abandoned above is booked.
 		booked := leafKey(leaf)
@@ -1367,7 +1372,11 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		if estSec <= 0 && f.leafEstSecondsFn != nil {
 			estSec = f.leafEstSecondsFn(leaf)
 		}
-		f.selector.RecordAssignment(head.Name, booked, wu.ID, estSec)
+		cores := 1
+		if f.unitCoresFn != nil {
+			cores = f.unitCoresFn(wu)
+		}
+		f.selector.RecordAssignment(head.Name, booked, wu.ID, estSec, cores)
 		pushed++
 	}
 	return pushed, returned

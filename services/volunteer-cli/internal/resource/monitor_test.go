@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/config"
-	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // mockLimiter implements Limiter for testing.
@@ -24,7 +23,6 @@ func (m *mockLimiter) Apply(_ *exec.Cmd, _ *TaskLimits) error { return nil }
 func (m *mockLimiter) Enforce(_ int, _ *TaskLimits) (func(), error) {
 	return func() {}, nil
 }
-func (m *mockLimiter) SetCPU(_ int, _ runtime.CPUGrant) error { return nil }
 func (m *mockLimiter) CheckDiskSpace(_ string, _ int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

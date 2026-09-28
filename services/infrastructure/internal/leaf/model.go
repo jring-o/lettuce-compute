@@ -386,6 +386,11 @@ func DefaultHealthConfig() HealthConfig {
 // ResourceRequirements defines minimum volunteer hardware.
 type ResourceRequirements struct {
 	MinCPUCores int `json:"min_cpu_cores"`
+	// MaxCPUCores is the most cores one unit can use. MinCPUCores stays the
+	// dispatch gate; a volunteer's client grants each task a figure between the
+	// two, holds it there and tells the task (LETTUCE_CPU_LIMIT). 0 means the
+	// leaf declares none: its units get exactly MinCPUCores (ResolveMaxCPUCores).
+	MaxCPUCores int `json:"max_cpu_cores"`
 	// Memory has no separate minimum: it is governed solely by
 	// ExecutionConfig.MaxMemoryMB (the container limit), which is also what the
 	// scheduler matches against — a single memory bound for the whole task.
@@ -394,6 +399,15 @@ type ResourceRequirements struct {
 	GPURequired          bool    `json:"gpu_required"`
 	GPUComputeCapability *string `json:"gpu_compute_capability"`
 	MinBandwidthMbps     int     `json:"min_bandwidth_mbps"`
+}
+
+// ResolveMaxCPUCores is the most cores one unit of the leaf is granted: the
+// declared MaxCPUCores, or MinCPUCores when the leaf declares none (or less).
+func (r ResourceRequirements) ResolveMaxCPUCores() int {
+	if r.MaxCPUCores > r.MinCPUCores {
+		return r.MaxCPUCores
+	}
+	return r.MinCPUCores
 }
 
 // Leaf is a computation within a head (server) — the fundamental entity of Lettuce.

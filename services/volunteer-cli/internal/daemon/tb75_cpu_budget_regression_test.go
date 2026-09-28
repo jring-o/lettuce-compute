@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -19,12 +18,12 @@ import (
 // container got the whole figure as its own quota and admission booked no
 // cores — so two tasks used four cores and filled his machine. Now the figure
 // is a whole-machine budget: admission books each unit's minimum core
-// requirement against it, the running tasks are given equal shares that are
-// adjusted live on every start and finish, and the budget is clipped to the
-// engine VM's vCPUs the way the memory budget is clipped to its RAM.
+// requirement against it (each task is then granted its cores), and
+// the budget is clipped to the engine VM's vCPUs the way the memory budget is
+// clipped to its RAM.
 
 // tb75Daemon is the tester's configuration on a host with no VM: a 2-core
-// budget, three slots, and every other admission guard isolated away.
+// budget, no running-task cap, and every other admission guard isolated away.
 func tb75Daemon(t *testing.T) *Daemon {
 	t.Helper()
 	// A limiter whose disk check always passes: the disk guard is not under
@@ -33,9 +32,7 @@ func tb75Daemon(t *testing.T) *Daemon {
 		resource.NewScheduler(&config.Scheduling{Mode: "ALWAYS"}, quietLogger()))
 	d.cfg.ResourceLimits.MaxCPUCores = 2
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
-	d.cfg.MaxConcurrentTasks = 3
 	d.slotManager = NewSlotManager(3, d.logger)
-	d.slotManager.SetCPUShareSource(d.currentCPUShares)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	t.Cleanup(func() { freeSystemMemoryMB = orig })
@@ -68,7 +65,6 @@ func release(d *Daemon, i int) {
 	slot.active = false
 	slot.wu = nil
 	slot.processHandle = nil
-	slot.cpuShare = 0
 	slot.mu.Unlock()
 }
 
@@ -81,8 +77,8 @@ func grepUnit(id string) *runtime.WorkUnit {
 }
 
 // TestTB75_AdmissionBooksCoresAgainstTheBudget: under max_cpu_cores 2, two
-// one-core units are admitted and a third is refused, whatever
-// max_concurrent_tasks says; a unit whose leaf declares two cores takes the
+// one-core units are admitted and a third is refused, three slots free;
+// a unit whose leaf declares two cores takes the
 // whole budget, so nothing is admitted beside it, and the backfill delay test
 // sees the same bookings. Pre-fix canAccommodateWU had no CPU guard at all:
 // three units were admitted and each was given two cores.
@@ -144,85 +140,6 @@ func TestTB75_AdmissionBooksCoresAgainstTheBudget(t *testing.T) {
 	}
 }
 
-// TestTB75_RunningTasksShareTheBudgetLive is the decided rule 2, driven
-// through the daemon's rebalance: a task alone is given the whole 2-core
-// budget; when a second starts each is given 1; when one finishes the
-// survivor is given 2 again — and at every step the shares sum to at most
-// the budget. A handle attached after the split changed is brought to the
-// current share at once, and a rebalance that changes nothing touches no
-// task. Pre-fix nothing ever adjusted a running task, and every task was
-// created with the whole budget.
-func TestTB75_RunningTasksShareTheBudgetLive(t *testing.T) {
-	d := tb75Daemon(t)
-
-	h0 := &mockProcessHandle{pid: 1}
-	occupy(d, 0, bbUnit("bb-1"), h0)
-	if got := d.cpuGrantFor(true); got.ShareCores != 2 || got.BudgetCores != 2 {
-		t.Fatalf("grant with one task running = %+v, want 2 of 2", got)
-	}
-	d.rebalanceCPUShares()
-
-	h1 := &mockProcessHandle{pid: 2}
-	occupy(d, 1, bbUnit("bb-2"), h1)
-	if got := d.cpuGrantFor(true).ShareCores; got != 1 {
-		t.Fatalf("grant with two tasks running = %v, want 1 (half of 2)", got)
-	}
-	d.rebalanceCPUShares()
-	d.rebalanceCPUShares() // unchanged split: no second call to any handle
-
-	release(d, 1)
-	d.rebalanceCPUShares()
-
-	if want := []float64{2, 1, 2}; !reflect.DeepEqual(h0.cpuShares, want) {
-		t.Errorf("first task's shares over start/second start/second finish = %v, want %v", h0.cpuShares, want)
-	}
-	if want := []float64{1}; !reflect.DeepEqual(h1.cpuShares, want) {
-		t.Errorf("second task's shares = %v, want %v", h1.cpuShares, want)
-	}
-
-	// A handle registered after the split changed (the newcomer's container
-	// created before its registration, or a container adopted from the
-	// previous session) is brought to the current share on attach.
-	occupy(d, 1, bbUnit("bb-3"), nil)
-	late := &mockProcessHandle{pid: 3}
-	d.slotManager.attachProcessHandle(d.slotManager.slots[1], late)
-	if want := []float64{1}; !reflect.DeepEqual(late.cpuShares, want) {
-		t.Errorf("late-attached handle's shares = %v, want %v (the current half-split)", late.cpuShares, want)
-	}
-
-	// The environment a task starting now would be told: the same share.
-	if got := d.cpuGrantFor(true).Env()[0]; got != "LETTUCE_CPU_LIMIT=1" {
-		t.Errorf("grant env = %q, want LETTUCE_CPU_LIMIT=1", got)
-	}
-
-	// A raised limit is re-split at once (ApplyConfig), a lone survivor gets
-	// the whole new budget.
-	release(d, 1)
-	raised := *d.cfg
-	raised.ResourceLimits.MaxCPUCores = 3
-	d.ApplyConfig(&raised)
-	if last := h0.cpuShares[len(h0.cpuShares)-1]; last != 3 {
-		t.Errorf("after raising max_cpu_cores to 3 the running task's share = %v, want 3", last)
-	}
-}
-
-// TestTB75_FractionalSharesAreExact: a 3-core budget shared by two tasks is
-// 1.5 each — the CFS quota is 150000 of 100000 — and by three tasks 1 each.
-func TestTB75_FractionalSharesAreExact(t *testing.T) {
-	d := tb75Daemon(t)
-	d.cfg.ResourceLimits.MaxCPUCores = 3
-	h0, h1 := &mockProcessHandle{pid: 1}, &mockProcessHandle{pid: 2}
-	occupy(d, 0, bbUnit("bb-1"), h0)
-	occupy(d, 1, bbUnit("bb-2"), h1)
-	d.rebalanceCPUShares()
-	if h0.cpuShares[0] != 1.5 || h1.cpuShares[0] != 1.5 {
-		t.Errorf("shares of 3 cores over two tasks = %v / %v, want 1.5 each", h0.cpuShares, h1.cpuShares)
-	}
-	if q, p := runtime.CFSQuota(h0.cpuShares[0]); q != 150000 || p != 100000 {
-		t.Errorf("CFS quota for 1.5 cores = %d/%d, want 150000/100000", q, p)
-	}
-}
-
 // TestTB75_EngineVMClipsTheCPUBudget: a 4-vCPU Podman machine bounds a
 // 6-core limit for container work. Container work's budget, the advertised
 // max_cpu_cores and every container booking become 4 (native work keeps the
@@ -266,7 +183,7 @@ func TestTB75_EngineVMClipsTheCPUBudget(t *testing.T) {
 	if got := d.AdvertisedHardware().MaxMemoryMb; got != 8192 {
 		t.Errorf("MaxMemoryMb = %d after the CPU clip, want 8192 (the VM's memory honors it)", got)
 	}
-	if got := d.cpuGrantFor(true); got.BudgetCores != 4 || got.ShareCores != 4 {
+	if got := d.grantCPU(headContainerUnit("g", "leaf-grep", "", 1024), nil); got.BudgetCores != 4 || got.Cores != 4 {
 		t.Errorf("grant after the clip = %+v, want 4 of 4", got)
 	}
 	if budget, cpus := f.ContainerCPUs(); budget != 4 || cpus != 4 {

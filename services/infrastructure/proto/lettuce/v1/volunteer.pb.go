@@ -1919,7 +1919,13 @@ type LeafResourceRequirements struct {
 	// (they were historically unsynced — issue #30), so a client that reads only the
 	// execution-spec flag reports a GPU-less machine eligible for a leaf that sets
 	// just this one. Read them together, never alone.
-	GpuRequired   bool `protobuf:"varint,6,opt,name=gpu_required,json=gpuRequired,proto3" json:"gpu_required,omitempty"`
+	GpuRequired bool `protobuf:"varint,6,opt,name=gpu_required,json=gpuRequired,proto3" json:"gpu_required,omitempty"`
+	// The most cores one unit of this leaf can use. min_cpu_cores stays the
+	// dispatch gate (the fewest a unit can run on); the client grants each task
+	// between the two, as many as its CPU budget has free, holds the task to that
+	// grant and tells it the figure. 0 (a head too old to send it, or a leaf that
+	// declares none) means the same as min_cpu_cores.
+	MaxCpuCores   int32 `protobuf:"varint,7,opt,name=max_cpu_cores,json=maxCpuCores,proto3" json:"max_cpu_cores,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1994,6 +2000,13 @@ func (x *LeafResourceRequirements) GetGpuRequired() bool {
 		return x.GpuRequired
 	}
 	return false
+}
+
+func (x *LeafResourceRequirements) GetMaxCpuCores() int32 {
+	if x != nil {
+		return x.MaxCpuCores
+	}
+	return 0
 }
 
 type GetHeadInfoRequest struct {
@@ -3393,14 +3406,15 @@ const file_proto_lettuce_v1_volunteer_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1aB\n" +
 	"\x14BinaryChecksumsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf9\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9d\x02\n" +
 	"\x18LeafResourceRequirements\x12\x1e\n" +
 	"\vmin_disk_mb\x18\x01 \x01(\x03R\tminDiskMb\x12\"\n" +
 	"\rmin_cpu_cores\x18\x02 \x01(\x05R\vminCpuCores\x12%\n" +
 	"\x0fmin_gpu_vram_mb\x18\x03 \x01(\x05R\fminGpuVramMb\x12\x19\n" +
 	"\bgpu_type\x18\x04 \x01(\tR\agpuType\x124\n" +
 	"\x16gpu_compute_capability\x18\x05 \x01(\tR\x14gpuComputeCapability\x12!\n" +
-	"\fgpu_required\x18\x06 \x01(\bR\vgpuRequired\"\x14\n" +
+	"\fgpu_required\x18\x06 \x01(\bR\vgpuRequired\x12\"\n" +
+	"\rmax_cpu_cores\x18\a \x01(\x05R\vmaxCpuCores\"\x14\n" +
 	"\x12GetHeadInfoRequest\"\xcf\x02\n" +
 	"\x13GetHeadInfoResponse\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12 \n" +

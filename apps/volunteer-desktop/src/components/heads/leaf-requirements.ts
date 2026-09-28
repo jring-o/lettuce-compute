@@ -136,7 +136,11 @@ export function leafRequirementItems(
 
   const cores = rr?.min_cpu_cores ?? 0;
   if (cores > 0) {
-    const item: RequirementItem = { key: "cores", label: `${cores} ${cores === 1 ? "core" : "cores"}` };
+    // A leaf that declares a range is granted between its minimum and its
+    // maximum per task; only the minimum must fit what this machine allows.
+    const maxCores = rr?.max_cpu_cores ?? 0;
+    const label = maxCores > cores ? `${cores}–${maxCores} cores` : `${cores} ${cores === 1 ? "core" : "cores"}`;
+    const item: RequirementItem = { key: "cores", label };
     const budget = machine ? budgetFor(container, machine.max_cpu_cores, machine.host_max_cpu_cores) : 0;
     if (machine && budget > 0 && cores > budget) {
       if (container && machine.cpu_limited_by_vm) {

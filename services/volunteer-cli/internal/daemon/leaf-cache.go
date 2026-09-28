@@ -46,6 +46,10 @@ type CachedExecutionSpec struct {
 type CachedResourceRequirements struct {
 	MinDiskMB   int64
 	MinCPUCores int32
+	// MaxCPUCores is the most cores one unit can use; each task is granted
+	// between MinCPUCores and this. 0 (a head too old to send it) means
+	// MinCPUCores.
+	MaxCPUCores int32
 	// The GPU dimensions (TB-21). MinGPUVRAMMB is matched against this machine's
 	// ALLOWED VRAM, not its card capacity — see MachineCapabilities.MaxGPUVRAMMB.
 	// GPUType empty or "ANY" means any vendor; GPUComputeCapability empty means no
@@ -140,6 +144,7 @@ func (lc *LeafCache) Refresh(ctx context.Context, serverName string, client Work
 			cli.ResourceRequirements = &CachedResourceRequirements{
 				MinDiskMB:            rr.GetMinDiskMb(),
 				MinCPUCores:          rr.GetMinCpuCores(),
+				MaxCPUCores:          rr.GetMaxCpuCores(),
 				MinGPUVRAMMB:         rr.GetMinGpuVramMb(),
 				GPUType:              rr.GetGpuType(),
 				GPUComputeCapability: rr.GetGpuComputeCapability(),

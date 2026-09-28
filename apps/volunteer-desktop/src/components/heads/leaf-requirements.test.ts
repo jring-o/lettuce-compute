@@ -120,6 +120,17 @@ describe("leafRequirementItems", () => {
     expect(leafRequirementItems(fits, machine).find((i) => i.key === "cores")?.shortfall).toBeUndefined();
   });
 
+  it("shows a leaf's core range, and gates only on its minimum", () => {
+    const ranged = makeLeaf({ resource_requirements: { min_cpu_cores: 2, max_cpu_cores: 4 } });
+    const machine = makeMachine({ max_cpu_cores: 3, host_max_cpu_cores: 3 });
+    expect(leafRequirementItems(ranged, machine).find((i) => i.key === "cores")).toEqual({
+      key: "cores",
+      label: "2–4 cores",
+    });
+    const fixed = makeLeaf({ resource_requirements: { min_cpu_cores: 1, max_cpu_cores: 1 } });
+    expect(leafRequirementItems(fixed, machine).find((i) => i.key === "cores")?.label).toBe("1 core");
+  });
+
   it("treats a budget the daemon reports as 0 as unknown, not as a shortfall", () => {
     const leaf = makeLeaf({ resource_requirements: { min_disk_mb: 15360, min_cpu_cores: 8 } });
     const items = leafRequirementItems(leaf, makeMachine({ max_disk_mb: 0, max_cpu_cores: 0 }));

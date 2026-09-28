@@ -28,7 +28,7 @@ func TestSaveEmitsComments(t *testing.T) {
 	// Spot-check a comment from each commented section. The yaml.v3 emitter
 	// prepends "# ", so assert on the rendered "# <text>" form.
 	wantSubstrings := []string{
-		"# Most work units that run at once",                     // top-level: max_concurrent_tasks
+		"# Optional cap on how many work units run at once",      // top-level: max_running_tasks
 		"# Most memory Lettuce's running work may use, in total", // resource_limits.max_memory_mb
 		"freeze ALL work when the CPU reaches this",              // thermal.cpu_pause_threshold
 	}

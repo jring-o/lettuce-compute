@@ -70,7 +70,7 @@ func tb85Mini(t *testing.T, memMB, cores, vmMB, vmCPUs int) (*Daemon, *reRegMock
 	d, rc, buf := tb63Daemon(t)
 	d.cfg.ResourceLimits.MaxMemoryMB = memMB
 	d.cfg.ResourceLimits.MaxCPUCores = cores
-	d.cfg.MaxConcurrentTasks = 2
+	setTestSlots(d.cfg, 2)
 	d.cachedHW = &lettucev1.HardwareCapabilities{CpuCores: 8, MaxCpuCores: int32(cores), MemoryTotalMb: 8192, MaxMemoryMb: int32(memMB), Os: "darwin"}
 	d.leafCache.PopulateForTest("server-a", &CachedHeadInfo{Name: "server-a", Leafs: tb85Leafs(1)})
 	f := tb63Factory(t, d, 0)
@@ -235,11 +235,10 @@ func TestTB85_HeadsAreToldBothBudgets(t *testing.T) {
 // TestTB85_CPUBudgetIsPerRuntimeToo is the CPU twin: four cores configured,
 // a two-vCPU VM. A native unit whose leaf needs two cores is admitted beside
 // a running one-core container unit (1 + 2 fits the four-core limit), while a
-// third container core does not exist in the VM. Running, two container
-// tasks share the VM's two CPUs — one each — and the native task is given
-// what they leave of the four, two. Pre-fix the whole budget was the VM's
-// two cores: the native unit was refused, and three tasks were given 0.66 of
-// a core each.
+// third container core does not exist in the VM. Granted in turn, the two
+// container tasks get one of the VM's two CPUs each and the native task its
+// two of the four. Pre-fix the whole budget was the VM's two cores: the
+// native unit was refused, and three tasks were given 0.66 of a core each.
 func TestTB85_CPUBudgetIsPerRuntimeToo(t *testing.T) {
 	d, _, _, _ := tb85Mini(t, 8192, 4, 8192+runtime.ContainerVMHeadroomMB, 2)
 	d.slotManager = NewSlotManager(3, d.logger)
@@ -257,18 +256,19 @@ func TestTB85_CPUBudgetIsPerRuntimeToo(t *testing.T) {
 		t.Error("a third container unit was admitted with both of the VM's CPUs booked")
 	}
 
-	h1, h2, hn := &mockProcessHandle{pid: 1}, &mockProcessHandle{pid: 2}, &mockProcessHandle{pid: 3}
+	// Started in turn, each granted with the others still waiting.
 	release(d, 0)
 	release(d, 1)
-	occupy(d, 0, c1, h1)
-	occupy(d, 1, c2, h2)
-	occupy(d, 2, native, hn)
-	d.rebalanceCPUShares()
-	if len(h1.cpuShares) != 1 || h1.cpuShares[0] != 1 || len(h2.cpuShares) != 1 || h2.cpuShares[0] != 1 {
-		t.Errorf("container tasks' shares = %v / %v, want 1 each (the VM's two CPUs between them)", h1.cpuShares, h2.cpuShares)
+	c1.CPUGrant = d.grantCPU(c1, []*runtime.WorkUnit{c2, native})
+	occupy(d, 0, c1, nil)
+	c2.CPUGrant = d.grantCPU(c2, []*runtime.WorkUnit{native})
+	occupy(d, 1, c2, nil)
+	native.CPUGrant = d.grantCPU(native, nil)
+	if c1.CPUGrant.Cores != 1 || c2.CPUGrant.Cores != 1 || c1.CPUGrant.BudgetCores != 2 {
+		t.Errorf("container tasks' grants = %v / %v, want 1 of 2 each (the VM's two CPUs between them)", c1.CPUGrant, c2.CPUGrant)
 	}
-	if len(hn.cpuShares) != 1 || hn.cpuShares[0] != 2 {
-		t.Errorf("native task's share = %v, want 2 (what the containers leave of the four-core limit)", hn.cpuShares)
+	if native.CPUGrant.Cores != 2 || native.CPUGrant.BudgetCores != 4 {
+		t.Errorf("native task's grant = %v, want 2 of 4 (its leaf's two, within what the containers leave of the limit)", native.CPUGrant)
 	}
 }
 

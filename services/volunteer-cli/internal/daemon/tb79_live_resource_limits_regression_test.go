@@ -221,7 +221,7 @@ func TestTB79_UnitDeclaringMoreThanTheBudgetIsGivenBackNotClamped(t *testing.T) 
 	d, rc, _ := tb63Daemon(t)
 	container := &mockRuntime{canHandle: true, name: "container"}
 	d.runtimeRegistry.Register(container)
-	d.cfg.MaxConcurrentTasks = 2
+	setTestSlots(d.cfg, 2)
 	d.slotManager = NewSlotManager(2, d.logger)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 	d.limiter = &testLimiter{}

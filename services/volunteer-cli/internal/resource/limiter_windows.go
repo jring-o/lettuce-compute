@@ -10,8 +10,6 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
-
-	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 var (
@@ -31,9 +29,12 @@ const (
 	infoClassExtendedLimit  = 9  // JobObjectExtendedLimitInformation
 	infoClassCpuRateControl = 15 // JobObjectCpuRateControlInformation
 
+	jobObjectLimitPriorityClass    = 0x00000020
 	jobObjectLimitProcessMemory    = 0x00000100
 	jobObjectCpuRateControlEnable  = 0x1
 	jobObjectCpuRateControlHardCap = 0x4
+
+	idlePriorityClass = 0x00000040 // IDLE_PRIORITY_CLASS
 )
 
 // Windows Job Object structures (64-bit layout).
@@ -78,9 +79,8 @@ type WindowsLimiter struct {
 	logger *slog.Logger
 
 	// jobs keeps each enforced process's Job Object handle until its cleanup
-	// runs, so the job's CPU rate can be rewritten while the process runs
-	// (SetCPU, TB-75). Before this the handle was held only by the cleanup
-	// closure and the rate was fixed for the process's life.
+	// runs, so the limits a running task is held to can be read back from its
+	// job (the limiter's tests do).
 	mu   sync.Mutex
 	jobs map[int]uintptr
 }
@@ -101,15 +101,15 @@ func (w *WindowsLimiter) Apply(cmd *exec.Cmd, limits *TaskLimits) error {
 	return nil
 }
 
-// cpuRateFor converts a task's CPU share into a Job Object CPU rate: the
-// share as a percentage of the machine's CPUs, in hundredths of a percent
+// cpuRateFor converts a task's CPU grant into a Job Object CPU rate: the
+// grant as a percentage of the machine's CPUs, in hundredths of a percent
 // (50 % = 5000, 100 % = 10000), clamped to the API's 1 %–100 % range. A
-// share of 1.5 cores on an 8-CPU machine is 18.75 % → 1875.
-func cpuRateFor(shareCores float64, numCPU int) uint32 {
+// grant of 3 cores on an 8-CPU machine is 37.5 % → 3750.
+func cpuRateFor(cores, numCPU int) uint32 {
 	if numCPU < 1 {
 		numCPU = 1
 	}
-	rate := uint32(shareCores * 10000 / float64(numCPU))
+	rate := uint32(cores * 10000 / numCPU)
 	if rate > 10000 {
 		rate = 10000
 	}
@@ -120,12 +120,12 @@ func cpuRateFor(shareCores float64, numCPU int) uint32 {
 }
 
 // setJobCPURate applies a hard CPU-rate cap to a Job Object, or lifts it when
-// shareCores is 0.
-func (w *WindowsLimiter) setJobCPURate(jobHandle uintptr, shareCores float64) error {
+// cores is 0.
+func (w *WindowsLimiter) setJobCPURate(jobHandle uintptr, cores int) error {
 	cpuInfo := jobobjectCpuRateControlInfo{}
-	if shareCores > 0 {
+	if cores > 0 {
 		cpuInfo.ControlFlags = jobObjectCpuRateControlEnable | jobObjectCpuRateControlHardCap
-		cpuInfo.CpuRate = cpuRateFor(shareCores, goruntime.NumCPU())
+		cpuInfo.CpuRate = cpuRateFor(cores, goruntime.NumCPU())
 	}
 	ret, _, callErr := procSetInformationJobObject.Call(
 		jobHandle,
@@ -136,7 +136,23 @@ func (w *WindowsLimiter) setJobCPURate(jobHandle uintptr, shareCores float64) er
 	if ret == 0 {
 		return fmt.Errorf("SetInformationJobObject (CPU rate): %w", callErr)
 	}
-	w.logger.Debug("set CPU rate", "rate_per_10000", cpuInfo.CpuRate, "cores", runtime.FormatCores(shareCores), "total_cores", goruntime.NumCPU())
+	w.logger.Debug("set CPU rate", "rate_per_10000", cpuInfo.CpuRate, "cores", cores, "total_cores", goruntime.NumCPU())
+	return nil
+}
+
+// setJobLimits applies a Job Object's extended limits. Each call replaces the
+// job's whole set of basic limit flags, so every limit the job carries travels
+// in the one call.
+func setJobLimits(jobHandle uintptr, info *jobobjectExtendedLimitInfo) error {
+	ret, _, callErr := procSetInformationJobObject.Call(
+		jobHandle,
+		uintptr(infoClassExtendedLimit),
+		uintptr(unsafe.Pointer(info)),
+		unsafe.Sizeof(*info),
+	)
+	if ret == 0 {
+		return callErr
+	}
 	return nil
 }
 
@@ -149,30 +165,39 @@ func (w *WindowsLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
 		return nil, fmt.Errorf("CreateJobObject: %w", err)
 	}
 
-	// Set memory limit.
+	// Run every process of the job at idle priority, so the owner's own
+	// programs are served first whenever the CPUs are contended, and set the
+	// memory limit alongside it. The priority is a courtesy: if the job refuses
+	// it the task still runs, with its memory limit, at normal priority.
+	info := jobobjectExtendedLimitInfo{}
+	info.BasicLimitInformation.LimitFlags = jobObjectLimitPriorityClass
+	info.BasicLimitInformation.PriorityClass = idlePriorityClass
 	if limits.MaxMemoryMB > 0 {
-		info := jobobjectExtendedLimitInfo{}
-		info.BasicLimitInformation.LimitFlags = jobObjectLimitProcessMemory
+		info.BasicLimitInformation.LimitFlags |= jobObjectLimitProcessMemory
 		info.ProcessMemoryLimit = uintptr(limits.MaxMemoryMB) * 1024 * 1024
-
-		ret, _, callErr := procSetInformationJobObject.Call(
-			jobHandle,
-			uintptr(infoClassExtendedLimit),
-			uintptr(unsafe.Pointer(&info)),
-			unsafe.Sizeof(info),
-		)
-		if ret == 0 {
-			procCloseHandle.Call(jobHandle)
-			return nil, fmt.Errorf("SetInformationJobObject (memory): %w", callErr)
+	}
+	if err := setJobLimits(jobHandle, &info); err != nil {
+		w.logger.Warn("could not lower the task's priority; it runs at normal priority", "pid", pid, "error", err)
+		info.BasicLimitInformation.LimitFlags &^= jobObjectLimitPriorityClass
+		info.BasicLimitInformation.PriorityClass = 0
+		if limits.MaxMemoryMB > 0 {
+			if err := setJobLimits(jobHandle, &info); err != nil {
+				procCloseHandle.Call(jobHandle)
+				return nil, fmt.Errorf("SetInformationJobObject (memory): %w", err)
+			}
 		}
+	} else {
+		w.logger.Debug("set job priority", "priority_class", "idle")
+	}
+	if limits.MaxMemoryMB > 0 {
 		w.logger.Debug("set memory limit", "limit_mb", limits.MaxMemoryMB)
 	}
 
-	// Set the CPU rate to this task's SHARE of the budget — not, as before,
-	// the whole budget for every job, which let N tasks use N times the
-	// limit (TB-75).
-	if limits.CPU.ShareCores > 0 {
-		if err := w.setJobCPURate(jobHandle, limits.CPU.ShareCores); err != nil {
+	// Set the CPU rate to this task's grant — not, as before, the whole
+	// budget for every job, which let N tasks use N times the limit
+	// (TB-75).
+	if limits.CPU.Cores > 0 {
+		if err := w.setJobCPURate(jobHandle, limits.CPU.Cores); err != nil {
 			procCloseHandle.Call(jobHandle)
 			return nil, err
 		}
@@ -205,19 +230,6 @@ func (w *WindowsLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
 		procCloseHandle.Call(jobHandle)
 	}
 	return cleanup, nil
-}
-
-// SetCPU rewrites the CPU rate of the Job Object a running task was assigned
-// to (TB-75). A pid that Enforce never saw, or whose cleanup already ran, is
-// an error the caller logs and moves past.
-func (w *WindowsLimiter) SetCPU(pid int, cpu runtime.CPUGrant) error {
-	w.mu.Lock()
-	jobHandle, ok := w.jobs[pid]
-	w.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("no job object for pid %d", pid)
-	}
-	return w.setJobCPURate(jobHandle, cpu.ShareCores)
 }
 
 // CheckDiskSpace verifies that at least requiredMB of disk space is available

@@ -334,6 +334,60 @@ func TestHeadInfo_CarriesGPURequirements(t *testing.T) {
 	}
 }
 
+// TestHeadInfo_CarriesCoreRange: a leaf's core range reaches the volunteer,
+// which grants each unit between min_cpu_cores and max_cpu_cores. A leaf that
+// declares no max is sent max = min, so a client never reads 0 as "no limit".
+func TestHeadInfo_CarriesCoreRange(t *testing.T) {
+	env, cleanup := setupHeadsLeafsServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	userID := createTestUser(t, env.pool, ctx, "headinfo-corerange")
+
+	for _, l := range []struct {
+		name string
+		rr   leaf.ResourceRequirements
+	}{
+		{"Ranged Leaf", leaf.ResourceRequirements{MinCPUCores: 2, MaxCPUCores: 4, MinDiskMB: 1024}},
+		{"Fixed Leaf", leaf.ResourceRequirements{MinCPUCores: 3, MinDiskMB: 1024}},
+	} {
+		rr := l.rr
+		createHLLeaf(t, env, ctx, userID, hlLeafOpts{
+			Name:         l.name,
+			TaskPattern:  leaf.PatternParameterSweep,
+			ExecConfig:   defaultExecConfig(),
+			ValConfig:    defaultHLValConfig(),
+			FTConfig:     defaultFTConfig(),
+			DataConfig:   defaultDataConfig(),
+			CreditConfig: leaf.CreditConfig{CreditPerValidatedWorkUnit: 1.0},
+			ResourceReqs: &rr,
+		})
+	}
+
+	resp, err := env.grpc.GetHeadInfo(ctx, &lettucev1.GetHeadInfoRequest{})
+	if err != nil {
+		t.Fatalf("GetHeadInfo: %v", err)
+	}
+
+	want := map[string][2]int32{"Ranged Leaf": {2, 4}, "Fixed Leaf": {3, 3}}
+	for _, li := range resp.Leafs {
+		w, ok := want[li.Name]
+		if !ok {
+			continue
+		}
+		delete(want, li.Name)
+		rr := li.GetResourceRequirements()
+		if rr.GetMinCpuCores() != w[0] || rr.GetMaxCpuCores() != w[1] {
+			t.Errorf("%s: cores %d–%d, want %d–%d", li.Name, rr.GetMinCpuCores(), rr.GetMaxCpuCores(), w[0], w[1])
+		}
+	}
+	if len(want) > 0 {
+		t.Fatalf("leafs not found in GetHeadInfo response: %v", want)
+	}
+}
+
 // registerHLVolunteerWithRuntimes registers a volunteer with specific available runtimes.
 func registerHLVolunteerWithRuntimes(t *testing.T, env *headsLeafsEnv, ctx context.Context, pubKey []byte, name string, runtimes []string) string {
 	t.Helper()

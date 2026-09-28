@@ -46,7 +46,7 @@ func TestTB45_CappedHeadDoesNotFreezeHarmlessBackfill(t *testing.T) {
 	q.Push(small)
 
 	neverDelays := func(_, _ *PreFetchItem) bool { return false }
-	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-beyblade" }, neverDelays)
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-beyblade" }, neverDelays, nil)
 	if got == nil || got.WU.ID != "wu-beyblade" {
 		t.Fatalf("PopFit = %v, want wu-beyblade — the capped head froze the queue and idled the slot (TB-45)", got)
 	}
@@ -70,7 +70,7 @@ func TestTB45_CapStillBlocksDelayingBackfill(t *testing.T) {
 	q.Push(head)
 	q.Push(mid)
 
-	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-mid" }, alwaysDelays)
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-mid" }, alwaysDelays, nil)
 	if got != nil {
 		t.Fatalf("PopFit = %v, want nil — a delaying backfill passed a capped head", got.WU.ID)
 	}
@@ -94,7 +94,7 @@ func TestTB45_OnlyDelayingJumpsCount(t *testing.T) {
 
 	fitsSmall := func(it *PreFetchItem) bool { return it.WU.ID != "wu-grep-head" }
 	neverDelays := func(_, _ *PreFetchItem) bool { return false }
-	if got := q.PopFit(fitsSmall, neverDelays); got == nil || got.WU.ID != "wu-beyblade" {
+	if got := q.PopFit(fitsSmall, neverDelays, nil); got == nil || got.WU.ID != "wu-beyblade" {
 		t.Fatalf("PopFit = %v, want wu-beyblade", got)
 	}
 	if waiting.TimesSkipped != 0 {
@@ -102,7 +102,7 @@ func TestTB45_OnlyDelayingJumpsCount(t *testing.T) {
 	}
 
 	q.Push(tb45Item("wu-mid", 4096))
-	if got := q.PopFit(fitsSmall, alwaysDelays); got == nil || got.WU.ID != "wu-mid" {
+	if got := q.PopFit(fitsSmall, alwaysDelays, nil); got == nil || got.WU.ID != "wu-mid" {
 		t.Fatalf("PopFit = %v, want wu-mid", got)
 	}
 	if waiting.TimesSkipped != 1 {

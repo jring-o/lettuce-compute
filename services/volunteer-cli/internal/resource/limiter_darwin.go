@@ -7,8 +7,6 @@ import (
 	"log/slog"
 	"os/exec"
 	"syscall"
-
-	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // DarwinLimiter enforces resource limits using setpriority (best-effort).
@@ -36,22 +34,36 @@ func (d *DarwinLimiter) Apply(cmd *exec.Cmd, limits *TaskLimits) error {
 	return nil
 }
 
-// Enforce lowers process priority as best-effort CPU management on macOS.
+const (
+	// lowestNice is the nice value every task runs at: the lowest priority the
+	// ordinary scheduler offers. Child processes inherit it.
+	lowestNice = 19
+
+	// prioDarwinProcess and prioDarwinBG are setpriority(2)'s PRIO_DARWIN_PROCESS
+	// and PRIO_DARWIN_BG (<sys/resource.h>): together they put a process in the
+	// background state, where the system schedules its CPU and disk work behind
+	// everything the user is doing.
+	prioDarwinProcess = 4
+	prioDarwinBG      = 0x1000
+)
+
+// Enforce runs the task at the lowest priority macOS offers, the only CPU
+// management available here: the background state, and nice 19, which every
+// child process inherits. Best-effort: a failure is logged and the task runs
+// on.
 func (d *DarwinLimiter) Enforce(pid int, limits *TaskLimits) (func(), error) {
-	// Lower priority: nice value 10 (range -20 to 19, higher = lower priority).
-	if err := syscall.Setpriority(syscall.PRIO_PROCESS, pid, 10); err != nil {
+	if err := syscall.Setpriority(syscall.PRIO_PROCESS, pid, lowestNice); err != nil {
 		d.logger.Warn("setpriority failed (best-effort)", "error", err, "pid", pid)
 	} else {
-		d.logger.Debug("set process priority", "pid", pid, "nice", 10)
+		d.logger.Debug("set process priority", "pid", pid, "nice", lowestNice)
+	}
+	if err := syscall.Setpriority(prioDarwinProcess, pid, prioDarwinBG); err != nil {
+		d.logger.Warn("could not put the task in the background state (best-effort)", "error", err, "pid", pid)
+	} else {
+		d.logger.Debug("task in the background state", "pid", pid)
 	}
 
 	return func() {}, nil
-}
-
-// SetCPU is a no-op: macOS has no per-process CPU cap to rewrite. The task's
-// share still reaches it through LETTUCE_CPU_LIMIT at start (TB-75).
-func (d *DarwinLimiter) SetCPU(pid int, cpu runtime.CPUGrant) error {
-	return nil
 }
 
 // CheckDiskSpace checks available disk space on the filesystem containing path.
@@ -71,7 +83,7 @@ func (d *DarwinLimiter) CheckDiskSpace(path string, requiredMB int) error {
 
 // describeCPUEnforcement reports macOS's CPU posture.
 //
-// The Darwin limiter sets a nice value and nothing else: macOS offers no
+// The Darwin limiter lowers the priority and nothing else: macOS offers no
 // per-process CPU quota or affinity API comparable to cgroups or a Job Object,
 // so a work unit is de-prioritised rather than capped. max_cpu_cores therefore
 // serves only as the capability figure a head gates dispatch on.

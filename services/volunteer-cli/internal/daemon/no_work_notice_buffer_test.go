@@ -39,7 +39,7 @@ func noWorkHost(t *testing.T, slots, running, queued int, memMB int32) (*Daemon,
 	d.logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	d.notices = NewNoticeLog()
 	d.cfg.WorkBufferHours = 2
-	d.cfg.MaxConcurrentTasks = slots
+	setTestSlots(d.cfg, slots)
 	d.benchmarkFPOPS = 1
 	d.cfg.ResourceLimits.MaxMemoryMB = 1024
 	d.slotManager = NewSlotManager(slots, d.logger)

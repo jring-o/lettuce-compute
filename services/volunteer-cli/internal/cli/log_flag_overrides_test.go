@@ -121,7 +121,7 @@ func TestLogLevelFlagDoesNotPersist(t *testing.T) {
 	cfgFile := writeDefaultConfig(t, dir)
 
 	// A command that deliberately writes config.yaml, run with the override.
-	if err := runCLI(t, "config", "set", "max_concurrent_tasks", "2",
+	if err := runCLI(t, "config", "set", "max_running_tasks", "2",
 		"--config", cfgFile, "--data-dir", dir, "--log-level", "debug"); err != nil {
 		t.Fatalf("config set: %v", err)
 	}
@@ -135,8 +135,8 @@ func TestLogLevelFlagDoesNotPersist(t *testing.T) {
 	}
 	// The deliberate change did land, so the test is not passing because the
 	// save was skipped altogether.
-	if saved.MaxConcurrentTasks != 2 {
-		t.Errorf("max_concurrent_tasks = %d, want 2 — the config was not saved at all", saved.MaxConcurrentTasks)
+	if saved.MaxRunningTasks != 2 {
+		t.Errorf("max_running_tasks = %d, want 2 — the config was not saved at all", saved.MaxRunningTasks)
 	}
 }
 
@@ -148,7 +148,7 @@ func TestLogFileFlagDoesNotPersist(t *testing.T) {
 	cfgFile := writeDefaultConfig(t, dir)
 	overrideLog := filepath.Join(dir, "one-off.log")
 
-	if err := runCLI(t, "config", "set", "max_concurrent_tasks", "3",
+	if err := runCLI(t, "config", "set", "max_running_tasks", "3",
 		"--config", cfgFile, "--data-dir", dir, "--log-file", overrideLog); err != nil {
 		t.Fatalf("config set: %v", err)
 	}

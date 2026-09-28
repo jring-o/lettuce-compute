@@ -157,6 +157,34 @@ describe("ProjectDetail", () => {
     expect(screen.queryByTestId("creator-card")).not.toBeInTheDocument();
   });
 
+  it("renders the core range a leaf declares", () => {
+    const ranged = {
+      ...defaultProps,
+      leaf: {
+        ...mockLeaf,
+        resource_requirements: { ...mockLeaf.resource_requirements, max_cpu_cores: 4 },
+      },
+    };
+    render(<ProjectDetail {...ranged} />);
+    expect(screen.getByTestId("cpu-requirement")).toHaveTextContent(
+      "2–4 CPU cores",
+    );
+  });
+
+  it("renders one figure when the leaf declares no max (0)", () => {
+    const undeclared = {
+      ...defaultProps,
+      leaf: {
+        ...mockLeaf,
+        resource_requirements: { ...mockLeaf.resource_requirements, max_cpu_cores: 0 },
+      },
+    };
+    render(<ProjectDetail {...undeclared} />);
+    expect(screen.getByTestId("cpu-requirement")).toHaveTextContent(
+      "2 CPU cores",
+    );
+  });
+
   it("renders default resource requirements when null", () => {
     const noReqs = {
       ...defaultProps,

@@ -127,11 +127,14 @@ has that unit refused and handed straight back. Declining everything is durable;
 will not quietly re-grant it.
 
 Your machine also holds the line on resources. You set CPU cores, memory, disk, GPU VRAM share,
-network bandwidth, and concurrent tasks. Each limit is a budget for the whole machine: the CPU cores you allow are shared
-equally by every task that is running (a task alone gets them all; two tasks get half each, adjusted
-as tasks start and finish), and each task is told its share so it can size its worker pool. The
-client reserves exactly what it will enforce, using cgroups where available, container limits, or
-WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU or GPU
+network bandwidth, and, if you want one, a cap on how many tasks run at once. Each limit is a budget
+for the whole machine. Each task is given the CPU cores its leaf can use: at least the minimum the
+leaf declares, up to its maximum, as many as your budget has free when the task starts. It keeps
+them until it finishes, is held to them, and is told the figure so it can size its worker pool.
+The tasks' cores together never exceed the CPU cores you allow, so how many tasks run at once
+follows from your CPU and memory budgets. Every task runs at the lowest priority, so your own
+programs come first. The client reserves exactly what it will enforce, using cgroups where available,
+container limits, or WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU or GPU
 gets too hot (where the machine lets a program read the temperature: the CPU on Linux, or on a Mac
 with the `osx-cpu-temp` helper; an NVIDIA GPU through `nvidia-smi`, an AMD GPU through `rocm-smi`
 on Linux and macOS — the client tells you when it cannot), keeps its downloads and its uploads

@@ -152,6 +152,9 @@ type ActiveTaskInfo struct {
 	HeadName              string  `json:"head_name"`
 	RuntimeType           string  `json:"runtime_type"`
 	ProcessID             *int    `json:"process_id"`
+	// CPUCores is the cores the task was granted when it started and is held
+	// to for its run (0 = no CPU limit).
+	CPUCores int `json:"cpu_cores"`
 }
 
 // computeTaskStatus determines the status string and reason for an active
@@ -213,6 +216,7 @@ func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason str
 		StatusReason:          statusReason,
 		HeadName:              t.ServerName,
 		RuntimeType:           t.RuntimeType,
+		CPUCores:              t.CPUCores,
 	}
 	if t.ProcessID != 0 {
 		pid := t.ProcessID
@@ -941,9 +945,11 @@ type ConfigResponse struct {
 	Notifications  config.NotificationConfig `json:"notifications"`
 	Servers        []config.ServerConfig     `json:"servers"`
 	LogLevel       string                    `json:"log_level"`
-	MaxConcurrent  int                       `json:"max_concurrent_tasks"`
+	// MaxRunningTasks is the optional cap on running tasks (0 = none: as many
+	// run as the CPU and memory limits hold).
+	MaxRunningTasks int `json:"max_running_tasks"`
 	// WorkBufferHours is how many hours of work the daemon keeps buffered per
-	// execution slot (0 = a small unit-count fallback). PUT already accepted it;
+	// task that can run at once (0 = a small unit-count fallback). PUT already accepted it;
 	// it is returned here so a client can show the current value it writes.
 	WorkBufferHours float64 `json:"work_buffer_hours"`
 }
@@ -968,7 +974,7 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 		Notifications:   cfg.Notifications,
 		Servers:         cfg.Servers,
 		LogLevel:        cfg.LogLevel,
-		MaxConcurrent:   cfg.MaxConcurrentTasks,
+		MaxRunningTasks: cfg.MaxRunningTasks,
 		WorkBufferHours: cfg.WorkBufferHours,
 	}
 }
@@ -980,9 +986,9 @@ type UpdateConfigResponse struct {
 	ConfigResponse
 	// RestartRequired is true when a setting that is only read at start-up
 	// changed: a head's trusted_runtimes (applied when the daemon builds its
-	// runtime registry and advertises runtimes to each head), or
-	// max_concurrent_tasks (the slot count). Such a change is on disk but not
-	// yet in force — exactly what `heads trust` tells the user after saving.
+	// runtime registry and advertises runtimes to each head). Such a change is on
+	// disk but not yet in force — exactly what `heads trust` tells the user
+	// after saving.
 	RestartRequired bool `json:"restart_required"`
 }
 
@@ -1029,14 +1035,9 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigRespon
 			newCfg.LogLevel = s
 		}
 	}
-	// The slot count is fixed when the daemon starts, so a change here is on
-	// disk but not in force until restart (ApplyConfig logs the same).
-	maxConcurrentChanged := false
-	if v, ok := partial["max_concurrent_tasks"]; ok {
-		if n := toInt(v); n != newCfg.MaxConcurrentTasks {
-			newCfg.MaxConcurrentTasks = n
-			maxConcurrentChanged = true
-		}
+	// Live: the cap bounds the next task admitted (ApplyConfig).
+	if v, ok := partial["max_running_tasks"]; ok {
+		newCfg.MaxRunningTasks = toInt(v)
 	}
 	if v, ok := partial["leafs"]; ok {
 		if p, ok := v.(map[string]any); ok {
@@ -1069,7 +1070,7 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigRespon
 
 	return &UpdateConfigResponse{
 		ConfigResponse:  b.GetConfig(),
-		RestartRequired: trustChanged || maxConcurrentChanged,
+		RestartRequired: trustChanged,
 	}, nil
 }
 
@@ -1132,6 +1133,9 @@ type LeafExecutionSpec struct {
 type LeafResourceRequirements struct {
 	MinDiskMB   int64 `json:"min_disk_mb,omitempty"`
 	MinCPUCores int32 `json:"min_cpu_cores,omitempty"`
+	// MaxCPUCores is the most cores one unit can use (the top of the range a
+	// task is granted from); omitted from a head too old to send it.
+	MaxCPUCores int32 `json:"max_cpu_cores,omitempty"`
 	// GPU dimensions (TB-21). MinGPUVRAMMB is compared against the machine's
 	// ALLOWED VRAM, not its card size.
 	MinGPUVRAMMB         int32  `json:"min_gpu_vram_mb,omitempty"`
@@ -1430,6 +1434,7 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 					ld.ResourceRequirements = &LeafResourceRequirements{
 						MinDiskMB:            rr.MinDiskMB,
 						MinCPUCores:          rr.MinCPUCores,
+						MaxCPUCores:          rr.MaxCPUCores,
 						MinGPUVRAMMB:         rr.MinGPUVRAMMB,
 						GPUType:              rr.GPUType,
 						GPUComputeCapability: rr.GPUComputeCapability,

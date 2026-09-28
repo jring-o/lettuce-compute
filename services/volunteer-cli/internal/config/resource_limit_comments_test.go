@@ -15,6 +15,9 @@ import (
 // max_cpu_cores tasks run at once); call max_concurrent_tasks "THIS is the
 // workload throttle", although the CPU budget also caps how many run; and call
 // max_bandwidth_mbps a "Bandwidth cap" while it did not limit image pulls.
+// Later max_cpu_cores said running tasks "share them equally", which stopped
+// being true when each task was given the cores its leaf can use, and
+// max_concurrent_tasks was retired for the optional max_running_tasks.
 func TestSavedCommentsDescribeResourceLimitsAsTheyAreApplied(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	c := Defaults()
@@ -33,6 +36,8 @@ func TestSavedCommentsDescribeResourceLimitsAsTheyAreApplied(t *testing.T) {
 		"THIS is the workload throttle",
 		"Bandwidth cap",
 		"freeze ALL work when the GPU reaches this.",
+		"Running tasks share them equally",
+		"max_concurrent_tasks",
 	} {
 		if strings.Contains(out, stale) {
 			t.Errorf("saved config still says %q", stale)
@@ -40,13 +45,13 @@ func TestSavedCommentsDescribeResourceLimitsAsTheyAreApplied(t *testing.T) {
 	}
 
 	for key, want := range map[string]string{
-		"resource_limits":      "totals for ALL running work together, not per task",
-		"max_cpu_cores":        "at most this many tasks run at once whatever max_concurrent_tasks says",
-		"max_memory_mb":        "in total: a unit starts only if its declared memory fits beside what is already running",
-		"max_concurrent_tasks": "with max_cpu_cores N, at most N tasks run",
-		"max_bandwidth_mbps":   "Container image pulls are made by the container engine and are NOT limited",
-		"gpu_pause_threshold":  "read with nvidia-smi, rocm-smi on Linux/macOS, or a Linux GPU sensor",
-		"thermal":              "Each threshold acts only where its temperature can be read",
+		"resource_limits":     "totals for ALL running work together, not per task",
+		"max_cpu_cores":       "Each task is given the cores its leaf can use",
+		"max_memory_mb":       "in total: a unit starts only if its declared memory fits beside what is already running",
+		"max_running_tasks":   "Optional cap on how many work units run at once; 0 = no cap",
+		"max_bandwidth_mbps":  "Container image pulls are made by the container engine and are NOT limited",
+		"gpu_pause_threshold": "read with nvidia-smi, rocm-smi on Linux/macOS, or a Linux GPU sensor",
+		"thermal":             "Each threshold acts only where its temperature can be read",
 	} {
 		comment := commentAbove(out, key+":")
 		if !strings.Contains(comment, want) {

@@ -163,12 +163,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Keep MaxConcurrentTasks at its default of 1 (config.Defaults). Memory-
-		// bound leaves (e.g. large model ensembles) consume tens of GB per task,
-		// so auto-scaling concurrency to the CPU-core count oversubscribed RAM and
-		// produced duplicate runs. The daemon's memory/GPU-aware admission still
-		// runs more than one task when the machine genuinely has room, and the
-		// operator can raise max_concurrent_tasks explicitly if desired.
+		// Leave max_running_tasks unset (config.Defaults): how many tasks run
+		// at once follows from max_cpu_cores and max_memory_mb, which admission
+		// books every task against, so memory-bound leaves (large model
+		// ensembles need tens of GB per task) run only as many as the memory
+		// limit holds. The operator can set a cap explicitly if desired.
 
 		// Container backend preference. Which runtimes actually run is decided per
 		// head (trusted_runtimes, chosen at attach or via `heads trust`) plus a live

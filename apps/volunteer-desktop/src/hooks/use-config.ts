@@ -17,24 +17,23 @@ import {
  * - `scheduling`: `resource.NewScheduler` copies mode, idle threshold and the
  *   schedule ranges at construction and is never rebuilt.
  * - `thermal`: copied into the thermal monitor's config at construction.
- * - `max_concurrent_tasks`: the slot count is fixed at start (the daemon logs
- *   "restart daemon to apply").
  * - `log_level`: the logger's level is parsed once at start.
  *
  * `resource_limits` is live since the client's TB-79 fix: `ApplyConfig`
  * rebuilds the hardware profile heads are told (carried on the next poll),
  * admission books against the new figures at once, and the runtimes read the
- * new memory ceiling for the next task. Running tasks keep the ceilings they
- * started with. `work_buffer_hours`, `notifications`, `leafs` and per-head
- * weights and leaf preferences are read live as well. `yield` is live since
- * TB-90: `ApplyConfig` hands the block to the running monitor, which judges
- * its next sample against the new thresholds, starts sampling when the
- * setting is turned on and releases a pause it holds when it is turned off.
+ * new memory ceiling for the next task. Running tasks keep the ceilings and
+ * the cores they started with. `work_buffer_hours`, `notifications`, `leafs`,
+ * per-head weights and leaf preferences, and `max_running_tasks` (the
+ * optional cap on how many tasks run at once) are read live as well. `yield`
+ * is live since TB-90: `ApplyConfig` hands the block to the running monitor,
+ * which judges its next sample against the new thresholds, starts sampling
+ * when the setting is turned on and releases a pause it holds when it is
+ * turned off.
  */
 const RESTART_ONLY_KEYS: ReadonlyArray<keyof ConfigUpdate> = [
   "scheduling",
   "thermal",
-  "max_concurrent_tasks",
   "log_level",
 ];
 

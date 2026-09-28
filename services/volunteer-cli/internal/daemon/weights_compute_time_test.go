@@ -104,7 +104,7 @@ func newWeightsDaemon(t *testing.T, hours float64, heads ...weightsHeadSpec) *Da
 	}
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = hours
-	d.cfg.MaxConcurrentTasks = 1
+	setTestSlots(d.cfg, 1)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 	d.slotManager = NewSlotManager(1, d.logger)
 	d.durations = LoadDurationTracker(t.TempDir())

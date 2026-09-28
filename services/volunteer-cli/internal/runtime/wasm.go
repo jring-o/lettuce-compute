@@ -31,10 +31,6 @@ type WasmRuntime struct {
 	// moment a module is instantiated (TB-79); memCeilingMB is the static
 	// figure in force until the daemon wires it.
 	memCeiling func() int
-	// cpuGrant answers "what CPU does a task starting now get" (TB-75). A WASM
-	// module runs single-threaded and is not capped, but it is told its share
-	// like every other task, and it counts as a running task in the split.
-	cpuGrant func() CPUGrant
 }
 
 // SetMemoryCeilingMB sets the volunteer's configured memory budget
@@ -55,10 +51,6 @@ func (w *WasmRuntime) MemoryCeilingMB() int {
 	}
 	return w.memCeilingMB
 }
-
-// SetCPUGrantSource wires the daemon's live CPU grant (TB-75); see
-// NativeRuntime.SetCPUGrantSource.
-func (w *WasmRuntime) SetCPUGrantSource(fn func() CPUGrant) { w.cpuGrant = fn }
 
 // NewWasmRuntime creates a WasmRuntime with the given data directory. Its HTTP
 // client is the shared netguard-guarded one so module/input/viz downloads cannot be
@@ -235,12 +227,12 @@ func (w *WasmRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareRe
 	if _, err := os.Stat(paramsPath); err == nil {
 		envVars["LETTUCE_PARAMS_FILE"] = "/work/params.json"
 	}
-	// Tell the module its CPU share (TB-75), as every runtime does.
-	if w.cpuGrant != nil {
-		for _, kv := range w.cpuGrant().Env() {
-			if k, v, ok := strings.Cut(kv, "="); ok {
-				envVars[k] = v
-			}
+	// Tell the module its CPU grant, as every runtime does. A WASM module runs
+	// single-threaded inside the daemon and is not held to it, but it counts
+	// against the budget like every other task.
+	for _, kv := range wu.CPUGrant.Env() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			envVars[k] = v
 		}
 	}
 

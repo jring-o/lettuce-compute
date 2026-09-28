@@ -25,7 +25,11 @@ type HistoryEntry struct {
 	CompletedAt      time.Time `json:"completed_at"`
 	WallClockSeconds int64     `json:"wall_clock_seconds"`
 	CPUSeconds       int64     `json:"cpu_seconds"`
-	ResultAccepted   bool      `json:"result_accepted"`
+	// CPUCores is the cores the run was granted; the weights count its time
+	// times these (core-seconds). 0 in entries written before grants were,
+	// read as one.
+	CPUCores       int  `json:"cpu_cores,omitempty"`
+	ResultAccepted bool `json:"result_accepted"`
 	// Outcome is set when the submission ended some other way than the head
 	// accepting or rejecting the result. Its one value is
 	// HistoryOutcomeNotNeeded, which comes with ResultAccepted false. Empty on

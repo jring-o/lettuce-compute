@@ -482,7 +482,7 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   volunteer follows it.
 - **It keeps a client work buffer measured in hours, not units.** Rather than
   fetching one unit at a time, the volunteer requests work in batches and holds
-  roughly `work_buffer_hours` of work per concurrent task. Once that buffer has
+  roughly `work_buffer_hours` of work per task that can run at once. Once that buffer has
   filled it makes **zero** work requests until the remaining work has drained
   below about half the target, then refills back to the target in one round — so
   fetches come in well-spaced batches instead of a constant trickle of one-unit
@@ -490,7 +490,7 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   yet started), so it is cheap to hand back if you stop, and it is only
   downloaded/prepared right before it runs.
 - **GPU work is buffered per GPU, not per task slot.** A unit that needs a GPU
-  runs one at a time per physical GPU, however many concurrent tasks you allow.
+  runs one at a time per physical GPU, however many tasks your limits run at once.
   So on a machine with one GPU and eight task slots the buffer holds at most
   `work_buffer_hours` of GPU units (2 h by default), not eight times that, and
   requests for a GPU leaf are sized to that smaller target; CPU leafs still fill
@@ -605,8 +605,13 @@ Two things make this volunteer-friendly:
 
 | Config key | Default | What it does |
 |---|---|---|
-| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task (per GPU for GPU-required units, which run one per GPU; on Windows and macOS, per container unit the container engine's machine can run at once for container units). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
-| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this, except that GPU units are bounded by the number of GPUs when that is smaller, and container units on Windows and macOS by how many the container engine's machine can run at once. |
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per task that can run at once (per GPU for GPU-required units, which run one per GPU; on Windows and macOS, per container unit the container engine's machine can run at once for container units). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `max_running_tasks` | `0` (no cap) | An optional cap on how many work units run at once. Without one, as many run as your CPU and memory limits hold (see below), and the buffer target scales with that number. Takes effect for the next task that starts. |
+
+> **Replaces `max_concurrent_tasks`.** Earlier releases ran one task at a time
+> unless you raised `max_concurrent_tasks`. That key is retired and ignored (the
+> client warns when it finds it): how many tasks run now follows from your CPU and
+> memory limits. Set `max_running_tasks` if you want a cap.
 
 ```bash
 ./lettuce-volunteer config set work_buffer_hours 4
@@ -615,40 +620,61 @@ Two things make this volunteer-friendly:
 > **Replaces `work_buffer_size`.** Earlier releases sized the buffer as a unit
 > count via `work_buffer_size`. That key is gone; use `work_buffer_hours`.
 
-### CPU cores — one budget, shared by the running tasks
+### CPU cores — one budget, each task given the cores its leaf needs
 
 `resource_limits.max_cpu_cores` (the **CPU Cores** slider in the desktop app) is
 the most CPU Lettuce will use on your machine, in total — the same kind of number
-as the memory and disk limits beside it. The tasks that are running share it
-equally: a task running alone is given the whole budget; when a second starts,
-each is given half; when one finishes, the survivor is given the whole again.
-The share is enforced on every task (a container's CPU quota, a cgroup or Job
-Object cap for native work) and adjusted live as tasks start and finish, so
-`max_cpu_cores: 2` means two cores whether `max_concurrent_tasks` is 1 or 4.
-Fractions are fine — three cores over two tasks is 1.5 each.
+as the memory and disk limits beside it. Each leaf declares how many cores one of
+its units can use: a minimum (the fewest it runs on; a head sends the leaf only to
+machines whose limit covers it) and a maximum. When a task starts it is **given**
+whole cores between the two: its minimum, plus as many of your free cores as are
+left once the units waiting in the buffer that could start beside it have their
+minimums set aside, up to its maximum. It keeps those cores until it finishes.
 
-Two consequences worth knowing:
+For example, with 4 cores allowed, a GREP unit (2–4 cores) and some Beyblade units
+(1 core each) waiting: GREP is given 2 cores and two Beyblades 1 each. With only one
+Beyblade waiting, GREP is given 3. Started alone, GREP is given all 4.
 
-- **At most `max_cpu_cores` tasks run at once**, whatever `max_concurrent_tasks`
-  allows: each unit books its leaf's minimum core requirement (at least one) and
-  admission keeps the sum within the budget, so no task is ever given less than
-  its leaf declared it needs. A leaf that needs two cores runs alone under a
-  two-core budget; two one-core leafs run side by side. On Windows and macOS
-  the container tasks together also stay within the container engine's machine
-  (see above): with four cores allowed and a two-CPU machine, two container
-  tasks get one core each and a native task beside them gets the other two.
-- **Each task is told its share.** Every task is started with
-  `LETTUCE_CPU_LIMIT=<cores>` (the exact share, possibly fractional) and the
-  standard thread-pool knobs (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
-  `MKL_NUM_THREADS`, `NUMEXPR_MAX_THREADS`) set to the same figure rounded to
-  whole threads, so a well-written leaf sizes its workers to what it was given
-  rather than to every CPU it can see. A running task cannot be told when its
-  share changes; only the cap moves.
+What follows from that:
 
-> **In earlier releases (through v0.12.1)** the figure was applied per task:
-> every task got the whole number as its own cap and nothing counted the total,
-> so "2 cores" with two tasks used four. If you lowered the slider to work
-> around that, you can put it back.
+- **The tasks' cores together never exceed `max_cpu_cores`**, so how many tasks run
+  at once follows from your CPU and memory limits: 8 cores run up to 8 one-core
+  tasks, or 4 two-core ones. `max_running_tasks` (above) is an optional extra cap.
+  On Windows and macOS the container tasks together also stay within the container
+  engine's machine (see above): with four cores allowed and a two-CPU machine, two
+  container tasks get one core each and a native task beside them can use the
+  other two.
+- **Each task is held to its cores** (a container's CPU quota, a cgroup or Job
+  Object cap for native work, or on Linux without cgroup delegation the CPUs it is
+  pinned to), and **runs at the lowest priority**, so your own programs come first
+  whenever the CPUs are contended. A task that uses no more threads than its cores
+  is never slowed by its hold.
+- **Each task is told its cores.** Every task is started with
+  `LETTUCE_CPU_LIMIT=<cores>` and the standard thread-pool knobs
+  (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `NUMEXPR_MAX_THREADS`, `DOCLING_NUM_THREADS`) set to the same figure, so a
+  well-written leaf sizes its workers to what it was given rather than to every
+  CPU it can see.
+- **A task that wants more cores than it was given is flagged.** When a task's
+  CPU limit keeps stopping it (it runs more threads than its cores), the client
+  raises a notice naming the leaf, the cores it was given and the leaf's range, and
+  logs a warning. That works for container tasks and for native tasks on Linux;
+  Windows and macOS do not report it for native tasks.
+- **A wide task is not kept waiting behind narrow ones.** Once a unit is waiting
+  only for cores, a narrower unit behind it in the buffer may not take the cores it
+  needs, so it starts as soon as enough running tasks finish.
+- **Changes apply to tasks started afterwards.** A running task keeps the cores it
+  was given; lowering or raising the limit changes what the next tasks get.
+- `lettuce-volunteer status` shows each running task's cores (the **CORES** column),
+  the desktop app shows them on each running task, and `lettuce-volunteer doctor`
+  lists them against your limit.
+
+> **In earlier releases** the figure was first applied per task (every task got the
+> whole number, so "2 cores" with two tasks used four), and then shared equally by
+> the running tasks, so a task that could use three cores got the same share as a
+> single-threaded one beside it. If you raised the core limit or
+> `max_concurrent_tasks` to give a wide leaf enough cores, you can set them back to
+> what you want Lettuce to use in total.
 
 ### Network bandwidth
 
@@ -760,8 +786,8 @@ thermal:
 
 > **These don't throttle *how much* runs.** Thermal pause is all-or-nothing
 > hardware protection, not a per-leaf or concurrency dial. To cap how much work
-> runs at once, use `max_concurrent_tasks` (above) and `resource_limits.*` (CPU
-> cores, memory, GPU VRAM) — those govern admission; the thermal thresholds only
+> runs at once, use `resource_limits.*` (CPU cores, memory, GPU VRAM) and, if
+> you want one, `max_running_tasks` — those govern admission; the thermal thresholds only
 > decide *whether* work runs at all based on temperature.
 
 > **Hard to observe with very short work units.** Temperatures are sampled every

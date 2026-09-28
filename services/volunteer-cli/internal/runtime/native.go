@@ -39,7 +39,7 @@ type NativeRuntime struct {
 	cmdModifier     CommandModifier
 	processNotifier ProcessNotifier
 	httpClient      *http.Client // injectable for testing
-	// cpuGrant answers "what CPU does a task starting now get" (TB-75); see
+	// cpuGrant is the grant for a unit the daemon gave none; see
 	// ContainerRuntime.cpuGrant. Nil means no CPU limit.
 	cpuGrant func() CPUGrant
 }
@@ -67,27 +67,12 @@ func (n *NativeRuntime) SetProcessNotifier(fn ProcessNotifier) {
 	n.processNotifier = fn
 }
 
-// SetCPUBudget gives the runtime a fixed CPU budget every process it starts
-// is granted the whole of — the grant until the daemon wires the live one
-// (SetCPUGrantSource), and the right one outside the daemon.
+// SetCPUBudget gives the runtime a fixed CPU budget: a process whose unit the
+// daemon gave no grant (WorkUnit.CPUGrant) is granted the whole of it — the
+// audit runner's case. The grant reaches the limiter through the command
+// modifier and the process notifier, and the task through its environment.
 func (n *NativeRuntime) SetCPUBudget(cores int) {
 	n.cpuGrant = staticCPUGrant(cores)
-}
-
-// SetCPUGrantSource wires the daemon's live CPU grant (TB-75): asked, at the
-// moment a process is started, what share of the budget a task starting now
-// is given. The grant reaches the limiter through the command modifier and
-// the process notifier, and the task through its environment.
-func (n *NativeRuntime) SetCPUGrantSource(fn func() CPUGrant) {
-	n.cpuGrant = fn
-}
-
-// currentCPUGrant is the grant a task starting now receives.
-func (n *NativeRuntime) currentCPUGrant() CPUGrant {
-	if n.cpuGrant == nil {
-		return CPUGrant{}
-	}
-	return n.cpuGrant()
 }
 
 // Name returns "native".
@@ -256,11 +241,11 @@ func (n *NativeRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prepare
 	if _, err := os.Stat(paramsPath); err == nil {
 		env = append(env, "LETTUCE_PARAMS_FILE="+paramsPath)
 	}
-	// The CPU this task is given — its share of the volunteer's budget, read
-	// once so the limiter's cap and the figure the task is told agree (TB-75).
+	// The CPU this task is given: the grant the daemon decided for its unit,
+	// read once so the limiter's cap and the figure the task is told agree.
 	// LETTUCE_CPU_LIMIT and the thread-pool knobs let the leaf size its
-	// workers to the share rather than to os.cpu_count().
-	cpu := n.currentCPUGrant()
+	// workers to the grant rather than to os.cpu_count().
+	cpu := grantFor(wu, n.cpuGrant)
 	env = append(env, cpu.Env()...)
 	cmd.Env = env
 

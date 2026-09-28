@@ -379,9 +379,8 @@ func closeRuntimeClient(rt runtime.Runtime) {
 // against them, and name the VM in its diagnostics. Before this the ceilings
 // were the configuration alone, so a Mac with a 2 GiB Podman machine
 // advertised 8192 MB, was sent 7000 MB units, and had each one killed at model
-// load. The runtime's CPU grant — what each container is given — is the
-// static whole budget until the daemon wires its live equal split
-// (wireRuntimeCPU).
+// load. The runtime's own CPU budget is only the grant for a unit the daemon
+// gave none; every unit the daemon starts carries its grant.
 func (f *ContainerRuntimeFactory) applyContainerBudgets(rt runtime.Runtime) {
 	configMB := f.cfg.ResourceLimits.MaxMemoryMB
 	configCores := f.cfg.ResourceLimits.MaxCPUCores
@@ -874,10 +873,9 @@ func (d *Daemon) RedetectContainerRuntime(ctx context.Context, forceMachineSetup
 // re-registration and the no-runnable-leaf verdict is re-evaluated (TB-60).
 func (d *Daemon) registerContainerRuntime(ctx context.Context, rt runtime.Runtime, backend runtime.BackendInfo) {
 	d.runtimeRegistry.Register(rt)
-	// The runtime was built with the static whole-budget CPU grant and the
-	// start-up memory ceiling; give it the daemon's live equal split (TB-75)
-	// and live memory budget (TB-79).
-	d.wireRuntimeCPU(rt)
+	// The runtime was built with the start-up memory ceiling; give it the
+	// daemon's live memory budget (TB-79). Its CPU comes with each unit's
+	// grant.
 	d.wireRuntimeMemory(rt)
 	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
 		cr.SetWantedImages(d.allEnabledImageRefs)

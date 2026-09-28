@@ -84,18 +84,27 @@ function Section({
 // Resource limit slider with usage bar
 /**
  * The sentence under the CPU slider: the allowance is a whole-machine total
- * that every running task shares equally (TB-75) — it used to be applied per
- * task, so "2 cores" with two tasks used four. It states the rule rather than
- * a worked case: every task books at least one core (more if its leaf needs
- * more), so the allowance also caps how many tasks run — at one core, one at
- * a time.
+ * (TB-75) — it used to be applied per task, so "2 cores" with two tasks used
+ * four — that each task is granted cores from: between its leaf's
+ * minimum and maximum, held for its run. It states the rule rather than a
+ * worked case; every task holds at least one core, so the allowance also caps
+ * how many tasks run — at one core, one at a time.
  */
 export function cpuShareCaption(cores: number): string {
-  const told = "Each task is told its share (LETTUCE_CPU_LIMIT).";
+  const held =
+    "Each task is held to its cores at the lowest priority and told the figure (LETTUCE_CPU_LIMIT). A change applies to tasks started afterwards.";
   if (cores <= 1) {
-    return `Running tasks share this 1 core. Each task needs at least one core, so one task runs at a time. ${told}`;
+    return `Each task needs at least one core, so with 1 core one task runs at a time. ${held}`;
   }
-  return `All running tasks share these ${cores} cores equally. Each task books at least one core (more if its leaf needs more), so at most ${cores} run at once. ${told}`;
+  return `Each task is given the cores its leaf can use — at least its minimum, as many as are free — and the tasks' cores together stay within these ${cores}, so up to ${cores} one-core tasks run at once. ${held}`;
+}
+
+/** The sentence under the Running task limit slider. */
+export function runningTasksCaption(limit: number): string {
+  if (limit <= 0) {
+    return "No limit: as many tasks run at once as your CPU and memory limits hold. Set a number to run fewer.";
+  }
+  return `At most ${limit} task${limit === 1 ? "" : "s"} run at once, even when your CPU and memory limits hold more. Applies to tasks started afterwards.`;
 }
 
 /** The sentence under the Network Bandwidth slider: what the figure holds, and what it cannot. */
@@ -515,7 +524,9 @@ export function SettingsPage() {
   // shown as it is rather than truncated the first time the slider is touched.
   const totalCores = hostCpuCount ?? navigator.hardwareConcurrency ?? 4;
   const coresSliderMax = Math.max(totalCores, config.resource_limits.max_cpu_cores);
-  const tasksSliderMax = Math.max(totalCores, config.max_concurrent_tasks);
+  // 0 is "no limit". A daemon older than the setting sends none: no limit.
+  const runningTasksLimit = config.max_running_tasks ?? 0;
+  const tasksSliderMax = Math.max(totalCores, runningTasksLimit);
   const totalMemMB =
     system && system.memory_total_mb > 0 ? system.memory_total_mb : 8192;
   // 0 is the daemon's unit-count fallback; a daemon too old to report the
@@ -574,7 +585,7 @@ export function SettingsPage() {
       {/* Section 1: Resource Limits */}
       <Section title="Resource Limits">
         <ResourceSlider
-          label="CPU Cores — shared by all running tasks"
+          label="CPU Cores — for all running tasks together"
           value={config.resource_limits.max_cpu_cores}
           min={1}
           max={coresSliderMax}
@@ -702,14 +713,17 @@ export function SettingsPage() {
       {/* Section 2: Compute */}
       <Section title="Compute">
         <ResourceSlider
-          label="Concurrent Tasks"
-          value={config.max_concurrent_tasks}
-          min={1}
+          label="Running task limit"
+          value={runningTasksLimit}
+          min={0}
           max={tasksSliderMax}
           step={1}
-          displayValue={`${config.max_concurrent_tasks}`}
-          onChange={(v) => updateConfig({ max_concurrent_tasks: v })}
+          displayValue={runningTasksLimit > 0 ? `${runningTasksLimit}` : "No limit"}
+          onChange={(v) => updateConfig({ max_running_tasks: v })}
         />
+        <p className="text-xs text-muted-foreground" data-testid="running-tasks-caption">
+          {runningTasksCaption(runningTasksLimit)}
+        </p>
 
         <ResourceSlider
           label="Work buffer"

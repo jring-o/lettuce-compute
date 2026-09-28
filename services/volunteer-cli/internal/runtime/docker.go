@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // EngineInfo carries the bits of the container backend's daemon info the
@@ -110,18 +112,17 @@ type DockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string) error
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
-	// ContainerUpdateCPU replaces a running (or paused) container's CPU quota
-	// in place — the engine's update call, which rewrites the container's
-	// cgroup without restarting it. quota/period are the CFS pair (CFSQuota);
-	// 0/0 removes the cap. Used to give a container its new share of the CPU
-	// budget when another task starts or finishes (TB-75).
-	ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error
 	// ContainerCPUNanos is the CPU time a container has used so far, in
 	// nanoseconds, from one stats sample. Read every few seconds while the
 	// yield monitor runs, so Lettuce's own containers are never mistaken for
 	// other programs' load (TB-83). On macOS and Windows this is time on the
 	// engine VM's CPUs, which the caller converts against the host's.
 	ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error)
+	// ContainerExecOutput runs cmd inside a running container and returns its
+	// standard output; a command that exits non-zero is an error carrying its
+	// standard error. Used to read the container's own cgroup files where the
+	// engine's stats leave a figure out (see ContainerCPUThrottling).
+	ContainerExecOutput(ctx context.Context, containerID string, cmd []string) ([]byte, error)
 	Close() error
 }
 
@@ -157,6 +158,7 @@ type ContainerConfig struct {
 	MemoryBytes int64             // memory limit
 	CPUQuota    int64             // CPU quota (microseconds per period)
 	CPUPeriod   int64             // CPU period (default 100000)
+	CPUShares   int64             // relative CPU weight (LowestCPUShares for task containers); <=0 leaves the engine default
 	DiskQuota   int64             // not enforced by Docker directly; use tmpfs size
 	NetworkMode string            // "none", "bridge", "host"
 	Labels      map[string]string // for identification/cleanup
@@ -180,6 +182,15 @@ type ContainerConfig struct {
 	DeviceMappings []DeviceMapping // host device passthrough (e.g., AMD GPUs)
 }
 
+// LowestCPUShares is the CPU weight every task container is created with: the
+// smallest the engines accept, which cgroup v2 maps to cpu.weight 1 (the
+// default is 100). The container keeps its CPU quota; the weight only decides
+// who yields when the machine's CPUs are contended, so the owner's own programs
+// run first and Lettuce's work takes what they leave. Under a rootful engine
+// the weight is relative to the engine's other containers only, since its
+// containers do not share a cgroup parent with the owner's programs.
+const LowestCPUShares int64 = 2
+
 // DeviceMapping maps a host device into a container.
 type DeviceMapping struct {
 	PathOnHost      string
@@ -192,6 +203,12 @@ type ContainerStats struct {
 	CPUUsageUser   uint64 // nanoseconds since the container started
 	CPUUsageKernel uint64 // nanoseconds since the container started
 	MemoryBytes    uint64 // working set at the reading
+	// ThrottlePeriods and ThrottledPeriods count, since the container
+	// started, the CPU quota periods in which it ran and those in which its
+	// quota stopped it. Docker reports them; Podman's compatibility API sends
+	// zeros.
+	ThrottlePeriods  uint64
+	ThrottledPeriods uint64
 }
 
 // errContainerNotRunning is a stats request the engine could not answer
@@ -517,6 +534,9 @@ func (d *dockerClientWrapper) ContainerCreate(ctx context.Context, cfg *Containe
 			CPUPeriod: cfg.CPUPeriod,
 		},
 	}
+	if cfg.CPUShares > 0 {
+		hostCfg.Resources.CPUShares = cfg.CPUShares
+	}
 
 	// BG-13 hardening posture. Each field is applied only when set, so a caller that
 	// does not populate them keeps the previous (unhardened) behavior.
@@ -619,9 +639,11 @@ func (d *dockerClientWrapper) ContainerUsage(ctx context.Context, containerID st
 		return nil, errContainerNotRunning
 	}
 	return &ContainerStats{
-		CPUUsageUser:   stats.CPUStats.CPUUsage.UsageInUsermode,
-		CPUUsageKernel: stats.CPUStats.CPUUsage.UsageInKernelmode,
-		MemoryBytes:    workingSetBytes(stats.MemoryStats),
+		CPUUsageUser:     stats.CPUStats.CPUUsage.UsageInUsermode,
+		CPUUsageKernel:   stats.CPUStats.CPUUsage.UsageInKernelmode,
+		MemoryBytes:      workingSetBytes(stats.MemoryStats),
+		ThrottlePeriods:  stats.CPUStats.ThrottlingData.Periods,
+		ThrottledPeriods: stats.CPUStats.ThrottlingData.ThrottledPeriods,
 	}, nil
 }
 
@@ -688,19 +710,6 @@ func (d *dockerClientWrapper) ContainerCPUNanos(ctx context.Context, containerID
 	return stats.CPUStats.CPUUsage.TotalUsage, nil
 }
 
-func (d *dockerClientWrapper) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
-	resp, err := d.cli.ContainerUpdate(ctx, containerID, container.UpdateConfig{
-		Resources: container.Resources{CPUQuota: quota, CPUPeriod: period},
-	})
-	if err != nil {
-		return fmt.Errorf("container update (cpu quota %d/%d): %w", quota, period, err)
-	}
-	for _, w := range resp.Warnings {
-		d.logger.Warn("container engine warned on CPU quota update", "container", containerID, "warning", w)
-	}
-	return nil
-}
-
 func (d *dockerClientWrapper) Close() error {
 	return d.cli.Close()
 }
@@ -755,4 +764,28 @@ func engineNameFromVersion(platform string, components []string) string {
 		return "podman"
 	}
 	return "docker"
+}
+
+func (d *dockerClientWrapper) ContainerExecOutput(ctx context.Context, containerID string, cmd []string) ([]byte, error) {
+	created, err := d.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{Cmd: cmd, AttachStdout: true, AttachStderr: true})
+	if err != nil {
+		return nil, fmt.Errorf("exec create: %w", err)
+	}
+	attached, err := d.cli.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("exec attach: %w", err)
+	}
+	defer attached.Close()
+	var stdout, stderr bytes.Buffer
+	if _, err := stdcopy.StdCopy(&stdout, &stderr, attached.Reader); err != nil {
+		return nil, fmt.Errorf("exec output: %w", err)
+	}
+	inspected, err := d.cli.ContainerExecInspect(ctx, created.ID)
+	if err != nil {
+		return nil, fmt.Errorf("exec inspect: %w", err)
+	}
+	if inspected.ExitCode != 0 {
+		return nil, fmt.Errorf("%s exited %d: %s", strings.Join(cmd, " "), inspected.ExitCode, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
 }

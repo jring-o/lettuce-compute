@@ -178,7 +178,7 @@ func TestPreFetchQueue_PopFit_FirstFitPreservesOrder(t *testing.T) {
 	q.Push(itemC)
 
 	// A does not fit — the first fitting item (B) is selected past it.
-	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID != "wu-a" }, alwaysDelays)
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID != "wu-a" }, alwaysDelays, nil)
 	if got == nil || got.WU.ID != "wu-b" {
 		t.Fatalf("PopFit = %v, want wu-b", got)
 	}
@@ -214,7 +214,7 @@ func TestPreFetchQueue_PopFit_StarvationGuard(t *testing.T) {
 	// The head has been jumped maxBackfillStarts times by delaying backfills:
 	// no further such backfill may start past it, even though it fits, so
 	// running work drains and the head recovers.
-	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-small" }, alwaysDelays)
+	got := q.PopFit(func(it *PreFetchItem) bool { return it.WU.ID == "wu-small" }, alwaysDelays, nil)
 	if got != nil {
 		t.Fatalf("PopFit = %v, want nil once the head hit the backfill cap", got.WU.ID)
 	}
@@ -226,12 +226,12 @@ func TestPreFetchQueue_PopFit_StarvationGuard(t *testing.T) {
 func TestPreFetchQueue_PopFit_EmptyAndNoneFit(t *testing.T) {
 	q := NewPreFetchQueue(5, newTestLogger())
 
-	if got := q.PopFit(func(*PreFetchItem) bool { return true }, alwaysDelays); got != nil {
+	if got := q.PopFit(func(*PreFetchItem) bool { return true }, alwaysDelays, nil); got != nil {
 		t.Errorf("PopFit on empty queue = %v, want nil", got)
 	}
 
 	q.Push(newMockPreFetchItem("wu-a", 100, time.Now()))
-	if got := q.PopFit(func(*PreFetchItem) bool { return false }, alwaysDelays); got != nil {
+	if got := q.PopFit(func(*PreFetchItem) bool { return false }, alwaysDelays, nil); got != nil {
 		t.Errorf("PopFit with nothing fitting = %v, want nil", got)
 	}
 	if q.Len() != 1 {
