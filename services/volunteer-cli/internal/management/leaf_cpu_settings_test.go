@@ -26,8 +26,10 @@ func TestLeafOverride_IsSavedAndAppliedLive(t *testing.T) {
 			ResourceRequirements: &daemon.CachedResourceRequirements{MinCPUCores: 2, MaxCPUCores: 4}},
 	}})
 
+	// An explicit CPU limit: the default is half this machine's CPUs, which
+	// on a small machine would clip the leaf's range below the override.
 	resp := env.doRequest(t, "PUT", "/api/v1/config",
-		`{"servers":[{"name":"test-server","leaf_preferences":{"cores":{"grep":3},"max_running":{"grep":1}}}]}`)
+		`{"resource_limits":{"max_cpu_cores":8},"servers":[{"name":"test-server","leaf_preferences":{"cores":{"grep":3},"max_running":{"grep":1}}}]}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("PUT /api/v1/config: %d %v", resp.StatusCode, decodeJSON(t, resp))
 	}
