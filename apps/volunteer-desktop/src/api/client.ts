@@ -125,6 +125,21 @@ export interface StatusResponse {
   failing_leafs: FailingLeaf[];
   /** Version of the running daemon (being added by the CLI; absent on older builds). */
   client_version?: string;
+  /**
+   * The CPU time limit in force (`resource_limits.max_cpu_time_pct` below
+   * 100): work runs `pct` percent of the time, `run_seconds` of every
+   * `period_seconds`. Absent when there is none. Its paused part is not
+   * reported as the daemon being paused — the limit is a standing setting.
+   */
+  cpu_time_limit?: CPUTimeLimit;
+}
+
+export interface CPUTimeLimit {
+  pct: number;
+  run_seconds: number;
+  period_seconds: number;
+  /** One line saying so, e.g. "Runs 50 % of the time (5 s of every 10 s): CPU time limit". */
+  description: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +249,12 @@ export interface ResourceLimits {
   max_gpu_vram_pct: number;
   /** Max processes per container; <= 0 uses the built-in default. */
   max_pids: number;
+  /**
+   * Share of the time Lettuce's work runs, 5–100 percent: below 100 running
+   * tasks are paused and resumed in turn. Live. Absent from a daemon older
+   * than the setting; 0 reads as 100.
+   */
+  max_cpu_time_pct?: number;
 }
 
 export interface ScheduleRange {
@@ -304,6 +325,14 @@ export interface LeafPreferences {
   enabled?: string[];
   /** Leaf slugs, BLOCKLIST mode. */
   disabled?: string[];
+  /**
+   * Leaf slug -> cores each of the leaf's tasks is given on this machine,
+   * kept within the leaf's declared range and the CPU limit. Replaced
+   * wholesale by an update; an empty map clears it.
+   */
+  cores?: Record<string, number>;
+  /** Leaf slug -> most of the leaf's tasks that run at once here. */
+  max_running?: Record<string, number>;
 }
 
 /** One configured head, as stored in config.yaml. */
@@ -450,6 +479,22 @@ export interface LeafInfo {
   /** Present only when the leaf has failed on this machine. */
   failures?: FailingLeaf;
   disk_gate?: LeafDiskGate;
+  /** This machine's CPU arrangement for the leaf; absent from an older daemon. */
+  cpu?: LeafCPU;
+}
+
+/**
+ * This machine's CPU arrangement for a leaf: the volunteer's overrides (0 =
+ * not set), the range each of its tasks is given cores from here, and the
+ * most of its tasks that run at once (also how many tasks' worth of it the
+ * work buffer holds).
+ */
+export interface LeafCPU {
+  cores_override: number;
+  max_running_override: number;
+  task_cores_min: number;
+  task_cores_max: number;
+  runs_at_once: number;
 }
 
 export interface HeadInfo {
@@ -1423,6 +1468,14 @@ export class ManagementClient {
 
   async abortTask(workUnitId: string): Promise<void> {
     await this.request("POST", `/api/v1/tasks/${workUnitId}/abort`);
+  }
+
+  /**
+   * Stop a running task and run its unit again from the start with the
+   * current settings. Rejects with a 409 while the task is still starting.
+   */
+  async restartTask(workUnitId: string): Promise<void> {
+    await this.request("POST", `/api/v1/tasks/${workUnitId}/restart`);
   }
 
   async taskDetails(workUnitId: string): Promise<TaskDetail> {

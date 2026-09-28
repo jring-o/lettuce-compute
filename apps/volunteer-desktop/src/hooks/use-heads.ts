@@ -258,6 +258,40 @@ export function useRaiseMemoryAllowance(): {
   return { raise };
 }
 
+/** A leaf's CPU override: `cores` or `max_running`; null removes it. */
+export type LeafCPUOverrideKey = "cores" | "max_running";
+
+/**
+ * Set or remove one leaf's CPU override (`leaf_preferences.cores` or
+ * `.max_running`) on its head. The rest of the head's map is kept as the
+ * daemon holds it — the daemon replaces the whole map on an update. Live: it
+ * applies to the next task that starts and to how much of the leaf is
+ * buffered.
+ */
+export function useWriteLeafCPUOverride(): {
+  write: (head: HeadRef, leafSlug: string, key: LeafCPUOverrideKey, value: number | null) => Promise<void>;
+} {
+  const { client } = useClient();
+
+  const write = useCallback(
+    async (head: HeadRef, leafSlug: string, key: LeafCPUOverrideKey, value: number | null) => {
+      if (!client) return;
+      await writeServerConfig(client, head, (s) => {
+        const map = { ...(s.leaf_preferences?.[key] ?? {}) };
+        if (value && value > 0) {
+          map[leafSlug] = value;
+        } else {
+          delete map[leafSlug];
+        }
+        return { ...s, leaf_preferences: { ...s.leaf_preferences, [key]: map } };
+      });
+    },
+    [client]
+  );
+
+  return { write };
+}
+
 // Debounced write — for continuous inputs (sliders).
 export function useDebouncedHeadWeight(): {
   write: (head: HeadRef, weight: number) => void;

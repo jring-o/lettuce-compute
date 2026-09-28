@@ -159,6 +159,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	checkBandwidth(rep, cfg.ResourceLimits.MaxBandwidthMbps)
 	checkCPUBudget(rep, caps)
 	checkCPUGrants(rep, cfg.ResourceLimits.MaxCPUCores, cfg.DataDir)
+	checkCPUTimeLimit(rep, cfg.ResourceLimits)
+	liveHeads, _ := fetchHeadsFromAPI()
+	checkLeafOverrides(rep, cfg.Servers, liveHeads)
 	// The affinity fallback confines native work, which the configured limit
 	// bounds (TB-85), not container work's VM-clipped figure.
 	checkCPUEnforcement(rep, caps.configCPUCores)

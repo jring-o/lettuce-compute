@@ -19,7 +19,10 @@ var (
 	ErrTaskNotFound         = errors.New("task not found")
 	ErrTaskAlreadySuspended = errors.New("task is already suspended")
 	ErrTaskNotSuspended     = errors.New("task is not suspended")
-	ErrDaemonPaused         = errors.New("cannot resume task while daemon is paused")
+	// ErrTaskStarting refuses a restart of a task that has not begun running
+	// yet (its run-start is still in flight).
+	ErrTaskStarting = errors.New("task is still starting; try again in a moment")
+	ErrDaemonPaused = errors.New("cannot resume task while daemon is paused")
 
 	// errStartWorkDropped is set as the slot's execErr when run-start (StartWork)
 	// reports the unit is no longer ours (Ok=false) or fails terminally. It signals
@@ -52,6 +55,16 @@ type ExecutionSlot struct {
 	preserved      *PersistedTask // non-nil if work dir was preserved on shutdown
 	processHandle  ProcessHandle  // for suspend/resume
 	suspended      bool
+	// userSuspended marks a task the volunteer suspended on its own (the
+	// per-task suspend verb). The automatic pauses leave it frozen when they
+	// end: the CPU time limit resumes work every few seconds, and a task the
+	// volunteer paused must not be resumed by it.
+	userSuspended bool
+	// executing is set once the unit's run has begun (after run-start), and
+	// restart when the volunteer asked for the task to be run again from the
+	// start with the current settings (RestartSlot).
+	executing bool
+	restart   bool
 	// suspendPending records that a suspend (schedule gate / pause) was requested
 	// while this slot was active but had no process handle yet — the window between
 	// StartSlot marking a re-executed resume active and the runtime registering the
@@ -112,6 +125,15 @@ type SlotResult struct {
 	// unit the one artifact explaining the failure is already gone (TB-10).
 	// Empty when the unit succeeded or the log could not be read.
 	FailureLogTail string
+	// Restart is set when the run ended because the volunteer asked for the
+	// task to be restarted (RestartSlot): the work dir was kept, and the
+	// daemon puts the unit back at the front of the buffer to run again
+	// under the current settings. Prep, FetchedAt and CheckpointSequence are
+	// what it needs for that.
+	Restart            bool
+	Prep               *runtime.PrepareResult
+	FetchedAt          time.Time
+	CheckpointSequence int32
 }
 
 // SlotManager owns a fixed pool of execution slots.
@@ -205,7 +227,23 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		// successfully), preserve the work directory for resumption on next startup.
 		// A unit dropped at run-start (errStartWorkDropped) is no longer ours, so it
 		// is never preserved — resuming it would only fail StartWork again.
-		if sm.shuttingDown.Load() && execErr != nil && !errors.Is(execErr, errStartWorkDropped) {
+		// A run ended by the volunteer's restart keeps its work dir, and with it
+		// any checkpoint the leaf wrote, for the run that replaces it.
+		slot.mu.Lock()
+		restart := slot.restart && execErr != nil && !errors.Is(execErr, errStartWorkDropped)
+		var restartCkptSeq int32
+		if restart && slot.checkpoint != nil {
+			restartCkptSeq = slot.checkpoint.Sequence()
+		} else if restart {
+			restartCkptSeq = wu.CheckpointSequence
+		}
+		fetchedAt := slot.fetchedAt
+		slot.mu.Unlock()
+		// Read once: a shutdown that begins while this runs must not leave a
+		// restarted unit's work dir neither preserved nor handed back.
+		shutting := sm.shuttingDown.Load()
+
+		if shutting && execErr != nil && !errors.Is(execErr, errStartWorkDropped) {
 			var ckptSeq int32
 			slot.mu.Lock()
 			if slot.checkpoint != nil {
@@ -239,6 +277,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 
 			sm.logger.Info("preserving work directory for resume",
 				"work_unit_id", wu.ID, "slot", slot.ID, "work_dir", prep.WorkDir)
+		} else if restart {
+			sm.logger.Info("task stopped for a restart; its work directory is kept for the new run",
+				"work_unit_id", wu.ID, "slot", slot.ID)
 		} else {
 			// Normal completion or error without shutdown — clean up.
 			if cleanErr := rt.Cleanup(prep); cleanErr != nil {
@@ -262,6 +303,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		slot.resumedFromCkp = false
 		slot.processHandle = nil
 		slot.suspended = false
+		slot.userSuspended = false
+		slot.executing = false
+		slot.restart = false
 		slot.suspendPending = false
 		slot.pausedAt = time.Time{}
 		slot.totalPausedDur = 0
@@ -272,7 +316,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		slot.mu.Unlock()
 
 		// Send result.
-		sm.results <- SlotResult{
+		res := SlotResult{
 			SlotID:         slot.ID,
 			WU:             wu,
 			Result:         execResult,
@@ -283,6 +327,13 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			VizBundlePath:  prep.VizBundlePath,
 			FailureLogTail: failureLogTail,
 		}
+		if restart && !shutting {
+			res.Restart = true
+			res.Prep = prep
+			res.FetchedAt = fetchedAt
+			res.CheckpointSequence = restartCkptSeq
+		}
+		sm.results <- res
 
 		// Return slot to available pool.
 		sm.available <- slot.ID
@@ -371,6 +422,9 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		}
 		sm.logger.Info("run-start StartWork ok", "work_unit_id", wu.ID, "slot", slot.ID, "server", conn.Name, "leaf_id", wu.LeafID)
 	}
+	slot.mu.Lock()
+	slot.executing = true
+	slot.mu.Unlock()
 
 	// Wire process handle callbacks for suspend/resume.
 	if prep != nil {
@@ -534,6 +588,20 @@ func (sm *SlotManager) ActiveCount() int {
 	return count
 }
 
+// ActiveCountForLeaf returns the number of active slots running a unit of the
+// leaf.
+func (sm *SlotManager) ActiveCountForLeaf(leafID string) int {
+	count := 0
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil && slot.wu.LeafID == leafID {
+			count++
+		}
+		slot.mu.Unlock()
+	}
+	return count
+}
+
 // ActiveWorkUnits returns the work units of all currently active slots. Used by
 // the client work buffer to account for in-flight (running) work toward the
 // hours-based buffer target.
@@ -606,6 +674,7 @@ func (sm *SlotManager) GetCurrentTasks(estimate func(leafID string, rscFpopsEst 
 				ElapsedSeconds:        int(elapsedDur.Seconds()),
 				ResumedFromCheckpoint: slot.resumedFromCkp,
 				Suspended:             slot.suspended,
+				UserSuspended:         slot.userSuspended,
 				TotalPausedSeconds:    int(pausedDur.Seconds()),
 				DeadlineSeconds:       slot.wu.DeadlineSeconds,
 				RuntimeType:           slot.wu.Runtime,
@@ -739,10 +808,14 @@ func (sm *SlotManager) SetShuttingDown() {
 	sm.shuttingDown.Store(true)
 }
 
-// SuspendAll freezes all active slot processes via OS-level suspension.
+// SuspendAll freezes all active slot processes via OS-level suspension. The
+// slots are suspended in parallel: a container is paused through its engine,
+// which takes a noticeable fraction of a second, and the CPU time limit
+// pauses everything every few seconds.
 func (sm *SlotManager) SuspendAll() {
-	for _, slot := range sm.slots {
+	sm.eachSlot(func(slot *ExecutionSlot) {
 		slot.mu.Lock()
+		defer slot.mu.Unlock()
 		if slot.active && !slot.suspended {
 			if slot.processHandle != nil {
 				if err := slot.processHandle.Suspend(); err != nil {
@@ -759,17 +832,35 @@ func (sm *SlotManager) SuspendAll() {
 				slot.suspendPending = true
 			}
 		}
-		slot.mu.Unlock()
-	}
+	})
 }
 
-// ResumeAll unfreezes all suspended slot processes.
-func (sm *SlotManager) ResumeAll() {
+// eachSlot runs fn for every slot at once and waits for all of them.
+func (sm *SlotManager) eachSlot(fn func(*ExecutionSlot)) {
+	var wg sync.WaitGroup
 	for _, slot := range sm.slots {
+		wg.Add(1)
+		go func(slot *ExecutionSlot) {
+			defer wg.Done()
+			fn(slot)
+		}(slot)
+	}
+	wg.Wait()
+}
+
+// ResumeAll unfreezes all suspended slot processes, in parallel, except a
+// task the volunteer suspended on its own: that one stays frozen until they
+// resume it.
+func (sm *SlotManager) ResumeAll() {
+	sm.eachSlot(func(slot *ExecutionSlot) {
 		slot.mu.Lock()
+		defer slot.mu.Unlock()
 		// Cancel any suspend that was deferred while the handle was missing: the window
 		// reopened before the process ever registered its handle, so it should run.
 		slot.suspendPending = false
+		if slot.userSuspended {
+			return
+		}
 		if slot.active && slot.processHandle != nil && slot.suspended {
 			// Accumulate pause duration before resuming.
 			if !slot.pausedAt.IsZero() {
@@ -791,8 +882,7 @@ func (sm *SlotManager) ResumeAll() {
 				slot.suspended = false
 			}
 		}
-		slot.mu.Unlock()
-	}
+	})
 }
 
 // SetProcessHandle stores a process handle on a slot for suspend/resume.
@@ -890,23 +980,29 @@ func (sm *SlotManager) GetPreservedTasks() []PersistedTask {
 	return tasks
 }
 
-// SuspendSlot suspends a single slot identified by work unit ID.
+// SuspendSlot suspends a single slot identified by work unit ID, at the
+// volunteer's request: it stays suspended until they resume it, whatever
+// automatic pause comes and goes meanwhile. A task an automatic pause has
+// already frozen is simply marked.
 func (sm *SlotManager) SuspendSlot(workUnitID string) error {
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
 		if slot.active && slot.wu != nil && slot.wu.ID == workUnitID {
-			if slot.suspended {
+			if slot.userSuspended {
 				slot.mu.Unlock()
 				return ErrTaskAlreadySuspended
 			}
-			if slot.processHandle != nil {
-				if err := slot.processHandle.Suspend(); err != nil {
-					slot.mu.Unlock()
-					return err
+			if !slot.suspended {
+				if slot.processHandle != nil {
+					if err := slot.processHandle.Suspend(); err != nil {
+						slot.mu.Unlock()
+						return err
+					}
 				}
+				slot.suspended = true
+				slot.pausedAt = time.Now()
 			}
-			slot.suspended = true
-			slot.pausedAt = time.Now()
+			slot.userSuspended = true
 			slot.mu.Unlock()
 			return nil
 		}
@@ -915,15 +1011,36 @@ func (sm *SlotManager) SuspendSlot(workUnitID string) error {
 	return ErrTaskNotFound
 }
 
-// ResumeSlot resumes a single suspended slot identified by work unit ID.
+// EndUserSuspend ends the volunteer's suspension of a task without resuming
+// it: an automatic pause holds the rest of the work, and its end resumes this
+// task with the others.
+func (sm *SlotManager) EndUserSuspend(workUnitID string) error {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil && slot.wu.ID == workUnitID {
+			defer slot.mu.Unlock()
+			if !slot.suspended || !slot.userSuspended {
+				return ErrTaskNotSuspended
+			}
+			slot.userSuspended = false
+			return nil
+		}
+		slot.mu.Unlock()
+	}
+	return ErrTaskNotFound
+}
+
+// ResumeSlot resumes a single slot the volunteer suspended, identified by work
+// unit ID.
 func (sm *SlotManager) ResumeSlot(workUnitID string) error {
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
 		if slot.active && slot.wu != nil && slot.wu.ID == workUnitID {
-			if !slot.suspended {
+			if !slot.suspended || !slot.userSuspended {
 				slot.mu.Unlock()
 				return ErrTaskNotSuspended
 			}
+			slot.userSuspended = false
 			// Accumulate pause duration before resuming.
 			if !slot.pausedAt.IsZero() {
 				slot.totalPausedDur += time.Since(slot.pausedAt)
@@ -937,6 +1054,30 @@ func (sm *SlotManager) ResumeSlot(workUnitID string) error {
 			}
 			slot.suspended = false
 			slot.mu.Unlock()
+			return nil
+		}
+		slot.mu.Unlock()
+	}
+	return ErrTaskNotFound
+}
+
+// RestartSlot stops the task running the unit so that it runs again from the
+// start (RestartTask): its run is cancelled — the process or container is
+// stopped — and its work dir kept, and the slot's result carries Restart for
+// the daemon to put the unit back in the buffer. A task still in its
+// run-start is refused (ErrTaskStarting); asking twice is harmless.
+func (sm *SlotManager) RestartSlot(workUnitID string) error {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil && slot.wu.ID == workUnitID {
+			defer slot.mu.Unlock()
+			if !slot.executing || slot.cancel == nil {
+				return ErrTaskStarting
+			}
+			if !slot.restart {
+				slot.restart = true
+				slot.cancel()
+			}
 			return nil
 		}
 		slot.mu.Unlock()

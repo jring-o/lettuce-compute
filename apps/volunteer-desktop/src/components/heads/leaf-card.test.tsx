@@ -983,3 +983,85 @@ describe("LeafCard", () => {
     });
   });
 });
+
+describe("LeafCard CPU override", () => {
+  const grep = () =>
+    makeLeaf({
+      slug: "grep",
+      name: "GREP",
+      resource_requirements: { min_cpu_cores: 2, max_cpu_cores: 4 },
+      cpu: { cores_override: 0, max_running_override: 0, task_cores_min: 2, task_cores_max: 4, runs_at_once: 4 },
+    });
+
+  function renderCard(leaf: LeafInfo, onCores = vi.fn(() => Promise.resolve()), onMax = vi.fn(() => Promise.resolve())) {
+    render(
+      <LeafCard
+        leaf={leaf}
+        showWeightSlider={false}
+        containerStatus={makeContainerStatus()}
+        machine={makeMachine({ host_max_cpu_cores: 8 })}
+        trustedRuntimes={null}
+        onToggle={vi.fn()}
+        onWeightChange={vi.fn()}
+        onCoresChange={onCores}
+        onMaxRunningChange={onMax}
+      />
+    );
+    return { onCores, onMax };
+  }
+
+  it("offers the cores within the leaf's range and a running cap, and saves each", async () => {
+    const user = userEvent.setup();
+    const { onCores, onMax } = renderCard(grep());
+    const cores = screen.getByLabelText("Cores per task") as HTMLSelectElement;
+    expect([...cores.options].map((o) => o.textContent)).toEqual(["Leaf's range (2–4 cores)", "2", "3", "4"]);
+    await user.selectOptions(cores, "3");
+    expect(onCores).toHaveBeenCalledWith(3);
+    await user.selectOptions(cores, "");
+    expect(onCores).toHaveBeenLastCalledWith(null);
+
+    const atOnce = screen.getByLabelText("Run at most") as HTMLSelectElement;
+    // 8 cores at 2 per task: up to 4 at once.
+    expect([...atOnce.options].map((o) => o.value)).toEqual(["", "1", "2", "3", "4"]);
+    await user.selectOptions(atOnce, "1");
+    expect(onMax).toHaveBeenCalledWith(1);
+  });
+
+  it("says what each task is given, how many run at once, and when it applies", () => {
+    renderCard(grep());
+    expect(screen.getByTestId("leaf-cpu-caption")).toHaveTextContent(
+      "Each task is given 2–4 cores, as many as are free when it starts; up to 4 run at once here, and Lettuce buffers no more of this leaf than that many can finish. Applies to tasks started afterwards — restart a running task from Overview to apply it now."
+    );
+  });
+
+  it("shows the volunteer's settings as selected", () => {
+    const leaf = grep();
+    leaf.cpu = { cores_override: 3, max_running_override: 1, task_cores_min: 3, task_cores_max: 3, runs_at_once: 1 };
+    renderCard(leaf);
+    expect((screen.getByLabelText("Cores per task") as HTMLSelectElement).value).toBe("3");
+    expect((screen.getByLabelText("Run at most") as HTMLSelectElement).value).toBe("1");
+    expect(screen.getByTestId("leaf-cpu-caption")).toHaveTextContent("Each task is given 3 cores; up to 1 run at once here");
+  });
+
+  it("offers no cores choice for a leaf that declares a single figure", () => {
+    const leaf = makeLeaf({
+      resource_requirements: { min_cpu_cores: 1 },
+      cpu: { cores_override: 0, max_running_override: 0, task_cores_min: 1, task_cores_max: 1, runs_at_once: 8 },
+    });
+    renderCard(leaf);
+    expect(screen.queryByLabelText("Cores per task")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Run at most")).toBeInTheDocument();
+  });
+
+  it("shows nothing for a daemon that does not report the arrangement", () => {
+    renderCard(makeLeaf());
+    expect(screen.queryByTestId("leaf-cpu-control")).not.toBeInTheDocument();
+  });
+
+  it("shows the daemon's refusal", async () => {
+    const user = userEvent.setup();
+    renderCard(grep(), vi.fn(() => Promise.reject(new Error("servers[\"x\"] refused"))));
+    await user.selectOptions(screen.getByLabelText("Cores per task"), "3");
+    expect(await screen.findByText(/refused/)).toBeInTheDocument();
+  });
+});

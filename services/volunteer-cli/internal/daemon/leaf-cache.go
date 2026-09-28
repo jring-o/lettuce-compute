@@ -247,6 +247,21 @@ func (lc *LeafCache) LeafByID(id string) (CachedLeafInfo, bool) {
 	return CachedLeafInfo{}, false
 }
 
+// HeadOfLeaf returns the cached leaf with the given ID and the name of the
+// head that serves it, as LeafByID does.
+func (lc *LeafCache) HeadOfLeaf(id string) (head string, leaf CachedLeafInfo, ok bool) {
+	lc.mu.RLock()
+	defer lc.mu.RUnlock()
+	for name, info := range lc.heads {
+		for _, l := range info.Leafs {
+			if l.ID == id {
+				return name, l, true
+			}
+		}
+	}
+	return "", CachedLeafInfo{}, false
+}
+
 // PopulateForTest directly sets cached head info for a server.
 // Intended for use by tests in other packages that need to inject cache state.
 func (lc *LeafCache) PopulateForTest(serverName string, info *CachedHeadInfo) {

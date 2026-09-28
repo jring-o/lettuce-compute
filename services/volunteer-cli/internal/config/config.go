@@ -169,6 +169,25 @@ type ResourceLimits struct {
 	MaxBandwidthMbps int `yaml:"max_bandwidth_mbps" json:"max_bandwidth_mbps"`
 	MaxGPUVRAMPct    int `yaml:"max_gpu_vram_pct" json:"max_gpu_vram_pct"` // 0-100, default 50. 0 = disable GPU tasks
 	MaxPids          int `yaml:"max_pids" json:"max_pids"`                 // max PIDs per container (BG-13 fork-bomb cap); <=0 = built-in default
+	// MaxCPUTimePct is the share of the time Lettuce's work may run: below
+	// 100, every running task is paused and resumed in turn so that it runs
+	// this percentage of each period (CPUTimePct). 100 (the default) runs
+	// work continuously; 0 reads as 100.
+	MaxCPUTimePct int `yaml:"max_cpu_time_pct" json:"max_cpu_time_pct"`
+}
+
+// MinCPUTimePct is the lowest max_cpu_time_pct accepted: below it a task
+// would run for less time in each period than pausing and resuming it takes.
+const MinCPUTimePct = 5
+
+// CPUTimePct is the share of the time work may run, 1-100: MaxCPUTimePct,
+// with 0 (a config written before the setting existed) and anything out of
+// range read as 100, no limit.
+func (r ResourceLimits) CPUTimePct() int {
+	if r.MaxCPUTimePct <= 0 || r.MaxCPUTimePct > 100 {
+		return 100
+	}
+	return r.MaxCPUTimePct
 }
 
 // GPUOverride allows per-GPU configuration.
@@ -363,6 +382,17 @@ type LeafPreferences struct {
 	Weights  map[string]int `yaml:"weights,omitempty" json:"weights,omitempty"`   // slug -> weight overrides
 	Enabled  []string       `yaml:"enabled,omitempty" json:"enabled,omitempty"`   // for SPECIFIC mode
 	Disabled []string       `yaml:"disabled,omitempty" json:"disabled,omitempty"` // for BLOCKLIST mode
+
+	// Cores and MaxRunning are the volunteer's CPU overrides for a leaf on
+	// this machine, keyed by slug like Weights (a pinned leaf the catalog does
+	// not list goes by its id). Cores is the number of cores each of the
+	// leaf's tasks is given, kept within the range the leaf declares and the
+	// CPU limit; MaxRunning is how many of the leaf's tasks may run at once.
+	// A leaf with no entry follows its own declaration. They are local: a head
+	// never sees them, and the work buffer holds no more of the leaf than
+	// they let run.
+	Cores      map[string]int `yaml:"cores,omitempty" json:"cores,omitempty"`
+	MaxRunning map[string]int `yaml:"max_running,omitempty" json:"max_running,omitempty"`
 }
 
 // defaultDataDir returns the default data directory (~/.lettuce/).
@@ -396,6 +426,7 @@ func Defaults() *Config {
 			MaxBandwidthMbps: 0,
 			MaxGPUVRAMPct:    50,
 			MaxPids:          512,
+			MaxCPUTimePct:    100,
 		},
 		Scheduling: Scheduling{
 			Mode:              "ALWAYS",
@@ -893,6 +924,11 @@ func (c *Config) marshalCommented() ([]byte, error) {
 		applyKeyComments(childMappingNode(root, "thermal"), thermalComments)
 		applyKeyComments(childMappingNode(root, "yield"), yieldComments)
 		applyKeyComments(childMappingNode(root, "scheduling"), schedulingComments)
+		if servers := childMappingNode(root, "servers"); servers != nil && servers.Kind == yaml.SequenceNode {
+			for _, srv := range servers.Content {
+				applyKeyComments(childMappingNode(srv, "leaf_preferences"), leafPreferencesComments)
+			}
+		}
 	}
 	return yaml.Marshal(&doc)
 }
@@ -945,6 +981,15 @@ var resourceLimitsComments = map[string]string{
 	"max_bandwidth_mbps": "Most network speed Lettuce uses, in Mbps: its downloads together stay under this (programs, input data, checkpoints), and so do its uploads (results, checkpoints). Container image pulls are made by the container engine and are NOT limited. 0 = unlimited.",
 	"max_gpu_vram_pct":   "Max percent of each GPU's VRAM a task may use. A head compares a leaf's VRAM requirement against this share of your card, not the card itself, so at the default 50% a 6 GB card offers 3072 MB. 0 disables GPU work entirely.",
 	"max_pids":           "Max simultaneous processes/threads inside a container (fork-bomb cap). 0 uses the built-in default.",
+	"max_cpu_time_pct":   "Share of the time Lettuce's work runs, 5-100 percent. Below 100, running tasks are paused and resumed in turn so each runs this share of every 10-20 seconds; 100 = run continuously. Lowers the machine's load and heat without changing how many tasks run or their cores. Takes effect at once.",
+}
+
+// leafPreferencesComments document the per-leaf keys of each server entry's
+// leaf_preferences block.
+var leafPreferencesComments = map[string]string{
+	"weights":     "Leaf slug -> weight: the leaf's share of this head's compute time here (default 100).",
+	"cores":       "Leaf slug -> cores each of the leaf's tasks is given, within the range the leaf declares and max_cpu_cores. Without an entry a task is given as many of the leaf's range as are free. Applies to tasks started afterwards.",
+	"max_running": "Leaf slug -> most of the leaf's tasks that run at once. Lettuce buffers no more of the leaf than this lets run.",
 }
 
 var thermalComments = map[string]string{
@@ -988,6 +1033,10 @@ func (c *Config) Validate() error {
 	if c.ResourceLimits.MaxGPUVRAMPct < 0 || c.ResourceLimits.MaxGPUVRAMPct > 100 {
 		return fmt.Errorf("resource_limits.max_gpu_vram_pct must be 0-100, got %d", c.ResourceLimits.MaxGPUVRAMPct)
 	}
+	// 0 is a config written before the setting existed, read as 100.
+	if p := c.ResourceLimits.MaxCPUTimePct; p != 0 && (p < MinCPUTimePct || p > 100) {
+		return fmt.Errorf("resource_limits.max_cpu_time_pct must be %d-100 (100 = no limit), got %d", MinCPUTimePct, p)
+	}
 
 	if err := c.Scheduling.Validate(); err != nil {
 		return err
@@ -1019,6 +1068,16 @@ func (c *Config) Validate() error {
 		for slug, w := range lp.Weights {
 			if w <= 0 {
 				return fmt.Errorf("servers[%d].leaf_preferences.weights[%q] must be > 0, got %d", i, slug, w)
+			}
+		}
+		for slug, n := range lp.Cores {
+			if n < 1 {
+				return fmt.Errorf("servers[%d].leaf_preferences.cores[%q] must be >= 1, got %d (remove the entry to use the leaf's own core range)", i, slug, n)
+			}
+		}
+		for slug, n := range lp.MaxRunning {
+			if n < 1 {
+				return fmt.Errorf("servers[%d].leaf_preferences.max_running[%q] must be >= 1, got %d (remove the entry to let as many run as the limits hold)", i, slug, n)
 			}
 		}
 	}
@@ -1221,6 +1280,12 @@ func (c *Config) SetByPath(dotPath string, value string) error {
 			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
 		}
 		c.ResourceLimits.MaxGPUVRAMPct = v
+	case "resource_limits.max_cpu_time_pct":
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid integer for %s: %w", dotPath, err)
+		}
+		c.ResourceLimits.MaxCPUTimePct = v
 	case "scheduling.mode":
 		c.Scheduling.Mode = strings.ToUpper(value)
 	case "scheduling.idle_threshold_mins":
@@ -1354,6 +1419,8 @@ func (c *Config) GetByPath(dotPath string) (string, error) {
 		return strconv.Itoa(c.ResourceLimits.MaxBandwidthMbps), nil
 	case "resource_limits.max_gpu_vram_pct":
 		return strconv.Itoa(c.ResourceLimits.MaxGPUVRAMPct), nil
+	case "resource_limits.max_cpu_time_pct":
+		return strconv.Itoa(c.ResourceLimits.CPUTimePct()), nil
 	case "scheduling.mode":
 		return c.Scheduling.Mode, nil
 	case "scheduling.idle_threshold_mins":

@@ -110,6 +110,19 @@ func (q *PreFetchQueue) Push(item *PreFetchItem) error {
 	return nil
 }
 
+// PushFront adds an item at the front of the queue, whatever its depth: a
+// unit the volunteer restarted goes back ahead of everything waiting, so it
+// is the next to start.
+func (q *PreFetchQueue) PushFront(item *PreFetchItem) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.items = append([]*PreFetchItem{item}, q.items...)
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
 // maxBackfillStarts bounds how many DELAYING units may start past a buffered
 // unit that does not currently fit (see PopFit). Once a unit has been jumped
 // this many times by backfills that could postpone its own admission, no

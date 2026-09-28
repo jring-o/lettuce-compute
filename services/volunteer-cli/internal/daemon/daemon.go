@@ -130,6 +130,10 @@ type Daemon struct {
 	yieldPauseCh chan bool
 	ownMeter     ownCPUMeter
 
+	// The CPU time limit (cpu_time.go): a fourth automatic pause source,
+	// driven by runCPUTimeLimit's cycle.
+	cpuTimePauseCh chan bool
+
 	// Backoff configuration (overridable for tests)
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
@@ -203,17 +207,18 @@ type Daemon struct {
 	mu       sync.Mutex
 	stopping bool
 	running  bool
-	// paused is true while ANY automatic source holds a pause; the three
-	// flags say which. Each source is remembered on its own — the resource
-	// monitor (schedule window, low disk), the thermal monitor, the yield
-	// monitor — so one source resuming cannot unfreeze work another still
-	// holds. Both are maintained only by setAutoPause.
+	// paused is true while ANY automatic source holds a pause; the flags say
+	// which. Each source is remembered on its own — the resource monitor
+	// (schedule window, low disk), the thermal monitor, the yield monitor,
+	// the CPU time limit — so one source resuming cannot unfreeze work
+	// another still holds. All are maintained only by setAutoPause.
 	paused         bool
 	resourcePaused bool
 	thermalPaused  bool
 	busyPaused     bool
-	// pauseReason is the automatic source PauseReason reports while paused,
-	// derived by setAutoPause: "thermal", "busy" or "scheduled", ranked in
+	cpuTimePaused  bool
+	// pauseReason is the automatic source holding the pause, derived by
+	// setAutoPause: "thermal", "busy", "scheduled" or "cpu_time", ranked in
 	// that order when several hold at once.
 	pauseReason string
 
@@ -536,6 +541,7 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		thermalPauseCh:      thermalPauseCh,
 		yieldMonitor:        yieldMonitor,
 		yieldPauseCh:        yieldPauseCh,
+		cpuTimePauseCh:      make(chan bool, 1),
 		initialBackoff:      1 * time.Second,
 		maxBackoff:          30 * time.Second,
 		cachedHW:            hw,
@@ -737,6 +743,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// restart.
 	go d.runBufferMaintenance(ctx)
 	go d.runCPUThrottleWatch(ctx)
+	go d.runCPUTimeLimit(ctx)
 
 	// Late container-engine detection (TB-59): while no container runtime is
 	// registered and a head is trusted for one, keep probing for an engine so
@@ -835,20 +842,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 		userPaused := d.userPaused
 		d.mu.Unlock()
 		if systemPaused || userPaused {
-			if systemPaused {
-				// Thermal/resource pause: stop everything including fetcher.
-				fetcherCancel()
+			// A schedule, thermal or yield pause stops everything including the
+			// fetcher; a user pause and the CPU time limit's paused part only
+			// freeze the running work. The limit's pause recurs every few
+			// seconds, so it is narrated at Debug.
+			fetchStopped := false
+			stopFetchIfDue := func() {
+				if !fetchStopped && d.pauseStopsFetching() {
+					fetcherCancel()
+					fetchStopped = true
+				}
+			}
+			stopFetchIfDue()
+			logPause := d.logger.Info
+			if d.onlyCPUTimePaused() {
+				logPause = d.logger.Debug
 			}
 
 			// Suspend all running processes (freeze in place).
 			d.slotManager.SuspendAll()
-			d.logger.Info("suspended all active processes",
-				"reason", d.PauseReason(),
+			logPause("suspended all active processes",
+				"reason", d.autoPauseReason(),
 				"active_slots", d.slotManager.ActiveCount(),
 			)
 
 			// Wait for resume.
-			if !d.waitForResume(ctx, pauseCh) {
+			if !d.waitForResume(ctx, pauseCh, stopFetchIfDue) {
 				// Shutting down — resume processes so they can be cleaned up. Mark the
 				// shutdown BEFORE resuming: the executors' own cancel paths are already
 				// racing to unpause-and-stop their containers, so a resume that finds
@@ -861,10 +880,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 			// Resume all suspended processes.
 			d.slotManager.ResumeAll()
-			d.logger.Info("resumed all active processes")
+			if fetchStopped {
+				logPause = d.logger.Info
+			}
+			logPause("resumed all active processes")
 
-			// Restart fetcher if it was stopped (system pause).
-			if systemPaused {
+			// Restart fetcher if it was stopped.
+			if fetchStopped {
 				startFetcher()
 			}
 			continue
@@ -926,6 +948,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.setAutoPause(pauseSourceThermal, shouldPause)
 		case shouldPause := <-d.yieldPauseCh:
 			d.setAutoPause(pauseSourceBusy, shouldPause)
+		case shouldPause := <-d.cpuTimePauseCh:
+			d.setAutoPause(pauseSourceCPUTime, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -940,6 +964,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wu := result.WU
 	conn := result.Conn
+
+	if result.Restart {
+		d.requeueForRestart(result)
+		return
+	}
 
 	if result.Err != nil {
 		if errors.Is(result.Err, context.Canceled) {
@@ -1399,7 +1428,8 @@ func refusalKind(reason string) string {
 //     was ample doesn't start after the disk filled up (TB-24). A refused unit
 //     waits in the buffer like a memory-refused one; the head's reservation
 //     expiry reclaims it if space never frees.
-//  5. Running-task cap — max_running_tasks, when the volunteer set one.
+//  5. Running-task caps — max_running_tasks, when the volunteer set one, and
+//     the volunteer's max_running for this unit's leaf (leaf_override.go).
 //  6. CPU budget — the running tasks' grants plus this unit's minimum cores
 //     within max_cpu_cores (and container work within the engine VM's CPUs).
 //
@@ -1487,6 +1517,13 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	if limit := d.maxRunningTasks(); limit > 0 {
 		if running := sm.ActiveCount(); running >= limit {
 			return false, fmt.Sprintf("running tasks cap: %d task(s) running, max_running_tasks is %d", running, limit)
+		}
+	}
+	// 5b. The volunteer's cap on this leaf's running tasks, also before the
+	// CPU budget.
+	if limit := d.leafMaxRunning(wu.LeafID); limit > 0 {
+		if running := sm.ActiveCountForLeaf(wu.LeafID); running >= limit {
+			return false, fmt.Sprintf("leaf running limit: %d of this leaf's tasks running, and you set it to run at most %d at once", running, limit)
 		}
 	}
 
@@ -1883,7 +1920,9 @@ func (d *Daemon) runnableAtOnce() int {
 }
 
 // leafRunnableAtOnce is how many units of leaf the budgets of its runtime
-// run together, each at its minimum cores and booked memory (at least one).
+// run together, each at its minimum cores (after the volunteer's cores
+// override) and booked memory, and no more than the volunteer's max_running
+// for the leaf (at least one).
 func (d *Daemon) leafRunnableAtOnce(leaf CachedLeafInfo) int {
 	cores, memMB := d.HostCPUBudgetCores(), d.HostMemoryBudgetMB()
 	if requiredRuntimeForLeaf(leaf) == runtime.RuntimeContainer {
@@ -1891,7 +1930,7 @@ func (d *Daemon) leafRunnableAtOnce(leaf CachedLeafInfo) int {
 	}
 	n := math.MaxInt32
 	if cores > 0 {
-		minCores, _ := coreRangeOf(leaf)
+		minCores, _ := d.effectiveCoreRange(leaf)
 		if minCores > cores {
 			minCores = cores
 		}
@@ -1901,6 +1940,9 @@ func (d *Daemon) leafRunnableAtOnce(leaf CachedLeafInfo) int {
 		if booked := runtime.BookedMemMB(int(leaf.ExecutionSpec.MaxMemoryMB), memMB); booked > 0 && memMB/booked < n {
 			n = memMB / booked
 		}
+	}
+	if limit := d.leafMaxRunning(leaf.ID); limit > 0 && limit < n {
+		n = limit
 	}
 	if n < 1 {
 		n = 1
@@ -2086,18 +2128,36 @@ func (d *Daemon) noteArrivalEstimate(leafID string, rscFpopsEst float64) {
 }
 
 // bufferTargetSeconds is the total seconds of work the client work buffer aims
-// to hold: work_buffer_hours hours per execution slot. Sizing in hours (rather
-// than a unit count) keeps the buffer meaningful across leafs whose units span
-// seconds to hours. Returns 0 when buffering is disabled by config (hours == 0).
+// to hold: work_buffer_hours hours per execution slot (bufferSecondsPerSlot).
+// Sizing in hours (rather than a unit count) keeps the buffer meaningful
+// across leafs whose units span seconds to hours. Returns 0 when buffering is
+// disabled by config (hours == 0).
 func (d *Daemon) bufferTargetSeconds() float64 {
+	return d.bufferSecondsPerSlot() * float64(d.maxSlots())
+}
+
+// bufferSecondsPerSlot is the work one slot's share of the buffer holds:
+// work_buffer_hours of wall-clock time, in the seconds of running that every
+// unit is booked at (a unit's learned duration leaves out the time it was
+// paused). Under a CPU time limit a slot runs only that share of the time
+// (cpuTimeFraction), so the same hours hold that share of the work - without
+// it a 50 % limit would buffer twice the hours asked for, and units would wait
+// in the buffer toward their deadline. 0 when buffering is disabled.
+func (d *Daemon) bufferSecondsPerSlot() float64 {
 	hours := d.cfg.WorkBufferHours
-	if hours < 0 {
-		hours = 0
-	}
-	if hours == 0 {
+	if hours <= 0 {
 		return 0
 	}
-	return hours * 3600 * float64(d.maxSlots())
+	return hours * 3600 * d.cpuTimeFraction()
+}
+
+// cpuTimeFraction is the share of the time work runs: max_cpu_time_pct as a
+// fraction, 1 when no limit is set.
+func (d *Daemon) cpuTimeFraction() float64 {
+	if d.cfg == nil {
+		return 1
+	}
+	return float64(d.cfg.ResourceLimits.CPUTimePct()) / 100
 }
 
 // gpuSlots is how many execution slots GPU-required units can occupy at once:
@@ -2122,11 +2182,7 @@ func (d *Daemon) gpuSlots() int {
 // and the global target (they occupy slots too); everything else counts against
 // the global target only. Returns 0 when buffering is disabled (hours == 0).
 func (d *Daemon) gpuBufferTargetSeconds() float64 {
-	hours := d.cfg.WorkBufferHours
-	if hours <= 0 {
-		return 0
-	}
-	return hours * 3600 * float64(d.gpuSlots())
+	return d.bufferSecondsPerSlot() * float64(d.gpuSlots())
 }
 
 // bufferedGPUSeconds is bufferedSeconds restricted to GPU-required units —
@@ -2238,11 +2294,7 @@ func (d *Daemon) containerSlotsFor(wu *runtime.WorkUnit) int {
 // the 90 %-of-deadline drop. Container units count against BOTH this and the
 // global target. Returns 0 when buffering is disabled (hours == 0).
 func (d *Daemon) containerBufferTargetSeconds(wu *runtime.WorkUnit) float64 {
-	hours := d.cfg.WorkBufferHours
-	if hours <= 0 {
-		return 0
-	}
-	return hours * 3600 * float64(d.containerSlotsFor(wu))
+	return d.bufferSecondsPerSlot() * float64(d.containerSlotsFor(wu))
 }
 
 // bufferedContainerSeconds is bufferedSeconds restricted to container units —
@@ -2300,6 +2352,109 @@ func (d *Daemon) containerBufferFullVerdict(wu *runtime.WorkUnit) (bool, string)
 	return true, fmt.Sprintf("container work buffer full (over the hours target for the %d unit(s) the container engine's VM runs at a time)", slots)
 }
 
+// leafSlotsFor is how many units of the leaf can run at once on this
+// machine: the slot count, bounded by the leaf's own figure
+// (leafRunnableAtOnce - its runtime's CPU budget over the cores each of its
+// tasks takes, its memory budget over its booked memory, and the volunteer's
+// max_running for it). At least one.
+//
+// The slot count is set by the most parallel enabled leaf, so on its own it
+// over-states how many units of a wider leaf, or of one the volunteer capped,
+// run together: sizing that leaf's buffer by it would hold work for tasks
+// that never start, which then sits toward its deadline. That is the
+// running-task limit that makes a client fetch far more than it can finish,
+// and the per-leaf buffer class below is what stops it.
+func (d *Daemon) leafSlotsFor(leaf CachedLeafInfo) int {
+	n := d.maxSlots()
+	if m := d.leafRunnableAtOnce(leaf); m < n {
+		n = m
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// leafOfUnit is the cached leaf a unit belongs to, or a bare descriptor with
+// its id when the cache does not hold it (a pinned leaf the catalog does not
+// list).
+func (d *Daemon) leafOfUnit(wu *runtime.WorkUnit) CachedLeafInfo {
+	if wu == nil {
+		return CachedLeafInfo{}
+	}
+	if l, ok := d.cachedLeaf(wu.LeafID); ok {
+		return l
+	}
+	return CachedLeafInfo{ID: wu.LeafID}
+}
+
+// leafBufferTargetSeconds is the hours target for one leaf's buffered work:
+// work_buffer_hours per unit of the leaf that runs at once (leafSlotsFor).
+// A leaf's units count against this, the global target and their GPU or
+// container class. 0 when buffering is disabled.
+func (d *Daemon) leafBufferTargetSeconds(leaf CachedLeafInfo) float64 {
+	return d.bufferSecondsPerSlot() * float64(d.leafSlotsFor(leaf))
+}
+
+// bufferedLeafSeconds is bufferedSeconds restricted to one leaf's units.
+func (d *Daemon) bufferedLeafSeconds(leafID string) float64 {
+	var total float64
+	for _, wu := range d.heldWorkUnits() {
+		if wu.LeafID == leafID {
+			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		}
+	}
+	return total
+}
+
+// bufferedLeafUnitCount counts one leaf's held units (the unit-count fallback
+// view of its class).
+func (d *Daemon) bufferedLeafUnitCount(leafID string) int {
+	n := 0
+	for _, wu := range d.heldWorkUnits() {
+		if wu.LeafID == leafID {
+			n++
+		}
+	}
+	return n
+}
+
+// leafClassExists reports whether the leaf has a buffer class of its own:
+// only when fewer of its units run at once than there are slots. Otherwise
+// the global target governs it, as it always has.
+func (d *Daemon) leafClassExists(leaf CachedLeafInfo) bool {
+	return leaf.ID != "" && d.leafSlotsFor(leaf) < d.maxSlots()
+}
+
+// leafBufferFullVerdict is the leaf's own buffer class's fullness, with the
+// give-back wording for the bound that held (see workBufferFullVerdict); ""
+// when not full, or when the leaf has no class of its own.
+func (d *Daemon) leafBufferFullVerdict(leaf CachedLeafInfo) (bool, string) {
+	if !d.leafClassExists(leaf) {
+		return false, ""
+	}
+	slots := d.leafSlotsFor(leaf)
+	held, cap := d.bufferedLeafUnitCount(leaf.ID), fallbackBufferUnitsPerSlot*slots
+	target := d.leafBufferTargetSeconds(leaf)
+	if target <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("leaf work buffer full (work_buffer_hours is 0: %d of %d of this leaf's units held; %d of them run at a time here)", held, cap, slots)
+	}
+	sec := d.bufferedLeafSeconds(leaf.ID)
+	if sec <= 0 {
+		if held < cap {
+			return false, ""
+		}
+		return true, fmt.Sprintf("leaf work buffer full (unit-count fallback: %d of %d of this leaf's units held, no duration estimate yet; %d of them run at a time here)", held, cap, slots)
+	}
+	if sec < target {
+		return false, ""
+	}
+	return true, fmt.Sprintf("leaf work buffer full (over the hours target for the %d of this leaf's units that run at a time here)", slots)
+}
+
 // leafShapeUnit is a work unit shaped like the leaf's declared execution spec
 // — its runtime, memory, disk and GPU need — for the checks that judge a leaf
 // before any of its units exists: the starved-backfill fit gate and the
@@ -2319,10 +2474,12 @@ func leafShapeUnit(leaf CachedLeafInfo) *runtime.WorkUnit {
 
 // leafClassBufferFull reports whether the resource class this leaf's units
 // belong to has already reached its own hours target, so the fetcher can skip
-// the leaf BEFORE issuing RequestWorkUnit (TB-48). Two classes are bounded
-// tighter than the slot count: GPU work, by the GPU count, and container work
-// on a machine whose container engine's VM runs fewer units of the leaf's
-// shape at once than there are slots. Any other leaf is never class-full here
+// the leaf BEFORE issuing RequestWorkUnit (TB-48). Three classes are bounded
+// tighter than the slot count: GPU work, by the GPU count; container work on
+// a machine whose container engine's VM runs fewer units of the leaf's shape
+// at once than there are slots; and the leaf itself, when fewer of its units
+// run at once than there are slots (leafSlotsFor: its cores, its memory, the
+// volunteer's max_running for it). Any other leaf is never class-full here
 // (the global target and workBufferFull govern it). Without this skip a
 // one-GPU host under its global target asked for GPU units every round and
 // returned each within seconds — the request-and-refuse churn TB-34 ended for
@@ -2337,6 +2494,10 @@ func (d *Daemon) leafClassBufferFull(leaf CachedLeafInfo) (bool, string) {
 			return true, fmt.Sprintf("container work buffer full (%.1f h of container units held against a target of %.1f h: the container engine's VM runs %d of this leaf's units at a time)",
 				d.bufferedContainerSeconds()/3600, d.containerBufferTargetSeconds(shape)/3600, d.containerSlotsFor(shape))
 		}
+	}
+	if full, _ := d.leafBufferFullVerdict(leaf); full {
+		return true, fmt.Sprintf("leaf work buffer full (%.1f h of this leaf's units held against a target of %.1f h: %d of them run at a time here)",
+			d.bufferedLeafSeconds(leaf.ID)/3600, d.leafBufferTargetSeconds(leaf)/3600, d.leafSlotsFor(leaf))
 	}
 	return false, ""
 }
@@ -2525,7 +2686,7 @@ func (d *Daemon) coresTaken() bool {
 	free := d.runningLedger().hostCores
 	need := 0
 	for _, leaf := range d.allEnabledLeafs() {
-		if minCores, _ := coreRangeOf(leaf); need == 0 || minCores < need {
+		if minCores, _ := d.effectiveCoreRange(leaf); need == 0 || minCores < need {
 			need = minCores
 		}
 	}
@@ -2647,7 +2808,9 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 // — on a one-GPU host the global target admitted slots × hours of GPU units, of
 // which one ran and the rest waited for the deadline drop. A container unit is
 // likewise measured against the container class's target where the
-// container engine's VM runs fewer such units at once than there are slots.
+// container engine's VM runs fewer such units at once than there are slots,
+// and every unit against its leaf's own target where fewer of the leaf's
+// units run at once than there are slots (leafSlotsFor).
 func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	// A unit whose declaration the budget cannot cover is returned before
 	// any Prepare cost (TB-79): the head sent it against an advertisement
@@ -2662,6 +2825,9 @@ func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
 	}
 	if !full {
 		full, reason = d.containerBufferFullVerdict(wu)
+	}
+	if !full {
+		full, reason = d.leafBufferFullVerdict(d.leafOfUnit(wu))
 	}
 	if !full {
 		return true, ""
@@ -2753,8 +2919,8 @@ func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64
 // and leaf weights give this request: share of the hours deficit (of the
 // unit-count headroom when nothing estimates a unit's length), so the leaves
 // of a head, and the heads, fill the buffer interleaved in proportion to their
-// weights instead of the first one asked taking all of it. The GPU and
-// container classes still bound the ask by their own deficits.
+// weights instead of the first one asked taking all of it. The GPU, container
+// and per-leaf classes still bound the ask by their own deficits.
 func (d *Daemon) requestShareBatchSize(leaf CachedLeafInfo, estSecondsPerUnit, share float64) int32 {
 	if share <= 0 || share > 1 {
 		share = 1
@@ -2777,6 +2943,12 @@ func (d *Daemon) requestShareBatchSize(leaf CachedLeafInfo, estSecondsPerUnit, s
 	if containerClass {
 		if containerDeficit := d.containerBufferTargetSeconds(shape) - d.bufferedContainerSeconds(); containerDeficit < deficit {
 			deficit = containerDeficit
+		}
+	}
+	leafClass := d.leafClassExists(leaf)
+	if leafClass {
+		if leafDeficit := d.leafBufferTargetSeconds(leaf) - d.bufferedLeafSeconds(leaf.ID); leafDeficit < deficit {
+			deficit = leafDeficit
 		}
 	}
 	if deficit <= 0 {
@@ -2802,6 +2974,11 @@ func (d *Daemon) requestShareBatchSize(leaf CachedLeafInfo, estSecondsPerUnit, s
 		}
 		if containerClass {
 			if h := fallbackBufferUnitsPerSlot*containerSlots - d.bufferedContainerUnitCount(); h < headroom {
+				headroom = h
+			}
+		}
+		if leafClass {
+			if h := fallbackBufferUnitsPerSlot*d.leafSlotsFor(leaf) - d.bufferedLeafUnitCount(leaf.ID); h < headroom {
 				headroom = h
 			}
 		}
@@ -3419,6 +3596,8 @@ func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
 			d.setAutoPause(pauseSourceThermal, shouldPause)
 		case shouldPause := <-d.yieldPauseCh:
 			d.setAutoPause(pauseSourceBusy, shouldPause)
+		case shouldPause := <-d.cpuTimePauseCh:
+			d.setAutoPause(pauseSourceCPUTime, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -3435,14 +3614,19 @@ func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
 }
 
 // waitForResume blocks until the daemon is unpaused or ctx is cancelled.
-// Returns false if ctx was cancelled.
-func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
+// Returns false if ctx was cancelled. onSignal, when set, runs after each
+// signal received while waiting — the run loop stops the fetcher there when
+// a source that stops fetching joins a pause that did not.
+func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool, onSignal func()) bool {
 	for {
 		d.mu.Lock()
 		paused := d.paused || d.userPaused
 		d.mu.Unlock()
 		if !paused {
 			return true
+		}
+		if onSignal != nil {
+			onSignal()
 		}
 
 		select {
@@ -3454,6 +3638,8 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 			d.setAutoPause(pauseSourceThermal, shouldPause)
 		case shouldPause := <-d.yieldPauseCh:
 			d.setAutoPause(pauseSourceBusy, shouldPause)
+		case shouldPause := <-d.cpuTimePauseCh:
+			d.setAutoPause(pauseSourceCPUTime, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -3471,6 +3657,7 @@ const (
 	pauseSourceResource = "scheduled" // the resource monitor: schedule window, low disk
 	pauseSourceThermal  = "thermal"   // the thermal monitor
 	pauseSourceBusy     = "busy"      // the yield monitor: other programs need the CPU (TB-83)
+	pauseSourceCPUTime  = "cpu_time"  // the CPU time limit's paused part (cpu_time.go)
 )
 
 // pauseReasonIdleUnknown is the reason reported in place of "scheduled" while
@@ -3498,13 +3685,20 @@ func (d *Daemon) setAutoPause(source string, on bool) {
 		d.thermalPaused = on
 	case pauseSourceBusy:
 		d.busyPaused = on
+	case pauseSourceCPUTime:
+		d.cpuTimePaused = on
 	}
-	d.paused = d.resourcePaused || d.thermalPaused || d.busyPaused
+	d.paused = d.resourcePaused || d.thermalPaused || d.busyPaused || d.cpuTimePaused
 	d.pauseReason = d.autoPauseReasonLocked()
 	stillPaused := d.paused
 	stillBy := d.pauseReason
 	d.mu.Unlock()
 
+	if source == pauseSourceCPUTime {
+		// Every few seconds while the limit is set: Debug, not Info.
+		d.logger.Debug("CPU time limit", "paused", on, "still_paused_by", stillBy)
+		return
+	}
 	var msg string
 	switch {
 	case source == pauseSourceResource && on:
@@ -3537,8 +3731,35 @@ func (d *Daemon) autoPauseReasonLocked() string {
 		return pauseSourceBusy
 	case d.resourcePaused:
 		return pauseSourceResource
+	case d.cpuTimePaused:
+		return pauseSourceCPUTime
 	}
 	return ""
+}
+
+// autoPauseReason is the automatic source holding the pause, "cpu_time"
+// included (PauseReason leaves it out); "" when none holds.
+func (d *Daemon) autoPauseReason() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pauseReason
+}
+
+// onlyCPUTimePaused reports whether the CPU time limit's paused part is the
+// only pause holding — no other automatic source and no user pause.
+func (d *Daemon) onlyCPUTimePaused() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cpuTimePaused && !d.resourcePaused && !d.thermalPaused && !d.busyPaused && !d.userPaused
+}
+
+// pauseStopsFetching reports whether a source that stops the fetcher holds a
+// pause: the schedule window or low disk, heat, or other programs' CPU use.
+// A user pause and the CPU time limit leave it fetching.
+func (d *Daemon) pauseStopsFetching() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.resourcePaused || d.thermalPaused || d.busyPaused
 }
 
 // waitForScheduleActive blocks until the scheduler says the daemon may run, and
@@ -3703,10 +3924,11 @@ func (d *Daemon) Resume() error {
 // them, and it usually beats the resource monitor's pause signal to a closing
 // window — always on a daemon booted inside one — so a gate-park was
 // unrepresentable here and `status` showed an active, unexplained daemon for
-// the whole window (TB-44).
+// the whole window (TB-44). The CPU time limit's paused part is not a pause
+// here: the limit is a standing setting reported by CPUTimeLimit (cpu_time.go).
 func (d *Daemon) IsPaused() bool {
 	d.mu.Lock()
-	paused := d.paused || d.userPaused
+	paused := d.userPaused || d.resourcePaused || d.thermalPaused || d.busyPaused
 	d.mu.Unlock()
 	return paused || d.scheduleClosed()
 }
@@ -3723,7 +3945,7 @@ func (d *Daemon) PauseReason() string {
 		d.mu.Unlock()
 		return "user"
 	}
-	if d.paused {
+	if d.paused && d.pauseReason != pauseSourceCPUTime {
 		reason := d.pauseReason
 		d.mu.Unlock()
 		if reason == pauseSourceResource {
@@ -3831,6 +4053,7 @@ type CurrentTask struct {
 	ResumedFromCheckpoint bool
 	EstimatedSeconds      float64 // expected total seconds (estSecondsForUnit; 0 = unknown)
 	Suspended             bool
+	UserSuspended         bool // suspended by the volunteer's per-task suspend, not an automatic pause
 	TotalPausedSeconds    int
 	DeadlineSeconds       int32
 	RuntimeType           string // "native", "container", or "wasm"
@@ -3859,14 +4082,20 @@ func (d *Daemon) SuspendTask(workUnitID string) error {
 
 // ResumeTask resumes a single suspended task by work unit ID.
 // Returns ErrDaemonPaused if the daemon is paused (resume blocked at daemon level).
+// During the CPU time limit's paused part the task's own suspension ends and
+// it resumes with the rest of the work.
 func (d *Daemon) ResumeTask(workUnitID string) error {
-	if d.slotManager == nil {
+	sm := d.slotManager
+	if sm == nil {
 		return ErrTaskNotFound
 	}
 	if d.IsPaused() {
 		return ErrDaemonPaused
 	}
-	return d.slotManager.ResumeSlot(workUnitID)
+	if d.onlyCPUTimePaused() {
+		return sm.EndUserSuspend(workUnitID)
+	}
+	return sm.ResumeSlot(workUnitID)
 }
 
 // AbortTask cancels a single task by work unit ID, killing its process.
@@ -3875,6 +4104,53 @@ func (d *Daemon) AbortTask(workUnitID string) error {
 		return ErrTaskNotFound
 	}
 	return d.slotManager.AbortSlot(workUnitID)
+}
+
+// RestartTask stops a running task and runs its unit again from the start
+// under the settings in force now: the cores its leaf is given, the
+// volunteer's override for it, the limits. A task keeps the grant it started
+// with for its whole run, so this is how a changed setting reaches a task
+// already running. The run is stopped and the unit goes back to the front of
+// the work buffer with its work dir — and with it any checkpoint the leaf
+// wrote, so a leaf that checkpoints continues from its last one and any
+// other starts over. The head still holds the unit as running on this
+// machine, so its deadline keeps counting from the first start and its
+// result is accepted as usual.
+func (d *Daemon) RestartTask(workUnitID string) error {
+	if d.slotManager == nil {
+		return ErrTaskNotFound
+	}
+	return d.slotManager.RestartSlot(workUnitID)
+}
+
+// requeueForRestart puts a unit whose run was stopped by RestartTask back at
+// the front of the work buffer, to be started with a fresh grant by the slot
+// filler. It is already run-started at its head, which holds it as running
+// rather than reserved, so it carries no reservation window for the buffer's
+// lapse sweep; its checkpoint sequence continues from the stopped run's.
+func (d *Daemon) requeueForRestart(result SlotResult) {
+	q := d.prefetchQueue
+	wu, prep := result.WU, result.Prep
+	if q == nil || wu == nil || prep == nil {
+		return
+	}
+	wu.CPUGrant = runtime.CPUGrant{}
+	wu.ReservedUntilUnix = 0
+	wu.CheckpointSequence = result.CheckpointSequence
+	prep.OrphanPID = 0
+	prep.OrphanContainerID = ""
+	prep.ElapsedAccrued = 0
+	prep.PausedAccrued = 0
+	prep.OriginalStartedAt = time.Time{}
+	q.PushFront(&PreFetchItem{
+		WU:        wu,
+		Prep:      prep,
+		Runtime:   result.Runtime,
+		Conn:      result.Conn,
+		FetchedAt: result.FetchedAt,
+	})
+	d.logger.Info("task restarting from the start with the current settings",
+		"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "slot", result.SlotID)
 }
 
 // GetQueuedCount returns the number of work units in the prefetch queue.
@@ -3962,7 +4238,23 @@ func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	// Reinitialize weights from new config.
 	d.initializeWeights()
 
-	if oldCfg == nil || oldCfg.ResourceLimits != newCfg.ResourceLimits || !reflect.DeepEqual(oldCfg.GPUOverrides, newCfg.GPUOverrides) {
+	// The CPU time limit is this machine's own business: heads are not told
+	// it, and its cycle picks a change up within a second (cpu_time.go).
+	oldLimits, newLimits := config.ResourceLimits{}, newCfg.ResourceLimits
+	if oldCfg != nil {
+		oldLimits = oldCfg.ResourceLimits
+	}
+	if oldPct, newPct := oldLimits.CPUTimePct(), newLimits.CPUTimePct(); oldCfg != nil && oldPct != newPct {
+		if newPct >= 100 {
+			d.logger.Info("CPU time limit removed: work runs continuously")
+		} else {
+			run, pause := cpuTimeCycle(newPct)
+			d.logger.Info("CPU time limit set: running work is paused and resumed in turn", "max_cpu_time_pct", newPct,
+				"runs", DescribeCPUTimeLimit(newPct, run, pause))
+		}
+	}
+	oldLimits.MaxCPUTimePct, newLimits.MaxCPUTimePct = 0, 0
+	if oldCfg == nil || oldLimits != newLimits || !reflect.DeepEqual(oldCfg.GPUOverrides, newCfg.GPUOverrides) {
 		d.applyBandwidthLimit(newCfg.ResourceLimits.MaxBandwidthMbps)
 		d.setAdvertisedResourceLimits()
 		hw := d.advertisedHardware()

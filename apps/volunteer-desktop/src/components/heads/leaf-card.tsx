@@ -21,6 +21,13 @@ interface LeafCardProps {
   trustedRuntimes: string[] | null;
   onToggle: (enabled: boolean) => void;
   onWeightChange: (weight: number) => void;
+  /**
+   * Save the cores each of the leaf's tasks is given, or null for the
+   * leaf's own range. Rejects on failure. Absent: no override control.
+   */
+  onCoresChange?: (cores: number | null) => Promise<void>;
+  /** Save the most of the leaf's tasks that run at once, or null for no cap. */
+  onMaxRunningChange?: (count: number | null) => Promise<void>;
   /** Raise `resource_limits.max_disk_gb` to the given whole-GB value. */
   onRaiseDisk?: (gb: number) => Promise<void>;
   /** Raise `resource_limits.max_memory_mb` to the given Memory-slider stop, in MB. */
@@ -63,6 +70,8 @@ export function LeafCard({
   trustedRuntimes,
   onToggle,
   onWeightChange,
+  onCoresChange,
+  onMaxRunningChange,
   onRaiseDisk,
   onRaiseMemory,
   memoryCeilingMb = null,
@@ -307,6 +316,123 @@ export function LeafCard({
           />
         </div>
       )}
+      {leaf.enabled && leaf.cpu && onCoresChange && onMaxRunningChange && (
+        <div className="pl-7">
+          <LeafCPUControl
+            leaf={leaf}
+            cpuLimit={machine?.host_max_cpu_cores ?? 0}
+            onCoresChange={onCoresChange}
+            onMaxRunningChange={onMaxRunningChange}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** "3 cores", "2–4 cores". */
+export function coreRangeText(min: number, max: number): string {
+  if (max > min) return `${min}–${max} cores`;
+  return `${min} core${min === 1 ? "" : "s"}`;
+}
+
+/**
+ * The sentence under a leaf's CPU control: what each of its tasks is given
+ * here, how many run at once, and when a change applies.
+ */
+export function leafCPUCaption(cpu: NonNullable<LeafInfo["cpu"]>): string {
+  const given =
+    cpu.task_cores_max > cpu.task_cores_min
+      ? `Each task is given ${coreRangeText(cpu.task_cores_min, cpu.task_cores_max)}, as many as are free when it starts`
+      : `Each task is given ${coreRangeText(cpu.task_cores_min, cpu.task_cores_max)}`;
+  return `${given}; up to ${cpu.runs_at_once} run at once here, and Lettuce buffers no more of this leaf than that many can finish. Applies to tasks started afterwards — restart a running task from Overview to apply it now.`;
+}
+
+/**
+ * The volunteer's CPU override for one leaf, beside its weight: the cores
+ * each task is given (within the range the leaf declares) and the most of
+ * its tasks that run at once. Saved at once; a failed save is shown.
+ */
+function LeafCPUControl({
+  leaf,
+  cpuLimit,
+  onCoresChange,
+  onMaxRunningChange,
+}: {
+  leaf: LeafInfo;
+  cpuLimit: number;
+  onCoresChange: (cores: number | null) => Promise<void>;
+  onMaxRunningChange: (count: number | null) => Promise<void>;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const cpu = leaf.cpu!;
+  const declaredMin = Math.max(1, leaf.resource_requirements?.min_cpu_cores ?? 1);
+  const declaredMax = Math.max(declaredMin, leaf.resource_requirements?.max_cpu_cores ?? declaredMin);
+  const coreChoices: number[] = [];
+  for (let n = declaredMin; n <= declaredMax; n++) coreChoices.push(n);
+  if (cpu.cores_override > 0 && !coreChoices.includes(cpu.cores_override)) coreChoices.push(cpu.cores_override);
+  const perTask = Math.max(1, cpu.task_cores_min);
+  const runLimit = Math.max(1, cpuLimit > 0 ? Math.floor(cpuLimit / perTask) : cpu.runs_at_once, cpu.max_running_override);
+  const runChoices: number[] = [];
+  for (let n = 1; n <= runLimit; n++) runChoices.push(n);
+
+  const save = async (fn: () => Promise<void>) => {
+    setSaving(true);
+    setError(null);
+    try {
+      await fn();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the setting");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1" data-testid="leaf-cpu-control">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+        {coreChoices.length > 1 && (
+          <label className="flex items-center gap-1">
+            Cores per task
+            <select
+              aria-label="Cores per task"
+              className="rounded border bg-background px-1 py-0.5 text-foreground"
+              value={cpu.cores_override > 0 ? String(cpu.cores_override) : ""}
+              disabled={saving}
+              onChange={(e) => save(() => onCoresChange(e.target.value ? Number(e.target.value) : null))}
+            >
+              <option value="">Leaf's range ({coreRangeText(declaredMin, declaredMax)})</option>
+              {coreChoices.map((n) => (
+                <option key={n} value={String(n)}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        <label className="flex items-center gap-1">
+          Run at most
+          <select
+            aria-label="Run at most"
+            className="rounded border bg-background px-1 py-0.5 text-foreground"
+            value={cpu.max_running_override > 0 ? String(cpu.max_running_override) : ""}
+            disabled={saving}
+            onChange={(e) => save(() => onMaxRunningChange(e.target.value ? Number(e.target.value) : null))}
+          >
+            <option value="">No limit</option>
+            {runChoices.map((n) => (
+              <option key={n} value={String(n)}>
+                {n} at once
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <p className="text-xs text-muted-foreground" data-testid="leaf-cpu-caption">
+        {leafCPUCaption(cpu)}
+      </p>
+      {error && <p className="text-xs text-destructive">{error}</p>}
     </div>
   );
 }

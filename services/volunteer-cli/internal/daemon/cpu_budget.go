@@ -22,8 +22,9 @@ import (
 //
 //   - Each leaf declares a core RANGE: min_cpu_cores, the head's dispatch gate
 //     and the fewest a unit runs on, and max_cpu_cores, the most it can use
-//     (leafCoreRange; a head too old to send the max, or a leaf that declares
-//     none, is min–min).
+//     (declaredCoreRange; a head too old to send the max, or a leaf that
+//     declares none, is min–min). A volunteer's cores override for the leaf
+//     narrows it to one figure inside it (leafCoreRange, leaf_override.go).
 //   - A task starting is GRANTED whole cores between the two (grantCPU): its
 //     minimum, plus as many of the budget's free cores as are left once the
 //     units waiting in the buffer that could start beside it have their
@@ -98,13 +99,27 @@ func (d *Daemon) CPULimitedByVM() bool {
 	return d.ContainerVMCPUs() > 0 && d.ContainerCPUBudgetCores() < d.cfg.ResourceLimits.MaxCPUCores
 }
 
-// leafCoreRange is the leaf's declared core range per unit from the leaf
+// declaredCoreRange is the leaf's declared core range per unit from the leaf
 // cache: min_cpu_cores (at least 1) and max_cpu_cores (at least the min). A
 // leaf the cache does not hold, or a head too old to send requirements, is
 // 1–1; a head too old to send the max is min–min.
-func (d *Daemon) leafCoreRange(leafID string) (minCores, maxCores int) {
+func (d *Daemon) declaredCoreRange(leafID string) (minCores, maxCores int) {
 	l, _ := d.cachedLeaf(leafID)
 	return coreRangeOf(l)
+}
+
+// leafCoreRange is the range a task of the leaf is granted from on this
+// machine: its declared range, or the volunteer's cores override for the leaf
+// brought inside it (applyCoresOverride).
+func (d *Daemon) leafCoreRange(leafID string) (minCores, maxCores int) {
+	minCores, maxCores = d.declaredCoreRange(leafID)
+	return applyCoresOverride(minCores, maxCores, d.leafOverride(leafID).cores)
+}
+
+// effectiveCoreRange is leafCoreRange for a leaf already in hand.
+func (d *Daemon) effectiveCoreRange(l CachedLeafInfo) (minCores, maxCores int) {
+	minCores, maxCores = coreRangeOf(l)
+	return applyCoresOverride(minCores, maxCores, d.leafOverride(l.ID).cores)
 }
 
 // coreRangeOf is leafCoreRange for a leaf already in hand.
@@ -237,7 +252,8 @@ func (d *Daemon) adoptedCPUGrant(wu *runtime.WorkUnit, cores int) runtime.CPUGra
 
 // budgetLedger is what the configured budgets have free: CPU cores and memory
 // on the machine and, where they are tighter, inside the container engine's
-// VM; physical GPUs; and room under max_running_tasks. A figure goes negative
+// VM; physical GPUs; room under max_running_tasks; and how many of each leaf
+// run, against the volunteer's max_running for it. A figure goes negative
 // when what runs exceeds a budget lowered since it started; noBound stands
 // for a budget that is not set. Built from the running tasks (runningLedger)
 // and charged with each unit taken, it lets grantCPU ask of a waiting unit the
@@ -246,6 +262,7 @@ type budgetLedger struct {
 	hostCores, containerCores int
 	hostMemMB, containerMemMB int
 	gpus, tasks               int
+	leafRunning               map[string]int
 }
 
 // noBound is a budgetLedger figure for a budget that is not set: larger than
@@ -254,10 +271,16 @@ const noBound = math.MaxInt32
 
 // runningLedger is the budgets less what the running tasks hold.
 func (d *Daemon) runningLedger() budgetLedger {
-	l := budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound}
+	l := budgetLedger{hostCores: noBound, containerCores: noBound, hostMemMB: noBound, containerMemMB: noBound, gpus: noBound, tasks: noBound,
+		leafRunning: make(map[string]int)}
 	sm := d.slotManager // one read: the daemon clears it when it stops
 	if sm == nil {
 		return l
+	}
+	for _, wu := range sm.ActiveWorkUnits() {
+		if wu != nil {
+			l.leafRunning[wu.LeafID]++
+		}
 	}
 	if host := d.HostCPUBudgetCores(); host > 0 {
 		l.hostCores = host - sm.TotalActiveCPUCores(d.bookedCPUCores)
@@ -298,6 +321,9 @@ func (l budgetLedger) fits(d *Daemon, wu *runtime.WorkUnit) bool {
 		l.tasks <= 0:
 		return false
 	}
+	if limit := d.leafMaxRunning(wu.LeafID); limit > 0 && l.leafRunning[wu.LeafID] >= limit {
+		return false
+	}
 	return true
 }
 
@@ -314,6 +340,9 @@ func (l *budgetLedger) take(d *Daemon, wu *runtime.WorkUnit, cores int) {
 		l.gpus--
 	}
 	l.tasks--
+	if wu != nil && l.leafRunning != nil {
+		l.leafRunning[wu.LeafID]++
+	}
 }
 
 // coresFreeFor is how many more cores the ledger could give wu: the host

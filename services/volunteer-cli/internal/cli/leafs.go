@@ -19,7 +19,7 @@ import (
 func newLeafsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "leafs",
-		Short: "Manage leaf preferences (list, enable, disable, weight, reset)",
+		Short: "Manage leaf preferences: which leafs run, their weights, and their cores and running-task caps on this machine",
 		Args:  noStrayArgs,
 		// See newHeadsCmd: a non-runnable parent never reaches its Args
 		// constraint, so the help is served from RunE instead (TB-6).
@@ -31,6 +31,8 @@ func newLeafsCmd() *cobra.Command {
 		newLeafsEnableCmd(),
 		newLeafsDisableCmd(),
 		newLeafsWeightCmd(),
+		newLeafsCoresCmd(),
+		newLeafsMaxRunningCmd(),
 		newLeafsResetCmd(),
 	)
 
@@ -116,6 +118,20 @@ type leafsAPILeaf struct {
 	// image cachedness) only the daemon has. nil from a daemon predating the
 	// field (TB-41).
 	DiskGate *leafsAPIDiskGate `json:"disk_gate"`
+	// CPU is the machine's CPU arrangement for the leaf (management.LeafCPU);
+	// nil from a daemon predating it.
+	CPU *leafsAPICPU `json:"cpu"`
+}
+
+// leafsAPICPU mirrors management.LeafCPU: the volunteer's overrides for the
+// leaf (0 = not set), the range each task is given cores from, and how many
+// of its tasks run at once.
+type leafsAPICPU struct {
+	CoresOverride      int `json:"cores_override"`
+	MaxRunningOverride int `json:"max_running_override"`
+	TaskCoresMin       int `json:"task_cores_min"`
+	TaskCoresMax       int `json:"task_cores_max"`
+	RunsAtOnce         int `json:"runs_at_once"`
 }
 
 // leafsAPIDiskGate mirrors management.LeafDiskGate: whether the daemon's
@@ -206,14 +222,17 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tRUNTIME\tSTATE\tQUEUED\tVOLUNTEERS\tHOSTS\tWEIGHT\tENABLED\tWILL FETCH\n")
+	fmt.Fprintf(w, "SERVER\tSLUG\tNAME\tRUNTIME\tSTATE\tQUEUED\tVOLUNTEERS\tHOSTS\tWEIGHT\tCORES\tAT ONCE\tENABLED\tWILL FETCH\n")
 
 	// Blocking reasons are collected and printed under the table so the rows stay
 	// aligned and scannable.
 	var notes []string
-	// Per-head snapshot ages, same treatment: an eleventh column would repeat the
+	// Per-head snapshot ages, same treatment: another column would repeat the
 	// same value on every row of a head (TB-14).
 	var ages []string
+	// overridden notes that some leaf's CORES or AT ONCE is the volunteer's
+	// own setting (marked *).
+	overridden := false
 	for _, h := range resp.Heads {
 		srv, known := serverConfigFor(servers, h)
 		if len(h.Leafs) > 0 {
@@ -256,14 +275,25 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 				notes = append(notes, fmt.Sprintf("  %s / %s: %s", h.Name, label, note))
 			}
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+			cores, atOnce := leafCPUCells(l.CPU)
+			if l.CPU != nil && (l.CPU.CoresOverride > 0 || l.CPU.MaxRunningOverride > 0) {
+				overridden = true
+			}
+
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 				h.Name, l.Slug, l.Name, runtimeKindOf(req), l.State,
 				l.QueuedWorkUnits, l.ActiveVolunteers, l.ActiveHosts,
-				l.EffectiveWeight, enabled, willFetch,
+				l.EffectiveWeight, cores, atOnce, enabled, willFetch,
 			)
 		}
 	}
 	w.Flush()
+
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "CORES is what each of the leaf's tasks is given here; AT ONCE how many of its tasks run together, and how many tasks' worth of it Lettuce buffers.")
+	if overridden {
+		fmt.Fprintln(out, "* set by you: `lettuce-volunteer leafs cores <slug> default` / `leafs max-running <slug> none` returns a leaf to its own figures.")
+	}
 
 	if len(ages) > 0 {
 		fmt.Fprintln(out)
@@ -279,6 +309,28 @@ func printLeafsTable(out io.Writer, resp *leafsAPIResponse, servers []config.Ser
 			fmt.Fprintln(out, n)
 		}
 	}
+}
+
+// leafCPUCells renders a leaf's CORES and AT ONCE cells: the range each task
+// is given cores from ("2-4", "1") and how many of its tasks run at once,
+// each marked * when it is the volunteer's own setting. Dashes from a daemon
+// that does not report them.
+func leafCPUCells(c *leafsAPICPU) (cores, atOnce string) {
+	if c == nil || c.TaskCoresMin <= 0 {
+		return "—", "—"
+	}
+	cores = strconv.Itoa(c.TaskCoresMin)
+	if c.TaskCoresMax > c.TaskCoresMin {
+		cores = fmt.Sprintf("%d-%d", c.TaskCoresMin, c.TaskCoresMax)
+	}
+	if c.CoresOverride > 0 {
+		cores += "*"
+	}
+	atOnce = strconv.Itoa(c.RunsAtOnce)
+	if c.MaxRunningOverride > 0 {
+		atOnce += "*"
+	}
+	return cores, atOnce
 }
 
 // staleSnapshotAfter is when a leaf snapshot is old enough to explain itself

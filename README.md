@@ -132,8 +132,11 @@ for the whole machine. Each task is given the CPU cores its leaf can use: at lea
 leaf declares, up to its maximum, as many as your budget has free when the task starts. It keeps
 them until it finishes, is held to them, and is told the figure so it can size its worker pool.
 The tasks' cores together never exceed the CPU cores you allow, so how many tasks run at once
-follows from your CPU and memory budgets. Every task runs at the lowest priority, so your own
-programs come first. The client reserves exactly what it will enforce, using cgroups where available,
+follows from your CPU and memory budgets. For any leaf you can fix the cores each of its tasks is
+given and cap how many of them run at once, and the client never buffers more of a leaf than it
+will run. You can also have Lettuce's work run only part of the time ("use at most N % of CPU
+time"), and restart a running task so it picks up changed settings. Every task runs at the lowest
+priority, so your own programs come first. The client reserves exactly what it will enforce, using cgroups where available,
 container limits, or WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU or GPU
 gets too hot (where the machine lets a program read the temperature: the CPU on Linux, or on a Mac
 with the `osx-cpu-temp` helper; an NVIDIA GPU through `nvidia-smi`, an AMD GPU through `rocm-smi`
@@ -152,7 +155,8 @@ and, if you turn the setting on, pauses everything while other programs need the
 | `credit` | Your credit, per head and per leaf, and your results by state (waiting for validation, agreed, did not agree, in progress), asked of each head directly |
 | `attach` / `detach` | Add or remove a head; `--leaf` pins a single leaf |
 | `heads` | `list`, `weight`, `trust` |
-| `leafs` | `list`, `enable`, `disable`, `weight`, `reset` |
+| `leafs` | `list`, `enable`, `disable`, `weight`, `cores`, `max-running`, `reset` |
+| `tasks` | `restart` a running task with the current settings |
 | `schedule` | `show`, `set`, `add`, `clear` |
 | `config` | Read and write settings (`config set <key> <value>`) |
 | `history` | Locally recorded completed work |

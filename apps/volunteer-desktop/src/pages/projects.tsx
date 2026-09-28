@@ -7,6 +7,7 @@ import {
   useRaiseMemoryAllowance,
   useDebouncedHeadWeight,
   useDebouncedLeafWeight,
+  useWriteLeafCPUOverride,
 } from "@/hooks/use-heads";
 import { useClient } from "@/hooks/use-api";
 import { useContainerRuntime } from "@/hooks/use-container-runtime";
@@ -40,6 +41,7 @@ export function ProjectsPage() {
   const { raise: raiseMemoryAllowance } = useRaiseMemoryAllowance();
   const { write: writeHeadWeight } = useDebouncedHeadWeight();
   const { write: writeLeafWeight } = useDebouncedLeafWeight();
+  const { write: writeLeafCPUOverride } = useWriteLeafCPUOverride();
   const { client } = useClient();
   const { status: containerStatus } = useContainerRuntime();
   // The Memory slider's ceiling (90 % of this machine's RAM), so a leaf card
@@ -146,13 +148,25 @@ export function ProjectsPage() {
     [setHeads, writeLeafWeight]
   );
 
-  // Every leaf on, and no leaf weights: the head's defaults, as `leafs reset`
-  // does. The empty map is what clears the saved weights — a body without
-  // `weights` keeps them. The head publishes each leaf's default weight, so
-  // the page shows what the daemon reads back rather than assuming 100.
+  // A leaf's cores or running-task cap: saved, then the heads re-read so the
+  // card shows what the daemon makes of it (a figure kept inside the leaf's
+  // range, how many now run at once).
+  const handleLeafCPUOverride = useCallback(
+    async (head: HeadInfo, leafSlug: string, key: "cores" | "max_running", value: number | null) => {
+      await writeLeafCPUOverride(head, leafSlug, key, value);
+      refetch();
+    },
+    [writeLeafCPUOverride, refetch]
+  );
+
+  // Every leaf on, no leaf weights and no CPU overrides: the head's defaults,
+  // as `leafs reset` does. The empty maps are what clear the saved ones — a
+  // body without a key keeps it. The head publishes each leaf's default
+  // weight, so the page shows what the daemon reads back rather than
+  // assuming 100.
   const handleResetDefaults = useCallback(
     (head: HeadInfo) => {
-      writeLeafPrefs(head, { mode: "ALL", weights: {} })
+      writeLeafPrefs(head, { mode: "ALL", weights: {}, cores: {}, max_running: {} })
         .then(() => refetch())
         .catch((err: unknown) => {
           setToastType("error");
@@ -269,6 +283,10 @@ export function ProjectsPage() {
           }
           onLeafWeightChange={(slug, weight) =>
             handleLeafWeightChange(head, slug, weight)
+          }
+          onLeafCoresChange={(slug, cores) => handleLeafCPUOverride(head, slug, "cores", cores)}
+          onLeafMaxRunningChange={(slug, count) =>
+            handleLeafCPUOverride(head, slug, "max_running", count)
           }
           onResetDefaults={() => handleResetDefaults(head)}
           onDetach={() => handleDetach(head)}

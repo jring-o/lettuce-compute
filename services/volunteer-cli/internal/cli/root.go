@@ -134,6 +134,7 @@ func newRootCmd() *cobra.Command {
 		newScheduleCmd(),
 		newProjectsCmd(),
 		newLeafsCmd(),
+		newTasksCmd(),
 		newHeadsCmd(),
 		newAttachCmd(),
 		newDetachCmd(),
