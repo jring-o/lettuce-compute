@@ -121,6 +121,15 @@ type leafsAPILeaf struct {
 	// CPU is the machine's CPU arrangement for the leaf (management.LeafCPU);
 	// nil from a daemon predating it.
 	CPU *leafsAPICPU `json:"cpu"`
+	// Deadline is the daemon's verdict on whether the leaf's units can finish
+	// before their deadline here; nil from a daemon predating it.
+	Deadline *leafsAPIDeadline `json:"deadline"`
+}
+
+// leafsAPIDeadline mirrors management.LeafDeadline.
+type leafsAPIDeadline struct {
+	Blocked bool   `json:"blocked"`
+	Reason  string `json:"reason"`
 }
 
 // leafsAPICPU mirrors management.LeafCPU: the volunteer's overrides for the
@@ -407,6 +416,9 @@ func willFetchVerdict(req leafRequirements, caps volunteerCaps, srv config.Serve
 	// looped `skipping disk-gated leaf` on the exact leaf.
 	if l.DiskGate != nil && l.DiskGate.Blocked {
 		return "no", "disk-gated right now by this machine's own daemon: " + l.DiskGate.Reason
+	}
+	if l.Deadline != nil && l.Deadline.Blocked {
+		return "no", "its units " + l.Deadline.Reason + " (see the notice in `lettuce-volunteer doctor` or the app for what would help)"
 	}
 	if l.Failures != nil && l.Failures.Paused {
 		return "paused", fmt.Sprintf("this leaf's work reached this machine and failed %d times in a row, so requests for it are paused; it retries automatically (see `lettuce-volunteer status`)",

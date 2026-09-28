@@ -37,10 +37,15 @@ type DurationTracker struct {
 	dataDir string
 }
 
-// durationSample is one completed unit of a leaf on this machine.
+// durationSample is one completed unit of a leaf on this machine: its FP-ops
+// estimate, the seconds it computed, the cores it was given (0 when not
+// recorded) and its deadline in seconds (0 when it had none, or it was not
+// recorded).
 type durationSample struct {
-	RscFpopsEst   float64 `json:"rsc_fpops_est"`
-	ActiveSeconds float64 `json:"active_seconds"`
+	RscFpopsEst     float64 `json:"rsc_fpops_est"`
+	ActiveSeconds   float64 `json:"active_seconds"`
+	CPUCores        int     `json:"cpu_cores,omitempty"`
+	DeadlineSeconds int32   `json:"deadline_seconds,omitempty"`
 }
 
 const durationsFile = "durations.json"
@@ -78,12 +83,21 @@ func LoadDurationTracker(dataDir string) *DurationTracker {
 // ignored. rscFpopsEst may be zero — the sample still counts toward the leaf's
 // unit seconds, just not toward its seconds per FP-op.
 func (t *DurationTracker) Record(leafID string, rscFpopsEst, activeSeconds float64) {
+	t.RecordRun(leafID, rscFpopsEst, activeSeconds, 0, 0)
+}
+
+// RecordRun is Record with the cores the unit was given and its deadline in
+// seconds, which let the deadline check scale the leaf's run time to the
+// cores a task would be given and know the leaf's deadline before any of its
+// units is held (deadline_skip.go). Zero for either means not known.
+func (t *DurationTracker) RecordRun(leafID string, rscFpopsEst, activeSeconds float64, cpuCores int, deadlineSeconds int32) {
 	if leafID == "" || activeSeconds <= 0 {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	s := append(t.samples[leafID], durationSample{RscFpopsEst: rscFpopsEst, ActiveSeconds: activeSeconds})
+	s := append(t.samples[leafID], durationSample{RscFpopsEst: rscFpopsEst, ActiveSeconds: activeSeconds,
+		CPUCores: cpuCores, DeadlineSeconds: deadlineSeconds})
 	if len(s) > durationSampleWindow {
 		s = s[len(s)-durationSampleWindow:]
 	}
@@ -116,6 +130,58 @@ func (t *DurationTracker) UnitSeconds(leafID string) (sec float64, ok bool) {
 		secs = append(secs, s.ActiveSeconds)
 	}
 	return median(secs)
+}
+
+// SecondsAt is the leaf's median unit seconds for a task given cores: each
+// recorded run's seconds scaled by the cores it ran on over cores — a unit
+// that took 5 h on 2 cores counts as 2.5 h on 4 — so a leaf that uses the
+// cores it declares is estimated at the cores a task would now be given. A
+// run that did not record its cores counts as run on cores. ok is false until
+// the leaf has completed here.
+func (t *DurationTracker) SecondsAt(leafID string, cores int) (sec float64, ok bool) {
+	if cores < 1 {
+		cores = 1
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var secs []float64
+	for _, s := range t.samples[leafID] {
+		ran := s.CPUCores
+		if ran <= 0 {
+			ran = cores
+		}
+		secs = append(secs, s.ActiveSeconds*float64(ran)/float64(cores))
+	}
+	return median(secs)
+}
+
+// RunCores is the median cores the leaf's recorded runs were given; 0 when
+// none recorded them.
+func (t *DurationTracker) RunCores(leafID string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var cores []float64
+	for _, s := range t.samples[leafID] {
+		if s.CPUCores > 0 {
+			cores = append(cores, float64(s.CPUCores))
+		}
+	}
+	m, _ := median(cores)
+	return int(m + 0.5)
+}
+
+// Deadline is the deadline, in seconds, of the leaf's most recent recorded
+// run that carried one; false when none did.
+func (t *DurationTracker) Deadline(leafID string) (int32, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	s := t.samples[leafID]
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i].DeadlineSeconds > 0 {
+			return s[i].DeadlineSeconds, true
+		}
+	}
+	return 0, false
 }
 
 // Completions is how many of the leaf's completions the tracker holds (at most

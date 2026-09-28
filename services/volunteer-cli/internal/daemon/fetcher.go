@@ -201,6 +201,13 @@ type Fetcher struct {
 	// noteArrivalEstFn feeds the daemon one arrived unit's rsc_fpops_est so the
 	// arrival-side estimate above learns (TB-34). nil disables the learning.
 	noteArrivalEstFn func(leafID string, rscFpopsEst float64)
+	// noteArrivalDeadlineFn feeds the daemon one arrived unit's deadline, so
+	// the deadline check knows the leaf's before asking again. nil ignores it.
+	noteArrivalDeadlineFn func(leafID string, deadlineSeconds int32)
+	// leafDeadlineGateFn reports a leaf whose units cannot finish before their
+	// deadline on this machine (deadline_skip.go). Such a leaf is skipped
+	// before RequestWorkUnit; its notice is the daemon's. nil disables it.
+	leafDeadlineGateFn func(leaf CachedLeafInfo) (bool, string)
 
 	// batchCap caps the next ask per head+leaf after a round whose tail the buffer
 	// returned (TB-34's batch feedback): the cap is what that round actually KEPT
@@ -332,6 +339,9 @@ func (f *Fetcher) sweepBuffer() {
 			if item == nil || item.WU == nil {
 				return ""
 			}
+			if item.RunStarted {
+				return "" // restarted by the volunteer: started as asked
+			}
 			return f.unfitBufferedFn(item.WU)
 		}) {
 			f.logger.Info("fetcher: returning buffered unit this machine can no longer run", "work_unit_id", u.Item.WU.ID, "leaf_id", u.Item.WU.LeafID, "reason", u.Reason)
@@ -380,7 +390,7 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		reRegisterFn:             d.reRegisterHost,
 		readvertiseFn:            d.readvertiseIfPending,
 		runtimeBlockedFn:         d.refreshRuntimeBlocked,
-		leafsRefreshedFn:         d.refreshContainerVMNotices,
+		leafsRefreshedFn:         d.refreshLeafNotices,
 		engineUnreachableFn:      d.NoteContainerEngineUnreachable,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
@@ -403,6 +413,8 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		unitCoresFn:              d.bookedCPUCores,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		noteArrivalEstFn:         d.noteArrivalEstimate,
+		noteArrivalDeadlineFn:    d.noteArrivalDeadline,
+		leafDeadlineGateFn:       d.leafDeadlineGate,
 		heldWorkUnitIDsFn:        d.heldWorkUnitIDs,
 		rateLimitBackoff:         defaultRateLimitBackoff,
 		runtimeAbandons:          make(map[string]int),
@@ -913,6 +925,16 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 				}
 			}
 
+			// A leaf whose units cannot finish before their deadline on this
+			// machine is not asked for; the daemon's notice names it and what
+			// would help (deadline_skip.go).
+			if f.leafDeadlineGateFn != nil {
+				if ok, reason := f.leafDeadlineGateFn(leaf); !ok {
+					f.logger.Debug("fetcher: skipping leaf this machine cannot finish before its deadline", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
+					continue
+				}
+			}
+
 			// TB-24: skip a leaf whose disk gate refuses — free space does not
 			// cover ITS declared need right now — so its units are never
 			// requested only to die mid-pull, while affordable leafs keep
@@ -1243,6 +1265,9 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		// evidence the leaf-level figure was wrong.
 		if f.noteArrivalEstFn != nil {
 			f.noteArrivalEstFn(wu.LeafID, wu.RscFpopsEst)
+		}
+		if f.noteArrivalDeadlineFn != nil {
+			f.noteArrivalDeadlineFn(wu.LeafID, wu.DeadlineSeconds)
 		}
 
 		// Skip a unit already held (buffered, running, or seen earlier in this batch).

@@ -41,6 +41,15 @@ func registerHandlers(mux *http.ServeMux, bridge *DaemonBridge) {
 	mux.HandleFunc("GET /api/v1/results", handleListResults(bridge))
 	mux.HandleFunc("GET /api/v1/results/{work_unit_id}", handleGetResult(bridge))
 	mux.HandleFunc("GET /api/v1/notices", handleGetNotices(bridge))
+	mux.HandleFunc("GET /api/v1/run-preview", handleGetRunPreview(bridge))
+}
+
+// handleGetRunPreview serves what would run together on this machine under
+// the current settings: each enabled leaf alone and all of them together.
+func handleGetRunPreview(bridge *DaemonBridge) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, bridge.GetRunPreview())
+	}
 }
 
 // handleGetNotices serves the volunteer-facing notice ring. ?since=<id>

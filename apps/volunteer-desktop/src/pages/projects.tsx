@@ -14,6 +14,8 @@ import { useContainerRuntime } from "@/hooks/use-container-runtime";
 import { useSystemMetrics } from "@/hooks/use-metrics";
 import { memoryAllowanceCeilingMb } from "@/lib/resource-limits";
 import { HeadSection } from "@/components/heads/head-section";
+import { RunPreviewCard } from "@/components/run-preview-card";
+import { RestartRunningTasksNote } from "@/components/restart-running-tasks-note";
 import { AddServerDialog } from "@/components/heads/add-server-dialog";
 import { markRestartRequired } from "@/hooks/use-restart-required";
 import { Button } from "@/components/ui/button";
@@ -53,6 +55,9 @@ export function ProjectsPage() {
   const [toast, setToast] = useState<string | null>(null);
   const [toastType, setToastType] = useState<"error" | "warning">("error");
   const [addDialogOpen, setAddDialogOpen] = useState(false);
+  // Bumped when a leaf's CPU setting is saved: the preview is asked again,
+  // and the note about running tasks is shown.
+  const [cpuSettingsSaved, setCpuSettingsSaved] = useState(0);
 
   useEffect(() => {
     if (toast) {
@@ -155,6 +160,7 @@ export function ProjectsPage() {
     async (head: HeadInfo, leafSlug: string, key: "cores" | "max_running", value: number | null) => {
       await writeLeafCPUOverride(head, leafSlug, key, value);
       refetch();
+      setCpuSettingsSaved((n) => n + 1);
     },
     [writeLeafCPUOverride, refetch]
   );
@@ -262,6 +268,10 @@ export function ProjectsPage() {
           Failed to load servers: {error.message}
         </p>
       )}
+
+      {/* What runs together under the current settings */}
+      {heads.length > 0 && <RunPreviewCard refreshKey={cpuSettingsSaved} />}
+      <RestartRunningTasksNote show={cpuSettingsSaved > 0} />
 
       {/* Head sections */}
       {heads.map((head) => (

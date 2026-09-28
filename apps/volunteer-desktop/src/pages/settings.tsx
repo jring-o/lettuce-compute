@@ -12,6 +12,8 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { useConfig } from "@/hooks/use-config";
+import { RunPreviewCard } from "@/components/run-preview-card";
+import { RestartRunningTasksNote } from "@/components/restart-running-tasks-note";
 import { restartLettuce, useOnDaemonRestart } from "@/hooks/use-restart-required";
 import { useMetrics, useSystemMetrics } from "@/hooks/use-metrics";
 import { useClient, useApiQuery } from "@/hooks/use-api";
@@ -422,6 +424,9 @@ function LogFolder() {
 
 export function SettingsPage() {
   const { config, isLoading, updateConfig, toast, refetch } = useConfig();
+  // Bumped when a CPU setting is saved: the preview is asked again, and the
+  // note about running tasks is shown.
+  const [cpuSettingsSaved, setCpuSettingsSaved] = useState(0);
   const { metrics } = useMetrics(5000);
   const { system } = useSystemMetrics(3000);
   const { data: headsResp, refetch: refetchHeads } = useApiQuery(
@@ -611,11 +616,12 @@ export function SettingsPage() {
           step={1}
           displayValue={`${config.resource_limits.max_cpu_cores} / ${totalCores} cores`}
           usagePct={system?.cpu_usage_pct}
-          onChange={(v) =>
-            updateConfig({
+          onChange={async (v) => {
+            await updateConfig({
               resource_limits: { ...config.resource_limits, max_cpu_cores: v },
-            })
-          }
+            });
+            setCpuSettingsSaved((n) => n + 1);
+          }}
         />
         <p className="text-xs text-muted-foreground">
           {machine?.cpu_limited_by_vm
@@ -643,6 +649,9 @@ export function SettingsPage() {
             </p>
           </>
         )}
+
+        <RunPreviewCard refreshKey={cpuSettingsSaved} />
+        <RestartRunningTasksNote show={cpuSettingsSaved > 0} />
 
         <ResourceSlider
           label="Memory"
@@ -759,7 +768,10 @@ export function SettingsPage() {
           max={tasksSliderMax}
           step={1}
           displayValue={runningTasksLimit > 0 ? `${runningTasksLimit}` : "No limit"}
-          onChange={(v) => updateConfig({ max_running_tasks: v })}
+          onChange={async (v) => {
+            await updateConfig({ max_running_tasks: v });
+            setCpuSettingsSaved((n) => n + 1);
+          }}
         />
         <p className="text-xs text-muted-foreground" data-testid="running-tasks-caption">
           {runningTasksCaption(runningTasksLimit)}

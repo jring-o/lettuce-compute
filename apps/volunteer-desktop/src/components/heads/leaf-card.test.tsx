@@ -1065,3 +1065,42 @@ describe("LeafCard CPU override", () => {
     expect(await screen.findByText(/refused/)).toBeInTheDocument();
   });
 });
+
+describe("LeafCard deadline verdict", () => {
+  it("says the leaf is not fetched because its units cannot finish in time, and what can bring it back", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({
+          deadline: {
+            blocked: true,
+            reason: "cannot finish before its deadline on this machine: needs about 6 h 15 min (a median 5 hours at 2 cores, +25 %), has 6 hours",
+          },
+        })}
+        showWeightSlider={false}
+        containerStatus={makeContainerStatus()}
+        machine={makeMachine()}
+        trustedRuntimes={null}
+        onToggle={vi.fn()}
+        onWeightChange={vi.fn()}
+      />
+    );
+    const line = screen.getByTestId("leaf-deadline-blocked");
+    expect(line).toHaveTextContent("Will not fetch: its units cannot finish before its deadline on this machine: needs about 6 h 15 min");
+    expect(line).toHaveTextContent("More cores for its tasks");
+  });
+
+  it("says nothing when the leaf's units can finish", () => {
+    render(
+      <LeafCard
+        leaf={makeLeaf({ deadline: { blocked: false } })}
+        showWeightSlider={false}
+        containerStatus={makeContainerStatus()}
+        machine={makeMachine()}
+        trustedRuntimes={null}
+        onToggle={vi.fn()}
+        onWeightChange={vi.fn()}
+      />
+    );
+    expect(screen.queryByTestId("leaf-deadline-blocked")).not.toBeInTheDocument();
+  });
+});

@@ -481,6 +481,46 @@ export interface LeafInfo {
   disk_gate?: LeafDiskGate;
   /** This machine's CPU arrangement for the leaf; absent from an older daemon. */
   cpu?: LeafCPU;
+  /**
+   * Whether the daemon skips the leaf because its units cannot finish before
+   * their deadline on this machine; absent from an older daemon.
+   */
+  deadline?: LeafDeadline;
+}
+
+export interface LeafDeadline {
+  blocked: boolean;
+  reason?: string;
+}
+
+/** One task the preview starts: its leaf, its head and the cores it is given. */
+export interface PreviewTask {
+  leaf_id: string;
+  leaf_name: string;
+  head: string;
+  cores: number;
+}
+
+/** One enabled leaf on its own: the cores of each task that starts, or why none can. */
+export interface PreviewLeaf {
+  leaf_id: string;
+  leaf_name: string;
+  head: string;
+  tasks: number[];
+  cores_used: number;
+  cannot_start?: string;
+}
+
+/**
+ * `GET /api/v1/run-preview`: what would run together on this machine under
+ * the current settings, worked out by the scheduler's own arithmetic.
+ */
+export interface RunPreview {
+  cpu_limit: number;
+  alone: PreviewLeaf[];
+  together: PreviewTask[];
+  together_cores: number;
+  waiting_for_cores?: PreviewTask | null;
 }
 
 /**
@@ -1468,6 +1508,16 @@ export class ManagementClient {
 
   async abortTask(workUnitId: string): Promise<void> {
     await this.request("POST", `/api/v1/tasks/${workUnitId}/abort`);
+  }
+
+  /** What would run together on this machine under the current settings. */
+  async runPreview(): Promise<RunPreview> {
+    const resp = await this.request<RunPreview>("GET", "/api/v1/run-preview");
+    return {
+      ...resp,
+      alone: list(resp.alone).map((a) => ({ ...a, tasks: list(a.tasks) })),
+      together: list(resp.together),
+    };
   }
 
   /**
