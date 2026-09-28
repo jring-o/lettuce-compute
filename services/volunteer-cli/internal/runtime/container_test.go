@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ type MockDockerClient struct {
 	ContainerStartFn       func(ctx context.Context, containerID string) error
 	ContainerWaitFn        func(ctx context.Context, containerID string) (int64, error)
 	ContainerLogsFn        func(ctx context.Context, containerID string) (io.ReadCloser, error)
-	ContainerInspectFn     func(ctx context.Context, containerID string) (*ContainerStats, error)
+	ContainerUsageFn       func(ctx context.Context, containerID string) (*ContainerStats, error)
 	ContainerStopFn        func(ctx context.Context, containerID string, timeout time.Duration) error
 	ContainerRemoveFn      func(ctx context.Context, containerID string) error
 	ImageIDFn              func(ctx context.Context, ref string) (string, error)
@@ -160,11 +161,11 @@ func (m *MockDockerClient) ContainerLogs(ctx context.Context, containerID string
 	return io.NopCloser(bytes.NewReader([]byte("mock logs"))), nil
 }
 
-func (m *MockDockerClient) ContainerInspect(ctx context.Context, containerID string) (*ContainerStats, error) {
-	if m.ContainerInspectFn != nil {
-		return m.ContainerInspectFn(ctx, containerID)
+func (m *MockDockerClient) ContainerUsage(ctx context.Context, containerID string) (*ContainerStats, error) {
+	if m.ContainerUsageFn != nil {
+		return m.ContainerUsageFn(ctx, containerID)
 	}
-	return &ContainerStats{}, nil
+	return nil, errContainerNotRunning
 }
 
 func (m *MockDockerClient) ContainerStop(ctx context.Context, containerID string, timeout time.Duration) error {
@@ -456,18 +457,21 @@ func TestInterpretPullError(t *testing.T) {
 
 func TestContainerRuntime_ExecuteHappyPath(t *testing.T) {
 	mock := &MockDockerClient{
+		// The container runs long enough for its stats to be read.
 		ContainerWaitFn: func(ctx context.Context, containerID string) (int64, error) {
+			time.Sleep(150 * time.Millisecond)
 			return 0, nil
 		},
-		ContainerInspectFn: func(ctx context.Context, containerID string) (*ContainerStats, error) {
+		ContainerUsageFn: func(ctx context.Context, containerID string) (*ContainerStats, error) {
 			return &ContainerStats{
 				CPUUsageUser:   2_000_000_000, // 2 seconds
 				CPUUsageKernel: 500_000_000,   // 0.5 seconds
-				MemoryPeak:     256 * 1024 * 1024,
+				MemoryBytes:    256 * 1024 * 1024,
 			}, nil
 		},
 	}
 	cr, _ := newTestContainerRuntime(t, mock)
+	cr.usagePollOverride = 10 * time.Millisecond
 
 	wu := &WorkUnit{
 		ID:              "f42b7a90-69c3-43bb-8a5b-0a4b3c29d4eb", // was exec-1
@@ -1375,13 +1379,21 @@ func TestContainerRuntime_ExecuteWaitErrorWithoutDeadline(t *testing.T) {
 	}
 }
 
-func TestContainerRuntime_ExecuteInspectFailure(t *testing.T) {
+func TestContainerRuntime_ExecuteStatsFailure(t *testing.T) {
+	var reads atomic.Int32
 	mock := &MockDockerClient{
-		ContainerInspectFn: func(ctx context.Context, containerID string) (*ContainerStats, error) {
-			return nil, fmt.Errorf("container gone")
+		ContainerWaitFn: func(ctx context.Context, containerID string) (int64, error) {
+			time.Sleep(150 * time.Millisecond)
+			return 0, nil
+		},
+		ContainerUsageFn: func(ctx context.Context, containerID string) (*ContainerStats, error) {
+			reads.Add(1)
+			return nil, fmt.Errorf("stats unavailable")
 		},
 	}
-	cr, _ := newTestContainerRuntime(t, mock)
+	var logBuf bytes.Buffer
+	cr := newTestContainerRuntimeWithLogBuffer(t, mock, &logBuf)
+	cr.usagePollOverride = 10 * time.Millisecond
 
 	wu := &WorkUnit{
 		ID:            "f903b256-4c4a-48f0-8e3c-d3033fa594df", // was inspect-fail-1
@@ -1396,21 +1408,31 @@ func TestContainerRuntime_ExecuteInspectFailure(t *testing.T) {
 
 	os.WriteFile(filepath.Join(prep.WorkDir, "output", "output.dat"), []byte("ok"), 0o644)
 
-	// Execute should succeed even if inspect fails (graceful degradation).
+	// Execute should succeed even if the engine never reports usage (graceful degradation).
 	result, err := cr.Execute(context.Background(), wu, prep)
 	if err != nil {
-		t.Fatalf("Execute should not fail on inspect error: %v", err)
+		t.Fatalf("Execute should not fail on a stats error: %v", err)
+	}
+	if n := reads.Load(); n < 2 {
+		t.Fatalf("the running container's stats were requested %d times; want a reading every interval", n)
+	}
+	// A failure that lasts is logged when it starts, not on every retry.
+	if n := strings.Count(logBuf.String(), "container stats unavailable"); n != 1 {
+		t.Errorf("the stats failure was logged %d times over %d readings, want once", n, reads.Load())
 	}
 
-	// Metrics should still have wall clock but zero CPU/memory.
+	// Wall clock only: no CPU time, cores or peak memory is made up.
 	if result.Metrics.WallClockSeconds < 0 {
 		t.Errorf("WallClockSeconds = %d, want >= 0", result.Metrics.WallClockSeconds)
 	}
 	if result.Metrics.CPUSecondsUser != 0 {
-		t.Errorf("CPUSecondsUser = %f, want 0 (inspect failed)", result.Metrics.CPUSecondsUser)
+		t.Errorf("CPUSecondsUser = %f, want 0 (stats failed)", result.Metrics.CPUSecondsUser)
+	}
+	if result.Metrics.CPUCoresUsed != 0 {
+		t.Errorf("CPUCoresUsed = %d, want 0 (stats failed)", result.Metrics.CPUCoresUsed)
 	}
 	if result.Metrics.PeakMemoryMB != 0 {
-		t.Errorf("PeakMemoryMB = %d, want 0 (inspect failed)", result.Metrics.PeakMemoryMB)
+		t.Errorf("PeakMemoryMB = %d, want 0 (stats failed)", result.Metrics.PeakMemoryMB)
 	}
 }
 
@@ -1496,12 +1518,13 @@ func TestContainerRuntime_BuildMetricsNilStats(t *testing.T) {
 
 func TestContainerRuntime_BuildMetricsZeroCPU(t *testing.T) {
 	cr, _ := newTestContainerRuntime(t, &MockDockerClient{})
-	stats := &ContainerStats{
+	usage := &containerUsage{}
+	usage.add(&ContainerStats{
 		CPUUsageUser:   0,
 		CPUUsageKernel: 0,
-		MemoryPeak:     128 * 1024 * 1024,
-	}
-	metrics := cr.buildMetrics(stats, 3*time.Second)
+		MemoryBytes:    128 * 1024 * 1024,
+	})
+	metrics := cr.buildMetrics(usage, 3*time.Second)
 
 	if metrics.WallClockSeconds != 3 {
 		t.Errorf("WallClockSeconds = %d, want 3", metrics.WallClockSeconds)
