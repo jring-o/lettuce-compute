@@ -121,11 +121,12 @@ type Fetcher struct {
 	// daemon; nil disables the skip.
 	leafNeedsAbsentGPUFn func(leaf CachedLeafInfo) bool
 
-	// leafClassBufferFullFn reports a leaf whose resource class — GPU work, or
+	// leafClassBufferFullFn reports a leaf whose resource class — GPU work,
 	// container work where the container engine's VM runs fewer units at once
-	// than there are slots — has already reached its own hours target
-	// (TB-48). Such a leaf is skipped BEFORE RequestWorkUnit:
-	// asking for it would only produce arrivals the buffer refuses on the spot.
+	// than there are slots, or the leaf itself when fewer of its units run at
+	// once — has already reached its own hours target (TB-48). Such a leaf is
+	// skipped BEFORE RequestWorkUnit: asking for it would only produce
+	// arrivals the buffer refuses on the spot.
 	// A round in which every remaining leaf was skipped this way is "buffer
 	// full for what this machine can use", not "the head has no work" — Run
 	// waits on the buffer cadence and leaves the no-work diagnostic alone.
@@ -517,9 +518,11 @@ func (f *Fetcher) Run(ctx context.Context) {
 			if round.classFull > 0 {
 				// TB-48: every leaf left to ask about belongs to a resource class
 				// whose buffer is already at target — the GPU class on a host with
-				// more slots than GPUs, or the container class on one whose engine's
-				// VM runs fewer container units at once than it has slots. That is
-				// the buffer being full for what this machine can use, not the head
+				// more slots than GPUs, the container class on one whose engine's
+				// VM runs fewer container units at once than it has slots, or the
+				// leaf's own class when fewer of its units run at once (its cores,
+				// its memory, the volunteer's running cap for it). That is the
+				// buffer being full for what this machine can use, not the head
 				// having no work: wait on the loop's poll granularity (no RPC, no
 				// retry delay to obey).
 				f.logger.Debug("fetcher: every requestable leaf is at its class buffer target, not requesting", "class_full_leafs", round.classFull)

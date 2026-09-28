@@ -435,6 +435,11 @@ export function OverviewPage() {
     onSuspend: (id) => client?.suspendTask(id),
     onResume: (id) => client?.resumeTask(id),
     onAbort: (id) => client?.abortTask(id),
+    onRestart: (id) => {
+      client?.restartTask(id).catch((err: unknown) =>
+        setToast(err instanceof Error ? `Could not restart the task: ${err.message}` : "Could not restart the task")
+      );
+    },
     onShowDetails: (task) => setDetailTaskId(task.work_unit_id),
     onCopyId: (id) => navigator.clipboard.writeText(id),
   }), [client]);
@@ -551,6 +556,11 @@ export function OverviewPage() {
           )}
         </div>
       </div>
+      {status?.cpu_time_limit && (
+        <p className="text-xs text-muted-foreground -mt-4" data-testid="cpu-time-limit">
+          {status.cpu_time_limit.description}. Change it in Settings.
+        </p>
+      )}
 
       {/* Visualization panel */}
       <div className="space-y-2">
@@ -801,6 +811,7 @@ export function OverviewPage() {
         onSuspend={(id) => client?.suspendTask(id)}
         onResume={(id) => client?.resumeTask(id)}
         onAbort={(id) => client?.abortTask(id)}
+        onRestart={taskActions.onRestart}
       />
     </div>
   );

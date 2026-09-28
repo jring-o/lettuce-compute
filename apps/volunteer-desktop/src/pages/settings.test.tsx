@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, renderHook } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { SettingsPage } from "./settings";
+import { SettingsPage, cpuTimeCaption } from "./settings";
 import { defaultCommandResult, invoke, mockManagementApi } from "@tauri-apps/api/core";
 import type { ConfigResponse } from "@/api/client";
 
@@ -1594,5 +1594,47 @@ describe("SettingsPage", () => {
     memory = (screen.getAllByRole("slider") as HTMLInputElement[]).find((el) => el.step === "256");
     expect(memory!.max).toBe("16000");
     expect(memory!.value).toBe("16000");
+  });
+});
+
+describe("CPU time setting", () => {
+  it("offers a CPU time slider in 5 % steps and says what a limit does", () => {
+    const updateConfig = vi.fn();
+    const config = makeConfig();
+    config.resource_limits.max_cpu_time_pct = 50;
+    mockUseConfig.mockReturnValue({ config, isLoading: false, updateConfig, toast: null });
+    render(<SettingsPage />);
+    expect(screen.getByText("50% of the time")).toBeInTheDocument();
+    expect(screen.getByTestId("cpu-time-caption")).toHaveTextContent(
+      "Running tasks are paused and resumed in turn: they run 5 s of every 10 s, so each unit takes about 2.0 times as long."
+    );
+    const slider = screen
+      .getByText("CPU time")
+      .parentElement!.parentElement!.querySelector("input[type='range']") as HTMLInputElement;
+    expect(slider).toHaveAttribute("min", "5");
+    expect(slider).toHaveAttribute("step", "5");
+    fireEvent.change(slider, { target: { value: "25" } });
+    expect(updateConfig).toHaveBeenCalledWith({
+      resource_limits: expect.objectContaining({ max_cpu_time_pct: 25, max_cpu_cores: 4 }),
+    });
+  });
+
+  it("reads 0 (a config from before the setting) as no limit, and hides it from an older daemon", () => {
+    const config = makeConfig();
+    config.resource_limits.max_cpu_time_pct = 0;
+    mockUseConfig.mockReturnValue({ config, isLoading: false, updateConfig: vi.fn(), toast: null });
+    const { unmount } = render(<SettingsPage />);
+    expect(screen.getByTestId("cpu-time-caption")).toHaveTextContent("Work runs continuously.");
+    unmount();
+
+    mockUseConfig.mockReturnValue({ config: makeConfig(), isLoading: false, updateConfig: vi.fn(), toast: null });
+    render(<SettingsPage />);
+    expect(screen.queryByText("CPU time")).not.toBeInTheDocument();
+  });
+
+  it("gives the cycle at the ends of the range", () => {
+    expect(cpuTimeCaption(5)).toContain("run 1 s of every 20 s");
+    expect(cpuTimeCaption(95)).toContain("run 19 s of every 20 s");
+    expect(cpuTimeCaption(100)).toContain("Work runs continuously");
   });
 });

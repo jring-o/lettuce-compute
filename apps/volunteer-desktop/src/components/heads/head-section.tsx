@@ -23,6 +23,10 @@ interface HeadSectionProps {
   onHeadWeightChange: (weight: number) => void;
   onLeafToggle: (leafSlug: string, enabled: boolean) => void;
   onLeafWeightChange: (leafSlug: string, weight: number) => void;
+  /** Save a leaf's cores-per-task override (null clears it). Rejects on failure. */
+  onLeafCoresChange?: (leafSlug: string, cores: number | null) => Promise<void>;
+  /** Save a leaf's running-task cap (null clears it). Rejects on failure. */
+  onLeafMaxRunningChange?: (leafSlug: string, count: number | null) => Promise<void>;
   onResetDefaults: () => void;
   onDetach: () => void;
   /** Save a new `trusted_runtimes` list for this head. Rejects on failure. */
@@ -52,6 +56,8 @@ export function HeadSection({
   onHeadWeightChange,
   onLeafToggle,
   onLeafWeightChange,
+  onLeafCoresChange,
+  onLeafMaxRunningChange,
   onResetDefaults,
   onDetach,
   onTrustChange,
@@ -217,6 +223,10 @@ export function HeadSection({
                 trustedRuntimes={trustedRuntimes}
                 onToggle={(enabled) => onLeafToggle(leaf.slug, enabled)}
                 onWeightChange={(weight) => onLeafWeightChange(leaf.slug, weight)}
+                onCoresChange={onLeafCoresChange && ((cores) => onLeafCoresChange(leaf.slug, cores))}
+                onMaxRunningChange={
+                  onLeafMaxRunningChange && ((count) => onLeafMaxRunningChange(leaf.slug, count))
+                }
                 onRaiseDisk={onRaiseDisk}
                 onRaiseMemory={onRaiseMemory}
                 memoryCeilingMb={memoryCeilingMb}
@@ -232,7 +242,7 @@ export function HeadSection({
               variant="outline"
               size="sm"
               onClick={onResetDefaults}
-              title="Turns on every leaf of this head and returns each leaf's weight to the head's default. The head's own weight is kept."
+              title="Turns on every leaf of this head, returns each leaf's weight to the head's default and removes your cores and running-task settings. The head's own weight is kept."
             >
               Use Leaf Defaults
             </Button>

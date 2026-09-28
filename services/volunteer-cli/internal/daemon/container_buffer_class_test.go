@@ -92,13 +92,15 @@ func TestContainerBufferClass_AcceptsOnlyWhatTheVMCanDrain(t *testing.T) {
 // TestContainerBufferClass_UnchangedWhereTheEngineDoesNotBindIt: with no VM
 // clip (Linux, where the engine shares the host) or a VM that runs a unit per
 // slot, container work is buffered against the global target exactly as
-// before: six 41-minute units against 4 h.
+// before: six 41-minute units against 4 h. The machine's memory holds two of
+// the 768 MB units at once, so neither the container class nor the leaf's own
+// class (leafSlotsFor) is tighter than the slots.
 func TestContainerBufferClass_UnchangedWhereTheEngineDoesNotBindIt(t *testing.T) {
 	for _, tc := range []struct {
 		name                  string
 		memMB, cores, vmMB, n int
 	}{
-		{"no VM", 1024, 2, 0, 0},
+		{"no VM", 1536, 2, 0, 0},
 		{"VM runs two at a time", 4096, 4, 2048 + runtime.ContainerVMHeadroomMB, 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

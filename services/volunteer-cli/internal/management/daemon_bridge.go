@@ -96,11 +96,47 @@ type StatusResponse struct {
 	// `lettuce-volunteer --version` prints), so a client can compare it with
 	// each head's head_version on GET /api/v1/heads.
 	ClientVersion string `json:"client_version"`
+	// CPUTimeLimit is the CPU time limit in force (max_cpu_time_pct below
+	// 100); absent when there is none. Its paused part is not reported as the
+	// daemon being paused: the limit is a standing setting.
+	CPUTimeLimit *CPUTimeLimitInfo `json:"cpu_time_limit,omitempty"`
 	// FailingLeafs lists every leaf whose units have failed locally since the
 	// daemon started, newest failure first. It exists so a volunteer can see that
 	// work IS arriving and failing, rather than concluding they are never sent
 	// work of that kind — the exact misreading TB-10 was filed for.
 	FailingLeafs []FailingLeafInfo `json:"failing_leafs"`
+}
+
+// CPUTimeLimitInfo describes the CPU time limit: work runs Pct percent of the
+// time, RunSeconds of every PeriodSeconds; Description says so in a line.
+type CPUTimeLimitInfo struct {
+	Pct           int     `json:"pct"`
+	RunSeconds    float64 `json:"run_seconds"`
+	PeriodSeconds float64 `json:"period_seconds"`
+	Description   string  `json:"description"`
+}
+
+// cpuTimeLimitInfo is the daemon's CPU time limit for the API; nil when none
+// is set.
+func (b *DaemonBridge) cpuTimeLimitInfo() *CPUTimeLimitInfo {
+	pct, run, pause := b.daemon.CPUTimeLimit()
+	if pause <= 0 {
+		return nil
+	}
+	return &CPUTimeLimitInfo{
+		Pct:           pct,
+		RunSeconds:    run.Seconds(),
+		PeriodSeconds: (run + pause).Seconds(),
+		Description:   daemon.DescribeCPUTimeLimit(pct, run, pause),
+	}
+}
+
+// cpuTimeLimitText is the CPU time limit's description, "" when none is set.
+func (b *DaemonBridge) cpuTimeLimitText() string {
+	if info := b.cpuTimeLimitInfo(); info != nil {
+		return info.Description
+	}
+	return ""
 }
 
 // FailingLeafInfo is one leaf's local failure record, as reported by `status`.
@@ -158,13 +194,24 @@ type ActiveTaskInfo struct {
 }
 
 // computeTaskStatus determines the status string and reason for an active
-// task. "User paused" is claimed only when it is the one remaining
-// explanation: with the daemon itself paused for a reason nobody named, an
-// unexplained suspension must say the reason is unknown rather than invent a
-// user action — the default arm is exactly how schedule-gate-suspended tasks
-// spent months displaying "User paused" (TB-44). With the daemon NOT paused,
-// a suspended slot is the per-task suspend verb, which IS a user action.
+// task. "User paused" is claimed when the volunteer suspended the task
+// (UserSuspended), or when it is the one remaining explanation: with the
+// daemon itself paused for a reason nobody named, an unexplained suspension
+// must say the reason is unknown rather than invent a user action — the
+// default arm is exactly how schedule-gate-suspended tasks spent months
+// displaying "User paused" (TB-44). Under a CPU time limit (taskStatusUnder)
+// a task is "running" with the limit as its reason, whichever part of the
+// limit's cycle it is in, so the status does not flicker every few seconds.
 func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused bool) (status string, reason *string) {
+	return taskStatusUnder(task, pauseReason, daemonPaused, "")
+}
+
+// taskStatusUnder is computeTaskStatus with the CPU time limit's description.
+func taskStatusUnder(task daemon.CurrentTask, pauseReason string, daemonPaused bool, cpuTimeLimit string) (status string, reason *string) {
+	if task.UserSuspended {
+		r := "User paused"
+		return "suspended_user", &r
+	}
 	if task.Suspended {
 		switch pauseReason {
 		case "thermal":
@@ -193,10 +240,18 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused
 				r := "Paused (reason not reported)"
 				return status, &r
 			}
+			if cpuTimeLimit != "" {
+				r := cpuTimeLimit
+				return "running", &r
+			}
 			status = "suspended_user"
 			r := "User paused"
 			return status, &r
 		}
+	}
+	if cpuTimeLimit != "" {
+		r := cpuTimeLimit
+		return "running", &r
 	}
 	return "running", nil
 }
@@ -204,7 +259,13 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused
 // buildActiveTaskInfo converts a daemon.CurrentTask into the API's ActiveTaskInfo,
 // computing derived fields (progress, elapsed, CPU seconds, ETA).
 func (b *DaemonBridge) buildActiveTaskInfo(t daemon.CurrentTask, pauseReason string, daemonPaused bool) ActiveTaskInfo {
-	taskStatus, statusReason := computeTaskStatus(t, pauseReason, daemonPaused)
+	return b.buildActiveTaskInfoUnder(t, pauseReason, daemonPaused, b.cpuTimeLimitText())
+}
+
+// buildActiveTaskInfoUnder is buildActiveTaskInfo with the CPU time limit's
+// description already worked out ("" when none is set).
+func (b *DaemonBridge) buildActiveTaskInfoUnder(t daemon.CurrentTask, pauseReason string, daemonPaused bool, cpuTimeLimit string) ActiveTaskInfo {
+	taskStatus, statusReason := taskStatusUnder(t, pauseReason, daemonPaused, cpuTimeLimit)
 
 	info := ActiveTaskInfo{
 		WorkUnitID:            t.WorkUnitID,
@@ -282,10 +343,15 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 	}
 
 	pauseReason := b.daemon.PauseReason()
+	cpuTime := b.cpuTimeLimitInfo()
+	cpuTimeText := ""
+	if cpuTime != nil {
+		cpuTimeText = cpuTime.Description
+	}
 
 	var activeTasks []ActiveTaskInfo
 	for _, t := range b.daemon.GetCurrentTasks() {
-		activeTasks = append(activeTasks, b.buildActiveTaskInfo(t, pauseReason, daemonPaused))
+		activeTasks = append(activeTasks, b.buildActiveTaskInfoUnder(t, pauseReason, daemonPaused, cpuTimeText))
 	}
 	if activeTasks == nil {
 		activeTasks = []ActiveTaskInfo{}
@@ -335,6 +401,7 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 		PausedReason:     pausedReasonPtr,
 		FailingLeafs:     b.failingLeafs(),
 		ClientVersion:    b.daemon.ClientVersion(),
+		CPUTimeLimit:     cpuTime,
 	}
 }
 
@@ -1186,6 +1253,24 @@ type LeafDetail struct {
 	// DiskGate is the daemon's own live fetch-gate verdict for this leaf, so
 	// WILL FETCH answers with the arithmetic that actually decides (TB-41).
 	DiskGate *LeafDiskGate `json:"disk_gate,omitempty"`
+	// CPU is this machine's CPU arrangement for the leaf: the volunteer's
+	// override and what it comes to.
+	CPU *LeafCPU `json:"cpu,omitempty"`
+}
+
+// LeafCPU is this machine's CPU arrangement for a leaf. CoresOverride and
+// MaxRunningOverride are what the volunteer set for it
+// (leaf_preferences.cores / .max_running; 0 = not set). TaskCoresMin and
+// TaskCoresMax are the range each of its tasks is given cores from here —
+// its declared range, narrowed by the override and kept within the CPU limit
+// — and RunsAtOnce the most of its tasks that run together, which is also
+// how many tasks' worth of it the work buffer holds.
+type LeafCPU struct {
+	CoresOverride      int `json:"cores_override"`
+	MaxRunningOverride int `json:"max_running_override"`
+	TaskCoresMin       int `json:"task_cores_min"`
+	TaskCoresMax       int `json:"task_cores_max"`
+	RunsAtOnce         int `json:"runs_at_once"`
 }
 
 // MachineCapabilities is what this machine can actually do, as the RUNNING
@@ -1446,6 +1531,14 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 				}
 				gs := b.daemon.LeafDiskGateStatus(leaf)
 				ld.DiskGate = &LeafDiskGate{Blocked: gs.Blocked, Reason: gs.Reason, RaiseToGB: gs.RaiseToGB}
+				cs := b.daemon.LeafCPUStatus(leaf)
+				ld.CPU = &LeafCPU{
+					CoresOverride:      cs.CoresOverride,
+					MaxRunningOverride: cs.MaxRunningOverride,
+					TaskCoresMin:       cs.TaskCoresMin,
+					TaskCoresMax:       cs.TaskCoresMax,
+					RunsAtOnce:         cs.RunsAtOnce,
+				}
 				hi.Leafs = append(hi.Leafs, ld)
 			}
 		} else {
@@ -1787,6 +1880,12 @@ func (b *DaemonBridge) AbortTask(workUnitID string) error {
 	return b.daemon.AbortTask(workUnitID)
 }
 
+// RestartTask stops a running task and runs its unit again from the start
+// under the current settings.
+func (b *DaemonBridge) RestartTask(workUnitID string) error {
+	return b.daemon.RestartTask(workUnitID)
+}
+
 // GetTaskDetails returns full details for a single active task including per-process metrics.
 func (b *DaemonBridge) GetTaskDetails(workUnitID string) (*TaskDetail, error) {
 	pauseReason := b.daemon.PauseReason()
@@ -1877,6 +1976,10 @@ func applyResourceLimits(rl *config.ResourceLimits, m map[string]any) {
 	}
 	if v, ok := m["max_gpu_vram_pct"]; ok {
 		rl.MaxGPUVRAMPct = toInt(v)
+	}
+	// Live: the CPU time limit's cycle re-reads it every second.
+	if v, ok := m["max_cpu_time_pct"]; ok {
+		rl.MaxCPUTimePct = toInt(v)
 	}
 }
 
@@ -2094,11 +2197,40 @@ func applyLeafPreferences(lp *config.LeafPreferences, m map[string]any) {
 			}
 		}
 	}
+	// The per-leaf CPU overrides replace the saved map, as weights do (an
+	// empty map clears them); an entry of 0 or less is dropped, which is how
+	// one leaf is returned to its own figures. Live: read at the next task
+	// start and the next buffer decision.
+	if v, ok := m["cores"]; ok {
+		if cm, ok := v.(map[string]any); ok {
+			lp.Cores = positiveEntries(cm)
+		}
+	}
+	if v, ok := m["max_running"]; ok {
+		if cm, ok := v.(map[string]any); ok {
+			lp.MaxRunning = positiveEntries(cm)
+		}
+	}
 	// Clear fields not relevant for the current mode
 	if lp.Mode == "ALL" {
 		lp.Enabled = nil
 		lp.Disabled = nil
 	}
+}
+
+// positiveEntries is a JSON object of numbers as a map, keeping only the
+// entries above zero; nil when none is.
+func positiveEntries(m map[string]any) map[string]int {
+	var out map[string]int
+	for k, v := range m {
+		if n := toInt(v); n > 0 {
+			if out == nil {
+				out = make(map[string]int, len(m))
+			}
+			out[k] = n
+		}
+	}
+	return out
 }
 
 func toInt(v any) int {

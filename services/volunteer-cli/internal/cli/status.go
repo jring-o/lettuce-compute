@@ -33,6 +33,10 @@ type statusAPIResponse struct {
 	PausedReason  *string             `json:"paused_reason"`
 	PausedDetail  string              `json:"paused_detail,omitempty"`
 	FailingLeafs  []statusFailingLeaf `json:"failing_leafs"`
+	// CPUTimeLimit is the CPU time limit in force; nil when none is set.
+	CPUTimeLimit *struct {
+		Description string `json:"description"`
+	} `json:"cpu_time_limit"`
 }
 
 // statusFailingLeaf is a leaf whose work has failed on this machine.
@@ -45,6 +49,7 @@ type statusFailingLeaf struct {
 }
 
 type statusActiveTask struct {
+	WorkUnitID            string  `json:"work_unit_id"`
 	LeafName              string  `json:"leaf_name"`
 	HeadName              string  `json:"head_name"`
 	RuntimeType           string  `json:"runtime_type"`
@@ -180,12 +185,16 @@ func printActiveTasks(dataDir string) {
 		}
 	}
 
+	if sr.CPUTimeLimit != nil && sr.CPUTimeLimit.Description != "" {
+		fmt.Printf("CPU time: %s (resource_limits.max_cpu_time_pct)\n", sr.CPUTimeLimit.Description)
+	}
+
 	if len(sr.ActiveTasks) == 0 {
 		fmt.Println("Active tasks: none")
 	} else {
 		fmt.Printf("Active tasks (%d):\n", len(sr.ActiveTasks))
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(w, "  LEAF\tRUNTIME\tCORES\tPROGRESS\tELAPSED\tETA\tSTATUS")
+		fmt.Fprintln(w, "  ID\tLEAF\tRUNTIME\tCORES\tPROGRESS\tELAPSED\tETA\tSTATUS")
 		for _, t := range sr.ActiveTasks {
 			eta := "—"
 			if t.EstimatedRemainingSec != nil {
@@ -200,7 +209,8 @@ func printActiveTasks(dataDir string) {
 			if t.CPUCores > 0 {
 				cores = strconv.Itoa(t.CPUCores)
 			}
-			fmt.Fprintf(w, "  %s\t%s\t%s\t%d%%\t%s\t%s\t%s\n",
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d%%\t%s\t%s\t%s\n",
+				shortID(t.WorkUnitID),
 				labelOrDash(t.LeafName),
 				labelOrDash(strings.ToLower(t.RuntimeType)),
 				cores,
@@ -215,6 +225,9 @@ func printActiveTasks(dataDir string) {
 
 	if len(sr.QueuedTasks) > 0 {
 		fmt.Printf("Buffered (fetched, not started): %d\n", len(sr.QueuedTasks))
+	}
+	if len(sr.ActiveTasks) > 0 {
+		fmt.Println("A running task keeps the cores and settings it started with; `lettuce-volunteer tasks restart <ID>` restarts one with the current settings.")
 	}
 
 	printFailingLeafs(sr.FailingLeafs)

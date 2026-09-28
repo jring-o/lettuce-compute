@@ -2739,3 +2739,29 @@ describe("OverviewPage", () => {
     });
   });
 });
+
+describe("OverviewPage CPU time limit", () => {
+  it("names the CPU time limit under the status, without calling the daemon paused", () => {
+    mockUseDaemonStatus.mockReturnValue({
+      status: {
+        state: "active",
+        uptime_seconds: 60,
+        connected_servers: 1,
+        active_tasks: [],
+        queued_tasks: [],
+        failing_leafs: [],
+        paused_reason: null,
+        cpu_time_limit: { pct: 50, run_seconds: 5, period_seconds: 10, description: "Runs 50 % of the time (5 s of every 10 s): CPU time limit" },
+      },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    });
+    mockUseMetrics.mockReturnValue({ metrics: null, isLoading: false, error: null });
+    mockUseCredit.mockReturnValue({ credit: null, isLoading: false, error: null });
+    render(<OverviewPage />);
+    expect(screen.getByTestId("cpu-time-limit")).toHaveTextContent(
+      "Runs 50 % of the time (5 s of every 10 s): CPU time limit. Change it in Settings."
+    );
+  });
+});

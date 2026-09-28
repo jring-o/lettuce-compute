@@ -263,3 +263,26 @@ describe("TaskContextMenu", () => {
     expect(screen.queryByRole("menuitem", { name: "Abort" })).not.toBeInTheDocument();
   });
 });
+
+describe("TaskContextMenu restart", () => {
+  it("restarts a task with the current settings after saying what that means", async () => {
+    const user = userEvent.setup();
+    const onRestart = vi.fn();
+    const actions = { ...makeActions(), onRestart };
+    const task = makeTask({ work_unit_id: "wu-restart-01", task_status: "running" });
+    renderMenu(task, actions);
+    await user.click(await screen.findByText("Restart with current settings"));
+    expect(await screen.findByText("Restart this task with the current settings?")).toBeInTheDocument();
+    expect(screen.getByText(/lost unless its leaf saves checkpoints/)).toBeInTheDocument();
+    expect(screen.getByText(/deadline keeps counting from when it first started/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Restart" }));
+    expect(onRestart).toHaveBeenCalledWith("wu-restart-01");
+  });
+
+  it("offers no restart when the page gives no way to do it", async () => {
+    const task = makeTask({ work_unit_id: "wu-restart-02", task_status: "running" });
+    renderMenu(task, makeActions());
+    await screen.findByText("Suspend");
+    expect(screen.queryByText("Restart with current settings")).not.toBeInTheDocument();
+  });
+});

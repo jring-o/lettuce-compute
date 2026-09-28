@@ -219,11 +219,14 @@ func (d *Daemon) checkCPUThrottling(ctx context.Context) {
 // than its grant, and logs once when the condition begins.
 func (d *Daemon) flagCPUThrottled(key headLeafKey, t throttledTask, begins bool) {
 	leafName, _ := d.resolveLeafInfo(key.leaf)
-	minCores, maxCores := d.leafCoreRange(key.leaf)
+	minCores, maxCores := d.declaredCoreRange(key.leaf)
 	granted := t.wu.CPUGrant.Cores
 	pct := int(t.share*100 + 0.5)
 	why := fmt.Sprintf("That is all its leaf declares it can use (max_cpu_cores %d), so the leaf's program runs more threads than it declares: its owner can size the program's threads to LETTUCE_CPU_LIMIT, or raise the leaf's max_cpu_cores.", maxCores)
-	if granted < maxCores {
+	switch override := d.leafOverride(key.leaf).cores; {
+	case granted < maxCores && override > 0 && override < maxCores:
+		why = fmt.Sprintf("Its leaf can use up to %d; you set its tasks to %s each. Raise that (lettuce-volunteer leafs cores, or the leaf's card in the app) to give its tasks more.", maxCores, plural(override, "core"))
+	case granted < maxCores:
 		why = fmt.Sprintf("Its leaf can use up to %d; the task was given %d because other tasks needed the rest of your CPU limit when it started. A higher max_cpu_cores lets such tasks be given more.", maxCores, granted)
 	}
 	message := fmt.Sprintf("A %s task is being slowed by its CPU grant: in the last minute its CPU limit stopped it in %d%% of its scheduling periods, so it tries to use more than the %s it was given (the leaf asks for %s). Lettuce holds each task to the cores it grants. %s",

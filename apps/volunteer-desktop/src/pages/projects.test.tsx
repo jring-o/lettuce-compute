@@ -17,6 +17,7 @@ const mockRaiseDisk = vi.fn();
 const mockRaiseMemory = vi.fn();
 const mockWriteHeadWeight = vi.fn();
 const mockWriteLeafWeight = vi.fn();
+const mockWriteLeafCPUOverride = vi.fn();
 const mockClient = {
   detachHead: vi.fn(),
   attachHead: vi.fn(),
@@ -47,6 +48,9 @@ vi.mock("@/hooks/use-heads", () => ({
   }),
   useDebouncedLeafWeight: () => ({
     write: mockWriteLeafWeight,
+  }),
+  useWriteLeafCPUOverride: () => ({
+    write: mockWriteLeafCPUOverride,
   }),
 }));
 
@@ -259,9 +263,10 @@ describe("ProjectsPage", () => {
     const defaultBtns = screen.getAllByRole("button", { name: /^Use (Leaf )?Defaults$/ });
     await user.click(defaultBtns[0]);
 
+    // The CPU overrides are cleared with the weights, as `leafs reset` does.
     expect(mockWriteLeafPrefs).toHaveBeenCalledWith(
       expect.objectContaining({ name: "lettuce.science", grpc_address: "lettuce.science:443" }),
-      { mode: "ALL", weights: {} }
+      { mode: "ALL", weights: {}, cores: {}, max_running: {} }
     );
     await waitFor(() => expect(mockRefetch).toHaveBeenCalled());
     expect(mockSetHeads).not.toHaveBeenCalled();
@@ -596,7 +601,7 @@ describe("ProjectsPage", () => {
     expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "SPECIFIC", enabled: ["mandelbrot"] });
 
     await user.click(screen.getByText("Use Leaf Defaults"));
-    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "ALL", weights: {} });
+    expect(mockWriteLeafPrefs).toHaveBeenLastCalledWith(ref, { mode: "ALL", weights: {}, cores: {}, max_running: {} });
 
     await user.click(screen.getByText("Detach"));
     await user.click(screen.getByText("Confirm"));

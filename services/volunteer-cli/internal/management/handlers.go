@@ -36,6 +36,7 @@ func registerHandlers(mux *http.ServeMux, bridge *DaemonBridge) {
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/suspend", handleSuspendTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/resume", handleResumeTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/abort", handleAbortTask(bridge))
+	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/restart", handleRestartTask(bridge))
 	mux.HandleFunc("GET /api/v1/tasks/{work_unit_id}/details", handleGetTaskDetails(bridge))
 	mux.HandleFunc("GET /api/v1/results", handleListResults(bridge))
 	mux.HandleFunc("GET /api/v1/results/{work_unit_id}", handleGetResult(bridge))
@@ -315,6 +316,28 @@ func handleAbortTask(bridge *DaemonBridge) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, map[string]string{"status": "aborted"})
+	}
+}
+
+// handleRestartTask stops a running task and runs its unit again from the
+// start under the current settings (Daemon.RestartTask).
+func handleRestartTask(bridge *DaemonBridge) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		wuID := r.PathValue("work_unit_id")
+		err := bridge.RestartTask(wuID)
+		if err != nil {
+			if errors.Is(err, daemon.ErrTaskNotFound) {
+				writeError(w, http.StatusNotFound, "NOT_FOUND", "Task not found")
+				return
+			}
+			if errors.Is(err, daemon.ErrTaskStarting) {
+				writeError(w, http.StatusConflict, "CONFLICT", "The task is still starting; try again in a moment")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"status": "restarting"})
 	}
 }
 

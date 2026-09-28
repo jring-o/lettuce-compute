@@ -99,6 +99,20 @@ export function cpuShareCaption(cores: number): string {
   return `Each task is given the cores its leaf can use — at least its minimum, as many as are free — and the tasks' cores together stay within these ${cores}, so up to ${cores} one-core tasks run at once. ${held}`;
 }
 
+/**
+ * The sentence under the CPU time slider: at 100 work runs continuously;
+ * below it, running tasks are paused and resumed in turn so they run that
+ * share of the time, which stretches each unit's run by the inverse.
+ */
+export function cpuTimeCaption(pct: number): string {
+  if (pct >= 100) {
+    return "Work runs continuously. Lower this to pause and resume Lettuce's running tasks in turn, so they use less CPU time and the machine runs cooler and quieter.";
+  }
+  const period = Math.max(10, Math.round(1 / Math.min(pct / 100, 1 - pct / 100)));
+  const run = Math.round(((period * pct) / 100) * 10) / 10;
+  return `Running tasks are paused and resumed in turn: they run ${run} s of every ${period} s, so each unit takes about ${(100 / pct).toFixed(1)} times as long. GPU tasks are paused too; WebAssembly tasks are not. Applies straight away.`;
+}
+
 /** The sentence under the Running task limit slider. */
 export function runningTasksCaption(limit: number): string {
   if (limit <= 0) {
@@ -524,6 +538,11 @@ export function SettingsPage() {
   // shown as it is rather than truncated the first time the slider is touched.
   const totalCores = hostCpuCount ?? navigator.hardwareConcurrency ?? 4;
   const coresSliderMax = Math.max(totalCores, config.resource_limits.max_cpu_cores);
+  // 0 (a config from before the setting) reads as 100, no limit.
+  const cpuTimePct =
+    !config.resource_limits.max_cpu_time_pct || config.resource_limits.max_cpu_time_pct > 100
+      ? 100
+      : config.resource_limits.max_cpu_time_pct;
   // 0 is "no limit". A daemon older than the setting sends none: no limit.
   const runningTasksLimit = config.max_running_tasks ?? 0;
   const tasksSliderMax = Math.max(totalCores, runningTasksLimit);
@@ -603,6 +622,27 @@ export function SettingsPage() {
             ? `Container work on this machine is limited to ${machine.max_cpu_cores} cores: the container engine's virtual machine has ${machine.container_vm_cpus} CPUs. Native and WebAssembly work can use all ${config.resource_limits.max_cpu_cores}. Give the machine more CPUs to run bigger container leafs.`
             : cpuShareCaption(config.resource_limits.max_cpu_cores)}
         </p>
+
+        {config.resource_limits.max_cpu_time_pct !== undefined && (
+          <>
+            <ResourceSlider
+              label="CPU time"
+              value={cpuTimePct}
+              min={5}
+              max={100}
+              step={5}
+              displayValue={cpuTimePct >= 100 ? "No limit" : `${cpuTimePct}% of the time`}
+              onChange={(v) =>
+                updateConfig({
+                  resource_limits: { ...config.resource_limits, max_cpu_time_pct: v },
+                })
+              }
+            />
+            <p className="text-xs text-muted-foreground" data-testid="cpu-time-caption">
+              {cpuTimeCaption(cpuTimePct)}
+            </p>
+          </>
+        )}
 
         <ResourceSlider
           label="Memory"

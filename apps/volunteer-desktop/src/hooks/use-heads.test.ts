@@ -4,6 +4,7 @@ import {
   useHeads,
   useDebouncedHeadWeight,
   useDebouncedLeafWeight,
+  useWriteLeafCPUOverride,
   useWriteLeafPreferences,
   useWriteHeadTrust,
   useRaiseDiskAllowance,
@@ -933,5 +934,39 @@ describe("useRaiseMemoryAllowance", () => {
 
     expect(resp).toBeNull();
     expect(mockConfigFn).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWriteLeafCPUOverride", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseClient.mockReturnValue({ client: mockClient, error: null });
+  });
+
+  // The daemon replaces a head's whole cores map on an update, so the write
+  // carries the other leafs' entries as the daemon holds them and changes
+  // only this leaf's; null removes it.
+  it("sets one leaf's cores and keeps the head's other entries", async () => {
+    mockConfigFn.mockResolvedValue(
+      makeConfig([
+        makeServer(),
+        makeLbryServer({ leaf_preferences: { mode: "ALL", weights: { cli: 200 }, cores: { cli: 2 }, max_running: { cli: 1 } } }),
+      ])
+    );
+    mockUpdateConfigFn.mockResolvedValue({});
+    const { result } = renderHook(() => useWriteLeafCPUOverride());
+
+    await act(async () => {
+      await result.current.write(titledHead, "grep", "cores", 3);
+    });
+    expect(mockUpdateConfigFn.mock.calls[0][0].servers?.[1]).toMatchObject({
+      name: "lbry.science",
+      leaf_preferences: { mode: "ALL", weights: { cli: 200 }, cores: { cli: 2, grep: 3 }, max_running: { cli: 1 } },
+    });
+
+    await act(async () => {
+      await result.current.write(titledHead, "cli", "max_running", null);
+    });
+    expect(mockUpdateConfigFn.mock.calls[1][0].servers?.[1]?.leaf_preferences?.max_running).toEqual({});
   });
 });

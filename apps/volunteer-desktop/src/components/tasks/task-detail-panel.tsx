@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { STATUS_DOT_COLOR, STATUS_TEXT, RUNTIME_BADGE } from "./task-status";
 import { cn, formatDuration, formatTimeAgo } from "@/lib/utils";
 import type { TaskDetail } from "@/api/client";
+import { RestartTaskDialog } from "./task-context-menu";
 
 interface TaskDetailPanelProps {
   workUnitId: string | null;
@@ -21,6 +22,8 @@ interface TaskDetailPanelProps {
   onSuspend: (id: string) => void;
   onResume: (id: string) => void;
   onAbort: (id: string) => void;
+  /** Restart the task with the current settings; the button is shown only when set. */
+  onRestart?: (id: string) => void;
 }
 
 function CollapsibleSection({
@@ -113,12 +116,14 @@ export function TaskDetailPanel({
   onSuspend,
   onResume,
   onAbort,
+  onRestart,
 }: TaskDetailPanelProps) {
   const { client } = useClient();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [abortOpen, setAbortOpen] = useState(false);
+  const [restartOpen, setRestartOpen] = useState(false);
 
   useEffect(() => {
     if (!workUnitId || !client || !open) {
@@ -287,6 +292,11 @@ export function TaskDetailPanel({
                     Suspend
                   </Button>
                 ) : null}
+                {onRestart && (
+                  <Button variant="outline" size="sm" onClick={() => setRestartOpen(true)}>
+                    Restart
+                  </Button>
+                )}
                 <Button
                   variant="destructive"
                   size="sm"
@@ -320,6 +330,18 @@ export function TaskDetailPanel({
             onAbort(workUnitId);
           }
           setAbortOpen(false);
+          onOpenChange(false);
+        }}
+      />
+
+      <RestartTaskDialog
+        open={restartOpen}
+        onOpenChange={setRestartOpen}
+        onConfirm={() => {
+          if (workUnitId) {
+            onRestart?.(workUnitId);
+          }
+          setRestartOpen(false);
           onOpenChange(false);
         }}
       />

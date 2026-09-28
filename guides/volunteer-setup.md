@@ -605,7 +605,7 @@ Two things make this volunteer-friendly:
 
 | Config key | Default | What it does |
 |---|---|---|
-| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per task that can run at once (per GPU for GPU-required units, which run one per GPU; on Windows and macOS, per container unit the container engine's machine can run at once for container units). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per task that can run at once (per GPU for GPU-required units, which run one per GPU; on Windows and macOS, per container unit the container engine's machine can run at once for container units; and for each leaf, per task of that leaf that can run at once — its cores, its memory and your running cap for it decide that). Under a CPU time limit the hours are of running at that pace, so the buffer holds correspondingly less work. Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
 | `max_running_tasks` | `0` (no cap) | An optional cap on how many work units run at once. Without one, as many run as your CPU and memory limits hold (see below), and the buffer target scales with that number. Takes effect for the next task that starts. |
 
 > **Replaces `max_concurrent_tasks`.** Earlier releases ran one task at a time
@@ -664,7 +664,8 @@ What follows from that:
   only for cores, a narrower unit behind it in the buffer may not take the cores it
   needs, so it starts as soon as enough running tasks finish.
 - **Changes apply to tasks started afterwards.** A running task keeps the cores it
-  was given; lowering or raising the limit changes what the next tasks get.
+  was given; lowering or raising the limit changes what the next tasks get. To give
+  a running task the new figure, restart it (see [Restarting a task](#restarting-a-task)).
 - `lettuce-volunteer status` shows each running task's cores (the **CORES** column),
   the desktop app shows them on each running task, and `lettuce-volunteer doctor`
   lists them against your limit.
@@ -675,6 +676,96 @@ What follows from that:
 > single-threaded one beside it. If you raised the core limit or
 > `max_concurrent_tasks` to give a wide leaf enough cores, you can set them back to
 > what you want Lettuce to use in total.
+
+### Per leaf: the cores each task is given, and how many run at once
+
+You can set two things for any leaf, on top of the machine-wide limit:
+
+- **Cores per task.** Instead of being given as many of the leaf's range as are
+  free, each of its tasks is given the figure you set, kept within the range the
+  leaf declares and your `max_cpu_cores`: for a GREP leaf that declares 2–4 cores,
+  3 means every GREP task runs on 3 cores; 6 runs at 4 and 1 at 2, because the
+  leaf's minimum is what its units need and its maximum is all they can use. A leaf
+  that declares one figure (1–1) has nothing to choose.
+- **How many run at once.** At most that many of the leaf's tasks run together;
+  other leafs fill the rest of your cores.
+
+```bash
+./lettuce-volunteer leafs cores grep 3            # each GREP task is given 3 cores
+./lettuce-volunteer leafs max-running grep 1      # one GREP task at a time
+./lettuce-volunteer leafs cores grep default      # back to the leaf's own range
+./lettuce-volunteer leafs max-running grep none   # no cap of its own
+```
+
+In the desktop app the same two controls, **Cores per task** and **Run at most**,
+sit under the leaf on the Projects page. Add `--server <name>` to scope a command
+to one head. With the daemon running, a change is applied at once, without a
+restart; otherwise it is saved for the next start. `lettuce-volunteer leafs list`
+shows each leaf's **CORES** and **AT ONCE** (marked `*` where they are your
+setting), and `doctor` lists your settings and what they come to.
+
+Two things make this safe to use:
+
+- **It counts cores, not tasks.** Tasks are booked at the cores they are given, so
+  the tasks running together never use more than `max_cpu_cores`, whatever mix of
+  wide and narrow leafs you run.
+- **It never makes Lettuce fetch more than it can run.** The work buffer holds each
+  leaf's work for the tasks of that leaf that can actually run at once — with one
+  GREP task at a time and a 2-hour buffer, about 2 hours of GREP units — and asks
+  a head for no more while that is held. A running-task cap that the fetcher did
+  not plan for is how a client ends up requesting far more work than it can
+  finish before the deadlines.
+
+Like the machine-wide limit, a change applies to tasks started afterwards; restart
+a running task to apply it now.
+
+### CPU time — run part of the time
+
+`resource_limits.max_cpu_time_pct` (the **CPU time** slider in the desktop app, in
+5 % steps) lowers the load Lettuce puts on your machine without changing how many
+tasks run or their cores: below 100, every running task is paused and resumed in
+turn, so it runs that share of the time. At 50 % tasks run 5 seconds of every 10;
+at 10 %, 1 second of every 10; at 5 %, 1 second of every 20 — each part is at
+least a second, because pausing and resuming a container through its engine takes
+a moment. It takes effect straight away.
+
+```bash
+./lettuce-volunteer config set resource_limits.max_cpu_time_pct 50
+```
+
+- A paused task simply does not run, so the limit causes no CPU pressure inside the
+  task, as a lower CPU quota would. Your machine runs cooler and quieter; each unit
+  takes correspondingly longer (twice as long at 50 %).
+- GPU tasks are paused too. WebAssembly tasks run inside Lettuce's own process and
+  are not paused.
+- The work buffer is sized for the limit: `work_buffer_hours` is wall-clock time
+  at the limit's pace.
+- It is not reported as Lettuce being paused. `lettuce-volunteer status`, the app's
+  Overview and each running task say the limit instead ("Runs 50 % of the time
+  (5 s of every 10 s): CPU time limit").
+- A task you suspend yourself stays suspended: the limit resuming work does not
+  resume it (nor does the end of any other automatic pause).
+
+The command-line `config set` saves the setting for the next start of the daemon;
+the app's slider applies it at once.
+
+### Restarting a task
+
+A task keeps the cores it was given, and the other settings it started with, until
+it finishes. To have a running task pick up a changed setting, restart it:
+
+```bash
+./lettuce-volunteer status                      # the ID column names each running task
+./lettuce-volunteer tasks restart 3f2a91c0      # the first characters are enough
+```
+
+In the desktop app, use **Restart with current settings** in a running task's menu
+(or **Restart** in its details). The task stops and starts again from the beginning
+under the settings in force now. The work it has done so far is lost unless its leaf
+saves checkpoints, in which case it continues from the last one. The head still
+holds the unit as yours, so its deadline keeps counting from when it first started
+and its result is accepted as usual. **Abort** is different: it stops the task and
+does not run it again.
 
 ### Network bandwidth
 
@@ -974,7 +1065,7 @@ yours uses the head's default for it (usually `100`):
 ./lettuce-volunteer leafs weight beyblade-arena 200   # twice the time of a leaf at 100
 ./lettuce-volunteer leafs disable some-leaf     # never run this one
 ./lettuce-volunteer leafs enable some-leaf      # run it again
-./lettuce-volunteer leafs reset                 # every leaf on, no leaf weights
+./lettuce-volunteer leafs reset                 # every leaf on, no leaf weights or cores settings
 ```
 
 Add `--server <name>` to any `leafs` command to scope it to one head; omit it to
