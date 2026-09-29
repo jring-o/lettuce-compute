@@ -111,6 +111,9 @@ func (m *mockWURepo) BulkTransitionByBatch(_ context.Context, _ types.ID, _, _ w
 func (m *mockWURepo) FindNextAssignable(_ context.Context, _ workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWURepo) FindAssignableBatch(context.Context, workunit.AssignmentOptions, int, []types.ID, types.ID, time.Duration) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *mockWURepo) ReserveNextAssignable(_ context.Context, _ workunit.AssignmentOptions, _ time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

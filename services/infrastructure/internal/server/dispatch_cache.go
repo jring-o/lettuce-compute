@@ -604,6 +604,11 @@ type dispatchCache struct {
 	starveMu      sync.Mutex
 	lastStarveLog map[types.ID]time.Time
 
+	// fallbackRuns records the latest per-requester database fallback for each machine and
+	// request scope (see dispatch_requester_fallback.go): it throttles the fallback and is the
+	// answer ALREADY_CONTRIBUTED stands on. Guarded by mu; pruned on the reconcile tick.
+	fallbackRuns map[fallbackKey]fallbackRun
+
 	// flusherDone is closed by runFlusher after its final best-effort flush on
 	// shutdown. Drained() exposes it so the shutdown tail can wait for the final
 	// flush to finish BEFORE closing the pool (BG-32) — closing first would fail
@@ -678,6 +683,7 @@ func newDispatchCache(cfg dispatchCacheConfig, deps dispatchDeps, logger *slog.L
 		pendingLeafRefills:   make(map[types.ID]struct{}),
 		heldReports:          make(map[types.ID]heldReport),
 		lastStarveLog:        make(map[types.ID]time.Time),
+		fallbackRuns:         make(map[fallbackKey]fallbackRun),
 		flusherDone:          make(chan struct{}),
 		flushDoneCh:          make(chan struct{}),
 	}
@@ -1098,10 +1104,36 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 	if taken > 0 && c.cfg.minSendInterval > 0 {
 		c.lastHandOut[hostKey] = c.now()
 	}
+	var fallback fallbackPlan
 	if taken == 0 {
 		noWork = c.noWorkReplyLocked(volunteerID, hostKey, opts, noWorkT)
+		fallback = c.planFallbackLocked(hostKey, opts, n, &rejects, noWork)
 	}
 	c.mu.Unlock()
+
+	// Refused on its own account by everything staged in reach: the pool, stocked without
+	// regard to who asks, may hold nothing for this requester while the database still does.
+	// Ask the database directly (dispatch_requester_fallback.go). ALREADY_CONTRIBUTED claims
+	// "every task", so it stands only on the database's answer, never on the pool's alone.
+	fallbackOutcome := ""
+	switch fallback.state {
+	case fallbackDue:
+		fb, ran := c.handOutFromDB(volunteerID, hostKey, reqSubject, opts, fallback)
+		switch {
+		case len(fb) > 0:
+			results, taken, noWork = fb, len(fb), noWorkReply{}
+		case ran:
+			fallbackOutcome = "none_in_database"
+		default:
+			noWork = noWork.unverified()
+			fallbackOutcome = "not_run"
+		}
+	case fallbackAnsweredEmpty:
+		fallbackOutcome = "none_in_database_recently"
+	case fallbackUnverified:
+		noWork = noWork.unverified()
+		fallbackOutcome = "not_run"
+	}
 
 	// Leaf-filtered starvation (PB-16): a requester that named specific leafs and was
 	// handed NOTHING always queues an on-demand, leaf-scoped refill for those leafs. This
@@ -1275,6 +1307,12 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 			"requested", n,
 			"leaf_ids", opts.LeafIDs,
 			"blocked_leaf_ids", opts.BlockedLeafIDs)
+		if fallbackOutcome != "" {
+			// What the database said when asked for this requester directly: whether a
+			// refused_already_contributed as large as ready_len means the account has done
+			// everything, or only everything the pool holds.
+			attrs = append(attrs, "requester_fallback", fallbackOutcome)
+		}
 		if rejects[rejectCapabilityMismatch] > 0 {
 			attrs = append(attrs,
 				"max_cpu_cores", opts.MaxCPUCores,
@@ -1785,26 +1823,7 @@ func (c *dispatchCache) releaseInMemLocked(unitID, volunteerID types.ID) {
 func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.releaseInMemLocked(unitID, volunteerID)
-	// releaseInMemLocked drops the hold but keeps the candidate staged (for its remaining
-	// redundancy copies), so it is still here to bench.
-	//
-	// The void bench is a short TIMED throttle (PB-9), not a permanent exclusion: the SQL
-	// landing is the authoritative refusal, and an unexpiring entry here out-lived the SQL
-	// cooldown whenever the candidate lingered staged. On expiry the volunteer gets one
-	// fresh offer; a still-standing SQL refusal re-benches it right back here. fallbackAt
-	// == until because the void does not know the underlying outcome time, so no early
-	// pool-exhausted re-admission is attempted from a void entry.
-	for i := range c.ready {
-		if c.ready[i].unit.ID == unitID {
-			if c.ready[i].benched == nil {
-				c.ready[i].benched = make(map[types.ID]benchEntry)
-			}
-			expiry := c.now().Add(voidBenchTTL)
-			c.ready[i].benched[volunteerID] = benchEntry{until: expiry, fallbackAt: expiry}
-			return
-		}
-	}
+	c.closeCopyLocked(unitID, volunteerID, copyVoided)
 }
 
 // onCopyClosed drops one volunteer's in-memory hold after its copy row was closed —
@@ -1837,19 +1856,65 @@ func (c *dispatchCache) voidNonLandedCopy(unitID, volunteerID types.ID) {
 // downgrades a mis-flagged give-back of a started copy to ABANDONED), so this stays
 // in lockstep with the row the SQL gate will read.
 func (c *dispatchCache) onCopyClosed(unitID, volunteerID types.ID, returned bool) {
+	how := copyFailed
+	if returned {
+		how = copyReturned
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closeCopyLocked(unitID, volunteerID, how)
+}
+
+// copyClose is how a copy ended, which decides the bench closeCopyLocked records.
+type copyClose int
+
+const (
+	// copyReturned: closed RETURNED, an un-run give-back (the client's, or the held-copy
+	// reconcile's for a buffered copy the machine no longer reports). The landing refuses the
+	// closer the unit for the short re-offer window (workunit.ReturnedReofferCooldownSeconds).
+	copyReturned copyClose = iota
+	// copyFailed: closed EXPIRED or ABANDONED. The landing refuses the closer for about one
+	// deadline.
+	copyFailed
+	// copyVoided: the landing write refused the hand-out, so no copy row exists and the cache
+	// does not know the refusal's cause or time. The re-offer is throttled for voidBenchTTL:
+	// the SQL landing stays the authoritative refusal, so on expiry the volunteer gets one
+	// fresh offer, and a still-standing SQL refusal benches it right back here. fallbackAt
+	// equals until, so no early pool-exhausted re-admission is attempted from a void.
+	copyVoided
+)
+
+// closeCopyLocked is the dispatch cache's one close of a copy. Every path that ends a
+// volunteer's copy of a unit (a give-back or abandon, the deadline reaper, the held-copy
+// reconcile, a refused landing) comes here, so the cache's view of the copy ends the way the
+// database's did: the volunteer's in-memory hold and its machine's in-flight count are dropped,
+// and the still-staged candidate benches the volunteer for the window the SQL landing now
+// enforces. The candidate's bench map is a refill-time snapshot that refreshes only on re-stage,
+// which never happens while it sits staged, so without this record the cache re-offers the unit
+// to the same volunteer on its next poll and the landing refuses the copy.
+//
+// Copies closed with their whole unit (validation, an operator requeue, a dead letter) go
+// through InvalidateWorkUnit or onUnitDone instead, which drop the candidate itself. The census
+// test (copy_close_census_test.go) fails when a copy-closing statement's caller reaches neither.
+// Caller holds mu.
+func (c *dispatchCache) closeCopyLocked(unitID, volunteerID types.ID, how copyClose) {
 	c.releaseInMemLocked(unitID, volunteerID)
 	for i := range c.ready {
 		if c.ready[i].unit.ID != unitID {
 			continue
 		}
+		var e benchEntry
+		if how == copyVoided {
+			expiry := c.now().Add(voidBenchTTL)
+			e = benchEntry{until: expiry, fallbackAt: expiry}
+		} else {
+			e = benchEntryFor(c.now(), how == copyReturned, c.ready[i].unit.DeadlineSeconds)
+		}
 		if c.ready[i].benched == nil {
 			c.ready[i].benched = make(map[types.ID]benchEntry)
 		}
-		e := benchEntryFor(c.now(), returned, c.ready[i].unit.DeadlineSeconds)
-		// Keep whichever bench holds longest (benchSet's merge rule: the SQL gate
-		// refuses while ANY arm refuses).
+		// Keep whichever bench holds longest (benchSet's merge rule: the SQL gate refuses
+		// while ANY arm refuses).
 		if prev, ok := c.ready[i].benched[volunteerID]; ok {
 			if prev.until.After(e.until) {
 				e.until = prev.until
@@ -3507,20 +3572,24 @@ func (c *dispatchCache) reconcileHeldCopies(ctx context.Context) {
 			continue
 		}
 		releasedAny = true
-		// Drop the released units from this replica's in-memory ledger so they stop
-		// counting as held and can be re-staged. The in-memory holders key on the ACCOUNT,
-		// so release by account (the host's owner); releaseInMemLocked then decrements the
-		// host's inflight via the holder's stored host id. A no-op for copies this replica
-		// never held in memory (a run-started copy, whose hold onRunStart already dropped;
-		// or one recovered from the DB after a head restart) — the inflight recount that
-		// follows this reconcile is what corrects those.
+		// Close the released copies in this replica's in-memory ledger the way the database
+		// closed them: the hold and the machine's in-flight count go, and the still-staged
+		// candidate benches the holder for the cooldown the landing now enforces (RETURNED
+		// for an un-started copy, ABANDONED for a started one), so the machine is not
+		// re-offered the unit on its next poll only to have the copy refused. The in-memory
+		// holders key on the ACCOUNT, so close by account (the host's owner). The hold part is
+		// a no-op for copies this replica never held in memory (a run-started copy, whose hold
+		// onRunStart already dropped, or one recovered from the DB after a head restart); the
+		// inflight recount that follows this reconcile corrects those.
 		startedCount := 0
 		c.mu.Lock()
 		for _, rc := range released {
-			c.releaseInMemLocked(rc.WorkUnitID, p.account)
+			how := copyReturned
 			if rc.Started {
+				how = copyFailed
 				startedCount++
 			}
+			c.closeCopyLocked(rc.WorkUnitID, p.account, how)
 		}
 		c.mu.Unlock()
 		// A lost RUNNING copy is wasted work and a bad reliability signal for the machine
@@ -3558,6 +3627,7 @@ func (c *dispatchCache) reconcileOnce(ctx context.Context) {
 	// reflected in the authoritative inflight counts recomputed below.
 	c.reconcileHeldCopies(ctx)
 	c.pruneStarveLog()
+	c.pruneFallbackRuns()
 	c.releaseLapsedHolds()
 
 	dbCtx, cancel := context.WithTimeout(ctx, dispatchDBTimeout)

@@ -55,6 +55,9 @@ func (m *mockWURepo) UpdateState(_ context.Context, _ types.ID, _, _ workunit.Wo
 func (m *mockWURepo) FindNextAssignable(context.Context, workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWURepo) FindAssignableBatch(context.Context, workunit.AssignmentOptions, int, []types.ID, types.ID, time.Duration) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *mockWURepo) ReserveNextAssignable(context.Context, workunit.AssignmentOptions, time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

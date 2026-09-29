@@ -86,6 +86,9 @@ func (m *mockWURepo) BulkTransitionByBatch(ctx context.Context, batchID types.ID
 func (m *mockWURepo) FindNextAssignable(ctx context.Context, opts workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWURepo) FindAssignableBatch(context.Context, workunit.AssignmentOptions, int, []types.ID, types.ID, time.Duration) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *mockWURepo) ReserveNextAssignable(ctx context.Context, opts workunit.AssignmentOptions, lease time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil
 }

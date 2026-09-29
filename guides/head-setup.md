@@ -705,6 +705,17 @@ generic "getting no work" warning. On the head side, the throttled
 `no work handed out` WARN (one per machine per five minutes) is written for the same
 requester-specific causes plus a capability mismatch, each with its own message.
 
+The in-memory pool below is stocked oldest-first without regard to who asks, so a
+volunteer that has run far ahead of the rest of the fleet on a leaf can find every
+staged unit of that leaf waiting on its own result for a second volunteer. When
+everything staged for a request refuses the account on its own grounds (its own
+result or copy, or a recent failed copy), the head asks the database for units the
+account can take and hands them out directly, leaving the pool as it was for other
+volunteers. "Already has a result on every unit" is sent only when the database has
+none either; that answer stands for five minutes per machine and request, after which
+the database is asked again. The WARN's `requester_fallback` field records what the
+database said (`none_in_database`, `none_in_database_recently`, or `not_run`).
+
 `LETTUCE_TRUSTED_PROXIES` also governs **per-client rate limiting** on the gRPC
 port: with it set, volunteers behind your reverse proxy are bucketed per real
 client IP (and per authenticated key) rather than sharing one proxy-IP bucket.
@@ -733,6 +744,9 @@ currently holding, and the head promptly releases any buffered (not-yet-started)
 reservation a volunteer no longer holds — e.g. after a client restart that dropped its
 buffer — so those units redispatch within seconds instead of waiting out the full
 deadline, and they stop counting against that volunteer's `max_inflight_per_volunteer`.
+A copy released this way is recorded like a give-back (`RETURNED`, or `ABANDONED` if it
+had started) with the reason `not in the machine's held report`, and the unit is not
+re-offered to that machine for the same window a give-back or abandon would bring.
 This needs volunteers on **v0.5.1+**; older clients don't report a held set and fall back
 to deadline-based reclaim only (so keep the fleet updated with `lettuce-volunteer update`).
 
@@ -749,7 +763,7 @@ These cache knobs are `head.*` keys (defaults are sane; you rarely touch them):
 
 | Key (env) | Default | What it does |
 |-----------|---------|--------------|
-| `ready_pool_size` (`LETTUCE_HEAD_READY_POOL_SIZE`) | `2000` | Max pre-fetched queued units held in memory for hand-out. |
+| `ready_pool_size` (`LETTUCE_HEAD_READY_POOL_SIZE`) | `2000` | Max pre-fetched queued units held in memory for hand-out. It need not exceed any leaf's queue: a volunteer the pool cannot serve because it has already contributed to everything staged is served from the database directly. |
 | `refill_batch_size` (`LETTUCE_HEAD_REFILL_BATCH_SIZE`) | `500` | How many units one bulk refill pulls from Postgres. |
 | `dispatch_admission_cap` (`LETTUCE_HEAD_DISPATCH_ADMISSION_CAP`) | `MaxConns/2` | Bounds concurrent CLIENT write-path dispatch-cache database operations (StartWork, SubmitResult, AbandonWorkUnit, run-start, the request cold-miss identity read) so they cannot saturate the pool. Background restock + landing use `maintenance_admission_cap`. |
 | `maintenance_admission_cap` (`LETTUCE_HEAD_MAINTENANCE_ADMISSION_CAP`) | `dispatch_admission_cap/4` | Reserved admission budget for background restock + spot-check landing (refiller, reservation-flush, spot-check landing) so client writes cannot starve them. |

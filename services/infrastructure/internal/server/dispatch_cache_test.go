@@ -50,6 +50,11 @@ type fakeWURepo struct {
 	// dispatchFn backs FindDispatchableBatch AND ClaimDispatchableBatch (the refill);
 	// it observes the leaf scope.
 	dispatchFn func(limit int, excludeIDs, leafIDs []types.ID) ([]workunit.DispatchCandidate, error)
+	// assignableFn backs FindAssignableBatch (the per-requester database fallback);
+	// assignableCalls counts invocations, so a test can assert that a request the ready
+	// pool serves never reaches the database.
+	assignableFn    func(opts workunit.AssignmentOptions, limit int, excludeIDs []types.ID, headID types.ID, claimLease time.Duration) ([]*workunit.WorkUnit, error)
+	assignableCalls int
 
 	flushedBatches   int
 	reserveCopyCalls int
@@ -86,6 +91,19 @@ func (f *fakeWURepo) FindDispatchableBatch(_ context.Context, limit int, exclude
 	f.mu.Unlock()
 	if fn != nil {
 		return fn(limit, excludeIDs, leafIDs)
+	}
+	return nil, nil
+}
+
+// FindAssignableBatch backs the per-requester database fallback. Nil assignableFn = the
+// database holds nothing more for the requester.
+func (f *fakeWURepo) FindAssignableBatch(_ context.Context, opts workunit.AssignmentOptions, limit int, excludeIDs []types.ID, headID types.ID, claimLease time.Duration) ([]*workunit.WorkUnit, error) {
+	f.mu.Lock()
+	f.assignableCalls++
+	fn := f.assignableFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(opts, limit, excludeIDs, headID, claimLease)
 	}
 	return nil, nil
 }

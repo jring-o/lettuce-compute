@@ -125,8 +125,11 @@ func TestNoWorkReason_InflightCap_OnlyWhenAUnitWouldOtherwiseBeHandedOut(t *test
 		holdInflight(c, host, 2)
 		opts := hostOpts(vol, host, 2)
 		opts.LeafIDs = []types.ID{lf}
-		if nw := emptyHandOut(t, c, vol, opts); nw.reason != reasonContributed {
-			t.Fatalf("reason = %v, want ALREADY_CONTRIBUTED (the cap binds no unit)", nw.reason)
+		// Not the cap. Nor ALREADY_CONTRIBUTED: "every task" is said only on the database's
+		// answer, and a machine with no in-flight room is not handed anything from the
+		// database, so it is not asked.
+		if nw := emptyHandOut(t, c, vol, opts); nw.reason != reasonUnspecified {
+			t.Fatalf("reason = %v, want UNSPECIFIED (the cap binds no unit, and the database was not asked)", nw.reason)
 		}
 	})
 	t.Run("the unit does not fit this machine", func(t *testing.T) {
