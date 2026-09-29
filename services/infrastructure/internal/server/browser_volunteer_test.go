@@ -134,6 +134,9 @@ func (m *bvMockWURepo) FindNextAssignable(context.Context, workunit.AssignmentOp
 	}
 	return m.wus[0], nil
 }
+func (m *bvMockWURepo) FindAssignableBatch(context.Context, workunit.AssignmentOptions, int, []types.ID, types.ID, time.Duration) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
 func (m *bvMockWURepo) ReserveNextAssignable(context.Context, workunit.AssignmentOptions, time.Duration) (*workunit.WorkUnit, error) {
 	if len(m.wus) == 0 {
 		return nil, nil

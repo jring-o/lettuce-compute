@@ -119,6 +119,13 @@ type WorkUnitRepository interface {
 	// the leaf's redundancy_factor. Returns nil, nil if no work available.
 	FindNextAssignable(ctx context.Context, opts AssignmentOptions) (*WorkUnit, error)
 
+	// FindAssignableBatch is FindNextAssignable's batch form for one requester: up to
+	// limit units by the same predicate and order, the batch bounded by the machine's
+	// remaining in-flight room, skipping excludeIDs. It reserves nothing (the caller lands
+	// copies through FlushReservations). With a non-zero headID it skips units another
+	// replica holds a live dispatch claim on and claims what it returns for headID.
+	FindAssignableBatch(ctx context.Context, opts AssignmentOptions, limit int, excludeIDs []types.ID, headID types.ID, claimLease time.Duration) ([]*WorkUnit, error)
+
 	// FindDispatchableBatch bulk-selects up to `limit` QUEUED, dispatch-eligible
 	// (non-WASM, redundancy/reservation-eligible) work units for the in-memory
 	// dispatch cache, excluding any id the cache already holds (excludeIDs). It keeps
@@ -188,8 +195,9 @@ type WorkUnitRepository interface {
 	// failure cooldown reads), so a machine that keeps dropping a unit does not immediately
 	// take it back.
 	//
-	// Returns one ReleasedCopy per closed copy, carrying whether it had run-started so the
-	// caller can apply the reliability signal that only wasted RUNNING work deserves.
+	// Each closed copy records ReleasedNotHeldReason as its outcome_reason. Returns one
+	// ReleasedCopy per closed copy, carrying whether it had run-started so the caller can
+	// apply the reliability signal that only wasted RUNNING work deserves.
 	ReleaseStaleHeldCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]ReleasedCopy, error)
 
 	// ReserveNextAssignable finds the next assignable QUEUED work unit (same

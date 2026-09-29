@@ -570,6 +570,9 @@ func (m *mockWorkUnitRepo) BulkTransitionByBatch(ctx context.Context, batchID ty
 func (m *mockWorkUnitRepo) FindNextAssignable(ctx context.Context, opts workunit.AssignmentOptions) (*workunit.WorkUnit, error) {
 	return nil, nil
 }
+func (m *mockWorkUnitRepo) FindAssignableBatch(context.Context, workunit.AssignmentOptions, int, []types.ID, types.ID, time.Duration) ([]*workunit.WorkUnit, error) {
+	return nil, nil
+}
 
 func (m *mockWorkUnitRepo) ReserveNextAssignable(ctx context.Context, opts workunit.AssignmentOptions, lease time.Duration) (*workunit.WorkUnit, error) {
 	return nil, nil

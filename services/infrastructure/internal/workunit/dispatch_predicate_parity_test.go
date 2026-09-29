@@ -433,6 +433,30 @@ func TestDispatchPredicateParity_SQL(t *testing.T) {
 					s.Name, s.Dimension, offered, s.SQLWant(), s.Divergence != nil)
 			}
 
+			// --- FindAssignableBatch: the batch form (the dispatch cache's per-requester
+			// fallback). It shares FindNextAssignable's predicate text, and adds a batch-wide
+			// in-flight bound and, under scale-out, the dispatch-claim rule; on the same seed (no
+			// claims; the reads above change nothing it reads) both forms must give
+			// FindNextAssignable's verdict. The claiming form runs last: it stamps a claim. ---
+			for _, head := range []types.ID{{}, types.NewID()} {
+				batch, err := repo.FindAssignableBatch(ctx, parityOpts(s, seed), 4, nil, head, time.Minute)
+				if err != nil {
+					t.Fatalf("FindAssignableBatch (head %v): %v", head, err)
+				}
+				offered := false
+				for _, wu := range batch {
+					offered = offered || wu.ID == seed.unitID
+				}
+				if offered != s.SQLWant() {
+					t.Fatalf("FindAssignableBatch verdict mismatch (scale-out %v)\n"+
+						"  scenario: %s (dimension %s)\n"+
+						"  offered:  %v\n"+
+						"  want:     %v\n"+
+						"It must enforce exactly FindNextAssignable's rule (assignableSelectSQL).",
+						head != (types.ID{}), s.Name, s.Dimension, offered, s.SQLWant())
+				}
+			}
+
 			// --- FlushReservations + ReserveCopy: the landing-write subsets ---
 			assertLandingGate(t, pool, repo, s, dispatchparity.GateFlushReservations)
 			assertLandingGate(t, pool, repo, s, dispatchparity.GateReserveCopy)

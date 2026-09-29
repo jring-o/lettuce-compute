@@ -771,8 +771,28 @@ func trustedContributorSubjectsSQL(floorExpr string) string {
 // the project's redundancy_factor. Uses FOR UPDATE SKIP LOCKED to prevent
 // concurrent assignment of the same work unit. Returns nil, nil if no work available.
 func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts AssignmentOptions) (*WorkUnit, error) {
-	row := r.db.QueryRow(ctx, `
-		SELECT `+prefixedWorkUnitColumns+`
+	row := r.db.QueryRow(ctx, assignableSelectSQL(prefixedWorkUnitColumns, "", "1"), r.assignableArgs(opts)...)
+
+	wu, err := scanWorkUnit(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, apierror.Internal("failed to find assignable work unit", err)
+	}
+	return wu, nil
+}
+
+// assignableSelectSQL is the per-requester dispatch predicate shared by FindNextAssignable and
+// its batch form, FindAssignableBatch: every capability, visibility, redundancy, copy-budget,
+// trusted-corroborator, distinctness, standing, cooldown, in-flight, hardware-class and
+// feasibility rule for ONE requester, written once so the two cannot drift. selectList is what
+// the query returns, extraWhere is appended to the WHERE clause (it must start with AND, or be
+// empty), and limit is the LIMIT expression. Its parameters are $1-$20 (assignableArgs); a
+// caller's extraWhere and limit may use $21 onward.
+func assignableSelectSQL(selectList, extraWhere, limit string) string {
+	return `
+		SELECT ` + selectList + `
 		FROM work_units wu
 		JOIN leafs l ON wu.leaf_id = l.id
 		-- Requester's account-level trust subject (trust.SubjectForVolunteer's SQL
@@ -787,10 +807,10 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		-- sentinel / 'OK' via COALESCE — the same defensive fallback for both.
 		CROSS JOIN (
 			SELECT COALESCE(
-			         (SELECT `+subjectExprSQL("rv")+` FROM volunteers rv WHERE rv.id = $9),
+			         (SELECT ` + subjectExprSQL("rv") + ` FROM volunteers rv WHERE rv.id = $9),
 			         'vol:' || $9::text) AS subject,
 			       COALESCE(
-			         (SELECT `+standingExprSQL("rv")+` FROM volunteers rv WHERE rv.id = $9),
+			         (SELECT ` + standingExprSQL("rv") + ` FROM volunteers rv WHERE rv.id = $9),
 			         'OK') AS effective_standing
 		) req
 		WHERE wu.state = 'QUEUED'
@@ -857,11 +877,11 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- PROBATION/BENCHED account does NOT count here (countableCoverageSQL), so full
 		  -- replication is FORCED around neutralized results; with an all-OK population this
 		  -- reduces byte-for-byte to the raw live+pending count.
-		  AND `+countableCoverageSQL("wu.id")+` < `+effTargetWuL+`
+		  AND ` + countableCoverageSQL("wu.id") + ` < ` + effTargetWuL + `
 		  -- Copy budget not exhausted (capsNotExhaustedSQL — TB-35): the browser
 		  -- immediate-assign twin of the refill/landing gates — a unit whose budget is
 		  -- spent can never mint another copy row, so it is not assignable.
-		  AND `+capsNotExhaustedWuL+`
+		  AND ` + capsNotExhaustedWuL + `
 		  -- Trusted-corroborator reservation (trust gate): when this unit's leaf resolves a
 		  -- trusted-corroborator requirement K > 0 (effTrustKSQL, the SQL twin of
 		  -- transition.TrustPolicy.ResolveTrust), the unit keeps its last slots RESERVED for
@@ -886,19 +906,19 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- per-statement snapshot (same race class as the redundancy headroom check — the
 		  -- in-memory layer budgets slots sequentially under its lock).
 		  AND (
-		    `+effTrustKSQL("wu", "l", "$16", "$17")+` = 0
+		    ` + effTrustKSQL("wu", "l", "$16", "$17") + ` = 0
 		    OR EXISTS (
 		      SELECT 1 FROM volunteer_trust rvt
 		      WHERE rvt.subject = req.subject
-		        AND rvt.score >= `+effTrustFloorSQL("l", "$18")+`
+		        AND rvt.score >= ` + effTrustFloorSQL("l", "$18") + `
 		    )
 		    OR (
 		      (
-		        `+countableCoverageSQL("wu.id")+`
+		        ` + countableCoverageSQL("wu.id") + `
 		        + 1
-		        + GREATEST(0, `+effTrustKSQL("wu", "l", "$16", "$17")+`
-		                      - `+trustedPresentCountSQL("wu.id", effTrustFloorSQL("l", "$18"))+`)
-		      ) <= `+effTargetWuL+`
+		        + GREATEST(0, ` + effTrustKSQL("wu", "l", "$16", "$17") + `
+		                      - ` + trustedPresentCountSQL("wu.id", effTrustFloorSQL("l", "$18")) + `)
+		      ) <= ` + effTargetWuL + `
 		    )
 		  )
 		  -- Subject-distinct self-copy exclusion: never hand this requester a unit a
@@ -914,7 +934,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    JOIN volunteers hv2 ON hv2.id = wuah2.volunteer_id
 		    WHERE wuah2.work_unit_id = wu.id
 		      AND wuah2.outcome IS NULL
-		      AND `+subjectExprSQL("hv2")+` = req.subject
+		      AND ` + subjectExprSQL("hv2") + ` = req.subject
 		  )
 		  -- Subject-distinct already-contributed exclusion: never hand this requester a
 		  -- unit for which a volunteer sharing its trust subject already authored a
@@ -926,7 +946,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    JOIN volunteers hv3 ON hv3.id = res3.volunteer_id
 		    WHERE res3.work_unit_id = wu.id
 		      AND res3.validation_status = 'PENDING'
-		      AND `+subjectExprSQL("hv3")+` = req.subject
+		      AND ` + subjectExprSQL("hv3") + ` = req.subject
 		  )
 		  -- BENCHED requester (account standing, BG-24b): an account the head has BENCHED
 		  -- gets NO dispatch at all until its bench lapses — the per-ACCOUNT standing twin of
@@ -942,7 +962,7 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		  -- incl. the PB-9 pool-exhausted fallback) so a fresh volunteer gets first
 		  -- refusal without a small pool ever stranding the work. Keyed on volunteer_id
 		  -- ($9), NOT the trust subject, BY DESIGN — see cooldownGuardSQL.
-		  AND `+cooldownGuardSQL("wu.id", "$9", "wu")+`
+		  AND ` + cooldownGuardSQL("wu.id", "$9", "wu") + `
 		  -- Per-MACHINE inflight cap (TODO #19): this HOST's live copies across all units.
 		  -- Keyed on COALESCE(host_id, volunteer_id) = the requester's effective host id
 		  -- ($14, the account id when no host was reported) so a user's rig and laptop have
@@ -977,9 +997,15 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		    OR (COALESCE((l.execution_config->>'rsc_fpops_est')::float8, 0)
 		        / NULLIF($15::float8, 0)) <= wu.deadline_seconds
 		  )
+		  ` + extraWhere + `
 		ORDER BY wu.priority DESC, wu.created_at ASC
-		LIMIT 1
-		FOR UPDATE OF wu SKIP LOCKED`,
+		LIMIT ` + limit + `
+		FOR UPDATE OF wu SKIP LOCKED`
+}
+
+// assignableArgs returns the $1-$20 parameters of assignableSelectSQL for one request.
+func (r *PgxWorkUnitRepository) assignableArgs(opts AssignmentOptions) []any {
+	return []any{
 		opts.LeafIDs,
 		opts.BlockedLeafIDs,
 		opts.MaxCPUCores,
@@ -1004,16 +1030,84 @@ func (r *PgxWorkUnitRepository) FindNextAssignable(ctx context.Context, opts Ass
 		// $19-$20: the requester's host budgets for NATIVE/WASM leaves (TB-85).
 		opts.HostMaxCPUCores,
 		opts.HostMaxMemoryMB,
-	)
-
-	wu, err := scanWorkUnit(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, apierror.Internal("failed to find assignable work unit", err)
 	}
-	return wu, nil
+}
+
+// FindAssignableBatch is the batch form of FindNextAssignable, for the dispatch cache's
+// per-requester fallback: up to limit QUEUED units this ONE requester may be given, chosen by
+// exactly the predicate FindNextAssignable applies (assignableSelectSQL) and in the same
+// order. It reserves nothing: the caller lands the copies through FlushReservations, the
+// landing write every cache hand-out goes through, so the SQL landing gates stay
+// authoritative.
+//
+// Two terms are added for a batch:
+//   - The in-flight cap bounds the whole batch, not each row. The LIMIT is the smaller of
+//     limit and the machine's remaining room (opts.MaxInflightPerVolunteer less its live
+//     copies), so a batch cannot take a machine past its cap the way N rows, each tested
+//     against the same pre-statement count, could.
+//   - excludeIDs (the cache's staged and in-memory-held units) are skipped: a held unit's
+//     copy may not have landed yet, so the per-row rules cannot see it.
+//
+// With a head id (scale-out), the select also skips every unit another replica holds a live
+// dispatch claim on, and stamps this head's claim on the units it returns (the
+// ClaimDispatchableBatch rule), so two replicas can never both hand one unit out.
+// FindNextAssignable itself stays claim-blind: the browser dispatch path uses it and is
+// arbitrated by the landing gates.
+func (r *PgxWorkUnitRepository) FindAssignableBatch(ctx context.Context, opts AssignmentOptions, limit int, excludeIDs []types.ID, headID types.ID, claimLease time.Duration) ([]*WorkUnit, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// $21 is the batch limit, $22 the ids to skip.
+	args := append(r.assignableArgs(opts), limit, excludeIDs)
+	extraWhere := `AND (array_length($22::uuid[], 1) IS NULL OR NOT (wu.id = ANY($22::uuid[])))`
+	limitSQL := `LEAST($21::int, CASE WHEN $12::int <= 0 THEN $21::int ELSE GREATEST(0, $12::int - (
+			SELECT COUNT(*) FROM work_unit_assignment_history cap_h
+			WHERE COALESCE(cap_h.host_id, cap_h.volunteer_id) = COALESCE($14::uuid, $9)
+			  AND cap_h.outcome IS NULL))::int END)`
+	query := assignableSelectSQL(prefixedWorkUnitColumns, extraWhere, limitSQL)
+	if headID != (types.ID{}) {
+		leaseSecs := claimLease.Seconds()
+		if leaseSecs <= 0 {
+			leaseSecs = float64(defaultClaimLeaseSeconds)
+		}
+		// $23 is this head, $24 the claim lease in seconds.
+		args = append(args, headID, leaseSecs)
+		extraWhere += `
+		  -- CLAIM EXCLUDE: another replica's LIVE claim hides the unit; a NULL claim, an
+		  -- expired claim, or THIS head's own claim is claimable.
+		  AND (wu.dispatch_claimed_by IS NULL
+		       OR wu.dispatch_claim_expires_at < NOW()
+		       OR wu.dispatch_claimed_by = $23)`
+		query = `
+		WITH picked AS (` + assignableSelectSQL("wu.id", extraWhere, limitSQL) + `
+		), claimed AS (
+			UPDATE work_units wu SET
+				dispatch_claimed_by = $23,
+				dispatch_claim_expires_at = NOW() + make_interval(secs => $24)
+			FROM picked
+			WHERE wu.id = picked.id
+			RETURNING ` + prefixedWorkUnitColumns + `
+		)
+		SELECT * FROM claimed ORDER BY priority DESC, created_at ASC`
+	}
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, apierror.Internal("failed to find assignable batch", err)
+	}
+	defer rows.Close()
+
+	var out []*WorkUnit
+	for rows.Next() {
+		wu, err := scanWorkUnit(rows)
+		if err != nil {
+			return nil, apierror.Internal("failed to scan assignable work unit", err)
+		}
+		out = append(out, wu)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apierror.Internal("failed to iterate assignable work units", err)
+	}
+	return out, nil
 }
 
 // DispatchCandidate is one stageable QUEUED unit returned by
@@ -1800,6 +1894,11 @@ type ReleasedCopy struct {
 	Started    bool
 }
 
+// ReleasedNotHeldReason is the outcome_reason ReleaseStaleHeldCopies records on each copy it
+// closes, so the copy history tells the head's release apart from a give-back the client asked
+// for (which records the client's own reason).
+const ReleasedNotHeldReason = "not in the machine's held report"
+
 // ReleaseStaleHeldCopies closes a machine's live copies that it no longer reports
 // holding, per the held set the client sends on each request (its buffer plus its
 // running slots). See the WorkUnitRepository interface for the full contract. The work
@@ -1817,11 +1916,13 @@ type ReleasedCopy struct {
 // dropped (or whose abandon RPC lost the flush race) never ran and says nothing about
 // the unit, so it must not spend the unit's copy budget. A RUN-STARTED copy still
 // closes ABANDONED (lost compute — a real signal, and it keeps the volunteer benched).
+// Either way the row records ReleasedNotHeldReason as its outcome_reason.
 func (r *PgxWorkUnitRepository) ReleaseStaleHeldCopies(ctx context.Context, hostID types.ID, heldWorkUnitIDs []types.ID, olderThan time.Time) ([]ReleasedCopy, error) {
 	rows, err := r.db.Query(ctx, `
 		UPDATE work_unit_assignment_history
 		SET outcome = (CASE WHEN started_at IS NULL THEN 'RETURNED' ELSE 'ABANDONED' END)::assignment_outcome,
-		    outcome_at = NOW()
+		    outcome_at = NOW(),
+		    outcome_reason = $4
 		-- Match by MACHINE (TODO #19): COALESCE(host_id, volunteer_id) = the reporting
 		-- host's effective id, so only THIS machine's copies are reaped and host A's
 		-- report never releases host B's. Equals volunteer_id for a no-host copy.
@@ -1832,7 +1933,7 @@ func (r *PgxWorkUnitRepository) ReleaseStaleHeldCopies(ctx context.Context, host
 		  -- grace-aged copy; otherwise release only those NOT in the held set.
 		  AND (array_length($3::uuid[], 1) IS NULL OR NOT (work_unit_id = ANY($3::uuid[])))
 		RETURNING work_unit_id, (started_at IS NOT NULL)`,
-		hostID, olderThan, heldWorkUnitIDs,
+		hostID, olderThan, heldWorkUnitIDs, ReleasedNotHeldReason,
 	)
 	if err != nil {
 		return nil, apierror.Internal("failed to release stale held copies", err)
@@ -2066,6 +2167,7 @@ func scanCopy(row pgx.Row) (*Copy, error) {
 //   - RUNNING copy (started_at set) past started_at + deadline_seconds, or
 //   - RESERVED copy (started_at NULL, buffered) past reserved_until — a holder that
 //     vanished before run-start.
+//
 // deadline_seconds = 0 means "no deadline" and a RUNNING copy is never expired here.
 func (r *PgxWorkUnitRepository) FindExpiredCopies(ctx context.Context, limit int) ([]*Copy, error) {
 	rows, err := r.db.Query(ctx, `

@@ -13,6 +13,10 @@
 //     authoritative read-side gate), FlushReservations (the batched hand-out
 //     landing write), and ReserveCopy (the single-copy landing write).
 //
+// FindAssignableBatch, the dispatch cache's per-requester fallback, is not a fifth
+// copy of the rule: it builds its query from FindNextAssignable's own SQL
+// (assignableSelectSQL). It is asserted beside FindNextAssignable all the same.
+//
 // Nothing asserted that the four agree. A rule added to one could silently diverge
 // from the others. This package is the shared spine of the parity tests that close
 // that gap:
@@ -21,8 +25,9 @@
 //     in-memory cache state and asserts eligibleLocked's verdict (a plain unit test,
 //     always run); and
 //   - internal/workunit/dispatch_predicate_parity_test.go seeds each Scenario into
-//     Postgres and asserts FindNextAssignable's verdict, plus the subset of the rule
-//     that FlushReservations / ReserveCopy re-enforce (an integration test).
+//     Postgres and asserts FindNextAssignable's and FindAssignableBatch's verdicts,
+//     plus the subset of the rule that FlushReservations / ReserveCopy re-enforce (an
+//     integration test).
 //
 // A Scenario carries ONLY primitive fields (ints, bools, strings, floats). It must
 // not import the workunit or leaf packages: the workunit integration test lives in
