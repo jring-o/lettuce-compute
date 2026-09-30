@@ -183,8 +183,12 @@ message RequestWorkUnitResponse {
   // drained leaf, units already covered by other volunteers' copies, a hidden
   // leaf — is UNSPECIFIED, as is every reply from a head that predates it.
   NoWorkReason no_work_reason = 3;
-  // INFLIGHT_CAP only: how many copies (running and buffered) this head lets
-  // the requesting machine hold at once right now, and how many it holds.
+  // On every reply: how many copies (running and buffered) this head lets the
+  // requesting machine hold at once right now, and how many it holds once this
+  // reply's assignments are counted. The room left is inflight_cap -
+  // inflight_held; a client asks for no more than that. inflight_cap is 0 when
+  // the head states none. INFLIGHT_CAP is the empty reply to a machine that
+  // holds its cap.
   int32 inflight_cap = 4;
   int32 inflight_held = 5;
   // INFEASIBLE_DEADLINE only: a refused unit's deadline, and how long the head

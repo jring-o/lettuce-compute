@@ -31,7 +31,7 @@ func slowGREPHost(t *testing.T, mc *mockClient) *Daemon {
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	d.cfg.Servers = []config.ServerConfig{{Name: "head-1", GRPCAddress: "head-1:443"}}
 	d.slotManager = NewSlotManager(4, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.durations = LoadDurationTracker(t.TempDir())
 	for i := 0; i < 4; i++ {
 		d.durations.Record("leaf-grep", 0, 5*3600)

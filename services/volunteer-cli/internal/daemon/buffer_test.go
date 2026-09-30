@@ -22,7 +22,7 @@ func newBufferTestDaemon(t *testing.T, hours float64, maxSlots int, benchFPOPS f
 		cfg:            cfg,
 		logger:         logger,
 		benchmarkFPOPS: benchFPOPS,
-		prefetchQueue:  NewPreFetchQueue(workBufferQueueDepth, logger),
+		prefetchQueue:  NewPreFetchQueue(minWorkBufferQueueDepth, logger),
 		slotManager:    NewSlotManager(maxSlots, logger),
 	}
 }

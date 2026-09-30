@@ -43,7 +43,7 @@ func noWorkHost(t *testing.T, slots, running, queued int, memMB int32) (*Daemon,
 	d.benchmarkFPOPS = 1
 	d.cfg.ResourceLimits.MaxMemoryMB = 1024
 	d.slotManager = NewSlotManager(slots, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false } // the configured budget decides
 	t.Cleanup(func() { freeSystemMemoryMB = orig })

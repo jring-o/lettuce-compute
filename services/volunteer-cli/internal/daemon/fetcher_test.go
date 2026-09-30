@@ -834,7 +834,8 @@ func TestFetcher_RequestsMaxAssignments(t *testing.T) {
 	// instead, TB-84 — see TestTB84_NoEstimateAskIsBoundedByTheCountHeadroom.)
 	d.durations = LoadDurationTracker(t.TempDir())
 	d.durations.Record("leaf-1", 0, 30)
-	queue := NewPreFetchQueue(16, d.logger)
+	// A queue with room for the whole ceiling: the ask never exceeds the room.
+	queue := NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	fetcher := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	fetcher.backoff = 1 * time.Millisecond
 	fetcher.maxBackoff = 2 * time.Millisecond

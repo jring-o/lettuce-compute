@@ -223,7 +223,7 @@ func previewHost(t *testing.T) *Daemon {
 	d := deadlineHost(t, 4)
 	d.durations = LoadDurationTracker(t.TempDir())
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.leafCache.PopulateForTest("head-1", &CachedHeadInfo{Name: "head-1", Leafs: []CachedLeafInfo{
 		{ID: "leaf-grep", Slug: "grep", Name: "GREP", State: "ACTIVE",
 			ResourceRequirements: &CachedResourceRequirements{MinCPUCores: 2, MaxCPUCores: 4}},

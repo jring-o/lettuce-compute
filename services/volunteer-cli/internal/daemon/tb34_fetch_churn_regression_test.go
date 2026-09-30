@@ -98,7 +98,8 @@ func TestTB34_ReturnedTailCapsNextAsk(t *testing.T) {
 	}
 	servers := []*ServerConnection{{Client: mc, VolunteerID: "vol-1", Name: "server-a", Available: true}}
 	d := newFetcherTestDaemon(servers)
-	queue := NewPreFetchQueue(16, d.logger)
+	// A queue with room for the whole ask: the ask never exceeds the room.
+	queue := NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	f := NewFetcher(d, queue, d.weightedSelector, d.leafCache)
 	f.batchSizeFn = func(CachedLeafInfo, float64, float64) int32 { return 64 }
 	// Accept the first arrival of each round, refuse the rest — the arrival guard's

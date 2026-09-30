@@ -180,7 +180,7 @@ func TestTB84_FleetRoundKeepsWhatItAsksFor(t *testing.T) {
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = 2
 	setTestSlots(d.cfg, 1)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.slotManager = NewSlotManager(1, d.logger)
 	d.durations = tb84Tracker(t)
 	f := NewFetcher(d, d.prefetchQueue, d.weightedSelector, d.leafCache)

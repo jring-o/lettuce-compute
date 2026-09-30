@@ -40,7 +40,7 @@ func newBackfillTestDaemon(t *testing.T, blockCh chan struct{}) *Daemon {
 	t.Helper()
 	d := newTestDaemon(&mockClient{}, &mockRuntime{canHandle: true})
 	d.slotManager = NewSlotManager(2, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.cfg.ResourceLimits.MaxMemoryMB = 8192
 
 	orig := freeSystemMemoryMB

@@ -145,7 +145,7 @@ func tb32FetchDaemon(t *testing.T, mc *mockClient) (*Daemon, []*ServerConnection
 	d.cfg.ResourceLimits.MaxMemoryMB = 8192
 	d.benchmarkFPOPS = 1.0
 	d.slotManager = NewSlotManager(2, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	tb32Starve(t, d)
 
 	d.leafCache.PopulateForTest("test-head", &CachedHeadInfo{

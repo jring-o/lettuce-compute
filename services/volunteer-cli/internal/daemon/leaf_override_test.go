@@ -51,7 +51,7 @@ func overrideHost(t *testing.T, mc *mockClient, prefs string) (*Daemon, CachedLe
 	d.cfg.Servers = []config.ServerConfig{{Name: "head-1", GRPCAddress: "head-1:443", LeafPreferences: leafPrefsYAML(t, prefs)}}
 	d.benchmarkFPOPS = 1.0
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	grep := CachedLeafInfo{ID: "leaf-grep", Slug: "grep", Name: "GREP", State: "ACTIVE", EstimatedDurationSeconds: 600,
 		ResourceRequirements: &CachedResourceRequirements{MinCPUCores: 1, MaxCPUCores: 1}}
 	bb := CachedLeafInfo{ID: "leaf-bb", Slug: "beyblade", Name: "Beyblade", State: "ACTIVE", EstimatedDurationSeconds: 600,
@@ -162,7 +162,7 @@ func grantHost(t *testing.T, prefs string) (*Daemon, *grantRecordingEngine, *run
 	head := d.multiClient.Servers()[0].Name
 	d.cfg.Servers = []config.ServerConfig{{Name: head, LeafPreferences: leafPrefsYAML(t, prefs)}}
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	t.Cleanup(func() { freeSystemMemoryMB = orig })

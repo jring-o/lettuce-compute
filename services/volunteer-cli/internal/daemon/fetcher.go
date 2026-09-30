@@ -485,8 +485,10 @@ func (f *Fetcher) Run(ctx context.Context) {
 		// ZERO RequestWorkUnit calls. Re-check on a short cadence (f.backoff, not
 		// the longer idleWait) so the fetcher refills promptly the moment a running
 		// slot completes and frees buffer capacity, without polling the head.
-		if f.workBufferFullFn != nil && f.workBufferFullFn() {
-			f.enterWait("buffer_full", "fetcher: work buffer full, not requesting", "queue_len", f.queue.Len())
+		// A queue at its depth is a full buffer too, whatever the hours say:
+		// nothing a head sent now could be buffered, only given back.
+		if full, queueFull := f.workBufferFullFn != nil && f.workBufferFullFn(), f.queue.Room() == 0; full || queueFull {
+			f.enterWait("buffer_full", "fetcher: work buffer full, not requesting", "queue_len", f.queue.Len(), "queue_at_depth", queueFull)
 			recheck := f.backoff
 			if recheck <= 0 {
 				recheck = time.Millisecond
@@ -657,10 +659,12 @@ func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
 	any := false
 	for _, srv := range f.availableServers() {
 		next := srv.NextContactAt
-		if f.capWaiting(srv) && srv.capWaitUntil.After(next) {
+		if f.capWaiting(srv) {
 			// Held at its in-flight cap until a copy finishes: re-checked on the
 			// poll granularity below, so a completion is noticed within idleWait.
-			next = srv.capWaitUntil
+			if hold := now.Add(idleWait); hold.After(next) {
+				next = hold
+			}
 		}
 		if !now.Before(next) {
 			// Contactable now.
@@ -809,7 +813,8 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 		// A head holding this machine at its in-flight cap has nothing for it until
 		// one of its copies is done: its share of the deficit passes on.
 		if f.capWaiting(head) {
-			f.logger.Debug("fetcher: head is holding this machine at its in-flight cap; waiting for a copy to finish", "server", head.Name, "held", head.capWaitHeld)
+			f.logger.Debug("fetcher: head is holding this machine at its in-flight cap; waiting for a copy to finish", "server", head.Name,
+				"held", f.heldFromHead(head.Name), "stated_cap", head.statedCap)
 			spent[head.Name] = true
 			continue
 		}
@@ -1053,6 +1058,17 @@ func (f *Fetcher) ask(ctx context.Context, head *ServerConnection, leaf CachedLe
 	if limit, ok := f.batchCap[batchCapKey(head.Name, leaf.ID)]; ok && maxAssignments > limit {
 		maxAssignments = limit
 	}
+	// Every limit that can refuse a unit bounds the ask, not only the hours: the room
+	// left in the queue (a unit arriving to a full one can only go back), and the room
+	// left under the in-flight cap this head stated on its last reply (it would hand out
+	// no more). Neither is ever zero here: the loop asks nothing while the queue is full,
+	// and passes over a head this machine holds its cap of (capWaiting).
+	if room := int32(f.queue.Room()); room > 0 && maxAssignments > room {
+		maxAssignments = room
+	}
+	if room, known := f.headRoom(head); known && room > 0 && maxAssignments > int32(room) {
+		maxAssignments = int32(room)
+	}
 
 	// Report the work units this volunteer currently holds so the head can release
 	// any reservations it no longer holds (e.g. dropped across a restart). The set
@@ -1173,6 +1189,7 @@ func (f *Fetcher) ask(ctx context.Context, head *ServerConnection, leaf CachedLe
 	f.headStatus.MarkContactOK(head.Config.GRPCAddress)
 	f.notices.Resolve("update_required", head.Name, "")
 	f.applyServerRetryDelay(head, resp.RetryAfterSeconds)
+	f.noteStatedCap(head, resp)
 
 	// No-work is an OK response carrying an empty assignments list (the
 	// codes.NotFound sentinel was removed from the protocol).
@@ -1218,12 +1235,18 @@ func (f *Fetcher) noteBatchOutcome(headName, leafID string, kept, returned int) 
 	delete(f.batchCap, key)
 }
 
+// queueFullReason is the give-back reason for a unit the work buffer's queue had
+// no room for.
+const queueFullReason = "work buffer full (its queue is at its depth)"
+
 // bufferBatch prepares each assignment in a batch and pushes it into the client
 // work buffer, recording the assignment with the selector once per buffered
 // unit. Unusable units (bad ID, no runtime, prepare failure) are abandoned back
-// to the head. Returns the count actually buffered AND the count returned as
-// un-run buffer give-backs (the bufferAccepts refusals + a full-queue push), so
-// requestAndBuffer can shrink the next ask after a returned tail (TB-34).
+// to the head. Every unit ends buffered or given back; only a duplicate of one
+// already held is skipped. Returns the count actually buffered AND the count
+// returned as un-run buffer give-backs (the bufferAccepts refusals and every
+// unit the queue had no room for), so requestAndBuffer can shrink the next ask
+// after a returned tail (TB-34).
 func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf CachedLeafInfo, assignments []*lettucev1.WorkUnitAssignment) (pushed, returned int) {
 	// Dedup against what this volunteer already holds (prefetch buffer + active slots)
 	// and against earlier units in this same batch. A head should never hand a unit a
@@ -1292,6 +1315,18 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 				returned++
 				continue
 			}
+		}
+
+		// The queue's depth is a limit too, and a unit it has no room for goes
+		// back the same way, before any Prepare cost. Every unit a head hands out
+		// ends buffered or given back: one that is neither is missing from the
+		// held set the next request reports, and the head holds it against this
+		// machine's cap until its reclaim notices, then re-offers it too soon.
+		if f.queue.IsFull() {
+			f.logger.Info("fetcher: returning batch unit; the work buffer's queue is full", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug)
+			f.giveBackWorkUnit(ctx, head, wu, queueFullReason)
+			returned++
+			continue
 		}
 
 		if engineDown[runtimeKeyForWU(wu)] {
@@ -1371,16 +1406,18 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			FetchedAt: f.now(),
 		}
 		if err := f.queue.Push(item); err != nil {
-			// Buffer filled between the fullness check and now — return the un-run
-			// unit to the head (a give-back: budget-neutral, TB-35) and clean up
-			// rather than orphaning it as reserved.
+			// The queue filled while this unit was prepared (a restarted task goes
+			// back in ahead of everything, whatever the depth). Return the un-run
+			// unit to the head (a give-back: budget-neutral), clean up, and
+			// carry on: every later unit of the batch meets the full queue above and
+			// goes back too, rather than being dropped.
 			f.logger.Warn("fetcher: queue push failed (full between check and push)", "error", err)
-			f.giveBackWorkUnit(ctx, head, wu, "buffer full")
+			f.giveBackWorkUnit(ctx, head, wu, queueFullReason)
 			returned++
 			if rt != nil && prep != nil {
 				rt.Cleanup(prep)
 			}
-			break
+			continue
 		}
 
 		f.logger.Debug("fetcher: buffered work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID)

@@ -223,7 +223,7 @@ func TestTB79_UnitDeclaringMoreThanTheBudgetIsGivenBackNotClamped(t *testing.T) 
 	d.runtimeRegistry.Register(container)
 	setTestSlots(d.cfg, 2)
 	d.slotManager = NewSlotManager(2, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.limiter = &testLimiter{}
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	defer func() { freeSystemMemoryMB = defaultFreeSystemMemoryMB }()
