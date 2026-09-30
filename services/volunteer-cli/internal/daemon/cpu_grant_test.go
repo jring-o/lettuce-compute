@@ -51,7 +51,7 @@ func grantTestDaemon(t *testing.T, cores int) *Daemon {
 	d.cfg.ResourceLimits.MaxCPUCores = cores
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	t.Cleanup(func() { freeSystemMemoryMB = orig })

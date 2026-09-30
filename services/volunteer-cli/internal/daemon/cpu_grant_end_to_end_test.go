@@ -104,7 +104,7 @@ func TestTasksAreGrantedTheirLeafsCoresNotAnEqualShare(t *testing.T) {
 	d.cfg.ResourceLimits.MaxCPUCores = 4
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	defer func() { freeSystemMemoryMB = orig }()
@@ -195,7 +195,7 @@ func TestWideUnitIsNotStarvedByNarrowOnes(t *testing.T) {
 	d.cfg.ResourceLimits.MaxCPUCores = 4
 	d.cfg.ResourceLimits.MaxMemoryMB = 0
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	defer func() { freeSystemMemoryMB = orig }()

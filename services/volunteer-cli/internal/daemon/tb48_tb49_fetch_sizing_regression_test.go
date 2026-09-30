@@ -57,7 +57,7 @@ func tb48FetchHost(t *testing.T, mc *mockClient) (*Daemon, *ServerConnection) {
 	setTestSlots(d.cfg, 8)
 	d.benchmarkFPOPS = 1.0
 	d.slotManager = NewSlotManager(8, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.cachedHW = &lettucev1.HardwareCapabilities{Gpus: []*lettucev1.GpuInfo{{Model: "one-gpu"}}}
 	return d, servers[0]
 }

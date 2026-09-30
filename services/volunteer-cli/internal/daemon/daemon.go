@@ -669,10 +669,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Initialize slot manager and the client work buffer. The buffer's "fullness"
 	// is governed by work_buffer_hours (see workBufferFull); the queue's hard
-	// maxDepth is only a safety ceiling on descriptor count, so it is set well
-	// above the hours target to avoid being the binding constraint.
+	// maxDepth is only a safety ceiling on descriptor count, sized from the slot
+	// pool so it stays above the hours target on a large machine too.
 	d.slotManager = NewSlotManager(slotPool, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepthFor(slotPool), d.logger)
 
 	// Pace this process's own transfers to the configured bandwidth limit
 	// before anything is downloaded or submitted; ApplyConfig keeps it live.
@@ -1882,12 +1882,31 @@ func (d *Daemon) noteUnstattableImageStore(path string) {
 		"path", path)
 }
 
-// workBufferQueueDepth is the hard ceiling on the number of un-run descriptors
-// the client work buffer may hold. The buffer's real "full" gate is hours-based
-// (workBufferFull); this is only a safety cap so a misbehaving head or a leaf
-// with tiny units cannot make the buffer grow without bound. Set generously high
-// so it is not normally the binding constraint.
-const workBufferQueueDepth = 256
+// The client work buffer's queue depth is the hard ceiling on the number of
+// un-run descriptors it may hold. The buffer's real "full" gate is hours-based
+// (workBufferFull); the depth is a safety bound, so that a misbehaving head or
+// a leaf with tiny units cannot make the buffer grow without bound, and it
+// scales with the machine so it is not the binding constraint on a large one:
+// workBufferQueueUnitsPerSlot per execution slot, never fewer than
+// minWorkBufferQueueDepth. A flat 256 bound a 256-slot machine whose two-hour
+// buffer of 13-minute units is some 2,400 units. Sixteen per slot holds two
+// hours of units as short as 7.5 minutes; a slot with sixteen shorter ones
+// queued still has far more runway than the time between two requests. Every
+// limit that can refuse a unit is one the ask obeys: the fetcher asks for no
+// more than the queue has room for and nothing while it is full (Fetcher.ask).
+const (
+	minWorkBufferQueueDepth     = 256
+	workBufferQueueUnitsPerSlot = 16
+)
+
+// workBufferQueueDepthFor is the queue depth for a machine with the given
+// number of execution slots.
+func workBufferQueueDepthFor(slots int) int {
+	if depth := slots * workBufferQueueUnitsPerSlot; depth > minWorkBufferQueueDepth {
+		return depth
+	}
+	return minWorkBufferQueueDepth
+}
 
 // fallbackBufferUnitsPerSlot bounds the buffer when no per-unit time estimate is
 // available: the leaf has not completed here yet, the head carries no leaf-level

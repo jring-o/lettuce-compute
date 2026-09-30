@@ -29,7 +29,7 @@ func containerClassMini(t *testing.T, memMB, cores, vmMB, vmCPUs int) *Daemon {
 	d, _, _, _ := tb85Mini(t, memMB, cores, vmMB, vmCPUs)
 	d.cfg.WorkBufferHours = 2
 	d.benchmarkFPOPS = 1
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	return d
 }
 

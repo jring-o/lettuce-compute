@@ -634,8 +634,12 @@ type RequestWorkUnitResponse struct {
 	// drained leaf, units already covered by other volunteers' copies, a hidden
 	// leaf — is UNSPECIFIED, as is every reply from a head that predates it.
 	NoWorkReason NoWorkReason `protobuf:"varint,3,opt,name=no_work_reason,json=noWorkReason,proto3,enum=lettuce.volunteer.v1.NoWorkReason" json:"no_work_reason,omitempty"`
-	// INFLIGHT_CAP only: how many copies (running and buffered) this head lets
-	// the requesting machine hold at once right now, and how many it holds.
+	// On every reply: how many copies (running and buffered) this head lets the
+	// requesting machine hold at once right now, and how many it holds once this
+	// reply's assignments are counted. The room left is inflight_cap -
+	// inflight_held; a client asks for no more than that. inflight_cap is 0 when
+	// the head states none. INFLIGHT_CAP is the empty reply to a machine that
+	// holds its cap.
 	InflightCap  int32 `protobuf:"varint,4,opt,name=inflight_cap,json=inflightCap,proto3" json:"inflight_cap,omitempty"`
 	InflightHeld int32 `protobuf:"varint,5,opt,name=inflight_held,json=inflightHeld,proto3" json:"inflight_held,omitempty"`
 	// INFEASIBLE_DEADLINE only: a refused unit's deadline, and how long the head

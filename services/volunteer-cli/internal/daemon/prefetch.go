@@ -282,6 +282,17 @@ func (q *PreFetchQueue) IsFull() bool {
 	return len(q.items) >= q.maxDepth
 }
 
+// Room is how many more items Push would take now (never below zero: a unit
+// the volunteer restarted goes back in whatever the depth, see PushFront).
+func (q *PreFetchQueue) Room() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if room := q.maxDepth - len(q.items); room > 0 {
+		return room
+	}
+	return 0
+}
+
 // DropExpiring removes items whose deadline is nearly expired.
 // threshold is the fraction of deadline remaining below which items are dropped
 // (e.g., 0.1 means drop when < 10% of deadline remains).

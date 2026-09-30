@@ -1344,31 +1344,24 @@ func (s *volunteerService) requestWorkUnitFromCache(volunteerID types.ID, opts w
 	}
 
 	assignStart := time.Now()
-	results, _, noWork := cache.HandOutWithReason(volunteerID, opts, n)
+	results, _, reply := cache.HandOutWithReason(volunteerID, opts, n)
 	// The near-zero in-memory hand-out duration folds into the latency signal,
 	// lowering the latency-saturation component of the load estimate.
 	s.loadEstimator.recordAssignLatency(time.Since(assignStart))
 
-	if len(results) == 0 {
-		// The empty reply says why, when the cause is the requester's own state (its
-		// in-flight cap, its account's results or standing, its speed on record); every
-		// other cause stays UNSPECIFIED.
-		resp := &lettucev1.RequestWorkUnitResponse{
-			Assignments:       nil,
-			RetryAfterSeconds: retryAfter,
+	// Every reply states the machine's in-flight cap and count, so the volunteer can ask
+	// for no more than the room left. An empty one also says why, when the cause is the
+	// requester's own state (its in-flight cap, its account's results or standing, its
+	// speed on record); every other cause stays UNSPECIFIED.
+	resp := &lettucev1.RequestWorkUnitResponse{RetryAfterSeconds: retryAfter}
+	if len(results) > 0 {
+		resp.Assignments = make([]*lettucev1.WorkUnitAssignment, 0, len(results))
+		for _, r := range results {
+			resp.Assignments = append(resp.Assignments, buildWorkUnitAssignment(r.unit, r.leaf, r.execConfig))
 		}
-		noWork.apply(resp)
-		return resp, nil
 	}
-
-	assignments := make([]*lettucev1.WorkUnitAssignment, 0, len(results))
-	for _, r := range results {
-		assignments = append(assignments, buildWorkUnitAssignment(r.unit, r.leaf, r.execConfig))
-	}
-	return &lettucev1.RequestWorkUnitResponse{
-		Assignments:       assignments,
-		RetryAfterSeconds: retryAfter,
-	}, nil
+	reply.apply(resp)
+	return resp, nil
 }
 
 // requestWorkUnitFromDB is the Layer-1 per-request reservation path, retained for

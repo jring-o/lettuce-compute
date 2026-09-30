@@ -28,6 +28,8 @@ import (
 //   - on INFLIGHT_CAP, stops asking that head until this machine holds fewer of its units
 //     than it did when the head answered — a copy finished or was given back — because
 //     asking again sooner only repeats the answer;
+//   - reads the in-flight cap a current head states on every reply, asks that head for no
+//     more than the room left under it, and does not ask it while this machine holds it;
 //   - keeps the head's last reason for `status` and `doctor`.
 //
 // A head that predates the field answers UNSPECIFIED, which behaves exactly as before.
@@ -325,10 +327,38 @@ func (f *Fetcher) heldFromHead(name string) int {
 	return f.heldFromHeadFn(name)
 }
 
-// capWaiting reports whether head is being left alone after an INFLIGHT_CAP answer,
-// releasing it once this machine holds fewer of its units than it did then, or after
-// capWaitMax.
+// noteStatedCap records the per-machine in-flight cap a head stated on its reply. A
+// current head states it on every reply; 0 means it stated none.
+func (f *Fetcher) noteStatedCap(head *ServerConnection, resp *lettucev1.RequestWorkUnitResponse) {
+	head.statedCap = int(resp.GetInflightCap())
+	head.statedCapAt = f.now()
+}
+
+// headRoom is how many more units head would hand this machine: the in-flight cap it
+// stated on its last reply less the units this machine holds from it now. The count is
+// this machine's own, because that is the held list its next request reports and the
+// head releases any reservation the list lacks before counting. known is false when the
+// head stated no cap, or stated it capWaitMax ago or more: the cap can rise without a
+// copy finishing here (the head's reliability quota ramps as other volunteers validate
+// this machine's results), and only a request finds that out.
+func (f *Fetcher) headRoom(head *ServerConnection) (room int, known bool) {
+	if head.statedCap <= 0 || f.now().Sub(head.statedCapAt) >= capWaitMax {
+		return 0, false
+	}
+	if room = head.statedCap - f.heldFromHead(head.Name); room < 0 {
+		room = 0
+	}
+	return room, true
+}
+
+// capWaiting reports whether head is holding this machine at its in-flight cap, so it is
+// not asked: the machine holds as many of its units as the cap the head last stated, or
+// the head answered INFLIGHT_CAP and the wait that started is on — released once this
+// machine holds fewer of its units than it did then, or after capWaitMax.
 func (f *Fetcher) capWaiting(head *ServerConnection) bool {
+	if room, known := f.headRoom(head); known && room == 0 {
+		return true
+	}
 	if head.capWaitUntil.IsZero() {
 		return false
 	}

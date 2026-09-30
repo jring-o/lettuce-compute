@@ -544,6 +544,14 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   request-and-return loop. Returned units cost the work unit nothing: the head
   records them as unused give-backs (not failures) and simply avoids re-offering
   the same unit to the same machine for a few minutes.
+- **It never asks for more than it can hold.** Every limit that could refuse a
+  unit bounds a request, not only the hours: the room left in the buffer's queue
+  (sixteen units per task slot, and at least 256) and the room left under the
+  head's per-machine cap, which the head states on every reply. A head whose cap
+  this machine already holds is not asked until one of its tasks finishes. If a
+  batch still brings more than the queue can take, the rest goes straight back to
+  the head unrun, like any other give-back: nothing a head hands out is left
+  neither buffered nor returned.
 - **It learns how long each leaf's units really take on your machine.** Until a
   leaf has completed a unit here, its units are booked at the per-leaf figure
   the head publishes, if it publishes one, or else at a rough figure derived

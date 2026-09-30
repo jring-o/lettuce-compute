@@ -56,7 +56,7 @@ func reasonHost(t *testing.T, heads, slots, running, queued int, reply func(h in
 	d.cfg.ResourceLimits.MaxMemoryMB = 1 << 20
 	d.benchmarkFPOPS = 1
 	d.slotManager = NewSlotManager(slots, d.logger)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	orig := freeSystemMemoryMB
 	freeSystemMemoryMB = func() (int, bool) { return 0, false }
 	t.Cleanup(func() { freeSystemMemoryMB = orig })

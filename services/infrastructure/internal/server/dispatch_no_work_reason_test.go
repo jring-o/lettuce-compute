@@ -41,8 +41,8 @@ func reasonCache(t *testing.T) (*dispatchCache, *fakeLeafRepo) {
 	return c, leafRepo
 }
 
-// emptyHandOut runs one hand-out that must return nothing and returns its reason.
-func emptyHandOut(t *testing.T, c *dispatchCache, vol types.ID, opts workunit.AssignmentOptions) noWorkReply {
+// emptyHandOut runs one hand-out that must return nothing and returns what its reply states.
+func emptyHandOut(t *testing.T, c *dispatchCache, vol types.ID, opts workunit.AssignmentOptions) handOutReply {
 	t.Helper()
 	res, _, nw := c.HandOutWithReason(vol, opts, 1)
 	if len(res) != 0 {
@@ -320,7 +320,7 @@ func TestNoWorkReason_AccountBenched(t *testing.T) {
 // cannot (estimate 1e12 FP-ops, benchmark 1e9/s, deadline 600 s).
 func TestNoWorkReason_Precedence(t *testing.T) {
 	type stage struct{ free, infeasible, cooldown, contributed bool }
-	build := func(t *testing.T, s stage, atCap, benched bool) noWorkReply {
+	build := func(t *testing.T, s stage, atCap, benched bool) handOutReply {
 		c, leafRepo := reasonCache(t)
 		fast, slow := types.NewID(), types.NewID()
 		c.warm(nativeLeaf(fast, 2, false, 0), leafRepo)

@@ -42,6 +42,13 @@ type ServerConnection struct {
 	// by the fetcher goroutine, like NextContactAt.
 	capWaitUntil time.Time
 	capWaitHeld  int
+
+	// statedCap is the per-machine in-flight cap this head stated on its last reply
+	// (0 = it stated none), and statedCapAt when. The fetcher asks the head for no
+	// more than the room left under it (Fetcher.headRoom). Owned by the fetcher
+	// goroutine, like NextContactAt.
+	statedCap   int
+	statedCapAt time.Time
 }
 
 // DaemonState is persisted to disk so the status command can show per-server info.

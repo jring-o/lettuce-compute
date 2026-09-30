@@ -32,12 +32,10 @@ import (
 // an empty answer is UNSPECIFIED.
 
 // noWorkReply is the reason an empty hand-out carries, with the figures its wording needs.
-// The zero value is UNSPECIFIED.
+// The zero value is UNSPECIFIED. The machine's in-flight cap and count, which the
+// INFLIGHT_CAP wording also needs, are on every reply (handOutReply).
 type noWorkReply struct {
 	reason lettucev1.NoWorkReason
-	// INFLIGHT_CAP: this machine's effective cap on this head and its current count.
-	inflightCap  int
-	inflightHeld int
 	// INFEASIBLE_DEADLINE: the first refused unit's deadline and estimated runtime.
 	deadlineSeconds  int64
 	estimatedSeconds int64
@@ -49,9 +47,6 @@ type noWorkReply struct {
 func (r noWorkReply) apply(resp *lettucev1.RequestWorkUnitResponse) {
 	resp.NoWorkReason = r.reason
 	switch r.reason {
-	case lettucev1.NoWorkReason_NO_WORK_REASON_INFLIGHT_CAP:
-		resp.InflightCap = int32(r.inflightCap)
-		resp.InflightHeld = int32(r.inflightHeld)
 	case lettucev1.NoWorkReason_NO_WORK_REASON_INFEASIBLE_DEADLINE:
 		resp.DeadlineSeconds = r.deadlineSeconds
 		resp.EstimatedSeconds = r.estimatedSeconds
@@ -178,18 +173,14 @@ func (t *noWorkTally) noteLocked(c *dispatchCache, volunteerID, hostKey types.ID
 // ALREADY_CONTRIBUTED, whose wording says "every", is reported only when every in-scope
 // refusal was this account's own result or copy. The others need one in-scope unit.
 // Caller holds mu.
-func (c *dispatchCache) noWorkReplyLocked(volunteerID, hostKey types.ID, opts workunit.AssignmentOptions, t noWorkTally) noWorkReply {
+func (c *dispatchCache) noWorkReplyLocked(volunteerID types.ID, t noWorkTally) noWorkReply {
 	if e, ok := c.standingSnapshot[volunteerID]; ok &&
 		volunteer.EffectiveStanding(e.Standing, e.BenchedUntil, c.now()) == volunteer.StandingBenched {
 		return noWorkReply{reason: lettucev1.NoWorkReason_NO_WORK_REASON_ACCOUNT_BENCHED, benchedUntil: e.BenchedUntil}
 	}
 	switch {
 	case t.capBinding:
-		return noWorkReply{
-			reason:       lettucev1.NoWorkReason_NO_WORK_REASON_INFLIGHT_CAP,
-			inflightCap:  opts.MaxInflightPerVolunteer,
-			inflightHeld: c.inflight[hostKey],
-		}
+		return noWorkReply{reason: lettucev1.NoWorkReason_NO_WORK_REASON_INFLIGHT_CAP}
 	case t.infeasible > 0:
 		return noWorkReply{
 			reason:           lettucev1.NoWorkReason_NO_WORK_REASON_INFEASIBLE_DEADLINE,

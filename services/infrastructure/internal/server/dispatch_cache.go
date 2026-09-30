@@ -903,10 +903,12 @@ func (c *dispatchCache) HandOut(volunteerID types.ID, opts workunit.AssignmentOp
 	return results, drained
 }
 
-// HandOutWithReason is HandOut plus, when it hands out nothing, the requester-specific
-// reason the empty reply carries (see dispatch_no_work_reason.go). The reason is the zero
-// value (UNSPECIFIED) whenever anything was handed out.
-func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.AssignmentOptions, n int) (results []handOutResult, drained bool, noWork noWorkReply) {
+// HandOutWithReason is HandOut plus what the reply states besides its units: the machine's
+// in-flight cap and count, on every hand-out (see dispatch_inflight_statement.go), and, when
+// it hands out nothing, the requester-specific reason the empty reply carries (see
+// dispatch_no_work_reason.go). The reason is the zero value (UNSPECIFIED) whenever anything
+// was handed out.
+func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.AssignmentOptions, n int) (results []handOutResult, drained bool, reply handOutReply) {
 	if n < 1 {
 		n = 1
 	}
@@ -956,6 +958,7 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 	// config.EffectiveMinSendIntervalSeconds, which is ENABLED by default.
 	if c.cfg.minSendInterval > 0 {
 		if last, ok := c.lastHandOut[hostKey]; ok && c.now().Sub(last) < c.cfg.minSendInterval {
+			held := c.inflight[hostKey]
 			c.mu.Unlock()
 			if c.logger.Enabled(context.Background(), slog.LevelDebug) {
 				c.logger.Debug("hand-out throttled: min send interval not elapsed",
@@ -963,7 +966,7 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 					"host_id", hostKey,
 					"min_send_interval", c.cfg.minSendInterval)
 			}
-			return nil, false, noWorkReply{}
+			return nil, false, handOutReply{inflightCap: opts.MaxInflightPerVolunteer, inflightHeld: held}
 		}
 	}
 	kept := c.ready[:0]
@@ -1104,9 +1107,10 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 	if taken > 0 && c.cfg.minSendInterval > 0 {
 		c.lastHandOut[hostKey] = c.now()
 	}
+	var noWork noWorkReply
 	var fallback fallbackPlan
 	if taken == 0 {
-		noWork = c.noWorkReplyLocked(volunteerID, hostKey, opts, noWorkT)
+		noWork = c.noWorkReplyLocked(volunteerID, noWorkT)
 		fallback = c.planFallbackLocked(hostKey, opts, n, &rejects, noWork)
 	}
 	c.mu.Unlock()
@@ -1228,6 +1232,9 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 	if drained {
 		c.signalRefill()
 	}
+	// The machine's count once this reply's units are counted (a hand-out the fallback made
+	// is in it, a voided one is not), stated on the reply beside the cap it was held to.
+	held := c.inflightFor(hostKey)
 	// TB-38 (1): every accepted hand-out is one Info line per unit carrying the
 	// identifying triple (unit, leaf, volunteer) plus the requesting machine and the
 	// reservation window — the head-side record that this unit left for that machine.
@@ -1297,7 +1304,7 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 		attrs = append(attrs,
 			"volunteer_id", volunteerID,
 			"host_id", hostKey,
-			"inflight", c.inflightFor(hostKey),
+			"inflight", held,
 			"inflight_cap", opts.MaxInflightPerVolunteer,
 			"ready_len", readyLen,
 			// TB-38 (2): the request's own inputs — what the machine ASKED for — next
@@ -1353,7 +1360,7 @@ func (c *dispatchCache) HandOutWithReason(volunteerID types.ID, opts workunit.As
 		}
 		c.logger.Warn(msg, attrs...)
 	}
-	return final, drained, noWork
+	return final, drained, handOutReply{noWorkReply: noWork, inflightCap: opts.MaxInflightPerVolunteer, inflightHeld: held}
 }
 
 // noteStarved reports whether the no-work WARN should be emitted for this machine now,
@@ -1371,7 +1378,8 @@ func (c *dispatchCache) noteStarved(hostKey types.ID) bool {
 	return true
 }
 
-// inflightFor returns a machine's current in-flight count (for the starvation WARN).
+// inflightFor returns a machine's current in-flight count (for the reply and the starvation
+// WARN).
 func (c *dispatchCache) inflightFor(hostKey types.ID) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

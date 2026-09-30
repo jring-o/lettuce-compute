@@ -105,7 +105,7 @@ func newWeightsDaemon(t *testing.T, hours float64, heads ...weightsHeadSpec) *Da
 	d := newFetcherTestDaemon(servers)
 	d.cfg.WorkBufferHours = hours
 	setTestSlots(d.cfg, 1)
-	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
+	d.prefetchQueue = NewPreFetchQueue(minWorkBufferQueueDepth, d.logger)
 	d.slotManager = NewSlotManager(1, d.logger)
 	d.durations = LoadDurationTracker(t.TempDir())
 	headWeights := map[string]int{}
