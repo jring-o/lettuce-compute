@@ -272,6 +272,79 @@ describe("OverviewPage", () => {
     ).toBeInTheDocument();
   });
 
+  // A machine that has done everything its heads have ready is told so where the
+  // idle state is shown, one line per head from the daemon, and pointed at the
+  // Projects page, never at a terminal command. Nothing lands under "Needs
+  // attention": the daemon raises these reasons as information.
+  describe("when every head says this account has done everything it has ready", () => {
+    const lbry =
+      "This account already has a result on, or holds a copy of, every task lbry.science has ready for Beyblade Arena and Beyblade Arena (native). Each task needs results from different volunteers, so these are waiting for others. New tasks will reach you.";
+    const scios =
+      "This account already has a result on, or holds a copy of, every task infra.scios.tech has ready for GREP f13 (CPU), GREP f14 (CPU) and 2 more. Each task needs results from different volunteers, so these are waiting for others. New tasks will reach you.";
+    const at = new Date(Date.now() - 18_000).toISOString();
+
+    function doneHeads() {
+      setHeads({
+        heads: [
+          { name: "LBRY.Science", grpc_address: "lbry:443", status: "connected", weight: 100, leafs: [],
+            no_work: { reason: "already_contributed", message: lbry, leaves: ["Beyblade Arena", "Beyblade Arena (native)"], at } },
+          { name: "SCIOS", grpc_address: "scios:443", status: "connected", weight: 100, leafs: [],
+            no_work: { reason: "already_contributed", message: scios, leaves: ["GREP f13 (CPU)", "GREP f14 (CPU)", "GREP V1 (CPU)", "GREP V1 (GPU)"], at } },
+        ],
+        machine: noGpuMachine,
+      });
+    }
+
+    it("says so, with each head's line and where to find other leafs", () => {
+      setupDefaultMocks();
+      doneHeads();
+      render(<OverviewPage />);
+      expect(
+        screen.getByText("No active tasks. You've done everything available; waiting for new tasks.")
+      ).toBeInTheDocument();
+      const lines = screen.getByTestId("no-work-lines");
+      expect(lines).toHaveTextContent(lbry);
+      expect(lines).toHaveTextContent(scios);
+      expect(lines).toHaveTextContent("The Projects page lists the other leafs you can run.");
+      expect(lines).not.toHaveTextContent("lettuce-volunteer");
+      expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    });
+
+    it("keeps the ordinary wording while one head has said nothing", () => {
+      setupDefaultMocks();
+      setHeads({
+        heads: [
+          { name: "LBRY.Science", grpc_address: "lbry:443", status: "connected", weight: 100, leafs: [],
+            no_work: { reason: "already_contributed", message: lbry, at } },
+          { name: "Other", grpc_address: "other:443", status: "connected", weight: 100, leafs: [] },
+        ],
+        machine: noGpuMachine,
+      });
+      render(<OverviewPage />);
+      expect(screen.getByText("No active tasks. Waiting for work...")).toBeInTheDocument();
+      expect(screen.getByTestId("no-work-lines")).toHaveTextContent(lbry);
+    });
+
+    it("shows no lines while tasks run", () => {
+      setupDefaultMocks({
+        status: {
+          status: {
+            state: "active",
+            uptime_seconds: 3600,
+            connected_servers: 2,
+            active_tasks: [makeTask({ work_unit_id: "wu-running" })],
+            queued_tasks: [],
+            failing_leafs: [],
+            paused_reason: null,
+          },
+        },
+      });
+      doneHeads();
+      render(<OverviewPage />);
+      expect(screen.queryByTestId("no-work-lines")).not.toBeInTheDocument();
+    });
+  });
+
   it("shows paused empty state when paused with no tasks", () => {
     setupDefaultMocks({
       status: {

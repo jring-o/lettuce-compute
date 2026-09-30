@@ -1176,10 +1176,15 @@ type HeadInfo struct {
 // readable code (inflight_cap, already_contributed, bench_cooldown,
 // account_benched, infeasible_deadline), its plain-language explanation, the
 // leaf it concerned when it concerned one, and when the head said it.
+// already_contributed and bench_cooldown are one line for the head naming
+// every leaf it currently answers that way, listed in Leaves; the reason is
+// already_contributed only when that covers every one of them. The message
+// names no command, so a client can show it as it is.
 type HeadNoWorkInfo struct {
 	Reason  string    `json:"reason"`
 	Message string    `json:"message"`
 	Leaf    string    `json:"leaf,omitempty"`
+	Leaves  []string  `json:"leaves,omitempty"`
 	At      time.Time `json:"at"`
 }
 
@@ -1456,7 +1461,7 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 			UpdateRequired: hs.UpdateRequired,
 		}
 		if nw := hs.NoWork; nw.Reason != "" {
-			hi.NoWork = &HeadNoWorkInfo{Reason: nw.Reason, Message: nw.Message, Leaf: nw.Leaf, At: nw.At}
+			hi.NoWork = &HeadNoWorkInfo{Reason: nw.Reason, Message: nw.Message, Leaf: nw.Leaf, Leaves: nw.Leaves, At: nw.At}
 		}
 
 		// Fill from cache if available.

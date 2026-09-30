@@ -555,6 +555,25 @@ export interface HeadInfo {
   head_version?: string;
   /** The head requires a newer volunteer client (being added by the CLI). */
   update_required?: boolean;
+  /** Why the head is sending no work, when it said; absent otherwise. */
+  no_work?: HeadNoWork;
+}
+
+/**
+ * A head's stated reason for sending no work (`no_work` on `GET /api/v1/heads`),
+ * until it sends work again. `reason` is one of inflight_cap, account_benched,
+ * infeasible_deadline, already_contributed and bench_cooldown. The last two ask
+ * nothing of the volunteer: they come as one line for the head naming every
+ * leaf it answers that way (`leaves`), and are `already_contributed` only when
+ * that covers every one of them. `message` names no command.
+ */
+export interface HeadNoWork {
+  reason: string;
+  message: string;
+  leaf?: string;
+  leaves?: string[];
+  /** When the head last said it (RFC 3339). */
+  at: string;
 }
 
 /** This machine's capabilities as the RUNNING daemon sees them. Arrays are normalised to `[]`. */

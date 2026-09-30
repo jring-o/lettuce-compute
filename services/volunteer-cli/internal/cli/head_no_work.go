@@ -14,7 +14,18 @@ type headNoWorkAPI struct {
 	Reason  string    `json:"reason"`
 	Message string    `json:"message"`
 	Leaf    string    `json:"leaf,omitempty"`
+	Leaves  []string  `json:"leaves,omitempty"`
 	At      time.Time `json:"at"`
+}
+
+// text is the head's line as the terminal shows it: the daemon's wording, which
+// names no command because the desktop app shows it too, and for a head whose
+// ready tasks this account has all done, where to find the others.
+func (nw *headNoWorkAPI) text() string {
+	if nw.Reason == "already_contributed" {
+		return nw.Message + " 'lettuce-volunteer leafs list' shows the other leafs you can run."
+	}
+	return nw.Message
 }
 
 // headNoWorkNeedsAttention reports the reasons doctor lists as warnings: the
@@ -33,7 +44,7 @@ func printHeadNoWork(w io.Writer, heads []leafsAPIHead) {
 		if h.NoWork == nil || h.NoWork.Message == "" {
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("  - %s (%s)", h.NoWork.Message, h.NoWork.At.Local().Format("15:04")))
+		lines = append(lines, fmt.Sprintf("  - %s (%s)", h.NoWork.text(), h.NoWork.At.Local().Format("15:04")))
 	}
 	if len(lines) == 0 {
 		return
@@ -58,6 +69,6 @@ func checkHeadNoWork(rep *doctorReport, heads []leafsAPIHead) {
 		if headNoWorkNeedsAttention(h.NoWork.Reason) {
 			level = docWarn
 		}
-		rep.add(level, name, fmt.Sprintf("sent no work at %s: %s", h.NoWork.At.Local().Format("15:04"), h.NoWork.Message), "")
+		rep.add(level, name, fmt.Sprintf("sent no work at %s: %s", h.NoWork.At.Local().Format("15:04"), h.NoWork.text()), "")
 	}
 }

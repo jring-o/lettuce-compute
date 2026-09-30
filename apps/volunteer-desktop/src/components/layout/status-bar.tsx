@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { getDaemonProcessState, type DaemonProcessState } from "@/api/client";
 import { useDaemonStatus } from "@/hooks/use-daemon-status";
+import { useHeadsNoWork } from "@/hooks/use-heads-no-work";
 import { useSystemMetrics } from "@/hooks/use-metrics";
+import { doneEverythingAvailable, informationalNoWorkLines } from "@/lib/no-work";
 import { cn, formatBytes, pausedLabel } from "@/lib/utils";
 
 function StatusDot({ state }: { state: string }) {
@@ -15,10 +17,16 @@ function StatusDot({ state }: { state: string }) {
   return <span className={cn("inline-block h-2.5 w-2.5 rounded-full", color)} />;
 }
 
-function statusLabel(state: string, taskCount: number, pausedReason: string | null): string {
+function statusLabel(
+  state: string,
+  taskCount: number,
+  pausedReason: string | null,
+  doneEverything: boolean
+): string {
   if (state === "active") {
-    return taskCount > 0
-      ? `Active — ${taskCount} task${taskCount === 1 ? "" : "s"}`
+    if (taskCount > 0) return `Active — ${taskCount} task${taskCount === 1 ? "" : "s"}`;
+    return doneEverything
+      ? "Active — you've done everything available; waiting for new tasks"
       : "Active — waiting for tasks";
   }
   if (state === "paused") {
@@ -80,16 +88,24 @@ export function StatusBar() {
   // reports zeros for both.
   const { system } = useSystemMetrics(5000);
 
+  // What the heads say about sending no work: why an idle machine is idle.
+  const heads = useHeadsNoWork(15000);
+
   const state = status?.state ?? "stopped";
   const taskCount = status?.active_tasks?.length ?? 0;
   const pausedReason = status?.paused_reason ?? null;
-  const label = status ? statusLabel(state, taskCount, pausedReason) : unreachableLabel(process);
+  const idle = state === "active" && taskCount === 0;
+  const label = status
+    ? statusLabel(state, taskCount, pausedReason, idle && doneEverythingAvailable(heads))
+    : unreachableLabel(process);
+  // The heads' own lines, on hover, while nothing runs.
+  const detail = idle ? informationalNoWorkLines(heads).map((l) => l.message).join("\n") : "";
 
   return (
     <div className="flex items-center justify-between border-t bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
       <div className="flex items-center gap-2">
         <StatusDot state={state} />
-        <span>{label}</span>
+        <span title={detail || undefined}>{label}</span>
       </div>
       {system && (
         <div className="flex items-center gap-3">

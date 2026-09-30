@@ -84,15 +84,23 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 
 A head tells the volunteer why it sent nothing when the cause is this machine or
 your account. The volunteer shows that reason instead of the generic "getting no
-work" warning, per head (and per leaf where it concerns one leaf), and clears it
-when that head sends work again. The first three are only a warning in the app's
-**Needs attention** list while a task slot sits idle because of them.
+work" warning, per head, and clears it when that head sends work again.
+
+- `inflight_cap` is a warning in the app's **Needs attention** list only while a task
+  slot sits idle because of it. `account_benched` and `infeasible_deadline` are always
+  warnings there.
+- `already_contributed` and `bench_cooldown` ask nothing of you, so they are never in
+  **Needs attention**. Each head that gives them has one line naming every leaf it
+  covers. `lettuce-volunteer status` and `doctor` show that line. In the app it appears
+  on the Overview while nothing runs, and when you hover over the status bar. When
+  every head says `already_contributed`, the status bar reads "Active — you've done
+  everything available; waiting for new tasks".
 
 | Reason (notice code) | What it means | What to do |
 |---|---|---|
 | `inflight_cap` | The head lets one machine hold only so many of its tasks at once, running and buffered together, and this machine holds that many. The message gives both figures, and how many of your slots are idle because of it. The volunteer does not ask that head again until one of its tasks finishes. | Nothing: it is the head's limit, not a setting on your computer. More work comes as tasks finish. |
-| `already_contributed` | Your account already has a result on, or holds a copy of, every task the head has for that leaf right now. Each task needs results from different volunteers, so those tasks wait for someone else. | Nothing. New tasks on that leaf will reach you; `lettuce-volunteer leafs list` shows the other leafs you can run. |
-| `bench_cooldown` | A recent copy of one of that leaf's tasks, run by your account, did not finish, so the head offers that task to other volunteers first, for about one task deadline. | Nothing, unless it keeps happening; then `lettuce-volunteer status` shows whether a leaf keeps failing on this machine. |
+| `already_contributed` | Your account already has a result on, or holds a copy of, every task the head has ready for the leafs the line names. Each task needs results from different volunteers, so those tasks wait for others. | Nothing. New tasks will reach you. The app's Projects page, or `lettuce-volunteer leafs list`, shows the other leafs you can run. |
+| `bench_cooldown` | A recent copy of one of the named leafs' tasks, run by your account, did not finish, so the head offers that task to other volunteers first, for about one task deadline. | Nothing, unless it keeps happening; then `lettuce-volunteer status` shows whether a leaf keeps failing on this machine. |
 | `account_benched` | The head has paused sending work to your account. The message says until when; with no end time, it lasts until the head's operator lifts it. | Wait for the stated time, or ask the head's operator. |
 | `infeasible_deadline` | At the speed the head has on record for your account (measured on whichever of your machines registered with it last), one of that leaf's tasks would not finish before its deadline, so the head gives them to faster machines. | Nothing on your side. |
 
@@ -779,14 +787,23 @@ than an estimate:
 ```text
 $ ./lettuce-volunteer doctor
   ...
-  info  runs together GREP 2 cores, Beyblade 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them (when the buffer holds work of every enabled leaf in turn)
+  info  runs together GREP × 1 · 2 cores, Beyblade × 1 · 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them (when the buffer holds work of every enabled leaf in turn)
   info  each alone    GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each
 ```
 
-The desktop app shows the same as **What runs together here** on the Projects page and
-under the CPU settings. "Together" assumes the buffer holds work of every enabled leaf
-in turn; "each alone" is what one leaf would do by itself. A task that "would wait" is
-a wide one that the free cores are kept for, rather than started beside narrower tasks.
+Tasks of the same leaf given the same cores are counted together (`Beyblade × 60 · 1 core
+each`). A leaf whose tasks alone get different cores lists each figure once with how
+many tasks get it (`66 at once: 62 × 4 cores, 4 × 2 cores`).
+
+The desktop app shows the same as **What would run together here** on the Projects page
+and under the CPU settings. It is a preview, not what is running now. Its first line
+says what would happen if your queue held work of every enabled leaf: how many tasks
+would run at once and how many of your allowed cores they would use. On a machine with
+many leafs the card starts folded to that line; **Show details** opens it, and the app
+remembers your choice on each page. "Together" assumes the buffer holds work of every
+enabled leaf in turn; "each alone" is what one leaf would do by itself. A task that
+"would wait" is a wide one that the free cores are kept for, rather than started beside
+narrower tasks.
 
 To size your machine:
 
