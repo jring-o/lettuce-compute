@@ -251,7 +251,7 @@ func TestRunPreview_GREPAndBeybladeOnFourCores(t *testing.T) {
 		t.Errorf("Beyblade alone = %v, want four tasks of 1 core", got)
 	}
 	together, aloneText := DescribeRunPreview(p)
-	if together != "GREP 2 cores, Beyblade 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them" {
+	if together != "GREP × 1 · 2 cores, Beyblade × 1 · 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them" {
 		t.Errorf("together = %q", together)
 	}
 	if aloneText != "GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each" {

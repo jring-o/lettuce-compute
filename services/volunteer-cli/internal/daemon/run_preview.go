@@ -155,14 +155,36 @@ func (l budgetLedger) fitsBarCores(d *Daemon, wu *runtime.WorkUnit) bool {
 	return c.fits(d, wu)
 }
 
-// DescribeRunPreview renders the preview in a few lines for `doctor`:
+// DescribeRunPreview renders the preview in a few lines for `doctor`, the tasks
+// that start together grouped by leaf and cores and each figure of a leaf on
+// its own said once, so a large machine's preview stays a line:
 //
-//	together: GREP 2 cores, Beyblade 1 core, Beyblade 1 core — 4 of 4 cores
-//	alone: GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each
+//	together: GREP × 1 · 2 cores, Beyblade × 2 · 1 core each — 4 of 4 cores
+//	alone: GREP 2 at once, 2 cores each; Wide 66 at once: 62 × 4 cores, 4 × 2 cores
 func DescribeRunPreview(p RunPreview) (together, alone string) {
-	var parts []string
+	type group struct {
+		name         string
+		cores, count int
+	}
+	var groups []*group
+	byKey := map[string]*group{}
 	for _, t := range p.Together {
-		parts = append(parts, fmt.Sprintf("%s %s", t.LeafName, plural(t.Cores, "core")))
+		key := fmt.Sprintf("%s/%s/%d", t.Head, t.LeafID, t.Cores)
+		if g := byKey[key]; g != nil {
+			g.count++
+			continue
+		}
+		g := &group{name: t.LeafName, cores: t.Cores, count: 1}
+		byKey[key] = g
+		groups = append(groups, g)
+	}
+	var parts []string
+	for _, g := range groups {
+		part := fmt.Sprintf("%s × %d · %s", g.name, g.count, plural(g.cores, "core"))
+		if g.count > 1 {
+			part += " each"
+		}
+		parts = append(parts, part)
 	}
 	if len(parts) == 0 {
 		together = "nothing can start"
@@ -183,27 +205,30 @@ func DescribeRunPreview(p RunPreview) (together, alone string) {
 		case len(a.Tasks) == 0:
 			leafs = append(leafs, a.LeafName+" none")
 		default:
-			leafs = append(leafs, fmt.Sprintf("%s %d at once, %s", a.LeafName, len(a.Tasks), coreFigures(a.Tasks)))
+			leafs = append(leafs, fmt.Sprintf("%s %d at once%s", a.LeafName, len(a.Tasks), coreFigures(a.Tasks)))
 		}
 	}
 	return together, strings.Join(leafs, "; ")
 }
 
-// coreFigures says the cores of the tasks of one leaf: "2 cores each", or
-// "4, 2 and 2 cores" when they differ.
+// coreFigures says the cores of the tasks of one leaf, to follow "N at once":
+// ", 2 cores each", or when they differ each figure once with how many tasks
+// get it, in the order they start (": 62 × 4 cores, 4 × 2 cores").
 func coreFigures(tasks []int) string {
-	same := true
+	var figures []int
+	count := map[int]int{}
 	for _, c := range tasks {
-		if c != tasks[0] {
-			same = false
+		if count[c] == 0 {
+			figures = append(figures, c)
 		}
+		count[c]++
 	}
-	if same {
-		return plural(tasks[0], "core") + " each"
+	if len(figures) == 1 {
+		return ", " + plural(figures[0], "core") + " each"
 	}
-	nums := make([]string, len(tasks))
-	for i, c := range tasks {
-		nums[i] = fmt.Sprint(c)
+	parts := make([]string, len(figures))
+	for i, c := range figures {
+		parts[i] = fmt.Sprintf("%d × %s", count[c], plural(c, "core"))
 	}
-	return strings.Join(nums[:len(nums)-1], ", ") + " and " + nums[len(nums)-1] + " cores"
+	return ": " + strings.Join(parts, ", ")
 }

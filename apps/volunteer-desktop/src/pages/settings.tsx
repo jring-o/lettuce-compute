@@ -650,7 +650,7 @@ export function SettingsPage() {
           </>
         )}
 
-        <RunPreviewCard refreshKey={cpuSettingsSaved} />
+        <RunPreviewCard refreshKey={cpuSettingsSaved} page="settings" />
         <RestartRunningTasksNote show={cpuSettingsSaved > 0} />
 
         <ResourceSlider

@@ -249,8 +249,10 @@ func TestInflightCap_IdleSlotsAreToldTheCap(t *testing.T) {
 	}
 }
 
-// Each other reason raises its own notice, keyed to the head and leaf, at the level
-// the filing asks, and the generic notice never fires however often the head is asked.
+// Each other reason raises its own notice at its level — a warning for the account's
+// standing and the speed on record, information, one per head, for "already
+// contributed" and "bench cooldown" even with every slot idle — and the generic notice
+// never fires however often the head is asked.
 func TestNoWorkReason_EachReasonHasItsOwnNotice(t *testing.T) {
 	end := time.Date(2026, 10, 1, 12, 30, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -262,10 +264,10 @@ func TestNoWorkReason_EachReasonHasItsOwnNotice(t *testing.T) {
 		wantParts []string
 	}{
 		{"already contributed, slot idle", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED},
-			noticeAlreadyContributed, "leaf-0", NoticeWarn,
-			[]string{"This account already has a result on, or already holds a copy of, every task head-0 has for Leaf 0 right now.", "'lettuce-volunteer leafs list'"}},
+			noticeAlreadyContributed, "", NoticeInfo,
+			[]string{"This account already has a result on, or holds a copy of, every task head-0 has ready for Leaf 0.", "New tasks will reach you."}},
 		{"bench cooldown, slot idle", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_BENCH_COOLDOWN},
-			noticeBenchCooldown, "leaf-0", NoticeWarn,
+			noticeBenchCooldown, "", NoticeInfo,
 			[]string{"A recent copy of a Leaf 0 task on head-0, run by this account, did not finish", "Nothing to change unless it keeps happening."}},
 		{"account benched until a time", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_ACCOUNT_BENCHED, BenchedUntilUnix: end.Unix()},
 			noticeAccountBenched, "", NoticeWarn,
@@ -302,6 +304,9 @@ func TestNoWorkReason_EachReasonHasItsOwnNotice(t *testing.T) {
 					t.Errorf("message %q lacks %q", n.Message, part)
 				}
 			}
+			if strings.Contains(n.Message, "lettuce-volunteer") {
+				t.Errorf("message %q names a terminal command; the app shows it as it is", n.Message)
+			}
 			if nw := d.headStatus.Get("head-0:443").NoWork; nw.Reason != tc.code || nw.Message != n.Message {
 				t.Errorf("head's last reason = %+v, want %s with the notice's wording", nw, tc.code)
 			}
@@ -309,8 +314,7 @@ func TestNoWorkReason_EachReasonHasItsOwnNotice(t *testing.T) {
 	}
 }
 
-// Already contributed and bench cooldown are warnings only while the machine is short
-// of work; with every slot busy nothing needs the owner's attention.
+// Already contributed is information with every slot busy too.
 func TestNoWorkReason_InfoWhileEverySlotIsBusy(t *testing.T) {
 	d, _, _ := reasonHost(t, 1, 1, 1, 0, func(int) *lettucev1.RequestWorkUnitResponse {
 		return &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED}
@@ -387,7 +391,9 @@ func TestNoWorkReasonMessage_Wording(t *testing.T) {
 		{"cap, one idle slot", "L", capReply(1, 1), 1, 2,
 			"lbry lets this machine hold 1 task at a time right now, and this machine holds 1, so 1 of its 2 slots is idle. More will come as these finish. This is the head's limit, not a setting on your computer."},
 		{"contributed, any-leaf request", "", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED}, 0, 1,
-			"This account already has a result on, or already holds a copy of, every task lbry has for this machine right now. Each task needs results from different volunteers, so these wait for someone else. New tasks, if the leaf gets any, will reach you. 'lettuce-volunteer leafs list' shows the other leafs you can run."},
+			"This account already has a result on, or holds a copy of, every task lbry has ready for this machine. Each task needs results from different volunteers, so these are waiting for others. New tasks will reach you."},
+		{"contributed, one leaf", "L", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED}, 3, 4,
+			"This account already has a result on, or holds a copy of, every task lbry has ready for L. Each task needs results from different volunteers, so these are waiting for others. New tasks will reach you."},
 		{"deadline without an estimate", "L", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_INFEASIBLE_DEADLINE, DeadlineSeconds: 3 * 3600}, 0, 1,
 			"L's tasks on lbry must finish within 3 hours, and at the speed lbry has on record for your account one would not, so the head gives them to faster machines. Nothing to change on your side."},
 		{"deadline, hours and minutes", "L", &lettucev1.RequestWorkUnitResponse{NoWorkReason: lettucev1.NoWorkReason_NO_WORK_REASON_INFEASIBLE_DEADLINE, DeadlineSeconds: 6 * 3600, EstimatedSeconds: 7*3600 + 5*60}, 0, 1,

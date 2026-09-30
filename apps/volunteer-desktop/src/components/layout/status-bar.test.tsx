@@ -5,6 +5,7 @@ import { StatusBar } from "./status-bar";
 
 const mockUseDaemonStatus = vi.fn();
 const mockUseSystemMetrics = vi.fn();
+const mockUseHeadsNoWork = vi.fn();
 
 vi.mock("@/hooks/use-daemon-status", () => ({
   useDaemonStatus: () => mockUseDaemonStatus(),
@@ -13,6 +14,21 @@ vi.mock("@/hooks/use-daemon-status", () => ({
 vi.mock("@/hooks/use-metrics", () => ({
   useSystemMetrics: () => mockUseSystemMetrics(),
 }));
+
+vi.mock("@/hooks/use-heads-no-work", () => ({
+  useHeadsNoWork: () => mockUseHeadsNoWork(),
+}));
+
+function head(address: string, noWork?: { reason: string; message: string }) {
+  return {
+    name: address,
+    grpc_address: address,
+    status: "connected",
+    weight: 100,
+    leafs: [],
+    ...(noWork ? { no_work: { ...noWork, at: "2026-09-29T10:15:00Z" } } : {}),
+  };
+}
 
 function status(overrides: Record<string, unknown>) {
   return {
@@ -38,6 +54,38 @@ describe("StatusBar", () => {
     mockUseSystemMetrics.mockReturnValue({
       system: { cpu_usage_pct: 33.4, memory_used_mb: 2048, memory_total_mb: 8192 },
       error: null,
+    });
+    mockUseHeadsNoWork.mockReturnValue([]);
+  });
+
+  // An idle machine whose heads all say this account has done everything they have
+  // ready says so, with each head's line on hover, instead of a bare "waiting".
+  describe("when the heads say why nothing runs", () => {
+    const done = (h: string) => ({
+      reason: "already_contributed",
+      message: `This account already has a result on, or holds a copy of, every task ${h} has ready for A and B.`,
+    });
+
+    it("says everything available is done when every head says so", () => {
+      mockUseHeadsNoWork.mockReturnValue([head("lbry", done("lbry")), head("scios", done("scios"))]);
+      mockUseDaemonStatus.mockReturnValue(status({}));
+      render(<StatusBar />);
+      const label = screen.getByText("Active — you've done everything available; waiting for new tasks");
+      expect(label).toHaveAttribute("title", `${done("lbry").message}\n${done("scios").message}`);
+    });
+
+    it("keeps the ordinary wording while one head has said nothing", () => {
+      mockUseHeadsNoWork.mockReturnValue([head("lbry", done("lbry")), head("scios")]);
+      mockUseDaemonStatus.mockReturnValue(status({}));
+      render(<StatusBar />);
+      expect(screen.getByText("Active — waiting for tasks")).toHaveAttribute("title", done("lbry").message);
+    });
+
+    it("counts tasks once one runs", () => {
+      mockUseHeadsNoWork.mockReturnValue([head("lbry", done("lbry")), head("scios", done("scios"))]);
+      mockUseDaemonStatus.mockReturnValue(status({ active_tasks: [{}, {}, {}] }));
+      render(<StatusBar />);
+      expect(screen.getByText("Active — 3 tasks")).not.toHaveAttribute("title");
     });
   });
 

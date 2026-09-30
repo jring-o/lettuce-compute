@@ -270,7 +270,7 @@ export function ProjectsPage() {
       )}
 
       {/* What runs together under the current settings */}
-      {heads.length > 0 && <RunPreviewCard refreshKey={cpuSettingsSaved} />}
+      {heads.length > 0 && <RunPreviewCard refreshKey={cpuSettingsSaved} page="projects" />}
       <RestartRunningTasksNote show={cpuSettingsSaved > 0} />
 
       {/* Head sections */}

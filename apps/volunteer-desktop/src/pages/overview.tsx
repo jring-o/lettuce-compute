@@ -17,6 +17,7 @@ import { ActiveTaskTable } from "@/components/tasks/active-task-table";
 import { TaskDetailPanel } from "@/components/tasks/task-detail-panel";
 import { TaskFilters, applyTaskFilters, isQueuedTask, type TaskFilterState } from "@/components/tasks/task-filters";
 import { STATUS_DOT_COLOR, STATUS_TEXT, RUNTIME_BADGE } from "@/components/tasks/task-status";
+import { doneEverythingAvailable, informationalNoWorkLines, OTHER_LEAFS_HINT } from "@/lib/no-work";
 import {
   cn,
   formatDuration,
@@ -220,6 +221,40 @@ function PulsingDot() {
       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
       <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-primary" />
     </span>
+  );
+}
+
+/**
+ * Nothing running and nothing paused. Where the heads said why they send no
+ * work and it asks nothing of the volunteer (this account has done every task
+ * they have ready, or a failed copy keeps it off one for a while), their lines
+ * are here, one per head, as information rather than under "Needs attention".
+ */
+function WaitingForWork({ heads }: { heads: HeadInfo[] }) {
+  const lines = informationalNoWorkLines(heads);
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <PulsingDot />
+        <span>
+          {doneEverythingAvailable(heads)
+            ? "No active tasks. You've done everything available; waiting for new tasks."
+            : "No active tasks. Waiting for work..."}
+        </span>
+      </div>
+      {lines.length > 0 && (
+        <div className="space-y-1 pl-5 text-xs text-muted-foreground" data-testid="no-work-lines">
+          <ul className="space-y-1">
+            {lines.map((l) => (
+              <li key={l.head}>
+                {l.message} <span className="opacity-70">· {formatTimeAgo(l.at)}</span>
+              </li>
+            ))}
+          </ul>
+          {lines.some((l) => l.reason === "already_contributed") && <p>{OTHER_LEAFS_HINT}</p>}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -660,10 +695,7 @@ export function OverviewPage() {
         ) : isPaused ? (
           <p className="text-sm text-muted-foreground">{pausedExplanation(pausedReason)}</p>
         ) : (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <PulsingDot />
-            <span>No active tasks. Waiting for work...</span>
-          </div>
+          <WaitingForWork heads={heads} />
         )}
       </div>
 

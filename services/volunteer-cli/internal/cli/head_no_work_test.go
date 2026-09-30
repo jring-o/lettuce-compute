@@ -49,3 +49,25 @@ func TestHeadNoWorkLines(t *testing.T) {
 		t.Errorf("doctor listed a head that gave no reason:\n%s", got)
 	}
 }
+
+// The daemon's line for a head whose ready tasks this account has all done names no
+// command, because the desktop app shows it too; the terminal adds where to look.
+func TestHeadNoWorkLines_AlreadyContributedPointsToLeafsList(t *testing.T) {
+	at := time.Date(2026, 9, 29, 6, 15, 0, 0, time.Local)
+	msg := "This account already has a result on, or holds a copy of, every task lbry has ready for A and B. New tasks will reach you."
+	heads := []leafsAPIHead{{Name: "lbry", NoWork: &headNoWorkAPI{Reason: "already_contributed", Message: msg, Leaves: []string{"A", "B"}, At: at}}}
+	pointer := " 'lettuce-volunteer leafs list' shows the other leafs you can run."
+
+	var out bytes.Buffer
+	printHeadNoWork(&out, heads)
+	if want := "Why a head is sending no work:\n  - " + msg + pointer + " (06:15)\n"; out.String() != want {
+		t.Errorf("status section =\n%s\nwant\n%s", out.String(), want)
+	}
+
+	out.Reset()
+	rep := &doctorReport{w: &out}
+	checkHeadNoWork(rep, heads)
+	if rep.warns != 0 || !strings.Contains(out.String(), msg+pointer) {
+		t.Errorf("doctor (warns %d):\n%s", rep.warns, out.String())
+	}
+}

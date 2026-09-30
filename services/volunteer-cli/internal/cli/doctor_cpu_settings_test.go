@@ -43,7 +43,7 @@ func TestDoctorShowsWhatRunsTogether(t *testing.T) {
 	var buf bytes.Buffer
 	checkRunPreview(&doctorReport{w: &buf}, dataDir)
 	out := buf.String()
-	for _, want := range []string{"GREP 2 cores, Beyblade 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them", "GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each"} {
+	for _, want := range []string{"GREP × 1 · 2 cores, Beyblade × 1 · 1 core — 3 of 4 cores; the next GREP task, which needs 2 cores, would wait for them", "GREP 2 at once, 2 cores each; Beyblade 4 at once, 1 core each"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor lacks %q:\n%s", want, out)
 		}

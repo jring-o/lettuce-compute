@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	lettucev1 "github.com/lettuce-compute/infrastructure/proto/lettuce/v1"
@@ -20,6 +22,9 @@ import (
 //
 //   - raises that reason's own notice, keyed to the head (and the leaf, where the reason
 //     is about a leaf's units), instead of feeding the generic "no units matching" streak;
+//     the two reasons that ask nothing of the volunteer (this account has done every task
+//     ready, a recent failed copy of its own) are informational, and are kept as one line
+//     per head naming every leaf they cover rather than a card per leaf;
 //   - on INFLIGHT_CAP, stops asking that head until this machine holds fewer of its units
 //     than it did when the head answered — a copy finished or was given back — because
 //     asking again sooner only repeats the answer;
@@ -45,7 +50,9 @@ const (
 
 var (
 	headReasonNotices = []string{noticeInflightCap, noticeAccountBenched}
-	leafReasonNotices = []string{noticeAlreadyContributed, noticeBenchCooldown, noticeInfeasibleDeadline}
+	// waitingReasonNotices are the informational reasons: one Info notice per head,
+	// worded for every leaf the head answers with that reason.
+	waitingReasonNotices = []string{noticeAlreadyContributed, noticeBenchCooldown}
 )
 
 // noWorkNoticeCode maps a reason to its notice code ("" for UNSPECIFIED or a value this
@@ -80,20 +87,9 @@ func noWorkReasonMessage(headName, leafName string, resp *lettucev1.RequestWorkU
 		}
 		return held + ". More will come as these finish. This is the head's limit, not a setting on your computer."
 	case lettucev1.NoWorkReason_NO_WORK_REASON_ALREADY_CONTRIBUTED:
-		scope := "for " + leafName
-		if leafName == "" {
-			scope = "for this machine"
-		}
-		return fmt.Sprintf("This account already has a result on, or already holds a copy of, every task %s has %s right now. "+
-			"Each task needs results from different volunteers, so these wait for someone else. New tasks, if the leaf gets any, will reach you. "+
-			"'lettuce-volunteer leafs list' shows the other leafs you can run.", headName, scope)
+		return waitingSentence(noticeAlreadyContributed, []waitingLeaf{{label: leafName, head: headName}})
 	case lettucev1.NoWorkReason_NO_WORK_REASON_BENCH_COOLDOWN:
-		task := "a task"
-		if leafName != "" {
-			task = "a " + leafName + " task"
-		}
-		return fmt.Sprintf("A recent copy of %s on %s, run by this account, did not finish, so the head is offering that task to other volunteers first, for about one task deadline. "+
-			"Nothing to change unless it keeps happening.", task, headName)
+		return waitingSentence(noticeBenchCooldown, []waitingLeaf{{label: leafName, head: headName}})
 	case lettucev1.NoWorkReason_NO_WORK_REASON_ACCOUNT_BENCHED:
 		if until := resp.GetBenchedUntilUnix(); until > 0 {
 			return fmt.Sprintf("%s has paused sending work to this account until %s. It resumes on its own.",
@@ -114,6 +110,62 @@ func noWorkReasonMessage(headName, leafName string, resp *lettucev1.RequestWorkU
 			within, headName)
 	}
 	return ""
+}
+
+// waitingSentence words an informational reason for the leaves of one head that
+// gave it; "" for none. It names no command, because the desktop app shows it
+// too: `status` and `doctor` add their own pointer to `leafs list`.
+func waitingSentence(code string, leaves []waitingLeaf) string {
+	if len(leaves) == 0 {
+		return ""
+	}
+	head := leaves[0].head
+	var names []string
+	anyLeaf := false
+	for _, wl := range leaves {
+		if wl.label == "" {
+			anyLeaf = true
+			continue
+		}
+		names = append(names, wl.label)
+	}
+	sort.Strings(names)
+	switch code {
+	case noticeAlreadyContributed:
+		scope := "for " + leafList(names)
+		if anyLeaf || len(names) == 0 {
+			scope = "for this machine"
+		}
+		return fmt.Sprintf("This account already has a result on, or holds a copy of, every task %s has ready %s. "+
+			"Each task needs results from different volunteers, so these are waiting for others. New tasks will reach you.", head, scope)
+	case noticeBenchCooldown:
+		if len(names) > 1 {
+			return fmt.Sprintf("Recent copies of %s tasks on %s, run by this account, did not finish, so the head is offering those tasks to other volunteers first, for about one task deadline. "+
+				"Nothing to change unless it keeps happening.", leafList(names), head)
+		}
+		task := "a task"
+		if len(names) == 1 {
+			task = "a " + names[0] + " task"
+		}
+		return fmt.Sprintf("A recent copy of %s on %s, run by this account, did not finish, so the head is offering that task to other volunteers first, for about one task deadline. "+
+			"Nothing to change unless it keeps happening.", task, head)
+	}
+	return ""
+}
+
+// leafList names leaves compactly: "A", "A and B", "A, B and C", and past three
+// the first two and a count ("A, B and 4 more").
+func leafList(names []string) string {
+	switch n := len(names); {
+	case n == 0:
+		return ""
+	case n == 1:
+		return names[0]
+	case n <= 3:
+		return strings.Join(names[:n-1], ", ") + " and " + names[n-1]
+	default:
+		return fmt.Sprintf("%s, %s and %d more", names[0], names[1], n-2)
+	}
 }
 
 // plural renders "1 task" / "3 tasks".
@@ -180,14 +232,13 @@ func (f *Fetcher) noteNoWorkReason(head *ServerConnection, leaf CachedLeafInfo, 
 		f.notices.Resolve(noticeAccountBenched, head.Name, "")
 	}
 	// One live reason per head and leaf: a different answer for the same leaf ends the
-	// one before it.
-	for _, c := range leafReasonNotices {
-		if c != code {
-			f.notices.Resolve(c, head.Name, leaf.ID)
-		}
+	// one before it (the head's waiting leaves are kept in step through its status).
+	if code != noticeInfeasibleDeadline {
+		f.notices.Resolve(noticeInfeasibleDeadline, head.Name, leaf.ID)
 	}
 	if code == "" {
 		f.headStatus.ClearNoWorkFor(addr, leaf.ID)
+		f.refreshWaitingNotices(head, "")
 		return false
 	}
 
@@ -200,7 +251,7 @@ func (f *Fetcher) noteNoWorkReason(head *ServerConnection, leaf CachedLeafInfo, 
 	if code != noticeInflightCap && code != noticeAccountBenched {
 		nw.Leaf = leafNoticeLabel(leaf)
 	}
-	f.headStatus.SetNoWork(addr, nw)
+	f.headStatus.SetNoWork(addr, head.Name, nw)
 	f.logger.Info("fetcher: head sent no work, and said why", "server", head.Name, "leaf_slug", leaf.Slug, "reason", code,
 		"inflight_cap", resp.GetInflightCap(), "inflight_held", resp.GetInflightHeld(), "idle_slots", idle)
 
@@ -218,17 +269,28 @@ func (f *Fetcher) noteNoWorkReason(head *ServerConnection, leaf CachedLeafInfo, 
 		f.notices.Notify(NoticeWarn, noticeAccountBenched, msg, head.Name, "")
 	case noticeInfeasibleDeadline:
 		f.notices.Notify(NoticeWarn, noticeInfeasibleDeadline, msg, head.Name, leaf.ID)
-	default:
-		// Already contributed, bench cooldown: nothing is wrong, but a machine left
-		// with an idle slot by it is short of work, which is worth a warning; the level
-		// is refreshed with every answer.
-		level := NoticeInfo
-		if idle > 0 {
-			level = NoticeWarn
-		}
-		f.notices.Notify(level, code, msg, head.Name, leaf.ID)
 	}
+	// Already contributed and bench cooldown ask nothing of the volunteer, idle slots
+	// or not: the other leaves they could run are theirs to choose, and these wait for
+	// other volunteers. They are information, one line per head.
+	f.refreshWaitingNotices(head, code)
 	return true
+}
+
+// refreshWaitingNotices keeps a head's informational notices in step with its waiting
+// leaves: one Info notice per reason and head, worded for every leaf the head answers
+// with it, refreshed for the reason the head just gave (observed) and resolved once no
+// leaf is left with it.
+func (f *Fetcher) refreshWaitingNotices(head *ServerConnection, observed string) {
+	for _, code := range waitingReasonNotices {
+		msg := f.headStatus.WaitingMessage(head.Config.GRPCAddress, code)
+		switch {
+		case msg == "":
+			f.notices.Resolve(code, head.Name, "")
+		case code == observed:
+			f.notices.Notify(NoticeInfo, code, msg, head.Name, "")
+		}
+	}
 }
 
 // noteHeadServed ends what a head's earlier empty answers said once it sends work.
@@ -238,9 +300,10 @@ func (f *Fetcher) noteHeadServed(head *ServerConnection, leaf CachedLeafInfo) {
 	for _, c := range headReasonNotices {
 		f.notices.Resolve(c, head.Name, "")
 	}
-	for _, c := range leafReasonNotices {
-		f.notices.Resolve(c, head.Name, leaf.ID)
+	for _, c := range waitingReasonNotices {
+		f.notices.Resolve(c, head.Name, "")
 	}
+	f.notices.Resolve(noticeInfeasibleDeadline, head.Name, leaf.ID)
 }
 
 // resolveCapNoticesIfBusy ends every head's cap notice once no slot is left idle: the
