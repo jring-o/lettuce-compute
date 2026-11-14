@@ -7,9 +7,10 @@
 // SUBJECTS, not merely enough copies.
 //
 // The guiding principle is "identity must be cheap to HAVE but expensive to have
-// TRUSTED": anyone may register and contribute immediately, but their results carry no
-// quorum power until the subject has earned trust through corroborated-clean work (or an
-// operator has seeded it).
+// TRUSTED": anyone may register and contribute immediately; their agreeing results count
+// toward the majority, but under the trust gate a unit validates only when enough of its
+// agreeing accounts have earned trust through corroborated-clean work (or an operator has
+// seeded it).
 //
 // # Distinct from internal/reliability
 //
