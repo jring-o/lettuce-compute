@@ -103,9 +103,9 @@ A desktop application for Windows, macOS, and Linux is in
 [`apps/volunteer-desktop`](apps/volunteer-desktop/README.md) for volunteers who would rather not
 use a terminal. It wraps the client above: it starts `lettuce-volunteer` for you, walks you through
 setup (on Windows, including installing a container runtime), shows what your machine is working
-on, and updates itself. A head sees it as an ordinary client, because it is one. The app's
-installers are published on GitHub as `desktop-vX.Y.Z` releases. The command-line client remains
-the reference client, though a few controls are in the app only, such as pausing all work,
+on, and checks for its own updates. A head sees it as an ordinary client, because it is one. The
+app's installers are published on GitHub as `desktop-vX.Y.Z` releases. The command-line client
+remains the reference client, though a few controls are in the app only, such as pausing all work,
 suspending or aborting a single task, and installing Podman on Windows.
 
 ### A head is a trust domain
