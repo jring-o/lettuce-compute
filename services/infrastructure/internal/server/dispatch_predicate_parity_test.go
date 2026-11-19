@@ -203,8 +203,10 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 	// Benched entries are TIMED (PB-9), derived from the benching outcome's age exactly
 	// as benchSet derives them from the SQL snapshot — the SQL half seeds the same age
 	// via insertCooldownCopy(outcomeAgoSecs = s.CooldownOutcomeAgoSeconds()).
+	// A copy that was still live at staging had no bench row then: its bench comes from the
+	// close below instead.
 	benched := map[types.ID]benchEntry{}
-	if s.Benched() {
+	if s.Benched() && !s.CooldownCopyLiveAtStaging {
 		outcomeAt := c.now().Add(-time.Duration(s.CooldownOutcomeAgoSeconds()) * time.Second)
 		cooldown := time.Duration(s.DeadlineSeconds) * time.Second
 		if cooldown < time.Second {
@@ -282,6 +284,26 @@ func projectGo(t *testing.T, c *dispatchCache, s dispatchparity.Scenario) (types
 		effectiveTrustK:     trustK,
 		effectiveTrustFloor: trustFloor,
 		trustedContributors: trustedContributors,
+	}
+
+	// The requester's closed copy was live when the unit was staged: stage the candidate as
+	// the refill did then (the copy counted, its holder a contributor), and close the copy at
+	// its outcome time while the unit stays staged, as AbandonWorkUnit does. What remains is
+	// what eligibleLocked judges now.
+	if s.CooldownCopyLiveAtStaging {
+		cand.dbActiveCount++
+		cand.contributors[reqSubject] = struct{}{}
+		cand.liveCopies = map[types.ID]liveCopy{requester: {subject: reqSubject}}
+		outcomeAt := c.now().Add(-time.Duration(s.CooldownOutcomeAgoSeconds()) * time.Second)
+		now := c.now
+		c.mu.Lock()
+		c.ready = append(c.ready, cand)
+		c.now = func() time.Time { return outcomeAt }
+		c.closeCopyLocked(unitID, requester, copyFailed)
+		c.now = now
+		cand = c.ready[len(c.ready)-1]
+		c.ready = c.ready[:len(c.ready)-1]
+		c.mu.Unlock()
 	}
 
 	if s.HostOtherInflight > 0 {

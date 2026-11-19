@@ -149,6 +149,13 @@ const (
 	// copies the fallback re-admits the requester (work never strands, PB-9); with
 	// any live copy the bench holds.
 	CooldownExpiredExhausted
+	// CooldownStartedAbandonStale: a run-started copy abandoned LONGER ago than the
+	// cooldown window. Does NOT bench — the cooldown has elapsed.
+	CooldownStartedAbandonStale
+	// CooldownStartedAbandonExhausted: a run-started copy abandoned inside the cooldown
+	// window but longer ago than the pool-exhausted fallback grace — the abandon twin of
+	// CooldownExpiredExhausted.
+	CooldownStartedAbandonExhausted
 )
 
 // FallbackGraceSeconds is the pool-exhausted fallback grace of the post-failure
@@ -163,10 +170,10 @@ const FallbackGraceSeconds = 120
 // row this old; the Go half derives the candidate's timed bench entry from it).
 func (s Scenario) CooldownOutcomeAgoSeconds() int {
 	switch s.Cooldown {
-	case CooldownExpiredStale:
+	case CooldownExpiredStale, CooldownStartedAbandonStale:
 		// Older than the cooldown window (~one deadline): the cooldown has elapsed.
 		return s.DeadlineSeconds + 120
-	case CooldownExpiredExhausted:
+	case CooldownExpiredExhausted, CooldownStartedAbandonExhausted:
 		// Inside the cooldown window but past the fallback grace.
 		return FallbackGraceSeconds + 60
 	default:
@@ -182,7 +189,8 @@ func (s Scenario) CooldownOutcomeAgoSeconds() int {
 // benched set. Whether an entry actually REFUSES additionally depends on its window
 // and the pool-exhausted fallback (PB-9) — see CooldownExpiredExhausted.
 func (c CooldownState) benches() bool {
-	return c == CooldownExpiredRecent || c == CooldownStartedAbandon || c == CooldownUnstartedAbandon || c == CooldownExpiredExhausted
+	return c == CooldownExpiredRecent || c == CooldownStartedAbandon || c == CooldownUnstartedAbandon ||
+		c == CooldownExpiredExhausted || c == CooldownStartedAbandonExhausted
 }
 
 // Gate identifies one of the four predicate implementations under parity test.
@@ -264,6 +272,14 @@ type Scenario struct {
 	SelfPendingResult bool
 	// Cooldown: the requester's most-recent closed copy of the target unit.
 	Cooldown CooldownState
+	// CooldownCopyLiveAtStaging: the requester's closed copy (Cooldown) was still live
+	// when the dispatch cache staged the unit, and was closed while the unit stayed
+	// staged. Only the in-memory layer has a staged snapshot: the refill counted the
+	// copy (its holder as a contributor, the copy in the coverage count) and the close
+	// must take it back out, leaving the cooldown alone to refuse the requester, as the
+	// SQL layer, which sees just the closed row, does. Meaningful only with a Cooldown
+	// state that writes a closed copy.
+	CooldownCopyLiveAtStaging bool
 
 	// --- Subject (DID) distinctness ------------------------------------------
 	// RequesterBinding is the requester row's DID-binding status: BindingNone
@@ -698,6 +714,26 @@ func Scenarios() []Scenario {
 				SQL: false,
 				Why: "in-memory bench-fallback exhaustion trusts live holders only (stale dbActiveCount froze it, TB-26); the SQL landing re-refuses",
 			}
+		}),
+		// A run-started copy that was live when the unit was staged, then abandoned while
+		// the unit stayed staged. The closed row is neither a live copy nor a result, so the
+		// SQL refuses the requester for the cooldown only. The staged candidate had counted
+		// the copy as the requester's contribution; it must stop, or it refuses the requester
+		// as "already contributed" past the window and past the pool-exhausted fallback.
+		with("cooldown_copy_live_at_staging_abandoned_benched", DimCooldown, func(s *Scenario) {
+			s.Cooldown = CooldownStartedAbandon
+			s.CooldownCopyLiveAtStaging = true
+			s.Eligible = false
+		}),
+		with("cooldown_copy_live_at_staging_abandoned_window_elapsed_admitted", DimCooldown, func(s *Scenario) {
+			s.Cooldown = CooldownStartedAbandonStale
+			s.CooldownCopyLiveAtStaging = true
+			s.Eligible = true
+		}),
+		with("cooldown_copy_live_at_staging_abandoned_pool_exhausted_admitted", DimCooldown, func(s *Scenario) {
+			s.Cooldown = CooldownStartedAbandonExhausted
+			s.CooldownCopyLiveAtStaging = true
+			s.Eligible = true
 		}),
 
 		// --- per-machine in-flight cap ---------------------------------------

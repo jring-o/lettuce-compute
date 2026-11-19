@@ -774,3 +774,77 @@ func TestReleaseStaleHeldCopies_FreesStrandedStartedCopy(t *testing.T) {
 		}
 	}
 }
+
+// TestDispatchableBatch_LiveAndPendingContributorsApart: both refill queries report the
+// subjects already covering a unit in two parts, the live copies by holder account (with
+// the holder's subject and whether the copy counts toward coverage) and the PENDING
+// authors' subjects, so the dispatch cache can stop counting a live copy that closes
+// without a result while the unit stays staged. A closed copy is in neither.
+func TestDispatchableBatch_LiveAndPendingContributorsApart(t *testing.T) {
+	pool, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	const valConfigRedundancy5 = `{"redundancy_factor":5,"agreement_threshold":1.0,"comparison_mode":"EXACT","max_retries":3}`
+	userID := createTestUser(t, pool, "dispatch-contributors")
+	leafID := createActiveTestLeaf(t, pool, &userID, "", "", valConfigRedundancy5)
+	repo := NewPgxWorkUnitRepository(pool)
+	ctx := context.Background()
+	wu := mustQueuedWU(t, ctx, repo, leafID)
+
+	okHolder := createTestVolunteer(t, pool)
+	insertLiveCopy(t, pool, wu.ID, okHolder, nil)
+	probationHolder := createTestVolunteer(t, pool)
+	insertLiveCopy(t, pool, wu.ID, probationHolder, nil)
+	setStanding(t, pool, probationHolder, "PROBATION", nil)
+	didHolder := createTestVolunteer(t, pool)
+	did := "did:plc:contrib" + types.NewID().String()[:12]
+	setVolunteerDID(t, pool, didHolder, did, "OK")
+	insertLiveCopy(t, pool, wu.ID, didHolder, nil)
+	author := createTestVolunteer(t, pool)
+	insertPendingResult(t, pool, wu.ID, author)
+	failed := createTestVolunteer(t, pool)
+	insertCooldownCopy(t, pool, wu.ID, failed, "ABANDONED", true, 60)
+
+	wantLive := map[types.ID]LiveContributor{
+		okHolder:        {VolunteerID: okHolder, Subject: "vol:" + okHolder.String(), Countable: true},
+		probationHolder: {VolunteerID: probationHolder, Subject: "vol:" + probationHolder.String(), Countable: false},
+		didHolder:       {VolunteerID: didHolder, Subject: did, Countable: true},
+	}
+	check := func(name string, cands []DispatchCandidate) {
+		t.Helper()
+		var cand *DispatchCandidate
+		for i := range cands {
+			if cands[i].WorkUnit.ID == wu.ID {
+				cand = &cands[i]
+			}
+		}
+		if cand == nil {
+			t.Fatalf("%s: the unit was not returned (countable coverage 3 of 5)", name)
+		}
+		if cand.ActiveAssignments != 4 || cand.ProbationCoverage != 1 {
+			t.Fatalf("%s: active %d, probation %d; want 4, 1", name, cand.ActiveAssignments, cand.ProbationCoverage)
+		}
+		if len(cand.LiveContributors) != len(wantLive) {
+			t.Fatalf("%s: live contributors %+v, want %+v", name, cand.LiveContributors, wantLive)
+		}
+		for _, lc := range cand.LiveContributors {
+			if w, ok := wantLive[lc.VolunteerID]; !ok || w != lc {
+				t.Fatalf("%s: live contributor %+v, want %+v", name, lc, wantLive)
+			}
+		}
+		if len(cand.PendingContributorSubjects) != 1 || cand.PendingContributorSubjects[0] != "vol:"+author.String() {
+			t.Fatalf("%s: pending subjects %v, want [vol:%s]", name, cand.PendingContributorSubjects, author)
+		}
+	}
+
+	found, err := repo.FindDispatchableBatch(ctx, 10, nil, nil)
+	if err != nil {
+		t.Fatalf("FindDispatchableBatch: %v", err)
+	}
+	check("FindDispatchableBatch", found)
+	claimed, err := repo.ClaimDispatchableBatch(ctx, types.NewID(), time.Minute, 10, nil, nil)
+	if err != nil {
+		t.Fatalf("ClaimDispatchableBatch: %v", err)
+	}
+	check("ClaimDispatchableBatch", claimed)
+}

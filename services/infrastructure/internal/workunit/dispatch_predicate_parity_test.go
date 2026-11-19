@@ -298,7 +298,9 @@ func seedParity(t *testing.T, pool *pgxpool.Pool, repo *PgxWorkUnitRepository, s
 	switch s.Cooldown {
 	case dispatchparity.CooldownExpiredRecent, dispatchparity.CooldownExpiredStale, dispatchparity.CooldownExpiredExhausted:
 		insertCooldownCopy(t, pool, wu.ID, requester, "EXPIRED", true, s.CooldownOutcomeAgoSeconds())
-	case dispatchparity.CooldownStartedAbandon:
+	case dispatchparity.CooldownStartedAbandon, dispatchparity.CooldownStartedAbandonStale, dispatchparity.CooldownStartedAbandonExhausted:
+		// CooldownCopyLiveAtStaging needs no extra row here: the database holds only the
+		// closed copy, whatever a cache had staged while it was live.
 		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", true, s.CooldownOutcomeAgoSeconds())
 	case dispatchparity.CooldownUnstartedAbandon:
 		insertCooldownCopy(t, pool, wu.ID, requester, "ABANDONED", false, s.CooldownOutcomeAgoSeconds())
