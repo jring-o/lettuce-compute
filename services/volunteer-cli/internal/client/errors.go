@@ -39,6 +39,25 @@ func IsVolunteerTooOldError(err error) bool {
 	return false
 }
 
+// IsMessageTooLargeError reports whether err is gRPC refusing a message for its
+// size: a reply larger than this client accepts ("received message larger than
+// max"), or a message larger than the sender may send ("trying to send message
+// larger than max"), whichever side refused it. gRPC reports both as
+// ResourceExhausted, the code a head also uses to shed load, so a caller that
+// backs off on ResourceExhausted checks this first: a reply that is too large is
+// not the head being busy, and asking again for the same thing gets the same
+// refusal.
+func IsMessageTooLargeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	return st.Code() == codes.ResourceExhausted && strings.Contains(st.Message(), "larger than max")
+}
+
 // The three constants below are the CLI-side twins of head-side message prefixes.
 // We pin our own copies rather than importing the head packages: those prefixes live
 // under internal/ (unimportable from this separate module) and the CLI must not depend

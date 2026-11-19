@@ -789,7 +789,13 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		return nil, c.classifyEngineError(fmt.Errorf("start container: %w", err))
 	}
 
-	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx, false)
+	result, err := c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx, false)
+	if result != nil {
+		// The limit this container was created with: a kill is explained by
+		// it, even if the budget changed while the container ran.
+		result.MemoryLimitMB = bookedMemMB
+	}
+	return result, err
 }
 
 // removeContainer is the best-effort removal every started container of a

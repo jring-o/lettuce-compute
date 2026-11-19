@@ -172,22 +172,46 @@ func (p pacedCredentials) Clone() credentials.TransportCredentials {
 	return pacedCredentials{p.TransportCredentials.Clone()}
 }
 
-// maxReplyBytes is the largest reply this client accepts: gRPC's default
-// receive limit, which the client does not raise.
+// maxReplyBytes is the largest reply most RPCs accept: gRPC's default receive
+// limit, kept for every RPC whose reply is small by nature.
 const maxReplyBytes = 4 * 1024 * 1024
+
+// maxLargeReplyBytes is the largest reply the two RPCs whose replies can be
+// large accept: GetCheckpoint (a stored checkpoint, up to the leaf's checkpoint
+// size limit, 100 MB by default) and RequestWorkUnit (a batch of units whose
+// inputs travel inline). It is the head's own transport ceiling, the most a head
+// sends in one message. With gRPC's 4 MiB default a larger checkpoint could be
+// saved but never restored, and a work reply over 4 MiB failed as if the head
+// were shedding load.
+const maxLargeReplyBytes = 128 * 1024 * 1024
+
+// largeReply is the call option those two RPCs pass.
+var largeReply = grpc.MaxCallRecvMsgSize(maxLargeReplyBytes)
 
 // rpcCtx returns ctx with the default request timeout if no deadline is set.
 // Under a bandwidth limit the timeout is widened by the time the largest reply
 // this client accepts takes to arrive at that rate (netlimit.Allowance), so
 // pacing alone cannot turn a large reply into a timeout.
 func (c *Client) rpcCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return c.rpcCtxSized(ctx, nil)
+	return c.rpcCtxFor(ctx, nil, maxReplyBytes)
 }
 
 // rpcCtxSized is rpcCtx for an RPC that uploads a large request — a result or
 // a checkpoint of up to about 100 MB — whose own paced transfer time is added
 // too. The request is sized only when a limit is set.
 func (c *Client) rpcCtxSized(ctx context.Context, req proto.Message) (context.Context, context.CancelFunc) {
+	return c.rpcCtxFor(ctx, req, maxReplyBytes)
+}
+
+// rpcCtxLargeReply is rpcCtx for an RPC that accepts a reply of up to
+// maxLargeReplyBytes, so a paced large reply is given the time it takes to
+// arrive. Only those RPCs pay for the longer deadline under a bandwidth limit;
+// every other call keeps the one sized for a 4 MiB reply.
+func (c *Client) rpcCtxLargeReply(ctx context.Context) (context.Context, context.CancelFunc) {
+	return c.rpcCtxFor(ctx, nil, maxLargeReplyBytes)
+}
+
+func (c *Client) rpcCtxFor(ctx context.Context, req proto.Message, replyBytes int64) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
 	}
@@ -197,7 +221,7 @@ func (c *Client) rpcCtxSized(ctx context.Context, req proto.Message) (context.Co
 		if req != nil {
 			up = int64(proto.Size(req))
 		}
-		timeout = netlimit.Allowance(timeout, up, maxReplyBytes)
+		timeout = netlimit.Allowance(timeout, up, replyBytes)
 	}
 	return context.WithTimeout(ctx, timeout)
 }
@@ -227,11 +251,12 @@ func (c *Client) GetRegistrationChallenge(ctx context.Context, req *lettucev1.Ge
 	return c.svc.GetRegistrationChallenge(ctx, req)
 }
 
-// RequestWorkUnit calls the RequestWorkUnit RPC.
+// RequestWorkUnit calls the RequestWorkUnit RPC. Its reply carries every
+// assignment of the batch with its inline input, so it may be large.
 func (c *Client) RequestWorkUnit(ctx context.Context, req *lettucev1.RequestWorkUnitRequest) (*lettucev1.RequestWorkUnitResponse, error) {
-	ctx, cancel := c.rpcCtx(ctx)
+	ctx, cancel := c.rpcCtxLargeReply(ctx)
 	defer cancel()
-	return c.svc.RequestWorkUnit(ctx, req)
+	return c.svc.RequestWorkUnit(ctx, req, largeReply)
 }
 
 // SubmitResult calls the SubmitResult RPC.
@@ -257,11 +282,12 @@ func (c *Client) SaveCheckpoint(ctx context.Context, req *lettucev1.SaveCheckpoi
 	return c.svc.SaveCheckpoint(ctx, req)
 }
 
-// GetCheckpoint calls the GetCheckpoint RPC.
+// GetCheckpoint calls the GetCheckpoint RPC. The head returns the stored
+// checkpoint whole, in one message, so its reply may be large.
 func (c *Client) GetCheckpoint(ctx context.Context, req *lettucev1.GetCheckpointRequest) (*lettucev1.GetCheckpointResponse, error) {
-	ctx, cancel := c.rpcCtx(ctx)
+	ctx, cancel := c.rpcCtxLargeReply(ctx)
 	defer cancel()
-	return c.svc.GetCheckpoint(ctx, req)
+	return c.svc.GetCheckpoint(ctx, req, largeReply)
 }
 
 // GetHeadInfo calls the GetHeadInfo RPC.

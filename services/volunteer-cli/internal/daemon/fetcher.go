@@ -1094,6 +1094,17 @@ func (f *Fetcher) ask(ctx context.Context, head *ServerConnection, leaf CachedLe
 	})
 	if err != nil {
 		st, ok := status.FromError(err)
+		if client.IsMessageTooLargeError(err) {
+			// The reply was too large to pass, not the head shedding load, though
+			// gRPC reports both as ResourceExhausted: the batch's inline inputs
+			// together are over the most one message may carry. Asking for fewer
+			// units next time is what can change the answer; the units the head
+			// reserved for this reply are released by its held-copy reconcile.
+			// The local backoff still applies, so a reply that cannot shrink (one
+			// unit alone over the limit) is not asked for again at once.
+			f.noteReplyTooLarge(head, leaf, maxAssignments, err)
+			return askResult{stop: true}
+		}
 		if ok && st.Code() == codes.ResourceExhausted {
 			// RATE LIMITED: the head is shedding load. ResourceExhausted carries NO
 			// server-directed value (blocker #2 resolution), so we apply a fixed
@@ -1536,6 +1547,25 @@ func (f *Fetcher) applyResourceExhaustedBackoff(head *ServerConnection, leafSlug
 	head.NextContactAt = f.now().Add(backoff)
 	f.logger.Info("fetcher: head shed load (ResourceExhausted), backing off locally",
 		"server", head.Name, "leaf_slug", leafSlug, "error", err, "backoff", backoff)
+}
+
+// noteReplyTooLarge handles a work reply refused for its size: a WARN that says
+// so (not "head shed load"), the next ask for this head and leaf capped at half
+// of this one (the batch cap, which a fully kept batch clears again), and the
+// same local backoff as a load-shedding answer.
+func (f *Fetcher) noteReplyTooLarge(head *ServerConnection, leaf CachedLeafInfo, asked int32, err error) {
+	next := asked / 2
+	if next < 1 {
+		next = 1
+	}
+	f.batchCap[batchCapKey(head.Name, leaf.ID)] = next
+	backoff := withBackoffJitter(f.rateLimitBackoff)
+	if backoff > maxResourceExhaustedBackoff {
+		backoff = maxResourceExhaustedBackoff
+	}
+	head.NextContactAt = f.now().Add(backoff)
+	f.logger.Warn("fetcher: the head's work reply was too large to receive; asking for fewer units next time",
+		"server", head.Name, "leaf_slug", leaf.Slug, "asked", asked, "next_ask_at_most", next, "backoff", backoff, "error", err)
 }
 
 // withBackoffJitter applies +/-20% jitter to a backoff duration.
