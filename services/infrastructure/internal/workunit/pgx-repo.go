@@ -685,6 +685,74 @@ func parseBenchTexts(texts []string) []BenchedVolunteer {
 	return out
 }
 
+// LiveContributor is one live copy (history row, outcome IS NULL) of a staged unit at
+// refill time: the account holding it, the account's trust subject, and whether the
+// copy counts toward the unit's coverage (the holder's current effective standing is
+// OK — countableLiveCopiesSQL's rule for one row). The dispatch cache keys its record
+// of the copy on the account, because a copy close reaches it by account.
+type LiveContributor struct {
+	VolunteerID types.ID
+	Subject     string
+	Countable   bool
+}
+
+// liveContributorsSQL builds the refill-time live-copy snapshot of the unit aliased by
+// wuAlias: one 'volunteer_id|c|subject' text per live copy whose holder row exists,
+// where c is '1' when the copy counts toward coverage and '0' when its holder's
+// standing neutralizes it. The subject is last because it is the only free-form part (a
+// DID); parseLiveContributorTexts splits on the first two separators only. A history
+// row with no holder has no subject and is dropped by the inner join, as the
+// contributor set always dropped it (it still counts in ActiveAssignments). The lc_*
+// aliases collide with none of the dispatch queries' aliases.
+func liveContributorsSQL(wuAlias string) string {
+	return `ARRAY(
+		SELECT lc_h.volunteer_id::text || '|'
+		       || (CASE WHEN ` + standingExprSQL("lc_v") + ` = 'OK' THEN '1' ELSE '0' END) || '|'
+		       || ` + subjectExprSQL("lc_v") + `
+		 FROM work_unit_assignment_history lc_h
+		 JOIN volunteers lc_v ON lc_v.id = lc_h.volunteer_id
+		 WHERE lc_h.work_unit_id = ` + wuAlias + `.id AND lc_h.outcome IS NULL
+	)`
+}
+
+// pendingContributorSubjectsSQL builds the distinct trust subjects that authored a
+// PENDING result on the unit aliased by wuAlias. The pc_* aliases collide with none of
+// the dispatch queries' aliases.
+func pendingContributorSubjectsSQL(wuAlias string) string {
+	return `ARRAY(
+		SELECT DISTINCT ` + subjectExprSQL("pc_v") + `
+		 FROM results pc_r
+		 JOIN volunteers pc_v ON pc_v.id = pc_r.volunteer_id
+		 WHERE pc_r.work_unit_id = ` + wuAlias + `.id AND pc_r.validation_status = 'PENDING'
+	)`
+}
+
+// parseLiveContributorTexts parses liveContributorsSQL's 'uuid|c|subject' texts.
+// Defensive, like parseBenchTexts: a malformed entry is dropped rather than failing the
+// whole refill.
+func parseLiveContributorTexts(texts []string) []LiveContributor {
+	if len(texts) == 0 {
+		return nil
+	}
+	out := make([]LiveContributor, 0, len(texts))
+	for _, t := range texts {
+		idPart, rest, found := strings.Cut(t, "|")
+		if !found {
+			continue
+		}
+		flag, subject, found := strings.Cut(rest, "|")
+		if !found || subject == "" || (flag != "0" && flag != "1") {
+			continue
+		}
+		id, err := types.ParseID(idPart)
+		if err != nil {
+			continue
+		}
+		out = append(out, LiveContributor{VolunteerID: id, Subject: subject, Countable: flag == "1"})
+	}
+	return out
+}
+
 // trustedPresentCountSQL builds the scalar subquery that counts the DISTINCT TRUSTED
 // subjects already covering the work unit identified by unitID (a column expression such as
 // "wu.id" or "v.id"), for the trusted-corroborator reservation. A subject counts trusted
@@ -1137,16 +1205,31 @@ type DispatchCandidate struct {
 	// Runtime is the leaf's execution_config.runtime (for capability matching at
 	// hand-out; WASM stages like every other runtime since PB-11).
 	Runtime string
-	// ContributorSubjects is the set of trust SUBJECTS (a live-bound DID, else the
-	// per-keypair "vol:<uuid>" sentinel — trust.SubjectForVolunteer's SQL twin)
-	// that ALREADY count toward this unit's redundancy at refill time: every
-	// holder of a live copy (history row, outcome IS NULL) plus every author of an
-	// already-submitted PENDING result. Each of the unit's redundant results must
-	// come from a DISTINCT principal — two devices bound to one DID are ONE — so
-	// the hand-out path excludes any requester whose subject is in this set: the
-	// in-memory mirror of the subject-level distinctness FindNextAssignable
-	// enforces in SQL but FindDispatchableBatch (volunteer-agnostic) cannot.
-	ContributorSubjects []string
+	// LiveContributors and PendingContributorSubjects together are the trust
+	// SUBJECTS (a live-bound DID, else the per-keypair "vol:<uuid>" sentinel —
+	// trust.SubjectForVolunteer's SQL twin) that ALREADY count toward this unit's
+	// redundancy at refill time. Each of the unit's redundant results must come from
+	// a DISTINCT principal — two devices bound to one DID are ONE — so the hand-out
+	// path excludes any requester whose subject is in either: the in-memory mirror
+	// of the subject-level distinctness FindNextAssignable enforces in SQL but
+	// FindDispatchableBatch (volunteer-agnostic) cannot.
+	//
+	// The two are kept apart because they end differently. A PENDING result's
+	// coverage stands while the unit is staged. A live copy's coverage ends when the
+	// copy is closed without a result (timed out, abandoned, given back): the SQL
+	// landing then admits its holder again once the post-failure cooldown allows,
+	// so the cache must stop counting that holder too, and it can only do so for a
+	// copy it can name by holder.
+	//
+	// LiveContributors is one entry per live copy (history row, outcome IS NULL:
+	// reserved or running) whose holder row exists, carrying the holder's account,
+	// its subject, and whether the copy counts toward coverage (the holder's
+	// current account standing is OK — the per-row split of ProbationCoverage's
+	// live arm).
+	LiveContributors []LiveContributor
+	// PendingContributorSubjects is the distinct subjects that authored a PENDING
+	// result on this unit at refill time.
+	PendingContributorSubjects []string
 	// Benched is the set of volunteers whose recent copy of this unit TIMED OUT or
 	// was ABANDONED mid-run within roughly one deadline window, each with the time
 	// of its latest benching outcome. They are benched (given last refusal) so a
@@ -1155,8 +1238,9 @@ type DispatchCandidate struct {
 	// in-memory bench mirrors — never out-lives — the SQL cooldown and a small
 	// volunteer pool never strands the work.
 	Benched []BenchedVolunteer
-	// TrustedContributorSubjects is the subset of ContributorSubjects that counts
-	// TRUSTED for the trusted-corroborator reservation at refill time: a live-copy
+	// TrustedContributorSubjects is the subset of the live and pending contributor
+	// subjects that counts TRUSTED for the trusted-corroborator reservation at refill
+	// time: a live-copy
 	// holder whose subject's CURRENT volunteer_trust score meets the resolved
 	// floor, or a PENDING-result author whose STAMPED submission-time score
 	// (results.trust_score_at_submit — exactly what the validation verdict will
@@ -1235,35 +1319,25 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 			-- only COUNTABLE coverage, matching the SQL headroom below (forced replication).
 			`+nonCountableCoverageSQL("wu.id")+` AS probation_coverage,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
-			-- Trust SUBJECTS already counting toward redundancy (distinct): live-copy
-			-- holders + PENDING-result authors, each mapped through the subject expression
-			-- (a live-bound DID, else the "vol:<uuid>" sentinel). The hand-out excludes
-			-- any requester whose subject is in this set, so each redundant result comes
-			-- from a DISTINCT principal — two devices bound to one live DID are one subject
-			-- (the volunteer-agnostic refill cannot express the per-requester guard; it is
-			-- re-checked in memory). A history row with NULL volunteer_id has no subject and
-			-- is dropped by the inner join, exactly as the old volunteer_id filter dropped it.
-			ARRAY(
-				SELECT DISTINCT subj FROM (
-					SELECT `+subjectExprSQL("vc")+` AS subj
-					 FROM work_unit_assignment_history wuah_c
-					 JOIN volunteers vc ON vc.id = wuah_c.volunteer_id
-					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL
-					UNION
-					SELECT `+subjectExprSQL("vr")+` AS subj
-					 FROM results res_c
-					 JOIN volunteers vr ON vr.id = res_c.volunteer_id
-					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
-				) contribs
-			) AS contributor_subjects,
+			-- Trust SUBJECTS already counting toward redundancy: live-copy holders (with
+			-- their account and whether the copy counts) and PENDING-result authors, each
+			-- mapped through the subject expression (a live-bound DID, else the
+			-- "vol:<uuid>" sentinel). The hand-out excludes any requester whose subject is
+			-- in either, so each redundant result comes from a DISTINCT principal — two
+			-- devices bound to one live DID are one subject (the volunteer-agnostic refill
+			-- cannot express the per-requester guard; it is re-checked in memory). The two
+			-- stay apart so the cache can stop counting a holder whose copy is closed
+			-- without a result while the unit stays staged.
+			`+liveContributorsSQL("wu")+` AS live_contributors,
+			`+pendingContributorSubjectsSQL("wu")+` AS pending_contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit
 			-- (~one deadline cooldown), each with its latest benching-outcome time so the
 			-- cache can seed TIMED bench entries (PB-9). Only a STARTED copy benches; a
 			-- graceful return of UN-STARTED buffered work (ABANDONED, started_at NULL) is
 			-- not unreliable (#59).
 			`+benchedSnapshotSQL("wu")+` AS benched_ids,
-			-- Trusted contributor subjects: the subset of contributor_subjects that counts
-			-- TRUSTED for the reservation at refill — live-copy holders by their CURRENT
+			-- Trusted contributor subjects: the subset of the live and pending contributors
+			-- that counts TRUSTED for the reservation at refill — live-copy holders by their CURRENT
 			-- volunteer_trust score, PENDING-result authors by the STAMPED submission-time
 			-- score, both against this leaf's resolved floor. The in-memory hand-out unions
 			-- this snapshot with the trusted holds it stages to size how many remaining copies
@@ -1337,9 +1411,9 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 		var wu WorkUnit
 		var redundancy, active, probationCoverage int
 		var runtime string
-		var contributorTexts, benchedTexts, trustedContribTexts []string
+		var liveTexts, pendingTexts, benchedTexts, trustedContribTexts []string
 		var trustK, trustFloor int
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &liveTexts, &pendingTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan dispatchable work unit", err)
 		}
 		cand := wu
@@ -1350,7 +1424,8 @@ func (r *PgxWorkUnitRepository) FindDispatchableBatch(ctx context.Context, limit
 			ActiveAssignments:          active,
 			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
-			ContributorSubjects:        contributorTexts,
+			LiveContributors:           parseLiveContributorTexts(liveTexts),
+			PendingContributorSubjects: pendingTexts,
 			Benched:                    parseBenchTexts(benchedTexts),
 			TrustedContributorSubjects: trustedContribTexts,
 			EffectiveTrustK:            trustK,
@@ -1469,23 +1544,13 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			-- coverage in its redundancy headroom (forced replication).
 			`+nonCountableCoverageSQL("wu.id")+` AS probation_coverage,
 			COALESCE(l.execution_config->>'runtime', 'NATIVE') AS runtime,
-			-- Distinct trust SUBJECTS already covering redundancy (live-copy holders +
-			-- PENDING-result authors, each mapped through the subject expression): excluded
-			-- at hand-out so each result comes from a distinct principal — two devices of
-			-- one live DID are one subject. Rows with NULL volunteer_id are dropped by the join.
-			ARRAY(
-				SELECT DISTINCT subj FROM (
-					SELECT `+subjectExprSQL("vc")+` AS subj
-					 FROM work_unit_assignment_history wuah_c
-					 JOIN volunteers vc ON vc.id = wuah_c.volunteer_id
-					 WHERE wuah_c.work_unit_id = wu.id AND wuah_c.outcome IS NULL
-					UNION
-					SELECT `+subjectExprSQL("vr")+` AS subj
-					 FROM results res_c
-					 JOIN volunteers vr ON vr.id = res_c.volunteer_id
-					 WHERE res_c.work_unit_id = wu.id AND res_c.validation_status = 'PENDING'
-				) contribs
-			) AS contributor_subjects,
+			-- Trust SUBJECTS already covering redundancy, live-copy holders and
+			-- PENDING-result authors apart, exactly as FindDispatchableBatch emits them:
+			-- excluded at hand-out so each result comes from a distinct principal — two
+			-- devices of one live DID are one subject. Rows with NULL volunteer_id are
+			-- dropped by the joins.
+			`+liveContributorsSQL("wu")+` AS live_contributors,
+			`+pendingContributorSubjectsSQL("wu")+` AS pending_contributor_subjects,
 			-- Volunteers benched by a recent timeout / mid-run abandon of this unit (cooldown
 			-- ~1 deadline), each with its latest benching-outcome time so the cache can seed
 			-- TIMED bench entries (PB-9). Only a STARTED copy benches; a graceful return of
@@ -1517,9 +1582,9 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 		var wu WorkUnit
 		var redundancy, active, probationCoverage int
 		var runtime string
-		var contributorTexts, benchedTexts, trustedContribTexts []string
+		var liveTexts, pendingTexts, benchedTexts, trustedContribTexts []string
 		var trustK, trustFloor int
-		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &contributorTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
+		if err := scanDispatchWorkUnit(rows, &wu, &redundancy, &active, &probationCoverage, &runtime, &liveTexts, &pendingTexts, &benchedTexts, &trustedContribTexts, &trustK, &trustFloor); err != nil {
 			return nil, apierror.Internal("failed to scan claimed work unit", err)
 		}
 		cand := wu
@@ -1530,7 +1595,8 @@ func (r *PgxWorkUnitRepository) ClaimDispatchableBatch(ctx context.Context, head
 			ActiveAssignments:          active,
 			ProbationCoverage:          probationCoverage,
 			Runtime:                    runtime,
-			ContributorSubjects:        contributorTexts,
+			LiveContributors:           parseLiveContributorTexts(liveTexts),
+			PendingContributorSubjects: pendingTexts,
 			Benched:                    parseBenchTexts(benchedTexts),
 			TrustedContributorSubjects: trustedContribTexts,
 			EffectiveTrustK:            trustK,

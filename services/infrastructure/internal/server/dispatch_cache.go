@@ -134,15 +134,30 @@ type candidate struct {
 	probationCoverage int
 	// contributors is the set of trust SUBJECTS that already count toward this unit's
 	// redundancy: live-copy holders + PENDING-result authors at refill time, kept
-	// current as copies run-start (onRunStart). A subject is the account-level trust
-	// key — a live-bound DID, else the per-keypair "vol:<uuid>" sentinel
-	// (trust.SubjectForVolunteer). eligibleLocked excludes them so each of the N
-	// redundant results comes from a DISTINCT PRINCIPAL: two devices under one live DID
-	// are ONE principal, so handing each a copy of one unit buys no extra corroboration
-	// (validation counts them as one subject) and only wastes compute. A subject is
-	// never removed once added (a result/copy is monotonic coverage), so a candidate
-	// that lingers staged across the submitter's submit still excludes it.
+	// current as copies run-start (onRunStart) and as counted copies close without a
+	// result (closeCopyLocked). A subject is the account-level trust key — a live-bound
+	// DID, else the per-keypair "vol:<uuid>" sentinel (trust.SubjectForVolunteer).
+	// eligibleLocked excludes them so each of the N redundant results comes from a
+	// DISTINCT PRINCIPAL: two devices under one live DID are ONE principal, so handing
+	// each a copy of one unit buys no extra corroboration (validation counts them as one
+	// subject) and only wastes compute. A subject stays while its contribution stands: a
+	// PENDING result, or a live copy (which stays counted when it ends in a result, so a
+	// candidate that lingers staged across the submitter's submit still excludes it). A
+	// copy closed without a result stops standing, as it does in the SQL landing, so its
+	// holder is removed and the post-failure bench alone keeps it out.
 	contributors map[string]struct{}
+	// pendingContributors is the subset of contributors counted through a PENDING result
+	// at refill time. A result's coverage never ends while the unit is staged, so a
+	// subject in this set is never removed by a copy close.
+	pendingContributors map[string]struct{}
+	// liveCopies is every live copy this candidate counts, keyed by the holder's ACCOUNT
+	// (a copy close reaches the cache by account): the refill-time live holders and the
+	// copies run-started here after staging. Each copy is counted once in dbActiveCount
+	// (and, when neutralized at refill, in probationCoverage), and its subject is in
+	// contributors. closeCopyLocked takes a closed copy back out of all three, so the
+	// candidate stays what a fresh refill would stage. A copy held only in memory (not
+	// yet run-started) is not here: reservedInMem counts it.
+	liveCopies map[types.ID]liveCopy
 	// benched maps volunteers whose recent copy of this unit timed out / was abandoned
 	// (a refill-time snapshot, plus flush-conflict entries from
 	// voidNonLandedCopy) to their bench window. They are given last refusal so a fresh
@@ -172,9 +187,11 @@ type candidate struct {
 	// live-copy holder whose CURRENT score met the floor, or a PENDING-result author whose
 	// STAMPED submission-time score met it. It is FROZEN at refill on purpose — a pending
 	// author's verdict counts its stamped score, so its trustedness must never be
-	// re-evaluated against a later (drifted) current score. eligibleLocked unions this set
-	// with the trusted subjects among the post-refill live copies (current in-memory holds
-	// + onRunStart-converted running copies) to size the reservation.
+	// re-evaluated against a later (drifted) current score. Its one change is a removal: a
+	// live holder whose copy closes without a result no longer covers the unit
+	// (uncountLiveCopy). eligibleLocked unions this set with the trusted subjects among the
+	// post-refill live copies (current in-memory holds + onRunStart-converted running
+	// copies) to size the reservation.
 	trustedContributors map[string]struct{}
 	// runStartedSubjects is the set of subjects whose in-memory hold was converted to a
 	// RUNNING copy AFTER this candidate was staged (recorded by onRunStart). Unlike the
@@ -183,6 +200,15 @@ type candidate struct {
 	// kept separate from the frozen contributors precisely so the reservation does not
 	// re-score a refill-time pending author. Only populated when effectiveTrustK > 0.
 	runStartedSubjects map[string]struct{}
+}
+
+// liveCopy is one live copy a staged candidate counts (candidate.liveCopies): the
+// holder's trust subject, and whether the copy was counted as non-countable coverage
+// (probationCoverage) when the unit was staged. A copy run-started after staging is
+// never in probationCoverage: onRunStart counts it in dbActiveCount alone.
+type liveCopy struct {
+	subject      string
+	nonCountable bool
 }
 
 // benchEntry is one volunteer's timed bench on a staged candidate (PB-9): the
@@ -1901,6 +1927,12 @@ const (
 // which never happens while it sits staged, so without this record the cache re-offers the unit
 // to the same volunteer on its next poll and the landing refuses the copy.
 //
+// A copy the candidate counts (a live copy at staging, or one run-started since) also stops
+// counting: the closed row is neither a live copy nor a result, so the SQL landing no longer
+// refuses its holder as having contributed, only for the cooldown. Without this the candidate
+// went on refusing the holder as "already contributed" for as long as the unit stayed staged,
+// past the bench and its pool-exhausted fallback, while the database would admit it.
+//
 // Copies closed with their whole unit (validation, an operator requeue, a dead letter) go
 // through InvalidateWorkUnit or onUnitDone instead, which drop the candidate itself. The census
 // test (copy_close_census_test.go) fails when a copy-closing statement's caller reaches neither.
@@ -1910,6 +1942,10 @@ func (c *dispatchCache) closeCopyLocked(unitID, volunteerID types.ID, how copyCl
 	for i := range c.ready {
 		if c.ready[i].unit.ID != unitID {
 			continue
+		}
+		// A void had no copy row, so it un-counts nothing.
+		if how != copyVoided {
+			c.ready[i].uncountLiveCopy(volunteerID)
 		}
 		var e benchEntry
 		if how == copyVoided {
@@ -1934,6 +1970,36 @@ func (c *dispatchCache) closeCopyLocked(unitID, volunteerID types.ID, how copyCl
 		c.ready[i].benched[volunteerID] = e
 		return
 	}
+}
+
+// uncountLiveCopy takes the account's live copy, closed without a result, out of the
+// candidate's coverage: dbActiveCount (and probationCoverage when it was counted there),
+// and its subject from contributors, trustedContributors and runStartedSubjects unless
+// the subject still stands another way (a PENDING result, or another live copy under the
+// same subject). A copy the candidate never counted changes nothing. Caller holds mu.
+func (cand *candidate) uncountLiveCopy(account types.ID) {
+	lc, counted := cand.liveCopies[account]
+	if !counted {
+		return
+	}
+	delete(cand.liveCopies, account)
+	if cand.dbActiveCount > 0 {
+		cand.dbActiveCount--
+	}
+	if lc.nonCountable && cand.probationCoverage > 0 {
+		cand.probationCoverage--
+	}
+	if _, pending := cand.pendingContributors[lc.subject]; pending {
+		return
+	}
+	for _, other := range cand.liveCopies {
+		if other.subject == lc.subject {
+			return
+		}
+	}
+	delete(cand.contributors, lc.subject)
+	delete(cand.trustedContributors, lc.subject)
+	delete(cand.runStartedSubjects, lc.subject)
 }
 
 // purgePendingForLocked drops any queued reservation / spot-check write for
@@ -2101,20 +2167,34 @@ func (c *dispatchCache) onRunStart(unitID, volunteerID types.ID) {
 	}
 	for i := range c.ready {
 		if c.ready[i].unit.ID == unitID {
-			// The run-started copy is now a live DB row: move it from the holder set
-			// into dbActiveCount so eligibleLocked still sees the correct coverage.
-			c.ready[i].dbActiveCount++
-			// Record this principal as a contributor on the STAGED candidate. The unit
-			// stays QUEUED while a redundancy>1 copy runs, so the candidate lingers in the
-			// ready pool across this volunteer's submit (which does not meet redundancy and
-			// so does not evict it). Its refill-time contributor snapshot predates this
-			// run-start, so without recording it here the same subject would become
-			// eligible again the moment its in-memory hold is released — re-handed its own
-			// unit. Adding it now keeps the staged candidate's distinctness correct.
-			if c.ready[i].contributors == nil {
-				c.ready[i].contributors = make(map[string]struct{})
+			if lc, counted := c.ready[i].liveCopies[volunteerID]; counted {
+				// A copy that was already live when the unit was staged (reserved then,
+				// starting now) is already in dbActiveCount and contributors, under the
+				// subject the refill resolved; counting it again would cover the unit
+				// twice for one copy.
+				subject = lc.subject
+			} else {
+				// The run-started copy is now a live DB row: move it from the holder set
+				// into dbActiveCount so eligibleLocked still sees the correct coverage.
+				c.ready[i].dbActiveCount++
+				// Record this principal as a contributor on the STAGED candidate. The unit
+				// stays QUEUED while a redundancy>1 copy runs, so the candidate lingers in
+				// the ready pool across this volunteer's submit (which does not meet
+				// redundancy and so does not evict it). Its refill-time contributor snapshot
+				// predates this run-start, so without recording it here the same subject
+				// would become eligible again the moment its in-memory hold is released —
+				// re-handed its own unit. Adding it now keeps the staged candidate's
+				// distinctness correct. The copy is recorded by account so a close without a
+				// result can take it out again (uncountLiveCopy).
+				if c.ready[i].contributors == nil {
+					c.ready[i].contributors = make(map[string]struct{})
+				}
+				c.ready[i].contributors[subject] = struct{}{}
+				if c.ready[i].liveCopies == nil {
+					c.ready[i].liveCopies = make(map[types.ID]liveCopy)
+				}
+				c.ready[i].liveCopies[volunteerID] = liveCopy{subject: subject}
 			}
-			c.ready[i].contributors[subject] = struct{}{}
 			// Trusted-corroborator reservation: also record this run-started subject as a
 			// post-refill live copy so trustedPresentLocked can count it (evaluated against
 			// the CURRENT score snapshot, like an in-memory hold — NOT frozen like the
@@ -2904,6 +2984,7 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			seenLeaf[dc.LeafID] = struct{}{}
 			c.warmLeaf(dbCtx, dc.LeafID)
 		}
+		contributors, pending, live := contributorSets(dc.LiveContributors, dc.PendingContributorSubjects)
 		staged = append(staged, candidate{
 			unit:                dc.WorkUnit,
 			effectiveRedundancy: dc.RedundancyFactor,
@@ -2911,9 +2992,11 @@ func (c *dispatchCache) fetchAndStage(ctx context.Context, want int, excluded, l
 			// Non-countable portion of the raw seed (account standing, BG-24b), subtracted
 			// by eligibleLocked's coverage bound so redundancy is closed only by countable
 			// copies — the cache's forced-replication parity with countableCoverageSQL.
-			probationCoverage: dc.ProbationCoverage,
-			contributors:      strSet(dc.ContributorSubjects),
-			benched:           benchSet(dc.Benched, dc.WorkUnit.DeadlineSeconds),
+			probationCoverage:   dc.ProbationCoverage,
+			contributors:        contributors,
+			pendingContributors: pending,
+			liveCopies:          live,
+			benched:             benchSet(dc.Benched, dc.WorkUnit.DeadlineSeconds),
 			// Trusted-corroborator reservation inputs (SQL twin: DispatchCandidate). K == 0
 			// leaves the reservation inert; the trusted-contributor snapshot is frozen here
 			// (see the candidate field docs) so a pending author's stamped trustedness is
@@ -3888,6 +3971,32 @@ func strSet(ss []string) map[string]struct{} {
 		s[v] = struct{}{}
 	}
 	return s
+}
+
+// contributorSets builds a staged candidate's contributor bookkeeping from the refill
+// snapshot: the union of live and pending subjects that eligibleLocked excludes, the
+// pending subset (never removed while staged), and the live copies by holder account
+// (removed by uncountLiveCopy when one closes without a result). A live copy whose
+// holder's standing neutralized it is marked, so its close takes it back out of
+// probationCoverage too.
+func contributorSets(live []workunit.LiveContributor, pending []string) (map[string]struct{}, map[string]struct{}, map[types.ID]liveCopy) {
+	pendingSet := strSet(pending)
+	var contributors map[string]struct{}
+	if len(live)+len(pending) > 0 {
+		contributors = make(map[string]struct{}, len(live)+len(pending))
+	}
+	for s := range pendingSet {
+		contributors[s] = struct{}{}
+	}
+	var copies map[types.ID]liveCopy
+	if len(live) > 0 {
+		copies = make(map[types.ID]liveCopy, len(live))
+	}
+	for _, lc := range live {
+		contributors[lc.Subject] = struct{}{}
+		copies[lc.VolunteerID] = liveCopy{subject: lc.Subject, nonCountable: !lc.Countable}
+	}
+	return contributors, pendingSet, copies
 }
 
 func containsID(ids []types.ID, target types.ID) bool {
