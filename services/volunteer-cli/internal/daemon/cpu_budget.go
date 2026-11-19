@@ -340,24 +340,50 @@ func (d *Daemon) ledgerFor(sm *SlotManager) budgetLedger {
 	return l
 }
 
+// budgetBooking is what a unit is charged against the budgets: the cores it is
+// booked at (bookedCPUCores), its booked memory, whether it runs inside the
+// container engine and whether it needs a GPU, with its leaf and the
+// volunteer's cap on how many of that leaf run at once (0 = none). The
+// ledger's questions are asked of a booking, so one worked out once answers
+// them for every unit of the same shape (runnableTogether).
+type budgetBooking struct {
+	leafID         string
+	cores, memMB   int
+	container, gpu bool
+	leafCap        int
+}
+
+// bookingOf is what wu is charged against the budgets.
+func (d *Daemon) bookingOf(wu *runtime.WorkUnit) budgetBooking {
+	b := budgetBooking{cores: d.bookedCPUCores(wu), memMB: d.bookedMemMB(wu), container: isContainerUnit(wu)}
+	if wu != nil {
+		b.leafID, b.gpu, b.leafCap = wu.LeafID, wu.ExecutionSpec.GPURequired, d.leafMaxRunning(wu.LeafID)
+	}
+	return b
+}
+
 // fits reports whether wu, at its minimum cores and booked memory, fits what
 // the ledger has left.
 func (l budgetLedger) fits(d *Daemon, wu *runtime.WorkUnit) bool {
 	if wu == nil {
 		return false
 	}
-	cores, memMB := d.bookedCPUCores(wu), d.bookedMemMB(wu)
-	container := isContainerUnit(wu)
+	return l.admits(d.bookingOf(wu), false)
+}
+
+// admits reports whether a unit booked as b fits what the ledger has left;
+// with barCores, whether it would if cores were no object.
+func (l budgetLedger) admits(b budgetBooking, barCores bool) bool {
 	switch {
-	case cores > l.hostCores,
-		container && cores > l.containerCores,
-		memMB > l.hostMemMB,
-		container && memMB > l.containerMemMB,
-		wu.ExecutionSpec.GPURequired && l.gpus <= 0,
+	case !barCores && b.cores > l.hostCores,
+		!barCores && b.container && b.cores > l.containerCores,
+		b.memMB > l.hostMemMB,
+		b.container && b.memMB > l.containerMemMB,
+		b.gpu && l.gpus <= 0,
 		l.tasks <= 0:
 		return false
 	}
-	if limit := d.leafMaxRunning(wu.LeafID); limit > 0 && l.leafRunning[wu.LeafID] >= limit {
+	if b.leafCap > 0 && l.leafRunning[b.leafID] >= b.leafCap {
 		return false
 	}
 	return true
@@ -365,19 +391,23 @@ func (l budgetLedger) fits(d *Daemon, wu *runtime.WorkUnit) bool {
 
 // take charges the ledger with wu running on cores.
 func (l *budgetLedger) take(d *Daemon, wu *runtime.WorkUnit, cores int) {
-	memMB := d.bookedMemMB(wu)
+	l.takeBooking(d.bookingOf(wu), cores)
+}
+
+// takeBooking charges the ledger with a unit booked as b running on cores.
+func (l *budgetLedger) takeBooking(b budgetBooking, cores int) {
 	l.hostCores -= cores
-	l.hostMemMB -= memMB
-	if isContainerUnit(wu) {
+	l.hostMemMB -= b.memMB
+	if b.container {
 		l.containerCores -= cores
-		l.containerMemMB -= memMB
+		l.containerMemMB -= b.memMB
 	}
-	if wu != nil && wu.ExecutionSpec.GPURequired {
+	if b.gpu {
 		l.gpus--
 	}
 	l.tasks--
-	if wu != nil && l.leafRunning != nil {
-		l.leafRunning[wu.LeafID]++
+	if b.leafID != "" && l.leafRunning != nil {
+		l.leafRunning[b.leafID]++
 	}
 }
 

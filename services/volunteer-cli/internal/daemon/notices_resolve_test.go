@@ -164,9 +164,12 @@ func TestFetcher_NoWorkNoticeResolvesWhenWorkArrives(t *testing.T) {
 	d := newFetcherTestDaemon([]*ServerConnection{srv})
 	d.notices = NewNoticeLog()
 	f := NewFetcher(d, NewPreFetchQueue(8, d.logger), d.weightedSelector, d.leafCache)
+	// A round in which the one head was asked and answered without work or a
+	// reason; the streak is kept per head.
+	empty := fetchRound{requested: 1, silent: []silentHead{{head: "server-a", leafs: []string{"Leaf One"}}}}
 
 	for i := 0; i < noWorkWarnThreshold; i++ {
-		f.noteEmptyRound()
+		f.noteEmptyRound(empty)
 	}
 	if n := noticeByCode(t, d.notices, "no_work"); n.ResolvedAt != nil {
 		t.Fatalf("no_work notice resolved before any work arrived: %+v", n)
@@ -184,7 +187,7 @@ func TestFetcher_NoWorkNoticeResolvesWhenWorkArrives(t *testing.T) {
 	// A later idle streak raises the diagnostic again (the notice reopens —
 	// the same episode within the window — or a new one starts after it).
 	for i := 0; i < noWorkWarnThreshold; i++ {
-		resumed.noteEmptyRound()
+		resumed.noteEmptyRound(empty)
 	}
 	if n := noticeByCode(t, d.notices, "no_work"); n.ResolvedAt != nil || n.Count != 2 {
 		t.Fatalf("a new idle streak must reopen the notice: %+v", n)
