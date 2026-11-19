@@ -138,6 +138,13 @@ type ExecutionResult struct {
 	OutputChecksum string           // SHA-256 hex digest of output
 	ExitCode       int              // process exit code
 	Metrics        ExecutionMetrics // resource usage
+	// MemoryLimitMB is the memory limit the unit actually ran under, as the
+	// runtime set it when it started the unit (a container's memory cgroup).
+	// It is read when explaining a kill, so the explanation names the limit
+	// the unit had, not one recomputed afterwards from settings that may have
+	// changed while it ran. 0 when the runtime does not report it, or did not
+	// set it this session (a container adopted from an earlier one).
+	MemoryLimitMB int
 }
 
 // ExecutionMetrics maps directly to the proto ExecutionMetadata.

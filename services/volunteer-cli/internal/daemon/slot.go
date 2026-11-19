@@ -339,11 +339,12 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		sm.available <- slot.ID
 	}()
 
-	// Restore checkpoint if applicable.
+	// Restore checkpoint if applicable. The task counts as resumed only when a
+	// checkpoint was actually restored.
 	if wu.HasCheckpoint && wu.CheckpointIntervalSeconds > 0 {
-		d.restoreCheckpoint(ctx, wu, prep, conn)
+		restored := d.restoreCheckpoint(ctx, wu, prep, conn)
 		slot.mu.Lock()
-		slot.resumedFromCkp = true
+		slot.resumedFromCkp = restored
 		slot.mu.Unlock()
 	}
 

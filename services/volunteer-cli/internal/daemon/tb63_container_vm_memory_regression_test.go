@@ -277,14 +277,14 @@ func TestTB63_Exit137NamesTheVMShortfall(t *testing.T) {
 		t.Errorf("leaf_failing notice does not carry the memory diagnosis: %s", notice.Message)
 	}
 
-	// A 137 within the budget is still explained as a kill, at its own limit;
-	// any other exit code is reported as before.
+	// A 137 within the budget is still explained as a kill, at the leaf's own
+	// limit; any other exit code is reported as before.
 	mc = &mockClient{}
 	small := headContainerUnit("wu-small", "leaf-grep", "", 1024)
 	d.handleSlotResult(context.Background(), SlotResult{WU: small, Conn: handleSlotResultTestConn(mc),
 		Result: &runtime.ExecutionResult{ExitCode: 137}})
-	if got := mc.lastAbandonReq.Reason; !strings.Contains(got, "usually out of memory at its 1024 MB limit") {
-		t.Errorf("in-budget 137 reason = %q, want the out-of-memory hint at the unit's own limit", got)
+	if got := mc.lastAbandonReq.Reason; !strings.Contains(got, "the leaf's own memory limit of 1024 MB") {
+		t.Errorf("in-budget 137 reason = %q, want the kill explained at the leaf's own limit", got)
 	}
 	mc = &mockClient{}
 	d.handleSlotResult(context.Background(), SlotResult{WU: small, Conn: handleSlotResultTestConn(mc),

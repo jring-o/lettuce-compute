@@ -1041,7 +1041,7 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 
 	if result.Result.ExitCode != 0 {
 		reason := fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode)
-		if note := d.containerKillNote(wu, result.Result.ExitCode); note != "" {
+		if note := d.containerKillNote(wu, result.Result); note != "" {
 			reason += " (" + note + ")"
 		}
 		d.logger.Error("slot execution non-zero exit",
@@ -3606,8 +3606,12 @@ func (d *Daemon) abandonUnit(wu *runtime.WorkUnit, conn *ServerConnection, reaso
 	d.logger.Info("abandoned failed work unit back to head", "work_unit_id", wu.ID, "reason", reason)
 }
 
-// restoreCheckpoint downloads and extracts a checkpoint for a work unit.
-func (d *Daemon) restoreCheckpoint(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult, conn *ServerConnection) {
+// restoreCheckpoint downloads and extracts a checkpoint for a work unit, and
+// reports whether it did. Every failure leaves the unit to start fresh, and the
+// slot then does not call the task resumed: before, a checkpoint that failed to
+// download (one over gRPC's 4 MiB receive limit, every time) was reported as
+// "resumed from checkpoint" while the unit ran from the beginning.
+func (d *Daemon) restoreCheckpoint(ctx context.Context, wu *runtime.WorkUnit, prep *runtime.PrepareResult, conn *ServerConnection) bool {
 	resp, getErr := conn.Client.GetCheckpoint(ctx, &lettucev1.GetCheckpointRequest{
 		WorkUnitId: wu.ID,
 	})
@@ -3616,24 +3620,25 @@ func (d *Daemon) restoreCheckpoint(ctx context.Context, wu *runtime.WorkUnit, pr
 			"work_unit_id", wu.ID,
 			"error", getErr,
 		)
-		return
+		return false
 	}
 	if !resp.HasCheckpoint {
-		return
+		return false
 	}
 	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
 	if mkErr := os.MkdirAll(checkpointDir, 0755); mkErr != nil {
 		d.logger.Warn("failed to create checkpoint dir", "error", mkErr)
-		return
+		return false
 	}
 	if exErr := extractTar(resp.CheckpointData, checkpointDir); exErr != nil {
 		d.logger.Warn("failed to extract checkpoint", "error", exErr)
-		return
+		return false
 	}
 	d.logger.Info("restored checkpoint",
 		"work_unit_id", wu.ID,
 		"sequence", resp.CheckpointSequence,
 	)
+	return true
 }
 
 // runSlotHeartbeat (per-task heartbeat loop) is removed: per-task heartbeats no
@@ -4727,23 +4732,49 @@ func (s *vmNoticeState) forget(code string) {
 }
 
 // containerKillNote explains an exit code 137 on a container unit: 137 is a
-// kill, and for a container almost always the out-of-memory kill. When the unit
-// declares more than container work on this machine can be given — the engine's
-// VM is smaller than the declaration — the note says so with both figures, so
-// the abandon reason the head logs and the leaf-failing notice the volunteer
-// sees read "killed for memory: … VM …" instead of a bare exit code (TB-63).
-// Empty for any other exit code or a non-container unit.
-func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, exitCode int) string {
-	if wu == nil || exitCode != 137 || wu.Runtime != runtime.RuntimeContainer {
+// kill, and for a container almost always the kill at its memory limit. The
+// note goes into the abandon reason the head logs and into the leaf-failing
+// notice the volunteer sees, so it says whose limit it was: the earlier "usually
+// out of memory at its 7000 MB limit" was read as the volunteer's own machine
+// running out, even on machines allowing Lettuce hundreds of gigabytes.
+//
+//   - The leaf's own limit: the figure the leaf declares, set by its owner and
+//     the same on every machine. Not this computer running out of memory.
+//   - Lettuce's default, when the leaf declares none: also the same everywhere.
+//   - Lowered here: the leaf declares more than this machine gave it. The
+//     container engine's VM (both figures and the VM's size, as before), or
+//     this machine's memory setting for Lettuce, with both figures.
+//
+// The figure is the limit the container was started with, as the runtime
+// reports it (ExecutionResult.MemoryLimitMB), not one recomputed at the kill
+// from a budget the volunteer may have changed while the unit ran. A result
+// that does not carry it (a container adopted from an earlier session) falls
+// back to the limit the current budget gives. Exit 137 is any SIGKILL, so the
+// note says "most likely". Empty for any other exit code or a non-container
+// unit.
+func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, res *runtime.ExecutionResult) string {
+	if wu == nil || res == nil || res.ExitCode != 137 || wu.Runtime != runtime.RuntimeContainer {
 		return ""
 	}
-	budget := d.ContainerMemoryBudgetMB()
 	declared := int(wu.ExecutionSpec.MaxMemoryMB)
-	booked := runtime.BookedMemMB(declared, budget)
-	if engineMB := d.ContainerVMMemoryMB(); engineMB > 0 && declared > budget {
-		return fmt.Sprintf("killed for memory: the unit declares %d MB but container work on this machine is limited to %d MB by the container engine's VM of %d MB", declared, budget, engineMB)
+	limit := res.MemoryLimitMB
+	if limit <= 0 {
+		limit = runtime.BookedMemMB(declared, d.ContainerMemoryBudgetMB())
 	}
-	return fmt.Sprintf("killed, usually out of memory at its %d MB limit", booked)
+	if declared > limit {
+		// This machine gave the unit less than the leaf declares. Name what did:
+		// the VM, when it is what bounds container work's budget here, else the
+		// volunteer's own memory setting.
+		configMB := d.HostMemoryBudgetMB()
+		if engineMB := d.ContainerVMMemoryMB(); engineMB > 0 && (configMB <= 0 || d.ContainerMemoryBudgetMB() < configMB) {
+			return fmt.Sprintf("killed for memory: the unit declares %d MB but container work on this machine is limited to %d MB by the container engine's VM of %d MB", declared, limit, engineMB)
+		}
+		return fmt.Sprintf("killed, most likely for using more than its memory limit of %d MB: the leaf declares %d MB, and this machine's memory setting for Lettuce lowered that to %d MB", limit, declared, limit)
+	}
+	if declared <= 0 {
+		return fmt.Sprintf("killed, most likely for using more than its memory limit of %d MB, Lettuce's default for a leaf that declares none, the same on every machine; it does not mean this computer ran out of memory", limit)
+	}
+	return fmt.Sprintf("killed, most likely for using more than the leaf's own memory limit of %d MB, which the leaf's owner sets and which is the same on every machine; it does not mean this computer ran out of memory", limit)
 }
 
 // ContainerBackend reports the engine the registered container runtime is
