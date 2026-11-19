@@ -42,11 +42,16 @@ type Fetcher struct {
 	notices    *NoticeLog
 	headStatus *HeadStatusTracker
 
-	// emptyPolls counts consecutive fetch rounds that buffered nothing;
-	// warnedNoWork records that the streak already raised the one-time
-	// "connected but getting no work" diagnostic. See noteEmptyRound.
-	emptyPolls   int
+	// silentPolls counts, per head, the consecutive fetch rounds in which the
+	// head was asked and answered every request empty without saying why, and
+	// silentLeafs names the leafs it was asked for in those rounds. warnedNoWork
+	// records that the streaks raised the machine-wide "connected but getting
+	// no work" diagnostic, warnedHeads the heads that got one of their own. See
+	// noteEmptyRound. Owned by the single Run goroutine — no lock.
+	silentPolls  map[string]int
+	silentLeafs  map[string][]string
 	warnedNoWork bool
+	warnedHeads  map[string]bool
 
 	// reRegisterFn re-registers this machine against one head after a host-unknown
 	// work-path refusal (BG-25 self-heal): it discards the refused id, registers with an
@@ -420,20 +425,24 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		runtimeAbandons:          make(map[string]int),
 		pausedRuntimes:           make(map[string]time.Time),
 		batchCap:                 make(map[string]int32),
+		silentPolls:              make(map[string]int),
+		silentLeafs:              make(map[string][]string),
+		warnedHeads:              make(map[string]bool),
 		now:                      time.Now,
 	}
 }
 
-// noWorkWarnThreshold is how many consecutive empty polls — rounds in which a
-// head was actually asked and answered with no work — trigger the one-time
-// "connected but getting no work" diagnostic WARN. Each such round obeys the
-// head's retry delay, so this is roughly half a minute of genuine idleness,
-// long enough to skip a momentarily-empty queue but short enough to be useful.
-// A round that asked nothing (every leaf skipped before the request) is not a
-// poll and does not count (TB-60), and neither is an empty answer while the
-// buffer already holds the next unit for every slot, a round in which a head
-// said why it sent nothing, or a round while a head is holding this machine at
-// its in-flight cap.
+// noWorkWarnThreshold is how many consecutive empty polls of one head — rounds
+// in which the head was actually asked and answered every request with no work
+// and no reason — trigger the one-time "connected but getting no work"
+// diagnostic WARN. Each such round obeys the head's retry delay, so this is
+// roughly half a minute of genuine idleness, long enough to skip a
+// momentarily-empty queue but short enough to be useful. A round that asked
+// nothing (every leaf skipped before the request) is not a poll and does not
+// count (TB-60), and neither is an empty answer while the buffer already holds
+// the next unit for every slot, or a round while a head is holding this
+// machine at its in-flight cap. A head that says why it sent nothing ends its
+// own streak; the other heads' streaks go on.
 const noWorkWarnThreshold = 5
 
 // idleWait is how long the fetcher sleeps when there is nothing to do right now
@@ -572,24 +581,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 		}
 
 		if round.pushed == 0 {
-			// An empty answer counts toward the no-work diagnostic only while the
-			// machine is, or is about to be, without work, and only when no head
-			// said why. A buffer that already holds the next unit for every slot is
-			// not without work: on a fast host it is what a head's per-machine
-			// in-flight cap looks like from a head too old to say so (the head
-			// refuses a buffer deeper than the cap), and the notice told such a
-			// volunteer the heads had no units for the machine beside a full
-			// queue. A head that named its reason has its own notice, and a head
-			// holding this machine at its cap has work for it: above five slots
-			// per head the buffer can never hold a unit per slot under a cap of
-			// ten, so only the stated cap keeps the diagnostic honest there.
-			inHand := f.workInHandFn != nil && f.workInHandFn()
-			capped := f.anyHeadCapWaiting()
-			f.logger.Debug("fetcher: fetchOne buffered no work", "work_in_hand_for_every_slot", inHand,
-				"explained_answers", round.explained, "head_holding_cap", capped)
-			if !inHand && round.explained == 0 && !capped {
-				f.noteEmptyRound()
-			}
+			f.noteEmptyRound(round)
 			// No work was buffered this cycle (no assignments, or every assignment
 			// was abandoned as unusable). The authoritative cadence is the head's
 			// retry delay, obeyed via NextContactAt by the head-eligibility gate at
@@ -606,29 +598,167 @@ func (f *Fetcher) Run(ctx context.Context) {
 	}
 }
 
-// noteEmptyRound counts one fetch round that asked a head for work and
-// buffered nothing. When the streak reaches noWorkWarnThreshold it surfaces
-// the "connected but getting no work" diagnostic exactly once, instead of
-// leaving the operator staring at a silent, idle daemon. Run only calls it
-// for rounds that issued a request (TB-60) while the buffer did not already
-// hold the next unit for every slot.
-func (f *Fetcher) noteEmptyRound() {
-	f.emptyPolls++
-	if f.emptyPolls >= noWorkWarnThreshold && !f.warnedNoWork {
-		f.warnNoWork()
-		f.warnedNoWork = true
+// noteEmptyRound accounts for one fetch round that asked a head for work and
+// buffered nothing. When a head's streak reaches noWorkWarnThreshold it
+// surfaces the "connected but getting no work" diagnostic exactly once,
+// instead of leaving the operator staring at a silent, idle daemon. Run only
+// calls it for rounds that issued a request (TB-60).
+//
+// Each head keeps its own streak. A head that said why it sent nothing ends
+// its streak and its own notice: its reason has a notice of its own
+// (no_work_reason.go). A head that answered every request of the round
+// without a reason adds one to its streak, but only while the machine is, or
+// is about to be, without work, and no head is holding it at its in-flight
+// cap. A buffer that already holds the next unit for every slot is not
+// without work: on a fast host it is what a head's per-machine in-flight cap
+// looks like from a head too old to say so (the head refuses a buffer deeper
+// than the cap), and the notice told such a volunteer the heads had no units
+// for the machine beside a full queue. A head holding this machine at its cap
+// has work for it: above five slots per head the buffer can never hold a unit
+// per slot under a cap of ten, so only the stated cap keeps the diagnostic
+// honest there.
+//
+// The streak used to be one count for the whole machine, fed by every round in
+// which no answer was explained, and ended only by work. Each head sets its own
+// retry delay, so many rounds asked only the head with the shortest one; when
+// that was a head that never says why (an older build), five such rounds raised
+// a warning worded for every leaf on every head, beside the other heads' own
+// lines, that lasted until work arrived.
+func (f *Fetcher) noteEmptyRound(round fetchRound) {
+	inHand := f.workInHandFn != nil && f.workInHandFn()
+	capped := f.anyHeadCapWaiting()
+	f.logger.Debug("fetcher: fetchOne buffered no work", "work_in_hand_for_every_slot", inHand,
+		"explained_answers", round.explained, "silent_heads", len(round.silent), "head_holding_cap", capped)
+	for _, head := range round.explainedHeads {
+		f.noteHeadExplained(head)
+	}
+	if !inHand && !capped {
+		for _, s := range round.silent {
+			f.noteHeadSilent(s.head, s.leafs)
+		}
+	}
+	f.refreshNoWorkNotices()
+}
+
+// noteHeadExplained ends a head's silent streak: it said why it sent nothing.
+// Its own no-work notice ends with it, one an earlier fetcher raised included.
+func (f *Fetcher) noteHeadExplained(head string) {
+	delete(f.silentPolls, head)
+	delete(f.silentLeafs, head)
+	delete(f.warnedHeads, head)
+	if head != "" { // an empty head would match every notice
+		f.notices.Resolve("no_work", head, "")
 	}
 }
 
-// noteWorkArrived ends a no-work streak: the diagnostic can fire again if the
-// volunteer later goes idle for a new reason, and any live no_work notice is
-// resolved, because work arriving is exactly that condition ending — it used
-// to outlive hours of completed units (TB-50). The resolve is unconditional
-// rather than gated on this fetcher's own warnedNoWork: the fetcher is
-// recreated on every pause/resume, and the notice an earlier instance raised
-// is still in the ring.
+// noteHeadSilent adds one round to a head's silent streak, with the leafs it
+// was asked for in it ("" for a request that named none).
+func (f *Fetcher) noteHeadSilent(head string, leafs []string) {
+	if f.silentPolls == nil {
+		f.silentPolls = make(map[string]int)
+	}
+	if f.silentLeafs == nil {
+		f.silentLeafs = make(map[string][]string)
+	}
+	f.silentPolls[head]++
+	for _, l := range leafs {
+		if l != "" && !contains(f.silentLeafs[head], l) {
+			f.silentLeafs[head] = append(f.silentLeafs[head], l)
+		}
+	}
+}
+
+// refreshNoWorkNotices raises the no-work diagnostic for the heads whose
+// streak reached noWorkWarnThreshold, worded for what they are. While no
+// attached head has a reason on record for sending nothing (HeadStatusTracker),
+// it is the one machine-wide notice it always was: every head asked had
+// nothing and said nothing. Once any head has said why, that wording would
+// speak for that head too, so it is resolved and each silent head gets a
+// notice of its own, naming it and the leafs it was asked for. A notice for a
+// head no longer attached is resolved.
+func (f *Fetcher) refreshNoWorkNotices() {
+	servers := f.attachedServers()
+	f.resolveDetachedNoWork(servers)
+	explains := false
+	var silent []*ServerConnection
+	for _, srv := range servers {
+		if f.headStatus.Get(srv.Config.GRPCAddress).NoWork.Reason != "" {
+			explains = true
+		}
+		if f.silentPolls[srv.Name] >= noWorkWarnThreshold {
+			silent = append(silent, srv)
+		}
+	}
+	// One form at a time: the machine-wide notice while no head says why, the
+	// heads' own once one does.
+	if explains {
+		f.notices.ResolveDaemonWide("no_work")
+		f.warnedNoWork = false
+	} else {
+		for _, srv := range servers {
+			if srv.Name != "" { // an empty head would match every notice
+				f.notices.Resolve("no_work", srv.Name, "")
+				delete(f.warnedHeads, srv.Name)
+			}
+		}
+	}
+	if len(silent) == 0 {
+		return
+	}
+	if !explains {
+		if !f.warnedNoWork {
+			f.warnNoWork()
+			f.warnedNoWork = true
+		}
+		return
+	}
+	if f.warnedHeads == nil {
+		f.warnedHeads = make(map[string]bool)
+	}
+	for _, srv := range silent {
+		if !f.warnedHeads[srv.Name] {
+			f.warnNoWorkFromHead(srv)
+			f.warnedHeads[srv.Name] = true
+		}
+	}
+}
+
+// attachedServers is every head this fetcher works with, available or not.
+func (f *Fetcher) attachedServers() []*ServerConnection {
+	if f.multiClient == nil {
+		return nil
+	}
+	return f.multiClient.Servers()
+}
+
+// resolveDetachedNoWork resolves the no-work notice of every head that is no
+// longer among servers: a notice an earlier fetcher raised must not outlive
+// the head it names.
+func (f *Fetcher) resolveDetachedNoWork(servers []*ServerConnection) {
+	attached := make(map[string]bool, len(servers))
+	for _, srv := range servers {
+		attached[srv.Name] = true
+	}
+	all, _ := f.notices.Since(0)
+	for _, n := range all {
+		if n.Code == "no_work" && n.ResolvedAt == nil && n.Head != "" && !attached[n.Head] {
+			f.notices.Resolve("no_work", n.Head, "")
+			delete(f.warnedHeads, n.Head)
+		}
+	}
+}
+
+// noteWorkArrived ends every no-work streak: the diagnostic can fire again if
+// the volunteer later goes idle for a new reason, and every live no_work
+// notice is resolved, the machine-wide one and each head's, because work
+// arriving is exactly that condition ending — it used to outlive hours of
+// completed units (TB-50). The resolve is unconditional rather than gated on
+// this fetcher's own record: the fetcher is recreated on every pause/resume,
+// and the notice an earlier instance raised is still in the ring.
 func (f *Fetcher) noteWorkArrived() {
-	f.emptyPolls = 0
+	f.silentPolls = make(map[string]int)
+	f.silentLeafs = make(map[string][]string)
+	f.warnedHeads = make(map[string]bool)
 	f.warnedNoWork = false
 	f.notices.Resolve("no_work", "", "")
 	f.resolveCapNoticesIfBusy()
@@ -696,11 +826,7 @@ func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
 // once by the daemon). A partly blocked host is noted in passing, because a
 // leaf the machine can never run is one the head is never asked for.
 func (f *Fetcher) warnNoWork() {
-	var runtimes []string
-	if f.registry != nil {
-		runtimes = f.registry.AvailableRuntimes()
-		sort.Strings(runtimes)
-	}
+	runtimes := f.runtimeNames()
 
 	var totalLeafs, runtimeBlocked int
 	if f.enabledLeafsFunc != nil && f.multiClient != nil {
@@ -727,6 +853,54 @@ func (f *Fetcher) warnNoWork() {
 		"", "")
 }
 
+// warnNoWorkFromHead emits the "connected but getting no work" diagnostic for
+// one head, once per streak: the head was asked, repeatedly, answered with
+// nothing and gave no reason, while another head has said why it sends
+// nothing. It names the head and the leafs it was asked for, and counts only
+// that head's leafs. A head that predates the reason field never gives one; a
+// current one gives none when it simply has nothing ready.
+func (f *Fetcher) warnNoWorkFromHead(srv *ServerConnection) {
+	runtimes := f.runtimeNames()
+	leafs := append([]string(nil), f.silentLeafs[srv.Name]...)
+	sort.Strings(leafs)
+
+	var totalLeafs, runtimeBlocked int
+	if f.enabledLeafsFunc != nil {
+		for _, lf := range f.enabledLeafsFunc(srv.Name) {
+			totalLeafs++
+			if _, missing, untrusted := leafRuntimeVerdict(lf, f.registry, srv.Config); missing || untrusted {
+				runtimeBlocked++
+			}
+		}
+	}
+	what := "units"
+	if len(leafs) > 0 {
+		what = "units of " + leafList(leafs)
+	}
+	blockedNote := ""
+	if runtimeBlocked > 0 {
+		blockedNote = fmt.Sprintf(" %d of its %d enabled leaf(s) need a runtime this machine does not offer it and are never requested.", runtimeBlocked, totalLeafs)
+	}
+	f.logger.Warn("connected but getting no work from one head after repeated polls, and it gives no reason — it has no matching units for this volunteer right now",
+		"server", srv.Name, "polls", f.silentPolls[srv.Name], "leafs", leafs, "runtimes", runtimes,
+		"enabled_leafs", totalLeafs, "runtime_blocked_leafs", runtimeBlocked,
+		"hint", "normal if its queue is just empty; a head on a Lettuce version older than 0.14 never says why it sends nothing")
+	f.notices.Notify(NoticeWarn, "no_work",
+		fmt.Sprintf("Connected to %s but getting no work from it after repeated polls, and it gives no reason: it has no %s matching this machine right now (runtimes: %s). This is normal when its queue is empty; a head that runs a Lettuce version older than 0.14 never says why it sends nothing.%s",
+			srv.Name, what, strings.Join(runtimes, ", "), blockedNote),
+		srv.Name, "")
+}
+
+// runtimeNames is the runtimes registered on this machine, sorted.
+func (f *Fetcher) runtimeNames() []string {
+	if f.registry == nil {
+		return nil
+	}
+	runtimes := f.registry.AvailableRuntimes()
+	sort.Strings(runtimes)
+	return runtimes
+}
+
 // fetchOne issues at most one RequestWorkUnit (to the first eligible head/leaf
 // in deficit order whose retry delay has elapsed), then prepares and buffers
 // every assignment in the returned batch. It returns the number of units pushed
@@ -749,6 +923,31 @@ type fetchRound struct {
 	classFull int
 	// explained counts the empty answers whose head named a reason.
 	explained int
+	// explainedHeads names the heads that named a reason for at least one of
+	// their empty answers this round; silent names each head that was asked
+	// and gave no reason for any of its answers, with the leafs it was asked
+	// for. A head reached and skipped without a request is in neither.
+	explainedHeads []string
+	silent         []silentHead
+}
+
+// silentHead is a head that answered every request of a round without work
+// and without a reason, and the leafs it was asked for ("" for a request that
+// named none).
+type silentHead struct {
+	head  string
+	leafs []string
+}
+
+// noteHeadAnswers records how one head answered this round.
+func (r *fetchRound) noteHeadAnswers(head string, asked, explained bool, leafs []string) {
+	switch {
+	case !asked:
+	case explained:
+		r.explainedHeads = append(r.explainedHeads, head)
+	default:
+		r.silent = append(r.silent, silentHead{head: head, leafs: leafs})
+	}
 }
 
 // fetchRound is fetchOne with the round's accounting; fetchOne keeps the
@@ -864,6 +1063,7 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			if ans.explained {
 				round.explained++
 			}
+			round.noteHeadAnswers(head.Name, true, ans.explained, []string{""})
 			continue
 		}
 		f.logger.Debug("fetcher: trying server", "server", head.Name, "enabled_leafs", len(enabled), "leaf_slugs", leafSlugs(enabled))
@@ -969,6 +1169,8 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			requestable = append(requestable, leaf)
 		}
 
+		asked, explained := false, false
+		var silentLeafs []string
 		for i, leaf := range requestable {
 			// Ask for the leaf's own share of the deficit, not the whole buffer,
 			// so a head's leaves fill it interleaved. The leaves ahead of this
@@ -976,6 +1178,7 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			// to the ones still in play: the last one is asked for the head's.
 			share := headShare * f.selector.LeafShare(head.Name, leaf, requestable[i:])
 			round.requested++
+			asked = true
 			ans := f.ask(ctx, head, leaf, []string{leaf.ID}, nil, share)
 			if ans.pushed > 0 {
 				round.pushed = ans.pushed
@@ -983,6 +1186,9 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			}
 			if ans.explained {
 				round.explained++
+				explained = true
+			} else {
+				silentLeafs = append(silentLeafs, leafNoticeLabel(leaf))
 			}
 			if ans.stop {
 				// Transport error or rate-limit on this head, or it is holding this
@@ -991,6 +1197,7 @@ func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
 			}
 			// No work / all-abandoned for this leaf: try the next leaf.
 		}
+		round.noteHeadAnswers(head.Name, asked, explained, silentLeafs)
 	}
 
 	f.logger.Debug("fetcher: exhausted all eligible servers and leafs, no work buffered")

@@ -1920,13 +1920,23 @@ const fallbackBufferUnitsPerSlot = 2
 
 // maxSlots is how many tasks this machine can run at once (>= 1): the most
 // units of any one enabled leaf the CPU and memory budgets hold together
-// (runnableAtOnce), bounded by max_running_tasks when the volunteer set one
+// (runnableAtOnce), or, when more than that, how many units of the enabled
+// leafs run together when the buffer holds work of every one of them
+// (runnableTogether), bounded by max_running_tasks when the volunteer set one
 // and by the slot pool. The work buffer and the idle-slot diagnostics count
 // in these slots — work_buffer_hours per task that can run. It used to be
-// max_concurrent_tasks, which defaulted to 1 whatever the budgets allowed
-//.
+// max_concurrent_tasks, which defaulted to 1 whatever the budgets allowed.
 func (d *Daemon) maxSlots() int {
 	n := d.runnableAtOnce()
+	if together := d.runnableTogether(); together > n {
+		n = together
+	}
+	return d.withinSlotLimits(n)
+}
+
+// withinSlotLimits bounds a count of tasks by max_running_tasks when the
+// volunteer set one and by the slot pool, and keeps it at one at least.
+func (d *Daemon) withinSlotLimits(n int) int {
 	if limit := d.maxRunningTasks(); limit > 0 && limit < n {
 		n = limit
 	}
@@ -1954,8 +1964,9 @@ func (d *Daemon) maxRunningTasks() int {
 // together: for each leaf, its runtime's CPU budget over the leaf's minimum
 // cores and its memory budget over the leaf's booked memory, whichever is
 // fewer; the largest of those. With no leaf known yet it is the CPU budget
-// (one-core units). An upper bound for a mix of leafs, which run fewer
-// together than the most parallel of them alone.
+// (one-core units). A mix of leafs can run fewer together than that (a
+// memory-heavy leaf beside a light one), or more, when the leafs are held by
+// different limits (runnableTogether).
 func (d *Daemon) runnableAtOnce() int {
 	best := 0
 	for _, leaf := range d.allEnabledLeafs() {
@@ -1998,6 +2009,83 @@ func (d *Daemon) leafRunnableAtOnce(leaf CachedLeafInfo) int {
 		n = 1
 	}
 	return n
+}
+
+// runnableTogether is how many units of the enabled leafs the budgets run at
+// once when the buffer holds work of every one of them: a unit shaped like
+// each leaf's declaration, one leaf after another and round after round,
+// placed on an idle machine by the admission ledger (budgetLedger), each at
+// the fewest cores it would be granted, up to the first that would wait only
+// for cores — the "together" figure of the run preview (RunPreview), which
+// places the same units the same way with their grants. A grant takes only
+// cores no unit behind it could use, so the count is the same.
+//
+// It is what counts when the leafs are held by different limits: a leaf the
+// volunteer runs one of at a time beside a container leaf the engine's VM runs
+// one of at a time run two tasks between them, though each alone runs one.
+// Counting the most parallel leaf alone, the machine believed it had one slot
+// while it ran two, so an idle slot could not be reported and the buffer, and
+// with it the fetch, were sized for one.
+//
+// Only leafs this machine can be handed are placed: not one that needs a GPU
+// it does not offer, one that can never start here, or one whose runtime it
+// does not offer that leaf's head — the fetcher never asks for those, and a
+// slot counted for them would be one nothing can fill. 0 when no such leaf is
+// known.
+func (d *Daemon) runnableTogether() int {
+	leafs := d.handableLeafs()
+	if len(leafs) == 0 {
+		return 0
+	}
+	rounds := 0
+	bookings := make([]budgetBooking, len(leafs))
+	for i, hl := range leafs {
+		if n := d.leafRunnableAtOnce(hl.leaf); n > rounds {
+			rounds = n
+		}
+		bookings[i] = d.bookingOf(leafShapeUnit(hl.leaf))
+	}
+	// No leaf runs more units than it runs alone, and a round places one of
+	// each, so the most parallel leaf's figure is enough rounds.
+	rounds = d.withinSlotLimits(rounds)
+	ledger := d.emptyLedger()
+	started := 0
+	for round := 0; round < rounds; round++ {
+		for _, b := range bookings {
+			if !ledger.admits(b, false) {
+				if ledger.admits(b, true) {
+					return started // the slot filler holds the free cores for it
+				}
+				continue
+			}
+			ledger.takeBooking(b, b.cores)
+			started++
+		}
+	}
+	return started
+}
+
+// handableLeafs is the enabled leafs, each with its head, that heads can hand
+// this machine and that can start on it: the run preview's runnable leafs,
+// less those whose runtime this machine does not offer their head
+// (leafRuntimeVerdict, the fetcher's own pre-request skip).
+func (d *Daemon) handableLeafs() []headLeaf {
+	if d.multiClient == nil {
+		return nil
+	}
+	var out []headLeaf
+	for _, srv := range d.multiClient.Servers() {
+		for _, leaf := range d.enabledLeafs(srv.Name) {
+			if d.leafNeedsAbsentGPU(leaf) || d.cannotStartReason(leaf) != "" {
+				continue
+			}
+			if _, missing, untrusted := leafRuntimeVerdict(leaf, d.runtimeRegistry, srv.Config); missing || untrusted {
+				continue
+			}
+			out = append(out, headLeaf{head: srv.Name, leaf: leaf})
+		}
+	}
+	return out
 }
 
 // slotPoolSize is how many execution slots the daemon allocates at start: as
@@ -2408,12 +2496,12 @@ func (d *Daemon) containerBufferFullVerdict(wu *runtime.WorkUnit) (bool, string)
 // tasks takes, its memory budget over its booked memory, and the volunteer's
 // max_running for it). At least one.
 //
-// The slot count is set by the most parallel enabled leaf, so on its own it
-// over-states how many units of a wider leaf, or of one the volunteer capped,
-// run together: sizing that leaf's buffer by it would hold work for tasks
-// that never start, which then sits toward its deadline. That is the
-// running-task limit that makes a client fetch far more than it can finish,
-// and the per-leaf buffer class below is what stops it.
+// The slot count is at least the most parallel enabled leaf's figure, so on
+// its own it over-states how many units of a wider leaf, or of one the
+// volunteer capped, run together: sizing that leaf's buffer by it would hold
+// work for tasks that never start, which then sits toward its deadline. That
+// is the running-task limit that makes a client fetch far more than it can
+// finish, and the per-leaf buffer class below is what stops it.
 func (d *Daemon) leafSlotsFor(leaf CachedLeafInfo) int {
 	n := d.maxSlots()
 	if m := d.leafRunnableAtOnce(leaf); m < n {
